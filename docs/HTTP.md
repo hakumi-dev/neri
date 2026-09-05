@@ -21,15 +21,51 @@ Run [the example](../examples/http.hk) with `neri examples/http.hk`, or build it
 with `neri build examples/http.hk --output server` and run `./server`.
 Request `http://127.0.0.1:8080/` from another terminal or browser.
 
+The example prints `Listening on http://127.0.0.1:8080` after the socket is
+bound and listening. `PORT` selects another port; `HTTP_LOG=1` enables connection
+and response logs. Access logging is off by default. For example:
+
+```sh
+PORT=3000 HTTP_LOG=1 neri examples/http.hk
+curl http://127.0.0.1:3000/
+```
+
+These environment variables belong to the example, not the HTTP library.
+An invalid or empty `PORT` reports an error and exits with status 1.
+
 ## API
 
-`http.serve(address: String, handler: fn(Request): Response): String` binds
+`http.serve(address: String, handler: fn(Request): Response, options: Options? = null): String` binds
 `127.0.0.1:<port>`, where the port is between 1 and 65535. It serves synchronously
 until process termination or a listener failure. Startup and listener failures
 return an error string, including the failing operation. An occupied port is a
 startup failure. Individual connection failures close that connection and allow
 the next request. The function has no normal successful return or graceful-stop
 operation.
+
+`http.Options` has two optional callbacks:
+
+- `onListening: (fn(String): Void)?` receives the address once, after successful
+  bind and listen and before accepting connections. Startup failures skip it.
+- `log: (fn(String): Void)?` receives a response status after a successful write,
+  or a connection setup, incomplete-read, or write-failure message. Response logs
+  use the actual wire status, including rejected requests and substituted 500s.
+  They contain no request paths, queries, headers, or bodies. A successful write
+  means the local socket accepted the bytes, not that the client consumed them.
+
+Both callbacks run synchronously. The library prints nothing itself; applications
+choose a destination and format. Startup and listener errors are returned to the
+caller, which decides how to report them.
+
+```ruby
+let options = new http.Options()
+options.onListening = fn(address)
+  console.println("Listening on http://" + address)
+end
+options.log = fn(message)
+  console.println(message)
+end
+```
 
 `Request` exposes `method`, `path`, and `query` as strings. Accepted requests have
 method `GET`. The path keeps percent escapes exactly as received, and ends before

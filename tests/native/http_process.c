@@ -39,11 +39,19 @@ int main(int argc, char **argv) {
   const int enabled = 1;
   setsockopt(probe, SOL_SOCKET, SO_REUSEADDR, &enabled, sizeof(enabled));
   struct sockaddr_in address = {0};
+  const char *configured_port = getenv("PORT");
+  char *port_end = NULL;
+  const long port = configured_port ? strtol(configured_port, &port_end, 10) : 8080;
+  if (port < 1 || port > 65535 || (configured_port && (*port_end || port_end == configured_port))) {
+    fputs("Invalid HTTP test PORT\n", stderr);
+    close(probe);
+    return 2;
+  }
   address.sin_family = AF_INET;
-  address.sin_port = htons(8080);
+  address.sin_port = htons((unsigned short)port);
   address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
   if (probe < 0 || bind(probe, (struct sockaddr *)&address, sizeof(address)) < 0) {
-    perror("HTTP test requires an available 127.0.0.1:8080");
+    perror("HTTP test requires an available loopback port");
     if (probe >= 0) close(probe);
     return 2;
   }

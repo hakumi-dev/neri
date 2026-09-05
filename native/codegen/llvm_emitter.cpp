@@ -202,7 +202,8 @@ std::string_view target_name(target_platform target) noexcept {
 std::string_view target_triple(target_platform target) noexcept {
   switch (target) {
   case target_platform::macos_arm64:
-    return "arm64-apple-macosx";
+    // The deployment version makes LLVM emit the Mach-O platform load command.
+    return "arm64-apple-macosx15.0.0";
   case target_platform::linux_x86_64:
     return "x86_64-unknown-linux-gnu";
   }

@@ -129,6 +129,27 @@ void test_primitive_codegen(const std::vector<std::uint8_t> &bytes) {
               macos_object.bytes == repeated_macos_object.bytes,
           "object emission is not deterministic ELF x86-64 and Mach-O ARM64");
 
+  // Mach-O load commands start after the 32-byte mach_header_64.
+  const auto word = [&](std::size_t offset) {
+    require(offset + 4 <= macos_object.bytes.size(), "truncated Mach-O command");
+    std::uint32_t value = 0;
+    for (std::size_t byte = 0; byte < 4; ++byte)
+      value |= std::uint32_t(macos_object.bytes[offset + byte]) << (byte * 8);
+    return value;
+  };
+  bool platform_found = false;
+  std::size_t offset = 32;
+  for (std::uint32_t command = 0; command < word(16); ++command) {
+    const auto size = word(offset + 4);
+    require(size >= 8 && size <= macos_object.bytes.size() - offset,
+            "invalid Mach-O load command size");
+    if (word(offset) == 0x32) { // LC_BUILD_VERSION
+      platform_found = word(offset + 8) == 1 && word(offset + 12) == (15U << 16);
+    }
+    offset += size;
+  }
+  require(platform_found, "Mach-O object must declare macOS 15 as its platform");
+
   try {
     static_cast<void>(neri::codegen::parse_target("invalid-triple"));
   } catch (const neri::codegen::codegen_error &error) {
