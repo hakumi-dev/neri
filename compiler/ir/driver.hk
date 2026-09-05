@@ -1,0 +1,225 @@
+use ConsoleInteraction
+use host
+
+def bootstrapFindText(text: String, pattern: String): Int
+  let textLength = host.stringByteLength(text)
+  let patternLength = host.stringByteLength(pattern)
+  var start = 0
+  while start + patternLength <= textLength
+    if host.stringSlice(text, start, patternLength) == pattern return start end
+    start = start + 1
+  end
+  return -1
+end
+
+def bootstrapManifestString(text: String, name: String): String
+  let marker = "\"" + name + "\":"
+  let found = bootstrapFindText(text, marker)
+  if found < 0 return "" end
+  var start = found + host.stringByteLength(marker)
+  while start < host.stringByteLength(text)
+    let byte = host.stringByteAt(text, start) as Int
+    if byte != 9 && byte != 10 && byte != 13 && byte != 32 break end
+    start = start + 1
+  end
+  if start >= host.stringByteLength(text) || (host.stringByteAt(text, start) as Int) != 34 return "" end
+  start = start + 1
+  var finish = start
+  while finish < host.stringByteLength(text) && (host.stringByteAt(text, finish) as Int) != 34
+    finish = finish + 1
+  end
+  return host.stringSlice(text, start, finish - start)
+end
+
+def bootstrapManifestInt(text: String, name: String): Int?
+  let marker = "\"" + name + "\":"
+  let found = bootstrapFindText(text, marker)
+  if found < 0 return null end
+  var start = found + host.stringByteLength(marker)
+  while start < host.stringByteLength(text)
+    let byte = host.stringByteAt(text, start) as Int
+    if byte != 9 && byte != 10 && byte != 13 && byte != 32 break end
+    start = start + 1
+  end
+  var finish = start
+  while finish < host.stringByteLength(text)
+    let byte = host.stringByteAt(text, finish) as Int
+    if byte < 48 || byte > 57 break end
+    finish = finish + 1
+  end
+  if finish == start return null end
+  return host.parseInt(host.stringSlice(text, start, finish - start))
+end
+
+def bootstrapManifestRequiredInt(text: String, name: String): Int
+  let value = bootstrapManifestInt(text, name)
+  if value != null return value end
+  return -1
+end
+
+def bootstrapFeaturePresent(features: Int, feature: Int): Bool
+  let bucket = features / feature
+  return bucket - (bucket / 2) * 2 == 1
+end
+
+def bootstrapFeatureUnion(features: Int, additions: Int): Int
+  var result = features
+  var feature = 1
+  while feature <= additions && feature <= 1152921504606846976
+    if bootstrapFeaturePresent(additions, feature) && !bootstrapFeaturePresent(result, feature)
+      result = result + feature
+    end
+    feature = feature * 2
+  end
+  return result
+end
+
+def bootstrapRequiredRuntimeMinor(module: IrModule): Int
+  var required = module.hasFeature("native-strings-v1") ? 2 : 1
+  var importValue = module.firstImport
+  while importValue != null
+    if importValue.kind == 1 && importValue.runtimeMinor > required required = importValue.runtimeMinor end
+    importValue = importValue.nextImport
+  end
+  return required
+end
+
+def bootstrapRequiredRuntimeFeatures(module: IrModule): Int
+  var required = 32
+  if module.hasFeature("native-strings-v1") required = bootstrapFeatureUnion(required, 64) end
+  var importValue = module.firstImport
+  while importValue != null
+    if importValue.kind == 1 required = bootstrapFeatureUnion(required, importValue.runtimeFeatures) end
+    importValue = importValue.nextImport
+  end
+  return required
+end
+
+def bootstrapArtifactNameValid(value: String): Bool
+  if value == "" || bootstrapStartsWith(value, "/") || bootstrapFindText(value, "..") >= 0 || bootstrapFindText(value, "\\") >= 0 return false end
+  return true
+end
+
+def bootstrapDirectory(path: String): String
+  var slash = -1
+  var index = 0
+  while index < host.stringByteLength(path)
+    if (host.stringByteAt(path, index) as Int) == 47 slash = index end
+    index = index + 1
+  end
+  if slash < 0 return "." end
+  if slash == 0 return "/" end
+  return host.stringSlice(path, 0, slash)
+end
+
+def bootstrapRun(executable: String, arguments: String[]): Bool
+  let status = host.run(executable, arguments)
+  if status == null
+    ConsoleInteraction.println("could not execute '" + executable + "': " + host.errorMessage())
+    return false
+  end
+  if status != 0
+    ConsoleInteraction.println("'" + executable + "' failed with status " + (status as String))
+    return false
+  end
+  return true
+end
+
+def bootstrapCodegenEmitName(emit: String): String
+  if emit == "asm" return "assembly" end
+  if emit == "obj" || emit == "executable" return "object" end
+  return "llvm-ir"
+end
+
+def bootstrapInvokeCodegen(module: IrModule, emit: String, output: String, target: String, release: Bool): Bool
+  let optionalCodegen = host.environment("NERI_CODEGEN")
+  if optionalCodegen == null || optionalCodegen == ""
+    ConsoleInteraction.println("NERI_CODEGEN must name the native neri-codegen executable")
+    return false
+  end
+  let codegen = optionalCodegen
+  let transport = output + ".nir.hex"
+  if !host.writeText(transport, irSerializeEnvelopeHex(module))
+    ConsoleInteraction.println("could not write Neri IR transport: " + host.errorMessage())
+    return false
+  end
+  let arguments: String[] = [
+    "--input", transport,
+    "--input-format", "hex",
+    "--target", target,
+    "--optimization", release ? "release" : "debug",
+    "--emit", bootstrapCodegenEmitName(emit),
+    "--output", output
+  ]
+  let succeeded = bootstrapRun(codegen, arguments)
+  host.removeFile(transport)
+  return succeeded
+end
+
+def bootstrapLinkExecutable(module: IrModule, objectPath: String, output: String, target: String): Bool
+  let optionalManifest = host.environment("NERI_RUNTIME_MANIFEST")
+  if optionalManifest == null || optionalManifest == ""
+    ConsoleInteraction.println("NERI_RUNTIME_MANIFEST must name the runtime package manifest")
+    return false
+  end
+  let manifestPath = optionalManifest
+  let optionalManifestText = host.readText(manifestPath)
+  if optionalManifestText == null
+    ConsoleInteraction.println("could not read runtime manifest: " + host.errorMessage())
+    return false
+  end
+  let manifestText = optionalManifestText
+  let schemaVersion = bootstrapManifestRequiredInt(manifestText, "schemaVersion")
+  let transportMajor = bootstrapManifestRequiredInt(manifestText, "irTransportMajor")
+  let transportMinor = bootstrapManifestRequiredInt(manifestText, "irTransportMinor")
+  let abiMajor = bootstrapManifestRequiredInt(manifestText, "abiMajor")
+  let abiMinor = bootstrapManifestRequiredInt(manifestText, "abiMinor")
+  let features = bootstrapManifestRequiredInt(manifestText, "features")
+  let requiredMinor = bootstrapRequiredRuntimeMinor(module)
+  let requiredFeatures = bootstrapRequiredRuntimeFeatures(module)
+  if schemaVersion < 0 || transportMajor < 0 || transportMinor < 0 || abiMajor < 0 || abiMinor < 0 || features < 0
+    ConsoleInteraction.println("runtime manifest is missing a required field")
+    return false
+  end
+  if schemaVersion != 2 || bootstrapManifestString(manifestText, "toolchainVersion") != "0.1.0-dev" || transportMajor != 1 || transportMinor != 1 || bootstrapManifestString(manifestText, "target") != target || abiMajor != 1
+    ConsoleInteraction.println("runtime manifest does not match Neri 0.1.0-dev, IR transport 1.1, target '" + target + "', and ABI v1")
+    return false
+  end
+  if abiMinor < requiredMinor
+    ConsoleInteraction.println("runtime manifest does not provide the required ABI minor version")
+    return false
+  end
+  var requiredFeature = 1
+  while requiredFeature <= requiredFeatures && requiredFeature <= 1152921504606846976
+    if bootstrapFeaturePresent(requiredFeatures, requiredFeature) && !bootstrapFeaturePresent(features, requiredFeature)
+      ConsoleInteraction.println("runtime manifest does not provide the required ABI features")
+      return false
+    end
+    requiredFeature = requiredFeature * 2
+  end
+  let artifact = bootstrapManifestString(manifestText, "artifact")
+  if !bootstrapArtifactNameValid(artifact)
+    ConsoleInteraction.println("runtime manifest has an invalid artifact path")
+    return false
+  end
+  let optionalRuntime = host.pathJoin(bootstrapDirectory(manifestPath), artifact)
+  if optionalRuntime == null
+    ConsoleInteraction.println("runtime artifact path is invalid")
+    return false
+  end
+  var linker = target == "macos-arm64" ? "/usr/bin/clang++" : "clang++-22"
+  let configuredLinker = host.environment("NERI_LINKER")
+  if configuredLinker != null && configuredLinker != "" linker = configuredLinker end
+  let triple = target == "macos-arm64" ? "arm64-apple-macos" : "x86_64-unknown-linux-gnu"
+  let arguments: String[] = ["--target=" + triple, objectPath, optionalRuntime, "-o", output]
+  return bootstrapRun(linker, arguments)
+end
+
+def bootstrapEmitNative(module: IrModule, emit: String, output: String, target: String, release: Bool): Bool
+  if emit != "executable" return bootstrapInvokeCodegen(module, emit, output, target, release) end
+  let objectPath = output + ".o"
+  if !bootstrapInvokeCodegen(module, emit, objectPath, target, release) return false end
+  let linked = bootstrapLinkExecutable(module, objectPath, output, target)
+  host.removeFile(objectPath)
+  return linked
+end

@@ -1,0 +1,1506 @@
+class IrRuntimeContract
+  public name: String = ""
+  public linkName: String = ""
+  public resultType: String = "void"
+  public effects: Int = 0
+  public runtimeMinor: Int = 4
+  public runtimeFeatures: Int = 0
+  public symbolKind: Int = 7
+
+  def init(name: String, linkName: String, resultType: String, effects: Int, runtimeMinor: Int, runtimeFeatures: Int, symbolKind: Int): Void
+    this.name = name
+    this.linkName = linkName
+    this.resultType = resultType
+    this.effects = effects
+    this.runtimeMinor = runtimeMinor
+    this.runtimeFeatures = runtimeFeatures
+    this.symbolKind = symbolKind
+  end
+end
+
+def irFloatBitsText(literal: String): String
+  let parsed = host.parseFloat(literal)
+  if parsed == null
+    return "0000000000000000"
+  end
+  var value = parsed
+  var result = ""
+  unsafe
+    let pointer = &value
+    let bytes = pointer as Byte*
+    var index = 7
+    while index >= 0
+      let byte = bytes[index] as Int
+      result = result + irHexDigit(byte / 16) + irHexDigit(byte - (byte / 16) * 16)
+      index = index - 1
+    end
+  end
+  return result
+end
+
+class IrLowerer
+  public semantic: SemanticModel = new SemanticModel()
+  public bound: BoundArena = new BoundArena()
+  public syntax: SyntaxArena = new SyntaxArena()
+  public source: String = ""
+  public module: IrModule = new IrModule("main", "")
+  public adapterTargets: StringBuffer = new StringBuffer()
+  public adapterArities: IntBuffer = new IntBuffer()
+  public adapterVirtual: IntBuffer = new IntBuffer()
+
+  def init(semantic: SemanticModel, syntax: SyntaxArena, source: String, moduleName: String): Void
+    this.semantic = semantic
+    this.bound = semantic.bound
+    this.syntax = syntax
+    this.source = source
+    this.module = new IrModule(moduleName, source)
+  end
+
+  def setSources(ids: StringBuffer, texts: StringBuffer, starts: IntBuffer): Void
+    this.module.clearSources()
+    var index = 0
+    while index < ids.size
+      this.module.addSource(new IrSource(ids.get(index), texts.get(index), starts.get(index)))
+      index = index + 1
+    end
+  end
+
+  def location(node: Int): IrLocation
+    return this.module.location(this.bound.startAt(node), this.bound.lengthAt(node))
+  end
+
+  def semanticLocation(start: Int, length: Int): IrLocation
+    return this.module.location(start, length)
+  end
+
+  def lower(): IrModule
+    var typeIndex = 0
+    while typeIndex < this.bound.count()
+      this.requireType(irType(this.bound.typeAt(typeIndex)))
+      typeIndex = typeIndex + 1
+    end
+    this.lowerClasses()
+    var classSymbol = this.semantic.firstClass
+    while classSymbol != null
+      var method = classSymbol.firstMethod
+      while method != null
+        this.lowerCallable(method)
+        method = method.nextCallable
+      end
+      classSymbol = classSymbol.nextClass
+    end
+    this.lowerFunctionsInSymbolOrder()
+    var adapter = 0
+    while adapter < this.adapterTargets.size
+      let target = this.findCallable(this.adapterTargets.get(adapter))
+      if target != null this.lowerDefaultAdapter(target, this.adapterArities.get(adapter), this.adapterVirtual.get(adapter) == 1) end
+      adapter = adapter + 1
+    end
+    this.propagateEffects()
+    return this.module
+  end
+
+  def requireType(typeName: String): Void
+    if typeName == "string"
+      this.module.requireFeature("native-strings-v1")
+      return
+    end
+    let kind = irTypeKind(typeName)
+    if kind == "array" || kind == "optional" || kind == "pointer"
+      this.requireType(irTypeInner(typeName))
+    end
+  end
+
+  def lowerFunctionsInSymbolOrder(): Void
+    var count = 0
+    var function = this.semantic.firstFunction
+    while function != null
+      count = count + 1
+      function = function.nextCallable
+    end
+    var emitted = 0
+    var previous = ""
+    while emitted < count
+      var best: SemanticCallable? = null
+      function = this.semantic.firstFunction
+      while function != null
+        let afterPrevious = emitted == 0 || irCompareText(function.fullName, previous) > 0
+        if afterPrevious && (best == null || irCompareText(function.fullName, best.fullName) < 0)
+          best = function
+        end
+        function = function.nextCallable
+      end
+      if best != null
+        this.lowerCallable(best)
+        previous = best.fullName
+      end
+      emitted = emitted + 1
+    end
+  end
+
+  def lowerClasses(): Void
+    var semanticClass = this.semantic.firstClass
+    while semanticClass != null
+      var baseSymbol: IrSymbol? = null
+      if semanticClass.baseName != ""
+        baseSymbol = irSymbol(this.module.id, 1, semanticClass.baseName)
+      end
+      let declaration = new IrClass(irSymbol(this.module.id, 1, semanticClass.fullName), baseSymbol, irAccessTag(semanticClass.access), irNoLocation())
+      var field = semanticClass.firstField
+      while field != null
+        declaration.addField(new IrField(irSymbol(this.module.id, 2, field.owner + "." + field.name), irType(field.typeName), irAccessTag(field.access), irNoLocation()))
+        field = field.nextField
+      end
+      var method = semanticClass.firstMethod
+      while method != null
+        var dispatch = 3
+        var slot: IrSymbol? = irSymbol(this.module.id, 3, this.dispatchSlot(semanticClass, method))
+        if method.isStatic
+          dispatch = 1
+          slot = null
+        else if method.name == "init"
+          dispatch = 2
+          slot = null
+        end
+        declaration.addMethod(new IrMethod(irSymbol(this.module.id, 3, method.fullName), dispatch, slot, this.semanticLocation(this.bound.startAt(method.boundNode), this.bound.lengthAt(method.boundNode))))
+        method = method.nextCallable
+      end
+      this.module.addClass(declaration)
+      semanticClass = semanticClass.nextClass
+    end
+  end
+
+  def dispatchSlot(owner: SemanticClass, method: SemanticCallable): String
+    var current = owner
+    var result = method.fullName
+    var steps = 0
+    while current.baseName != "" && steps < 256
+      let baseClass = this.semantic.findClass(current.baseName)
+      if baseClass == null return result end
+      var candidate = baseClass.firstMethod
+      while candidate != null
+        if candidate.name == method.name && !candidate.isStatic && candidate.name != "init"
+          result = candidate.fullName
+        end
+        candidate = candidate.nextCallable
+      end
+      current = baseClass
+      steps = steps + 1
+    end
+    return result
+  end
+
+  def lowerCallable(callable: SemanticCallable): Void
+    if callable.cAbiSymbol != ""
+      return
+    end
+    let symbolKind = callable.className == "" ? 4 : 3
+    var functionKind = 1
+    if callable.className != ""
+      if callable.isStatic functionKind = 2 else if callable.name == "init" functionKind = 4 else functionKind = 3 end
+    end
+    let function = new IrFunction(irSymbol(this.module.id, symbolKind, callable.fullName), irType(callable.returnType), functionKind, callable.isUnsafe, this.location(callable.boundNode))
+    if callable.className != ""
+      function.declaringClass = irSymbol(this.module.id, 1, callable.className)
+      if !callable.isStatic && callable.name != "init"
+        let owner = this.semantic.findClass(callable.className)
+        if owner != null function.dispatchSlot = irSymbol(this.module.id, 3, this.dispatchSlot(owner, callable)) end
+      end
+    end
+    let entry = function.createBlock()
+    let context = new IrFunctionContext(function, entry)
+    if callable.className != "" && !callable.isStatic
+      let receiverType = irType(callable.className)
+      function.parameterTypes.add(receiverType)
+      let receiver = function.allocateValue()
+      entry.addParameter(new IrParameter(receiver, receiverType, this.location(callable.boundNode)))
+      context.addVariable(callable.fullName + "/this", 5, "this", receiverType, receiver, false)
+      function.addDebugLocal(new IrDebugLocal("this", receiver, this.location(callable.boundNode)))
+    end
+    var parameter = callable.firstParameter
+    while parameter != null
+      let typeName = irType(parameter.typeName)
+      function.parameterTypes.add(typeName)
+      let value = function.allocateValue()
+      let parameterLocation = this.module.location(this.syntax.startAt(parameter.syntaxNode), this.syntax.lengthAt(parameter.syntaxNode))
+      entry.addParameter(new IrParameter(value, typeName, parameterLocation))
+      context.addVariable(parameter.identity, 5, parameter.name, typeName, value, false)
+      function.addDebugLocal(new IrDebugLocal(parameter.name, value, parameterLocation))
+      parameter = parameter.nextParameter
+    end
+    if callable.isUnsafe
+      function.unsafeRootId = function.allocateValue()
+      context.unsafeCapabilities.add(function.unsafeRootId)
+      context.unsafeDepth = 1
+    end
+    if callable.className != "" && callable.name == "init"
+      let receiver = context.findVariable("this")
+      let owner = this.semantic.findClass(callable.className)
+      if receiver != null && owner != null
+        this.lowerConstructorPreamble(context, callable, owner, receiver.value, function.location)
+      end
+    end
+    var index = 0
+    while index < this.bound.childCountAt(callable.boundNode) && !context.terminated
+      this.lowerStatement(context, this.bound.childAt(callable.boundNode, index))
+      index = index + 1
+    end
+    if !context.terminated && function.resultType == "void"
+      context.returnValue(-1, function.location)
+    end
+    this.module.addFunction(function)
+  end
+
+  def lowerFieldInitializers(context: IrFunctionContext, owner: SemanticClass, receiver: Int, location: IrLocation): Void
+    let previousOverride = context.thisOverride
+    let previousOverrideType = context.thisOverrideType
+    context.thisOverride = receiver
+    context.thisOverrideType = "class|" + owner.fullName
+    var field = owner.firstField
+    while field != null
+      let typeName = irType(field.typeName)
+      var value = new IrValue(-1, typeName)
+      if field.boundInitializer >= 0
+        value = this.lowerExpression(context, field.boundInitializer, typeName)
+      else
+        value = this.lowerDefaultFieldValue(context, typeName, location)
+      end
+      if value.id >= 0
+        let operands: Int[] = [receiver, value.id]
+        context.emitSymbol(40, "void", operands, irSymbol(this.module.id, 2, field.owner + "." + field.name), location)
+        context.function.localEffects = irEffectUnion(context.function.localEffects, 2)
+      end
+      field = field.nextField
+    end
+    context.thisOverride = previousOverride
+    context.thisOverrideType = previousOverrideType
+  end
+
+  def lowerDefaultFieldValue(context: IrFunctionContext, typeName: String, location: IrLocation): IrValue
+    if typeName == "bool" return context.emitConstant(typeName, 1, "false", location) end
+    if typeName == "byte" return context.emitConstant(typeName, 2, "0", location) end
+    if typeName == "int" return context.emitConstant(typeName, 3, "0", location) end
+    if typeName == "float" return context.emitConstant(typeName, 4, "0x0000000000000000", location) end
+    if typeName == "string"
+      let name = "literal.string.sha256." + sha256Text("")
+      if !this.hasGlobal(name)
+        this.module.addGlobal(new IrGlobal(irSymbol(this.module.id, 9, name), "", irNoLocation()))
+      end
+      this.module.requireFeature("native-strings-v1")
+      this.module.requireFeature("string-data-v1")
+      return context.emit(1, "string", irEmptyInts(), irEmptyStrings(), null, 7, name, 0, false, location)
+    end
+    if irIsOptional(typeName)
+      return context.emitTyped(21, typeName, irEmptyInts(), irTypeInner(typeName), location)
+    end
+    return new IrValue(-1, typeName)
+  end
+
+  def lowerConstructorPreamble(context: IrFunctionContext, callable: SemanticCallable, owner: SemanticClass, receiver: Int, location: IrLocation): Void
+    if owner.baseName != ""
+      let baseClass = this.semantic.findClass(owner.baseName)
+      if baseClass != null
+        var baseConstructor = this.findCallable(callable.baseConstructorName)
+        if baseConstructor == null baseConstructor = this.findCallable(baseClass.fullName + ".init") end
+        if baseConstructor != null
+          var arguments: Int[] = []
+          var index = 0
+          while index < callable.baseArguments.size
+            let parameter = baseConstructor.parameterAt(index)
+            var expected = ""
+            if parameter != null expected = irType(parameter.typeName) end
+            let value = this.lowerExpression(context, callable.baseArguments.get(index), expected)
+            arguments = host.appendInt(arguments, value.id)
+            index = index + 1
+          end
+          let upcastOperands: Int[] = [receiver]
+          let baseReceiver = context.emitValue(20, "class|" + baseClass.fullName, upcastOperands, location)
+          var operands: Int[] = [baseReceiver.id]
+          for argument in arguments operands = host.appendInt(operands, argument) end
+          if callable.baseArguments.size < baseConstructor.parameterCount
+            let adapterName = this.requestDefaultAdapter(baseConstructor, callable.baseArguments.size, false)
+            context.emitSymbol(28, "void", operands, irSymbol(this.module.id, 4, adapterName), location)
+            context.function.callees.add(adapterName)
+          else
+            context.emitSymbol(29, "void", operands, irSymbol(this.module.id, 3, baseConstructor.fullName), location)
+            context.function.callees.add(baseConstructor.fullName)
+          end
+        else
+          this.lowerConstructionDefaults(context, baseClass, receiver, location)
+        end
+      end
+    end
+    this.lowerFieldInitializers(context, owner, receiver, location)
+  end
+
+  def lowerConstructionDefaults(context: IrFunctionContext, owner: SemanticClass, receiver: Int, location: IrLocation): Void
+    if owner.baseName != ""
+      let baseClass = this.semantic.findClass(owner.baseName)
+      if baseClass != null this.lowerConstructionDefaults(context, baseClass, receiver, location) end
+    end
+    this.lowerFieldInitializers(context, owner, receiver, location)
+  end
+
+  def lowerStatement(context: IrFunctionContext, node: Int): Void
+    let kind = this.bound.kindAt(node)
+    if kind == "Let" || kind == "Var"
+      let value = this.lowerExpression(context, this.bound.childAt(node, 0), irType(this.bound.typeAt(node)))
+      context.addVariable(this.bound.symbolAt(node), 6, this.bound.dataAt(node), irType(this.bound.typeAt(node)), value.id, kind == "Var")
+      context.function.addDebugLocal(new IrDebugLocal(this.bound.dataAt(node), value.id, this.location(node)))
+    else if kind == "Assignment"
+      this.lowerAssignment(context, node)
+    else if kind == "Return"
+      if this.bound.childCountAt(node) == 0
+        this.emitScopeCleanups(context, 0)
+        context.returnValue(-1, this.location(node))
+      else
+        let value = this.lowerExpression(context, this.bound.childAt(node, 0), context.function.resultType)
+        this.emitScopeCleanups(context, 0)
+        context.returnValue(value.id, this.location(node))
+      end
+    else if kind == "ExpressionStatement"
+      this.lowerExpression(context, this.bound.childAt(node, 0), "")
+    else if kind == "If"
+      this.lowerIf(context, node)
+    else if kind == "While"
+      this.lowerWhile(context, node)
+    else if kind == "For"
+      this.lowerFor(context, node)
+    else if kind == "Break"
+      this.lowerLoopTransfer(context, false, node)
+    else if kind == "Continue"
+      this.lowerLoopTransfer(context, true, node)
+    else if kind == "UnsafeBlock"
+      this.lowerUnsafeBlock(context, node)
+    else if kind == "BorrowBlock"
+      this.lowerBorrowBlock(context, node)
+    end
+  end
+
+  def lowerAssignment(context: IrFunctionContext, node: Int): Void
+    if this.bound.dataAt(node) != ""
+      let variable = context.findVariableIdentity(this.bound.symbolAt(node), this.bound.dataAt(node))
+      let value = this.lowerExpression(context, this.bound.childAt(node, 0), irType(this.bound.typeAt(node)))
+      if variable != null
+        if variable.addressedPointer >= 0
+          let operands: Int[] = [this.currentUnsafe(context), variable.addressedPointer, value.id]
+          context.emitTyped(45, "void", operands, variable.typeName, this.location(node))
+          context.function.localEffects = irEffectUnion(context.function.localEffects, 66)
+        else
+          variable.value = value.id
+          context.function.addDebugLocal(new IrDebugLocal(variable.name, value.id, this.location(node)))
+        end
+      end
+      return
+    end
+    if this.bound.childCountAt(node) == 2 && this.bound.kindAt(this.bound.childAt(node, 0)) == "Member"
+      let targetNode = this.bound.childAt(node, 0)
+      let field = this.findField(this.bound.dataAt(targetNode))
+      var receiverType = ""
+      if field != null receiverType = "class|" + field.owner end
+      let receiver = this.lowerExpression(context, this.bound.childAt(targetNode, 0), receiverType)
+      let value = this.lowerExpression(context, this.bound.childAt(node, 1), irType(this.bound.typeAt(node)))
+      let operands: Int[] = [receiver.id, value.id]
+      context.emitSymbol(40, "void", operands, irSymbol(this.module.id, 2, this.bound.dataAt(targetNode)), this.location(node))
+      context.function.localEffects = irEffectUnion(context.function.localEffects, 2)
+    else if this.bound.childCountAt(node) == 2
+      let targetNode = this.bound.childAt(node, 0)
+      let targetKind = this.bound.kindAt(targetNode)
+      if targetKind == "Unary" && this.bound.dataAt(targetNode) == "*"
+        let pointer = this.lowerExpression(context, this.bound.childAt(targetNode, 0), "")
+        let value = this.lowerExpression(context, this.bound.childAt(node, 1), irType(this.bound.typeAt(node)))
+        let operands: Int[] = [this.currentUnsafe(context), pointer.id, value.id]
+        context.emitTyped(45, "void", operands, irType(this.bound.typeAt(node)), this.location(node))
+        context.function.localEffects = irEffectUnion(context.function.localEffects, 66)
+      else if targetKind == "Index"
+        let collectionNode = this.bound.childAt(targetNode, 0)
+        let collection = this.lowerExpression(context, collectionNode, "")
+        let index = this.lowerExpression(context, this.bound.childAt(targetNode, 1), "int")
+        if irIsPointer(collection.typeName)
+          let offsetOperands: Int[] = [this.currentUnsafe(context), collection.id, index.id]
+          let pointer = context.emitTyped(46, collection.typeName, offsetOperands, irTypeInner(collection.typeName), irNoLocation())
+          let value = this.lowerExpression(context, this.bound.childAt(node, 1), irType(this.bound.typeAt(node)))
+          let storeOperands: Int[] = [this.currentUnsafe(context), pointer.id, value.id]
+          context.emitTyped(45, "void", storeOperands, irTypeInner(collection.typeName), this.location(node))
+          context.function.localEffects = irEffectUnion(context.function.localEffects, 66)
+        else
+          let value = this.lowerExpression(context, this.bound.childAt(node, 1), irType(this.bound.typeAt(node)))
+          let storeOperands: Int[] = [collection.id, index.id, value.id]
+          context.emitValue(37, "void", storeOperands, this.location(node))
+          context.function.localEffects = irEffectUnion(context.function.localEffects, 6)
+        end
+      end
+    end
+  end
+
+  def lowerExpression(context: IrFunctionContext, node: Int, expectedType: String): IrValue
+    let value = this.lowerRawExpression(context, node, expectedType)
+    return this.coerce(context, value, expectedType, node)
+  end
+
+  def lowerRawExpression(context: IrFunctionContext, node: Int, expectedType: String): IrValue
+    let kind = this.bound.kindAt(node)
+    let typeName = irType(this.bound.typeAt(node))
+    let location = this.location(node)
+    if kind == "IntLiteral"
+      return context.emitConstant("int", 3, host.stringSlice(this.bound.valueAt(node), 2, host.stringByteLength(this.bound.valueAt(node)) - 2), location)
+    else if kind == "FloatLiteral"
+      let literal = host.stringSlice(this.bound.valueAt(node), 2, host.stringByteLength(this.bound.valueAt(node)) - 2)
+      return context.emitConstant("float", 4, "0x" + irFloatBitsText(literal), location)
+    else if kind == "BoolLiteral"
+      return context.emitConstant("bool", 1, host.stringSlice(this.bound.valueAt(node), 2, host.stringByteLength(this.bound.valueAt(node)) - 2), location)
+    else if kind == "StringLiteral"
+      return this.lowerString(context, node)
+    else if kind == "NullLiteral"
+      var resultType = expectedType
+      if resultType == "" resultType = typeName end
+      return context.emit(1, resultType, irEmptyInts(), irEmptyStrings(), null, 5, "", 0, false, location)
+    else if kind == "Name"
+      let variable = context.findVariableIdentity(this.bound.symbolAt(node), this.bound.dataAt(node))
+      if variable != null
+        if variable.addressedPointer >= 0
+          let operands: Int[] = [this.currentUnsafe(context), variable.addressedPointer]
+          context.function.localEffects = irEffectUnion(context.function.localEffects, 65)
+          return context.emitTyped(44, variable.typeName, operands, variable.typeName, location)
+        end
+        if variable.typeName == typeName return new IrValue(variable.value, typeName) end
+        if irIsOptional(variable.typeName) && irTypeInner(variable.typeName) == typeName
+          let operands: Int[] = [variable.value]
+          context.function.localEffects = irEffectUnion(context.function.localEffects, 4)
+          return context.emitValue(24, typeName, operands, location)
+        end
+        return new IrValue(variable.value, variable.typeName)
+      end
+    else if kind == "This"
+      if context.thisOverride >= 0 return new IrValue(context.thisOverride, context.thisOverrideType) end
+      let receiver = context.findVariable("this")
+      if receiver != null return new IrValue(receiver.value, receiver.typeName) end
+    else if kind == "Unary"
+      return this.lowerUnary(context, node)
+    else if kind == "Binary"
+      return this.lowerBinary(context, node)
+    else if kind == "Ternary"
+      return this.lowerTernary(context, node)
+    else if kind == "Cast"
+      return this.lowerCast(context, node)
+    else if kind == "ArrayLiteral"
+      return this.lowerArray(context, node)
+    else if kind == "Index"
+      return this.lowerIndex(context, node)
+    else if kind == "Member"
+      let field = this.findField(this.bound.dataAt(node))
+      var receiverType = ""
+      if field != null receiverType = "class|" + field.owner end
+      let receiver = this.lowerExpression(context, this.bound.childAt(node, 0), receiverType)
+      let operands: Int[] = [receiver.id]
+      context.function.localEffects = irEffectUnion(context.function.localEffects, 1)
+      return context.emitSymbol(39, typeName, operands, irSymbol(this.module.id, 2, this.bound.dataAt(node)), location)
+    else if kind == "Call"
+      return this.lowerCall(context, node)
+    else if kind == "InstanceCall"
+      return this.lowerInstanceCall(context, node)
+    else if kind == "New"
+      return this.lowerNew(context, node)
+    else if kind == "StackAlloc"
+      return this.lowerStackAlloc(context, node)
+    else if kind == "NativeIntrinsic"
+      return this.lowerNative(context, node)
+    end
+    return new IrValue(-1, typeName)
+  end
+
+  def coerce(context: IrFunctionContext, value: IrValue, expectedType: String, node: Int): IrValue
+    if expectedType == "" || value.typeName == expectedType
+      return value
+    end
+    let operands: Int[] = [value.id]
+    if irIsOptional(expectedType) && irTypeInner(expectedType) == value.typeName
+      return context.emitValue(22, expectedType, operands, this.location(node))
+    end
+    if value.typeName == "int" && expectedType == "float"
+      return context.emitValue(16, expectedType, operands, this.location(node))
+    end
+    if irTypeKind(value.typeName) == "class" && irTypeKind(expectedType) == "class"
+      return context.emitValue(20, expectedType, operands, this.location(node))
+    end
+    return value
+  end
+
+  def lowerUnary(context: IrFunctionContext, node: Int): IrValue
+    let operation = this.bound.dataAt(node)
+    if operation == "&" return this.lowerAddressOf(context, node) end
+    let operand = this.lowerExpression(context, this.bound.childAt(node, 0), "")
+    if operation == "*"
+      let operands: Int[] = [this.currentUnsafe(context), operand.id]
+      context.function.localEffects = irEffectUnion(context.function.localEffects, 65)
+      return context.emitTyped(44, irType(this.bound.typeAt(node)), operands, irType(this.bound.typeAt(node)), this.location(node))
+    end
+    if operation == "+" return operand end
+    var opcode = 12
+    if operation == "-" && operand.typeName == "int" opcode = 2 end
+    if operation == "-" && operand.typeName == "float" opcode = 7 end
+    let operands: Int[] = [operand.id]
+    if opcode == 2 context.function.localEffects = irEffectUnion(context.function.localEffects, 4) end
+    return context.emitValue(opcode, irType(this.bound.typeAt(node)), operands, this.location(node))
+  end
+
+  def lowerBinary(context: IrFunctionContext, node: Int): IrValue
+    let operation = this.bound.dataAt(node)
+    if operation == "&&" || operation == "||"
+      return this.lowerShortCircuit(context, node, operation == "||")
+    end
+    let leftNode = this.bound.childAt(node, 0)
+    let rightNode = this.bound.childAt(node, 1)
+    var leftExpected = ""
+    var rightExpected = ""
+    if this.bound.kindAt(leftNode) == "NullLiteral" leftExpected = irType(this.bound.typeAt(rightNode)) end
+    if this.bound.kindAt(rightNode) == "NullLiteral" rightExpected = irType(this.bound.typeAt(leftNode)) end
+    let left = this.lowerExpression(context, leftNode, leftExpected)
+    let right = this.lowerExpression(context, rightNode, rightExpected)
+    let operands: Int[] = [left.id, right.id]
+    if irIsPointer(left.typeName)
+      if operation == "+" || (operation == "-" && !irIsPointer(right.typeName))
+        var offset = right
+        if operation == "-"
+          let negateOperands: Int[] = [right.id]
+          offset = context.emitValue(2, "int", negateOperands, this.location(node))
+          context.function.localEffects = irEffectUnion(context.function.localEffects, 4)
+        end
+        let pointerOperands: Int[] = [this.currentUnsafe(context), left.id, offset.id]
+        context.function.localEffects = irEffectUnion(context.function.localEffects, 64)
+        return context.emitTyped(46, left.typeName, pointerOperands, irTypeInner(left.typeName), this.location(node))
+      end
+      let opcode = operation == "-" && irIsPointer(right.typeName) ? 47 : 48
+      var predicate = 0
+      if operation == "==" predicate = 1 end
+      if operation == "!=" predicate = 2 end
+      if operation == "<" predicate = 3 end
+      if operation == "<=" predicate = 4 end
+      if operation == ">" predicate = 5 end
+      if operation == ">=" predicate = 6 end
+      let pointerOperands: Int[] = [this.currentUnsafe(context), left.id, right.id]
+      context.function.localEffects = irEffectUnion(context.function.localEffects, 64)
+      return context.emit(opcode, opcode == 47 ? "int" : "bool", pointerOperands, [irTypeInner(left.typeName)], null, 0, "", predicate, false, this.location(node))
+    end
+    if operation == "==" || operation == "!=" || operation == "<" || operation == "<=" || operation == ">" || operation == ">="
+      var predicate = 1
+      if operation == "!=" predicate = 2 end
+      if operation == "<" predicate = 3 end
+      if operation == "<=" predicate = 4 end
+      if operation == ">" predicate = 5 end
+      if operation == ">=" predicate = 6 end
+      if left.typeName == "string"
+        context.function.localEffects = irEffectUnion(context.function.localEffects, 1)
+        return context.emitValue(operation == "==" ? 26 : 27, "bool", operands, this.location(node))
+      end
+      if irIsManaged(left.typeName) || irIsOptional(left.typeName) context.function.localEffects = irEffectUnion(context.function.localEffects, 1) end
+      return context.emitCompare(left.id, right.id, predicate, this.location(node))
+    end
+    var opcode = 3
+    if left.typeName == "int"
+      if operation == "+" opcode = 3 end
+      if operation == "-" opcode = 4 end
+      if operation == "*" opcode = 5 end
+      if operation == "/" opcode = 6 end
+      context.function.localEffects = irEffectUnion(context.function.localEffects, 4)
+    else if left.typeName == "float"
+      if operation == "+" opcode = 8 end
+      if operation == "-" opcode = 9 end
+      if operation == "*" opcode = 10 end
+      if operation == "/" opcode = 11 end
+    else if left.typeName == "string"
+      opcode = 25
+      context.function.localEffects = irEffectUnion(context.function.localEffects, 44)
+    end
+    return context.emitValue(opcode, irType(this.bound.typeAt(node)), operands, this.location(node))
+  end
+
+  def lowerCast(context: IrFunctionContext, node: Int): IrValue
+    let value = this.lowerExpression(context, this.bound.childAt(node, 0), "")
+    let target = irType(this.bound.typeAt(node))
+    if value.typeName == target return value end
+    var opcode = 16
+    if value.typeName == "float" && target == "int" opcode = 17 end
+    if value.typeName == "int" && target == "byte" opcode = 18 end
+    if value.typeName == "byte" && target == "int" opcode = 19 end
+    if value.typeName == "int" && target == "string" opcode = 55 end
+    if value.typeName == "byte" && target == "string" opcode = 56 end
+    if value.typeName == "float" && target == "string" opcode = 57 end
+    if irTypeKind(value.typeName) == "class" && irTypeKind(target) == "class" opcode = 20 end
+    if irIsPointer(value.typeName) && irIsPointer(target)
+      let operands: Int[] = [this.currentUnsafe(context), value.id]
+      let types: String[] = [irTypeInner(value.typeName), irTypeInner(target)]
+      context.function.localEffects = irEffectUnion(context.function.localEffects, 64)
+      return context.emit(49, target, operands, types, null, 0, "", 0, false, this.location(node))
+    end
+    let operands: Int[] = [value.id]
+    if opcode == 17 || opcode == 18 context.function.localEffects = irEffectUnion(context.function.localEffects, 4) end
+    if opcode >= 55 && opcode <= 57
+      context.function.localEffects = irEffectUnion(context.function.localEffects, 44)
+      this.module.requireFeature("native-strings-v1")
+    end
+    return context.emitValue(opcode, target, operands, this.location(node))
+  end
+
+  def lowerArray(context: IrFunctionContext, node: Int): IrValue
+    var operands: Int[] = []
+    var index = 0
+    while index < this.bound.childCountAt(node)
+      let value = this.lowerExpression(context, this.bound.childAt(node, index), irTypeInner(irType(this.bound.typeAt(node))))
+      operands = host.appendInt(operands, value.id)
+      index = index + 1
+    end
+    context.function.localEffects = irEffectUnion(context.function.localEffects, 44)
+    return context.emitTyped(34, irType(this.bound.typeAt(node)), operands, irTypeInner(irType(this.bound.typeAt(node))), this.location(node))
+  end
+
+  def lowerIndex(context: IrFunctionContext, node: Int): IrValue
+    let collection = this.lowerExpression(context, this.bound.childAt(node, 0), "")
+    let index = this.lowerExpression(context, this.bound.childAt(node, 1), "int")
+    if irIsPointer(collection.typeName)
+      let offsetOperands: Int[] = [this.currentUnsafe(context), collection.id, index.id]
+      let pointer = context.emitTyped(46, collection.typeName, offsetOperands, irTypeInner(collection.typeName), this.location(node))
+      let loadOperands: Int[] = [this.currentUnsafe(context), pointer.id]
+      context.function.localEffects = irEffectUnion(context.function.localEffects, 65)
+      return context.emitTyped(44, irType(this.bound.typeAt(node)), loadOperands, irTypeInner(collection.typeName), this.location(node))
+    end
+    let operands: Int[] = [collection.id, index.id]
+    context.function.localEffects = irEffectUnion(context.function.localEffects, 5)
+    return context.emitValue(36, irType(this.bound.typeAt(node)), operands, this.location(node))
+  end
+
+  def lowerAddressOf(context: IrFunctionContext, node: Int): IrValue
+    let nameNode = this.bound.childAt(node, 0)
+    let variable = context.findVariableIdentity(this.bound.symbolAt(nameNode), this.bound.dataAt(nameNode))
+    if variable == null return new IrValue(-1, irType(this.bound.typeAt(node))) end
+    if variable.addressedPointer >= 0 return new IrValue(variable.addressedPointer, "pointer|" + variable.typeName) end
+    let one = context.emitConstant("int", 3, "1", this.location(node))
+    let allocationOperands: Int[] = [this.currentUnsafe(context), one.id]
+    let pointer = context.emitTyped(43, "pointer|" + variable.typeName, allocationOperands, variable.typeName, this.location(node))
+    let storeOperands: Int[] = [this.currentUnsafe(context), pointer.id, variable.value]
+    context.emitTyped(45, "void", storeOperands, variable.typeName, this.location(node))
+    context.function.localEffects = irEffectUnion(context.function.localEffects, 70)
+    variable.addressedPointer = pointer.id
+    variable.addressedDepth = context.unsafeDepth
+    return pointer
+  end
+
+  def lowerStackAlloc(context: IrFunctionContext, node: Int): IrValue
+    let count = this.lowerExpression(context, this.bound.childAt(node, 0), "int")
+    let operands: Int[] = [this.currentUnsafe(context), count.id]
+    context.function.localEffects = irEffectUnion(context.function.localEffects, 68)
+    return context.emitTyped(43, irType(this.bound.typeAt(node)), operands, irTypeInner(irType(this.bound.typeAt(node))), this.location(node))
+  end
+
+  def lowerNative(context: IrFunctionContext, node: Int): IrValue
+    var operands: Int[] = [this.currentUnsafe(context)]
+    var index = 0
+    while index < this.bound.childCountAt(node)
+      let value = this.lowerExpression(context, this.bound.childAt(node, index), "")
+      operands = host.appendInt(operands, value.id)
+      index = index + 1
+    end
+    let operation = this.bound.dataAt(node)
+    let resultType = irType(this.bound.typeAt(node))
+    var elementType = irTypeInner(resultType)
+    if elementType == "" && this.bound.childCountAt(node) > 0 elementType = irTypeInner(irType(this.bound.typeAt(this.bound.childAt(node, 0)))) end
+    var opcode = 50
+    if operation == "realloc" opcode = 51 end
+    if operation == "free" opcode = 52 end
+    context.function.localEffects = irEffectUnion(context.function.localEffects, opcode == 52 ? 64 : 84)
+    let types: String[] = [elementType]
+    return context.emit(opcode, resultType, operands, types, null, 0, "", 0, operation == "calloc", this.location(node))
+  end
+
+  def lowerCall(context: IrFunctionContext, node: Int): IrValue
+    let target = this.bound.dataAt(node)
+    if target == "Array.Length"
+      let array = this.lowerExpression(context, this.bound.childAt(node, 0), "")
+      let operands: Int[] = [array.id]
+      context.function.localEffects = irEffectUnion(context.function.localEffects, 1)
+      return context.emitValue(35, "int", operands, this.location(node))
+    end
+    if this.runtimeContract(target) != null
+      return this.lowerRuntimeCall(context, node, target)
+    end
+    var callable = this.findCallable(this.bound.symbolAt(node))
+    if callable == null callable = this.findCallable(target) end
+    var resolvedCallable = callable
+    if resolvedCallable == null resolvedCallable = this.findCAbiCallable(target) end
+    if resolvedCallable != null && resolvedCallable.cAbiSymbol != ""
+      return this.lowerCAbiCall(context, node, resolvedCallable)
+    end
+    var operands: Int[] = []
+    var index = 0
+    while index < this.bound.childCountAt(node)
+      var expected = ""
+      if callable != null
+        let parameter = callable.parameterAt(index)
+        if parameter != null expected = irType(parameter.typeName) end
+      end
+      let argument = this.lowerExpression(context, this.bound.childAt(node, index), expected)
+      operands = host.appendInt(operands, argument.id)
+      index = index + 1
+    end
+    let symbolKind = callable != null && callable.className != "" ? 3 : 4
+    var callTarget = target
+    var callSymbolKind = symbolKind
+    if callable != null && operands.Length < callable.parameterCount
+      callTarget = this.requestDefaultAdapter(callable, operands.Length, false)
+      callSymbolKind = 4
+    end
+    context.function.callees.add(callTarget)
+    return context.emitSymbol(28, irType(this.bound.typeAt(node)), operands, irSymbol(this.module.id, callSymbolKind, callTarget), this.location(node))
+  end
+
+  def lowerInstanceCall(context: IrFunctionContext, node: Int): IrValue
+    var operands: Int[] = []
+    let callable = this.findCallable(this.bound.dataAt(node))
+    let receiverNode = this.bound.childAt(node, 0)
+    var receiver = this.lowerExpression(context, receiverNode, "")
+    let isDirect = this.bound.valueAt(node) == "direct"
+    if callable != null && receiver.typeName != "class|" + callable.className
+      let upcastOperands: Int[] = [receiver.id]
+      receiver = context.emitValue(20, "class|" + callable.className, upcastOperands, isDirect ? irNoLocation() : this.location(receiverNode))
+    end
+    operands = host.appendInt(operands, receiver.id)
+    var index = 1
+    while index < this.bound.childCountAt(node)
+      var expected = ""
+      if callable != null
+        let parameter = callable.parameterAt(index - 1)
+        if parameter != null expected = irType(parameter.typeName) end
+      end
+      let value = this.lowerExpression(context, this.bound.childAt(node, index), expected)
+      operands = host.appendInt(operands, value.id)
+      index = index + 1
+    end
+    var opcode = 30
+    var targetName = this.bound.dataAt(node)
+    if callable != null && callable.name == "init" opcode = 29 end
+    if isDirect opcode = 29 end
+    if callable != null && operands.Length - 1 < callable.parameterCount
+      let adapterName = this.requestDefaultAdapter(callable, operands.Length - 1, opcode == 30)
+      context.function.callees.add(adapterName)
+      return context.emitSymbol(28, irType(this.bound.typeAt(node)), operands, irSymbol(this.module.id, 4, adapterName), this.location(node))
+    end
+    if callable != null && !callable.isStatic && callable.name != "init"
+      let owner = this.semantic.findClass(callable.className)
+      if owner != null targetName = this.dispatchSlot(owner, callable) end
+    end
+    if opcode == 30
+      operands = this.virtualOperands(context, operands, receiver.typeName, targetName)
+      this.addVirtualCallees(context, targetName)
+    else
+      context.function.callees.add(this.bound.dataAt(node))
+    end
+    return context.emitSymbol(opcode, irType(this.bound.typeAt(node)), operands, irSymbol(this.module.id, 3, targetName), this.location(node))
+  end
+
+  def lowerNew(context: IrFunctionContext, node: Int): IrValue
+    let className = this.bound.dataAt(node)
+    let constructor = this.findCallable(className + ".init")
+    var arguments: Int[] = []
+    var index = 0
+    while index < this.bound.childCountAt(node)
+      var expected = ""
+      if constructor != null
+        let parameter = constructor.parameterAt(index)
+        if parameter != null expected = irType(parameter.typeName) end
+      end
+      let value = this.lowerExpression(context, this.bound.childAt(node, index), expected)
+      arguments = host.appendInt(arguments, value.id)
+      index = index + 1
+    end
+    context.function.localEffects = irEffectUnion(context.function.localEffects, 44)
+    let receiver = context.emitSymbol(38, irType(this.bound.typeAt(node)), irEmptyInts(), irSymbol(this.module.id, 1, className), this.location(node))
+    if constructor != null
+      var operands: Int[] = [receiver.id]
+      for argument in arguments operands = host.appendInt(operands, argument) end
+      if arguments.Length < constructor.parameterCount
+        let adapterName = this.requestDefaultAdapter(constructor, arguments.Length, false)
+        context.emitSymbol(28, "void", operands, irSymbol(this.module.id, 4, adapterName), this.location(node))
+        context.function.callees.add(adapterName)
+      else
+        context.emitSymbol(29, "void", operands, irSymbol(this.module.id, 3, constructor.fullName), this.location(node))
+        context.function.callees.add(constructor.fullName)
+      end
+    else
+      let owner = this.semantic.findClass(className)
+      if owner != null this.lowerConstructionDefaults(context, owner, receiver.id, this.location(node)) end
+    end
+    return receiver
+  end
+
+  def lowerString(context: IrFunctionContext, node: Int): IrValue
+    let encoded = this.bound.valueAt(node)
+    let value = host.stringSlice(encoded, 2, host.stringByteLength(encoded) - 2)
+    let name = "literal.string.sha256." + sha256Text(value)
+    let symbol = irSymbol(this.module.id, 9, name)
+    if !this.hasGlobal(name)
+      this.module.addGlobal(new IrGlobal(symbol, value, irNoLocation()))
+    end
+    this.module.requireFeature("native-strings-v1")
+    this.module.requireFeature("string-data-v1")
+    return context.emit(1, "string", irEmptyInts(), irEmptyStrings(), null, 7, name, 0, false, this.location(node))
+  end
+
+  def hasGlobal(name: String): Bool
+    var current = this.module.firstGlobal
+    while current != null
+      if current.symbol.name == name return true end
+      current = current.nextGlobal
+    end
+    return false
+  end
+
+  def lowerShortCircuit(context: IrFunctionContext, node: Int, shortValue: Bool): IrValue
+    let left = this.lowerExpression(context, this.bound.childAt(node, 0), "bool")
+    var rightBlock = context.function.createBlock()
+    var shortBlock = context.function.createBlock()
+    if shortValue
+      let swap = rightBlock
+      rightBlock = shortBlock
+      shortBlock = swap
+    end
+    let merge = context.function.createBlock()
+    let result = context.function.allocateValue()
+    merge.addParameter(new IrParameter(result, "bool", this.location(node)))
+    if shortValue
+      context.conditional(left.id, shortBlock, irEmptyInts(), rightBlock, irEmptyInts(), this.location(node))
+    else
+      context.conditional(left.id, rightBlock, irEmptyInts(), shortBlock, irEmptyInts(), this.location(node))
+    end
+    context.setCurrent(rightBlock)
+    let right = this.lowerExpression(context, this.bound.childAt(node, 1), "bool")
+    let rightArguments: Int[] = [right.id]
+    context.branch(merge, rightArguments, this.location(node))
+    context.setCurrent(shortBlock)
+    let constant = context.emitConstant("bool", 1, shortValue ? "true" : "false", this.location(node))
+    let shortArguments: Int[] = [constant.id]
+    context.branch(merge, shortArguments, this.location(node))
+    context.setCurrent(merge)
+    return new IrValue(result, "bool")
+  end
+
+  def lowerTernary(context: IrFunctionContext, node: Int): IrValue
+    let condition = this.lowerExpression(context, this.bound.childAt(node, 0), "bool")
+    let baseline = context.snapshot()
+    let thenBlock = context.function.createBlock()
+    let elseBlock = context.function.createBlock()
+    let merge = context.function.createBlock()
+    let resultType = irType(this.bound.typeAt(node))
+    let result = context.function.allocateValue()
+    merge.addParameter(new IrParameter(result, resultType, this.location(node)))
+    context.conditional(condition.id, thenBlock, irEmptyInts(), elseBlock, irEmptyInts(), this.location(node))
+    context.restore(baseline)
+    context.setCurrent(thenBlock)
+    let whenTrue = this.lowerExpression(context, this.bound.childAt(node, 1), resultType)
+    let trueArguments: Int[] = [whenTrue.id]
+    context.branch(merge, trueArguments, this.location(node))
+    context.restore(baseline)
+    context.setCurrent(elseBlock)
+    let whenFalse = this.lowerExpression(context, this.bound.childAt(node, 2), resultType)
+    let falseArguments: Int[] = [whenFalse.id]
+    context.branch(merge, falseArguments, this.location(node))
+    context.restore(baseline)
+    context.setCurrent(merge)
+    return new IrValue(result, resultType)
+  end
+
+  def lowerIf(context: IrFunctionContext, node: Int): Void
+    let conditionNode = this.bound.childAt(node, 0)
+    if this.isUnsupportedOptionalPointerNullComparison(conditionNode) return end
+    let condition = this.lowerExpression(context, conditionNode, "bool")
+    let incoming = context.snapshot()
+    let mutableValues = context.sortedMutableState()
+    let thenCount = semanticIntField(this.bound.dataAt(node), 0)
+    let elseCount = semanticIntField(this.bound.dataAt(node), 1)
+    let thenBlock = context.function.createBlock()
+    let elseBlock = context.function.createBlock()
+    context.conditional(condition.id, thenBlock, irEmptyInts(), elseBlock, irEmptyInts(), this.location(node))
+    context.restore(incoming)
+    context.setCurrent(thenBlock)
+    context.enterScope()
+    var index = 0
+    while index < thenCount && !context.terminated
+      this.lowerStatement(context, this.bound.childAt(node, 1 + index))
+      index = index + 1
+    end
+    context.leaveScope()
+    let thenPath = new IrPath(context.current, context.snapshot(), context.terminated)
+    context.restore(incoming)
+    context.setCurrent(elseBlock)
+    context.enterScope()
+    index = 0
+    while index < elseCount && !context.terminated
+      this.lowerStatement(context, this.bound.childAt(node, 1 + thenCount + index))
+      index = index + 1
+    end
+    context.leaveScope()
+    let elsePath = new IrPath(context.current, context.snapshot(), context.terminated)
+    if thenPath.terminated && elsePath.terminated
+      context.terminated = true
+      return
+    end
+    if thenPath.terminated
+      context.restore(elsePath.state)
+      context.setCurrent(elsePath.block)
+      return
+    end
+    if elsePath.terminated
+      context.restore(thenPath.state)
+      context.setCurrent(thenPath.block)
+      return
+    end
+    let merge = context.function.createBlock()
+    let changed = this.changedVariables(mutableValues, thenPath.state, elsePath.state)
+    let merged = context.addParameters(merge, changed, this.location(node))
+    context.current = thenPath.block
+    context.branch(merge, this.stateArguments(thenPath.state, changed), this.location(node))
+    context.current = elsePath.block
+    context.branch(merge, this.stateArguments(elsePath.state, changed), this.location(node))
+    context.restore(incoming)
+    this.applyState(merged)
+    context.setCurrent(merge)
+  end
+
+  def isUnsupportedOptionalPointerNullComparison(node: Int): Bool
+    if this.bound.kindAt(node) != "Binary" return false end
+    if this.bound.dataAt(node) != "==" && this.bound.dataAt(node) != "!=" return false end
+    let left = this.bound.childAt(node, 0)
+    let right = this.bound.childAt(node, 1)
+    var valueNode = left
+    if this.bound.kindAt(left) == "NullLiteral" valueNode = right else if this.bound.kindAt(right) != "NullLiteral" return false end
+    let typeName = irType(this.bound.typeAt(valueNode))
+    return irIsOptional(typeName) && irIsPointer(irTypeInner(typeName))
+  end
+
+  def lowerWhile(context: IrFunctionContext, node: Int): Void
+    let incoming = context.snapshot()
+    let carried = context.sortedMutableState()
+    let header = context.function.createBlock()
+    let body = context.function.createBlock()
+    let exit = context.function.createBlock()
+    let headerValues = context.addParameters(header, carried, this.location(node))
+    let exitValues = context.addParameters(exit, carried, this.location(node))
+    context.branch(header, this.stateArguments(incoming, carried), this.location(node))
+    context.restore(incoming)
+    this.applyState(headerValues)
+    context.setCurrent(header)
+    let condition = this.lowerExpression(context, this.bound.childAt(node, 0), "bool")
+    context.conditional(condition.id, body, irEmptyInts(), exit, this.currentArguments(carried), this.location(node))
+    context.setCurrent(body)
+    context.enterScope()
+    let previousLoop = context.loop
+    context.loop = new IrLoopFrame(header, exit, carried, -1, this.location(node), context.cleanupDepth, previousLoop)
+    var index = 1
+    while index < this.bound.childCountAt(node) && !context.terminated
+      this.lowerStatement(context, this.bound.childAt(node, index))
+      index = index + 1
+    end
+    if !context.terminated context.branch(header, this.currentArguments(carried), this.location(node)) end
+    context.loop = previousLoop
+    context.leaveScope()
+    context.restore(incoming)
+    this.applyState(exitValues)
+    context.setCurrent(exit)
+  end
+
+  def lowerFor(context: IrFunctionContext, node: Int): Void
+    let collection = this.lowerExpression(context, this.bound.childAt(node, 0), "")
+    let collectionOperands: Int[] = [collection.id]
+    context.function.localEffects = irEffectUnion(context.function.localEffects, 1)
+    let length = context.emitValue(35, "int", collectionOperands, this.location(node))
+    let zero = context.emitConstant("int", 3, "0", this.location(node))
+    let incoming = context.snapshot()
+    let carried = context.sortedMutableState()
+    let header = context.function.createBlock()
+    let body = context.function.createBlock()
+    let exit = context.function.createBlock()
+    let indexValue = context.function.allocateValue()
+    header.addParameter(new IrParameter(indexValue, "int", this.location(node)))
+    let headerValues = context.addParameters(header, carried, this.location(node))
+    let exitValues = context.addParameters(exit, carried, this.location(node))
+    var initialArguments: Int[] = [zero.id]
+    for argument in this.stateArguments(incoming, carried) initialArguments = host.appendInt(initialArguments, argument) end
+    context.branch(header, initialArguments, this.location(node))
+    context.restore(incoming)
+    this.applyState(headerValues)
+    context.setCurrent(header)
+    let hasNext = context.emitCompare(indexValue, length.id, 3, this.location(node))
+    context.conditional(hasNext.id, body, irEmptyInts(), exit, this.currentArguments(carried), this.location(node))
+    context.setCurrent(body)
+    let loadOperands: Int[] = [collection.id, indexValue]
+    context.function.localEffects = irEffectUnion(context.function.localEffects, 5)
+    let element = context.emitValue(36, irType(semanticField(this.bound.dataAt(node), 1)), loadOperands, this.location(node))
+    context.enterScope()
+    context.addVariable(this.bound.symbolAt(node), 6, semanticField(this.bound.dataAt(node), 0), irType(semanticField(this.bound.dataAt(node), 1)), element.id, false)
+    let previousLoop = context.loop
+    context.loop = new IrLoopFrame(header, exit, carried, indexValue, this.location(node), context.cleanupDepth, previousLoop)
+    var child = 1
+    while child < this.bound.childCountAt(node) && !context.terminated
+      this.lowerStatement(context, this.bound.childAt(node, child))
+      child = child + 1
+    end
+    if !context.terminated this.emitLoopContinue(context, context.loop, this.location(node)) end
+    context.loop = previousLoop
+    context.leaveScope()
+    context.restore(incoming)
+    this.applyState(exitValues)
+    context.setCurrent(exit)
+  end
+
+  def lowerLoopTransfer(context: IrFunctionContext, isContinue: Bool, node: Int): Void
+    let frame = context.loop
+    if frame == null return end
+    this.emitScopeCleanups(context, frame.cleanupDepth)
+    if isContinue
+      this.emitLoopContinue(context, frame, this.location(node))
+    else
+      context.branch(frame.breakTarget, this.currentArguments(frame.carried), this.location(node))
+    end
+  end
+
+  def emitScopeCleanups(context: IrFunctionContext, fromDepth: Int): Void
+    var cleanup = context.cleanup
+    var depth = context.cleanupDepth
+    while cleanup != null && depth > fromDepth
+      if cleanup.opcode == 54
+        let borrowOperands: Int[] = [cleanup.capability, cleanup.token]
+        context.emitValue(54, "void", borrowOperands, irNoLocation())
+      else
+        let unsafeOperands: Int[] = [cleanup.capability]
+        context.emitValue(42, "void", unsafeOperands, irNoLocation())
+      end
+      cleanup = cleanup.previous
+      depth = depth - 1
+    end
+  end
+
+  def emitLoopContinue(context: IrFunctionContext, frame: IrLoopFrame?, branchLocation: IrLocation): Void
+    if frame == null return end
+    var arguments: Int[] = []
+    if frame.indexValue >= 0
+      let one = context.emitConstant("int", 3, "1", branchLocation)
+      let addOperands: Int[] = [frame.indexValue, one.id]
+      context.function.localEffects = irEffectUnion(context.function.localEffects, 4)
+      let next = context.emitValue(3, "int", addOperands, branchLocation)
+      arguments = host.appendInt(arguments, next.id)
+    end
+    for argument in this.currentArguments(frame.carried) arguments = host.appendInt(arguments, argument) end
+    context.branch(frame.continueTarget, arguments, branchLocation)
+  end
+
+  def changedVariables(candidates: IrState, first: IrState, second: IrState): IrState
+    let result = new IrState()
+    var entry = candidates.first
+    while entry != null
+      if first.valueFor(entry.variable) != second.valueFor(entry.variable)
+        result.add(entry.variable, entry.value)
+      end
+      entry = entry.nextEntry
+    end
+    return result
+  end
+
+  def stateArguments(state: IrState, variables: IrState): Int[]
+    var result: Int[] = []
+    var entry = variables.first
+    while entry != null
+      result = host.appendInt(result, state.valueFor(entry.variable))
+      entry = entry.nextEntry
+    end
+    return result
+  end
+
+  def currentArguments(variables: IrState): Int[]
+    var result: Int[] = []
+    var entry = variables.first
+    while entry != null
+      result = host.appendInt(result, entry.variable.value)
+      entry = entry.nextEntry
+    end
+    return result
+  end
+
+  def applyState(state: IrState): Void
+    var entry = state.first
+    while entry != null
+      entry.variable.value = entry.value
+      entry = entry.nextEntry
+    end
+  end
+
+  def lowerUnsafeBlock(context: IrFunctionContext, node: Int): Void
+    let capability = context.emitValue(41, "!unsafe", irEmptyInts(), this.location(node))
+    context.unsafeDepth = context.unsafeDepth + 1
+    if context.unsafeCapabilities.size < context.unsafeDepth
+      context.unsafeCapabilities.add(capability.id)
+    else
+      context.unsafeCapabilities.set(context.unsafeDepth - 1, capability.id)
+    end
+    context.function.localEffects = irEffectUnion(context.function.localEffects, 64)
+    context.pushCleanup(42, capability.id, -1)
+    var index = 0
+    while index < this.bound.childCountAt(node) && !context.terminated
+      this.lowerStatement(context, this.bound.childAt(node, index))
+      index = index + 1
+    end
+    if !context.terminated
+      var variable = context.firstVariable
+      while variable != null
+        if variable.addressedPointer >= 0 && variable.addressedDepth == context.unsafeDepth
+          let loadOperands: Int[] = [capability.id, variable.addressedPointer]
+          let value = context.emitTyped(44, variable.typeName, loadOperands, variable.typeName, this.location(node))
+          variable.value = value.id
+          variable.addressedPointer = -1
+          variable.addressedDepth = -1
+          context.function.addDebugLocal(new IrDebugLocal(variable.name, value.id, this.location(node)))
+          context.function.localEffects = irEffectUnion(context.function.localEffects, 65)
+        end
+        variable = variable.nextVariable
+      end
+      let operands: Int[] = [capability.id]
+      context.emitValue(42, "void", operands, this.location(node))
+    end
+    context.popCleanup()
+    context.unsafeDepth = context.unsafeDepth - 1
+  end
+
+  def currentUnsafe(context: IrFunctionContext): Int
+    if context.unsafeDepth == 0 return -1 end
+    return context.unsafeCapabilities.get(context.unsafeDepth - 1)
+  end
+
+  def lowerBorrowBlock(context: IrFunctionContext, node: Int): Void
+    let owner = this.lowerExpression(context, this.bound.childAt(node, 0), "")
+    let pointerType = irType(semanticField(this.bound.dataAt(node), 1))
+    let elementType = irTypeInner(pointerType)
+    let operands: Int[] = [this.currentUnsafe(context), owner.id]
+    let pair = context.emitPair(53, pointerType, "borrow|" + elementType, operands, elementType, this.location(node))
+    context.function.localEffects = irEffectUnion(context.function.localEffects, 97)
+    context.pushCleanup(54, this.currentUnsafe(context), pair.secondResultId)
+    context.enterScope()
+    context.addVariable(this.bound.symbolAt(node), 6, semanticField(this.bound.dataAt(node), 0), pointerType, pair.resultId, false)
+    var index = 1
+    while index < this.bound.childCountAt(node) && !context.terminated
+      this.lowerStatement(context, this.bound.childAt(node, index))
+      index = index + 1
+    end
+    if !context.terminated
+      let endOperands: Int[] = [this.currentUnsafe(context), pair.secondResultId]
+      context.emitValue(54, "void", endOperands, this.location(node))
+    end
+    context.popCleanup()
+    context.leaveScope()
+  end
+
+  def lowerRuntimeCall(context: IrFunctionContext, node: Int, target: String): IrValue
+    var operands: Int[] = []
+    var operandTypes = new StringBuffer()
+    var index = 0
+    while index < this.bound.childCountAt(node)
+      var value = this.lowerExpression(context, this.bound.childAt(node, index), "")
+      if (target == "ConsoleInteraction.print" || target == "ConsoleInteraction.println") && value.typeName != "string"
+        var opcode = 55
+        if value.typeName == "byte" opcode = 56 end
+        if value.typeName == "float" opcode = 57 end
+        let conversionOperands: Int[] = [value.id]
+        value = context.emitValue(opcode, "string", conversionOperands, this.location(node))
+        context.function.localEffects = irEffectUnion(context.function.localEffects, 44)
+        this.module.requireFeature("native-strings-v1")
+      end
+      operands = host.appendInt(operands, value.id)
+      operandTypes.add(value.typeName)
+      index = index + 1
+    end
+    var resultType = irType(this.bound.typeAt(node))
+    var effectiveTarget = target
+    if target == "test.assertEqual" && operands.Length == 2
+      var compare = new IrValue(-1, "bool")
+      if operandTypes.get(0) == "string"
+        let comparisonOperands: Int[] = [operands[0], operands[1]]
+        compare = context.emitValue(26, "bool", comparisonOperands, this.location(node))
+        context.function.localEffects = irEffectUnion(context.function.localEffects, 1)
+      else
+        compare = context.emitCompare(operands[0], operands[1], 1, this.location(node))
+        if irIsManaged(operandTypes.get(0)) || irIsOptional(operandTypes.get(0))
+          context.function.localEffects = irEffectUnion(context.function.localEffects, 1)
+        end
+      end
+      let assertionOperands: Int[] = [compare.id]
+      operands = assertionOperands
+      operandTypes = new StringBuffer()
+      operandTypes.add("bool")
+      resultType = "void"
+      effectiveTarget = "test.assert"
+    end
+    let contract = this.runtimeContract(effectiveTarget)
+    if contract == null return new IrValue(-1, resultType) end
+    let importName = "runtime.import." + (contract.symbolKind as String) + "." + contract.name
+    let importSymbol = irSymbol(this.module.id, 7, importName)
+    if !this.hasImport(importName)
+      let declaration = new IrImport(importSymbol, contract.resultType, 1, contract.linkName, contract.effects, irNoLocation())
+      declaration.runtimeMajor = 1
+      declaration.runtimeMinor = contract.runtimeMinor
+      declaration.runtimeFeatures = contract.runtimeFeatures
+      index = 0
+      while index < operands.Length
+        declaration.parameterTypes.add(operandTypes.get(index))
+        index = index + 1
+      end
+      this.module.addImport(declaration)
+    end
+    context.function.localEffects = irEffectUnion(context.function.localEffects, contract.effects)
+    return context.emitSymbol(31, resultType, operands, importSymbol, this.location(node))
+  end
+
+  def lowerCAbiCall(context: IrFunctionContext, node: Int, callable: SemanticCallable): IrValue
+    if !this.hasImport(callable.fullName)
+      let declaration = new IrImport(irSymbol(this.module.id, 4, callable.fullName), irType(callable.returnType), 2, callable.cAbiSymbol, 67, this.location(callable.boundNode))
+      var parameter = callable.firstParameter
+      while parameter != null
+        declaration.parameterTypes.add(irType(parameter.typeName))
+        parameter = parameter.nextParameter
+      end
+      this.module.addImport(declaration)
+    end
+    var operands: Int[] = [this.currentUnsafe(context)]
+    var index = 0
+    while index < this.bound.childCountAt(node)
+      let value = this.lowerExpression(context, this.bound.childAt(node, index), "")
+      operands = host.appendInt(operands, value.id)
+      index = index + 1
+    end
+    context.function.localEffects = irEffectUnion(context.function.localEffects, 67)
+    return context.emitSymbol(33, irType(callable.returnType), operands, irSymbol(this.module.id, 4, callable.fullName), this.location(node))
+  end
+
+  def hasImport(name: String): Bool
+    var current = this.module.firstImport
+    while current != null
+      if current.symbol.name == name return true end
+      current = current.nextImport
+    end
+    return false
+  end
+
+  def findField(name: String): SemanticField?
+    var classSymbol = this.semantic.firstClass
+    while classSymbol != null
+      var field = classSymbol.firstField
+      while field != null
+        if field.owner + "." + field.name == name return field end
+        field = field.nextField
+      end
+      classSymbol = classSymbol.nextClass
+    end
+    return null
+  end
+
+  def findCAbiCallable(symbol: String): SemanticCallable?
+    var function = this.semantic.firstFunction
+    while function != null
+      if function.cAbiSymbol == symbol return function end
+      function = function.nextCallable
+    end
+    return null
+  end
+
+  def addVirtualCallees(context: IrFunctionContext, slotName: String): Void
+    var classSymbol = this.semantic.firstClass
+    while classSymbol != null
+      var method = classSymbol.firstMethod
+      while method != null
+        if !method.isStatic && method.name != "init" && this.dispatchSlot(classSymbol, method) == slotName
+          context.function.callees.add(method.fullName)
+        end
+        method = method.nextCallable
+      end
+      classSymbol = classSymbol.nextClass
+    end
+  end
+
+  def virtualOperands(context: IrFunctionContext, operands: Int[], receiverType: String, slot: String): Int[]
+    let declaration = this.findCallable(slot)
+    if declaration == null || receiverType == "class|" + declaration.className return operands end
+    let receiver = context.emitValue(20, "class|" + declaration.className, [operands[0]], irNoLocation())
+    var adjusted: Int[] = [receiver.id]
+    var index = 1
+    while index < operands.Length
+      adjusted = host.appendInt(adjusted, operands[index])
+      index = index + 1
+    end
+    return adjusted
+  end
+
+  def requestDefaultAdapter(target: SemanticCallable, arity: Int, virtualDispatch: Bool): String
+    let name = target.fullName + "$default$arity" + (arity as String) + (virtualDispatch ? "$virtual" : "")
+    let dispatch = virtualDispatch ? 1 : 0
+    var index = 0
+    while index < this.adapterTargets.size
+      if this.adapterTargets.get(index) == target.fullName && this.adapterArities.get(index) == arity && this.adapterVirtual.get(index) == dispatch return name end
+      index = index + 1
+    end
+    this.adapterTargets.add(target.fullName)
+    this.adapterArities.add(arity)
+    this.adapterVirtual.add(dispatch)
+    return name
+  end
+
+  def lowerDefaultAdapter(target: SemanticCallable, arity: Int, virtualDispatch: Bool): Void
+    let name = target.fullName + "$default$arity" + (arity as String) + (virtualDispatch ? "$virtual" : "")
+    let function = new IrFunction(irSymbol(this.module.id, 4, name), irType(target.returnType), 5, false, this.location(target.boundNode))
+    let entry = function.createBlock()
+    let context = new IrFunctionContext(function, entry)
+    var operands: Int[] = []
+    if target.className != "" && !target.isStatic
+      let receiverType = "class|" + target.className
+      function.parameterTypes.add(receiverType)
+      let receiver = function.allocateValue()
+      entry.addParameter(new IrParameter(receiver, receiverType, this.location(target.boundNode)))
+      context.addVariable(target.fullName + "/this", 5, "this", receiverType, receiver, false)
+      operands = host.appendInt(operands, receiver)
+    end
+    var parameter = target.firstParameter
+    var index = 0
+    while parameter != null && index < arity
+      let typeName = irType(parameter.typeName)
+      function.parameterTypes.add(typeName)
+      let value = function.allocateValue()
+      entry.addParameter(new IrParameter(value, typeName, this.module.location(this.syntax.startAt(parameter.syntaxNode), this.syntax.lengthAt(parameter.syntaxNode))))
+      context.addVariable(parameter.identity, 5, parameter.name, typeName, value, false)
+      operands = host.appendInt(operands, value)
+      parameter = parameter.nextParameter
+      index = index + 1
+    end
+    while parameter != null
+      let value = this.lowerExpression(context, parameter.boundDefault, irType(parameter.typeName))
+      context.addVariable(parameter.identity, 5, parameter.name, irType(parameter.typeName), value.id, false)
+      operands = host.appendInt(operands, value.id)
+      parameter = parameter.nextParameter
+    end
+    var opcode = target.className != "" && !target.isStatic ? 29 : 28
+    var callTarget = target.fullName
+    if virtualDispatch
+      let owner = this.semantic.findClass(target.className)
+      if owner != null callTarget = this.dispatchSlot(owner, target) end
+      operands = this.virtualOperands(context, operands, "class|" + target.className, callTarget)
+      opcode = 30
+      this.addVirtualCallees(context, callTarget)
+    else
+      function.callees.add(target.fullName)
+    end
+    let symbolKind = target.className != "" ? 3 : 4
+    let result = context.emitSymbol(opcode, irType(target.returnType), operands, irSymbol(this.module.id, symbolKind, callTarget), this.location(target.boundNode))
+    context.returnValue(irType(target.returnType) == "void" ? -1 : result.id, this.location(target.boundNode))
+    this.module.addFunction(function)
+  end
+
+  def findCallable(name: String): SemanticCallable?
+    let function = this.semantic.findFunction(name)
+    if function != null return function end
+    var classSymbol = this.semantic.firstClass
+    while classSymbol != null
+      var method = classSymbol.firstMethod
+      while method != null
+        if method.fullName == name return method end
+        method = method.nextCallable
+      end
+      classSymbol = classSymbol.nextClass
+    end
+    return null
+  end
+
+  def runtimeContract(name: String): IrRuntimeContract?
+    if name == "ConsoleInteraction.print" return new IrRuntimeContract(name, "neri_rt_v1_stdout_write", "void", 6, 3, 128, 2) end
+    if name == "ConsoleInteraction.println" return new IrRuntimeContract(name, "neri_rt_v1_stdout_write_line", "void", 6, 3, 128, 2) end
+    if name == "ConsoleInteraction.read" return new IrRuntimeContract(name, "neri_rt_v1_stdin_read_line", "string", 45, 4, 192, 2) end
+    if name == "math.abs" return new IrRuntimeContract(name, "neri_rt_v1_math_abs", "int", 4, 4, 0, 6) end
+    if name == "math.max" return new IrRuntimeContract(name, "neri_rt_v1_math_max", "int", 0, 4, 0, 6) end
+    if name == "math.min" return new IrRuntimeContract(name, "neri_rt_v1_math_min", "int", 0, 4, 0, 6) end
+    if name == "math.pow" return new IrRuntimeContract(name, "neri_rt_v1_math_pow", "int", 4, 4, 0, 6) end
+    if name == "test.assert" || name == "test.assertTrue" return new IrRuntimeContract(name, name == "test.assert" ? "neri_rt_v1_test_assert" : "neri_rt_v1_test_assert_true", "void", 4, 4, 0, 6) end
+    if name == "test.assertFalse" return new IrRuntimeContract(name, "neri_rt_v1_test_assert_false", "void", 4, 4, 0, 6) end
+    if name == "test.assertEqual" return new IrRuntimeContract(name, "", "void", 4, 4, 0, 6) end
+    if host.stringByteLength(name) > 5 && host.stringSlice(name, 0, 5) == "host."
+      return this.hostContract(name, host.stringSlice(name, 5, host.stringByteLength(name) - 5))
+    end
+    return null
+  end
+
+  def hostContract(fullName: String, name: String): IrRuntimeContract
+    var result = "void"
+    var effects = 4
+    if name == "stringByteLength" || name == "argumentCount" result = "int" end
+    if name == "stringByteAt" result = "byte" end
+    if name == "stringSlice" || name == "errorMessage" result = "string" end
+    if name == "stringFromBytes" || name == "readText" || name == "pathJoin" || name == "pathAbsolute" || name == "pathFileName" || name == "argumentAt" || name == "environment" result = "optional|string" end
+    if name == "parseInt" || name == "run" result = "optional|int" end
+    if name == "parseFloat" result = "optional|float" end
+    if name == "appendByte" result = "array|byte" end
+    if name == "appendInt" result = "array|int" end
+    if name == "appendString" result = "array|string" end
+    if name == "writeText" || name == "writeBytes" || name == "removeFile" result = "bool" end
+    if name == "stringSlice" || name == "stringFromBytes" || name == "appendByte" || name == "appendInt" || name == "appendString" || name == "pathJoin" || name == "pathFileName" effects = 44 end
+    if name == "readText" || name == "pathAbsolute" || name == "argumentAt" || name == "environment" || name == "errorMessage" effects = 45 end
+    if name == "writeText" || name == "writeBytes" || name == "removeFile" effects = 6 end
+    if name == "run" effects = 7 end
+    if name == "exit" effects = 6 end
+    if name == "argumentCount" effects = 1 end
+    return new IrRuntimeContract(fullName, "neri_rt_v1_host_" + this.snakeCase(name), result, effects, 6, 2048, 6)
+  end
+
+  def snakeCase(name: String): String
+    var result = ""
+    var index = 0
+    while index < host.stringByteLength(name)
+      let byte = host.stringByteAt(name, index) as Int
+      if byte >= 65 && byte <= 90
+        let character = host.stringFromBytes([(byte + 32) as Byte])
+        if character != null
+          result = result + "_" + character
+        end
+      else
+        result = result + host.stringSlice(name, index, 1)
+      end
+      index = index + 1
+    end
+    return result
+  end
+
+  def propagateEffects(): Void
+    var changed = true
+    while changed
+      changed = false
+      var function = this.module.firstFunction
+      while function != null
+        var nextEffects = function.localEffects
+        var index = 0
+        while index < function.callees.size
+          let callee = this.findIrFunction(function.callees.get(index))
+        if callee != null
+          nextEffects = irEffectUnion(nextEffects, 32)
+          nextEffects = irEffectUnion(nextEffects, callee.effects)
+        end
+          index = index + 1
+        end
+        if nextEffects != function.effects
+          function.effects = nextEffects
+          changed = true
+        end
+        function = function.nextFunction
+      end
+    end
+  end
+
+  def findIrFunction(name: String): IrFunction?
+    var function = this.module.firstFunction
+    while function != null
+      if function.symbol.name == name return function end
+      function = function.nextFunction
+    end
+    return null
+  end
+end

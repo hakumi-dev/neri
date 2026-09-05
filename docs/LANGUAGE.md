@@ -1,0 +1,133 @@
+# Language contract
+
+Neri compiles typed source to native code. Debug and Release preserve the same
+arithmetic, null, bounds, evaluation-order, and lifetime rules.
+
+## Source and expressions
+
+Names are case-sensitive Unicode identifiers. `#` introduces a line comment.
+Newlines separate statements, blocks end with `end`, and indentation is cosmetic.
+Delimited arguments and array literals may span lines. String literals support
+`\"`, `\\`, `\0`, `\n`, `\t`, and `\r` and contain canonical UTF-8.
+
+Precedence, from strongest to weakest:
+
+| Operators | Associativity |
+|---|---|
+| Calls, member access, indexing | Left |
+| Unary `+`, `-`, `!`, `&`, `*` | Nested unary |
+| `as` | Left |
+| `*`, `/` | Left |
+| `+`, `-` | Left |
+| `==`, `!=` | Left |
+| `<`, `<=`, `>`, `>=` | Left |
+| `&&` | Left |
+| `||` | Left |
+| `condition ? yes : no` | Nested conditional |
+
+Equality binds more tightly than relational comparison. `(1 < 2) == true` is
+valid; `1 < 2 == true` and `a < b < c` produce type errors for integer operands.
+Expressions, arguments, and array elements evaluate left to right. Logical
+operators and conditional expressions evaluate only the required branch.
+
+## Values and variables
+
+| Type | Contract |
+|---|---|
+| `Int` | Signed 64-bit integer; checked addition, subtraction, multiplication and negation. |
+| `Float` | IEEE-754 binary64, including infinities, NaN and signed zero. |
+| `Byte` | Unsigned 8-bit integer. |
+| `Bool` | Boolean logic and equality. |
+| `String` | Immutable UTF-8, concatenation and ordinal value equality. |
+| `Void` | No returned value. |
+| `T[]` | Homogeneous fixed-length array, checked indexing, `Length`, and `for` iteration. |
+| `T?` | Explicit optional value. |
+| Class | Managed reference to an instance. |
+
+Integer division truncates toward zero; division by zero and minimum Int divided
+by -1 panic. Float arithmetic follows IEEE-754 without fast-math.
+Float equality considers two NaNs equal; ordered comparisons with NaN are false.
+Numeric casts are explicit: `Int`/`Float`, checked `Int` to `Byte`, and lossless `Byte` to `Int`.
+Float-to-Int truncates and panics for unrepresentable values. Numeric `as String`
+conversions are locale-independent. Arrays and objects have no equality operator.
+
+`let` and parameters are immutable bindings; `var` permits reassignment. Binding
+immutability does not freeze the fields of an object. An explicit annotation
+supplies the element type for `let values: Int[] = []`. `let values = []` fails
+because there is no element type to infer.
+
+Only `T?` accepts `null`. Proven checks such as `x != null` refine optional locals
+on the corresponding control-flow path. Access requires that refinement.
+`T?[]` and `T[]?` differ. `Void?` and repeated optional suffixes are invalid.
+
+## Functions, modules and classes
+
+Functions declare parameter and return types. Trailing default arguments,
+recursion and forward calls are supported. A program defines exactly one
+non-namespaced top-level `main(): Void` with no parameters. Non-Void functions
+return on every statically recognized path. Overloading is outside this surface.
+
+`if`, `while`, and `for` have lexical scopes. A `for` element binding is immutable.
+`break` and `continue` require an enclosing loop.
+
+All supplied source files contribute to one compilation module. `namespace`
+applies to subsequent declarations; `use` exposes a namespace throughout the
+module and does not load files. Duplicate or ambiguous declarations are errors.
+Module scope contains only namespace/use directives and function/class declarations;
+other tokens produce a parse diagnostic.
+
+Classes have single inheritance. Classes default to `internal`, fields to
+`private`, and methods to `public`. `internal` is module visibility, `private`
+is declaring-class visibility, and `protected` includes derived classes.
+Instance methods dispatch virtually; exact name and signature override a base
+method. `@override` asserts that relationship. `def static` declares a method
+without a receiver. `super.method()` dispatches directly to the base method.
+Omitted arguments use defaults from the statically resolved declaration; supplying
+those defaults preserves virtual dispatch to the receiver's implementation.
+
+Construction initializes base classes before derived classes. `init` is not
+inherited. An explicit `super(args)` starts a derived initializer when the base
+requires arguments. A valid zero-argument base call is implicit. Inherited fields
+cannot be redeclared.
+
+## Unsafe and memory boundary
+
+Raw pointer operations require `def unsafe` or an `unsafe ... end` block. `T*`
+is non-null; `T*?` requires a null check before access. Raw pointers do not retain
+managed allocations. Address-of applies to mutable unmanaged locals.
+
+`stackalloc T[count]` allocates uninitialized storage for the function lifetime.
+`native.alloc<T>` and `native.allocZeroed<T>` allocate manually owned storage.
+`native.realloc` consumes the previous allocation and preserves its common prefix;
+`native.free` releases native storage. Stack and borrowed storage cannot be freed
+or reallocated. Invalid pointer access inside unsafe code may have undefined
+behavior; safe wrappers must restore the language invariants before returning.
+
+`borrow values as pointer ... end` exposes an unmanaged array payload for a
+lexical scope. The owner remains alive and its address stable. The pointer cannot
+escape the scope or acquire ownership. `@cabi("symbol")` on an empty unsafe
+function declaration imports a C symbol with supported scalar and pointer types.
+
+The runtime [ABI and collection contract](ABI.md) defines roots and allocation
+boundaries. Bounds and arithmetic failures panic with exit status 70. Compile
+errors produce diagnostics and prevent artifact emission.
+
+## Tooling
+
+`check` validates and emits canonical NIR by default. A source file without a
+subcommand is equivalent to `run`. `build` emits an executable by default, named
+after the first source file without `.hk` in the working directory. `--output`
+overrides that path. Native emission defaults to the installed runtime manifest's
+target; `--target` explicitly selects a target. `--version` prints the compiler
+version. `run` compiles in a
+unique temporary directory, executes the result, and removes its temporary files
+on normal completion or a reported child failure. Arguments after `--` reach the
+program unchanged. Program exit codes 0..125 propagate; larger statuses map to
+125. `run` owns its output location and accepts only executable emission.
+
+The `host` library supplies checked UTF-8 byte access, parsing, atomic file writes,
+path operations, environment and argument access, and shell-free process spawning.
+Fallible operations return an optional or Bool and expose `errorMessage()`.
+`appendByte`, `appendInt`, and `appendString` allocate a new array and copy the
+input; they preserve the original array. Repeated append therefore has quadratic
+copy cost. Arrays and compiler buffer classes are distinct data structures.

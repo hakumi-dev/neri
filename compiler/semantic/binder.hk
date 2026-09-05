@@ -1,0 +1,632 @@
+use host
+
+class BootstrapBinder
+  public syntax: SyntaxArena = new SyntaxArena()
+  public model: SemanticModel = new SemanticModel()
+  public root: Int = -1
+  public currentNamespace: String = ""
+  public currentClass: SemanticClass?
+  public currentCallable: SemanticCallable?
+  public firstLocal: SemanticLocal?
+  public lastLocal: SemanticLocal?
+  public scopeDepth: Int = 0
+  public loopDepth: Int = 0
+  public unsafeDepth: Int = 0
+  public sourceLength: Int = 0
+  public sourceIds: StringBuffer = new StringBuffer()
+  public sourceStarts: IntBuffer = new IntBuffer()
+
+  def init(syntax: SyntaxArena, root: Int, sourceLength: Int): Void
+    this.syntax = syntax
+    this.root = root
+    this.sourceLength = sourceLength
+    this.addSource("main", 0)
+  end
+
+  def clearSources(): Void
+    this.sourceIds = new StringBuffer()
+    this.sourceStarts = new IntBuffer()
+  end
+
+  def addSource(id: String, start: Int): Void
+    this.sourceIds.add(id)
+    this.sourceStarts.add(start)
+  end
+
+  def sourceIdAt(position: Int): String
+    var result = "main"
+    var index = 0
+    while index < this.sourceStarts.size && position >= this.sourceStarts.get(index)
+      result = this.sourceIds.get(index)
+      index = index + 1
+    end
+    return result
+  end
+
+  def sourceStartAt(position: Int): Int
+    var result = 0
+    var index = 0
+    while index < this.sourceStarts.size && position >= this.sourceStarts.get(index)
+      result = this.sourceStarts.get(index)
+      index = index + 1
+    end
+    return result
+  end
+
+  def report(code: String, node: Int, message: String): Void
+    this.model.diagnostics.add(code, this.syntax.startAt(node), this.syntax.lengthAt(node), message)
+  end
+
+  def reportLength(code: String, node: Int, length: Int, message: String): Void
+    this.model.diagnostics.add(code, this.syntax.startAt(node), length, message)
+  end
+
+  def reportSecondary(code: String, node: Int, message: String): Void
+    this.model.diagnostics.add(code, this.syntax.secondaryStartAt(node), this.syntax.secondaryLengthAt(node), message)
+  end
+
+  def addBound(kind: String, typeName: String, data: String, syntaxNode: Int, children: Int[]): Int
+    return this.model.bound.add(kind, typeName, data, this.syntax.irStartAt(syntaxNode), this.syntax.irLengthAt(syntaxNode), children)
+  end
+
+  def addBoundValue(kind: String, typeName: String, data: String, value: String, syntaxNode: Int, children: Int[]): Int
+    let node = this.addBound(kind, typeName, data, syntaxNode, children)
+    this.model.bound.setValue(node, value)
+    return node
+  end
+
+  def addBoundSymbol(kind: String, typeName: String, data: String, symbol: String, syntaxNode: Int, children: Int[]): Int
+    let node = this.addBound(kind, typeName, data, syntaxNode, children)
+    this.model.bound.setSymbol(node, symbol)
+    return node
+  end
+
+  def bind(): SemanticModel
+    this.registerNamespaces()
+    this.registerUses()
+    this.registerClassNames()
+    this.registerClassMembers()
+    this.resolveInheritance()
+    this.validateInheritedMembers()
+    this.registerFunctions()
+    this.validateEntryPoint()
+    let bodies = new BootstrapBodyBinder(this)
+    bodies.bindClassBodies()
+    bodies.bindFunctionBodies()
+    return this.model
+  end
+
+  def useCount(): Int
+    return semanticIntField(this.syntax.dataAt(this.root), 0)
+  end
+
+  def classCount(): Int
+    return semanticIntField(this.syntax.dataAt(this.root), 1)
+  end
+
+  def functionCount(): Int
+    return semanticIntField(this.syntax.dataAt(this.root), 2)
+  end
+
+  def classNodeAt(index: Int): Int
+    return this.syntax.childAt(this.root, this.useCount() + index)
+  end
+
+  def functionNodeAt(index: Int): Int
+    return this.syntax.childAt(this.root, this.useCount() + this.classCount() + index)
+  end
+
+  def registerNamespaces(): Void
+    var index = 0
+    while index < this.classCount()
+      let node = this.classNodeAt(index)
+      this.addNamespace(semanticField(this.syntax.dataAt(node), 0))
+      index = index + 1
+    end
+    index = 0
+    while index < this.functionCount()
+      let node = this.functionNodeAt(index)
+      this.addNamespace(semanticField(this.syntax.dataAt(node), 0))
+      index = index + 1
+    end
+  end
+
+  def addNamespace(name: String): Void
+    if name == ""
+      return
+    end
+    var index = 0
+    while index < this.model.declaredNamespaces.size
+      if this.model.declaredNamespaces.get(index) == name
+        return
+      end
+      index = index + 1
+    end
+    this.model.declaredNamespaces.add(name)
+  end
+
+  def namespaceExists(name: String): Bool
+    var index = 0
+    while index < this.model.declaredNamespaces.size
+      if this.model.declaredNamespaces.get(index) == name
+        return true
+      end
+      index = index + 1
+    end
+    return false
+  end
+
+  def knownLibrary(name: String): Bool
+    return name == "host" || name == "math" || name == "test" || name == "ConsoleInteraction" || name == "Array"
+  end
+
+  def registerUses(): Void
+    var index = 0
+    while index < this.useCount()
+      let node = this.syntax.childAt(this.root, index)
+      let name = this.syntax.dataAt(node)
+      if this.knownLibrary(name) || this.namespaceExists(name)
+        if !this.model.hasUse(name)
+          this.model.usedNames.add(name)
+        end
+      else
+        this.report("NR101A", node, "Unknown import '" + name + "'. Available imports: Libraries/Classes: Array, ConsoleInteraction, host, math, test")
+      end
+      index = index + 1
+    end
+  end
+
+  def registerClassNames(): Void
+    var index = 0
+    while index < this.classCount()
+      let node = this.classNodeAt(index)
+      let data = this.syntax.dataAt(node)
+      let namespaceName = semanticField(data, 0)
+      let access = semanticField(data, 1)
+      let name = semanticField(data, 2)
+      let fullName = semanticQualifiedName(namespaceName, name)
+      if this.model.findClass(fullName) != null
+        this.report("NR156", node, "Type '" + fullName + "' is already defined.")
+      else
+        this.model.addClass(new SemanticClass(fullName, name, namespaceName, access, node))
+      end
+      index = index + 1
+    end
+  end
+
+  def classForNode(node: Int): SemanticClass?
+    var current = this.model.firstClass
+    while current != null
+      if current.syntaxNode == node
+        return current
+      end
+      current = current.nextClass
+    end
+    return null
+  end
+
+  def classBaseNode(node: Int): Int
+    if this.syntax.childCountAt(node) > 0
+      let first = this.syntax.childAt(node, 0)
+      if this.syntax.kindAt(first) == "Type"
+        return first
+      end
+    end
+    return -1
+  end
+
+  def classMemberStart(node: Int): Int
+    if this.classBaseNode(node) >= 0
+      return 1
+    end
+    return 0
+  end
+
+  def resolveTypeNode(node: Int, namespaceName: String, fieldName: String): String
+    let written = this.syntax.dataAt(node)
+    let resolved = semanticResolveType(this.model, written, namespaceName)
+    if resolved == "Unknown"
+      if fieldName == ""
+        this.report("NR109", node, "Unknown type '" + semanticField(written, 0) + "'.")
+      else
+        this.report("NR152", node, "Unknown type '" + semanticField(written, 0) + "' for field '" + fieldName + "'.")
+      end
+      return "Error"
+    else if resolved == "Ambiguous"
+      this.report("NR157", node, "Type '" + written + "' is ambiguous.")
+      return "Error"
+    end
+    if semanticEndsWith(written, "??")
+      this.report("NR168", node, "Optional suffix '?' cannot be repeated without an intervening type constructor.")
+      return "Error"
+    end
+    if semanticEndsWith(written, "Void?")
+      this.report("NR167", node, "Type 'Void' cannot be optional.")
+      return "Error"
+    end
+    return resolved
+  end
+
+  def validatePointerType(node: Int, unsafeAllowed: Bool): Void
+    let typeName = this.syntax.dataAt(node)
+    if !semanticContainsPointer(typeName)
+      return
+    end
+    if !unsafeAllowed
+      this.reportSecondary("NR190", node, "Raw pointer types can be used only inside an unsafe declaration or block.")
+    end
+    this.validatePointerElement(node)
+  end
+
+  def validatePointerElement(node: Int): Void
+    let typeName = this.syntax.dataAt(node)
+    if !semanticContainsPointer(typeName)
+      return
+    end
+    var baseName = typeName
+    while semanticIsArray(baseName) || semanticIsOptional(baseName) || semanticIsPointer(baseName)
+      baseName = semanticInnerType(baseName)
+    end
+    if baseName != "Int" && baseName != "Bool" && baseName != "Byte" && baseName != "Float" && baseName != "Void"
+      this.reportSecondary("NR191", node, "Type '" + baseName + "' cannot be the element type of a raw pointer.")
+    end
+  end
+
+  def registerClassMembers(): Void
+    var index = 0
+    while index < this.classCount()
+      let classNode = this.classNodeAt(index)
+      let classSymbol = this.classForNode(classNode)
+      if classSymbol != null
+        this.currentNamespace = classSymbol.namespaceName
+        let start = this.classMemberStart(classNode)
+        var offset = start
+        while offset < this.syntax.childCountAt(classNode)
+          let member = this.syntax.childAt(classNode, offset)
+          if this.syntax.kindAt(member) == "Field"
+            this.registerField(classSymbol, member)
+          else if this.syntax.kindAt(member) == "Method"
+            this.registerMethod(classSymbol, member)
+          end
+          offset = offset + 1
+        end
+      end
+      index = index + 1
+    end
+    this.currentNamespace = ""
+  end
+
+  def findDeclaredField(classSymbol: SemanticClass, name: String): SemanticField?
+    var field = classSymbol.firstField
+    while field != null
+      if field.name == name
+        return field
+      end
+      field = field.nextField
+    end
+    return null
+  end
+
+  def findDeclaredMethod(classSymbol: SemanticClass, name: String): SemanticCallable?
+    var method = classSymbol.firstMethod
+    while method != null
+      if method.name == name
+        return method
+      end
+      method = method.nextCallable
+    end
+    return null
+  end
+
+  def registerField(classSymbol: SemanticClass, node: Int): Void
+    let data = this.syntax.dataAt(node)
+    let access = semanticField(data, 0)
+    let name = semanticField(data, 1)
+    if this.findDeclaredField(classSymbol, name) != null
+      this.report("NR155A", node, "Field '" + name + "' is already defined in class '" + classSymbol.fullName + "'.")
+      return
+    end
+    let typeNode = this.syntax.childAt(node, 0)
+    let typeName = this.resolveTypeNode(typeNode, classSymbol.namespaceName, name)
+    this.validatePointerType(typeNode, true)
+    classSymbol.addField(new SemanticField(classSymbol.fullName, name, typeName, access, node))
+  end
+
+  def registerMethod(classSymbol: SemanticClass, node: Int): Void
+    let access = semanticField(this.syntax.dataAt(node), 0)
+    let annotationCount = semanticIntField(this.syntax.dataAt(node), 1)
+    let functionNode = this.syntax.childAt(node, annotationCount)
+    let name = semanticField(this.syntax.dataAt(functionNode), 1)
+    if this.findDeclaredMethod(classSymbol, name) != null
+      this.report("NR155", functionNode, "Method '" + name + "' is already defined in class '" + classSymbol.fullName + "'.")
+      return
+    end
+    let callable = this.createCallable(functionNode, classSymbol, access)
+    if name == "init" && callable.returnType != "Void"
+      this.report("NR154B", functionNode, "Constructor 'init' in class '" + classSymbol.name + "' must return Void.")
+    end
+    if name == "init" && callable.isStatic
+      this.report("NR179", functionNode, "Constructor 'init' cannot be static.")
+    end
+    var annotation = 0
+    var seenOverride = false
+    while annotation < annotationCount
+      let annotationNode = this.syntax.childAt(node, annotation)
+      let annotationName = this.syntax.dataAt(annotationNode)
+      if annotationName != "override"
+        this.report("NR172", annotationNode, "Unknown method annotation '@" + annotationName + "'.")
+      else if seenOverride
+        this.report("NR173", annotationNode, "Method annotation '@override' cannot be repeated.")
+      end
+      if annotationName == "override"
+        seenOverride = true
+      end
+      annotation = annotation + 1
+    end
+    callable.hasOverride = seenOverride
+    classSymbol.addMethod(callable)
+  end
+
+  def createCallable(functionNode: Int, classSymbol: SemanticClass?, access: String): SemanticCallable
+    let data = this.syntax.dataAt(functionNode)
+    var namespaceName = semanticField(data, 0)
+    let name = semanticField(data, 1)
+    let annotationCount = semanticIntField(data, 2)
+    let parameterCount = semanticIntField(data, 3)
+    let bodyCount = semanticIntField(data, 4)
+    let isStatic = semanticBoolField(data, 5)
+    let isUnsafe = semanticBoolField(data, 6)
+    var className = ""
+    var fullName = semanticQualifiedName(namespaceName, name)
+    if classSymbol != null
+      className = classSymbol.fullName
+      namespaceName = classSymbol.namespaceName
+      fullName = classSymbol.fullName + "." + name
+    end
+    let returnNode = this.syntax.childAt(functionNode, annotationCount + parameterCount)
+    let returnType = this.resolveTypeNode(returnNode, namespaceName, "")
+    this.validatePointerType(returnNode, isUnsafe)
+    this.validatePointerElement(returnNode)
+    let callable = new SemanticCallable(fullName, name, namespaceName, className, returnType, isStatic, isUnsafe, access, functionNode)
+    callable.bodyStart = annotationCount + parameterCount + 1
+    callable.bodyCount = bodyCount
+    var annotationIndex = 0
+    var sawCAbi = false
+    while annotationIndex < annotationCount
+      let annotationNode = this.syntax.childAt(functionNode, annotationIndex)
+      let annotationName = this.syntax.dataAt(annotationNode)
+      if annotationName != "cabi"
+        this.report("NR205", annotationNode, "Unknown function annotation '@" + annotationName + "'.")
+      else if sawCAbi
+        this.report("NR206", annotationNode, "Function annotation '@cabi' cannot be repeated.")
+      else
+        sawCAbi = true
+        if this.syntax.childCountAt(annotationNode) == 1
+          let rawSymbol = this.syntax.dataAt(this.syntax.childAt(annotationNode, 0))
+          if host.stringByteLength(rawSymbol) >= 2
+            callable.cAbiSymbol = host.stringSlice(rawSymbol, 1, host.stringByteLength(rawSymbol) - 2)
+          end
+        end
+        if callable.cAbiSymbol == ""
+          this.report("NR210", annotationNode, "Annotation '@cabi' requires exactly one portable C symbol string.")
+        end
+        if !isUnsafe
+          this.report("NR207", functionNode, "A '@cabi' declaration must use 'def unsafe'.")
+        end
+        if bodyCount > 0
+          this.report("NR208", functionNode, "A '@cabi' declaration describes an external symbol and must have an empty body.")
+        end
+      end
+      annotationIndex = annotationIndex + 1
+    end
+    var index = 0
+    var sawDefault = false
+    while index < parameterCount
+      let parameterNode = this.syntax.childAt(functionNode, annotationCount + index)
+      let parameterName = this.syntax.dataAt(parameterNode)
+      let parameterType = this.resolveTypeNode(this.syntax.childAt(parameterNode, 0), namespaceName, "")
+      this.validatePointerType(this.syntax.childAt(parameterNode, 0), isUnsafe)
+      this.validatePointerElement(this.syntax.childAt(parameterNode, 0))
+      let hasDefault = this.syntax.childCountAt(parameterNode) > 1
+      if !hasDefault && sawDefault
+        this.report("NR107A", parameterNode, "Parameter '" + parameterName + "' is missing a default value after a defaulted parameter.")
+      end
+      if hasDefault
+        sawDefault = true
+      end
+      if this.findParameter(callable, parameterName) != null
+        this.report("NR107", parameterNode, "Duplicate parameter '" + parameterName + "'.")
+      end
+      callable.addParameter(new SemanticParameter(fullName + "/parameter[" + (index as String) + "]", parameterName, parameterType, hasDefault, parameterNode))
+      index = index + 1
+    end
+    return callable
+  end
+
+  def findParameter(callable: SemanticCallable, name: String): SemanticParameter?
+    var parameter = callable.firstParameter
+    while parameter != null
+      if parameter.name == name
+        return parameter
+      end
+      parameter = parameter.nextParameter
+    end
+    return null
+  end
+
+  def resolveInheritance(): Void
+    var index = 0
+    while index < this.classCount()
+      let node = this.classNodeAt(index)
+      let symbol = this.classForNode(node)
+      let baseNode = this.classBaseNode(node)
+      if symbol != null && baseNode >= 0
+        let written = this.syntax.dataAt(baseNode)
+        if semanticIsBuiltin(written) || semanticIsArray(written) || semanticIsOptional(written) || semanticIsPointer(written)
+          this.report("NR159", baseNode, "Base type '" + written + "' must be a class.")
+        else
+          let resolved = semanticResolveType(this.model, written, symbol.namespaceName)
+          if resolved == "Unknown"
+            this.report("NR158", baseNode, "Base class '" + written + "' was not found.")
+          else if resolved == symbol.fullName
+            this.report("NR160", baseNode, "Class '" + symbol.name + "' cannot inherit from itself.")
+          else
+            symbol.baseName = resolved
+          end
+        end
+      end
+      index = index + 1
+    end
+    var current = this.model.firstClass
+    while current != null
+      if this.hasInheritanceCycle(current)
+        this.report("NR161", current.syntaxNode, "Inheritance cycle detected for class '" + current.name + "'.")
+        current.baseName = ""
+      end
+      current = current.nextClass
+    end
+  end
+
+  def hasInheritanceCycle(classSymbol: SemanticClass): Bool
+    var current = this.model.findClass(classSymbol.baseName)
+    var steps = 0
+    while current != null && steps < 256
+      if current.fullName == classSymbol.fullName
+        return true
+      end
+      current = this.model.findClass(current.baseName)
+      steps = steps + 1
+    end
+    return false
+  end
+
+  def findBaseField(classSymbol: SemanticClass, name: String): SemanticField?
+    var current = this.model.findClass(classSymbol.baseName)
+    var steps = 0
+    while current != null && steps < 256
+      let field = this.findDeclaredField(current, name)
+      if field != null
+        return field
+      end
+      current = this.model.findClass(current.baseName)
+      steps = steps + 1
+    end
+    return null
+  end
+
+  def findBaseMethod(classSymbol: SemanticClass, name: String): SemanticCallable?
+    var current = this.model.findClass(classSymbol.baseName)
+    var steps = 0
+    while current != null && steps < 256
+      let method = this.findDeclaredMethod(current, name)
+      if method != null && method.name != "init" && method.access != "private"
+        return method
+      end
+      current = this.model.findClass(current.baseName)
+      steps = steps + 1
+    end
+    return null
+  end
+
+  def compatibleMethods(left: SemanticCallable, right: SemanticCallable): Bool
+    if left.access != right.access || left.isUnsafe != right.isUnsafe || left.returnType != right.returnType || left.parameterCount != right.parameterCount
+      return false
+    end
+    var index = 0
+    while index < left.parameterCount
+      let leftParameter = left.parameterAt(index)
+      let rightParameter = right.parameterAt(index)
+      if leftParameter == null || rightParameter == null || leftParameter.typeName != rightParameter.typeName
+        return false
+      end
+      index = index + 1
+    end
+    return true
+  end
+
+  def validateInheritedMembers(): Void
+    var classSymbol = this.model.firstClass
+    while classSymbol != null
+      var field = classSymbol.firstField
+      while field != null
+        let inherited = this.findBaseField(classSymbol, field.name)
+        if inherited != null
+          this.report("NR178", field.syntaxNode, "Field '" + field.name + "' cannot redeclare the inherited field from '" + inherited.owner + "'.")
+        end
+        field = field.nextField
+      end
+      var method = classSymbol.firstMethod
+      while method != null
+        if method.name == "init"
+          if method.hasOverride
+            this.report("NR176", method.syntaxNode, "Constructor 'init' cannot be marked '@override'.")
+          end
+        else if method.isStatic && method.hasOverride
+          this.report("NR175", method.syntaxNode, "Static method '" + method.name + "' cannot override or be overridden.")
+        else
+          let inherited = this.findBaseMethod(classSymbol, method.name)
+          if inherited == null
+            if method.hasOverride
+              this.report("NR174", method.syntaxNode, "Method '" + method.name + "' is marked '@override', but no compatible base method exists.")
+            end
+          else if method.isStatic || inherited.isStatic
+            this.report("NR175", method.syntaxNode, "Static method '" + method.name + "' cannot override or be overridden.")
+          else if !this.compatibleMethods(method, inherited)
+            this.report("NR177", method.syntaxNode, "Method '" + method.name + "' conflicts with an inherited method and must use the exact same signature and visibility.")
+          end
+        end
+        method = method.nextCallable
+      end
+      classSymbol = classSymbol.nextClass
+    end
+  end
+
+  def registerFunctions(): Void
+    var index = 0
+    while index < this.functionCount()
+      let node = this.functionNodeAt(index)
+      let data = this.syntax.dataAt(node)
+      let namespaceName = semanticField(data, 0)
+      let name = semanticField(data, 1)
+      let fullName = semanticQualifiedName(namespaceName, name)
+      if this.model.findFunction(fullName) != null
+        this.report("NR105", node, "Function '" + name + "' is already defined.")
+      else
+        let callable = this.createCallable(node, null, "internal")
+        if callable.isStatic
+          this.report("NR170", node, "Modifier 'static' is valid only on methods declared inside a class.")
+        end
+        this.model.addFunction(callable)
+      end
+      index = index + 1
+    end
+  end
+
+  def validateEntryPoint(): Void
+    var mainCount = 0
+    var current = this.model.firstFunction
+    while current != null
+      if current.name == "main"
+        if current.namespaceName != ""
+          this.report("NR165", current.syntaxNode, "Function 'main' cannot belong to namespace '" + current.namespaceName + "'.")
+        else
+          mainCount = mainCount + 1
+          if mainCount > 1
+            this.report("NR164", current.syntaxNode, "Program cannot define more than one top-level 'main' entry point.")
+          end
+          if current.parameterCount > 0
+            this.report("NR166", current.syntaxNode, "Function 'main' must not declare parameters.")
+          end
+          if current.returnType != "Void"
+            let returnNode = this.syntax.childAt(current.syntaxNode, semanticIntField(this.syntax.dataAt(current.syntaxNode), 2) + current.parameterCount)
+            this.report("NR106", returnNode, "Function 'main' must return Void, not '" + current.returnType + "'.")
+          end
+        end
+      end
+      current = current.nextCallable
+    end
+    if mainCount == 0
+      this.model.diagnostics.add("NR163", this.sourceLength, 1, "Program must define exactly one top-level 'main(): Void' entry point with no parameters.")
+    end
+  end
+end
