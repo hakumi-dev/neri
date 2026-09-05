@@ -40,6 +40,19 @@ compiler reproducibility across build locations.
 
 ## Installation
 
+`brew install hakumi-dev/tap/neri` installs the versioned distribution through the
+[Neri Homebrew tap](https://github.com/hakumi-dev/homebrew-tap). The formula pins
+the release asset and SHA-256, declares LLVM and zstd dependencies, and preserves
+the verified package under its `libexec` directory in the Homebrew Cellar.
+Its `bin/neri` wrapper selects the declared LLVM installation. Homebrew manages
+updates and removal; this path does not invoke the standalone installer.
+
+Homebrew release artifacts come from a passing package CI run. The formula's
+minimum macOS version matches the distributed binaries; the current package
+supports Apple silicon on macOS 15 or newer with LLVM 22.1.8.
+
+### Standalone installer
+
 `install.sh [--prefix <directory>]` installs under `~/.neri` by default.
 `scripts/build.sh install [--prefix <directory>]` builds and verifies a package,
 then invokes the same installer. Installation policy lives in `tooling/install.hk`;

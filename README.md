@@ -16,8 +16,20 @@ executable with `neri build main.hk`.
 
 ### 1. Install Neri
 
-The current distribution supports macOS ARM64. Install LLVM 22.1.8 with
-`brew install llvm@22`, extract a verified Neri package, and run its `install.sh`:
+The current Homebrew distribution supports macOS 15 or newer on Apple silicon:
+
+```sh
+brew install hakumi-dev/tap/neri
+neri --version
+```
+
+Homebrew installs LLVM and zstd and manages the `neri` command. The Xcode Command
+Line Tools are required. See the [Homebrew tap](https://github.com/hakumi-dev/homebrew-tap)
+for package requirements and updates.
+
+For a standalone installation, install LLVM 22.1.8 with `brew install llvm@22`,
+download and extract an [installable release](https://github.com/hakumi-dev/neri/releases/tag/v0.1.0-dev),
+and run its `install.sh`:
 
 ```bash
 ./install.sh
