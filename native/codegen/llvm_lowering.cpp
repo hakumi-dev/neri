@@ -2177,6 +2177,10 @@ private:
       minimum_minor = std::max(minimum_minor, native_class_runtime_minor);
     }
     for (const auto &import : input_.imports) {
+      if (import.link_name.starts_with("neri_rt_v1_net_")) {
+        minimum_minor = std::max(minimum_minor, uint16_t{7});
+        required_features |= NERI_RT_FEATURE_SOCKETS;
+      }
       if (import.kind == NERI_IR_IMPORT_RUNTIME_V1 &&
           import.minimum_runtime.has_value()) {
         minimum_minor =

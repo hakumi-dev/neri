@@ -21,7 +21,7 @@ extern "C" {
 #endif
 
 #define NERI_RUNTIME_ABI_MAJOR UINT16_C(1)
-#define NERI_RUNTIME_ABI_MINOR UINT16_C(6)
+#define NERI_RUNTIME_ABI_MINOR UINT16_C(7)
 
 #define NERI_RT_FEATURE_PRECISE_GC UINT64_C(1)
 #define NERI_RT_FEATURE_NONMOVING_GC (UINT64_C(1) << 1)
@@ -36,6 +36,7 @@ extern "C" {
 #define NERI_RT_FEATURE_EXTENDED_SCALARS (UINT64_C(1) << 9)
 #define NERI_RT_FEATURE_MULTIPLE_MUTATORS (UINT64_C(1) << 10)
 #define NERI_RT_FEATURE_BOOTSTRAP_HOST (UINT64_C(1) << 11)
+#define NERI_RT_FEATURE_SOCKETS (UINT64_C(1) << 12)
 
 #define NERI_TYPE_KIND_CLASS_V1 UINT32_C(1)
 #define NERI_TYPE_KIND_STRING_V1 UINT32_C(2)
@@ -282,6 +283,25 @@ NERI_RT_API void neri_rt_v1_host_run(neri_optional_int_v1 *result,
 NERI_RT_API NERI_RT_NORETURN void
 neri_rt_v1_host_exit(neri_int_v1 status);
 NERI_RT_API neri_ref_v1 neri_rt_v1_host_error_message(void);
+
+/* Unsafe socket primitives: caller owns descriptors and pointer ranges.
+ * I/O returns -2 for retryable interruption/would-block, -1 for failure.
+ * Read zero is EOF, poll zero is timeout. Close is called once, never retried.
+ * net_error must be called immediately after failure, before another OS call.
+ * configure enables nonblocking I/O, close-on-exec and SIGPIPE suppression.
+ */
+NERI_RT_API neri_int_v1 neri_rt_v1_net_open(void);
+NERI_RT_API neri_int_v1 neri_rt_v1_net_configure(neri_int_v1 fd);
+NERI_RT_API neri_int_v1 neri_rt_v1_net_bind(neri_int_v1 fd, neri_int_v1 port);
+NERI_RT_API neri_int_v1 neri_rt_v1_net_listen(neri_int_v1 fd);
+NERI_RT_API neri_int_v1 neri_rt_v1_net_connect(neri_int_v1 fd, neri_int_v1 port);
+NERI_RT_API neri_int_v1 neri_rt_v1_net_accept(neri_int_v1 fd);
+NERI_RT_API neri_int_v1 neri_rt_v1_net_poll(neri_int_v1 fd, neri_int_v1 writing, neri_int_v1 milliseconds);
+NERI_RT_API neri_int_v1 neri_rt_v1_net_read(neri_int_v1 fd, uint8_t *bytes, neri_int_v1 length);
+NERI_RT_API neri_int_v1 neri_rt_v1_net_write(neri_int_v1 fd, uint8_t *bytes, neri_int_v1 length);
+NERI_RT_API void neri_rt_v1_net_close(neri_int_v1 fd);
+NERI_RT_API neri_int_v1 neri_rt_v1_net_milliseconds(void);
+NERI_RT_API neri_int_v1 neri_rt_v1_net_error(uint8_t *bytes, neri_int_v1 capacity);
 
 NERI_RT_API neri_int_v1 neri_rt_v1_math_abs(neri_int_v1 value);
 NERI_RT_API neri_int_v1 neri_rt_v1_math_max(neri_int_v1 left,

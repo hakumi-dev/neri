@@ -35,6 +35,11 @@ library; rejection fixtures require a nonzero compiler status and diagnostic.
 `callbacks.hk` covers contextual and named callbacks, indirect storage, nested
 captures and invocation after explicit collection. `callback-errors.hk` protects
 signature checking, complete returns and the mutable/raw-pointer capture boundary.
+`postfix-if.hk` checks conditional actions, optional refinement and loop control;
+its negative fixture checks unsupported modifier forms and inline block rejection.
+HTTP process cases use a Neri client against both a run-mode example and a built
+executable. They require an available loopback port 8080. The small C supervisor
+starts both processes and bounds their lifetime; protocol assertions live in Neri.
 The process helper provides EOF on stdin and enforces a deadline on the process
 group. It records stdout, stderr and exit status separately under `build/work.*`.
 Each language case has a distinct `case-N` prefix and a `.source` sidecar identifying

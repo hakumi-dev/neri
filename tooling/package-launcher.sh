@@ -27,4 +27,5 @@ fi
 exec env "NERI_CODEGEN=$PACKAGE_ROOT/bin/neri-codegen" \
   "NERI_RUNTIME_MANIFEST=$PACKAGE_ROOT/lib/neri-runtime.json" \
   "NERI_LINKER=$LLVM_PREFIX/bin/clang++" \
+  "NERI_STDLIB=$PACKAGE_ROOT/stdlib" \
   "$PACKAGE_ROOT/libexec/neri" "$@"

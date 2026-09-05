@@ -8,6 +8,7 @@ packages include the language reference for the packaged compiler.
 - [Install and run a program](../README.md#install).
 - [Work through the examples](../examples/README.md).
 - [Look up syntax, types and commands](LANGUAGE.md).
+- [Serve HTTP requests](HTTP.md).
 - [Install a standalone toolchain](PACKAGING.md#standalone-installer).
 
 ## Develop Neri

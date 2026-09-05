@@ -1,0 +1,203 @@
+use http
+use host
+use test
+use ConsoleInteraction
+
+@cabi("neri_rt_v1_net_connect")
+def unsafe connectLocal(fd: Int, port: Int): Int
+end
+
+def connect(): Int
+  unsafe
+    let deadline = http.netMilliseconds() + 5000
+    while http.netMilliseconds() < deadline
+      let fd = http.netOpen()
+      if fd >= 0
+        if connectLocal(fd, 8080) == 0
+          if http.netConfigure(fd) == 0
+            return fd
+          end
+        end
+        http.netClose(fd)
+      end
+    end
+  end
+  test.assertTrue(false)
+  return -1
+end
+
+def exchange(request: String, fragmented: Bool = false): String
+  let fd = connect()
+  var result = ""
+  unsafe
+    let bytes = stackalloc Byte[4096]
+    let deadline = http.netMilliseconds() + 5000
+    var written = true
+    if fragmented
+      var offset = 0
+      while offset < host.stringByteLength(request)
+        var count = host.stringByteLength(request) - offset
+        count = 3 if count > 3
+        written = http.writeText(fd, host.stringSlice(request, offset, count)) && written
+        offset = offset + count
+        http.netPoll(fd, 0, 5) if offset < host.stringByteLength(request)
+      end
+    else
+      written = http.writeText(fd, request)
+    end
+    if !written
+      http.netClose(fd)
+      test.assertTrue(false)
+      return ""
+    end
+    var done = false
+    while !done
+      if http.waitSocket(fd, 0, deadline) <= 0
+        http.netClose(fd)
+        test.assertTrue(false)
+        return ""
+      end
+      let count = http.netRead(fd, bytes, 4096)
+      if count == 0
+        done = true
+      else if count == -1
+        http.netClose(fd)
+        test.assertTrue(false)
+        return ""
+      else if count > 0
+        var index = 0
+        while index < count
+          let character = host.stringFromBytes([bytes[index]])
+          result = result + character if character != null
+          index = index + 1
+        end
+      end
+    end
+    http.netClose(fd)
+  end
+  return result
+end
+
+def expect(request: String, status: Int): Void
+  let result = exchange(request)
+  test.assertTrue(http.find(result, "HTTP/1.1 " + (status as String) + " ", 0) == 0)
+  test.assertTrue(http.find(result, "\r\nConnection: close\r\n", 0) > 0)
+end
+
+def largeResponse(): Void
+  let fd = connect()
+  var header = ""
+  var bodyBytes = 0
+  var bodyValid = true
+  var readingHeader = true
+  unsafe
+    let bytes = stackalloc Byte[4096]
+    let deadline = http.netMilliseconds() + 10000
+    test.assertTrue(http.writeText(fd, "GET /large HTTP/1.1\r\nHost: a\r\n\r\n"))
+    var done = false
+    while !done
+      test.assertTrue(http.waitSocket(fd, 0, deadline) > 0)
+      let count = http.netRead(fd, bytes, 4096)
+      test.assertTrue(count != -1)
+      done = true if count == 0
+      var index = 0
+      while index < count
+        if readingHeader
+          let character = host.stringFromBytes([bytes[index]])
+          header = header + character if character != null
+          test.assertTrue(host.stringByteLength(header) < 1024)
+          readingHeader = http.find(header, "\r\n\r\n", 0) < 0
+        else
+          bodyValid = bodyValid && (bytes[index] as Int) == 120
+          bodyBytes = bodyBytes + 1
+        end
+        index = index + 1
+      end
+    end
+    http.netClose(fd)
+  end
+  test.assertEqual(bodyBytes, 1048576)
+  test.assertTrue(bodyValid)
+  test.assertTrue(http.find(header, "Content-Length: 1048576\r\n", 0) > 0)
+end
+
+def disconnectResponse(): Void
+  let fd = connect()
+  unsafe
+    let byte = stackalloc Byte[1]
+    test.assertTrue(http.writeText(fd, "GET /large HTTP/1.1\r\nHost: a\r\n\r\n"))
+    test.assertTrue(http.waitSocket(fd, 0, http.netMilliseconds() + 5000) > 0)
+    test.assertEqual(http.netRead(fd, byte, 1), 1)
+    http.netClose(fd)
+  end
+end
+
+def main(): Void
+  let valid = "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n"
+  let response = exchange(valid)
+  test.assertTrue(http.find(response, "Content-Type: text/plain; charset=utf-8\r\n", 0) > 0)
+  test.assertTrue(http.find(response, "Content-Length: 13\r\n", 0) > 0)
+  test.assertTrue(http.find(response, "\r\n\r\nHello, world!", 0) > 0)
+  let fragmented = exchange(valid, true)
+  test.assertEqual(fragmented, response)
+  let occupied = http.serve("127.0.0.1:8080", fn(request)
+    return http.text(200, "unused")
+  end)
+  test.assertTrue(http.find(occupied, "Address already in use", 0) >= 0)
+  let fixture = host.environment("NERI_HTTP_FIXTURE") != null
+  if !fixture
+    ConsoleInteraction.println("HTTP example contracts passed")
+    return
+  end
+  var descriptors = ""
+  if fixture
+    descriptors = exchange("GET /fds HTTP/1.1\r\nHost: a\r\n\r\n")
+    let encoded = exchange("GET /a%2Fb?q=%E2%82%AC HTTP/1.1\r\nHost: a\r\n\r\n", true)
+    test.assertTrue(http.find(encoded, "\r\n\r\nGET /a%2Fb?q=%E2%82%AC", 0) > 0)
+    expect("GET /invalid HTTP/1.1\r\nHost: a\r\n\r\n", 500)
+    let empty = exchange("GET /empty HTTP/1.1\r\nHost: a\r\n\r\n")
+    test.assertTrue(http.find(empty, "Content-Length", 0) < 0)
+    test.assertTrue(http.find(empty, "discarded", 0) < 0)
+  end
+  for malformed in [
+    "GET / HTTP/1.1\r\n\r\n",
+    "GET / HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n",
+    "GET / HTTP/1.1\r\nHost : a\r\n\r\n",
+    "GET /%xx HTTP/1.1\r\nHost: a\r\n\r\n",
+    "GET / HTTP/1.1\r\nHost: a\r\nContent-Length: 1\r\n\r\nx",
+    "GET / HTTP/1.1\r\nHost: a\r\nContent-Length: 0\r\nContent-Length: 0\r\n\r\n",
+    "GET / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n"]
+    expect(malformed, 400)
+    expect(valid, 200)
+  end
+  expect("POST / HTTP/1.1\r\nHost: a\r\n\r\n", 405)
+  expect("GET / HTTP/1.0\r\nHost: a\r\n\r\n", 505)
+  expect("GET / HTTP/1.1\r\nHost: a\r\nExpect: 100-continue\r\n\r\n", 417)
+  expect("GET / HTTP/1.1\r\nHost:", 408)
+  var oversized = "x"
+  while host.stringByteLength(oversized) < 8192
+    oversized = oversized + oversized
+  end
+  expect(oversized, 431)
+  var index = 0
+  while index < 100
+    let fd = connect()
+    http.writeText(fd, "GET / HTTP/1.1\r\n")
+    unsafe
+      http.netClose(fd)
+    end
+    expect(valid, 200)
+    index = index + 1
+  end
+  if fixture
+    largeResponse()
+    index = 0
+    while index < 20
+      disconnectResponse()
+      expect(valid, 200)
+      index = index + 1
+    end
+    test.assertEqual(exchange("GET /fds HTTP/1.1\r\nHost: a\r\n\r\n"), descriptors)
+  end
+  ConsoleInteraction.println("HTTP protocol contracts passed")
+end

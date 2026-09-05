@@ -107,6 +107,7 @@ add_library(neri_runtime STATIC
   native/runtime/entry.cpp
   native/runtime/math.cpp
   native/runtime/runtime.cpp
+  native/runtime/socket.c
   native/runtime/test_support.cpp
 )
 set_target_properties(neri_runtime PROPERTIES OUTPUT_NAME "neri-runtime")
@@ -124,6 +125,10 @@ add_executable(neri_host native/tools/host.cpp)
 set_target_properties(neri_host PROPERTIES OUTPUT_NAME neri-host)
 target_link_libraries(neri_host PRIVATE neri_build_options)
 if(BUILD_TESTING)
+  add_executable(neri_http_process tests/native/http_process.c)
+  set_target_properties(neri_http_process PROPERTIES OUTPUT_NAME neri-http-process)
+  target_link_libraries(neri_http_process PRIVATE neri_build_options)
+
   add_executable(neri_abi_probe tests/native/abi_probe.c)
   target_link_libraries(neri_abi_probe PRIVATE neri_build_options neri_runtime)
   add_test(NAME native_abi COMMAND neri_abi_probe)
@@ -146,7 +151,7 @@ endif()
 
 file(GENERATE
   OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/neri-runtime-${NERI_TARGET}.json"
-  CONTENT "{\n  \"schemaVersion\": 2,\n  \"toolchainVersion\": \"${NERI_VERSION}\",\n  \"irTransportMajor\": 1,\n  \"irTransportMinor\": 1,\n  \"target\": \"${NERI_TARGET}\",\n  \"abiMajor\": 1,\n  \"abiMinor\": 6,\n  \"features\": 2303,\n  \"artifact\": \"$<TARGET_FILE_NAME:neri_runtime>\"\n}\n"
+  CONTENT "{\n  \"schemaVersion\": 2,\n  \"toolchainVersion\": \"${NERI_VERSION}\",\n  \"irTransportMajor\": 1,\n  \"irTransportMinor\": 1,\n  \"target\": \"${NERI_TARGET}\",\n  \"abiMajor\": 1,\n  \"abiMinor\": 7,\n  \"features\": 6399,\n  \"artifact\": \"$<TARGET_FILE_NAME:neri_runtime>\"\n}\n"
 )
 
 install(TARGETS neri_codegen_cli neri_runtime RUNTIME DESTINATION bin ARCHIVE DESTINATION lib)

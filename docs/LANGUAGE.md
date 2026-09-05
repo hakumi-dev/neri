@@ -70,9 +70,17 @@ return on every statically recognized path. Overloading is outside this surface.
 `if`, `while`, and `for` have lexical scopes. A `for` element binding is immutable.
 `break` and `continue` require an enclosing loop.
 
+A single-line assignment, call, `return`, `break`, or `continue` may use a
+postfix condition: `result = result + value if value != null`. The condition
+is checked before the action and refines optional types inside that action.
+Postfix conditions have no `else`, `end`, or chained modifier. Declarations and
+multiline actions use a block instead. Block `if` bodies begin on the next line;
+`else` and `end` begin separate lines. `else if` chains remain supported.
+
 All supplied source files contribute to one compilation module. `namespace`
 applies to subsequent declarations; `use` exposes a namespace throughout the
-module and does not load files. Duplicate or ambiguous declarations are errors.
+module. `use http` additionally loads the toolchain's bundled HTTP library;
+other namespaces do not load files. Duplicate or ambiguous declarations are errors.
 Module scope contains only namespace/use directives and function/class declarations;
 other tokens produce a parse diagnostic.
 

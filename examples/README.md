@@ -29,6 +29,10 @@ neri build examples/arguments.hk --release
 # Hello, Ada!
 ```
 
+Run `neri examples/http.hk` to serve `Hello, world!` at
+`http://127.0.0.1:8080/`. The [HTTP guide](../docs/HTTP.md) describes the typed
+handler, request fields, and protocol limits.
+
 From a source checkout, `scripts/neri.sh` can replace `neri` after
 `scripts/build.sh test`. See the [language reference](../docs/LANGUAGE.md) for the
 current syntax, types, and tooling contracts.
