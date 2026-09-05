@@ -74,7 +74,9 @@ The [language reference](docs/LANGUAGE.md) describes the current syntax and cont
 
 ## Build and install from source
 
-The trusted `macos-arm64` seed is published with this repository. The launcher verifies the seed and compiles the Neri build driver. The driver builds the current native components, compiles the compiler twice with them, and requires both generations to be identical.
+Building Neri from source starts with a verified, prebuilt compiler. The newly
+built compiler then rebuilds itself, and both resulting executables must match
+byte for byte. See the [bootstrap contract](docs/BOOTSTRAP.md) for details.
 
 Requirements:
 
