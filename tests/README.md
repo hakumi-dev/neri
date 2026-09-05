@@ -1,4 +1,4 @@
-# Executable contracts
+# Testing Neri
 
 `scripts/build.sh test` builds the current native codegen/runtime, reaches the
 compiler fixed point with those artifacts, runs native ABI/IR tests and executes

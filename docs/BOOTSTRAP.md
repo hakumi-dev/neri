@@ -1,4 +1,4 @@
-# Bootstrap contract
+# Bootstrapping Neri
 
 ## Trust root
 

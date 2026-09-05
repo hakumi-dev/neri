@@ -1,4 +1,4 @@
-# Package contract
+# Toolchain packages
 
 `scripts/build.sh package` produces a Release toolchain archive for the bootstrap
 host. The command builds the current native components, reaches the compiler
@@ -52,6 +52,19 @@ minimum macOS version matches the distributed binaries; the current package
 supports Apple silicon on macOS 15 or newer with LLVM 22.1.8.
 
 ### Standalone installer
+
+Install LLVM 22.1.8 and zstd, download an
+[installable release](https://github.com/hakumi-dev/neri/releases/tag/v0.1.0-dev),
+and extract its archive. On macOS, the Xcode Command Line Tools provide the SDK.
+From the extracted directory:
+
+```sh
+./install.sh
+export PATH="$HOME/.neri/bin:$PATH"
+neri --version
+```
+
+Add the PATH setting to your shell configuration to keep it across sessions.
 
 `install.sh [--prefix <directory>]` installs under `~/.neri` by default.
 `scripts/build.sh install [--prefix <directory>]` builds and verifies a package,

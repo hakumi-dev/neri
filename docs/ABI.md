@@ -44,8 +44,7 @@ payloads; metadata and native storage are separate. Managed and native allocatio
 Trace callbacks run inside collection and must not allocate managed objects or
 reenter collection. Root/borrow bookkeeping and descriptor access allocate no
 storage. Slot tracing performs no managed allocation; the collector's mark
-worklist can grow through the native allocator. These distinct boundaries apply
-to a future runtime implementation as well.
+worklist can grow through the native allocator.
 Runtime contract failures panic; no exception unwinds into Neri code.
 
 ## IR transport

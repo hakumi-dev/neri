@@ -1,4 +1,4 @@
-# Language contract
+# Language reference
 
 Neri compiles typed source to native code. Debug and Release preserve the same
 arithmetic, null, bounds, evaluation-order, and lifetime rules.

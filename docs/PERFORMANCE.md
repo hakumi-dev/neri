@@ -20,11 +20,11 @@ for this live-set shape, not an application-wide heap limit.
 
 A local macOS ARM64 Release observation with LLVM 22.1.8 on 2026-09-05 measured:
 
-| Metric | Allocation-failure-only collection | Growth-triggered collection |
-|---|---:|---:|
-| Peak managed bytes | 67,190,800 | 4,129,776 |
-| Automatic collections | 0 | 16 |
-| Peak RSS bytes | 69,042,176 | 5,652,480 |
+| Metric | Measurement |
+|---|---:|
+| Peak managed bytes | 4,129,776 |
+| Automatic collections | 16 |
+| Peak RSS bytes | 5,652,480 |
 
 These are individual process observations, not a cross-machine performance claim.
 Timing and RSS remain reported measurements rather than pass/fail thresholds.

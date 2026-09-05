@@ -24,7 +24,9 @@ property does not propagate to callers or other implementations of its slot.
 
 `native/codegen/` is a narrow C++ LLVM consumer. It accepts only verified Neri IR and emits LLVM IR, assembly, or native objects.
 
-`native/runtime/` implements the versioned Neri runtime ABI. Generated programs link to its static archive.
+`native/runtime/` implements the runtime and precise tracing garbage collector in
+C++. Generated programs link to its static archive through the versioned
+[runtime ABI](ABI.md).
 
 Language syntax, binding, type rules, diagnostics, and Neri IR lowering are owned by `compiler/`.
 
