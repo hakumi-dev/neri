@@ -90,6 +90,50 @@ inherited. An explicit `super(args)` starts a derived initializer when the base
 requires arguments. A valid zero-argument base call is implicit. Inherited fields
 cannot be redeclared.
 
+## Function values and closures
+
+`fn(Int): String` is a function type. Function types are invariant: parameter
+and return types must match exactly. Values can be passed, returned, stored in
+fields and arrays, and invoked with ordinary call syntax. Named safe top-level
+functions are values; their default arguments apply to direct calls, while calls
+through a function value supply the full signature.
+
+```text
+def apply(value: Int, operation: fn(Int): Int): Int
+  return operation(value)
+end
+
+def offsetBy(offset: Int): fn(Int): Int
+  return fn(value)
+    return value + offset
+  end
+end
+```
+
+`fn(parameters) ... end` creates a closure. An expected function type supplies
+omitted parameter and return annotations in arguments, returns, annotated
+initializers, assignments and typed array elements. Explicit annotations must
+match that contract. Without an expected type, annotate every parameter and the
+return type, such as `fn(value: Int): Int ... end`. Every non-Void callback must
+return on all statically recognized paths, just like a named function.
+
+Parentheses apply a suffix to the whole function type: `(fn(Int): Int)?` is an
+optional callback, `(fn(Int): Int)[]` is an array of callbacks, and `fn(Int): Int?`
+is a callback returning an optional integer. Optional callbacks require a null
+check before invocation.
+
+Closures capture referenced `let` bindings, parameters and lexical `this` by
+value. Captured managed objects, strings, arrays and other closures remain alive
+as long as the closure needs them, including after the enclosing function returns.
+Captured object references retain their ordinary field mutability and lexical
+member access. Optional captured bindings can be refined by null checks.
+
+Capturing a `var` binding or raw pointer is a compile error. A local immutable
+snapshot can be captured instead of a `var`; a raw pointer is never a managed
+capture. Callback signatures contain safe value types, and an unsafe enclosing
+block does not grant unsafe access inside a callback. Unsafe and C ABI functions
+require an explicitly written callback wrapper with its own unsafe block.
+
 ## Unsafe and memory boundary
 
 Raw pointer operations require `def unsafe` or an `unsafe ... end` block. `T*`

@@ -1,6 +1,10 @@
 use host
 
 class BootstrapBodyBinder
+  public enclosing: BootstrapBodyBinder?
+  public closureClass: SemanticClass?
+  public captureNames: StringBuffer = new StringBuffer()
+  public captureValues: IntBuffer = new IntBuffer()
   public owner: BootstrapBinder = new BootstrapBinder(new SyntaxArena(), 0, 0)
   public firstLocal: SemanticLocal?
   public lastLocal: SemanticLocal?
@@ -146,6 +150,18 @@ class BootstrapBodyBinder
         baseType = local.typeName
       end
     end
+    if baseType == ""
+      let closure = this.closureClass
+      if closure != null
+        var field = closure.firstField
+        var capture = 0
+        while field != null
+          if this.captureNames.get(capture) == name baseType = field.typeName end
+          capture = capture + 1
+          field = field.nextField
+        end
+      end
+    end
     var index = this.flowNames.size - 1
     while index >= 0
       if this.flowActive.get(index) == 1 && this.flowDepths.get(index) <= this.flowDepth && this.flowNames.get(index) == name
@@ -229,30 +245,34 @@ class BootstrapBodyBinder
   def bindClassBodies(): Void
     var classSymbol = this.model().firstClass
     while classSymbol != null
-      this.owner.currentClass = classSymbol
-      this.owner.currentNamespace = classSymbol.namespaceName
-      let classNode = classSymbol.syntaxNode
-      var memberOffset = this.owner.classMemberStart(classNode)
-      while memberOffset < this.syntax().childCountAt(classNode)
-        let fieldNode = this.syntax().childAt(classNode, memberOffset)
-        if this.syntax().kindAt(fieldNode) == "Field"
-          let fieldName = semanticField(this.syntax().dataAt(fieldNode), 1)
-          let field = this.owner.findDeclaredField(classSymbol, fieldName)
-          if field != null && this.syntax().childCountAt(fieldNode) > 1
-            let initializerNode = this.syntax().childAt(fieldNode, 1)
-            let value = this.bindExpression(initializerNode, field.typeName)
-            field.boundInitializer = value.boundNode
-            if !semanticAssignable(this.model(), field.typeName, value.typeName)
-              this.report("NR142", initializerNode, "Cannot assign expression of type '" + value.typeName + "' to variable '" + field.name + "' of type '" + field.typeName + "'.")
+      if !classSymbol.isFunctionType && !classSymbol.isClosure
+        this.owner.currentClass = classSymbol
+        this.owner.currentNamespace = classSymbol.namespaceName
+        this.owner.currentCallable = null
+        this.resetLocals()
+        let classNode = classSymbol.syntaxNode
+        var memberOffset = this.owner.classMemberStart(classNode)
+        while memberOffset < this.syntax().childCountAt(classNode)
+          let fieldNode = this.syntax().childAt(classNode, memberOffset)
+          if this.syntax().kindAt(fieldNode) == "Field"
+            let fieldName = semanticField(this.syntax().dataAt(fieldNode), 1)
+            let field = this.owner.findDeclaredField(classSymbol, fieldName)
+            if field != null && this.syntax().childCountAt(fieldNode) > 1
+              let initializerNode = this.syntax().childAt(fieldNode, 1)
+              let value = this.bindExpression(initializerNode, field.typeName)
+              field.boundInitializer = value.boundNode
+              if !semanticAssignable(this.model(), field.typeName, value.typeName)
+                this.report("NR142", initializerNode, "Cannot assign expression of type '" + value.typeName + "' to variable '" + field.name + "' of type '" + field.typeName + "'.")
+              end
             end
           end
+          memberOffset = memberOffset + 1
         end
-        memberOffset = memberOffset + 1
-      end
-      var method = classSymbol.firstMethod
-      while method != null
-        this.bindCallable(method)
-        method = method.nextCallable
+        var method = classSymbol.firstMethod
+        while method != null
+          this.bindCallable(method)
+          method = method.nextCallable
+        end
       end
       classSymbol = classSymbol.nextClass
     end
@@ -332,6 +352,8 @@ class BootstrapBodyBinder
   end
 
   def callableDisplayName(callable: SemanticCallable): String
+    let owner = this.model().findClass(callable.className)
+    if owner != null && owner.isClosure return "callback" end
     if callable.className != ""
       let classSymbol = this.model().findClass(callable.className)
       if classSymbol != null
@@ -496,11 +518,13 @@ class BootstrapBodyBinder
   def bindAssignment(node: Int): Int
     let targetNode = this.syntax().childAt(node, 0)
     let valueNode = this.syntax().childAt(node, 1)
-    let value = this.bindExpression(valueNode, "")
     let targetKind = this.syntax().kindAt(targetNode)
     if targetKind == "Name"
       let name = this.syntax().dataAt(targetNode)
       let local = this.findLocal(name)
+      var expectedType = ""
+      if local != null expectedType = local.typeName end
+      let value = this.bindExpression(valueNode, expectedType)
       if local == null
         let callable = this.owner.currentCallable
         if callable != null && this.owner.findParameter(callable, name) != null
@@ -523,6 +547,7 @@ class BootstrapBodyBinder
       return this.addBoundSymbol("Assignment", local.typeName, name, local.identity, targetNode, appendChild(emptyInts(), value.boundNode))
     end
     let target = this.bindExpression(targetNode, "")
+    let value = this.bindExpression(valueNode, target.typeName)
     if !semanticAssignable(this.model(), target.typeName, value.typeName)
       this.report("NR142", valueNode, "Cannot assign expression of type '" + value.typeName + "' to variable 'target' of type '" + target.typeName + "'.")
     end
@@ -685,7 +710,9 @@ class BootstrapBodyBinder
   def bindExpression(node: Int, expectedType: String): BoundValue
     let kind = this.syntax().kindAt(node)
     let data = this.syntax().dataAt(node)
-    if kind == "IntLiteral"
+    if kind == "Closure"
+      return bindClosure(this, node, expectedType)
+    else if kind == "IntLiteral"
       if host.parseInt(data) == null && data != "9223372036854775808"
         this.report("NR162", node, "Integer literal '" + data + "' is outside the signed 64-bit range.")
       end
@@ -734,8 +761,14 @@ class BootstrapBodyBinder
 
   def bindName(node: Int): BoundValue
     let name = this.syntax().dataAt(node)
+    let enclosing = this.enclosing
+    if enclosing != null && this.findVariableIdentity(name) == "" && closureHasVariable(enclosing, name)
+      return bindCapture(this, node, name)
+    end
     let typeName = this.findVariableType(name)
     if typeName == ""
+      let function = this.resolveFunction(name)
+      if function != null return bindFunctionValue(this, node, function) end
       this.report("NR113", node, "Undefined name '" + name + "'.")
       return new BoundValue("Error", this.addBound("Name", "Error", name, node, emptyInts()))
     end
@@ -743,6 +776,7 @@ class BootstrapBodyBinder
   end
 
   def bindThis(node: Int): BoundValue
+    if this.enclosing != null return bindCapture(this, node, "this") end
     let classSymbol = this.owner.currentClass
     let callable = this.owner.currentCallable
     if classSymbol == null
@@ -1024,6 +1058,8 @@ class BootstrapBodyBinder
   end
 
   def memberAccessible(ownerName: String, access: String): Bool
+    let outer = this.enclosing
+    if outer != null && outer.memberAccessible(ownerName, access) return true end
     if access == "public" || access == "internal"
       return true
     end
@@ -1042,6 +1078,11 @@ class BootstrapBodyBinder
 
   def bindMember(node: Int): BoundValue
     let objectNode = this.syntax().childAt(node, 0)
+    if this.syntax().kindAt(objectNode) == "Name" && !closureHasVariable(this, this.syntax().dataAt(objectNode))
+      let qualified = this.syntax().dataAt(objectNode) + "." + this.syntax().dataAt(node)
+      let function = this.resolveFunction(qualified)
+      if function != null return bindFunctionValue(this, node, function) end
+    end
     let objectValue = this.bindExpression(objectNode, "")
     let name = this.syntax().dataAt(node)
     if semanticIsOptional(objectValue.typeName)
@@ -1229,6 +1270,9 @@ class BootstrapBodyBinder
     let actual = this.syntax().childCountAt(node) - 1
     if calleeKind == "Name"
       let name = this.syntax().dataAt(calleeNode)
+      if closureHasVariable(this, name)
+        return bindFunctionCall(this, node, this.bindExpression(calleeNode, ""))
+      end
       let callable = this.resolveFunction(name)
       if callable == null
         this.reportLength("NR110", calleeNode, 1, "Undefined function '" + name + "'.")
@@ -1249,8 +1293,7 @@ class BootstrapBodyBinder
     else if calleeKind == "Member"
       return this.bindMemberCall(node, calleeNode)
     end
-    this.report("NR104", calleeNode, "Unsupported call target.")
-    return new BoundValue("Error", this.addBound("Call", "Error", "", calleeNode, emptyInts()))
+    return bindFunctionCall(this, node, this.bindExpression(calleeNode, ""))
   end
 
   def bindMemberCall(node: Int, calleeNode: Int): BoundValue
@@ -1283,8 +1326,7 @@ class BootstrapBodyBinder
     end
     if this.syntax().kindAt(objectNode) == "Name"
       let objectName = this.syntax().dataAt(objectNode)
-      let variableType = this.findVariableType(objectName)
-      if variableType == ""
+      if !closureHasVariable(this, objectName)
         let libraryType = this.libraryReturn(objectName, memberName)
         if libraryType != ""
           if objectName != "Array" && !this.model().hasUse(objectName)
@@ -1333,6 +1375,11 @@ class BootstrapBodyBinder
     end
     let method = this.findMethod(classSymbol, memberName)
     if method == null
+      let field = this.findField(classSymbol, memberName)
+      if field != null && this.memberAccessible(field.owner, field.access)
+        let value = new BoundValue(field.typeName, this.addBound("Member", field.typeName, field.owner + "." + field.name, calleeNode, [instance.boundNode]))
+        return bindFunctionCall(this, node, value)
+      end
       this.report("NR131", calleeNode, "Type '" + classSymbol.fullName + "' does not have a member '" + memberName + "'.")
       return new BoundValue("Error", this.addBound("Call", "Error", memberName, calleeNode, appendChild(emptyInts(), instance.boundNode)))
     end

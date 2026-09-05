@@ -32,6 +32,9 @@ Language fixtures cover class construction/dispatch, array layouts, short-circui
 floating-point operations, unsafe storage, C imports and deterministic rejection
 of invalid expressions. Successful executions assert output or use the test
 library; rejection fixtures require a nonzero compiler status and diagnostic.
+`callbacks.hk` covers contextual and named callbacks, indirect storage, nested
+captures and invocation after explicit collection. `callback-errors.hk` protects
+signature checking, complete returns and the mutable/raw-pointer capture boundary.
 The process helper provides EOF on stdin and enforces a deadline on the process
 group. It records stdout, stderr and exit status separately under `build/work.*`.
 Each language case has a distinct `case-N` prefix and a `.source` sidecar identifying

@@ -10,6 +10,14 @@ Neri has three explicit implementation layers.
 - `semantic/` binds symbols, types, control flow, and diagnostics;
 - `ir/` lowers bound programs to canonical Neri IR and provides the command-line driver.
 
+Function types are structural language types. Closure conversion represents each
+signature with a hidden managed class and virtual invocation slot, and each
+closure with an implementation class containing its captures. Existing class
+allocation, tracing and indirect dispatch provide closure lifetime and invocation;
+the IR transport and runtime ABI remain unchanged. The signature class is not
+source-constructible, and its fallback invocation traps. A callee's `noreturn`
+property does not propagate to callers or other implementations of its slot.
+
 `compiler/ir/main.hk` is the executable entry point. `frontend/main.hk` and `semantic/main.hk` are standalone development entry points and are excluded from the compiler source set.
 
 ## Native boundary

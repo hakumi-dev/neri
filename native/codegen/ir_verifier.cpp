@@ -536,7 +536,7 @@ void require_binary(const function_context &context, const instruction &value,
   if (result_count == 1U) {
     require_result_type(value, 0U, *result);
   }
-  return effects;
+  return effects & ~NERI_IR_EFFECT_NO_RETURN_V1;
 }
 
 [[nodiscard]] std::uint32_t verify_virtual_call(function_context &context,
@@ -598,7 +598,8 @@ void require_binary(const function_context &context, const instruction &value,
   if (result_count == 1U) {
     require_result_type(value, 0U, signature->result_type);
   }
-  return effects;
+  // One non-returning implementation does not make the dispatch slot noreturn.
+  return effects & ~NERI_IR_EFFECT_NO_RETURN_V1;
 }
 
 [[nodiscard]] std::uint32_t verify_instruction(function_context &context,

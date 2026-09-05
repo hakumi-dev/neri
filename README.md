@@ -4,7 +4,7 @@ Neri is a statically typed programming language that compiles to native executab
 It combines automatic memory management with explicit access to low-level operations.
 
 - Static types with local type inference and explicit optional values.
-- Functions, typed arrays, and classes with single inheritance.
+- Functions and closures, typed arrays, and classes with single inheritance.
 - Automatic memory management for objects, strings, and arrays.
 - Checked integer arithmetic and array indexing.
 - Explicit `unsafe` blocks for raw memory operations and C interoperability.
