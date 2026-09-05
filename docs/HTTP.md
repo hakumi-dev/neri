@@ -5,14 +5,14 @@ The installed launcher loads it when a source file declares `use http`.
 
 ```ruby
 use http
-use ConsoleInteraction
+use console
 use host
 
 def main(): Void
   let error = http.serve("127.0.0.1:8080", fn(request)
     return http.text(200, "Hello, world!")
   end)
-  ConsoleInteraction.println(error)
+  console.println(error)
   host.exit(1)
 end
 ```

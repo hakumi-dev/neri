@@ -32,10 +32,10 @@ releases include the language reference for their compiler.
 Save this as `main.hk`:
 
 ```neri
-use ConsoleInteraction
+use console
 
 def main(): Void
-  ConsoleInteraction.println("Hello, Neri!")
+  console.println("Hello, Neri!")
 end
 ```
 

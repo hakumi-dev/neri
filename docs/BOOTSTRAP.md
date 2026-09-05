@@ -25,6 +25,10 @@ two generations in an isolated `build/work.*` directory:
 2. Stage1 compiles the same sources into Stage2;
 3. Stage1 and Stage2 canonical NIR, objects, and executables are compared byte for byte.
 
+Seed-compiled compiler and tooling sources use the seed-compatible
+`ConsoleInteraction` spelling. User programs use `console`; both resolve to the
+same runtime operations and preserve the canonical import identity.
+
 Every compiler process receives the current native artifact paths, the pinned LLVM linker, the macOS SDK path, a C locale, UTC, and the host `PATH`. Any unexplained difference fails the bootstrap. Native configuration independently checks Clang/LLVM and Ninja versions.
 
 Both generations use the executable basename `neri` in separate directories.

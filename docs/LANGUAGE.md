@@ -30,7 +30,15 @@ valid; `1 < 2 == true` and `a < b < c` produce type errors for integer operands.
 Expressions, arguments, and array elements evaluate left to right. Logical
 operators and conditional expressions evaluate only the required branch.
 
+## Console
+
+`use console` provides terminal input and output: `console.print(value)` writes
+without a newline, `console.println(value)` appends a newline, and
+`console.read()` reads a line as a string. Output accepts strings and numeric
+values. End of input produces an empty string. Output is flushed after each call.
+
 ## Values and variables
+
 
 | Type | Contract |
 |---|---|
