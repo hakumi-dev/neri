@@ -9,6 +9,7 @@ packages include the language reference for the packaged compiler.
 - [Work through the examples](../examples/README.md).
 - [Look up syntax, types and commands](LANGUAGE.md).
 - [Serve HTTP requests](HTTP.md).
+- [Build interactive terminal applications](TERMINAL.md).
 - [Install a standalone toolchain](PACKAGING.md#standalone-installer).
 
 ## Develop Neri

@@ -54,7 +54,7 @@ supports Apple silicon on macOS 15 or newer with LLVM 22.1.8.
 ### Standalone installer
 
 Install LLVM 22.1.8 and zstd, download an
-[installable release](https://github.com/hakumi-dev/neri/releases/tag/v0.1.0-dev),
+[installable release](https://github.com/hakumi-dev/neri/releases/tag/v0.2.0-dev),
 and extract its archive. On macOS, the Xcode Command Line Tools provide the SDK.
 From the extracted directory:
 

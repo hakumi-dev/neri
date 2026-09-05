@@ -21,7 +21,7 @@ extern "C" {
 #endif
 
 #define NERI_RUNTIME_ABI_MAJOR UINT16_C(1)
-#define NERI_RUNTIME_ABI_MINOR UINT16_C(7)
+#define NERI_RUNTIME_ABI_MINOR UINT16_C(8)
 
 #define NERI_RT_FEATURE_PRECISE_GC UINT64_C(1)
 #define NERI_RT_FEATURE_NONMOVING_GC (UINT64_C(1) << 1)
@@ -37,6 +37,7 @@ extern "C" {
 #define NERI_RT_FEATURE_MULTIPLE_MUTATORS (UINT64_C(1) << 10)
 #define NERI_RT_FEATURE_BOOTSTRAP_HOST (UINT64_C(1) << 11)
 #define NERI_RT_FEATURE_SOCKETS (UINT64_C(1) << 12)
+#define NERI_RT_FEATURE_INTERACTIVE_IO (UINT64_C(1) << 13)
 
 #define NERI_TYPE_KIND_CLASS_V1 UINT32_C(1)
 #define NERI_TYPE_KIND_STRING_V1 UINT32_C(2)
@@ -291,6 +292,16 @@ NERI_RT_API neri_ref_v1 neri_rt_v1_host_error_message(void);
  * configure enables nonblocking I/O, close-on-exec and SIGPIPE suppression.
  */
 NERI_RT_API neri_int_v1 neri_rt_v1_net_open(void);
+/* ABI 1.8: one foreground terminal lease, positive generation token.
+ * Read: byte 0..255, -1 timeout, -2 closed/interrupted/error. Timeout 0..60000ms.
+ * Close is idempotent; stale tokens cannot affect a subsequent lease.
+ * Size: columns (rows=0), rows (otherwise), 0 unavailable.
+ * Clock: monotonic milliseconds, -1 unavailable. */
+NERI_RT_API neri_int_v1 neri_rt_v1_terminal_open(void);
+NERI_RT_API void neri_rt_v1_terminal_close(neri_int_v1 token);
+NERI_RT_API neri_int_v1 neri_rt_v1_terminal_read(neri_int_v1 token, neri_int_v1 timeout);
+NERI_RT_API neri_int_v1 neri_rt_v1_terminal_size(neri_int_v1 token, neri_int_v1 rows);
+NERI_RT_API neri_int_v1 neri_rt_v1_clock_milliseconds(void);
 NERI_RT_API neri_int_v1 neri_rt_v1_net_configure(neri_int_v1 fd);
 NERI_RT_API neri_int_v1 neri_rt_v1_net_bind(neri_int_v1 fd, neri_int_v1 port);
 NERI_RT_API neri_int_v1 neri_rt_v1_net_listen(neri_int_v1 fd);

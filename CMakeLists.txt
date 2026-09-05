@@ -108,6 +108,7 @@ add_library(neri_runtime STATIC
   native/runtime/math.cpp
   native/runtime/runtime.cpp
   native/runtime/socket.c
+  native/runtime/terminal.c
   native/runtime/test_support.cpp
 )
 set_target_properties(neri_runtime PROPERTIES OUTPUT_NAME "neri-runtime")
@@ -128,6 +129,9 @@ if(BUILD_TESTING)
   add_executable(neri_http_process tests/native/http_process.c)
   set_target_properties(neri_http_process PROPERTIES OUTPUT_NAME neri-http-process)
   target_link_libraries(neri_http_process PRIVATE neri_build_options)
+  add_executable(neri_terminal_process tests/native/terminal_process.c)
+  set_target_properties(neri_terminal_process PROPERTIES OUTPUT_NAME neri-terminal-process)
+  target_link_libraries(neri_terminal_process PRIVATE neri_build_options util)
 
   add_executable(neri_abi_probe tests/native/abi_probe.c)
   target_link_libraries(neri_abi_probe PRIVATE neri_build_options neri_runtime)
@@ -149,10 +153,19 @@ if(BUILD_TESTING)
     "${CMAKE_CURRENT_SOURCE_DIR}/tests/golden/ir-codegen-primitives.nir.hex")
 endif()
 
-file(GENERATE
-  OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/neri-runtime-${NERI_TARGET}.json"
-  CONTENT "{\n  \"schemaVersion\": 2,\n  \"toolchainVersion\": \"${NERI_VERSION}\",\n  \"irTransportMajor\": 1,\n  \"irTransportMinor\": 1,\n  \"target\": \"${NERI_TARGET}\",\n  \"abiMajor\": 1,\n  \"abiMinor\": 7,\n  \"features\": 6399,\n  \"artifact\": \"$<TARGET_FILE_NAME:neri_runtime>\"\n}\n"
-)
+foreach(NERI_MANIFEST_KIND current seed)
+  set(NERI_MANIFEST_VERSION "${NERI_VERSION}")
+  set(NERI_MANIFEST_NAME "neri-runtime-${NERI_TARGET}.json")
+  if(NERI_MANIFEST_KIND STREQUAL "seed")
+    # The pinned seed requires its original version label, not a different ABI.
+    set(NERI_MANIFEST_VERSION "0.1.0-dev")
+    set(NERI_MANIFEST_NAME "neri-runtime-seed-${NERI_TARGET}.json")
+  endif()
+  file(GENERATE
+    OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/${NERI_MANIFEST_NAME}"
+    CONTENT "{\n  \"schemaVersion\": 2,\n  \"toolchainVersion\": \"${NERI_MANIFEST_VERSION}\",\n  \"irTransportMajor\": 1,\n  \"irTransportMinor\": 1,\n  \"target\": \"${NERI_TARGET}\",\n  \"abiMajor\": 1,\n  \"abiMinor\": 8,\n  \"features\": 14591,\n  \"artifact\": \"$<TARGET_FILE_NAME:neri_runtime>\"\n}\n"
+  )
+endforeach()
 
 install(TARGETS neri_codegen_cli neri_runtime RUNTIME DESTINATION bin ARCHIVE DESTINATION lib)
 install(FILES "${CMAKE_CURRENT_BINARY_DIR}/neri-runtime-${NERI_TARGET}.json" DESTINATION lib)

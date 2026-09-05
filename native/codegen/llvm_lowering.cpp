@@ -2181,6 +2181,11 @@ private:
         minimum_minor = std::max(minimum_minor, uint16_t{7});
         required_features |= NERI_RT_FEATURE_SOCKETS;
       }
+      if (import.link_name.starts_with("neri_rt_v1_terminal_") ||
+          import.link_name.starts_with("neri_rt_v1_clock_")) {
+        minimum_minor = std::max(minimum_minor, uint16_t{8});
+        required_features |= NERI_RT_FEATURE_INTERACTIVE_IO;
+      }
       if (import.kind == NERI_IR_IMPORT_RUNTIME_V1 &&
           import.minimum_runtime.has_value()) {
         minimum_minor =

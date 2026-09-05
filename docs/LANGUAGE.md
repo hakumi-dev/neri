@@ -87,7 +87,7 @@ multiline actions use a block instead. Block `if` bodies begin on the next line;
 
 All supplied source files contribute to one compilation module. `namespace`
 applies to subsequent declarations; `use` exposes a namespace throughout the
-module. `use http` additionally loads the toolchain's bundled HTTP library;
+module. `use http`, `use terminal`, and `use clock` load their bundled libraries;
 other namespaces do not load files. Duplicate or ambiguous declarations are errors.
 Module scope contains only namespace/use directives and function/class declarations;
 other tokens produce a parse diagnostic.

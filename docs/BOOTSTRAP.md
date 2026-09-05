@@ -31,6 +31,13 @@ same runtime operations and preserve the canonical import identity.
 
 Every compiler process receives the current native artifact paths, the pinned LLVM linker, the macOS SDK path, a C locale, UTC, and the host `PATH`. Any unexplained difference fails the bootstrap. Native configuration independently checks Clang/LLVM and Ninja versions.
 
+The pinned seed requires the `0.1.0-dev` toolchain label in its runtime manifest.
+Native builds generate a seed-only compatibility manifest with that label and
+the current artifact, ABI and feature values. Only trusted-seed compiler calls
+receive this manifest. Stage1, Stage2 and distributed packages receive the current
+versioned manifest; artifact compatibility checks and fixed-point comparisons
+remain enabled. The compatibility manifest is not distributed.
+
 Both generations use the executable basename `neri` in separate directories.
 The macOS linker embeds that basename in its ad-hoc signing identifier, so the
 basename is part of the reproducibility contract.

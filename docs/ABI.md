@@ -1,10 +1,15 @@
 # Runtime and IR boundary
 
 The canonical exported declarations and layouts are in
-[`runtime_abi.h`](../native/include/neri/runtime_abi.h). Runtime ABI 1.7 uses a
+[`runtime_abi.h`](../native/include/neri/runtime_abi.h). Runtime ABI 1.8 uses a
 C calling convention on macOS ARM64 and Linux x86-64. Generated programs negotiate
 major version, minimum minor version and required feature bits before execution.
 The package manifest also identifies the toolchain version and native target.
+
+ABI 1.8 adds the `INTERACTIVE_IO` feature (8192): generation-scoped terminal
+leases, byte input with bounded waiting, terminal dimensions, and monotonic
+milliseconds. Platform terminal layouts remain inside the runtime. Key decoding
+and the public session API are implemented in Neri.
 
 ## Representation
 
