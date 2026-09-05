@@ -66,3 +66,24 @@ The compiler fixed-point workload is a correctness gate for automatic collection
 it exercises long-lived graphs and temporary strings while compiling itself with
 the current runtime. It does not by itself establish throughput, pause or memory
 budgets for general workloads.
+
+## Generic specialization
+
+`examples/generics.hk` exercises a generic box and a generic transformation with
+a callback. Its concrete baseline uses the same bodies, with `Box` storing `Int`
+and `transform(Int, fn(Int): String): String`; type parameter declarations and
+explicit type arguments are removed. Both executables print `The answer is 42`.
+
+A local macOS ARM64 Release comparison on 2026-09-05 with LLVM 22.1.8 measured
+five alternating builds after initial builds of both variants:
+
+| Variant | Build wall seconds (five samples) | Median | Executable bytes |
+|---|---|---:|---:|
+| Generic | 0.49, 0.13, 0.16, 0.15, 0.14 | 0.15 s | 98,800 |
+| Concrete | 0.14, 0.13, 0.15, 0.15, 0.13 | 0.14 s | 98,704 |
+
+Builds used `/usr/bin/time -p scripts/neri.sh build <source> --release --output <path>`;
+sizes used `wc -c`. Timing includes the launcher and native linker. The 96-byte
+size difference and noisy short build times describe this two-specialization
+example only; they are not regression thresholds or a projection for large
+generic programs. More concrete argument combinations can increase generated code.

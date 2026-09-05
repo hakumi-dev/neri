@@ -10,6 +10,15 @@ Neri has three explicit implementation layers.
 - `semantic/` binds symbols, types, control flow, and diagnostics;
 - `ir/` lowers bound programs to canonical Neri IR and provides the command-line driver.
 
+Generic declarations, specialization, and inference live in separate semantic
+components. `GenericInference` owns the type-variable bindings for one application.
+The binder registers templates before resolving signatures, then processes newly
+specialized bodies until the work set is complete. Specialization clones syntax
+at type positions and preserves source locations. Concrete classes retain the
+existing field layout and precise tracing rules; concrete functions use the same
+IR and runtime ABI as ordinary functions. Specializations are cached by qualified
+declaration name and canonical type arguments, with bounded expansion.
+
 Function types are structural language types. Closure conversion represents each
 signature with a hidden managed class and virtual invocation slot, and each
 closure with an implementation class containing its captures. Existing class

@@ -106,6 +106,62 @@ inherited. An explicit `super(args)` starts a derived initializer when the base
 requires arguments. A valid zero-argument base call is implicit. Inherited fields
 cannot be redeclared.
 
+## Generics
+
+Module functions and classes may declare type parameters:
+
+```ruby
+def identity<T>(value: T): T
+  return value
+end
+
+class Box<T>
+  public value: T
+
+  def init(value: T): Void
+    this.value = value
+  end
+end
+```
+
+`identity(42)` infers `T` as `Int`; `identity<Int>(42)` supplies it explicitly.
+The opening `<` in an explicit function specialization is adjacent to its name.
+Class construction supplies its arguments: `new Box<String>("Neri")`.
+Arguments may themselves be arrays, optionals, callbacks, or generic classes.
+`Box<Int>` and `Box<String>` are distinct, invariant types. An assignment through
+`Box<T>.value` must satisfy the concrete `T`, including after passing the box
+through a function or a callback.
+
+Inference uses the expected result type and argument types. For example,
+`let empty: String? = absent()` can infer `T` for `absent<T>(): T?`, and
+`let copy: fn(Int): Int = identity` specializes the function value. An expected
+type supplies callback annotations once the generic parameters in that signature
+are known. A callback whose result type remains unknown requires an explicit
+return annotation or an expected result type at the call site. `null` and an
+untyped empty array alone do not determine a type parameter. Conflicting arguments
+produce a type error; inference introduces no numeric or unchecked conversions.
+
+Signatures name every parameter and return type. Each used specialization is
+type-checked with concrete arguments, including its body and initializers, and
+compiled once per compilation module. Unused generic bodies are checked when
+specialized. Type parameters accept safe value types; `Void`, raw pointers and
+unresolved types cannot be type arguments. The entry point and C ABI imports have
+concrete signatures.
+
+The current generic surface consists of module functions and classes with their
+own fields and methods. Method-level type parameters, generic class inheritance,
+interface constraints and higher-kinded types are outside this surface. Templates
+are supplied as source files in the same compilation invocation, including across
+namespaces. A compiled specialization is concrete; it is not a separately
+importable generic template or a package ABI promise.
+
+Compilation permits 128 distinct generic specializations, 32 nested class
+instantiations, 64 levels of written type nesting, and canonical type arguments
+of at most 1024 UTF-8 bytes. Ordinary recursion reuses the same specialization;
+recursion that creates an unbounded sequence of new types reports `NR222`.
+`NR220` reports invalid generic declarations or type-argument counts; `NR221`
+reports arguments that cannot be inferred or used as safe value types.
+
 ## Function values and closures
 
 `fn(Int): String` is a function type. Function types are invariant: parameter

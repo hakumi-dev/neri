@@ -1,0 +1,161 @@
+use host
+
+def genericBase(typeName: String): String
+  var result = typeName
+  while semanticIsArray(result) || semanticIsOptional(result) || semanticIsPointer(result)
+    result = semanticInnerType(result)
+  end
+  return result
+end
+
+def genericSubstitute(written: String, names: String[], arguments: StringBuffer): String
+  let base = genericBase(written)
+  var index = 0
+  while index < names.Length
+    if names[index] == base && arguments.get(index) != ""
+      return arguments.get(index) + host.stringSlice(written, host.stringByteLength(base), host.stringByteLength(written) - host.stringByteLength(base))
+    end
+    index = index + 1
+  end
+  return written
+end
+
+# Clone syntax, preserving source identity; only type positions are substituted.
+def genericClone(owner: BootstrapBinder, node: Int, names: String[], arguments: StringBuffer): Int
+  let source = owner.syntax.nodeAt(node)
+  var children: Int[] = []
+  for child in source.children
+    children = host.appendInt(children, genericClone(owner, child, names, arguments))
+  end
+  var data = source.data
+  if source.kind == "Type"
+    data = genericSubstitute(data, names, arguments)
+  end
+  let result = owner.syntax.add(source.kind, data, children)
+  let copy = owner.syntax.nodeAt(result)
+  copy.value = source.value
+  copy.start = source.start
+  copy.length = source.length
+  copy.secondaryStart = source.secondaryStart
+  copy.secondaryLength = source.secondaryLength
+  copy.irStart = source.irStart
+  copy.irLength = source.irLength
+  copy.typeParameters = source.typeParameters
+  for argument in source.typeArguments
+    copy.typeArguments = host.appendInt(copy.typeArguments, genericClone(owner, argument, names, arguments))
+  end
+  return result
+end
+
+def genericKey(owner: BootstrapBinder, template: Int, arguments: StringBuffer, node: Int): String
+  let parameters = owner.syntax.nodeAt(template).typeParameters
+  if parameters.Length != arguments.size
+    owner.report("NR220", node, "Generic '" + genericName(owner, template) + "' expects " + (parameters.Length as String) + " type arguments.")
+    return ""
+  end
+  var result = genericName(owner, template) + "<"
+  var index = 0
+  while index < arguments.size
+    let argument = arguments.get(index)
+    if host.stringByteLength(argument) > 1024
+      owner.report("NR222", node, "Generic type argument exceeds the 1024-byte canonical type limit.")
+      return ""
+    end
+    if argument == "" || argument == "Error" || argument == "Null" || argument == "Void" || semanticContainsPointer(argument)
+      owner.report("NR221", node, "Cannot infer a safe value type for '" + parameters[index] + "'; supply explicit type arguments or an expected type.")
+      return ""
+    end
+    if index > 0
+      result = result + ","
+    end
+    result = result + argument
+    index = index + 1
+  end
+  return result + ">"
+end
+
+def genericReserve(owner: BootstrapBinder, node: Int): Bool
+  if owner.model.genericInstances >= 128 || owner.model.genericDepth >= 32
+    owner.report("NR222", node, "Generic specialization limit exceeded (128 instances, 32 nested type instantiations).")
+    return false
+  end
+  owner.model.genericInstances = owner.model.genericInstances + 1
+  return true
+end
+
+def instantiateGenericClass(owner: BootstrapBinder, template: Int, arguments: StringBuffer, node: Int): SemanticClass?
+  let key = genericKey(owner, template, arguments, node)
+  if key == ""
+    return null
+  end
+  let existing = owner.model.findClass(key)
+  if existing != null
+    return existing
+  end
+  if !genericReserve(owner, node)
+    return null
+  end
+  owner.model.genericDepth = owner.model.genericDepth + 1
+  let source = owner.syntax.nodeAt(template)
+  let clone = genericClone(owner, template, source.typeParameters, arguments)
+  let namespaceName = semanticField(source.data, 0)
+  let offset = namespaceName == "" ? 0 : host.stringByteLength(namespaceName) + 1
+  let name = host.stringSlice(key, offset, host.stringByteLength(key) - offset)
+  let symbol = new SemanticClass(key, name, namespaceName, semanticField(source.data, 1), clone)
+  symbol.genericOrigin = template
+  var index = 0
+  while index < arguments.size
+    symbol.genericArguments = host.appendString(symbol.genericArguments, arguments.get(index))
+    index = index + 1
+  end
+  owner.model.addClass(symbol)
+  let baseNode = owner.classBaseNode(clone)
+  if baseNode >= 0
+    owner.report("NR220", baseNode, "Generic classes currently declare their own fields and methods without inheritance.")
+  end
+  index = owner.classMemberStart(clone)
+  while index < owner.syntax.childCountAt(clone)
+    let member = owner.syntax.childAt(clone, index)
+    if owner.syntax.kindAt(member) == "Field"
+      owner.registerField(symbol, member)
+    else if owner.syntax.kindAt(member) == "Method"
+      owner.registerMethod(symbol, member)
+    end
+    index = index + 1
+  end
+  owner.model.genericDepth = owner.model.genericDepth - 1
+  return symbol
+end
+
+def instantiateGenericFunction(owner: BootstrapBinder, template: Int, arguments: StringBuffer, node: Int): SemanticCallable?
+  let key = genericKey(owner, template, arguments, node)
+  if key == ""
+    return null
+  end
+  let existing = owner.model.findFunction(key)
+  if existing != null
+    return existing
+  end
+  if !genericReserve(owner, node)
+    return null
+  end
+  let source = owner.syntax.nodeAt(template)
+  if semanticIntField(source.data, 2) > 0
+    owner.report("NR220", template, "Generic functions cannot import C ABI symbols.")
+    return null
+  end
+  let clone = genericClone(owner, template, source.typeParameters, arguments)
+  let namespaceName = semanticField(source.data, 0)
+  let offset = namespaceName == "" ? 0 : host.stringByteLength(namespaceName) + 1
+  let name = host.stringSlice(key, offset, host.stringByteLength(key) - offset)
+  var data = namespaceName + "|" + name
+  var index = 2
+  while index <= 6
+    data = data + "|" + semanticField(source.data, index)
+    index = index + 1
+  end
+  owner.syntax.nodeAt(clone).data = data
+  let callable = owner.createCallable(clone, null, "internal")
+  owner.model.addFunction(callable)
+  return callable
+end
