@@ -1,4 +1,7 @@
 using System.Diagnostics;
+using System.Runtime;
+using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 
 sealed class ComputeNode(long value, ComputeNode? next)
 {
@@ -88,6 +91,7 @@ static class Program
 
     static int Main(string[] args)
     {
+        Console.Error.WriteLine($"{{\"runtime\":\"{Environment.Version}\",\"architecture\":\"{RuntimeInformation.ProcessArchitecture}\",\"dynamicCode\":{RuntimeFeature.IsDynamicCodeSupported.ToString().ToLowerInvariant()},\"serverGc\":{GCSettings.IsServerGC.ToString().ToLowerInvariant()}}}");
         if ((args.Length != 3 && args.Length != 4) || !long.TryParse(args[1], out long size) ||
             !long.TryParse(args[2], out long rounds) || size < 1 || size > 200000000 ||
             rounds < 1 || rounds > 10000)
