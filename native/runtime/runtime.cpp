@@ -49,6 +49,14 @@ struct managed_allocation final {
   bool marked;
 };
 
+// One reservation per managed object. The private prefix preserves the public
+// object/payload alignment and is the address passed back to the allocator.
+constexpr size_t managed_prefix_size =
+    (sizeof(managed_allocation) + alignof(std::max_align_t) - 1) &
+    ~(alignof(std::max_align_t) - 1);
+static_assert(managed_prefix_size % alignof(neri_object_header_v1) == 0);
+static_assert(sizeof(neri_object_header_v1) % alignof(std::max_align_t) == 0);
+
 struct native_allocation final {
   native_allocation *previous;
   native_allocation *next;
@@ -343,7 +351,6 @@ void collect_impl() {
       state.managed_object_count -= 1;
       state.managed_byte_count -=
           sizeof(neri_object_header_v1) + allocation->payload_size;
-      std::free(allocation->object);
       std::free(allocation);
     }
     allocation = next;
@@ -995,7 +1002,6 @@ NERI_RT_API void neri_rt_v1_shutdown(void) {
   while (state.managed_head != nullptr) {
     auto *allocation = state.managed_head;
     state.managed_head = allocation->next;
-    std::free(allocation->object);
     std::free(allocation);
   }
   while (state.native_head != nullptr) {
@@ -1019,34 +1025,31 @@ neri_rt_v1_gc_alloc(const neri_type_descriptor_v1 *type,
 
   const size_t total_size =
       sizeof(neri_object_header_v1) + static_cast<size_t>(payload_size);
+  if (total_size > SIZE_MAX - managed_prefix_size) {
+    out_of_memory("managed allocation size is not representable");
+  }
   if (state.managed_byte_count >= state.next_collection_bytes ||
       total_size > state.next_collection_bytes - state.managed_byte_count) {
     collect_impl();
   }
 
+  const size_t physical_size = managed_prefix_size + total_size;
   auto *metadata =
-      static_cast<managed_allocation *>(std::malloc(sizeof(managed_allocation)));
+      static_cast<managed_allocation *>(std::calloc(1, physical_size));
   if (metadata == nullptr) {
     collect_impl();
     metadata = static_cast<managed_allocation *>(
-        std::malloc(sizeof(managed_allocation)));
+        std::calloc(1, physical_size));
   }
-  if (metadata == nullptr) {
-    out_of_memory("managed allocation metadata failed");
-  }
-
-  auto *object = static_cast<neri_ref_v1>(std::calloc(1, total_size));
-  if (object == nullptr) {
-    collect_impl();
-    object = static_cast<neri_ref_v1>(std::calloc(1, total_size));
-  }
-  if (object == nullptr ||
+  if (metadata == nullptr ||
       state.managed_byte_count > UINT64_MAX - total_size ||
       state.managed_object_count == UINT64_MAX) {
-    std::free(object);
     std::free(metadata);
     out_of_memory("managed allocation failed");
   }
+
+  auto *object = reinterpret_cast<neri_ref_v1>(
+      reinterpret_cast<unsigned char *>(metadata) + managed_prefix_size);
 
   *metadata = {nullptr, state.managed_head, object, payload_size, false};
   if (state.managed_head != nullptr) {

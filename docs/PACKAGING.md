@@ -11,7 +11,8 @@ examples with a getting-started guide in `examples/README.md`, and three
 records:
 
 - `SOURCE-MANIFEST.sha256` hashes source, build, test and documentation inputs using
-  repository-relative names, excluding Finder's `.DS_Store` metadata. Changes detected during validation or packaging fail
+  repository-relative names, excluding Finder's `.DS_Store` metadata and generated
+  `bin/` and `obj/` outputs of the C# benchmark reference. Changes detected during validation or packaging fail
   the command.
 - `ARTIFACTS.sha256` hashes packaged executables, libraries, documentation, examples and the
   source manifest.

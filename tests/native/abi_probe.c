@@ -130,6 +130,20 @@ static neri_ref_v1 allocate_node(void) {
                                alignof(probe_node_payload));
 }
 
+static void probe_managed_alignment_and_zeroing(void) {
+  neri_type_descriptor_v1 type = node_type;
+  type.flags = 0;
+  type.trace = NULL;
+  type.payload_size = 32;
+  type.payload_alignment = alignof(max_align_t);
+  neri_ref_v1 object = neri_rt_v1_gc_alloc(&type, 32, alignof(max_align_t));
+  const unsigned char *payload = (const unsigned char *)object + sizeof(*object);
+  const unsigned char zeros[32] = {0};
+  NERI_ABI_CHECK((uintptr_t)payload % alignof(max_align_t) == 0);
+  NERI_ABI_CHECK(memcmp(payload, zeros, sizeof(zeros)) == 0);
+  neri_rt_v1_gc_collect();
+}
+
 static void probe_legacy_descriptor_prefix(void) {
   neri_type_descriptor_v1 legacy_type = node_type;
   legacy_type.struct_size = NERI_TYPE_DESCRIPTOR_V1_BASE_SIZE;
@@ -307,6 +321,7 @@ static void probe_native_memory(void) {
 
 int main(void) {
   probe_abi_negotiation();
+  probe_managed_alignment_and_zeroing();
   probe_legacy_descriptor_prefix();
   probe_reference_transfer_and_cycles();
   probe_managed_borrow();

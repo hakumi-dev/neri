@@ -45,6 +45,12 @@ reference. Scoped borrows retain the owning allocation and expose a stable addre
 until the borrow ends. Raw pointers alone do not retain objects. Collection reclaims
 unreachable cycles. Shutdown requires all root frames and borrows to have ended.
 
+Each managed object and its private collector metadata share one zero-initialized
+native reservation. The prefix preserves the maximum supported payload alignment;
+the public object header, payload offsets and ABI are unchanged. Collection frees
+the reservation once. Managed-byte statistics count the public header and payload,
+while allocator metadata and alignment padding contribute to RSS separately.
+
 Collection runs before an allocation would exceed the heap threshold, on an
 explicit call, or on allocation retry after native reservation failure. The
 threshold starts at 4 MiB and becomes the larger of 4 MiB and twice the surviving
