@@ -99,7 +99,7 @@ The bootstrap release contains a Neri compiler plus its matching codegen and run
 
 ## Execution and optimization boundaries
 
-Safe Neri executes with one managed mutator. Native runtime contexts own independent
+Safe Neri executes with one managed mutator per active heap. Native runtime contexts own independent
 heaps, root/borrow stacks, collection state and host-error storage. Each native
 thread initializes and shuts down its base context explicitly. Runtime reference
 stores and tracing enforce context ownership.

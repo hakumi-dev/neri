@@ -45,30 +45,33 @@ static class Program
         return sum;
     }
 
-    static long BatchKernel(long size, long jobs, int workers)
+    static long BatchKernel(long size, long jobs, int workers, bool allocating)
     {
         long sum = 0;
         if (workers == 1)
         {
             for (long job = 0; job < jobs; job++)
-                sum += IntegerKernel(size + job);
+                sum += allocating ? AllocationKernel(size + job, 1) : IntegerKernel(size + job);
         }
         else
         {
             var results = new long[(int)jobs];
             Parallel.For(0, (int)jobs, new ParallelOptions { MaxDegreeOfParallelism = workers },
-                job => results[job] = IntegerKernel(size + job));
+                job => results[job] = allocating ? AllocationKernel(size + job, 1) : IntegerKernel(size + job));
             foreach (long value in results)
                 sum += value;
         }
         return sum;
     }
 
-    static long BatchExpected(long size, long jobs)
+    static long BatchExpected(long size, long jobs, bool allocating)
     {
         long sum = 0;
         for (long job = 0; job < jobs; job++)
-            sum += IntegerExpected(size + job);
+        {
+            long count = size + job;
+            sum += allocating ? count * (count - 1) / 2 : IntegerExpected(count);
+        }
         return sum;
     }
 
@@ -97,13 +100,14 @@ static class Program
             rounds < 1 || rounds > 10000)
             return 2;
         string mode = args[0];
+        bool batch = mode == "batch" || mode == "allocation-batch";
         int workers = 1;
-        if (args.Length == 4 && (!int.TryParse(args[3], out workers) || workers < 1 || workers > 64 || mode != "batch"))
+        if (args.Length == 4 && (!int.TryParse(args[3], out workers) || workers < 1 || workers > 64 || !batch))
             return 2;
-        if ((mode != "integer" && mode != "array" && mode != "allocation" && mode != "batch") ||
-            (mode == "array" && size > 8192) || (mode == "allocation" && size > 1000000))
+        if ((mode != "integer" && mode != "array" && mode != "allocation" && !batch) ||
+            (mode == "array" && size > 8192) || ((mode == "allocation" || mode == "allocation-batch") && size > 1000000))
             return 2;
-        long expected = mode == "batch" ? BatchExpected(size, rounds) : mode == "integer" ? IntegerExpected(size) :
+        long expected = batch ? BatchExpected(size, rounds, mode == "allocation-batch") : mode == "integer" ? IntegerExpected(size) :
             mode == "array" ? rounds * size * (size - 1) / 2 + size * rounds * (rounds + 1) / 2 :
             rounds * size * (size - 1) / 2;
         for (int sample = -1; sample < 7; sample++)
@@ -112,7 +116,7 @@ static class Program
             for (long index = 0; index < values.LongLength; index++)
                 values[index] = index;
             long started = Stopwatch.GetTimestamp();
-            long checksum = mode == "batch" ? BatchKernel(size, rounds, workers) : mode == "integer" ? IntegerKernel(size) :
+            long checksum = batch ? BatchKernel(size, rounds, workers, mode == "allocation-batch") : mode == "integer" ? IntegerKernel(size) :
                 mode == "array" ? ArrayKernel(values, rounds) : AllocationKernel(size, rounds);
             long elapsed = (Stopwatch.GetTimestamp() - started) * 1000 / Stopwatch.Frequency;
             if (checksum != expected)

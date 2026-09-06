@@ -57,20 +57,31 @@ The contracts are:
 - `batch`: sum the independent integer kernels with counts `n+j` for jobs
   `j = 0..r-1`. Changing each count prevents loop-invariant reuse of identical
   pure calls. Each job is independently checked by the logarithmic oracle.
+- `allocation-batch`: build and traverse one linked chain of `n+j` objects per
+  job, then sum the job results. Its oracle sums `(n+j)*(n+j-1)/2` independently
+  of the allocated graphs. It measures task-local allocation and collection;
+  only scalar checksums cross the join, not managed graphs.
 
 ## Multicore execution
 
-Both programs accept an optional worker limit for `batch`. Neri uses
+Both programs accept an optional worker limit for `batch` and `allocation-batch`. Neri uses
 `tasks.generate`; the C# reference uses a joined `Parallel.For`. Both use one
 result slot per job and a checked final reduction. The one-worker case is the
 ordinary sequential loop, so scaling includes the cost of introducing task
 execution. Scheduling, worker-result storage and the join are inside the timer.
 Neri creates and joins its worker threads per call; .NET may reuse pool threads.
+Neri's task completion reclaims unreachable child allocations inside the timer;
+.NET reclaims objects according to its own collection policy. No forced .NET
+collection normalizes this difference. The parallel memory workload tests the
+independent-heap motivation in
+[Hierarchical Memory Management for Parallel Programs (2016)](https://www.cs.cmu.edu/~rraghuna/publications/icfp-2016-hierarchical-memory-management-for-parallel-programs/paper.pdf),
+not a claim that Neri implements that paper's collector or inherits its proof.
 
 ```sh
 ./build/compute batch 2000000 64
 ./build/compute batch 2000000 64 4
 ./build/compute batch 2000000 64 14
+./build/compute allocation-batch 100000 64 14
 DOTNET_TieredCompilation=0 dotnet benchmarks/reference-dotnet/bin/Release/net10.0/Compute.dll batch 2000000 64 1
 DOTNET_TieredCompilation=0 dotnet benchmarks/reference-dotnet/bin/Release/net10.0/Compute.dll batch 2000000 64 4
 DOTNET_TieredCompilation=0 dotnet benchmarks/reference-dotnet/bin/Release/net10.0/Compute.dll batch 2000000 64 14
@@ -84,7 +95,7 @@ separately; emulation is not hardware performance evidence.
 
 ## Repeated native comparison
 
-`compute-matrix.hk` runs the four kernels in four configurations: Neri Release,
+`compute-matrix.hk` runs the five kernels in four configurations: Neri Release,
 default .NET JIT, optimized JIT with tiering disabled, and .NET NativeAOT. Each
 configuration occupies every position once across four independent process
 repetitions. Worker counts are powers of two up to a supplied limit, including
@@ -104,7 +115,8 @@ mkdir -p build/compute-results
 Build the native helper with `scripts/build.sh native-test` if it is unavailable.
 Use an empty output directory for each experiment. The matrix uses 20 million
 integer steps, a 4096-element array with 10000 rounds, 100000 allocations with
-16 rounds, and 64 batch jobs starting at 2 million steps. Round counts control
+16 rounds, 64 integer batch jobs starting at 2 million steps, and 64 allocation
+batch jobs starting at 100000 nodes. Round counts control
 timer quantization; compare only matching parameters. Each kernel invocation
 checks its result.
 
