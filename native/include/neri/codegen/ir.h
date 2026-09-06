@@ -88,6 +88,7 @@ struct import_declaration final {
   type result_type;
   std::uint8_t kind{};
   std::string link_name;
+  std::string native_library;
   std::uint32_t effects{};
   std::optional<runtime_requirement> minimum_runtime;
   std::optional<source_location> location;

@@ -310,6 +310,18 @@ void verify_constant(const constant &value, const type &expected,
   });
 }
 
+[[nodiscard]] bool native_library_name(std::string_view value) {
+  const auto alphanumeric = [](char character) {
+    return (character >= 'A' && character <= 'Z') ||
+           (character >= 'a' && character <= 'z') ||
+           (character >= '0' && character <= '9');
+  };
+  return !value.empty() && value.size() <= 128U && alphanumeric(value.front()) &&
+         std::ranges::all_of(value, [&](char character) {
+           return alphanumeric(character) || character == '_' || character == '-' || character == '.';
+         });
+}
+
 template <typename T, typename Projection>
 void require_unique_order(const std::vector<T> &values,
                           std::string_view description,
@@ -1427,7 +1439,7 @@ void verify_supported_module(const ir_module &value) {
            "Required feature '" + feature +
                "' is not a canonical feature identifier.");
     }
-    if (feature != "string-data-v1" && feature != "native-strings-v1") {
+    if (feature != "string-data-v1" && feature != "native-strings-v1" && feature != "native-libraries-v1") {
       fail(unsupported_feature,
            "Unknown required semantic feature '" + feature + "'.");
     }
@@ -1607,6 +1619,11 @@ void verify_supported_module(const ir_module &value) {
     }
     if (!printable_ascii_symbol(import.link_name)) {
       fail(malformed_module, "Import link name is not printable ASCII.");
+    }
+    if (!import.native_library.empty() &&
+        (import.kind != NERI_IR_IMPORT_C_ABI_V1 || !native_library_name(import.native_library) ||
+         std::ranges::find(value.required_features, "native-libraries-v1") == value.required_features.end())) {
+      fail(invalid_type, "Native library requires a C ABI import, a portable library name, and native-libraries-v1.");
     }
     if (import.kind == NERI_IR_IMPORT_RUNTIME_V1) {
       if (!import.minimum_runtime.has_value() ||

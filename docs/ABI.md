@@ -54,7 +54,10 @@ Runtime contract failures panic; no exception unwinds into Neri code.
 
 ## IR transport
 
-The compiler emits canonical Neri IR and transport 1.1. The transport header
+The compiler emits canonical Neri IR with transport 1.1, or 1.2 when external
+library metadata is present. The `native-libraries-v1` feature adds a library
+name after each import's source location; empty names retain platform-default
+symbol resolution. Only C ABI imports may declare a library. The transport header
 includes versions, flags, payload size and a SHA-256 digest. The native reader
 validates the envelope and the typed program before constructing LLVM objects.
 Malformed, unsupported and incompatible inputs produce stable NIR diagnostics.

@@ -174,7 +174,7 @@ void test_envelope_rejections(const std::vector<std::uint8_t> &valid) {
   expect_error(malformed, "NIR001");
 
   malformed = valid;
-  write_u16(malformed, NERI_IR_VERSION_MINOR_OFFSET_V1, 2U);
+  write_u16(malformed, NERI_IR_VERSION_MINOR_OFFSET_V1, NERI_IR_TRANSPORT_MINOR_V1 + 1U);
   expect_error(malformed, "NIR002");
 
   malformed = valid;

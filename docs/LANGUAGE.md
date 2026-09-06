@@ -224,6 +224,27 @@ lexical scope. The owner remains alive and its address stable. The pointer canno
 escape the scope or acquire ownership. `@cabi("symbol")` on an empty unsafe
 function declaration imports a C symbol with supported scalar and pointer types.
 
+`@library("name")` on a C ABI declaration adds its external library when linking
+an executable that imports the function. The name is passed as one `-lname`
+argument, with duplicates removed. Names contain ASCII letters, digits, `_`,
+`-`, or `.`, start with a letter or digit, and have at most 128 bytes. Library
+names are not paths or linker options. Install the library separately; the
+compiler does not download dependencies. `NERI_LIBRARY_PATH` adds one absolute
+library search directory and embeds it as a runtime search path; macOS ARM64
+defaults to `/opt/homebrew/lib`. The platform
+linker's standard directories remain available. Shared libraries must also be
+available to the operating system's loader when running the program.
+
+```ruby
+@library("m")
+@cabi("cos")
+def unsafe cosine(value: Float): Float
+end
+```
+
+Neri IR preserves library declarations through the `native-libraries-v1`
+feature in transport 1.2. Modules without this feature retain transport 1.1.
+
 The runtime [ABI and collection contract](ABI.md) defines roots and allocation
 boundaries. Bounds and arithmetic failures panic with exit status 70. Compile
 errors produce diagnostics and prevent artifact emission.

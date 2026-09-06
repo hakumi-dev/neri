@@ -5,7 +5,7 @@
 
 /* Canonical Neri IR transport v1 constants. Never parse the header by casting a C struct. */
 #define NERI_IR_TRANSPORT_MAJOR_V1 UINT16_C(1)
-#define NERI_IR_TRANSPORT_MINOR_V1 UINT16_C(1)
+#define NERI_IR_TRANSPORT_MINOR_V1 UINT16_C(2)
 #define NERI_IR_HEADER_SIZE_V1 UINT32_C(56)
 #define NERI_IR_DIGEST_SIZE_V1 UINT32_C(32)
 #define NERI_IR_VERSION_MAJOR_OFFSET_V1 UINT32_C(8)

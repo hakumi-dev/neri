@@ -310,6 +310,12 @@ public:
     result.id = identity("Module identity");
     result.required_features = read_vector<std::string>(
         input_, "required features", [this] { return input_.utf8(); });
+    for (const auto &feature : result.required_features) {
+      if (feature == "native-libraries-v1") native_libraries_ = true;
+    }
+    if (native_libraries_ && transport_minor_ < 2U) {
+      fail(unsupported_feature, "Native libraries require IR transport 1.2.", input_.offset());
+    }
     result.sources = read_vector<source>(input_, "sources",
                                          [this] { return read_source(); });
     result.classes = read_vector<class_declaration>(
@@ -505,6 +511,7 @@ private:
       return runtime_requirement{input_.u16(), input_.u16(), input_.u64()};
     });
     result.location = read_location();
+    if (native_libraries_) result.native_library = input_.utf8();
     return result;
   }
 
@@ -659,6 +666,7 @@ private:
   cursor input_;
   const reader_options &options_;
   std::uint16_t transport_minor_{};
+  bool native_libraries_{};
 };
 
 void validate_options(const reader_options &options) {
