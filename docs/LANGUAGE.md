@@ -283,6 +283,40 @@ capture. Callback signatures contain safe value types, and an unsafe enclosing
 block does not grant unsafe access inside a callback. Unsafe and C ABI functions
 require an explicitly written callback wrapper with its own unsafe block.
 
+### Shared callbacks
+
+`shared fn(Parameters): Result` gives a callback read-only access through its
+captures. Managed captures are transitive views of the same objects, not copies.
+Captured `this`, arrays and nested closures obey the same rule. A captured
+callback can be invoked only when it also has a shared contract. Local variables,
+newly created objects and explicitly mutable arguments retain their ordinary
+mutability.
+
+```neri
+def apply(value: Int, callback: shared fn(Int): Int): Int
+  return callback(value)
+end
+
+def main(): Void
+  let offset = 3
+  let result = apply(7) do |value|
+    return value + offset
+  end
+end
+```
+
+The expected type supplies the shared contract to a `do` block, closure or named
+function value. A shared callback can be assigned to an ordinary function type
+with the same parameters and result. An ordinary callback value cannot be
+upgraded by assignment or cast. A readonly view of a shared callback remains
+invocable; a readonly view of an ordinary callback does not establish a shared
+contract.
+
+This is a capture-access contract, not a purity or synchronization guarantee.
+Sequential aliases may still modify the captured objects, and callbacks may
+perform I/O. Shared callbacks alone do not freeze an object graph, establish a
+task lifetime or authorize concurrent native-service access.
+
 ## Unsafe and memory boundary
 
 ### Explicit-width numbers

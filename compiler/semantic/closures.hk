@@ -1,8 +1,8 @@
 use host
 
 # Function signatures share a hidden managed class and one virtual call slot.
-def semanticFunctionType(owner: BootstrapBinder, parameters: StringBuffer, result: String, node: Int): SemanticClass
-  var name = "fn("
+def semanticFunctionType(owner: BootstrapBinder, parameters: StringBuffer, result: String, node: Int, shared: Bool = false): SemanticClass
+  var name = shared ? "shared fn(" : "fn("
   var index = 0
   while index < parameters.size
     if parameters.get(index) == "Void" || semanticContainsPointer(parameters.get(index))
@@ -24,7 +24,12 @@ def semanticFunctionType(owner: BootstrapBinder, parameters: StringBuffer, resul
   end
   let signature = new SemanticClass(name, name, "", "internal", node)
   signature.isFunctionType = true
+  signature.isSharedFunction = shared
+  if shared
+    signature.baseName = semanticFunctionType(owner, parameters, result, node).fullName
+  end
   let invoke = new SemanticCallable(name + ".invoke", "invoke", "", name, result, false, false, "public", node)
+  invoke.isReadonly = shared
   index = 0
   while index < parameters.size
     let parameterName = "argument" + (index as String)
@@ -35,6 +40,15 @@ def semanticFunctionType(owner: BootstrapBinder, parameters: StringBuffer, resul
   signature.addMethod(invoke)
   owner.model.addClass(signature)
   return signature
+end
+
+def semanticExpectedFunction(body: BootstrapBodyBinder, expectedType: String): SemanticClass?
+  let value = semanticIsOptional(expectedType) ? semanticInnerType(expectedType) : expectedType
+  let signature = body.model().findClass(semanticMutableType(value))
+  if signature != null && signature.isFunctionType
+    return signature
+  end
+  return null
 end
 
 def closureHasVariable(body: BootstrapBodyBinder, name: String): Bool
@@ -81,6 +95,9 @@ def bindCapture(body: BootstrapBodyBinder, node: Int, name: String): BoundValue
   else if value.typeName == "Void"
     body.report("NR211", node, "A closure cannot capture a Void result.")
   end
+  if closure.isSharedFunction
+    value = new BoundValue(semanticReadView(value.typeName), value.boundNode)
+  end
   let fieldName = "capture" + (body.captureNames.size as String)
   closure.addField(new SemanticField(closure.fullName, fieldName, value.typeName, "private", node))
   body.captureNames.add(name)
@@ -91,7 +108,7 @@ end
 
 def bindClosure(body: BootstrapBodyBinder, node: Int, expectedType: String): BoundValue
   let count = semanticIntField(body.syntax().dataAt(node), 0)
-  let expectedClass = body.model().findClass(semanticIsOptional(expectedType) ? semanticInnerType(expectedType) : expectedType)
+  let expectedClass = semanticExpectedFunction(body, expectedType)
   var expected: SemanticCallable? = null
   if expectedClass != null && expectedClass.isFunctionType
     expected = expectedClass.firstMethod
@@ -126,13 +143,16 @@ def bindClosure(body: BootstrapBodyBinder, node: Int, expectedType: String): Bou
   else
     body.report("NR212", node, "Callback return type requires an annotation or an expected function type.")
   end
-  let signature = semanticFunctionType(body.owner, parameterTypes, result, node)
+  let shared = expectedClass != null && expectedClass.isSharedFunction
+  let signature = semanticFunctionType(body.owner, parameterTypes, result, node, shared)
   let name = "$closure" + (body.model().nextClosureId as String)
   body.model().nextClosureId = body.model().nextClosureId + 1
   let closure = new SemanticClass(name, name, body.owner.currentNamespace, "internal", node)
   closure.isClosure = true
+  closure.isSharedFunction = shared
   closure.baseName = signature.fullName
   let invoke = new SemanticCallable(name + ".invoke", "invoke", body.owner.currentNamespace, name, result, false, false, "public", node)
+  invoke.isReadonly = shared
   invoke.bodyStart = count + 1
   invoke.bodyCount = body.syntax().childCountAt(node) - invoke.bodyStart
   index = 0
@@ -167,10 +187,10 @@ def bindClosure(body: BootstrapBodyBinder, node: Int, expectedType: String): Bou
 end
 
 def bindFunctionCall(body: BootstrapBodyBinder, node: Int, value: BoundValue): BoundValue
-  if semanticIsReadonly(value.typeName)
+  let signature = body.model().findClass(semanticMutableType(value.typeName))
+  if semanticIsReadonly(value.typeName) && (signature == null || !signature.isSharedFunction)
     body.report("NR240", node, "A readonly callback view cannot invoke mutable captures.")
   end
-  let signature = body.model().findClass(value.typeName)
   if signature != null && signature.isFunctionType
     let invoke = signature.firstMethod
     if invoke != null
@@ -185,7 +205,7 @@ def bindFunctionCall(body: BootstrapBodyBinder, node: Int, value: BoundValue): B
   return new BoundValue("Error", body.addBound("ErrorExpression", "Error", "", node, emptyInts()))
 end
 
-def bindFunctionValue(body: BootstrapBodyBinder, node: Int, function: SemanticCallable): BoundValue
+def bindFunctionValue(body: BootstrapBodyBinder, node: Int, function: SemanticCallable, expectedType: String = ""): BoundValue
   if function.isUnsafe || function.cAbiSymbol != ""
     body.report("NR212", node, "Unsafe and C ABI functions require an explicit safe callback wrapper.")
   end
@@ -195,13 +215,17 @@ def bindFunctionValue(body: BootstrapBodyBinder, node: Int, function: SemanticCa
     parameters.add(parameter.typeName)
     parameter = parameter.nextParameter
   end
-  let signature = semanticFunctionType(body.owner, parameters, function.returnType, node)
-  let name = "$function." + function.fullName
+  let expected = semanticExpectedFunction(body, expectedType)
+  let shared = expected != null && expected.isSharedFunction
+  let signature = semanticFunctionType(body.owner, parameters, function.returnType, node, shared)
+  let name = (shared ? "$shared-function." : "$function.") + function.fullName
   if body.model().findClass(name) == null
     let closure = new SemanticClass(name, name, "", "internal", node)
     closure.isClosure = true
+    closure.isSharedFunction = shared
     closure.baseName = signature.fullName
     let invoke = new SemanticCallable(name + ".invoke", "invoke", "", name, function.returnType, false, false, "public", node)
+    invoke.isReadonly = shared
     var arguments: Int[] = []
     parameter = function.firstParameter
     while parameter != null

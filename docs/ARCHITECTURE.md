@@ -107,6 +107,9 @@ borrows to have ended and reclaims all task-owned allocations. Managed results
 cannot escape this boundary. Callbacks are trusted native code; direct pointer
 writes are outside these checks. This boundary supplies no scheduler or language
 capture checking. A closure retaining an object does not make it safe to share.
+The frontend's `shared fn` contract restricts access through captured references;
+it does not connect a callback to this native task boundary or check parallel
+effects and result transfer.
 The ABI reserves but does not advertise multiple-mutator support; safe Neri has
 no task, atomic, transfer or synchronization API.
 
