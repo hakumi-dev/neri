@@ -5,8 +5,8 @@ with an installed toolchain, start with the [installation instructions](../READM
 
 ## Requirements
 
-The bootstrap host is macOS on Apple silicon. Install the Xcode Command Line Tools
-and these dependencies:
+The bootstrap host is macOS on Apple silicon. Install the Xcode Command Line
+Tools and these dependencies:
 
 - LLVM 22.1.8 and zstd.
 - CMake 3.28 or newer and Ninja 1.11 or newer.
@@ -15,6 +15,11 @@ and these dependencies:
 ```sh
 brew install llvm@22 zstd cmake ninja
 ```
+
+For native Windows x86-64 builds, use the [Windows build guide](WINDOWS.md).
+It covers the PowerShell 7 entry point, Visual Studio C++ and Windows SDK
+requirements, the pinned LLVM and GitHub Actions seed downloads, and the
+Windows CMake presets.
 
 Clone the source from GitHub, then run the following commands from its root:
 

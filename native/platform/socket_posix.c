@@ -1,6 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 #define _DARWIN_C_SOURCE
-// Platform layouts and constants only. Ownership, retries and deadlines live in Neri.
+// POSIX layouts and constants only. Ownership, retries and deadlines live in Neri.
 #include "neri/runtime_abi.h"
 #include <errno.h>
 #include <limits.h>

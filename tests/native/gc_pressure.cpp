@@ -4,7 +4,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
+#if defined(_WIN32)
+#include <windows.h>
+#include <psapi.h>
+#else
 #include <sys/resource.h>
+#endif
 
 namespace {
 constexpr std::size_t payload_bytes = 64 * 1024;
@@ -66,6 +71,11 @@ int main() {
   neri_rt_v1_gc_root_frame_leave(&frame);
   neri_rt_v1_shutdown();
   std::sort(samples.begin(), samples.end());
+#if defined(_WIN32)
+  PROCESS_MEMORY_COUNTERS usage{};
+  if (!GetProcessMemoryInfo(GetCurrentProcess(), &usage, sizeof(usage))) return 1;
+  const auto rss_bytes = usage.PeakWorkingSetSize;
+#else
   rusage usage{};
   if (getrusage(RUSAGE_SELF, &usage) != 0) return 1;
 #if defined(__APPLE__)
@@ -73,12 +83,13 @@ int main() {
 #else
   const auto rss_bytes = usage.ru_maxrss * 1024;
 #endif
+#endif
   std::printf("{\"workload\":\"gc-pressure\",\"allocated_payload_bytes\":%zu,"
-      "\"peak_managed_bytes\":%llu,\"automatic_collections\":%llu,\"peak_rss_bytes\":%ld,"
+      "\"peak_managed_bytes\":%llu,\"automatic_collections\":%llu,\"peak_rss_bytes\":%llu,"
       "\"seconds\":%.6f,\"allocation_us_p50\":%.3f,\"allocation_us_p95\":%.3f,"
       "\"allocation_us_p99\":%.3f,\"allocation_us_max\":%.3f}\n",
       allocations * payload_bytes, static_cast<unsigned long long>(peak_heap),
-      static_cast<unsigned long long>(automatic_collections), rss_bytes, elapsed,
+      static_cast<unsigned long long>(automatic_collections), static_cast<unsigned long long>(rss_bytes), elapsed,
       samples[allocations / 2], samples[allocations * 95 / 100],
       samples[allocations * 99 / 100], samples.back());
   // A long-lived process must reclaim garbage before allocation failure. This

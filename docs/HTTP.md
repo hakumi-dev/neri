@@ -109,7 +109,7 @@ the Neri library closes each accepted descriptor explicitly.
 
 Protocol parsing, response construction, retries, deadlines, and descriptor
 ownership are implemented in [Neri](../stdlib/http.hk). A small
-[C adapter](../native/runtime/socket.c) supplies platform socket layouts,
+[C adapter](../native/platform/socket_posix.c) supplies platform socket layouts,
 constants, monotonic time, and individual system calls. These unsafe imports
 require runtime ABI 1.7 and the sockets feature. The toolchain includes and
 checksums the standard-library source alongside its native artifacts.

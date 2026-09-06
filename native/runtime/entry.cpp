@@ -2,6 +2,12 @@
 
 #include <cstdint>
 #include <cstring>
+#if defined(_WIN32)
+#include "../platform/windows_support.h"
+#include <shellapi.h>
+#include <io.h>
+#include <fcntl.h>
+#endif
 
 extern "C" void hk1_f_q1_n4_6d61696e__p0_rv(void);
 
@@ -35,6 +41,23 @@ namespace {
 } // namespace
 
 int main(int argc, char **argv) {
+#if defined(_WIN32)
+  // The LSP byte counts and UTF-8 console output must not undergo CRLF conversion.
+  _setmode(_fileno(stdin), _O_BINARY);
+  _setmode(_fileno(stdout), _O_BINARY);
+  _setmode(_fileno(stderr), _O_BINARY);
+  int wide_count = 0;
+  auto **wide_args = CommandLineToArgvW(GetCommandLineW(), &wide_count);
+  if (!wide_args) return 1;
+  std::vector<std::string> storage;
+  for (int index = 0; index < wide_count; ++index) storage.push_back(neri::windows::utf8(wide_args[index]));
+  LocalFree(wide_args);
+  std::vector<char *> arguments;
+  for (auto &argument : storage) arguments.push_back(argument.data());
+  arguments.push_back(nullptr);
+  argc = wide_count;
+  argv = arguments.data();
+#endif
   volatile unsigned char abi_anchor = neri_rt_v1_abi_anchor;
   static_cast<void>(abi_anchor);
   const auto status =

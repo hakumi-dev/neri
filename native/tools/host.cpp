@@ -12,20 +12,28 @@
 #include <thread>
 #include <vector>
 #include <fcntl.h>
+#include "neri/host_path.h"
+#if defined(_WIN32)
+#include "../platform/windows_support.h"
+#include <psapi.h>
+#else
 #include <spawn.h>
 #include <sys/wait.h>
 #include <sys/resource.h>
 #include <unistd.h>
 
 extern char **environ;
+#endif
 
 namespace {
+#if !defined(_WIN32)
 void check(int error, const char *operation) {
   if (error != 0) throw std::runtime_error(std::string(operation) + ": " + std::strerror(error));
 }
+#endif
 
 void write(const std::string &path, const std::string &value) {
-  std::ofstream stream(path, std::ios::binary | std::ios::trunc);
+  std::ofstream stream(neri::host_path(path), std::ios::binary | std::ios::trunc);
   stream << value;
   stream.close();
   if (!stream) throw std::runtime_error("cannot write " + path);
@@ -33,9 +41,9 @@ void write(const std::string &path, const std::string &value) {
 
 void list_files(const char *root, const char *suffix, const char *output) {
   std::vector<std::string> paths;
-  for (const auto &entry : std::filesystem::recursive_directory_iterator(root)) {
+  for (const auto &entry : std::filesystem::recursive_directory_iterator(neri::host_path(root))) {
     if (!entry.is_regular_file()) continue;
-    const auto path = entry.path().string();
+    const auto path = neri::path_text(entry.path());
     if (!path.ends_with(suffix)) continue;
     if (path.find('\n') != std::string::npos || path.find('\r') != std::string::npos)
       throw std::runtime_error("file names must not contain line separators");
@@ -48,15 +56,15 @@ void list_files(const char *root, const char *suffix, const char *output) {
 }
 
 bool generated_directory(const std::filesystem::path &path) {
-  const auto name = path.filename().string();
+  const auto name = neri::path_text(path.filename());
   return name == ".git" || name == ".neri" || name == ".cache" || name == ".idea" ||
       name == ".bootstrap" || name == "build" || name == "out" || name == "dist" ||
       name == "target" || name == "bin";
 }
 
 std::filesystem::path project_source_root(const char *project, const char *relative) {
-  const std::filesystem::path project_root = std::filesystem::absolute(project);
-  const std::filesystem::path suffix(relative);
+  const std::filesystem::path project_root = std::filesystem::absolute(neri::host_path(project));
+  const std::filesystem::path suffix = neri::host_path(relative);
   if (suffix.empty() || suffix.is_absolute())
     throw std::runtime_error("project source root must be relative");
   if (std::filesystem::is_symlink(std::filesystem::symlink_status(project_root)))
@@ -64,7 +72,7 @@ std::filesystem::path project_source_root(const char *project, const char *relat
   if (suffix == ".") return project_root;
   std::filesystem::path root = project_root;
   for (const auto &component : suffix) {
-    const auto name = component.string();
+    const auto name = neri::path_text(component);
     if (name.empty() || name == "." || name == "..")
       throw std::runtime_error("project source root contains traversal");
     root /= component;
@@ -98,7 +106,7 @@ void list_project_files(const char *project, const char *relative, const char *s
       continue;
     }
     if (!entry->is_regular_file()) continue;
-    const auto path = entry->path().string();
+    const auto path = neri::path_text(entry->path());
     if (!path.ends_with(suffix)) continue;
     if (path.find('\n') != std::string::npos || path.find('\r') != std::string::npos)
       throw std::runtime_error("file names must not contain line separators");
@@ -112,10 +120,10 @@ void list_project_files(const char *project, const char *relative, const char *s
 
 void canonical_path(const char *path, const char *output) {
   std::error_code error;
-  const auto canonical = std::filesystem::weakly_canonical(path, error);
+  const auto canonical = std::filesystem::weakly_canonical(neri::host_path(path), error);
   if (error || canonical.empty())
     throw std::runtime_error("cannot canonicalize project path");
-  write(output, canonical.string());
+  write(output, neri::path_text(canonical));
 }
 
 void stamp(const char *root, const char *epoch) {
@@ -123,7 +131,11 @@ void stamp(const char *root, const char *epoch) {
   const auto seconds = std::stoll(epoch, &consumed);
   if (consumed != std::strlen(epoch) || seconds < 0)
     throw std::runtime_error("invalid timestamp");
+#if defined(_WIN32)
+  const auto time = std::chrono::clock_cast<std::filesystem::file_time_type::clock>(
+#else
   const auto time = std::filesystem::file_time_type::clock::from_sys(
+#endif
       std::chrono::system_clock::time_point(std::chrono::seconds(seconds)));
   for (const auto &entry : std::filesystem::recursive_directory_iterator(root)) {
     if (entry.is_symlink()) throw std::runtime_error("timestamp tree contains a symlink");
@@ -135,6 +147,9 @@ void stamp(const char *root, const char *epoch) {
 // stdout/stderr are separate files, stdin is EOF, and the complete child process
 // group is terminated at the deadline. The result file distinguishes signals,
 // ordinary exits, and timeout (124); helper failures return nonzero themselves.
+#if defined(_WIN32)
+#include "host_windows.inc"
+#else
 void run(int argc, char **argv) {
   if (argc < 7) throw std::runtime_error("run <seconds> <stdout> <stderr> <status> <executable> [args...]");
   std::size_t consumed = 0;
@@ -203,15 +218,26 @@ void run(int argc, char **argv) {
   posix_spawn_file_actions_destroy(&actions);
   posix_spawnattr_destroy(&attributes);
 }
+#endif
 }
 
 int main(int argc, char **argv) {
   try {
+#if defined(_WIN32)
+    neri::windows::command_arguments arguments;
+    argc = static_cast<int>(arguments.storage.size());
+    argv = arguments.pointers.data();
+#endif
     if (argc == 5 && std::string(argv[1]) == "list") list_files(argv[2], argv[3], argv[4]);
     else if (argc == 6 && std::string(argv[1]) == "list-project") list_project_files(argv[2], argv[3], argv[4], argv[5]);
     else if (argc == 4 && std::string(argv[1]) == "canonical-path") canonical_path(argv[2], argv[3]);
     else if (argc == 4 && std::string(argv[1]) == "stamp") stamp(argv[2], argv[3]);
     else if (argc == 4 && std::string(argv[1]) == "replace") std::filesystem::rename(argv[2], argv[3]);
+    else if (argc == 3 && std::string(argv[1]) == "remove-directory") {
+      const auto directory = neri::host_path(argv[2]);
+      if (!std::filesystem::is_directory(directory) || !std::filesystem::remove(directory))
+        throw std::runtime_error("cannot remove empty directory");
+    }
     else if (argc >= 7 && std::string(argv[1]) == "run") run(argc, argv);
     else throw std::runtime_error("expected list <root> <suffix> <output>, or run");
     return 0;

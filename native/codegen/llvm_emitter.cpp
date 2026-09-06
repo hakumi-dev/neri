@@ -1,4 +1,5 @@
 #include "neri/codegen/emitter.h"
+#include "neri/host_path.h"
 
 #include "llvm_lowering.h"
 
@@ -151,6 +152,7 @@ codegen_error::codegen_error(std::string code, std::string message)
 const std::string &codegen_error::code() const noexcept { return code_; }
 
 target_platform parse_target(std::string_view value) {
+  if (value == "windows-x86_64") return target_platform::windows_x86_64;
   if (value == target_name(target_platform::macos_arm64)) {
     return target_platform::macos_arm64;
   }
@@ -159,7 +161,7 @@ target_platform parse_target(std::string_view value) {
   }
   throw codegen_error(
       std::string(driver_error), "Unsupported target '" + std::string(value) +
-                                     "'; expected macos-arm64 or linux-x86_64.");
+                                     "'; expected macos-arm64, linux-x86_64 or windows-x86_64.");
 }
 
 optimization_mode parse_optimization(std::string_view value) {
@@ -191,6 +193,8 @@ output_kind parse_output_kind(std::string_view value) {
 
 std::string_view target_name(target_platform target) noexcept {
   switch (target) {
+  case target_platform::windows_x86_64:
+    return "windows-x86_64";
   case target_platform::macos_arm64:
     return "macos-arm64";
   case target_platform::linux_x86_64:
@@ -201,6 +205,8 @@ std::string_view target_name(target_platform target) noexcept {
 
 std::string_view target_triple(target_platform target) noexcept {
   switch (target) {
+  case target_platform::windows_x86_64:
+    return "x86_64-pc-windows-msvc";
   case target_platform::macos_arm64:
     // The deployment version makes LLVM emit the Mach-O platform load command.
     return "arm64-apple-macosx15.0.0";
@@ -280,14 +286,14 @@ void write_artifact_atomically(const std::filesystem::path &path,
                         "Output path must name a file.");
   }
 
-  const auto model = path.string() + ".tmp-%%%%%%";
+  const auto model = neri::path_text(path) + ".tmp-%%%%%%";
   int descriptor = -1;
   llvm::SmallString<256> temporary;
   if (const auto error =
           llvm::sys::fs::createUniqueFile(model, descriptor, temporary)) {
     throw codegen_error(std::string(output_error),
                         "Cannot create an atomic output beside '" +
-                            path.string() + "': " + error.message());
+                            neri::path_text(path) + "': " + error.message());
   }
 
   std::error_code write_error;
@@ -303,13 +309,13 @@ void write_artifact_atomically(const std::filesystem::path &path,
   if (write_error) {
     static_cast<void>(llvm::sys::fs::remove(temporary));
     throw codegen_error(std::string(output_error),
-                        "Cannot write output '" + path.string() + "': " +
+                        "Cannot write output '" + neri::path_text(path) + "': " +
                             write_error.message());
   }
-  if (const auto error = llvm::sys::fs::rename(temporary, path.string())) {
+  if (const auto error = llvm::sys::fs::rename(temporary, neri::path_text(path))) {
     static_cast<void>(llvm::sys::fs::remove(temporary));
     throw codegen_error(std::string(output_error),
-                        "Cannot publish output '" + path.string() + "': " +
+                        "Cannot publish output '" + neri::path_text(path) + "': " +
                             error.message());
   }
 }

@@ -5,7 +5,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
-#include <pthread.h>
+#include <new>
+#include <system_error>
 #include <thread>
 
 namespace {
@@ -165,13 +166,15 @@ extern "C" void neri_task_parallel_for(uint64_t count, uint32_t parallelism,
       std::min(parallelism, hardware), std::max(uint64_t{1}, count)));
   executor pool{limit};
   auto *threads = limit == 1 ? nullptr
-      : static_cast<pthread_t *>(std::calloc(limit - 1, sizeof(pthread_t)));
+      : new (std::nothrow) std::thread[limit - 1];
   if (limit > 1 && threads == nullptr) {
     fail(NERI_PANIC_OUT_OF_MEMORY_V1, "task worker allocation failed");
   }
   active_executor = &pool;
   for (uint32_t index = 0; index + 1 < limit; ++index) {
-    if (pthread_create(&threads[index], nullptr, worker, &pool) != 0) {
+    try {
+      threads[index] = std::thread(worker, &pool);
+    } catch (const std::system_error &) {
       fail(NERI_PANIC_OUT_OF_MEMORY_V1, "task worker creation failed");
     }
   }
@@ -182,10 +185,12 @@ extern "C" void neri_task_parallel_for(uint64_t count, uint32_t parallelism,
     pool.changed.notify_all();
   }
   for (uint32_t index = 0; index + 1 < limit; ++index) {
-    if (pthread_join(threads[index], nullptr) != 0) {
+    try {
+      threads[index].join();
+    } catch (const std::system_error &) {
       fail(NERI_PANIC_RUNTIME_CONTRACT_V1, "task worker join failed");
     }
   }
   active_executor = nullptr;
-  std::free(threads);
+  delete[] threads;
 }
