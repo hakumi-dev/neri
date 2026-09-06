@@ -67,16 +67,23 @@ neri --version
 
 Add the PATH setting to your shell configuration to keep it across sessions.
 
-`install.sh [--prefix <directory>]` installs under `~/.neri` by default.
-`scripts/build.sh install [--prefix <directory>]` builds and verifies a package,
+`install.sh [--prefix <directory>] [--no-doc]` installs under `~/.neri` by default.
+`--no-doc` may be combined with `--prefix` in either order; it installs the compiler,
+runtime, examples, and required standard-library `.hk` sources without packaged
+documentation or `stdlib/documentation.json`. `scripts/build.sh install [--prefix <directory>]`
+builds and verifies a package,
 then invokes the same installer. Installation policy lives in `tooling/install.hk`;
 the shell launcher locates the package and starts that binary.
 
 The installer verifies artifact hashes before and after copying, stores the package
-under `toolchains/<artifact-manifest-sha256>`, and atomically replaces `bin/neri`
+under `toolchains/<installed-artifact-manifest-sha256>`, and atomically replaces `bin/neri`
 with a relative symlink. Existing versions remain available. Reinstallation verifies
 the existing version; unrelated executables and symlinks are preserved by refusing
 to replace them. The launcher resolves its symlink before locating its native tools.
+Each installed tree preserves the distributed `PACKAGE-ARTIFACTS.sha256`; its
+`INSTALLATION.json` records that package-manifest hash, the installed-manifest hash,
+and whether documentation was included. `PROVENANCE.json` remains the provenance of
+the original distributed package.
 The install prefix's `bin` directory belongs in `PATH`; shell configuration is
 managed by the user. Removing that symlink disables the installation, and individual
 unused toolchain directories can be removed independently.

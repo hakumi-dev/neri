@@ -69,8 +69,8 @@ ctest --preset linux-debug
 The same commands accept `linux-release`, `linux-sanitize` (ASan/UBSan), and
 `linux-thread-sanitize` (TSan). Run sanitizer configurations separately.
 These profiles cover the C/C++ backend and runtime, not the self-hosted `.hk`
-compiler. There is currently no Neri language server or editor grammar in this
-repository; C++ completion does not provide semantic completion for `.hk` files.
+compiler. Semantic editor support for `.hk` files is provided by the
+[Neri language server](LANGUAGE-SERVER.md); C++ completion is independent of it.
 The `.editorconfig` uses two-space indentation, UTF-8 and LF line endings.
 See [Linux setup from GitHub](LINUX.md) for dependencies and the remaining
 installation instructions.
@@ -97,4 +97,6 @@ Packaging runs the full validation suite and produces two byte-identical archive
 Verified packages are stored in `build/packages/` with their SHA-256 in the filename.
 Installation builds and validates a package, then installs it under `~/.neri` by
 default. `scripts/build.sh install --prefix /your/directory` selects another prefix.
+The standalone installer accepts `--no-doc` together with `--prefix` in either
+order when the packaged documentation and documentation sidecar are not needed.
 See [packaging and installation](PACKAGING.md) for integrity checks and PATH setup.

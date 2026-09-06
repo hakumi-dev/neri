@@ -6,6 +6,10 @@ language fixtures through the resulting compiler. `--debug` selects Debug native
 components and Debug compilation of language fixtures. The compiler bootstrap
 itself uses Release output for canonical generation comparisons.
 
+The full suite also uses a native C stdio client to exercise
+`neri lsp` against the freshly built compiler. See the
+[language-server contract](../docs/LANGUAGE-SERVER.md) for scope and standalone commands.
+
 `smoke-test` selects the documented run/argument contracts; `negative-test` selects
 compiler diagnostics and runtime panics. Both commands first build a current
 fixed-point compiler and preserve the published toolchain. `native-test` selects
