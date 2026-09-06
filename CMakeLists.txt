@@ -2,6 +2,10 @@ cmake_minimum_required(VERSION 3.28)
 
 project(NeriNative LANGUAGES C CXX)
 
+if(NOT CMAKE_BUILD_TYPE MATCHES "^(Debug|Release|RelWithDebInfo|MinSizeRel)$")
+  message(FATAL_ERROR "Set CMAKE_BUILD_TYPE explicitly (for example Release or Debug).")
+endif()
+
 file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/VERSION" NERI_VERSION LIMIT_COUNT 1)
 set(NERI_LLVM_VERSION "22.1.8" CACHE INTERNAL "Pinned LLVM version" FORCE)
 

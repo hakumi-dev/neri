@@ -31,6 +31,10 @@ same runtime operations and preserve the canonical import identity.
 
 Every compiler process receives the current native artifact paths, the pinned LLVM linker, the macOS SDK path, a C locale, UTC, and the host `PATH`. Any unexplained difference fails the bootstrap. Native configuration independently checks Clang/LLVM and Ninja versions.
 
+Native builds require an explicit CMake build type. Seed preparation and the
+Neri driver use the same absolute compiler paths under `LLVM_PREFIX`, preserving
+the compiler identity and Release configuration across native build invocations.
+
 The pinned seed requires the `0.1.0-dev` toolchain label in its runtime manifest.
 Native builds generate a seed-only compatibility manifest with that label and
 the current artifact, ABI and feature values. Only trusted-seed compiler calls
