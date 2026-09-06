@@ -148,6 +148,7 @@ specified configurations, not a ranking of languages.
 | [ARM64 matrix](compute-matrix-macos-arm64.json) | 112 processes, 784 checked kernel samples, M4 Pro. |
 | [Runtime-pinned ARM64 matrix](compute-matrix-macos-arm64-pinned.json) | 112 processes with actual .NET runtime identity and substantial host variability. |
 | [Native x86-64 matrix](compute-matrix-linux-x86_64.json) | 88 processes, 616 checked samples, four-vCPU AMD EPYC VM. |
+| [Scoped-task ARM64 matrix](scoped-tasks-macos-arm64.json) | 128 processes, 896 checked samples, Neri and .NET worker limits 1, 2, 4, 8 and 14. |
 
 Summarize each process by its median, then compare those process summaries.
 Keep process and kernel timers separate. Absolute times require matching workload
