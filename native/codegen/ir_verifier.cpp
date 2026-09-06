@@ -2,6 +2,7 @@
 
 #include "neri/codegen/reader.h"
 #include "neri/ir_transport.h"
+#include "numeric_types.h"
 
 #include <llvm/Support/ConvertUTF.h>
 
@@ -95,8 +96,8 @@ constexpr std::string_view invalid_source = "NIR010";
 }
 
 [[nodiscard]] bool is_scalar(const type &value) {
-  return value.tag >= NERI_IR_TYPE_BOOL_V1 &&
-         value.tag <= NERI_IR_TYPE_FLOAT_V1 && !value.symbol.has_value() &&
+  return ((value.tag >= NERI_IR_TYPE_BOOL_V1 &&
+         value.tag <= NERI_IR_TYPE_FLOAT_V1) || extended_scalar(value.tag)) && !value.symbol.has_value() &&
          value.arguments.empty();
 }
 
@@ -397,6 +398,9 @@ struct found_field final {
 void require_declared_type(const ir_module &module, const type &value,
                            std::string_view description) {
   require_value_type(value, description);
+  if (extended_scalar(value.tag) &&
+      std::ranges::find(module.required_features, "extended-scalars-v1") == module.required_features.end())
+    fail(unsupported_feature, "Extended scalar types require extended-scalars-v1.");
   if (is_class(value) && find_class(module, *value.symbol) == nullptr) {
     fail(invalid_reference,
          std::string(description) + " references a missing class.");
@@ -620,6 +624,8 @@ void require_binary(const function_context &context, const instruction &value,
   for (const auto operand : value.operands) {
     static_cast<void>(definition_type(context, operand));
   }
+  if (value.opcode >= NERI_IR_OPCODE_INT_NEG_CHECKED_V1 && value.opcode <= NERI_IR_OPCODE_FLOAT_DIV_V1 && value.results.size() != 1U)
+    fail(invalid_type, "Numeric arithmetic requires one result.");
 
   switch (value.opcode) {
   case NERI_IR_OPCODE_CONSTANT_V1:
@@ -639,26 +645,32 @@ void require_binary(const function_context &context, const instruction &value,
     }
     return 0U;
   case NERI_IR_OPCODE_INT_NEG_CHECKED_V1:
-    require_unary(context, value, NERI_IR_TYPE_INT_V1,
-                  NERI_IR_TYPE_INT_V1);
+    if (!integer_scalar(value.results.at(0).value_type.tag) || value.results.at(0).value_type.tag == NERI_IR_TYPE_BYTE_V1)
+      fail(invalid_type, "Integer negation requires an arithmetic integer.");
+    require_unary(context, value, value.results.at(0).value_type.tag,
+                  value.results.at(0).value_type.tag);
     return NERI_IR_EFFECT_MAY_PANIC_V1;
   case NERI_IR_OPCODE_INT_ADD_CHECKED_V1:
   case NERI_IR_OPCODE_INT_SUB_CHECKED_V1:
   case NERI_IR_OPCODE_INT_MUL_CHECKED_V1:
   case NERI_IR_OPCODE_INT_DIV_CHECKED_V1:
-    require_binary(context, value, NERI_IR_TYPE_INT_V1,
-                   NERI_IR_TYPE_INT_V1);
+    if (!integer_scalar(value.results.at(0).value_type.tag) || value.results.at(0).value_type.tag == NERI_IR_TYPE_BYTE_V1)
+      fail(invalid_type, "Integer arithmetic requires an arithmetic integer.");
+    require_binary(context, value, value.results.at(0).value_type.tag,
+                   value.results.at(0).value_type.tag);
     return NERI_IR_EFFECT_MAY_PANIC_V1;
   case NERI_IR_OPCODE_FLOAT_NEG_V1:
-    require_unary(context, value, NERI_IR_TYPE_FLOAT_V1,
-                  NERI_IR_TYPE_FLOAT_V1);
+    if (!floating_scalar(value.results.at(0).value_type.tag)) fail(invalid_type, "Float negation requires a floating-point type.");
+    require_unary(context, value, value.results.at(0).value_type.tag,
+                  value.results.at(0).value_type.tag);
     return 0U;
   case NERI_IR_OPCODE_FLOAT_ADD_V1:
   case NERI_IR_OPCODE_FLOAT_SUB_V1:
   case NERI_IR_OPCODE_FLOAT_MUL_V1:
   case NERI_IR_OPCODE_FLOAT_DIV_V1:
-    require_binary(context, value, NERI_IR_TYPE_FLOAT_V1,
-                   NERI_IR_TYPE_FLOAT_V1);
+    if (!floating_scalar(value.results.at(0).value_type.tag)) fail(invalid_type, "Float arithmetic requires a floating-point type.");
+    require_binary(context, value, value.results.at(0).value_type.tag,
+                   value.results.at(0).value_type.tag);
     return 0U;
   case NERI_IR_OPCODE_BOOL_NOT_V1:
     require_unary(context, value, NERI_IR_TYPE_BOOL_V1,
@@ -691,6 +703,15 @@ void require_binary(const function_context &context, const instruction &value,
     require_unary(context, value, NERI_IR_TYPE_INT_V1,
                   NERI_IR_TYPE_FLOAT_V1);
     return 0U;
+  case NERI_IR_OPCODE_NUMERIC_CAST_CHECKED_V1: {
+    verify_instruction_shape(value, 1U, 1U, 0U, false, false, false);
+    const auto source = definition_type(context, value.operands.front()).tag;
+    const auto target = value.results.front().value_type.tag;
+    if (!(integer_scalar(source) || floating_scalar(source)) ||
+        !(integer_scalar(target) || floating_scalar(target)))
+      fail(invalid_type, "Numeric conversion requires numeric operands and results.");
+    return NERI_IR_EFFECT_MAY_PANIC_V1;
+  }
   case NERI_IR_OPCODE_CAST_FLOAT_TO_INT_CHECKED_V1:
     require_unary(context, value, NERI_IR_TYPE_FLOAT_V1,
                   NERI_IR_TYPE_INT_V1);
@@ -1439,7 +1460,7 @@ void verify_supported_module(const ir_module &value) {
            "Required feature '" + feature +
                "' is not a canonical feature identifier.");
     }
-    if (feature != "string-data-v1" && feature != "native-strings-v1" && feature != "native-libraries-v1") {
+    if (feature != "string-data-v1" && feature != "native-strings-v1" && feature != "native-libraries-v1" && feature != "extended-scalars-v1") {
       fail(unsupported_feature,
            "Unknown required semantic feature '" + feature + "'.");
     }

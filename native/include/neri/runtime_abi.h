@@ -21,7 +21,7 @@ extern "C" {
 #endif
 
 #define NERI_RUNTIME_ABI_MAJOR UINT16_C(1)
-#define NERI_RUNTIME_ABI_MINOR UINT16_C(8)
+#define NERI_RUNTIME_ABI_MINOR UINT16_C(9)
 
 #define NERI_RT_FEATURE_PRECISE_GC UINT64_C(1)
 #define NERI_RT_FEATURE_NONMOVING_GC (UINT64_C(1) << 1)
@@ -31,7 +31,8 @@ extern "C" {
 #define NERI_RT_FEATURE_SOURCE_LOCATIONS (UINT64_C(1) << 5)
 #define NERI_RT_FEATURE_NATIVE_STRINGS (UINT64_C(1) << 6)
 #define NERI_RT_FEATURE_CONSOLE_IO (UINT64_C(1) << 7)
-/* Reserved ABI v1.4 capabilities; the baseline runtime does not advertise them. */
+/* ABI v1.4 capability bits. Extended scalars are advertised since ABI v1.9;
+ * inline aggregates and multiple mutators remain reserved. */
 #define NERI_RT_FEATURE_INLINE_AGGREGATES (UINT64_C(1) << 8)
 #define NERI_RT_FEATURE_EXTENDED_SCALARS (UINT64_C(1) << 9)
 #define NERI_RT_FEATURE_MULTIPLE_MUTATORS (UINT64_C(1) << 10)
@@ -50,6 +51,10 @@ extern "C" {
 #define NERI_SCALAR_KIND_BYTE_V1 UINT32_C(2)
 #define NERI_SCALAR_KIND_INT_V1 UINT32_C(3)
 #define NERI_SCALAR_KIND_FLOAT_V1 UINT32_C(4)
+#define NERI_SCALAR_KIND_INT32_V1 UINT32_C(5)
+#define NERI_SCALAR_KIND_UINT32_V1 UINT32_C(6)
+#define NERI_SCALAR_KIND_UINT64_V1 UINT32_C(7)
+#define NERI_SCALAR_KIND_FLOAT32_V1 UINT32_C(8)
 
 #define NERI_TYPE_FLAG_CONTAINS_REFS_V1 UINT32_C(1)
 #define NERI_TYPE_FLAG_IMMUTABLE_V1 (UINT32_C(1) << 1)

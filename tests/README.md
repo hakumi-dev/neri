@@ -32,6 +32,9 @@ Language fixtures cover class construction/dispatch, array layouts, short-circui
 floating-point operations, unsafe storage, C imports and deterministic rejection
 of invalid expressions. Successful executions assert output or use the test
 library; rejection fixtures require a nonzero compiler status and diagnostic.
+The native scalar contract uses an independent C shared library to verify widths,
+signedness and memory stride. Its conversion/overflow cases run in both Debug and
+Release and require arithmetic panics, not merely a failing process.
 `callbacks.hk` covers contextual and named callbacks, indirect storage, nested
 captures and invocation after explicit collection. `callback-errors.hk` protects
 signature checking, complete returns and the mutable/raw-pointer capture boundary.

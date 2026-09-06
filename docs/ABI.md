@@ -1,7 +1,7 @@
 # Runtime and IR boundary
 
 The canonical exported declarations and layouts are in
-[`runtime_abi.h`](../native/include/neri/runtime_abi.h). Runtime ABI 1.8 uses a
+[`runtime_abi.h`](../native/include/neri/runtime_abi.h). Runtime ABI 1.9 uses a
 C calling convention on macOS ARM64 and Linux x86-64. Generated programs negotiate
 major version, minimum minor version and required feature bits before execution.
 The package manifest also identifies the toolchain version and native target.
@@ -13,6 +13,12 @@ and the public session API are implemented in Neri.
 
 ## Representation
 
+ABI 1.9 advertises `EXTENDED_SCALARS` (512). `Int32`, `UInt32`, and `Float32`
+occupy four bytes with four-byte alignment; `UInt64` occupies eight bytes with
+eight-byte alignment. Their array descriptors identify each scalar kind.
+Transport 1.2 carries these types under `extended-scalars-v1`; numeric cast
+instructions preserve their checked-conversion contract through native lowering.
+
 Bool and Byte occupy one byte; Int and Float occupy eight bytes; managed references
 and pointers occupy eight bytes on both targets. Object headers contain a descriptor
 pointer and a runtime-owned word, occupying 16 bytes. Strings and arrays append an
@@ -23,7 +29,7 @@ references use a null reference for absence. Type descriptors specify payload
 size/alignment, element layout and tracing behavior. Existing descriptor prefixes
 remain accepted according to their declared ABI version and size.
 
-Inline aggregates, additional scalar widths and multiple mutators have reserved
+Inline aggregates and multiple mutators have reserved
 feature bits. The runtime does not advertise these capabilities. A consumer that
 requires an unavailable capability is rejected during negotiation.
 
@@ -54,8 +60,8 @@ Runtime contract failures panic; no exception unwinds into Neri code.
 
 ## IR transport
 
-The compiler emits canonical Neri IR with transport 1.1, or 1.2 when external
-library metadata is present. The `native-libraries-v1` feature adds a library
+The compiler emits canonical Neri IR with transport 1.1, or 1.2 when extended
+scalars or external library metadata are present. The `native-libraries-v1` feature adds a library
 name after each import's source location; empty names retain platform-default
 symbol resolution. Only C ABI imports may declare a library. The transport header
 includes versions, flags, payload size and a SHA-256 digest. The native reader

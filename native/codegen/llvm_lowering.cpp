@@ -1,4 +1,5 @@
 #include "llvm_lowering.h"
+#include "llvm_numeric.h"
 
 #include "neri/codegen/emitter.h"
 #include "neri/ir_transport.h"
@@ -139,6 +140,10 @@ void append_qualified_parts(std::vector<std::string_view> &parts,
     return "i64";
   case NERI_IR_TYPE_FLOAT_V1:
     return "f64";
+  case NERI_IR_TYPE_INT32_V1: return "i32";
+  case NERI_IR_TYPE_UINT32_V1: return "u32";
+  case NERI_IR_TYPE_UINT64_V1: return "u64";
+  case NERI_IR_TYPE_FLOAT32_V1: return "f32";
   case NERI_IR_TYPE_STRING_V1:
     return "s";
   case NERI_IR_TYPE_ARRAY_V1:
@@ -305,6 +310,14 @@ private:
       result = debug_builder_->createPointerType(
           debug_type(value.arguments.front()), 64U, 64U, std::nullopt,
           "Pointer");
+      break;
+    case NERI_IR_TYPE_INT32_V1:
+    case NERI_IR_TYPE_UINT32_V1:
+    case NERI_IR_TYPE_UINT64_V1:
+    case NERI_IR_TYPE_FLOAT32_V1:
+      result = debug_builder_->createBasicType(key, scalar_width(value.tag),
+          floating_scalar(value.tag) ? llvm::dwarf::DW_ATE_float :
+          unsigned_scalar(value.tag) ? llvm::dwarf::DW_ATE_unsigned : llvm::dwarf::DW_ATE_signed);
       break;
     case NERI_IR_TYPE_STRING_V1:
     case NERI_IR_TYPE_ARRAY_V1:
@@ -572,7 +585,7 @@ private:
         std::string_view message,
         const std::optional<source_location> &location) {
       auto *declaration = llvm::Intrinsic::getOrInsertDeclaration(
-          module_.output_.get(), intrinsic, {builder_.getInt64Ty()});
+          module_.output_.get(), intrinsic, {operands.front()->getType()});
       auto *pair = builder_.CreateCall(declaration,
                                        llvm::ArrayRef(operands.data(),
                                                       operands.size()),
@@ -589,7 +602,7 @@ private:
                                               llvm::Value *right,
                                               const type &operand_type,
                                               std::uint8_t predicate) {
-      if (operand_type.tag == NERI_IR_TYPE_FLOAT_V1) {
+      if (floating_scalar(operand_type.tag)) {
         if (predicate == NERI_IR_COMPARISON_EQUAL_V1 ||
             predicate == NERI_IR_COMPARISON_NOT_EQUAL_V1) {
           auto *ordered_equal = builder_.CreateFCmpOEQ(left, right, "float.eq");
@@ -628,19 +641,19 @@ private:
         case NERI_IR_COMPARISON_NOT_EQUAL_V1:
           return llvm::CmpInst::ICMP_NE;
         case NERI_IR_COMPARISON_LESS_V1:
-          return operand_type.tag == NERI_IR_TYPE_BYTE_V1
+          return unsigned_scalar(operand_type.tag)
                      ? llvm::CmpInst::ICMP_ULT
                      : llvm::CmpInst::ICMP_SLT;
         case NERI_IR_COMPARISON_LESS_OR_EQUAL_V1:
-          return operand_type.tag == NERI_IR_TYPE_BYTE_V1
+          return unsigned_scalar(operand_type.tag)
                      ? llvm::CmpInst::ICMP_ULE
                      : llvm::CmpInst::ICMP_SLE;
         case NERI_IR_COMPARISON_GREATER_V1:
-          return operand_type.tag == NERI_IR_TYPE_BYTE_V1
+          return unsigned_scalar(operand_type.tag)
                      ? llvm::CmpInst::ICMP_UGT
                      : llvm::CmpInst::ICMP_SGT;
         case NERI_IR_COMPARISON_GREATER_OR_EQUAL_V1:
-          return operand_type.tag == NERI_IR_TYPE_BYTE_V1
+          return unsigned_scalar(operand_type.tag)
                      ? llvm::CmpInst::ICMP_UGE
                      : llvm::CmpInst::ICMP_SGE;
         default:
@@ -920,9 +933,10 @@ private:
         break;
       case NERI_IR_OPCODE_INT_NEG_CHECKED_V1: {
         std::array<llvm::Value *, 2> operands{
-            llvm::ConstantInt::get(builder_.getInt64Ty(), 0U),
+            llvm::ConstantInt::get(value(instruction.operands[0])->getType(), 0U),
             value(instruction.operands[0])};
-        result = checked_overflow(llvm::Intrinsic::ssub_with_overflow, operands,
+        const bool is_unsigned = unsigned_scalar(instruction.results.front().value_type.tag);
+        result = checked_overflow(is_unsigned ? llvm::Intrinsic::usub_with_overflow : llvm::Intrinsic::ssub_with_overflow, operands,
                                   "Integer negation overflow.",
                                   instruction.location);
         break;
@@ -932,13 +946,17 @@ private:
       case NERI_IR_OPCODE_INT_MUL_CHECKED_V1: {
         std::array operands{value(instruction.operands[0]),
                             value(instruction.operands[1])};
-        const auto intrinsic = instruction.opcode ==
+        auto intrinsic = instruction.opcode ==
                                        NERI_IR_OPCODE_INT_ADD_CHECKED_V1
                                    ? llvm::Intrinsic::sadd_with_overflow
                                : instruction.opcode ==
                                          NERI_IR_OPCODE_INT_SUB_CHECKED_V1
                                    ? llvm::Intrinsic::ssub_with_overflow
                                    : llvm::Intrinsic::smul_with_overflow;
+        if (unsigned_scalar(instruction.results.front().value_type.tag)) {
+          intrinsic = instruction.opcode == NERI_IR_OPCODE_INT_ADD_CHECKED_V1 ? llvm::Intrinsic::uadd_with_overflow :
+                      instruction.opcode == NERI_IR_OPCODE_INT_SUB_CHECKED_V1 ? llvm::Intrinsic::usub_with_overflow : llvm::Intrinsic::umul_with_overflow;
+        }
         const auto message = instruction.opcode ==
                                      NERI_IR_OPCODE_INT_ADD_CHECKED_V1
                                  ? "Integer addition overflow."
@@ -953,19 +971,20 @@ private:
       case NERI_IR_OPCODE_INT_DIV_CHECKED_V1: {
         auto *left = value(instruction.operands[0]);
         auto *right = value(instruction.operands[1]);
+        const bool is_unsigned = unsigned_scalar(instruction.results.front().value_type.tag);
         auto *nonzero = builder_.CreateICmpNE(
-            right, llvm::ConstantInt::get(builder_.getInt64Ty(), 0U),
+            right, llvm::ConstantInt::get(right->getType(), 0U),
             "division.nonzero");
         auto *minimum = llvm::ConstantInt::get(
-            builder_.getInt64Ty(), UINT64_C(0x8000000000000000));
-        auto *minus_one = llvm::ConstantInt::getSigned(builder_.getInt64Ty(), -1);
+            builder_.getContext(), llvm::APInt::getSignedMinValue(left->getType()->getIntegerBitWidth()));
+        auto *minus_one = llvm::ConstantInt::getSigned(left->getType(), -1);
         auto *overflow = builder_.CreateAnd(
             builder_.CreateICmpEQ(left, minimum),
             builder_.CreateICmpEQ(right, minus_one), "division.overflow");
-        emit_guard(builder_.CreateAnd(nonzero, builder_.CreateNot(overflow)),
+        emit_guard(is_unsigned ? nonzero : builder_.CreateAnd(nonzero, builder_.CreateNot(overflow)),
                    NERI_PANIC_ARITHMETIC_V1,
                    "Invalid integer division.", instruction.location);
-        result = builder_.CreateSDiv(left, right, "division.value");
+        result = is_unsigned ? builder_.CreateUDiv(left, right, "division.value") : builder_.CreateSDiv(left, right, "division.value");
         break;
       }
       case NERI_IR_OPCODE_FLOAT_NEG_V1:
@@ -1014,6 +1033,15 @@ private:
         result = builder_.CreateSIToFP(value(instruction.operands[0]),
                                        builder_.getDoubleTy(), "int.to.float");
         break;
+      case NERI_IR_OPCODE_NUMERIC_CAST_CHECKED_V1: {
+        const auto &source_type = module_.value_type(input_, instruction.operands.front());
+        const auto &target_type = instruction.results.front().value_type;
+        result = numeric_cast(builder_, value(instruction.operands.front()), source_type.tag, target_type.tag,
+            module_.semantic_type(target_type), [&](llvm::Value *valid) {
+              emit_guard(valid, NERI_PANIC_ARITHMETIC_V1, "Numeric conversion is outside the target range.", instruction.location);
+            });
+        break;
+      }
       case NERI_IR_OPCODE_CAST_FLOAT_TO_INT_CHECKED_V1: {
         auto *operand = value(instruction.operands[0]);
         auto *minimum = llvm::ConstantFP::get(builder_.getDoubleTy(),
@@ -1639,6 +1667,13 @@ private:
       return llvm::Type::getInt64Ty(context_);
     case NERI_IR_TYPE_FLOAT_V1:
       return llvm::Type::getDoubleTy(context_);
+    case NERI_IR_TYPE_INT32_V1:
+    case NERI_IR_TYPE_UINT32_V1:
+      return llvm::Type::getInt32Ty(context_);
+    case NERI_IR_TYPE_UINT64_V1:
+      return llvm::Type::getInt64Ty(context_);
+    case NERI_IR_TYPE_FLOAT32_V1:
+      return llvm::Type::getFloatTy(context_);
     case NERI_IR_TYPE_STRING_V1:
     case NERI_IR_TYPE_ARRAY_V1:
     case NERI_IR_TYPE_CLASS_V1:
@@ -1657,6 +1692,8 @@ private:
         return llvm::StructType::get(context_, {tag, payload});
       }
       auto *padding = llvm::ArrayType::get(tag, 7U);
+      if (extended_scalar(value.arguments.front().tag) && scalar_width(value.arguments.front().tag) == 32U)
+        padding = llvm::ArrayType::get(tag, 3U);
       return llvm::StructType::get(context_, {tag, padding, payload});
     }
     default:
@@ -1857,6 +1894,10 @@ private:
         return NERI_SCALAR_KIND_INT_V1;
       case NERI_IR_TYPE_FLOAT_V1:
         return NERI_SCALAR_KIND_FLOAT_V1;
+      case NERI_IR_TYPE_INT32_V1: return NERI_SCALAR_KIND_INT32_V1;
+      case NERI_IR_TYPE_UINT32_V1: return NERI_SCALAR_KIND_UINT32_V1;
+      case NERI_IR_TYPE_UINT64_V1: return NERI_SCALAR_KIND_UINT64_V1;
+      case NERI_IR_TYPE_FLOAT32_V1: return NERI_SCALAR_KIND_FLOAT32_V1;
       default:
         throw codegen_error(std::string(lowering_error),
                             "Array element has no scalar ABI descriptor.");
@@ -2135,6 +2176,10 @@ private:
   void emit_program_requirements() {
     std::uint16_t minimum_minor = source_location_runtime_minor;
     std::uint64_t required_features = NERI_RT_FEATURE_SOURCE_LOCATIONS;
+    if (std::ranges::find(input_.required_features, "extended-scalars-v1") != input_.required_features.end()) {
+      minimum_minor = 9;
+      required_features |= NERI_RT_FEATURE_EXTENDED_SCALARS;
+    }
     if (std::ranges::find(input_.required_features, "native-strings-v1") !=
         input_.required_features.end()) {
       minimum_minor = std::max(minimum_minor, native_string_runtime_minor);

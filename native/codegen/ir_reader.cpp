@@ -377,6 +377,12 @@ private:
     case NERI_IR_TYPE_STRING_V1:
     case NERI_IR_TYPE_UNSAFE_CAPABILITY_V1:
       return result;
+    case NERI_IR_TYPE_INT32_V1:
+    case NERI_IR_TYPE_UINT32_V1:
+    case NERI_IR_TYPE_UINT64_V1:
+    case NERI_IR_TYPE_FLOAT32_V1:
+      if (transport_minor_ < 2U) fail(unsupported_feature, "Extended scalars require transport 1.2.", tag_offset);
+      return result;
     case NERI_IR_TYPE_CLASS_V1:
       result.symbol = read_symbol();
       return result;
@@ -557,7 +563,7 @@ private:
     const auto opcode_offset = input_.offset();
     result.opcode = input_.u16();
     require_tag(result.opcode, NERI_IR_OPCODE_CONSTANT_V1,
-                NERI_IR_OPCODE_STRING_FROM_FLOAT_V1, "opcode", opcode_offset);
+                NERI_IR_OPCODE_NUMERIC_CAST_CHECKED_V1, "opcode", opcode_offset);
     result.results = read_vector<value_definition>(
         input_, "instruction results",
         [this] { return read_value_definition(); });

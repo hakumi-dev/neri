@@ -166,7 +166,7 @@ foreach(NERI_MANIFEST_KIND current seed)
   endif()
   file(GENERATE
     OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/${NERI_MANIFEST_NAME}"
-    CONTENT "{\n  \"schemaVersion\": 2,\n  \"toolchainVersion\": \"${NERI_MANIFEST_VERSION}\",\n  \"irTransportMajor\": 1,\n  \"irTransportMinor\": 1,\n  \"target\": \"${NERI_TARGET}\",\n  \"abiMajor\": 1,\n  \"abiMinor\": 8,\n  \"features\": 14591,\n  \"artifact\": \"$<TARGET_FILE_NAME:neri_runtime>\"\n}\n"
+    CONTENT "{\n  \"schemaVersion\": 2,\n  \"toolchainVersion\": \"${NERI_MANIFEST_VERSION}\",\n  \"irTransportMajor\": 1,\n  \"irTransportMinor\": 1,\n  \"target\": \"${NERI_TARGET}\",\n  \"abiMajor\": 1,\n  \"abiMinor\": 9,\n  \"features\": 15103,\n  \"artifact\": \"$<TARGET_FILE_NAME:neri_runtime>\"\n}\n"
   )
 endforeach()
 

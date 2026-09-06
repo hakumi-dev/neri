@@ -208,6 +208,43 @@ require an explicitly written callback wrapper with its own unsafe block.
 
 ## Unsafe and memory boundary
 
+### Explicit-width numbers
+
+`Int32`, `UInt32`, `UInt64`, and `Float32` preserve their widths in storage and
+C ABI calls. They are distinct types; assignments and arithmetic do not implicitly
+mix widths or signedness. Integer literals have type `Int`, floating literals
+have type `Float`; use an explicit numeric conversion at a native boundary.
+
+| Type | Representation | Range |
+| --- | --- | --- |
+| `Int32` | Signed 32-bit integer | −2147483648 to 2147483647 |
+| `UInt32` | Unsigned 32-bit integer | 0 to 4294967295 |
+| `UInt64` | Unsigned 64-bit integer | 0 to 18446744073709551615 |
+| `Float32` | IEEE 754 binary32 | 24 significant binary digits |
+
+```ruby
+let width = 800 as Int32
+let mask = 4294967295 as UInt32
+let scale = 1.5 as Float32
+let ordinaryWidth = width as Int
+```
+
+Numeric `as` conversions involving these types check integer range and signedness.
+Float-to-integer conversion rejects NaN, infinity and values outside the target
+range, then truncates toward zero. Float narrowing rejects finite values outside
+the finite target range; NaN, infinity and signed zero are preserved. Conversions
+to floating point round to the target precision; underflow may round to zero.
+Arithmetic requires matching operand types. Integer addition, subtraction,
+multiplication, negation and division check overflow and division by zero,
+including unsigned underflow. Failures panic with `NRP002` and exit status 70.
+
+The types work in fields, arrays, optionals, generic values, native allocations
+and pointers. Their raw memory operations follow the unsafe rules below.
+String formatting accepts `Int`, `Byte` and `Float`; explicitly convert a new
+numeric type to an appropriate formatting type when its range permits it.
+
+### Raw memory
+
 Raw pointer operations require `def unsafe` or an `unsafe ... end` block. `T*`
 is non-null; `T*?` requires a null check before access. Raw pointers do not retain
 managed allocations. Address-of applies to mutable unmanaged locals.
