@@ -190,6 +190,7 @@ Capability boundaries relevant to performance:
 |---|---|
 | Growing collections | Flat append copies the old array; compiler buffers use linked nodes. |
 | CPU parallelism | Scoped task generation uses checked parallel callbacks and one mutator per active heap. |
+| Mutable task inputs | Captures are read-only; task callbacks receive indices, not exclusively transferred mutable input graphs. |
 | Resource lifetime | Native resources require explicit cleanup. |
 | Generic abstraction | Concrete specialization and type inference. |
 | Data modeling | Classes and native records. |

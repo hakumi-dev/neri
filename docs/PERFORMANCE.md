@@ -59,6 +59,51 @@ provides the broader foundation for memoization and change propagation. The run
 cache is whole-artifact memoization, not a query-level incremental compiler or
 an implementation of that paper's formal proof.
 
+## Compute and scoped tasks
+
+Release kernels retain checked arithmetic, bounds checks and managed collection.
+`tasks.generate` executes independent index callbacks on a bounded worker pool,
+shares captured graphs through read-only views and joins before returning ordered
+results. Task-local allocation and mutation are permitted. Workload definitions,
+raw samples, compiler/runtime fingerprints and host conditions are in the
+[measurement records](../benchmarks/README.md#measurement-records).
+
+Representative Neri process-median summaries are:
+
+| Workload and host | One worker | Worker limit | Parallel time | Speedup |
+|---|---:|---:|---:|---:|
+| Integer batch, M4 Pro | 390 ms | 14 | 44 ms | 8.86x |
+| Integer batch, EPYC 9V74 VM | 690 ms | 4 | 181 ms | 3.81x |
+| Allocation batch, M4 Pro, GC-mode matrix | 162.5 ms | 14 | 29 ms | 5.60x |
+| Allocation batch, EPYC 7763 VM, GC-mode matrix | 262 ms | 4 | 144.5 ms | 1.81x |
+
+These are within-run ratios against each implementation's ordinary sequential
+loop, including parallel scheduling, result storage and joining. The M4 Pro has
+ten performance and four efficiency cores; the Linux hosts are four-vCPU virtual
+machines. These results do not establish a universal processor optimum or
+dedicated-PC performance. The two EPYC records use different hosts and cannot
+isolate a compiler change by comparing absolute times.
+
+Allocation is a material limit. In the matched GC-mode matrix, default-JIT C#
+with server GC is faster than Neri for the allocation workload on both hosts.
+On the Mac, its best measured worker limit is eight, with a 7 ms median and
+19.55 ms mean sample time, versus Neri's 29 ms median and 32.33 ms mean at fourteen.
+Their median whole-process peak RSS values are approximately 644 and 110 MiB.
+On the EPYC 7763 VM at four workers, server JIT and Neri have 66 and 144.5 ms
+medians, with approximately 116 and 52 MiB median peak RSS. Process RSS includes
+runtime and JIT memory; it is not the size of live objects or isolated GC overhead.
+
+GC mode changes the throughput/memory tradeoff. Workstation and server GC use
+the same reference assembly and default tiering. Server GC is not faster at every
+worker count: on the EPYC VM, its one-worker median is 180 ms versus workstation
+GC's 72.5 ms. Large variation in server-GC samples makes medians insufficient as
+a description of throughput or pauses; records also retain means, maxima and
+whole-process metrics. One warmup and six processes do not prove steady state.
+
+The analytical boundaries are [work/span and Roofline](../benchmarks/README.md#analytical-foundations):
+independent work exposes parallelism, while allocation, collection and memory
+access can limit scaling. A ratio alone does not identify which cost dominates.
+
 ## Managed memory
 
 `neri_gc_pressure` is a deterministic allocation/retention workload built with

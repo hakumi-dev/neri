@@ -186,6 +186,7 @@ specified configurations, not a ranking of languages.
 | [Allocation-task ARM64 matrix](allocation-tasks-macos-arm64.json) | 208 processes, 1456 checked samples, integer and allocation-heavy task scaling; .NET references use workstation GC. |
 | [Allocation-task x86-64 matrix](allocation-tasks-linux-x86_64.json) | 144 processes, 1008 checked samples, four-vCPU AMD EPYC VM; workstation GC references. |
 | [Allocation GC-mode ARM64 comparison](allocation-gc-macos-arm64.json) | 90 processes, 630 checked samples, Neri and the same JIT assembly with workstation/server GC; kernel means and process memory accompany medians. |
+| [Allocation GC-mode x86-64 comparison](allocation-gc-linux-x86_64.json) | 54 processes, 378 checked samples, workstation/server GC comparison on a four-vCPU EPYC 7763 VM. |
 
 Summarize each process by its median, then compare those process summaries.
 Keep process and kernel timers separate. Absolute times require matching workload
