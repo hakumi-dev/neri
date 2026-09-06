@@ -45,7 +45,8 @@ Managed allocations carry a private owner identity. Runtime reference stores and
 tracing reject objects from unrelated heaps. The runtime's
 [private scoped-task boundary](ARCHITECTURE.md#execution-and-optimization-boundaries)
 allows child contexts to read suspended ancestor heaps until their scope joins;
-it is not part of the versioned ABI or a managed result-transfer protocol.
+registered result spans retain child objects for ownership adoption after all
+tasks finish. This trusted native protocol is not part of the versioned ABI.
 Static string literals are immortal
 and may be referenced by any heap. Ordinary managed strings remain heap-owned,
 even though their content is immutable. Raw native pointers do not provide a

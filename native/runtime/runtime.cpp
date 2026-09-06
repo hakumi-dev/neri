@@ -21,6 +21,7 @@
 #include <limits>
 #include <locale.h>
 #include <mutex>
+#include <new>
 #include <spawn.h>
 #include <string>
 #include <string_view>
@@ -30,19 +31,6 @@
 #include <vector>
 
 extern char **environ;
-
-struct neri_task_scope final {
-  explicit neri_task_scope(void *owner) : parent(owner) {}
-  void *parent;
-  std::mutex mutex;
-  std::condition_variable completed;
-  uint64_t outstanding = 0;
-  bool accepting = true;
-};
-
-struct neri_task_ticket final {
-  neri_task_scope *scope;
-};
 
 namespace {
 constexpr uintptr_t root_frame_cookie = UINT64_C(0x484b524f4f545631);
@@ -104,6 +92,29 @@ struct runtime_state final {
   std::string host_error;
 };
 
+struct task_result_heap final {
+  runtime_state heap{};
+  task_result_heap *next = nullptr;
+};
+} // namespace
+
+struct neri_task_scope final {
+  explicit neri_task_scope(runtime_state *owner) : parent(owner) {}
+  runtime_state *parent;
+  std::mutex mutex;
+  std::condition_variable completed;
+  uint64_t outstanding = 0;
+  bool accepting = true;
+  task_result_heap *results = nullptr;
+};
+
+struct neri_task_ticket final {
+  neri_task_scope *scope;
+  neri_ref_v1 *results;
+  uint64_t result_count;
+};
+
+namespace {
 struct mark_stack final {
   managed_allocation **items;
   size_t count;
@@ -993,6 +1004,16 @@ struct formatted_float final {
   }
   return result;
 }
+void release_native_allocations(runtime_state &heap) {
+  while (heap.native_head != nullptr) {
+    auto *allocation = heap.native_head;
+    heap.native_head = allocation->next;
+    std::free(allocation->pointer);
+    std::free(allocation);
+  }
+  heap.native_byte_count = 0;
+}
+
 void release_heap() {
   require_initialized();
   auto &heap = current_state();
@@ -1004,13 +1025,38 @@ void release_heap() {
     heap.managed_head = allocation->next;
     std::free(allocation);
   }
-  while (heap.native_head != nullptr) {
-    auto *allocation = heap.native_head;
-    heap.native_head = allocation->next;
-    std::free(allocation->pointer);
-    std::free(allocation);
-  }
+  release_native_allocations(heap);
   heap = {};
+}
+
+void adopt_results(neri_task_scope &scope) {
+  auto &parent = *scope.parent;
+  while (scope.results != nullptr) {
+    auto *result = scope.results;
+    scope.results = result->next;
+    auto &child = result->heap;
+    if (parent.managed_object_count > UINT64_MAX - child.managed_object_count ||
+        parent.managed_byte_count > UINT64_MAX - child.managed_byte_count) {
+      out_of_memory("task result allocation accounting overflow");
+    }
+    managed_allocation *tail = nullptr;
+    for (auto *allocation = child.managed_head; allocation != nullptr;
+         allocation = allocation->next) {
+      assert(allocation->owner == &child);
+      allocation->owner = &parent;
+      tail = allocation;
+    }
+    if (tail != nullptr) {
+      tail->next = parent.managed_head;
+      if (parent.managed_head != nullptr) {
+        parent.managed_head->previous = tail;
+      }
+      parent.managed_head = child.managed_head;
+    }
+    parent.managed_object_count += child.managed_object_count;
+    parent.managed_byte_count += child.managed_byte_count;
+    delete result;
+  }
 }
 } // namespace
 
@@ -1056,13 +1102,23 @@ void neri_task_scope_run(neri_task_coordinator coordinate, void *context) {
     scope.accepting = false;
     scope.completed.wait(lock, [&scope] { return scope.outstanding == 0; });
   }
+  adopt_results(scope);
   parent.suspended = false;
+  assert_consistent();
 }
 
 neri_task_ticket *neri_task_register(neri_task_scope *scope) {
+  return neri_task_register_results(scope, nullptr, 0);
+}
+
+neri_task_ticket *neri_task_register_results(neri_task_scope *scope,
+                                            neri_ref_v1 *slots, uint64_t count) {
   if (scope == nullptr || scope->parent != &current_state() ||
       !current_state().suspended) {
     contract_panic("only the suspended coordinator may register a task");
+  }
+  if ((count != 0 && slots == nullptr) || count > SIZE_MAX / sizeof(neri_ref_v1)) {
+    contract_panic("task result span requires valid reference storage");
   }
   auto *ticket = static_cast<neri_task_ticket *>(std::malloc(sizeof(neri_task_ticket)));
   if (ticket == nullptr) {
@@ -1072,7 +1128,7 @@ neri_task_ticket *neri_task_register(neri_task_scope *scope) {
   if (!scope->accepting || scope->outstanding == UINT64_MAX) {
     contract_panic("task registration requires an open scope");
   }
-  ticket->scope = scope;
+  *ticket = {scope, slots, count};
   ++scope->outstanding;
   return ticket;
 }
@@ -1082,28 +1138,54 @@ void neri_task_execute(neri_task_ticket *ticket, neri_task_body body, void *cont
     contract_panic("task execution requires a ticket and body outside tracing");
   }
   auto *scope = ticket->scope;
-  auto *parent = static_cast<runtime_state *>(scope->parent);
+  auto *parent = scope->parent;
   {
     std::lock_guard lock(scope->mutex);
     if (scope->outstanding == 0 || !parent->suspended) {
       contract_panic("task execution requires a suspended parent scope");
     }
   }
-  runtime_state child{};
+  runtime_state local{};
+  task_result_heap *result = nullptr;
+  if (ticket->result_count != 0) {
+    result = new (std::nothrow) task_result_heap;
+    if (result == nullptr) {
+      out_of_memory("task result heap allocation failed");
+    }
+  }
+  auto &child = result == nullptr ? local : result->heap;
   child.initialized = true;
   child.read_parent = parent;
   child.process_argument_count = parent->process_argument_count;
   child.process_arguments = parent->process_arguments;
   auto *previous = active_state;
   active_state = &child;
+  neri_gc_root_frame_v1 results{nullptr, ticket->results, ticket->result_count, 0};
+  if (result != nullptr) {
+    neri_rt_v1_gc_root_frame_enter(&results);
+  }
   body(context);
-  release_heap();
+  if (result == nullptr) {
+    release_heap();
+  } else {
+    require_initialized();
+    if (child.root_frame != &results || child.borrow != nullptr || child.collecting) {
+      contract_panic("task results require no live body roots or native borrows");
+    }
+    collect_impl();
+    neri_rt_v1_gc_root_frame_leave(&results);
+    release_native_allocations(child);
+  }
   active_state = previous;
   std::free(ticket);
-  // Release the ticket only after every child object and root is gone. No
-  // access to the scope or its ancestors may follow this critical section.
+  // Completed result heaps stay alive until join; no sibling may read or adopt
+  // them. No access to the scope or its ancestors follows this critical section.
   {
     std::lock_guard lock(scope->mutex);
+    if (result != nullptr) {
+      result->next = scope->results;
+      scope->results = result;
+    }
     --scope->outstanding;
     if (scope->outstanding == 0) {
       scope->completed.notify_all();

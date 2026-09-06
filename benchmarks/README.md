@@ -197,6 +197,9 @@ and the native worker probe with ThreadSanitizer. The probe checks simultaneous
 independent collection and rejects foreign references through stores and roots.
 It also checks ancestor reads during child collection, nested execution on a
 waiting thread, join-before-resume, and rejection of ancestor writes and borrows.
+Returned graphs preserve identity and cycles across nested joins, become
+parent-owned, and are reclaimed when their roots disappear. Sibling result
+references and unfinished body roots/borrows are rejected before adoption.
 It uses C because native entry callbacks are not expressible in Neri's current
 C ABI. Address/undefined-behavior checks use the separate `--sanitize` build.
 

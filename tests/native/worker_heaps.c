@@ -13,6 +13,7 @@
 
 typedef struct node_payload {
   neri_ref_v1 next;
+  neri_ref_v1 shared;
   int64_t value;
 } node_payload;
 
@@ -22,6 +23,7 @@ static node_payload *payload(neri_ref_v1 object) {
 
 static void trace(neri_ref_v1 object, neri_gc_visit_slot_fn_v1 visit, void *context) {
   visit(&payload(object)->next, context);
+  visit(&payload(object)->shared, context);
 }
 
 static const neri_type_descriptor_v1 node_type = {
@@ -269,6 +271,136 @@ static void reject_scoped_write(neri_ref_v1 ancestor, neri_task_body body) {
   CHECK(WIFEXITED(status) && WEXITSTATUS(status) == NERI_RUNTIME_PANIC_EXIT_CODE_V1);
 }
 
+typedef struct result_case {
+  neri_task_ticket *ticket;
+  neri_ref_v1 ancestor;
+  neri_ref_v1 *slots;
+  neri_ref_v1 produced;
+  pthread_t thread;
+  neri_task_body body;
+} result_case;
+
+static void result_body(void *context) {
+  result_case *test = context;
+  /* The runtime roots the output span throughout allocation and final GC. */
+  test->slots[0] = allocate();
+  neri_ref_v1 other = allocate();
+  neri_rt_v1_gc_store_ref(test->slots[0], &payload(test->slots[0])->next, other);
+  neri_rt_v1_gc_store_ref(other, &payload(other)->next, test->slots[0]);
+  neri_rt_v1_gc_store_ref(test->slots[0], &payload(test->slots[0])->shared, test->ancestor);
+  test->slots[1] = test->slots[0];
+  for (unsigned index = 0; index < 256; ++index) (void)allocate();
+  neri_rt_v1_gc_collect();
+  CHECK(stats().managed_object_count == 2);
+  (void)allocate(); /* Final collection must discard non-result objects. */
+  (void)neri_rt_v1_native_alloc(64, 8);
+  test->produced = test->slots[0];
+}
+
+static void nested_result_coordinator(neri_task_scope *scope, void *context) {
+  result_case *test = context;
+  neri_task_execute(neri_task_register_results(scope, test->slots, 2), result_body, test);
+}
+
+static void nested_result_body(void *context) {
+  neri_task_scope_run(nested_result_coordinator, context);
+  CHECK(stats().managed_object_count == 2 && stats().native_byte_count == 0);
+}
+
+static void *result_worker(void *context) {
+  result_case *test = context;
+  neri_task_execute(test->ticket, nested_result_body, test);
+  return NULL;
+}
+
+static void result_coordinator(neri_task_scope *scope, void *context) {
+  result_case *tests = context;
+  for (unsigned index = 0; index < 4; ++index) {
+    tests[index].ticket = neri_task_register_results(scope, tests[index].slots, 2);
+    CHECK(pthread_create(&tests[index].thread, NULL, result_worker, &tests[index]) == 0);
+  }
+}
+
+static void check_result_adoption(neri_ref_v1 ancestor) {
+  neri_ref_v1 slots[8] = {NULL};
+  neri_gc_root_frame_v1 frame = {NULL, slots, 8, 0};
+  neri_rt_v1_gc_root_frame_enter(&frame);
+  result_case tests[4] = {0};
+  for (unsigned index = 0; index < 4; ++index) {
+    tests[index].ancestor = ancestor;
+    tests[index].slots = &slots[index * 2];
+  }
+  neri_task_scope_run(result_coordinator, tests);
+  for (unsigned index = 0; index < 4; ++index) {
+    CHECK(pthread_join(tests[index].thread, NULL) == 0);
+    neri_ref_v1 root = slots[index * 2];
+    CHECK(root == tests[index].produced && root == slots[index * 2 + 1]);
+    CHECK(payload(payload(root)->next)->next == root && payload(root)->shared == ancestor);
+  }
+  neri_rt_v1_gc_collect();
+  CHECK(stats().managed_object_count == 9 && stats().native_byte_count == 0);
+  /* A parent-owned store breaks one returned cycle; the detached node dies. */
+  neri_rt_v1_gc_store_ref(slots[0], &payload(slots[0])->next, ancestor);
+  neri_rt_v1_gc_collect();
+  CHECK(stats().managed_object_count == 8);
+  for (unsigned index = 0; index < 8; ++index) slots[index] = NULL;
+  neri_rt_v1_gc_collect();
+  CHECK(stats().managed_object_count == 1);
+  neri_rt_v1_gc_root_frame_leave(&frame);
+}
+
+static void sibling_result_body(void *context) {
+  neri_ref_v1 *slots = context;
+  slots[2] = slots[0];
+}
+
+static void sibling_result_coordinator(neri_task_scope *scope, void *context) {
+  result_case *test = context;
+  neri_task_execute(neri_task_register_results(scope, test->slots, 2), result_body, test);
+  /* Completed results still belong to the first child until the scope joins. */
+  neri_task_execute(neri_task_register_results(scope, &test->slots[2], 1), sibling_result_body, test->slots);
+}
+
+static void leak_result_root(void *context) {
+  result_case *test = context;
+  test->slots[0] = allocate();
+  neri_gc_root_frame_v1 frame = {NULL, test->slots, 1, 0};
+  neri_rt_v1_gc_root_frame_enter(&frame);
+}
+
+static void leak_result_borrow(void *context) {
+  result_case *test = context;
+  test->slots[0] = allocate();
+  neri_gc_borrow_v1 borrow = {{0}};
+  (void)neri_rt_v1_gc_borrow_begin(test->slots[0], 0, 1, &borrow);
+}
+
+static void result_boundary_coordinator(neri_task_scope *scope, void *context) {
+  result_case *test = context;
+  if (test->body == NULL) {
+    sibling_result_coordinator(scope, context);
+  } else {
+    neri_task_execute(neri_task_register_results(scope, test->slots, 2), test->body, test);
+  }
+}
+
+static void reject_result_boundary(neri_ref_v1 ancestor, neri_task_body body) {
+  const pid_t child = fork();
+  CHECK(child >= 0);
+  if (child == 0) {
+    neri_ref_v1 slots[3] = {NULL};
+    result_case test = {0};
+    test.ancestor = ancestor;
+    test.slots = slots;
+    test.body = body;
+    neri_task_scope_run(result_boundary_coordinator, &test);
+    _Exit(1);
+  }
+  int status = 0;
+  CHECK(waitpid(child, &status, 0) == child);
+  CHECK(WIFEXITED(status) && WEXITSTATUS(status) == NERI_RUNTIME_PANIC_EXIT_CODE_V1);
+}
+
 int main(void) {
   initialize();
   neri_ref_v1 root = allocate();
@@ -292,6 +424,10 @@ int main(void) {
   check_scoped_reads(root);
   neri_rt_v1_gc_collect();
   CHECK(stats().managed_object_count == 1 && payload(root)->value == 43);
+  reject_result_boundary(root, NULL);
+  reject_result_boundary(root, leak_result_root);
+  reject_result_boundary(root, leak_result_borrow);
+  check_result_adoption(root);
   neri_rt_v1_gc_root_frame_leave(&frame);
   neri_rt_v1_shutdown();
   return 0;

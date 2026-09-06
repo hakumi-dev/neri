@@ -102,16 +102,38 @@ ancestor references in child objects, but their destinations must be child-owned
 Native borrows require ownership of the borrowed object.
 
 Context identity is independent of worker identity: nested execution on a waiting
-parent's thread preserves every suspended heap. Task teardown requires roots and
-borrows to have ended and reclaims all task-owned allocations. Managed results
-cannot escape this boundary. Callbacks are trusted native code; direct pointer
-writes are outside these checks. This boundary supplies no scheduler or language
+parent's thread preserves every suspended heap. Tasks may register initialized,
+disjoint result-reference spans whose storage remains valid through join. The
+runtime roots each span during its task, then collects the child heap with only
+that span as roots. Body-owned root frames and native borrows must have ended
+before this final collection. Native temporary allocations are reclaimed.
+Completed child heaps stay separate until every task in the scope has finished;
+the parent then adopts their surviving allocations before resuming. Object
+addresses, aliases, cycles and references to ancestors are preserved without
+copying payloads. Results from sibling heaps are rejected. Tasks without a result
+span reclaim their entire heap at completion.
+
+Adoption updates each survivor's owner and joins its allocation list to the
+parent's list: `O(k + n)` work for `k` completed result heaps and `n` surviving
+objects, in addition to final child collection. The parent must keep results
+rooted across subsequent allocating calls. The native caller guarantees that
+output spans are inaccessible through other tasks and captures. Callbacks are
+trusted native code; direct pointer writes are outside these checks.
+This boundary supplies no scheduler or language
 capture checking. A closure retaining an object does not make it safe to share.
 The frontend's `shared fn` contract restricts access through captured references;
 it does not connect a callback to this native task boundary or check parallel
 effects and result transfer.
 The ABI reserves but does not advertise multiple-mutator support; safe Neri has
 no task, atomic, transfer or synchronization API.
+
+[Hierarchical Memory Management for Parallel Programs (2016)](https://www.cs.cmu.edu/~rraghuna/publications/icfp-2016-hierarchical-memory-management-for-parallel-programs/paper.pdf)
+provides the task-tree/heap-tree model and ancestor-only reference discipline.
+Neri's private boundary uses a nonmoving collector and deferred ownership adoption,
+not that paper's copying collector or a proof of its language calculus.
+[Disentanglement in Nested-Parallel Programs (2020)](https://www.cs.cmu.edu/~swestric/20/popl-disentangled.pdf)
+distinguishes this memory separation property from race freedom: separation alone
+does not justify concurrent mutation of shared data.
 
 Terminal leases and window state are process-wide, thread-confined services.
 Independent heaps do not permit concurrent terminal/window access or remove
