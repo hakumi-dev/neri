@@ -1,5 +1,66 @@
 # Memory and performance checks
 
+## Run latency
+
+`neri source.hk --timings` separates frontend, cache lookup, code generation,
+linking and program execution. `--no-cache` provides an uncached comparison with
+the same compiler, runtime and safety checks. A cache hit still parses, type-checks,
+lowers and verifies the program; it skips native code generation and linking.
+
+The key hashes the canonical IR transport and a length-delimited build context
+with SHA-256. The context includes target, optimization mode, runtime manifest,
+working directory, selected SDK/developer tools, deployment target and PATH.
+File identities include device/inode, permissions, size and nanosecond mtime/ctime
+for codegen, the linker, runtime archive and selected platform link inputs.
+Access time is excluded. This cache assumes installed LLVM and SDK distributions
+are immutable; use `--no-cache` when developing or modifying their internal
+dependencies. External `@library` dependencies and custom search/injection
+environments are uncached. Other host ABIs use the uncached path.
+
+Each entry contains the executable and its file-identity receipt, under a
+user-owned 0700 directory. A mismatch is a miss. Builds happen in private staging
+directories, recheck dependency identities, and publish by atomic directory rename.
+Concurrent builders may duplicate work; readers only accept complete entries.
+Arguments and runtime environment are applied on every execution. Program output
+and exit status are never memoized. Cache I/O failures preserve uncached execution.
+
+Run the standalone Neri benchmark from the repository root:
+
+```sh
+scripts/neri.sh build benchmarks/run-latency.hk compiler/ir/process.hk --release --output build/run-latency
+./build/run-latency scripts/neri.sh examples/hello.hk build/run-latency.jsonl
+```
+
+It creates an isolated empty cache, records its first run, warms both cases,
+then records ten alternating-order samples each for warm-cache and uncached runs.
+The monotonic wall measurements include the launcher and child program, with
+millisecond resolution. An empty Neri cache does not imply a cold OS filesystem
+or loader cache. Compare medians and retain raw samples; small samples do not
+establish reliable tail-latency percentiles. Timing is a measurement, not a flaky
+pass/fail threshold.
+
+The [macOS ARM64 baseline](../benchmarks/run-latency-macos-arm64.json) records a
+small class-based Hello program on an Apple M4 Pro, macOS 26.6.2 and LLVM 22.1.8:
+the ten-sample median was 407 ms uncached and 46 ms cached (8.8x), including
+`scripts/neri.sh`. The first empty-cache run was 474 ms. This is a local run-loop
+observation, not a general application-throughput or first-build speedup claim.
+
+The cost model is `T = frontend + lookup + codegen + link + startup + program`.
+A hit removes codegen and link and reuses an already-created executable. For a
+fraction `p` accelerated by a factor `s`, overall speedup is
+`1 / ((1 - p) + p / s)`; optimize measured dominant phases first.
+This is the application of [Amdahl's law](https://www.cs.cmu.edu/~18742/papers/Amdahl1967.pdf).
+
+Dependency-keyed reuse follows the task/rebuild distinction in
+[Build Systems à la Carte](https://simon.peytonjones.org/assets/pdfs/build-systems-original.pdf).
+The correctness requirement is reuse of a compilation result only for matching
+recorded inputs. [A Consistent Semantics of Self-Adjusting Computation](https://arxiv.org/abs/1106.0478)
+provides the broader foundation for memoization and change propagation. The run
+cache is whole-artifact memoization, not a query-level incremental compiler or
+an implementation of that paper's formal proof.
+
+## Managed memory
+
 `neri_gc_pressure` is a deterministic allocation/retention workload built with
 the native tests. It keeps one 64 KiB object rooted, allocates and touches 1024
 unreachable 64 KiB objects, verifies the retained contents, and explicitly collects

@@ -1,0 +1,277 @@
+use host
+
+@cabi("stat")
+def unsafe runCacheStat(path: Byte*, data: Byte*): Int
+end
+
+@cabi("uname")
+def unsafe runCacheUname(data: Byte*): Int
+end
+
+def runCacheSupportedHost(): Bool
+  var data: Byte[] = []
+  var index = 0
+  while index < 1280
+    data = host.appendByte(data, 0 as Byte)
+    index = index + 1
+  end
+  unsafe
+    borrow data as pointer
+      if runCacheUname(pointer) != 0
+        return false
+      end
+    end
+  end
+  let darwin = "Darwin"
+  let arm = "arm64"
+  index = 0
+  while index < 6
+    if data[index] != host.stringByteAt(darwin, index)
+      return false
+    end
+    index = index + 1
+  end
+  index = 0
+  while index < 5
+    if data[1024 + index] != host.stringByteAt(arm, index)
+      return false
+    end
+    index = index + 1
+  end
+  return true
+end
+
+@cabi("lstat")
+def unsafe runCacheLstat(path: Byte*, data: Byte*): Int
+end
+
+@cabi("getuid")
+def unsafe runCacheUid(): Int
+end
+
+@cabi("mkdir")
+def unsafe runCacheMkdir(path: Byte*, mode: Int): Int
+end
+
+@cabi("rename")
+def unsafe runCacheRename(from: Byte*, to: Byte*): Int
+end
+
+@cabi("write")
+def unsafe runCacheWrite(fd: Int, bytes: Byte*, length: Int): Int
+end
+
+@cabi("neri_rt_v1_clock_milliseconds")
+def unsafe runCacheClock(): Int
+end
+
+def runCacheBytes(text: String): Byte[]
+  var bytes: Byte[] = []
+  var index = 0
+  while index < host.stringByteLength(text)
+    bytes = host.appendByte(bytes, host.stringByteAt(text, index))
+    index = index + 1
+  end
+  return host.appendByte(bytes, 0 as Byte)
+end
+
+def runCacheTime(): Int
+  unsafe
+    return runCacheClock()
+  end
+end
+
+def runCacheFrame(text: String): String
+  return (host.stringByteLength(text) as String) + ":" + text
+end
+
+def runCacheReport(enabled: Bool, phase: String, started: Int): Void
+  if enabled
+    let text = "neri timing " + phase + " " + ((runCacheTime() - started) as String) + " ms\n"
+    let bytes = runCacheBytes(text)
+    unsafe
+      borrow bytes as pointer
+        runCacheWrite(2, pointer, host.stringByteLength(text))
+      end
+    end
+  end
+end
+
+# Darwin arm64 stat is 144 bytes. Keep the OS layout at this boundary;
+# byte buffers also allow the trusted seed to compile this implementation.
+# Never call these operations on a different host ABI.
+class RunCacheFile
+  public fingerprint: String = ""
+  public mode: Int = 0
+  public owner: Int = -1
+
+  def init(path: String, follow: Bool): Void
+    let name = runCacheBytes(path)
+    var data: Byte[] = []
+    var index = 0
+    while index < 144
+      data = host.appendByte(data, 0 as Byte)
+      index = index + 1
+    end
+    var status = -1
+    unsafe
+      borrow name as namePointer
+        borrow data as dataPointer
+          if follow
+            status = runCacheStat(namePointer, dataPointer)
+          else
+            status = runCacheLstat(namePointer, dataPointer)
+          end
+        end
+      end
+    end
+    if status != 0
+      return
+    end
+    this.mode = (data[4] as Int) + (data[5] as Int) * 256
+    this.owner = (data[16] as Int) + (data[17] as Int) * 256 + (data[18] as Int) * 65536 + (data[19] as Int) * 16777216
+    # Identity, permissions, mtime, ctime and size; reading must not invalidate
+    # an entry, so atime and filesystem padding are deliberately excluded.
+    for start in [0, 8, 16, 48, 56, 64, 72, 96]
+      index = start
+      while index < start + 8
+        let value = data[index] as Int
+        this.fingerprint = this.fingerprint + irHexDigit(value / 16) + irHexDigit(value - (value / 16) * 16)
+        index = index + 1
+      end
+    end
+  end
+end
+
+class RunCache
+  public directory: String = ""
+  public executable: String = ""
+  public inputs: String = ""
+  public dependencies: String[] = []
+  public owner: Int = -1
+
+  def privateDirectory(path: String): Bool
+    let info = new RunCacheFile(path, false)
+    return info.mode == 16832 && info.owner == this.owner
+  end
+
+  def snapshot(): String
+    var result = ""
+    for path in this.dependencies
+      let info = new RunCacheFile(path, true)
+      result = result + (host.stringByteLength(path) as String) + ":" + path + ":" + info.fingerprint + "\n"
+    end
+    return result
+  end
+
+  def prepare(module: IrModule, target: String, release: Bool): Void
+    # External link inputs and other host ABIs are uncached until their complete
+    # dependency discovery is available. Failures always use the normal run path.
+    if target != "macos-arm64" || module.hasFeature("native-libraries-v1") || !runCacheSupportedHost()
+      return
+    end
+    let manifestPath = host.environment("NERI_RUNTIME_MANIFEST")
+    let codegen = host.environment("NERI_CODEGEN")
+    let linker = host.environment("NERI_LINKER")
+    let sdk = host.environment("SDKROOT")
+    if manifestPath == null || codegen == null || linker == null || sdk == null
+      return
+    end
+    if !bootstrapStartsWith(linker, "/") || !semanticEndsWith(linker, "/bin/clang++") || !bootstrapStartsWith(sdk, "/")
+      return
+    end
+    # Custom linker search/injection environments cannot be represented by the
+    # system-library dependency set below.
+    for variable in ["LIBRARY_PATH", "COMPILER_PATH", "GCC_EXEC_PREFIX", "CCC_OVERRIDE_OPTIONS", "DYLD_INSERT_LIBRARIES", "DYLD_LIBRARY_PATH", "DYLD_FRAMEWORK_PATH", "DYLD_FALLBACK_LIBRARY_PATH", "DYLD_FALLBACK_FRAMEWORK_PATH", "DYLD_VERSIONED_LIBRARY_PATH", "DYLD_VERSIONED_FRAMEWORK_PATH", "DYLD_ROOT_PATH", "DYLD_IMAGE_SUFFIX"]
+      let value = host.environment(variable)
+      if value != null && value != ""
+        return
+      end
+    end
+    let manifest = host.readText(manifestPath)
+    if manifest == null || bootstrapManifestString(manifest, "target") != target
+      return
+    end
+    let artifact = bootstrapManifestString(manifest, "artifact")
+    if !bootstrapArtifactNameValid(artifact)
+      return
+    end
+    let runtime = bootstrapDirectory(manifestPath) + "/" + artifact
+    let prefix = bootstrapDirectory(bootstrapDirectory(linker))
+    this.dependencies = [codegen, linker, runtime, manifestPath, "/usr/bin/ld", "/usr/bin/xcrun",
+      "/var/db/xcode_select_link", prefix + "/lib/libLLVM.dylib", prefix + "/lib/libc++.1.dylib",
+      prefix + "/bin/ld", prefix + "/bin/ld64.lld",
+      sdk, sdk + "/SDKSettings.json", sdk + "/usr/lib/libSystem.tbd", sdk + "/usr/lib/libc++.tbd"]
+    for path in [codegen, linker, runtime, sdk + "/usr/lib/libSystem.tbd", sdk + "/usr/lib/libc++.tbd"]
+      if (new RunCacheFile(path, true)).fingerprint == ""
+        return
+      end
+    end
+    var root = ""
+    let configured = host.environment("NERI_CACHE_DIR")
+    let homeDirectory = host.environment("HOME")
+    if configured != null
+      root = configured
+    else if homeDirectory != null
+      root = homeDirectory + "/.neri-run-cache"
+    end
+    if !bootstrapStartsWith(root, "/") || root == "/"
+      return
+    end
+    let rootBytes = runCacheBytes(root)
+    unsafe
+      this.owner = runCacheUid()
+      borrow rootBytes as pointer
+        runCacheMkdir(pointer, 448)
+      end
+    end
+    if !this.privateDirectory(root)
+      return
+    end
+    this.inputs = this.snapshot()
+    var configuration = "neri-run-cache-v1\n" + runCacheFrame(target) + runCacheFrame(release ? "release" : "debug") + runCacheFrame(manifest) + runCacheFrame(this.inputs)
+    for variable in ["SDKROOT", "DEVELOPER_DIR", "MACOSX_DEPLOYMENT_TARGET", "PATH"]
+      let value = host.environment(variable)
+      if value != null
+        configuration = configuration + runCacheFrame(variable) + runCacheFrame(value)
+      end
+    end
+    let workingDirectory = host.pathAbsolute(".")
+    if workingDirectory != null
+      configuration = configuration + runCacheFrame(workingDirectory)
+    end
+    let key = sha256Text(runCacheFrame(configuration) + runCacheFrame(irSerializeEnvelopeHex(module)))
+    this.directory = root + "/" + key
+    this.executable = this.directory + "/program"
+  end
+
+  def hit(): Bool
+    if this.directory == "" || !this.privateDirectory(this.directory)
+      return false
+    end
+    let info = new RunCacheFile(this.executable, false)
+    let receipt = host.readText(this.directory + "/receipt")
+    return info.owner == this.owner && info.mode / 4096 == 8 && receipt != null && receipt == info.fingerprint
+  end
+
+  def publish(staging: String): Bool
+    if this.directory == "" || this.inputs != this.snapshot()
+      return false
+    end
+    # Publish a complete directory with one atomic rename. Concurrent builders
+    # never overwrite or execute each other's partially linked artifacts.
+    let info = new RunCacheFile(staging + "/program", false)
+    if !host.writeText(staging + "/receipt", info.fingerprint)
+      return false
+    end
+    let sourceDirectory = runCacheBytes(staging)
+    let destinationDirectory = runCacheBytes(this.directory)
+    unsafe
+      borrow sourceDirectory as sourcePointer
+        borrow destinationDirectory as destinationPointer
+          return runCacheRename(sourcePointer, destinationPointer) == 0
+        end
+      end
+    end
+  end
+end

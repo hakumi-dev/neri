@@ -15,6 +15,9 @@ only after every contract passes.
 The hello and functions programs in `examples/` run as language cases. The package
 gate additionally checks the documented arguments example through the installed
 launcher. These checks keep the getting-started commands executable.
+The run-cache sequence protects reuse, fresh arguments and exit status, source
+and toolchain invalidation, optimization-mode separation, bypass and diagnostics.
+It uses an isolated private cache and asserts behavior rather than timing.
 
 Native probes call the exported C++ runtime directly from C and protect public
 layouts, negotiation, root transfer, cycles, borrows and native allocation.

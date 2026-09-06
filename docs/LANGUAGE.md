@@ -360,11 +360,25 @@ subcommand is equivalent to `run`. `build` emits an executable by default, named
 after the first source file without `.hk` in the working directory. `--output`
 overrides that path. Native emission defaults to the installed runtime manifest's
 target; `--target` explicitly selects a target. `--version` prints the compiler
-version. `run` compiles in a
-unique temporary directory, executes the result, and removes its temporary files
-on normal completion or a reported child failure. Arguments after `--` reach the
+version. `run` validates the sources and executes a native program. On macOS ARM64,
+eligible runs reuse a private persistent executable cache; other runs compile in
+a unique temporary directory and remove it on normal completion or a reported
+child failure. `--no-cache` selects this temporary path. Arguments after `--` reach the
 program unchanged. Program exit codes 0..125 propagate; larger statuses map to
 125. `run` owns its output location and accepts only executable emission.
+
+The run cache defaults to `$HOME/.neri-run-cache`. `NERI_CACHE_DIR` selects an
+absolute directory whose parent exists. The directory must belong to the current
+user with mode 0700; an unavailable or unsuitable cache falls back to compilation.
+Cache entries are disposable and can be removed when no compiler is using them.
+Programs using `@library` or custom linker search/injection environments use the
+uncached path. `build` and `check` do not reuse run artifacts.
+
+`--timings` writes phase durations in milliseconds to stderr. Native executable
+builds report frontend, codegen and link time; runs also report cache lookup,
+total time until ready, and execution. The ready measurement includes preceding
+phases and is not an additional phase. Launcher overhead is outside these timings.
+See [performance checks](PERFORMANCE.md#run-latency) for cache inputs and measurement.
 
 The `host` library supplies checked UTF-8 byte access, parsing, atomic file writes,
 path operations, environment and argument access, and shell-free process spawning.

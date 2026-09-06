@@ -173,7 +173,7 @@ def bootstrapNextSource(first: BootstrapSourceInput?): BootstrapSourceInput?
 end
 
 def bootstrapUsage(): Void
-  ConsoleInteraction.println("usage: neri [build|check|run] [--module <name>] [--source-root <dir>] [--target <target>] [--release] [--emit=neri-ir|neri-ir-hex|llvm-ir|asm|obj|executable] [--output <path>] <source.hk>... [-- <program arguments>]")
+  ConsoleInteraction.println("usage: neri [build|check|run] [--module <name>] [--source-root <dir>] [--target <target>] [--release] [--no-cache] [--timings] [--emit=neri-ir|neri-ir-hex|llvm-ir|asm|obj|executable] [--output <path>] <source.hk>... [-- <program arguments>]")
   ConsoleInteraction.println("A source file without a command is run. Native targets default to the installed runtime target.")
   ConsoleInteraction.println("neri build main.hk creates ./main; use --output to choose another path. neri --version prints the version.")
 end
@@ -195,6 +195,9 @@ def bootstrapWriteArtifact(output: String, artifact: String): Bool
 end
 
 def main(): Void
+  let started = runCacheTime()
+  var timings = false
+  var noCache = false
   var moduleName = "main"
   var sourceRoot = ""
   var emit = "neri-ir"
@@ -262,6 +265,12 @@ def main(): Void
       emit = host.stringSlice(argument, 7, host.stringByteLength(argument) - 7)
       emitExplicit = true
       index = index + 1
+    else if argument == "--timings"
+      timings = true
+      index = index + 1
+    else if argument == "--no-cache"
+      noCache = true
+      index = index + 1
     else if argument == "--release"
       release = true
       index = index + 1
@@ -307,7 +316,7 @@ def main(): Void
     emit = "executable"
   end
   if command == "run" && (emit != "executable" || output != "")
-    ConsoleInteraction.println("run creates a temporary executable; --output and non-executable --emit are invalid")
+    ConsoleInteraction.println("run owns its executable location; --output and non-executable --emit are invalid")
     host.exit(2)
     return
   end
@@ -461,6 +470,7 @@ def main(): Void
     return
   end
   if emit == "llvm-ir" || emit == "asm" || emit == "obj" || emit == "executable"
+    runCacheReport(timings, "frontend", started)
     if target == ""
       let manifestPath = host.environment("NERI_RUNTIME_MANIFEST")
       if manifestPath != null
@@ -476,8 +486,32 @@ def main(): Void
       return
     end
     var runDirectory = ""
+    let cache = new RunCache()
     if command == "run"
-      let directory = bootstrapRunDirectory()
+      let lookupStarted = runCacheTime()
+      if !noCache
+        cache.prepare(module, target, release)
+      end
+      let hit = cache.hit()
+      runCacheReport(timings, hit ? "cache-hit" : "cache-miss", lookupStarted)
+      if hit
+        runCacheReport(timings, "ready", started)
+        let executionStarted = runCacheTime()
+        let result = host.run(cache.executable, programArguments)
+        runCacheReport(timings, "execute", executionStarted)
+        if result != null
+          host.exit(result > 125 ? 125 : result)
+          return
+        end
+        # A vanished or non-executable artifact is a miss, not a program error.
+      end
+      var directory: String? = null
+      if cache.directory != ""
+        directory = bootstrapTemporaryDirectory(bootstrapDirectory(cache.directory), "pending")
+      end
+      if directory == null
+        directory = bootstrapRunDirectory()
+      end
       if directory == null
         ConsoleInteraction.println("could not create temporary run directory")
         host.exit(2)
@@ -508,18 +542,29 @@ def main(): Void
       host.exit(2)
       return
     end
-    let nativeSucceeded = bootstrapEmitNative(module, emit, output, target, release)
+    let nativeSucceeded = bootstrapEmitNative(module, emit, output, target, release, timings)
     if command == "run"
       var status = 2
       if nativeSucceeded
+        if cache.publish(runDirectory)
+          runDirectory = ""
+        end
+        if cache.hit()
+          output = cache.executable
+        end
+        runCacheReport(timings, "ready", started)
+        let executionStarted = runCacheTime()
         let result = host.run(output, programArguments)
+        runCacheReport(timings, "execute", executionStarted)
         if result != null
           status = result
         else
           ConsoleInteraction.println("could not run executable: " + host.errorMessage())
         end
       end
-      bootstrapRemoveRunDirectory(runDirectory)
+      if runDirectory != ""
+        bootstrapRemoveRunDirectory(runDirectory)
+      end
       if status > 125
         status = 125
       end
