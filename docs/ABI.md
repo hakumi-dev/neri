@@ -69,6 +69,16 @@ reference. Scoped borrows retain the owning allocation and expose a stable addre
 until the borrow ends. Raw pointers alone do not retain objects. Collection reclaims
 unreachable cycles. Shutdown requires all root frames and borrows to have ended.
 
+Mark bits are clear between collections. The collector completes reachability
+tracing before sweeping its allocation list, reclaiming unmarked objects and
+clearing survivors in that same sweep. This is the mark-and-sweep discipline
+described in [McCarthy (1960), section 4c](https://www-formal.stanford.edu/jmc/recursive.pdf).
+Collection makes one full allocation-list traversal. For N owned allocations,
+R root slots and E scanned reference edges, local tracing and sweeping take
+O(N + R + E) work. Validating ancestor references additionally walks the task
+ancestry. Child collectors leave suspended ancestor objects and their mark bits
+untouched.
+
 Each managed object and its private collector metadata share one zero-initialized
 native reservation. The prefix preserves the maximum supported payload alignment;
 the public object header and payload offsets follow the ABI layouts. Collection frees

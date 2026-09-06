@@ -286,6 +286,7 @@ void assert_consistent() {
     assert(allocation->previous == managed_previous);
     assert(allocation->object != nullptr);
     assert(allocation->owner == &current_state());
+    assert(current_state().collecting || !allocation->marked);
     managed_previous = allocation;
     ++managed_count;
     managed_bytes += sizeof(neri_object_header_v1) + allocation->payload_size;
@@ -385,11 +386,6 @@ void collect_impl() {
     contract_panic("nested GC collection is not supported by ABI v1.0");
   }
   heap.collecting = true;
-  for (auto *allocation = heap.managed_head; allocation != nullptr;
-       allocation = allocation->next) {
-    allocation->marked = false;
-  }
-
   mark_stack stack{};
   active_mark_stack = &stack;
   for (auto *frame = heap.root_frame; frame != nullptr;
@@ -429,6 +425,10 @@ void collect_impl() {
       heap.managed_byte_count -=
           sizeof(neri_object_header_v1) + allocation->payload_size;
       std::free(allocation);
+    } else {
+      // Outside collection every live object is unmarked. Reset survivors
+      // while sweeping instead of traversing the entire heap before marking.
+      allocation->marked = false;
     }
     allocation = next;
   }
