@@ -9,9 +9,9 @@ use console
 use host
 
 def main(): Void
-  let error = http.serve("127.0.0.1:8080", fn(request)
+  let error = http.serve("127.0.0.1:8080") do |request|
     return http.text(200, "Hello, world!")
-  end)
+  end
   console.println(error)
   host.exit(1)
 end

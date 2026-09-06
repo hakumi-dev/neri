@@ -24,6 +24,10 @@ Homebrew installs LLVM and zstd. The Xcode Command Line Tools are also required.
 For other installation methods, see [standalone installation](docs/PACKAGING.md#standalone-installer)
 or [building from source](docs/BUILDING.md).
 
+On Linux x86-64, follow [the GitHub source setup guide](docs/LINUX.md).
+It builds, tests and installs the complete compiler using the pinned Linux seed
+candidate from GitHub Actions. Downloading that candidate requires GitHub CLI access.
+
 Neri is in development. This repository documents its source revision; packaged
 releases include the language reference for their compiler.
 

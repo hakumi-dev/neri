@@ -16,7 +16,15 @@ and these dependencies:
 brew install llvm@22 zstd cmake ninja
 ```
 
-Run the following commands from the repository root.
+Clone the source from GitHub, then run the following commands from its root:
+
+```sh
+git clone https://github.com/hakumi-dev/neri.git
+cd neri
+```
+
+For Linux dependencies and full source installation, follow
+[Linux setup from GitHub](LINUX.md).
 
 ## Build and test
 
@@ -26,7 +34,7 @@ scripts/build.sh test
 ```
 
 The launcher verifies a prebuilt seed compiler and uses it to compile the Neri
-build driver. The driver builds the native components, compiles two generations
+build driver. The driver builds the native components, compiles three generations
 of the compiler and requires matching output. It then runs the language and
 native tests before selecting the verified toolchain at `build/current`.
 See [bootstrapping](BOOTSTRAP.md) and [testing](../tests/README.md) for details.
@@ -40,6 +48,34 @@ scripts/neri.sh build examples/functions.hk --release
 ```
 
 ## Build native components
+
+### Linux editor setup
+
+Open `CMakeLists.txt` in a CMake-capable editor (including Rider with CMake
+support). Select `linux-debug` for development or `linux-release` for optimized
+native builds. Reload the CMake project after changing presets. These profiles
+use the Debian/Ubuntu LLVM 22 installation at `/usr/lib/llvm-22` and generate
+`compile_commands.json` in `build/native/<preset>/` for C++ tooling.
+They clear inherited pkg-config and library search paths to avoid accidentally
+linking another project's environment. Other LLVM layouts can override
+`LLVM_DIR` and compiler paths with a local CMake user preset.
+
+```sh
+cmake --preset linux-debug
+cmake --build --preset linux-debug --parallel 4
+ctest --preset linux-debug
+```
+
+The same commands accept `linux-release`, `linux-sanitize` (ASan/UBSan), and
+`linux-thread-sanitize` (TSan). Run sanitizer configurations separately.
+These profiles cover the C/C++ backend and runtime, not the self-hosted `.hk`
+compiler. There is currently no Neri language server or editor grammar in this
+repository; C++ completion does not provide semantic completion for `.hk` files.
+The `.editorconfig` uses two-space indentation, UTF-8 and LF line endings.
+See [Linux setup from GitHub](LINUX.md) for dependencies and the remaining
+installation instructions.
+
+### macOS bootstrap host
 
 ```sh
 scripts/build.sh native

@@ -2,13 +2,20 @@
 
 ## Trust root
 
-The `bootstrap-seed-v1` release is the trust root for `macos-arm64`. Its provenance records the compiler/native source inventory, target, ABI, IR transport version, fixed-point verification, and hashes of every executable or archive.
+The pinned `v0.2.0-dev` release is the bootstrap input for `macos-arm64`.
+Its provenance records fixed-point and native/language verification and the
+provenance digest of its predecessor, `bootstrap-seed-v1`. The archive and
+extracted compiler/native artifacts are independently pinned in this repository.
 
 The seed contains:
 
 - a Neri-native compiler executable;
 - the C++ `neri-codegen` executable;
 - the C++ Neri runtime archive and manifest.
+
+The compiler is invoked directly at `libexec/neri`; the package's user-facing
+`bin/neri` wrapper is not used for bootstrap. The extracted cache directory
+includes the archive digest so an earlier seed cache remains untouched.
 
 `SOURCE-MANIFEST.sha256` identifies the compiler, native implementation, native
 test inputs, CMake configuration, and version used to produce and verify the seed.
@@ -19,15 +26,20 @@ test inputs, CMake configuration, and version used to produce and verify the see
 
 `scripts/build.sh bootstrap` compiles the Neri driver with the trusted seed.
 The driver builds the native backend and runtime from this checkout, then performs
-two generations in an isolated `build/work.*` directory:
+three generations in an isolated `build/work.*` directory:
 
 1. the trusted seed compiles `compiler/` into Stage1;
 2. Stage1 compiles the same sources into Stage2;
-3. Stage1 and Stage2 canonical NIR, objects, and executables are compared byte for byte.
+3. Stage2 compiles the same sources into Stage3;
+4. Stage1 and Stage2 must emit byte-identical canonical NIR and objects, and
+   Stage2 and Stage3 executables must match byte for byte.
 
-Seed-compiled compiler and tooling sources use the seed-compatible
-`ConsoleInteraction` spelling. User programs use `console`; both resolve to the
-same runtime operations and preserve the canonical import identity.
+The seed establishes Stage1; it may use an older internal IR naming convention.
+Fixed-point checks compare generations running the current compiler sources,
+without normalizing or ignoring any output differences.
+
+Compiler, tooling and user sources use `console`. The pinned release already
+supports this spelling, so no legacy import alias or source rewriting is needed.
 
 Every compiler process receives the current native artifact paths, the pinned LLVM linker, the macOS SDK path, a C locale, UTC, and the host `PATH`. Any unexplained difference fails the bootstrap. Native configuration independently checks Clang/LLVM and Ninja versions.
 
@@ -35,18 +47,16 @@ Native builds require an explicit CMake build type. Seed preparation and the
 Neri driver use the same absolute compiler paths under `LLVM_PREFIX`, preserving
 the compiler identity and Release configuration across native build invocations.
 
-The pinned seed requires the `0.1.0-dev` toolchain label in its runtime manifest.
-Native builds generate a seed-only compatibility manifest with that label and
-the current artifact, ABI and feature values. Only trusted-seed compiler calls
-receive this manifest. Stage1, Stage2 and distributed packages receive the current
-versioned manifest; artifact compatibility checks and fixed-point comparisons
-remain enabled. The compatibility manifest is not distributed.
+The pinned compiler uses the `0.2.0-dev` toolchain label. Seed, Stage1 and Stage2
+calls all receive the current native runtime manifest; artifact compatibility
+checks and fixed-point comparisons remain enabled. The initial build-driver
+compilation uses the pinned package's own codegen and runtime.
 
 Both generations use the executable basename `neri` in separate directories.
 The macOS linker embeds that basename in its ad-hoc signing identifier, so the
 basename is part of the reproducibility contract.
 
-The verified Stage2 compiler, codegen, runtime and manifest are copied together
+The verified Stage3 compiler, codegen, runtime and manifest are copied together
 under `build/toolchains/<artifact-manifest-sha256>`. An atomic symlink replacement
 selects that immutable tuple at `build/current`. `build/neri` is a compatibility
 link to its compiler. Failures preserve the last published tuple; native build
@@ -60,15 +70,18 @@ compiler, codegen and runtime from that immutable directory for the whole invoca
 
 ## Provenance
 
-- Release: `bootstrap-seed-v1`
+- Release: `v0.2.0-dev`
 - Target: `macos-arm64`
 - Compiler implementation: Neri
-- Runtime ABI: `1.6`
+- Runtime ABI: `1.8`
 - Neri IR transport: `1.1`
 
 The archive's `PROVENANCE.json` records its source-manifest digest and artifact hashes. The archive SHA-256 is pinned in `bootstrap/macos-arm64.seed`.
 
-Linux x86-64 remains a supported native target, but it requires a separately built and verified Linux seed before it can be advertised as a bootstrap host.
+Linux x86-64 uses the candidate pinned in `bootstrap/linux-x86_64.seed` and its
+extracted-file manifest. The pin identifies GitHub Actions run `34046783143`
+and the archive digest. It bootstraps locally using `bin/neri` and the
+target-specific runtime manifest; GitHub CLI access is needed to download it.
 
 ## Preparing a Linux seed
 
@@ -90,8 +103,8 @@ The candidate contains the native compiler, code generator, runtime archive and
 manifest, source inventory and provenance. `build/seeds/` also contains candidate
 archive and extracted-file pins. A final job step extracts the candidate, checks
 its file pins and bootstraps through `scripts/build.sh` on Linux. Publishing a
-trusted seed requires publishing the verified archive and committing its matching
-pins under `bootstrap/`.
+release seed remains a separate publication step. The current Linux pin downloads
+the verified Actions candidate instead; its availability depends on artifact retention.
 
 Linux source launchers use `/usr/lib/llvm-22` by default; `LLVM_PREFIX` selects
 another installation. The run cache currently supports macOS ARM64. Linux runs

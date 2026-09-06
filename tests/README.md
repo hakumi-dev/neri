@@ -39,7 +39,13 @@ The native scalar contract uses an independent C shared library to verify widths
 signedness and memory stride. Its conversion/overflow cases run in both Debug and
 Release and require arithmetic panics, not merely a failing process.
 `callbacks.hk` covers contextual and named callbacks, indirect storage, nested
-captures and invocation after explicit collection. `callback-errors.hk` protects
+captures and invocation after explicit collection, including trailing `do` blocks
+on functions, methods and constructors, typed/multiple parameters and nested blocks.
+The effects fixture exercises a parameterless `do` callback. The inline-callback,
+do-target and do-ending rejection fixtures protect the syntax boundary.
+`legacy-console-error.hk` rejects the removed console import spelling; the
+existing console contract exercises `console.print`, `println` and `read`.
+`callback-errors.hk` protects
 signature checking, complete returns and the mutable/raw-pointer capture boundary.
 `postfix-if.hk` checks conditional actions, optional refinement and loop control;
 its negative fixture checks unsupported modifier forms and inline block rejection.

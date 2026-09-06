@@ -177,19 +177,11 @@ if(BUILD_TESTING)
     "${CMAKE_CURRENT_SOURCE_DIR}/tests/golden/ir-codegen-primitives.nir.hex")
 endif()
 
-foreach(NERI_MANIFEST_KIND current seed)
-  set(NERI_MANIFEST_VERSION "${NERI_VERSION}")
-  set(NERI_MANIFEST_NAME "neri-runtime-${NERI_TARGET}.json")
-  if(NERI_MANIFEST_KIND STREQUAL "seed")
-    # The pinned seed requires its original version label, not a different ABI.
-    set(NERI_MANIFEST_VERSION "0.1.0-dev")
-    set(NERI_MANIFEST_NAME "neri-runtime-seed-${NERI_TARGET}.json")
-  endif()
+set(NERI_MANIFEST_VERSION "${NERI_VERSION}")
+set(NERI_MANIFEST_NAME "neri-runtime-${NERI_TARGET}.json")
   file(GENERATE
     OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/${NERI_MANIFEST_NAME}"
     CONTENT "{\n  \"schemaVersion\": 2,\n  \"toolchainVersion\": \"${NERI_MANIFEST_VERSION}\",\n  \"irTransportMajor\": 1,\n  \"irTransportMinor\": 1,\n  \"target\": \"${NERI_TARGET}\",\n  \"abiMajor\": 1,\n  \"abiMinor\": 9,\n  \"features\": 15103,\n  \"artifact\": \"$<TARGET_FILE_NAME:neri_runtime>\"\n}\n"
   )
-endforeach()
-
 install(TARGETS neri_codegen_cli neri_runtime RUNTIME DESTINATION bin ARCHIVE DESTINATION lib)
 install(FILES "${CMAKE_CURRENT_BINARY_DIR}/neri-runtime-${NERI_TARGET}.json" DESTINATION lib)

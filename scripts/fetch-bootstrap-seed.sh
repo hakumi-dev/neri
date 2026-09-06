@@ -21,9 +21,17 @@ REPOSITORY="$(sed -n 's/^repository=//p' "$SEED_FILE")"
 TAG="$(sed -n 's/^tag=//p' "$SEED_FILE")"
 ASSET="$(sed -n 's/^asset=//p' "$SEED_FILE")"
 EXPECTED_SHA256="$(sed -n 's/^sha256=//p' "$SEED_FILE")"
-SEED_DIR="$ROOT_DIR/.bootstrap/$TARGET"
+ARCHIVE_DIRECTORY="$(sed -n 's/^directory=//p' "$SEED_FILE")"
+ARCHIVE_DIRECTORY="${ARCHIVE_DIRECTORY:-neri-bootstrap-seed-v1-$TARGET}"
+COMPILER_PATH=bin/neri
+MANIFEST_PATH="lib/neri-runtime-$TARGET.json"
+if [[ "$TARGET" == macos-arm64 ]]; then
+  COMPILER_PATH=libexec/neri
+  MANIFEST_PATH=lib/neri-runtime.json
+fi
+SEED_DIR="$ROOT_DIR/.bootstrap/$TARGET-$EXPECTED_SHA256"
 
-if [[ -x "$SEED_DIR/bin/neri" ]]; then
+if [[ -x "$SEED_DIR/$COMPILER_PATH" ]]; then
   (cd "$SEED_DIR" && shasum -a 256 -c "$ROOT_DIR/bootstrap/$TARGET.files.sha256") >/dev/null
   printf '%s\n' "$SEED_DIR"
   exit 0
@@ -33,9 +41,21 @@ command -v curl >/dev/null || { echo "curl is required to fetch the seed release
 mkdir -p "$ROOT_DIR/.bootstrap/downloads"
 ARCHIVE="$ROOT_DIR/.bootstrap/downloads/$ASSET"
 
-echo "[bootstrap] Downloading $REPOSITORY $TAG ($TARGET)" >&2
-curl --fail --location --retry 3 \
-  "https://github.com/$REPOSITORY/releases/download/$TAG/$ASSET" --output "$ARCHIVE"
+if [[ ! -f "$ARCHIVE" ]]; then
+  RUN="$(sed -n 's/^run=//p' "$SEED_FILE")"
+  if [[ -n "$RUN" ]]; then
+    ARTIFACT="$(sed -n 's/^artifact=//p' "$SEED_FILE")"
+    command -v gh >/dev/null || { echo "GitHub CLI authentication is required for the Linux seed candidate." >&2; exit 2; }
+    DOWNLOAD_DIR="$(mktemp -d "$ROOT_DIR/.bootstrap/downloads/candidate.XXXXXX")"
+    echo "[bootstrap] Downloading verified candidate from $REPOSITORY run $RUN" >&2
+    gh run download "$RUN" --repo "$REPOSITORY" --name "$ARTIFACT" --dir "$DOWNLOAD_DIR"
+    cp "$DOWNLOAD_DIR/seeds/$ASSET" "$ARCHIVE"
+  else
+    echo "[bootstrap] Downloading $REPOSITORY $TAG ($TARGET)" >&2
+    curl --fail --location --retry 3 \
+      "https://github.com/$REPOSITORY/releases/download/$TAG/$ASSET" --output "$ARCHIVE"
+  fi
+fi
 
 ACTUAL_SHA256="$(shasum -a 256 "$ARCHIVE" | awk '{print $1}')"
 if [[ "$ACTUAL_SHA256" != "$EXPECTED_SHA256" ]]; then
@@ -46,8 +66,8 @@ fi
 EXTRACT_DIR="$(mktemp -d "$ROOT_DIR/.bootstrap/.extract.XXXXXX")"
 trap 'rm -rf "$EXTRACT_DIR"' EXIT
 tar -xzf "$ARCHIVE" -C "$EXTRACT_DIR"
-EXTRACTED="$EXTRACT_DIR/neri-bootstrap-seed-v1-$TARGET"
-for REQUIRED in bin/neri bin/neri-codegen lib/neri-runtime-$TARGET.json lib/libneri-runtime.a PROVENANCE.json SOURCE-MANIFEST.sha256; do
+EXTRACTED="$EXTRACT_DIR/$ARCHIVE_DIRECTORY"
+for REQUIRED in "$COMPILER_PATH" bin/neri-codegen "$MANIFEST_PATH" lib/libneri-runtime.a PROVENANCE.json SOURCE-MANIFEST.sha256; do
   if [[ ! -f "$EXTRACTED/$REQUIRED" ]]; then
     echo "Bootstrap seed is missing $REQUIRED." >&2
     exit 1

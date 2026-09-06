@@ -15,6 +15,8 @@ packages include the language reference for the packaged compiler.
 ## Develop Neri
 
 - [Building](BUILDING.md) — tools, source builds and local installation.
+- [Linux setup from GitHub](LINUX.md) — dependencies, verified bootstrap, tests
+  and local compiler installation.
 - [Testing](../tests/README.md) — language contracts and native validation.
 - [Architecture](ARCHITECTURE.md) — compiler, native components and build driver.
 - [Bootstrapping](BOOTSTRAP.md) — trusted seed and reproducible compiler generations.

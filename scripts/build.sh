@@ -18,12 +18,18 @@ case "$(uname -s):$(uname -m)" in
 esac
 mkdir -p "$ROOT_DIR/build"
 LAUNCH_DIR="$(mktemp -d "$ROOT_DIR/build/launcher.XXXXXX")"
+SEED_COMPILER="$SEED_DIR/bin/neri"
+SEED_MANIFEST="$SEED_DIR/lib/neri-runtime-$TARGET.json"
+if [[ "$TARGET" == macos-arm64 ]]; then
+  SEED_COMPILER="$SEED_DIR/libexec/neri"
+  SEED_MANIFEST="$SEED_DIR/lib/neri-runtime.json"
+fi
 trap 'rm -rf "$LAUNCH_DIR"' EXIT
 env -i "PATH=$PATH" "HOME=$HOME" LC_ALL=C LANG=C TZ=UTC "SDKROOT=$SDKROOT" \
   "NERI_CODEGEN=$SEED_DIR/bin/neri-codegen" \
-  "NERI_RUNTIME_MANIFEST=$SEED_DIR/lib/neri-runtime-$TARGET.json" \
+  "NERI_RUNTIME_MANIFEST=$SEED_MANIFEST" \
   "NERI_LINKER=$LLVM_PREFIX/bin/clang++" \
-  "$SEED_DIR/bin/neri" build "$ROOT_DIR/tooling/build.hk" "$ROOT_DIR/tooling/common.hk" "$ROOT_DIR/tooling/seed.hk" "$ROOT_DIR/compiler/ir/process.hk" \
+  "$SEED_COMPILER" build "$ROOT_DIR/tooling/build.hk" "$ROOT_DIR/tooling/common.hk" "$ROOT_DIR/tooling/seed.hk" "$ROOT_DIR/compiler/ir/process.hk" \
   --source-root "$ROOT_DIR" --module neri-build --target "$TARGET" --release \
   --output "$LAUNCH_DIR/neri-build"
 env -i "PATH=$PATH" "HOME=$HOME" LC_ALL=C LANG=C TZ=UTC "SDKROOT=$SDKROOT" \

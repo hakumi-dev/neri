@@ -230,8 +230,37 @@ def offsetBy(offset: Int): fn(Int): Int
 end
 ```
 
-`fn(parameters) ... end` creates a closure. An expected function type supplies
-omitted parameter and return annotations in arguments, returns, annotated
+Use a trailing `do` block to pass an inline callback to a call:
+
+```text
+let answer = apply(40) do |value|
+  return value + 2
+end
+```
+
+The block is appended after the explicitly supplied positional arguments. It
+binds to the immediately preceding call (including method, function-value and
+constructor calls), and uses that parameter's expected function type. Any later
+parameters must have defaults. It does not search the signature for a callback
+slot or reorder arguments. With no block parameters, write `call() do` followed
+by the body on a new line. Multiple parameters use `do |left, right|`; explicit
+annotations use `do |value: Int|: Int`.
+
+`do` must follow the closing parenthesis on the same line. The body starts on
+a new line and its closing `end` occupies its own line. A trailing block cannot
+appear inside another call's argument list or be followed by chaining or `end)`.
+Assign its call result to a local binding before passing that result elsewhere.
+Nested calls with their own `do` blocks inside the body are supported. `return`
+returns from the callback, not from the function enclosing the call.
+
+`fn(parameters) ... end` creates a standalone closure for a binding, field,
+return or array element. Inline `fn` closures inside call arguments are rejected
+with `NR009`; use `do` or pass a named callback instead. `NR009` also rejects a
+block attached to a non-call or an invalid block ending. The function type syntax
+remains `fn(Int): Int`.
+
+An expected function type supplies
+omitted parameter and return annotations in trailing blocks, returns, annotated
 initializers, assignments and typed array elements. Explicit annotations must
 match that contract. Without an expected type, annotate every parameter and the
 return type, such as `fn(value: Int): Int ... end`. Every non-Void callback must
