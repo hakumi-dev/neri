@@ -138,6 +138,25 @@ see Microsoft's [version selection rules](https://learn.microsoft.com/en-us/dotn
 NativeAOT compiles at publish time; see Microsoft's
 [NativeAOT contract](https://learn.microsoft.com/en-us/dotnet/core/deploying/native-aot/).
 
+The optional matrix mode `allocation-gc` runs only `allocation-batch`, comparing
+Neri with the same default-JIT assembly under workstation and server GC. Six
+cyclic process repetitions put each of the three configurations in every position
+twice, with worker order reversed in alternate repetitions. Both GC modes retain
+default tiering; this is a GC configuration comparison, not an optimized-JIT or
+NativeAOT comparison. The matrix clears inherited server-GC overrides and selects
+`DOTNET_gcServer=0` or `1` explicitly, following Microsoft's
+[GC configuration contract](https://learn.microsoft.com/en-us/dotnet/core/runtime-config/garbage-collector#workstation-vs-server).
+The ordinary `all` mode selects workstation GC for its .NET references. Other
+GC tuning remains part of the environment and must be recorded; verify the actual
+mode reported by each child before interpreting its measurements.
+
+```sh
+./build/compute-matrix build/native/native-release/neri-host ./build/compute benchmarks/reference-dotnet/bin/Release/net10.0/Compute.dll ./build/compute-aot/Compute build/gc-results 14 allocation-gc
+```
+
+`build/gc-results` must be a new, empty directory. This mode contains 90 processes
+at worker limits 1, 2, 4, 8 and 14, or 54 processes at limits 1, 2 and 4.
+
 The manual `Native compute observations` workflow verifies the frontend on
 macOS, exports canonical IR, and builds and runs x86-64 machine code on an
 Ubuntu x86-64 runner. It verifies source/IR hashes and the commit before lowering,
