@@ -1,0 +1,105 @@
+name: Native compute observations
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  transport:
+    name: Verify frontend and export portable IR
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Build and verify the current compiler
+        run: |
+          test "$(uname -m)" = arm64
+          brew install llvm@22 cmake ninja
+          scripts/build.sh test
+      - name: Export the checked workloads, not host machine code
+        run: |
+          mkdir -p build/compute-transport
+          scripts/neri.sh build benchmarks/compute.hk --emit=neri-ir-hex --output build/compute-transport/compute.nir.hex
+          scripts/neri.sh build benchmarks/compute-matrix.hk --emit=neri-ir-hex --output build/compute-transport/compute-matrix.nir.hex
+          git rev-parse HEAD > build/compute-transport/commit.txt
+          shasum -a 256 benchmarks/compute.hk benchmarks/compute-matrix.hk benchmarks/reference-dotnet/Program.cs build/compute-transport/*.nir.hex > build/compute-transport/SHA256SUMS
+          cp build/current/ARTIFACTS.sha256 build/compute-transport/frontend-artifacts.sha256
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: compute-transport
+          path: build/compute-transport/
+          if-no-files-found: error
+
+  linux-compute:
+    name: Native x86-64 Neri and .NET measurements
+    needs: transport
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      DOTNET_CLI_TELEMETRY_OPTOUT: '1'
+      DOTNET_NOLOGO: '1'
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: compute-transport
+          path: build/compute-transport
+      - uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5
+        with:
+          dotnet-version: '10.0.302'
+      - name: Install the declared native tools
+        run: |
+          test "$(uname -m)" = x86_64
+          test "$(git rev-parse HEAD)" = "$(cat build/compute-transport/commit.txt)"
+          sha256sum -c build/compute-transport/SHA256SUMS
+          sudo apt-get update
+          sudo apt-get install -y ca-certificates curl gnupg lsb-release software-properties-common cmake ninja-build build-essential zlib1g-dev libzstd-dev libedit-dev libffi-dev libxml2-dev
+          curl --fail --location --retry 3 https://raw.githubusercontent.com/opencollab/llvm-jenkins.debian.net/cf853fefa308484749df8a87004c580a6c0fe830/llvm.sh -o /tmp/neri-llvm.sh
+          echo '03878e08f47b66cc95bc4b544b0db3c6d9ce8d60e6cf2492ae357984330a9eae  /tmp/neri-llvm.sh' | sha256sum -c -
+          sudo bash /tmp/neri-llvm.sh 22
+          sudo apt-get install -y llvm-22-dev
+          test "$(llvm-config-22 --version)" = 22.1.8
+      - name: Build and validate native code generation and runtime
+        run: |
+          cmake -S . -B build/linux-native -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DNERI_SANITIZERS=OFF \
+            -DCMAKE_C_COMPILER=clang-22 -DCMAKE_CXX_COMPILER=clang++-22 \
+            -DLLVM_DIR=/usr/lib/llvm-22/lib/cmake/llvm -DBUILD_TESTING=ON
+          cmake --build build/linux-native --parallel 2
+          ctest --test-dir build/linux-native --output-on-failure --no-tests=error
+          build/linux-native/neri-codegen --input build/compute-transport/compute.nir.hex --input-format hex --target linux-x86_64 --optimization release --emit object --output build/compute.o
+          clang++-22 build/compute.o build/linux-native/libneri-runtime.a -o build/compute
+          build/linux-native/neri-codegen --input build/compute-transport/compute-matrix.nir.hex --input-format hex --target linux-x86_64 --optimization release --emit object --output build/compute-matrix.o
+          clang++-22 build/compute-matrix.o build/linux-native/libneri-runtime.a -o build/compute-matrix
+      - name: Build the matched JIT and NativeAOT references
+        run: |
+          dotnet build benchmarks/reference-dotnet/Compute.csproj --configuration Release --configfile benchmarks/reference-dotnet/NuGet.Config
+          dotnet publish benchmarks/reference-dotnet/Compute.csproj --configuration Release --runtime linux-x64 -p:PublishAot=true --configfile benchmarks/reference-dotnet/NuGet.Config --output build/compute-aot
+      - name: Record host and artifact identity
+        run: |
+          mkdir -p build/compute-results
+          uname -a > build/compute-results/uname.txt
+          lscpu > build/compute-results/cpu.txt
+          cat /proc/meminfo > build/compute-results/memory.txt
+          dotnet --info > build/compute-results/dotnet.txt
+          clang-22 --version > build/compute-results/clang.txt
+          file build/compute build/compute-matrix build/compute-aot/Compute > build/compute-results/binary-formats.txt
+          sha256sum build/compute build/compute-matrix build/compute-aot/Compute benchmarks/reference-dotnet/bin/Release/net10.0/Compute.dll build/linux-native/libneri-runtime.a > build/compute-results/SHA256SUMS
+          cp build/compute-transport/commit.txt build/compute-results/commit.txt
+      - name: Run checked independent processes in balanced configuration order
+        run: build/compute-matrix build/linux-native/neri-host ./build/compute benchmarks/reference-dotnet/bin/Release/net10.0/Compute.dll ./build/compute-aot/Compute build/compute-results 4
+      - name: Preserve raw results, process metrics and failure evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: compute-linux-x86_64
+          path: |
+            build/compute-results/
+            build/linux-native/Testing/Temporary/
+          if-no-files-found: warn

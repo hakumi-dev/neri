@@ -100,6 +100,53 @@ establish an optimal worker count or explain the 10-worker slowdown; that requir
 repeated randomized sweeps and scheduling evidence. Native x86-64 compute/scaling
 measurements and parallel Neri measurements are not represented in this baseline.
 
+## Repeated native comparison
+
+`compute-matrix.hk` runs the four kernels in four configurations: Neri Release,
+default .NET JIT, optimized JIT with tiering disabled, and .NET NativeAOT. Each
+configuration occupies every position once across four independent process
+repetitions. Worker counts are powers of two up to a supplied limit, including
+the limit itself; their order reverses in alternate repetitions. Neri has only
+the sequential batch case. This is a deterministic balanced order, not a random
+sample of machine conditions.
+
+```sh
+scripts/neri.sh build benchmarks/compute.hk --release --output build/compute
+scripts/neri.sh build benchmarks/compute-matrix.hk --release --output build/compute-matrix
+dotnet build benchmarks/reference-dotnet/Compute.csproj --configuration Release --configfile benchmarks/reference-dotnet/NuGet.Config
+dotnet publish benchmarks/reference-dotnet/Compute.csproj --configuration Release --runtime osx-arm64 -p:PublishAot=true --configfile benchmarks/reference-dotnet/NuGet.Config --output build/compute-aot
+mkdir -p build/compute-results
+./build/compute-matrix build/native/native-release/neri-host ./build/compute benchmarks/reference-dotnet/bin/Release/net10.0/Compute.dll ./build/compute-aot/Compute build/compute-results 14
+```
+
+Build the native helper with `scripts/build.sh native-test` if it is unavailable.
+Use an empty output directory for each experiment. The matrix uses 20 million
+integer steps, a 4096-element array with 10000 rounds, 100000 allocations with
+16 rounds, and 64 batch jobs starting at 2 million steps. The larger round counts
+reduce timer quantization relative to the initial array/allocation observations;
+compare only matching parameters. Each kernel invocation checks its result.
+
+Every child has a 120-second deadline. Nonzero exits, signals, timeouts and helper
+failures stop the experiment. Named files retain the seven kernel samples, stderr,
+exit status, and whole-process CPU time, wall time and peak RSS. `order.tsv`
+records process order and configuration. Process metrics include warmup, setup
+and reporting; they are not interchangeable with kernel timings. The matrix
+clears tiering/PGO environment overrides before selecting its JIT configuration;
+other runtime settings and host load remain experiment conditions to record.
+Default JIT samples can include tier promotion and are not asserted to be steady
+state. NativeAOT compiles at publish time; see Microsoft's
+[NativeAOT contract](https://learn.microsoft.com/en-us/dotnet/core/deploying/native-aot/).
+
+The manual `Native compute observations` workflow verifies the frontend on
+macOS, exports canonical IR, and builds and runs x86-64 machine code on an
+Ubuntu x86-64 runner. It verifies source/IR hashes and the commit before lowering,
+runs native contracts, and retains host identity, tool versions, binary hashes
+and raw results as artifacts. The Linux job compares .NET SDK 10.0.302 JIT and
+NativeAOT on the same host with worker limits 1, 2 and 4. No emulation is involved;
+the [GitHub-hosted environment](https://docs.github.com/en/actions/reference/runners/github-hosted-runners)
+is a virtual machine, not a dedicated bare-metal PC. This measures kernel
+execution, not a Linux self-hosted frontend, and defines no CI timing threshold.
+
 ## Analytical foundations
 
 - [Amdahl (1967)](https://www.cs.cmu.edu/~18742/papers/Amdahl1967.pdf): for an
@@ -123,6 +170,12 @@ measurements and parallel Neri measurements are not represented in this baseline
   Apple performance and efficiency cores require host-specific measurement and
   appropriate scheduling. Uniform-worker mathematical bounds alone do not model
   the relative speeds of heterogeneous cores.
+- [Kalibera and Jones, Rigorous Benchmarking in Reasonable Time (2013)](https://kar.kent.ac.uk/33611/45/p63-kaliber.pdf):
+  variation between process executions and variation within one process are
+  distinct levels. The matrix retains both levels; summarize process medians
+  before comparing configurations rather than treating all seven samples as
+  independent experiments. Four processes and one binary build do not establish
+  confidence intervals across builds, hosts or scheduling conditions.
 
 Run-loop, collection-pressure and growing-buffer measurements are documented in
 [PERFORMANCE.md](../docs/PERFORMANCE.md). Current language/runtime boundaries are in
