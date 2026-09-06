@@ -21,13 +21,36 @@ declaration name and canonical type arguments, with bounded expansion.
 
 Function types are structural language types. Closure conversion represents each
 signature with a hidden managed class and virtual invocation slot, and each
-closure with an implementation class containing its captures. Existing class
-allocation, tracing and indirect dispatch provide closure lifetime and invocation;
-the IR transport and runtime ABI remain unchanged. The signature class is not
+closure with an implementation class containing its captures. Class
+allocation, tracing and indirect dispatch provide closure lifetime and invocation
+through the ordinary IR transport and runtime ABI. The signature class is not
 source-constructible, and its fallback invocation traps. A callee's `noreturn`
 property does not propagate to callers or other implementations of its slot.
 
 `compiler/ir/main.hk` is the executable entry point. `frontend/main.hk` and `semantic/main.hk` are standalone development entry points and are excluded from the compiler source set.
+
+### Effect summaries
+
+`compiler/ir/effects.hk` computes transitive summaries over the lowered call graph,
+including virtual-call targets. Each function starts with its local effects and
+the safepoint effect of known calls. A callee contributes all its effects except
+`noreturn`, which describes that function's control flow, not its callers.
+
+The solver uses reverse call edges and a deduplicated work queue. A summary is a
+set of eight effect bits; union only adds information. Each function's set can
+grow at most eight times, so the queue terminates even for recursive cycles.
+At termination every caller contains its callees' propagated effects. Starting
+from local effects and adding only required bits yields the least fixed point.
+This is a finite monotone dataflow analysis; the general foundation is
+[Kildall's global analysis framework (1973)](https://calhoun.nps.edu/bitstream/10945/42162/1/Kildall_A_unified_approach_1973.pdf).
+
+For `V` functions and `E` call edges, propagation takes `O(V + 8E)` work and
+scratch storage takes `O(V + E)`. Building the reverse graph still uses linear
+name lookup and can take `O(VE)` work. These bounds describe this pass, not the
+whole compiler. Queue and reverse-edge state are private to analysis and are
+absent from serialized IR. Read/write summaries do not distinguish local mutable
+state from shared state and are not a proof that a closure is safe to run on
+another thread.
 
 ## Native boundary
 

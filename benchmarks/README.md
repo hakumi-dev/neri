@@ -78,28 +78,6 @@ machine. C# scaling is a reference for this workload; it does not demonstrate
 parallel Neri execution. Repeat native ARM64 and native x86-64 measurements
 separately; emulation is not hardware performance evidence.
 
-## Local observations
-
-The [ARM64 observations](compute-macos-arm64.json) retain raw samples and binary
-fingerprints. Initial kernel medians were 62/78 ms (Neri/C# integer), 7/7 ms
-(small array, coarse timer resolution), and 43/5 ms (allocation). These are narrow
-workloads under the stated .NET configuration, not a language ranking.
-
-In three before/after process pairs, combining Neri's object and metadata
-reservations reduced the pooled allocation median from 38 to 28 ms (26% less time,
-1.36x throughput). Both variants have linear allocation work; native reservations
-per object fall from two to one. No hardware-counter measurement isolates the
-contribution of cache locality. This change does not close the allocation gap to
-.NET or add concurrent collection.
-
-For the same 64-job batch, the initial C# sweep measured medians of 503, 255, 135,
-74, 84 and 72 ms at maximum worker counts 1, 2, 4, 8, 10 and 14. Neri's sequential
-median was 391 ms. The 14-worker reference speedup is about 7x relative to its
-own sequential case, not 14x. These ordered, single-process observations do not
-establish an optimal worker count or explain the 10-worker slowdown; that requires
-repeated randomized sweeps and scheduling evidence. Native x86-64 compute/scaling
-measurements and parallel Neri measurements are not represented in this baseline.
-
 ## Repeated native comparison
 
 `compute-matrix.hk` runs the four kernels in four configurations: Neri Release,
@@ -122,9 +100,9 @@ mkdir -p build/compute-results
 Build the native helper with `scripts/build.sh native-test` if it is unavailable.
 Use an empty output directory for each experiment. The matrix uses 20 million
 integer steps, a 4096-element array with 10000 rounds, 100000 allocations with
-16 rounds, and 64 batch jobs starting at 2 million steps. The larger round counts
-reduce timer quantization relative to the initial array/allocation observations;
-compare only matching parameters. Each kernel invocation checks its result.
+16 rounds, and 64 batch jobs starting at 2 million steps. Round counts control
+timer quantization; compare only matching parameters. Each kernel invocation
+checks its result.
 
 Every child has a 120-second deadline. Nonzero exits, signals, timeouts and helper
 failures stop the experiment. Named files retain the seven kernel samples, stderr,
@@ -154,57 +132,53 @@ the [GitHub-hosted environment](https://docs.github.com/en/actions/reference/run
 is a virtual machine, not a dedicated bare-metal PC. This measures kernel
 execution, not a Linux self-hosted frontend, and defines no CI timing threshold.
 
-The [repeated ARM64 observation](compute-matrix-macos-arm64.json) contains all 112
-processes and 784 checked kernel samples on the M4 Pro. Median-of-process-median
-times in milliseconds are:
+### Measurement records
 
-| Kernel | Neri | Default JIT | Optimized JIT | NativeAOT |
-|---|---:|---:|---:|---:|
-| Integer | 61 | 74.5 | 79 | 77.5 |
-| Array, 10000 rounds | 17 | 19.5 | 17.5 | 17 |
-| Allocation, 16 rounds | 54.5 | 11 | 11 | 11 |
-| Batch, sequential | 382.5 | 485.5 | 512.5 | 496.5 |
-| Batch, worker limit 14 | — | 68.5 | 70.5 | 68 |
+Records retain workload parameters, source and binary fingerprints, hardware,
+runtime identity, raw samples and process metrics. They are evidence for the
+specified configurations, not a ranking of languages.
 
-The repeated allocation workload retains a roughly 5x gap despite Neri's reduced
-allocation cost. C#'s 14-worker speedups relative to each configuration's own
-sequential case are approximately 7.1x, 7.3x and 7.3x. At 8 workers, corresponding
-times are 68.5, 70 and 71 ms: adding workers does not imply proportional throughput.
-These observations do not identify the best scheduler or core assignment, and
-the serial Neri results do not substitute for a managed parallel execution path.
+| Record | Scope |
+|---|---|
+| [ARM64 kernels and allocator comparison](compute-macos-arm64.json) | Kernel samples and paired allocator variants. |
+| [ARM64 matrix](compute-matrix-macos-arm64.json) | 112 processes, 784 checked kernel samples, M4 Pro. |
+| [Runtime-pinned ARM64 matrix](compute-matrix-macos-arm64-pinned.json) | 112 processes with actual .NET runtime identity and substantial host variability. |
+| [Native x86-64 matrix](compute-matrix-linux-x86_64.json) | 88 processes, 616 checked samples, four-vCPU AMD EPYC VM. |
 
-The [runtime-pinned ARM64 repetition](compute-matrix-macos-arm64-pinned.json)
-retains a second complete 112-process series with runtime 10.0.10 confirmed on
-each C# process. Host conditions varied: the unchanged Neri binary's integer
-process medians were 60, 92, 92 and 92 ms; corresponding default-JIT medians were
-79, 116, 115 and 116 ms. A post-run snapshot showed battery power and background
-CPU activity, but no per-sample power/load telemetry establishes their individual
-contributions. These data are retained, not discarded as outliers. They do not
-show a compiler regression or justify comparing absolute times across runs as if
-the host were controlled. Record power mode and background load before and after
-dedicated workstation measurements; four process repetitions alone do not remove
-such variation.
+Summarize each process by its median, then compare those process summaries.
+Keep process and kernel timers separate. Absolute times require matching workload
+and host conditions; runtime pinning alone does not control power mode or background
+load. Record power and load before and after workstation runs. The runtime-pinned
+ARM64 data contain large changes within the same binary: no per-sample telemetry
+isolates their cause. Neither VM results nor local Mac samples establish
+dedicated-PC performance.
 
-The [native x86-64 observation](compute-matrix-linux-x86_64.json), from
-[the verified workflow run](https://github.com/hakumi-dev/neri/actions/runs/34034648403),
-contains 88 processes and 616 checked samples. The VM reports an AMD EPYC 7763,
-four virtual CPUs and a two-core/two-thread topology. Application runtime 10.0.10
-is confirmed per C# process; the installed host executable reports 10.0.11, which
-is not the selected application runtime. Median-of-process-median times are:
+## Compiler effect analysis
 
-| Kernel | Neri | Default JIT | Optimized JIT | NativeAOT |
-|---|---:|---:|---:|---:|
-| Integer | 95 | 93 | 93 | 93 |
-| Array, 10000 rounds | 30 | 32 | 32.5 | 31 |
-| Allocation, 16 rounds | 98 | 18.5 | 19 | 17 |
-| Batch, sequential | 611 | 597 | 598 | 598 |
-| Batch, worker limit 4 | — | 156.5 | 161 | 161 |
+`compiler-effects.hk` generates ascending call chains of 128, 256, 512 and 1024
+functions and compares two compiler executables on the same source. Each size has
+one warmup pair and four measured process pairs with balanced variant order.
+The native helper records whole-process wall time, user/system CPU time and peak
+RSS. Every invocation has a 120-second deadline, must succeed, and must produce
+byte-identical canonical IR across variants. Source generation and comparison are
+outside the child-process measurements; parsing, binding, lowering and IR emission
+are included. These are compiler timings, not program execution timings.
 
-On this host the integer and small-array cases are close, while the object-heavy
-case retains a substantial gap. The C# reference scales about 3.7–3.8x at four
-workers relative to its own sequential case. Neri's ARM64 integer advantage in
-the local observation is not a cross-platform language ranking; neither these
-virtualized results nor the Mac samples establish dedicated-PC performance.
+```sh
+scripts/neri.sh build benchmarks/compiler-effects.hk --release --output build/compiler-effects
+mkdir -p build/effects-results
+./build/compiler-effects build/native/native-release/neri-host /path/to/compiler-a /path/to/compiler-b build/effects-results
+```
+
+Use immutable compiler binaries, an empty output directory, matching standard
+libraries and an otherwise idle host. Retain binary hashes and process records.
+The forward chain stresses transitive propagation; it does not represent every
+program shape or isolate the time spent in a single compiler pass.
+
+The [ARM64 effect-analysis record](compiler-effects-macos-arm64.json) contains
+all 40 process measurements, compiler/source hashes and host conditions. Its
+paired variants must satisfy the same canonical-IR contract. Timing values are
+descriptive evidence; no timing threshold is part of the test suite.
 
 ## Analytical foundations
 

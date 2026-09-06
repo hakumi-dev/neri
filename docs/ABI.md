@@ -6,7 +6,7 @@ C calling convention on macOS ARM64 and Linux x86-64. Generated programs negotia
 major version, minimum minor version and required feature bits before execution.
 The package manifest also identifies the toolchain version and native target.
 
-ABI 1.8 adds the `INTERACTIVE_IO` feature (8192): generation-scoped terminal
+The `INTERACTIVE_IO` feature (8192) provides generation-scoped terminal
 leases, byte input with bounded waiting, terminal dimensions, and monotonic
 milliseconds. Platform terminal layouts remain inside the runtime. Key decoding
 and the public session API are implemented in Neri.
@@ -47,7 +47,7 @@ unreachable cycles. Shutdown requires all root frames and borrows to have ended.
 
 Each managed object and its private collector metadata share one zero-initialized
 native reservation. The prefix preserves the maximum supported payload alignment;
-the public object header, payload offsets and ABI are unchanged. Collection frees
+the public object header and payload offsets follow the ABI layouts. Collection frees
 the reservation once. Managed-byte statistics count the public header and payload,
 while allocator metadata and alignment padding contribute to RSS separately.
 
@@ -68,7 +68,7 @@ Runtime contract failures panic; no exception unwinds into Neri code.
 
 The compiler emits canonical Neri IR with transport 1.1, 1.2 for extended
 scalars or external library metadata, and 1.3 for native records and fixed arrays.
-The `native-libraries-v1` feature adds a library
+The `native-libraries-v1` feature carries a library
 name after each import's source location; empty names retain platform-default
 symbol resolution. Only C ABI imports may declare a library. The transport header
 includes versions, flags, payload size and a SHA-256 digest. The native reader
