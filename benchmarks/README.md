@@ -164,6 +164,7 @@ specified configurations, not a ranking of languages.
 | [Scoped-task x86-64 matrix](scoped-tasks-linux-x86_64.json) | 96 processes, 672 checked samples, native Intel Xeon VM with four vCPU. |
 | [GC sweep ARM64 comparison](gc-sweep-macos-arm64.json) | 32 paired-variant processes, 224 checked samples, identical program object with separate runtime archives. |
 | [GC leaf-frame ARM64 comparison](gc-leaf-macos-arm64.json) | 32 paired-variant processes, 224 checked samples, effect-proven root-frame omission with the same frontend and runtime. |
+| [Allocation-task ARM64 matrix](allocation-tasks-macos-arm64.json) | 208 processes, 1456 checked samples, integer and allocation-heavy task scaling; .NET references use workstation GC. |
 
 Summarize each process by its median, then compare those process summaries.
 Keep process and kernel timers separate. Absolute times require matching workload
