@@ -59,6 +59,14 @@ inline bool run(const std::vector<std::string> &arguments, unsigned long &status
   }
   STARTUPINFOW startup{};
   startup.cb = sizeof(startup);
+  startup.dwFlags = STARTF_USESTDHANDLES;
+  startup.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+  startup.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE);
+  startup.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+  // IDEs and pipe-based runners have no console. Do not allocate one for
+  // each compiler/tool invocation; interactive shells retain their console.
+  const DWORD flags = (supervise ? CREATE_SUSPENDED : 0) |
+      (GetConsoleCP() == 0 ? CREATE_NO_WINDOW : 0);
   PROCESS_INFORMATION process{};
   HANDLE job = nullptr;
   if (supervise) {
@@ -70,7 +78,7 @@ inline bool run(const std::vector<std::string> &arguments, unsigned long &status
       error = GetLastError(); CloseHandle(job); return false;
     }
   }
-  if (!CreateProcessW(nullptr, command.data(), nullptr, nullptr, TRUE, supervise ? CREATE_SUSPENDED : 0, nullptr, nullptr, &startup, &process)) {
+  if (!CreateProcessW(nullptr, command.data(), nullptr, nullptr, TRUE, flags, nullptr, nullptr, &startup, &process)) {
     error = GetLastError(); if (job) CloseHandle(job); return false;
   }
   if (supervise && (!AssignProcessToJobObject(job, process.hProcess) || ResumeThread(process.hThread) == static_cast<DWORD>(-1))) {

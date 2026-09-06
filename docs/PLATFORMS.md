@@ -14,6 +14,5 @@ Windows; Windows-specific coverage remains in progress.
 
 The CI workflow keeps the macOS and Linux jobs and includes Windows Debug and
 Release jobs. Its `Required / supported platforms` job checks all three
-platform results. Repository maintainers must select that check in branch
-protection for the gate to enforce supported-platform coverage on remote
-pull requests.
+platform results. Branch protection for `main` requires that check, enforcing
+supported-platform coverage on remote pull requests.

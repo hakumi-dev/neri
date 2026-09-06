@@ -125,6 +125,7 @@ try {
   Invoke-Checked "$tree/bin/neri.exe" @("$root/examples/hello.hk")
   if ($Action -eq 'build') { Write-Host "Toolchain: $tree/bin/neri.exe"; return }
   Invoke-Checked node @("$PSScriptRoot/test-windows.mjs","$tree/bin/neri.exe",$native)
+  & "$root/tests/windows-launcher.ps1" -Compiler "$tree/bin/neri.exe"
   [IO.File]::WriteAllText("$work/VALIDATED", "Windows native, language, UTF-8 paths and LSP contracts passed.`n")
   if ($Action -eq 'test') { Write-Host "Validated toolchain: $tree/bin/neri.exe"; return }
 

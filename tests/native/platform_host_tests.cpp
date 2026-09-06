@@ -142,6 +142,11 @@ int main(int argc, char **argv) {
     neri::windows::command_arguments native_arguments;
     argc = static_cast<int>(native_arguments.storage.size());
     argv = native_arguments.pointers.data();
+    if (argc == 2 && std::string(argv[1]) == "--no-console") {
+      require(GetConsoleWindow() == nullptr || !IsWindowVisible(GetConsoleWindow()),
+          "background child opened a visible console");
+      return 0;
+    }
 #endif
     if (argc >= 2 && std::string(argv[1]) == "--child") {
       require(static_cast<size_t>(argc) == child_arguments.size() + 2, "child argument count changed");
@@ -154,6 +159,16 @@ int main(int argc, char **argv) {
     test_environment();
     test_memory();
     test_process(std::filesystem::absolute(neri::host_path(argv[0])), directory.path);
+#if defined(_WIN32)
+    // Model an IDE/pipe runner without opening even a temporary test console.
+    FreeConsole();
+    for (const bool supervise : {false, true}) {
+      unsigned long status = 1, error = 0;
+      require(neri::windows::run({neri::path_text(std::filesystem::absolute(
+          neri::host_path(argv[0]))), "--no-console"}, status, error, supervise) && status == 0,
+          "background subprocess must remain console-free");
+    }
+#endif
     return 0;
   } catch (const std::exception &error) {
     std::cerr << "Neri platform test failed: " << error.what() << '\n';

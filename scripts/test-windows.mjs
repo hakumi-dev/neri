@@ -12,7 +12,7 @@ fs.mkdirSync(evidence, {recursive: true});
 const env = {...process.env, NERI_LIBRARY_PATH: native.replaceAll('\\', '/'), PATH: native + ';' + process.env.PATH};
 let count = 0;
 function execute(args, status = 0, expected, exact = true, options = {}) {
-  const result = spawnSync(compiler, args, {cwd: root, env, encoding: 'utf8', timeout: 60000, maxBuffer: 32 * 1024 * 1024, ...options});
+  const result = spawnSync(compiler, args, {cwd: root, env, windowsHide: true, encoding: 'utf8', timeout: 60000, maxBuffer: 32 * 1024 * 1024, ...options});
   const label = String(++count).padStart(3, '0');
   fs.writeFileSync(path.join(evidence, label + '.json'), JSON.stringify({args, status: result.status, error: result.error?.message, stdout: result.stdout, stderr: result.stderr}, null, 2));
   assert.ifError(result.error);
@@ -52,14 +52,14 @@ const unicodeRoot = path.join(evidence, 'proyecto español con espacios');
 fs.mkdirSync(unicodeRoot, {recursive: true});
 fs.writeFileSync(path.join(unicodeRoot, 'hello.hk'), 'use console\ndef main(): Void\n  console.println("¡Hola!")\nend\n');
 execute(['build', 'hello.hk', '--release'], 0, undefined, true, {cwd: unicodeRoot});
-const hello = spawnSync(path.join(unicodeRoot, 'hello.exe'), [], {encoding: 'utf8', timeout: 10000});
+const hello = spawnSync(path.join(unicodeRoot, 'hello.exe'), [], {windowsHide: true, encoding: 'utf8', timeout: 10000});
 assert.equal(hello.status, 0);
 assert.equal(hello.stdout, '¡Hola!\n');
 fs.writeFileSync(path.join(unicodeRoot, 'neri.json'), JSON.stringify({version: 2, defaultUnit: 'app', units: {app: {kind: 'executable', sources: ['hello.hk']}}}));
 execute(['run', '--project', 'neri.json'], 0, '¡Hola!\n', true, {cwd: unicodeRoot});
 
 // LSP frames are byte-counted; this detects Windows CRLF translation as well as URI handling.
-const server = spawn(compiler, ['lsp'], {cwd: root, env, stdio: ['pipe', 'pipe', 'pipe']});
+const server = spawn(compiler, ['lsp'], {cwd: root, env, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe']});
 let buffer = Buffer.alloc(0), stderr = '', messages = [];
 server.stderr.on('data', data => { stderr += data; });
 server.stdout.on('data', data => {

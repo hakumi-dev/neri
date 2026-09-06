@@ -79,9 +79,9 @@ worker and PTY helpers have no direct Windows port with identical behavior.
 Windows-specific tests and helper coverage are still being expanded.
 
 The local Windows validation recorded three identical compiler generations and
-4/4 CTest cases in both Debug and Release, plus the 74-case CLI, UTF-8 path and
-LSP checks above. The repository workflow retains the macOS and Linux jobs and
-adds Windows Debug/Release jobs plus a `Required / supported platforms` gate.
-Selecting that gate in branch protection is required before it enforces all
-supported-platform jobs on remote pull requests; this document does not claim
-that a remote CI run has been executed.
+7/7 CTest cases in both Debug and Release, plus the 74-case CLI, UTF-8 path,
+and LSP checks above. The HTTP example contracts were also verified locally.
+The repository workflow retains the macOS and Linux
+jobs and adds Windows Debug/Release jobs plus a `Required / supported platforms`
+gate. Branch protection for `main` requires that gate, so all supported-platform
+jobs are enforced on remote pull requests.
