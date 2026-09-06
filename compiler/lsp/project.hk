@@ -1,0 +1,525 @@
+# Source membership is shared by CLI commands and language-service analysis.
+class NeriProject
+  public root: String = ""
+  public manifest: String = ""
+  public sourceSet: String = ""
+  public sources: StringBuffer = new StringBuffer()
+  # Parallel to sources. Root members are executable-entry candidates; refs
+  # are source-only libraries until a binary-library model exists.
+  public sourceOwners: StringBuffer = new StringBuffer()
+  public ownSources: StringBuffer = new StringBuffer()
+  public referenceSources: StringBuffer = new StringBuffer()
+  public error: String = ""
+  public sets: LspJson = new LspJson()
+end
+
+class NeriProjectReference
+  public path: String = ""
+  public next: NeriProjectReference?
+
+  def init(path: String, next: NeriProjectReference?): Void
+    this.path = path
+    this.next = next
+  end
+end
+
+def neriSourceNameValid(path: String): Bool
+  let name = host.pathFileName(path)
+  if name == null || !semanticEndsWith(name, ".hk")
+    return true
+  end
+  var offset = 0
+  while offset < host.stringByteLength(name)
+    let point = codePointAt(name, offset)
+    # Unicode White_Space; directory names are deliberately not checked.
+    if (point >= 9 && point <= 13) || point == 32 || point == 133 || point == 160 || point == 5760 || (point >= 8192 && point <= 8202) || point == 8232 || point == 8233 || point == 8239 || point == 8287 || point == 12288
+      return false
+    end
+    offset = offset + utf8Width(host.stringByteAt(name, offset) as Int)
+  end
+  return true
+end
+
+# Explicit source paths stay deliberately permissive for compatibility. Glob
+# roots are narrower: they cannot walk upward or select generated output trees.
+def neriRelativeProjectPath(path: String): Bool
+  if path == "" || bootstrapStartsWith(path, "/") || bootstrapFindText(path, "\\") >= 0
+    return false
+  end
+  var start = 0
+  var index = 0
+  while index <= host.stringByteLength(path)
+    if index == host.stringByteLength(path) || host.stringByteAt(path, index) == (47 as Byte)
+      if index == start
+        return false
+      end
+      let segment = host.stringSlice(path, start, index - start)
+      if segment == "." || segment == ".."
+        return false
+      end
+      start = index + 1
+    end
+    index = index + 1
+  end
+  return true
+end
+
+def neriGeneratedProjectDirectory(path: String): Bool
+  var start = 0
+  var index = 0
+  while index <= host.stringByteLength(path)
+    if index == host.stringByteLength(path) || host.stringByteAt(path, index) == (47 as Byte)
+      let segment = host.stringSlice(path, start, index - start)
+      if segment == ".git" || segment == ".neri" || segment == ".cache" || segment == ".idea" || segment == ".bootstrap" || segment == "build" || segment == "out" || segment == "dist" || segment == "target" || segment == "bin"
+        return true
+      end
+      start = index + 1
+    end
+    index = index + 1
+  end
+  return false
+end
+
+# The grammar is intentionally small and portable: a literal directory prefix
+# followed by either *.hk or **/*.hk. A root-wide **/*.hk would mix entry
+# points, so it is not a source-set pattern.
+def neriGlobRoot(pattern: String): String?
+  var suffix = "/*.hk"
+  if semanticEndsWith(pattern, "/**/*.hk")
+    suffix = "/**/*.hk"
+  else if !semanticEndsWith(pattern, suffix)
+    return null
+  end
+  let root = host.stringSlice(pattern, 0, host.stringByteLength(pattern) - host.stringByteLength(suffix))
+  if !neriRelativeProjectPath(root) || bootstrapFindText(root, "*") >= 0 || bootstrapFindText(root, "?") >= 0 || neriGeneratedProjectDirectory(root)
+    return null
+  end
+  return root
+end
+
+def neriGlobRecursive(pattern: String): Bool
+  return semanticEndsWith(pattern, "/**/*.hk")
+end
+
+def neriGlobMatches(path: String, root: String, recursive: Bool): Bool
+  let prefix = root + "/"
+  if !bootstrapStartsWith(path, prefix)
+    return false
+  end
+  let remainder = host.stringSlice(path, host.stringByteLength(prefix), host.stringByteLength(path) - host.stringByteLength(prefix))
+  if !semanticEndsWith(remainder, ".hk") || neriGeneratedProjectDirectory(remainder)
+    return false
+  end
+  return recursive || bootstrapFindText(remainder, "/") < 0
+end
+
+def neriProjectHost(): String?
+  let configured = host.environment("NERI_HOST")
+  if configured != null && configured != ""
+    return configured
+  end
+  let manifest = host.environment("NERI_RUNTIME_MANIFEST")
+  if manifest == null || manifest == ""
+    return null
+  end
+  let directory = bootstrapDirectory(manifest)
+  let name = host.pathFileName(directory)
+  if name != null && name == "lib"
+    return bootstrapDirectory(directory) + "/libexec/neri-host"
+  end
+  return directory + "/neri-host"
+end
+
+def neriRemoveProjectListing(directory: String): Void
+  host.removeFile(directory + "/sources")
+  host.run("/bin/rmdir", [directory])
+end
+
+def neriCanonicalPath(path: String): String?
+  let helper = neriProjectHost()
+  if helper == null
+    return null
+  end
+  let directory = bootstrapRunDirectory()
+  if directory == null
+    return null
+  end
+  let status = host.run(helper, ["canonical-path", path, directory + "/manifest"])
+  var canonical: String? = null
+  if status != null && status == 0
+    canonical = host.readText(directory + "/manifest")
+  end
+  host.removeFile(directory + "/manifest")
+  host.run("/bin/rmdir", [directory])
+  if canonical == null || canonical == ""
+    return null
+  end
+  return canonical
+end
+
+def neriProjectListed(paths: StringBuffer, path: String): Bool
+  var entry = paths.first.nextNode
+  while entry != null
+    if entry.value == path
+      return true
+    end
+    entry = entry.nextNode
+  end
+  return false
+end
+
+def neriProjectStackContains(active: NeriProjectReference?, path: String): Bool
+  var entry = active
+  while entry != null
+    if entry.path == path
+      return true
+    end
+    entry = entry.next
+  end
+  return false
+end
+
+# References deliberately allow ../library, but no absolute, empty, or
+# platform-dependent spellings. The resolved manifest is normalized before it
+# participates in the DFS, so equivalent lexical paths deduplicate.
+def neriProjectReferencePathValid(path: String): Bool
+  if path == "" || bootstrapStartsWith(path, "/") || bootstrapFindText(path, "\\") >= 0
+    return false
+  end
+  var start = 0
+  var index = 0
+  while index <= host.stringByteLength(path)
+    if index == host.stringByteLength(path) || host.stringByteAt(path, index) == (47 as Byte)
+      if index == start
+        return false
+      end
+      let segment = host.stringSlice(path, start, index - start)
+      if segment == "."
+        return false
+      end
+      start = index + 1
+    end
+    index = index + 1
+  end
+  return true
+end
+
+def neriAddProjectSource(project: NeriProject, path: String, source: String, owner: String, own: Bool): Bool
+  if !neriSourceNameValid(path)
+    project.error = ".hk file names must not contain whitespace: " + source
+    return false
+  end
+  if neriProjectListed(project.sources, path)
+    project.error = "Duplicate project source: " + source
+    return false
+  end
+  project.sources.add(path)
+  project.sourceOwners.add(owner)
+  if own
+    project.ownSources.add(path)
+  else
+    project.referenceSources.add(path)
+  end
+  return true
+end
+
+def neriExpandProjectGlob(project: NeriProject, projectRoot: String, owner: String, own: Bool, pattern: String): Bool
+  let root = neriGlobRoot(pattern)
+  let helper = neriProjectHost()
+  if root == null || helper == null
+    project.error = root == null ? "Source globs require a relative directory/*.hk or directory/**/*.hk pattern outside generated output directories." : "Source glob expansion requires the Neri host helper."
+    return false
+  end
+  let directory = bootstrapRunDirectory()
+  if directory == null
+    project.error = "Cannot create a temporary source listing."
+    return false
+  end
+  let status = host.run(helper, ["list-project", projectRoot, root, ".hk", directory + "/sources"])
+  var listed: String? = null
+  if status != null && status == 0
+    listed = host.readText(directory + "/sources")
+  end
+  neriRemoveProjectListing(directory)
+  if listed == null
+    project.error = "Cannot enumerate source glob: " + pattern
+    return false
+  end
+  let listing = listed
+  var start = 0
+  var index = 0
+  while index <= host.stringByteLength(listing)
+    if index == host.stringByteLength(listing) || host.stringByteAt(listing, index) == (10 as Byte)
+      if index > start
+        let path = host.stringSlice(listing, start, index - start)
+        let prefix = projectRoot + "/"
+        if bootstrapStartsWith(path, prefix)
+          let relative = host.stringSlice(path, host.stringByteLength(prefix), host.stringByteLength(path) - host.stringByteLength(prefix))
+          if neriGlobMatches(relative, root, neriGlobRecursive(pattern))
+            if !neriAddProjectSource(project, path, relative, owner, own)
+              return false
+            end
+          end
+        end
+      end
+      start = index + 1
+    end
+    index = index + 1
+  end
+  return true
+end
+
+def neriDiscoverProjectSources(project: NeriProject, projectRoot: String, owner: String, own: Bool): Bool
+  let helper = neriProjectHost()
+  if helper == null
+    project.error = "Automatic project discovery requires the Neri host helper."
+    return false
+  end
+  let directory = bootstrapRunDirectory()
+  if directory == null
+    project.error = "Cannot create a temporary source listing."
+    return false
+  end
+  let status = host.run(helper, ["list-project", projectRoot, ".", ".hk", directory + "/sources"])
+  var listed: String? = null
+  if status != null && status == 0
+    listed = host.readText(directory + "/sources")
+  end
+  neriRemoveProjectListing(directory)
+  if listed == null
+    project.error = "Cannot enumerate project sources."
+    return false
+  end
+  let listing = listed
+  let prefix = projectRoot + "/"
+  var start = 0
+  var index = 0
+  while index <= host.stringByteLength(listing)
+    if index == host.stringByteLength(listing) || host.stringByteAt(listing, index) == (10 as Byte)
+      if index > start
+        let path = host.stringSlice(listing, start, index - start)
+        if bootstrapStartsWith(path, prefix)
+          let relative = host.stringSlice(path, host.stringByteLength(prefix), host.stringByteLength(path) - host.stringByteLength(prefix))
+          if !neriAddProjectSource(project, path, relative, owner, own)
+            return false
+          end
+        end
+      end
+      start = index + 1
+    end
+    index = index + 1
+  end
+  return true
+end
+
+def neriLoadProjectManifest(project: NeriProject, path: String, selectedSet: String, own: Bool, active: NeriProjectReference?, visited: StringBuffer): Bool
+  let absolute = neriCanonicalPath(path)
+  if absolute == null
+    project.error = "Cannot resolve project path: " + path
+    return false
+  end
+  if neriProjectStackContains(active, absolute)
+    project.error = "Project reference cycle: " + absolute
+    return false
+  end
+  if neriProjectListed(visited, absolute)
+    return true
+  end
+  let text = host.readText(absolute)
+  if text == null
+    project.error = "Cannot read project: " + absolute
+    return false
+  end
+  let parser = new LspJsonParser(text)
+  let config = parser.parse()
+  parser.spaces()
+  if parser.failed || parser.position != host.stringByteLength(text) || config.kind != "object" || config.get("version").kind != "number" || config.get("version").value != "1"
+    project.error = "Project must be a JSON object with version 1."
+    return false
+  end
+  visited.add(absolute)
+  let projectRoot = bootstrapDirectory(absolute)
+  if own
+    project.root = projectRoot
+    project.manifest = absolute
+  end
+  let sets = config.get("sourceSets")
+  if sets.kind == "missing"
+    if selectedSet != ""
+      project.error = "--source-set requires a project with sourceSets."
+      return false
+    end
+    if !neriDiscoverProjectSources(project, projectRoot, absolute, own)
+      return false
+    end
+  else
+    if sets.kind != "object"
+      project.error = "sourceSets must be an object."
+      return false
+    end
+    var name = selectedSet
+    if name == ""
+      let defaultSet = config.get("defaultSourceSet")
+      if defaultSet.kind == "string"
+        name = defaultSet.value
+      end
+    end
+    let sources = sets.get(name)
+    if name == "" || sources.kind != "array" || sources.first == null
+      project.error = "Select a nonempty source set using defaultSourceSet or --source-set."
+      return false
+    end
+    if own
+      project.sets = sets
+      project.sourceSet = name
+    end
+    var source = sources.first
+    while source != null
+      if source.kind != "string" || source.value == ""
+        project.error = "Source sets require relative .hk file paths or supported source globs."
+        return false
+      else if bootstrapFindText(source.value, "*") >= 0 || bootstrapFindText(source.value, "?") >= 0
+        if !neriExpandProjectGlob(project, projectRoot, absolute, own, source.value)
+          return false
+        end
+      else if !semanticEndsWith(source.value, ".hk") || bootstrapStartsWith(source.value, "/")
+        project.error = "Source sets require relative .hk file paths or supported source globs."
+        return false
+      else
+        let fullPath = neriCanonicalPath(projectRoot + "/" + source.value)
+        if fullPath == null
+          project.error = "Invalid source path: " + source.value
+          return false
+        end
+        if !neriAddProjectSource(project, fullPath, source.value, absolute, own)
+          return false
+        end
+      end
+      source = source.next
+    end
+  end
+  let references = config.get("references")
+  if references.kind != "missing" && references.kind != "array"
+    project.error = "references must be an array of relative project directories."
+    return false
+  end
+  var reference = references.first
+  while reference != null
+    if reference.kind != "string" || !neriProjectReferencePathValid(reference.value)
+      project.error = "references must be an array of relative project directories."
+      return false
+    end
+    let referenceManifest = host.pathAbsolute(projectRoot + "/" + reference.value + "/neri.json")
+    if referenceManifest == null
+      project.error = "Invalid project reference: " + reference.value
+      return false
+    end
+    if !neriLoadProjectManifest(project, referenceManifest, "", false, new NeriProjectReference(absolute, active), visited)
+      return false
+    end
+    reference = reference.next
+  end
+  return true
+end
+
+def neriLoadProject(path: String, selectedSet: String): NeriProject
+  let project = new NeriProject()
+  let visited = new StringBuffer()
+  if !neriLoadProjectManifest(project, path, selectedSet, true, null, visited)
+    return project
+  end
+  if project.sources.first.nextNode == null
+    project.error = "Project must resolve at least one .hk source."
+  end
+  return project
+end
+
+def neriProjectContains(project: NeriProject, path: String): Bool
+  return neriProjectListed(project.sources, path)
+end
+
+def neriProjectForSource(path: String, sourcePath: String, selectedSet: String): NeriProject
+  let project = neriLoadProject(path, selectedSet)
+  if project.error != "" || selectedSet != "" || neriProjectListed(project.referenceSources, sourcePath) || neriProjectContains(project, sourcePath)
+    return project
+  end
+  var found: NeriProject? = null
+  var set = project.sets.first
+  while set != null
+    let candidate = neriLoadProject(path, set.key)
+    if candidate.error == "" && neriProjectContains(candidate, sourcePath)
+      if found != null
+        project.error = "Source belongs to multiple non-default source sets; select one explicitly."
+        return project
+      end
+      found = candidate
+    end
+    set = set.next
+  end
+  if found != null
+    return found
+  end
+  return project
+end
+
+def lspUri(path: String): String
+  var result = "file://"
+  var index = 0
+  while index < host.stringByteLength(path)
+    let byte = host.stringByteAt(path, index) as Int
+    if (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) || (byte >= 48 && byte <= 57) || byte == 47 || byte == 45 || byte == 46 || byte == 95 || byte == 126
+      result = result + lspCharacter(byte)
+    else
+      result = result + "%" + irHexDigit(byte / 16) + irHexDigit(byte - (byte / 16) * 16)
+    end
+    index = index + 1
+  end
+  return result
+end
+
+def lspHexDigit(byte: Int): Int
+  if byte >= 48 && byte <= 57
+    return byte - 48
+  else if byte >= 65 && byte <= 70
+    return byte - 55
+  else if byte >= 97 && byte <= 102
+    return byte - 87
+  end
+  return -1
+end
+
+def lspPath(uri: String): String?
+  if !bootstrapStartsWith(uri, "file:///") || host.stringByteLength(uri) > 16384
+    return null
+  end
+  var bytes: Byte[] = []
+  var index = 7
+  while index < host.stringByteLength(uri)
+    var byte = host.stringByteAt(uri, index) as Int
+    if byte == 63 || byte == 35
+      return null
+    end
+    if byte == 37
+      if index + 2 >= host.stringByteLength(uri)
+        return null
+      end
+      let high = lspHexDigit(host.stringByteAt(uri, index + 1) as Int)
+      let low = lspHexDigit(host.stringByteAt(uri, index + 2) as Int)
+      if high < 0 || low < 0
+        return null
+      end
+      byte = high * 16 + low
+      index = index + 2
+    end
+    if byte == 0
+      return null
+    end
+    bytes = host.appendByte(bytes, byte as Byte)
+    index = index + 1
+  end
+  let path = host.stringFromBytes(bytes)
+  if path == null
+    return null
+  end
+  return host.pathAbsolute(path)
+end

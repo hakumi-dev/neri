@@ -1,0 +1,370 @@
+# Completion reparses and binds a marked copy of the current document. The
+# lexer identifies only the replacement range and syntactic shape; candidates
+# and receiver types always come from the fresh semantic model.
+class LspCompletionTarget
+  public valid: Bool = false
+  public start: Int = 0
+  public length: Int = 0
+  public prefix: String = ""
+  public kind: String = "name"
+  public addCall: Bool = true
+end
+
+def lspUtf16Slice(text: String, start: Int, length: Int): String
+  let map = new IrSourceMap(text)
+  let first = map.offsetAt(start)
+  let last = map.offsetAt(start + length)
+  return host.stringSlice(text, first, last - first)
+end
+
+def lspCompletionTarget(text: String, position: Int): LspCompletionTarget
+  let result = new LspCompletionTarget()
+  let tokens = (new BootstrapLexer(text)).lex()
+  var tokenIndex = -1
+  var index = 0
+  while index + 1 < tokens.count()
+    let start = tokens.startAt(index)
+    let finish = start + tokens.lengthAt(index)
+    if tokens.kindAt(index) == "Identifier" && start <= position && position <= finish
+      tokenIndex = index
+      break
+    end
+    # Completion inside a literal, keyword or punctuation is not a name query.
+    if start < position && position < finish
+      return result
+    end
+    index = index + 1
+  end
+
+  var previous = -1
+  var following = -1
+  if tokenIndex >= 0
+    result.start = tokens.startAt(tokenIndex)
+    result.length = tokens.lengthAt(tokenIndex)
+    result.prefix = lspUtf16Slice(text, result.start, position - result.start)
+    previous = tokenIndex - 1
+    following = tokenIndex + 1
+  else
+    result.start = position
+    index = 0
+    while index + 1 < tokens.count()
+      if tokens.startAt(index) + tokens.lengthAt(index) <= position
+        previous = index
+      else if tokens.startAt(index) >= position
+        following = index
+        break
+      end
+      index = index + 1
+    end
+  end
+
+  if previous >= 0 && tokens.kindAt(previous) == "Dot"
+    result.kind = "member"
+  else if previous >= 0 && tokens.kindAt(previous) == "New"
+    result.kind = "type"
+    result.addCall = false
+  end
+  if following >= 0 && tokens.kindAt(following) == "LParen"
+    result.addCall = false
+  end
+  result.valid = true
+  return result
+end
+
+# Shared by completion and other semantic queries which repair a copy of the
+# current text. It never falls back to the document's previous semantic model.
+def lspAnalyzeQueryText(document: LspDocument, primaryText: String): SemanticModel?
+  # analyze() deliberately leaves this null when project setup, file-name or
+  # standard-library loading failed. A semantic query must preserve that gate.
+  if document.tokens == null
+    return null
+  end
+  var source = primaryText + "\n"
+  let starts = new IntBuffer()
+  let ids = new StringBuffer()
+  starts.add(0)
+  ids.add(document.uri)
+  var index = 1
+  while index < document.sourceTexts.size
+    starts.add((new IrSourceMap(source)).utf16Length())
+    ids.add(document.sourceUris.get(index))
+    source = source + document.sourceTexts.get(index) + "\n"
+    index = index + 1
+  end
+  let tokens = (new BootstrapLexer(source)).lex()
+  let parser = new BootstrapParser(tokens)
+  index = 0
+  while index < starts.size
+    parser.addSourceBoundary(starts.get(index))
+    index = index + 1
+  end
+  let root = parser.parseProgram()
+  if parser.diagnostics.count() != 0
+    return null
+  end
+  let binder = new BootstrapBinder(parser.arena, root, tokens.startAt(tokens.count() - 1))
+  binder.recordSourceSymbols = true
+  binder.recordCompletionSites = true
+  binder.requireEntryPoint = document.requireEntryPoint
+  binder.forbiddenEntryPointSources = document.forbiddenEntryPointSources
+  binder.clearSources()
+  index = 0
+  while index < starts.size
+    binder.addSource(ids.get(index), starts.get(index))
+    index = index + 1
+  end
+  return binder.bind()
+end
+
+def lspCompletionSite(model: SemanticModel, target: LspCompletionTarget): SemanticCompletionSite?
+  var selected: SemanticCompletionSite? = null
+  var ambiguous = false
+  var site = model.completionSites
+  while site != null
+    let kindMatches = target.kind == "member" ? site.receiverKind != "" && site.receiverKind != "type" : site.receiverKind == target.kind || (target.kind == "name" && site.receiverKind == "")
+    if kindMatches && site.start == target.start
+      if selected == null
+        selected = site
+      else
+        var callableDiffers = false
+        let selectedCallable = selected.callable
+        let siteCallable = site.callable
+        if (selectedCallable == null && siteCallable != null) || (selectedCallable != null && siteCallable == null)
+          callableDiffers = true
+        else if selectedCallable != null && siteCallable != null && selectedCallable.fullName != siteCallable.fullName
+          callableDiffers = true
+        end
+        if callableDiffers || selected.receiverKind != site.receiverKind || selected.receiverType != site.receiverType || selected.namespaceName != site.namespaceName || selected.className != site.className
+          ambiguous = true
+        end
+      end
+    end
+    site = site.next
+  end
+  if ambiguous
+    return null
+  end
+  return selected
+end
+
+def lspCompletionHas(labels: StringBuffer, label: String): Bool
+  var current = labels.first.nextNode
+  while current != null
+    if current.value == label
+      return true
+    end
+    current = current.nextNode
+  end
+  return false
+end
+
+def lspCompletionAdd(items: StringBuffer, labels: StringBuffer, prefix: String, label: String, kind: Int, detail: String, editRange: String, data: String = ""): Void
+  if label == "" || label == "__neri_completion_site_7f31__" || !bootstrapStartsWith(label, prefix) || lspCompletionHas(labels, label)
+    return
+  end
+  labels.add(label)
+  let separator = items.size == 0 ? "" : ","
+  let dataProperty = data == "" ? "" : ",\"data\":" + data
+  items.add(separator + "{\"label\":" + lspQuote(label) + ",\"kind\":" + (kind as String) + ",\"detail\":" + lspQuote(detail) + ",\"textEdit\":{\"range\":" + editRange + ",\"newText\":" + lspQuote(label) + "}" + dataProperty + "}")
+end
+
+def lspCompletionData(document: LspDocument, target: LspCompletionTarget, identity: String): String
+  if identity == "" || lspSourceSymbolIsGenerated(identity)
+    return ""
+  end
+  return "{\"uri\":" + lspQuote(document.uri) + ",\"identity\":" + lspQuote(identity) + ",\"version\":" + (document.version as String) + ",\"revision\":" + (document.analysisRevision as String) + ",\"start\":" + (target.start as String) + ",\"length\":" + (target.length as String) + ",\"call\":" + (target.addCall ? "true" : "false") + "}"
+end
+
+def lspCompletionCallableDetail(callable: SemanticCallable): String
+  var result = callable.fullName + "("
+  var parameter = callable.firstParameter
+  var separator = ""
+  while parameter != null
+    result = result + separator + parameter.name + ": " + parameter.typeName
+    separator = ", "
+    parameter = parameter.nextParameter
+  end
+  return result + "): " + callable.returnType
+end
+
+def lspCompletionResolveFunction(model: SemanticModel, namespaceName: String, name: String): String
+  let local = model.findFunction(semanticQualifiedName(namespaceName, name))
+  if local != null
+    return local.fullName
+  end
+  var candidate = ""
+  var index = 0
+  while index < model.usedNames.size
+    let imported = model.findFunction(semanticQualifiedName(model.usedNames.get(index), name))
+    if imported != null
+      if candidate != ""
+        return ""
+      end
+      candidate = imported.fullName
+    end
+    index = index + 1
+  end
+  if candidate != ""
+    return candidate
+  end
+  let global = model.findFunction(name)
+  if global != null
+    return global.fullName
+  end
+  return ""
+end
+
+def lspCompletionAccessible(model: SemanticModel, site: SemanticCompletionSite, owner: String, access: String): Bool
+  if access == "public" || access == "internal"
+    return true
+  end
+  if site.className == ""
+    return false
+  end
+  if site.className == owner
+    return true
+  end
+  return access == "protected" && semanticClassAssignable(model, owner, site.className)
+end
+
+def lspCompletionAddClassMembers(document: LspDocument, target: LspCompletionTarget, model: SemanticModel, site: SemanticCompletionSite, prefix: String, items: StringBuffer, labels: StringBuffer, className: String, staticOnly: Bool, editRange: String): Void
+  var current = model.findClass(className)
+  var steps = 0
+  while current != null && steps < 256
+    if !staticOnly
+      var field = current.firstField
+      while field != null
+        if lspCompletionAccessible(model, site, field.owner, field.access) && !(semanticIsReadonly(site.receiverType) && semanticContainsPointer(field.typeName))
+          lspCompletionAdd(items, labels, prefix, field.name, 5, field.owner + "." + field.name + ": " + semanticViewMember(site.receiverType, field.typeName), editRange, lspCompletionData(document, target, "field:" + field.owner + "." + field.name))
+        end
+        field = field.nextField
+      end
+    end
+    var method = current.firstMethod
+    while method != null
+      let receiverMatches = staticOnly ? method.isStatic : !method.isStatic
+      let readonlyMatches = staticOnly || !semanticIsReadonly(site.receiverType) || method.isReadonly
+      if method.name != "init" && receiverMatches && readonlyMatches && lspCompletionAccessible(model, site, method.className, method.access)
+        lspCompletionAdd(items, labels, prefix, method.name, 2, lspCompletionCallableDetail(method), editRange, lspCompletionData(document, target, "callable:" + method.fullName))
+      end
+      method = method.nextCallable
+    end
+    current = model.findClass(current.baseName)
+    steps = steps + 1
+  end
+end
+
+def lspCompletionLibraryDetail(body: BootstrapBodyBinder, library: String, name: String): String
+  let count = body.libraryParameterCount(library, name)
+  let returnType = body.libraryReturn(library, name)
+  var result = library + "." + name + "("
+  var index = 0
+  var separator = ""
+  while index < count
+    result = result + separator + body.libraryParameterType(library, name, index)
+    separator = ", "
+    index = index + 1
+  end
+  return result + "): " + returnType
+end
+
+def lspCompletionAddLibrary(site: SemanticCompletionSite, prefix: String, items: StringBuffer, labels: StringBuffer, editRange: String): Void
+  let library = site.receiverType
+  let evaluator = new BootstrapBodyBinder(new BootstrapBinder(new SyntaxArena(), 0, 0))
+  for name in semanticLibraryNames(library)
+    # Do not trust enumeration alone: only the compiler's callable contract can
+    # make an intrinsic a completion candidate.
+    if evaluator.libraryReturn(library, name) != "" && evaluator.libraryParameterCount(library, name) >= 0
+      lspCompletionAdd(items, labels, prefix, name, 3, lspCompletionLibraryDetail(evaluator, library, name), editRange)
+    end
+  end
+end
+
+def lspCompletionItems(document: LspDocument, target: LspCompletionTarget, model: SemanticModel, site: SemanticCompletionSite, prefix: String): String
+  let items = new StringBuffer()
+  let labels = new StringBuffer()
+  let editRange = "{\"start\":" + lspPosition(document.text, target.start) + ",\"end\":" + lspPosition(document.text, target.start + target.length) + "}"
+  if site.receiverKind == "instance"
+    if site.receiverType == "Error" || semanticIsOptional(site.receiverType)
+      return "[]"
+    end
+    if semanticIsArray(site.receiverType)
+      lspCompletionAdd(items, labels, prefix, "Length", 5, "Array.Length: Int", editRange)
+    end
+    lspCompletionAddClassMembers(document, target, model, site, prefix, items, labels, semanticMutableType(site.receiverType), false, editRange)
+  else if site.receiverKind == "class"
+    lspCompletionAddClassMembers(document, target, model, site, prefix, items, labels, site.receiverType, true, editRange)
+  else if site.receiverKind == "super"
+    lspCompletionAddClassMembers(document, target, model, site, prefix, items, labels, site.receiverType, false, editRange)
+  else if site.receiverKind == "namespace"
+    var function = model.firstFunction
+    while function != null
+      if function.namespaceName == site.receiverType
+        lspCompletionAdd(items, labels, prefix, function.name, 3, lspCompletionCallableDetail(function), editRange, lspCompletionData(document, target, "callable:" + function.fullName))
+      end
+      function = function.nextCallable
+    end
+  else if site.receiverKind == "library"
+    if site.receiverType == "Array" || model.hasUse(site.receiverType)
+      lspCompletionAddLibrary(site, prefix, items, labels, editRange)
+    end
+  else if site.receiverKind == "type"
+    var classSymbol = model.firstClass
+    while classSymbol != null
+      if !classSymbol.isClosure && !classSymbol.isFunctionType && classSymbol.genericOrigin < 0 && semanticResolveType(model, classSymbol.name, site.namespaceName) == classSymbol.fullName
+        lspCompletionAdd(items, labels, prefix, classSymbol.name, 7, "class " + classSymbol.fullName, editRange, lspCompletionData(document, target, "type:" + classSymbol.fullName))
+      end
+      classSymbol = classSymbol.nextClass
+    end
+  else
+    var symbol = site.firstSymbol
+    while symbol != null
+      lspCompletionAdd(items, labels, prefix, symbol.name, 6, symbol.name + ": " + symbol.typeName, editRange, lspCompletionData(document, target, symbol.identity))
+      symbol = symbol.next
+    end
+    let callable = site.callable
+    if site.className != "" && callable != null && !callable.isStatic
+      lspCompletionAdd(items, labels, prefix, "this", 14, "this: " + site.className, editRange)
+    end
+    var function = model.firstFunction
+    while function != null
+      if lspCompletionResolveFunction(model, site.namespaceName, function.name) == function.fullName
+        lspCompletionAdd(items, labels, prefix, function.name, 3, lspCompletionCallableDetail(function), editRange, lspCompletionData(document, target, "callable:" + function.fullName))
+      end
+      function = function.nextCallable
+    end
+    var classSymbol = model.firstClass
+    while classSymbol != null
+      if !classSymbol.isClosure && !classSymbol.isFunctionType && classSymbol.genericOrigin < 0 && semanticResolveType(model, classSymbol.name, site.namespaceName) == classSymbol.fullName
+        lspCompletionAdd(items, labels, prefix, classSymbol.name, 7, "class " + classSymbol.fullName, editRange, lspCompletionData(document, target, "type:" + classSymbol.fullName))
+      end
+      classSymbol = classSymbol.nextClass
+    end
+    for keyword in ["false", "null", "true"]
+      lspCompletionAdd(items, labels, prefix, keyword, 14, "keyword", editRange)
+    end
+  end
+  return "[" + lspJoin(items, 0, items.size) + "]"
+end
+
+def lspCompletion(document: LspDocument, position: Int): String
+  let target = lspCompletionTarget(document.text, position)
+  if !target.valid
+    return "[]"
+  end
+  let marker = "__neri_completion_site_7f31__"
+  let map = new IrSourceMap(document.text)
+  let first = map.offsetAt(target.start)
+  let last = map.offsetAt(target.start + target.length)
+  let suffix = target.addCall ? "()" : ""
+  let repaired = host.stringSlice(document.text, 0, first) + marker + suffix + host.stringSlice(document.text, last, host.stringByteLength(document.text) - last)
+  let model = lspAnalyzeQueryText(document, repaired)
+  if model == null
+    return "[]"
+  end
+  let site = lspCompletionSite(model, target)
+  if site == null
+    return "[]"
+  end
+  return lspCompletionItems(document, target, model, site, target.prefix)
+end

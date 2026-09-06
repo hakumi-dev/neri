@@ -47,6 +47,77 @@ void list_files(const char *root, const char *suffix, const char *output) {
   write(output, result);
 }
 
+bool generated_directory(const std::filesystem::path &path) {
+  const auto name = path.filename().string();
+  return name == ".git" || name == ".neri" || name == ".cache" || name == ".idea" ||
+      name == ".bootstrap" || name == "build" || name == "out" || name == "dist" ||
+      name == "target" || name == "bin";
+}
+
+std::filesystem::path project_source_root(const char *project, const char *relative) {
+  const std::filesystem::path project_root = std::filesystem::absolute(project);
+  const std::filesystem::path suffix(relative);
+  if (suffix.empty() || suffix.is_absolute())
+    throw std::runtime_error("project source root must be relative");
+  if (std::filesystem::is_symlink(std::filesystem::symlink_status(project_root)))
+    throw std::runtime_error("project source root must not be a symlink");
+  if (suffix == ".") return project_root;
+  std::filesystem::path root = project_root;
+  for (const auto &component : suffix) {
+    const auto name = component.string();
+    if (name.empty() || name == "." || name == "..")
+      throw std::runtime_error("project source root contains traversal");
+    root /= component;
+    if (std::filesystem::is_symlink(std::filesystem::symlink_status(root)))
+      throw std::runtime_error("project source root contains a symlink");
+  }
+  const auto canonical_project = std::filesystem::weakly_canonical(project_root);
+  const auto canonical_root = std::filesystem::weakly_canonical(root);
+  const auto relative_root = canonical_root.lexically_relative(canonical_project);
+  if (relative_root.empty() || relative_root == ".")
+    throw std::runtime_error("project source root escapes the project");
+  for (const auto &component : relative_root) {
+    if (component == "..") throw std::runtime_error("project source root escapes the project");
+  }
+  return root;
+}
+
+void list_project_files(const char *project, const char *relative, const char *suffix, const char *output) {
+  std::vector<std::string> paths;
+  const auto root = project_source_root(project, relative);
+  for (auto entry = std::filesystem::recursive_directory_iterator(root);
+       entry != std::filesystem::recursive_directory_iterator(); ++entry) {
+    if (entry->is_symlink()) {
+      if (entry->is_directory()) entry.disable_recursion_pending();
+      continue;
+    }
+    if (entry->is_directory()) {
+      if (generated_directory(entry->path()) ||
+          (entry->path() != root && std::filesystem::exists(entry->path() / "neri.json")))
+        entry.disable_recursion_pending();
+      continue;
+    }
+    if (!entry->is_regular_file()) continue;
+    const auto path = entry->path().string();
+    if (!path.ends_with(suffix)) continue;
+    if (path.find('\n') != std::string::npos || path.find('\r') != std::string::npos)
+      throw std::runtime_error("file names must not contain line separators");
+    paths.push_back(path);
+  }
+  std::sort(paths.begin(), paths.end());
+  std::string result;
+  for (const auto &path : paths) result += path + "\n";
+  write(output, result);
+}
+
+void canonical_path(const char *path, const char *output) {
+  std::error_code error;
+  const auto canonical = std::filesystem::weakly_canonical(path, error);
+  if (error || canonical.empty())
+    throw std::runtime_error("cannot canonicalize project path");
+  write(output, canonical.string());
+}
+
 void stamp(const char *root, const char *epoch) {
   std::size_t consumed = 0;
   const auto seconds = std::stoll(epoch, &consumed);
@@ -137,6 +208,8 @@ void run(int argc, char **argv) {
 int main(int argc, char **argv) {
   try {
     if (argc == 5 && std::string(argv[1]) == "list") list_files(argv[2], argv[3], argv[4]);
+    else if (argc == 6 && std::string(argv[1]) == "list-project") list_project_files(argv[2], argv[3], argv[4], argv[5]);
+    else if (argc == 4 && std::string(argv[1]) == "canonical-path") canonical_path(argv[2], argv[3]);
     else if (argc == 4 && std::string(argv[1]) == "stamp") stamp(argv[2], argv[3]);
     else if (argc == 4 && std::string(argv[1]) == "replace") std::filesystem::rename(argv[2], argv[3]);
     else if (argc >= 7 && std::string(argv[1]) == "run") run(argc, argv);

@@ -16,6 +16,7 @@ LINKER="${NERI_LINKER:-$LLVM_PREFIX/bin/clang++}"
 
 exec env \
   "SDKROOT=$SDKROOT" \
+  "NERI_HOST=$ROOT_DIR/build/native/native-release/neri-host" \
   "NERI_CODEGEN=$TOOLCHAIN_DIR/bin/neri-codegen" \
   "NERI_RUNTIME_MANIFEST=$TOOLCHAIN_DIR/lib/neri-runtime.json" \
   "NERI_LINKER=$LINKER" \

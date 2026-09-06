@@ -1,0 +1,402 @@
+# Signature help deliberately combines two sources of truth:
+#
+# * the lexer locates the innermost still-open argument list and its comma;
+# * the bound model supplies the already-resolved callable.
+#
+# Text is never used to guess a declaration.  In particular, a spelling match
+# is not enough for a method, an imported function, or a function value.
+
+class LspSignatureContext
+  public openParen: Int = -1
+  public activeParameter: Int = 0
+  public callable: SemanticCallable?
+  public library: String = ""
+  public libraryMember: String = ""
+end
+
+def lspSignatureCallable(model: SemanticModel, name: String): SemanticCallable?
+  let function = model.findFunction(name)
+  if function != null
+    return function
+  end
+  var classSymbol = model.firstClass
+  while classSymbol != null
+    var method = classSymbol.firstMethod
+    while method != null
+      if method.fullName == name
+        return method
+      end
+      method = method.nextCallable
+    end
+    classSymbol = classSymbol.nextClass
+  end
+  return null
+end
+
+def lspSignatureConstructor(model: SemanticModel, className: String): SemanticCallable?
+  let classSymbol = model.findClass(className)
+  if classSymbol == null
+    return null
+  end
+  var method = classSymbol.firstMethod
+  while method != null
+    if method.name == "init"
+      return method
+    end
+    method = method.nextCallable
+  end
+  return null
+end
+
+# A bound call is anchored to the final name in its callee.  A constructor is
+# anchored to `new`.  Starting from that anchor, only a generic suffix may
+# occur before the argument parenthesis.
+def lspSignatureCallOpensAt(tokens: TokenBuffer, node: BoundNode, openParen: Int): Bool
+  var index = 0
+  while index < tokens.count() && tokens.startAt(index) != node.start
+    index = index + 1
+  end
+  if index >= tokens.count()
+    return false
+  end
+  if node.kind == "New"
+    index = index + 1
+    while index < tokens.count() && tokens.kindAt(index) != "LParen"
+      if tokens.kindAt(index) == "NewLine" || tokens.kindAt(index) == "EndOfFile"
+        return false
+      end
+      index = index + 1
+    end
+    return index < tokens.count() && tokens.startAt(index) == openParen
+  end
+  index = index + 1
+  if index < tokens.count() && tokens.kindAt(index) == "LBracket"
+    var brackets = 0
+    while index < tokens.count()
+      if tokens.kindAt(index) == "LBracket"
+        brackets = brackets + 1
+      else if tokens.kindAt(index) == "RBracket"
+        brackets = brackets - 1
+        if brackets == 0
+          index = index + 1
+          break
+        end
+      end
+      index = index + 1
+    end
+  end
+  return index < tokens.count() && tokens.kindAt(index) == "LParen" && tokens.startAt(index) == openParen
+end
+
+def lspSignatureBoundCallable(model: SemanticModel, tokens: TokenBuffer, openParen: Int): SemanticCallable?
+  var resolved: SemanticCallable? = null
+  var node = model.bound.first.nextNode
+  while node != null
+    if (node.kind == "Call" || node.kind == "InstanceCall" || node.kind == "New") && lspSignatureCallOpensAt(tokens, node, openParen)
+      var candidate: SemanticCallable? = null
+      if node.kind == "New"
+        candidate = lspSignatureConstructor(model, node.data)
+      else
+        let name = node.symbol != "" ? node.symbol : node.data
+        candidate = lspSignatureCallable(model, name)
+      end
+      if candidate != null
+        if resolved != null && resolved.fullName != candidate.fullName
+          # Generic bodies can contribute more than one bound node at one
+          # source span.  An ambiguous instantiation must not be guessed.
+          return null
+        end
+        resolved = candidate
+      end
+    end
+    node = node.nextNode
+  end
+  return resolved
+end
+
+def lspSignatureLibraryPart(value: String, wanted: Int): String
+  let separator = semanticFindByte(value, 46)
+  if separator < 1 || separator + 1 >= host.stringByteLength(value)
+    return ""
+  end
+  if wanted == 0
+    return host.stringSlice(value, 0, separator)
+  end
+  return host.stringSlice(value, separator + 1, host.stringByteLength(value) - separator - 1)
+end
+
+def lspSignatureLibraryValid(library: String, member: String): Bool
+  let evaluator = new BootstrapBodyBinder(new BootstrapBinder(new SyntaxArena(), 0, 0))
+  return evaluator.libraryReturn(library, member) != "" && evaluator.libraryParameterCount(library, member) >= 0
+end
+
+def lspSignatureBoundLibrary(model: SemanticModel, tokens: TokenBuffer, openParen: Int): String
+  var resolved = ""
+  var node = model.bound.first.nextNode
+  while node != null
+    if node.kind == "Call" && lspSignatureCallOpensAt(tokens, node, openParen)
+      let library = lspSignatureLibraryPart(node.data, 0)
+      let member = lspSignatureLibraryPart(node.data, 1)
+      if lspSignatureLibraryValid(library, member)
+        let candidate = library + "|" + member
+        if resolved != "" && resolved != candidate
+          return ""
+        end
+        resolved = candidate
+      end
+    end
+    node = node.nextNode
+  end
+  return resolved
+end
+
+def lspSignatureActiveParameter(tokens: TokenBuffer, openIndex: Int, position: Int): Int
+  var parameter = 0
+  var nested = 0
+  var index = openIndex + 1
+  while index < tokens.count() && tokens.startAt(index) < position
+    let kind = tokens.kindAt(index)
+    if kind == "LParen" || kind == "LBracket"
+      nested = nested + 1
+    else if kind == "RParen" || kind == "RBracket"
+      if nested > 0
+        nested = nested - 1
+      else
+        return parameter
+      end
+    else if kind == "Comma" && nested == 0
+      parameter = parameter + 1
+    end
+    index = index + 1
+  end
+  return parameter
+end
+
+def lspSignatureStillOpen(tokens: TokenBuffer, openIndex: Int, position: Int): Bool
+  var nested = 1
+  var index = openIndex + 1
+  while index < tokens.count() && tokens.startAt(index) < position
+    let kind = tokens.kindAt(index)
+    if kind == "LParen"
+      nested = nested + 1
+    else if kind == "RParen"
+      nested = nested - 1
+      if nested == 0
+        return false
+      end
+    end
+    index = index + 1
+  end
+  return true
+end
+
+def lspSignatureCallLikeOpen(tokens: TokenBuffer, openIndex: Int): Bool
+  if openIndex == 0
+    return false
+  end
+  let previous = tokens.kindAt(openIndex - 1)
+  # This establishes only that the parenthesis is a syntactic call context.
+  # It never identifies a declaration; that remains the bound model's job.
+  return previous == "Identifier" || previous == "RBracket" || previous == "RParen"
+end
+
+def lspSignatureRepairText(source: String, position: Int): String?
+  # Repair only unmatched delimiters before the cursor, inserting the matching
+  # suffix at the cursor.  The semantic query therefore describes the current
+  # text prefix; it never reuses a model from an older document version.
+  let tokens = (new BootstrapLexer(source)).lex()
+  let openings = new StringBuffer()
+  var top = -1
+  var index = 0
+  while index < tokens.count() && tokens.startAt(index) < position
+    let kind = tokens.kindAt(index)
+    if kind == "LParen"
+      top = top + 1
+      if top < openings.size
+        openings.set(top, ")")
+      else
+        openings.add(")")
+      end
+    else if kind == "LBracket"
+      top = top + 1
+      if top < openings.size
+        openings.set(top, "]")
+      else
+        openings.add("]")
+      end
+    else if kind == "RParen" || kind == "RBracket"
+      if top < 0
+        return null
+      end
+      let expected = kind == "RParen" ? ")" : "]"
+      if openings.get(top) != expected
+        return null
+      end
+      top = top - 1
+    end
+    index = index + 1
+  end
+  if top < 0
+    return null
+  end
+  let suffix = new StringBuffer()
+  index = top
+  while index >= 0
+    suffix.add(openings.get(index))
+    index = index - 1
+  end
+  # `position` is a UTF-16 offset, while String slicing is byte based.
+  var byte = 0
+  var utf16 = 0
+  while byte < host.stringByteLength(source) && utf16 < position
+    let width = utf16Width(codePointAt(source, byte))
+    if utf16 + width > position
+      return null
+    end
+    utf16 = utf16 + width
+    byte = byte + utf8Width(host.stringByteAt(source, byte) as Int)
+  end
+  if utf16 != position
+    return null
+  end
+  return host.stringSlice(source, 0, byte) + lspJoin(suffix, 0, suffix.size) + host.stringSlice(source, byte, host.stringByteLength(source) - byte)
+end
+
+# This remains useful when the current document has a repaired, current-source
+# model.  It intentionally does not fall back to a previous document version.
+def lspSignatureContextForTokens(tokens: TokenBuffer, semantic: SemanticModel, position: Int): LspSignatureContext?
+  var index = 0
+  while index < tokens.count() && tokens.startAt(index) < position
+    index = index + 1
+  end
+  index = index - 1
+  while index >= 0
+    if tokens.kindAt(index) == "LParen" && lspSignatureStillOpen(tokens, index, position)
+      let openParen = tokens.startAt(index)
+      let callable = lspSignatureBoundCallable(semantic, tokens, openParen)
+      if callable != null
+        let context = new LspSignatureContext()
+        context.openParen = openParen
+        context.activeParameter = lspSignatureActiveParameter(tokens, index, position)
+        context.callable = callable
+        return context
+      end
+      let library = lspSignatureBoundLibrary(semantic, tokens, openParen)
+      if library != ""
+        let context = new LspSignatureContext()
+        context.openParen = openParen
+        context.activeParameter = lspSignatureActiveParameter(tokens, index, position)
+        context.library = semanticField(library, 0)
+        context.libraryMember = semanticField(library, 1)
+        return context
+      end
+      if lspSignatureCallLikeOpen(tokens, index)
+        # An unresolved inner call is still the active call site.  Falling
+        # through to an enclosing signature would mislead the editor.
+        return null
+      end
+    end
+    index = index - 1
+  end
+  return null
+end
+
+def lspSignatureContext(source: String, semantic: SemanticModel, position: Int): LspSignatureContext?
+  return lspSignatureContextForTokens((new BootstrapLexer(source)).lex(), semantic, position)
+end
+
+def lspSignatureLabel(callable: SemanticCallable): String
+  var label = "def " + callable.fullName + "("
+  var parameter = callable.firstParameter
+  var separator = ""
+  while parameter != null
+    label = label + separator + parameter.name + ": " + parameter.typeName
+    separator = ", "
+    parameter = parameter.nextParameter
+  end
+  return label + "): " + callable.returnType
+end
+
+def lspSignatureParameters(callable: SemanticCallable): String
+  let parameters = new StringBuffer()
+  var parameter = callable.firstParameter
+  while parameter != null
+    let text = parameter.name + ": " + parameter.typeName
+    if parameters.size > 0
+      parameters.add(",")
+    end
+    # Offset labels require a client capability which this server does not
+    # negotiate.  A string label is always valid and remains a label substring.
+    parameters.add("{\"label\":" + lspQuote(text) + "}")
+    parameter = parameter.nextParameter
+  end
+  return "[" + lspJoin(parameters, 0, parameters.size) + "]"
+end
+
+def lspSignatureResult(context: LspSignatureContext): String
+  let callable = context.callable
+  if callable == null
+    return lspSignatureLibraryResult(context)
+  end
+  let label = lspSignatureLabel(callable)
+  var result = "{\"signatures\":[{\"label\":" + lspQuote(label) + ",\"parameters\":" + lspSignatureParameters(callable) + "}],\"activeSignature\":0"
+  if context.activeParameter < callable.parameterCount
+    result = result + ",\"activeParameter\":" + (context.activeParameter as String)
+  end
+  return result + "}"
+end
+
+def lspSignatureLibraryResult(context: LspSignatureContext): String
+  if !lspSignatureLibraryValid(context.library, context.libraryMember)
+    return "null"
+  end
+  let evaluator = new BootstrapBodyBinder(new BootstrapBinder(new SyntaxArena(), 0, 0))
+  let count = evaluator.libraryParameterCount(context.library, context.libraryMember)
+  var label = context.library + "." + context.libraryMember + "("
+  let parameters = new StringBuffer()
+  var index = 0
+  var separator = ""
+  while index < count
+    let typeName = evaluator.libraryParameterType(context.library, context.libraryMember, index)
+    label = label + separator + typeName
+    parameters.add((parameters.size > 0 ? "," : "") + "{\"label\":" + lspQuote(typeName) + "}")
+    separator = ", "
+    index = index + 1
+  end
+  label = label + "): " + evaluator.libraryReturn(context.library, context.libraryMember)
+  var result = "{\"signatures\":[{\"label\":" + lspQuote(label) + ",\"parameters\":[" + lspJoin(parameters, 0, parameters.size) + "]}],\"activeSignature\":0"
+  if context.activeParameter < count
+    result = result + ",\"activeParameter\":" + (context.activeParameter as String)
+  end
+  return result + "}"
+end
+
+def lspSignatureHelpForSemantic(document: LspDocument, semantic: SemanticModel, position: Int): String
+  let tokens = document.tokens
+  var context: LspSignatureContext? = null
+  if tokens != null
+    context = lspSignatureContextForTokens(tokens, semantic, position)
+  else
+    context = lspSignatureContext(document.text, semantic, position)
+  end
+  if context == null
+    return "null"
+  end
+  return lspSignatureResult(context)
+end
+
+def lspSignatureHelp(document: LspDocument, position: Int): String
+  let semantic = document.semantic
+  if semantic != null
+    return lspSignatureHelpForSemantic(document, semantic, position)
+  end
+  let repaired = lspSignatureRepairText(document.text, position)
+  if repaired == null
+    return "null"
+  end
+  let current = lspAnalyzeQueryText(document, repaired)
+  if current == null
+    return "null"
+  end
+  return lspSignatureHelpForSemantic(document, current, position)
+end

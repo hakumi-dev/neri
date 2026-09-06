@@ -28,6 +28,7 @@ class Build
       "SDKROOT=" + envOr("SDKROOT", ""),
       "NERI_STDLIB=" + this.root + "/stdlib",
       "NERI_LIBRARY_PATH=" + this.nativeDirectory(),
+      "NERI_HOST=" + this.nativeDirectory() + "/neri-host",
       "NERI_CODEGEN=" + this.nativeDirectory() + "/neri-codegen",
       "NERI_RUNTIME_MANIFEST=" + this.nativeDirectory() + "/neri-runtime-" + this.target + ".json",
       "NERI_LINKER=" + this.llvm + "/bin/clang++"]
@@ -137,11 +138,12 @@ class Build
     for library in ["http", "terminal", "clock"]
       execute("cp", [this.root + "/stdlib/" + library + ".hk", tree + "/stdlib/" + library + ".hk"])
     end
+    this.documentationIndex(tree)
     execute("cp", [this.compiler, tree + "/bin/neri"])
     execute("cp", [this.nativeDirectory() + "/neri-codegen", tree + "/bin/neri-codegen"])
     execute("cp", [this.nativeDirectory() + "/libneri-runtime.a", tree + "/lib/libneri-runtime.a"])
     execute("cp", [this.nativeDirectory() + "/neri-runtime-" + this.target + ".json", tree + "/lib/neri-runtime.json"])
-    let files = ["bin/neri", "bin/neri-codegen", "lib/libneri-runtime.a", "lib/neri-runtime.json", "stdlib/http.hk", "stdlib/terminal.hk", "stdlib/clock.hk"]
+    let files = ["bin/neri", "bin/neri-codegen", "lib/libneri-runtime.a", "lib/neri-runtime.json", "stdlib/http.hk", "stdlib/terminal.hk", "stdlib/clock.hk", "stdlib/documentation.json"]
     var manifest = ""
     for file in files manifest = manifest + this.digest(tree + "/" + file) + "  " + file + "\n" end
     if !host.writeText(tree + "/ARTIFACTS.sha256", manifest)
@@ -161,6 +163,15 @@ class Build
     execute(this.nativeDirectory() + "/neri-host", ["replace", this.work + "/current", this.root + "/build/current"])
     execute("ln", ["-s", "current/bin/neri", this.work + "/neri"])
     execute(this.nativeDirectory() + "/neri-host", ["replace", this.work + "/neri", this.root + "/build/neri"])
+  end
+
+  def documentationIndex(tree: String): Void
+    let versions = lines(requiredText(this.root + "/VERSION"))
+    if versions.Length != 1 || versions[0] == ""
+      fail("invalid VERSION for documentation index")
+    end
+    execute(this.compiler, ["documentation-index", "--toolchain-version", versions[0], "--output", tree + "/stdlib/documentation.json",
+      tree + "/stdlib/http.hk", tree + "/stdlib/terminal.hk", tree + "/stdlib/clock.hk"])
   end
 
   def capture(arguments: String[], name: String, seconds: Int): Int
@@ -321,6 +332,7 @@ class Build
     for library in ["http", "terminal", "clock"]
       execute("cp", [this.root + "/stdlib/" + library + ".hk", tree + "/stdlib/" + library + ".hk"])
     end
+    this.documentationIndex(tree)
     execute("cp", [this.compiler, tree + "/libexec/neri"])
     execute("cp", [this.root + "/tooling/package-launcher.sh", tree + "/bin/neri"])
     execute("cp", [this.root + "/tooling/install-launcher.sh", tree + "/install.sh"])
@@ -339,6 +351,7 @@ class Build
     for library in ["http", "terminal", "clock"]
       hashes = hashes + this.digest(tree + "/stdlib/" + library + ".hk") + "  stdlib/" + library + ".hk\n"
     end
+    hashes = hashes + this.digest(tree + "/stdlib/documentation.json") + "  stdlib/documentation.json\n"
     for example in ["README.md", "hello.hk", "functions.hk", "arguments.hk", "http.hk", "generics.hk"]
       execute("cp", [this.root + "/examples/" + example, tree + "/examples/" + example])
       hashes = hashes + this.digest(tree + "/examples/" + example) + "  examples/" + example + "\n"
@@ -368,6 +381,31 @@ class Build
     execute(this.target == "linux-x86_64" ? "bsdtar" : "tar", ["--format=ustar", "--uid", "0", "--gid", "0", "--uname", "root", "--gname", "root", "-cf", archive, "-C", directory, "-T", directory + "/members"])
     execute("gzip", ["-n", archive])
     return archive + ".gz"
+  end
+
+  def installedToolchain(prefix: String, name: String): String
+    let launcher = prefix + "/bin/neri"
+    if this.capture(["readlink", launcher], name, 30) != 0
+      fail("cannot resolve installed launcher")
+    end
+    let links = lines(requiredText(this.work + "/" + name + ".stdout"))
+    if links.Length != 1 || !bytesEqualAt(links[0], "../toolchains/", 0) || !endsWith(links[0], "/bin/neri")
+      fail("installed launcher has an unsafe target")
+    end
+    return prefix + "/bin/" + host.stringSlice(links[0], 0, host.stringByteLength(links[0]) - 9)
+  end
+
+  def pathMissing(path: String): Bool
+    let exists = host.run("test", ["-e", path])
+    if exists == null
+      fail("cannot inspect expected missing path: " + path)
+      return false
+    end
+    if exists != 1
+      fail("cannot inspect expected missing path: " + path)
+      return false
+    end
+    return true
   end
 
   def package(): Void
@@ -447,6 +485,51 @@ class Build
       launcher, "run", this.packagedTree + "/examples/arguments.hk", "--", "Ada", "Grace Hopper"]
     if this.capture(arguments, "package-arguments", 30) != 0 || requiredText(this.work + "/package-arguments.stdout") != "Hello, Ada!\nHello, Grace Hopper!\n"
       fail("packaged arguments example violated its documented output")
+    end
+    let documentedToolchain = this.installedToolchain(prefix, "installed-documentation-link")
+    execute("test", ["-d", documentedToolchain + "/docs"])
+    execute(this.packagedTree + "/install.sh", ["--no-doc", "--prefix", prefix])
+    let noDocumentationToolchain = this.installedToolchain(prefix, "installed-no-documentation-link")
+    if documentedToolchain == noDocumentationToolchain
+      fail("documentation and --no-doc installations must not share a toolchain")
+    end
+    let noDocumentationManifest = requiredText(noDocumentationToolchain + "/ARTIFACTS.sha256")
+    if contains(noDocumentationManifest, "  docs/") || contains(noDocumentationManifest, "  stdlib/documentation.json\n")
+      fail("--no-doc installation retained documentation artifacts")
+    end
+    let packageManifest = requiredText(this.packagedTree + "/ARTIFACTS.sha256")
+    let installation = requiredText(noDocumentationToolchain + "/INSTALLATION.json")
+    if requiredText(noDocumentationToolchain + "/PACKAGE-ARTIFACTS.sha256") != packageManifest || !contains(installation, "\"packageArtifactManifestSha256\": \"" + this.digest(this.packagedTree + "/ARTIFACTS.sha256") + "\"") || !contains(installation, "\"installedArtifactManifestSha256\": \"" + this.digest(noDocumentationToolchain + "/ARTIFACTS.sha256") + "\"") || !contains(installation, "\"documentationIncluded\": false")
+      fail("--no-doc installation metadata is not truthful")
+    end
+    if !this.pathMissing(noDocumentationToolchain + "/docs") || !this.pathMissing(noDocumentationToolchain + "/stdlib/documentation.json")
+      fail("--no-doc installation retained documentation files")
+    end
+    execute(launcher, ["--version"])
+    let noDocumentationCheck = ["-i", "PATH=" + envOr("PATH", "/usr/bin:/bin"), "LC_ALL=C", "LLVM_PREFIX=" + this.llvm,
+      launcher, "check", this.packagedTree + "/examples/hello.hk", "--release"]
+    if this.capture(noDocumentationCheck, "installed-no-documentation-check", 30) != 0
+      fail("--no-doc installation cannot check a program")
+    end
+    execute(this.packagedTree + "/install.sh", ["--prefix", prefix, "--no-doc"])
+    if this.installedToolchain(prefix, "reinstalled-no-documentation-link") != noDocumentationToolchain
+      fail("--no-doc reinstallation did not reuse its staged manifest")
+    end
+    execute(this.packagedTree + "/install.sh", ["--prefix", prefix])
+    if this.installedToolchain(prefix, "reinstalled-documentation-link") != documentedToolchain
+      fail("documentation reinstallation did not preserve its content address")
+    end
+    let tampered = this.work + "/tampered-package"
+    execute("cp", ["-R", this.packagedTree, tampered])
+    if !host.writeText(tampered + "/docs/LANGUAGE.md", requiredText(tampered + "/docs/LANGUAGE.md") + "\n")
+      fail("cannot tamper package fixture")
+    end
+    let tamperedPrefix = this.work + "/tampered-installation"
+    if this.capture([tampered + "/install.sh", "--no-doc", "--prefix", tamperedPrefix], "tampered-install", 30) == 0
+      fail("installer accepted a tampered package")
+    end
+    if !this.pathMissing(tamperedPrefix + "/bin/neri")
+      fail("tampered package created an installation")
     end
     let hash = this.digest(first)
     if this.sourceManifest() != sources
@@ -540,6 +623,16 @@ class Build
 
   def test(): Void
     this.bootstrap(false)
+    var lspArguments = this.environment()
+    for argument in [this.nativeDirectory() + "/neri-lsp-test", this.compiler, this.root]
+      lspArguments = host.appendString(lspArguments, argument)
+    end
+    execute("/usr/bin/env", lspArguments)
+    var projectArguments = this.environment()
+    for argument in [this.compiler, "build", "--project", this.root + "/tests/lsp/project/neri.json", "--output", this.work + "/project-contract"]
+      projectArguments = host.appendString(projectArguments, argument)
+    end
+    execute("/usr/bin/env", projectArguments)
     execute("ctest", ["--test-dir", this.nativeDirectory(), "--output-on-failure", "--no-tests=error"])
     this.languageCase("examples/hello.hk", 0, "Hello, Neri!\n", true)
     this.languageCase("examples/functions.hk", 0, "Total: 60\n", true)

@@ -1,0 +1,644 @@
+use console
+use host
+
+@cabi("getchar")
+def unsafe lspGetchar(): Int32
+end
+
+def lspReadByte(): Int
+  unsafe
+    return lspGetchar() as Int
+  end
+end
+
+def lspReadMessage(): String?
+  var length = -1
+  var headerBytes = 0
+  while true
+    var line = ""
+    var byte = lspReadByte()
+    while byte != 10
+      if byte < 0 || byte > 127 || headerBytes > 8192
+        return null
+      end
+      line = line + lspCharacter(byte)
+      headerBytes = headerBytes + 1
+      byte = lspReadByte()
+    end
+    headerBytes = headerBytes + 1
+    if line == "\r"
+      break
+    end
+    if !semanticEndsWith(line, "\r")
+      return null
+    end
+    # Header names are case-insensitive, per the base protocol.
+    var lower = ""
+    var index = 0
+    while index < host.stringByteLength(line)
+      var value = host.stringByteAt(line, index) as Int
+      if value >= 65 && value <= 90
+        value = value + 32
+      end
+      lower = lower + lspCharacter(value)
+      index = index + 1
+    end
+    if bootstrapStartsWith(lower, "content-length:")
+      if length >= 0
+        return null
+      end
+      index = 15
+      while index < host.stringByteLength(lower) && ((host.stringByteAt(lower, index) as Int) == 32 || (host.stringByteAt(lower, index) as Int) == 9)
+        index = index + 1
+      end
+      let value = host.parseInt(host.stringSlice(lower, index, host.stringByteLength(lower) - index - 1))
+      if value == null || value < 0 || value > 2097152
+        return null
+      end
+      length = value
+    end
+  end
+  if length < 0
+    return null
+  end
+  var bytes: Byte[] = []
+  let parts = new StringBuffer()
+  var continuation = 0
+  var index = 0
+  while index < length
+    let byte = lspReadByte()
+    if byte < 0
+      return null
+    end
+    bytes = host.appendByte(bytes, byte as Byte)
+    if byte >= 192
+      continuation = utf8Width(byte) - 1
+    else if continuation > 0
+      continuation = continuation - 1
+    end
+    index = index + 1
+    if (bytes.Length >= 256 && continuation == 0) || index == length
+      let part = host.stringFromBytes(bytes)
+      if part == null
+        return null
+      end
+      parts.add(part)
+      bytes = []
+    end
+  end
+  return lspJoin(parts, 0, parts.size)
+end
+
+def lspSend(body: String): Void
+  console.print("Content-Length: " + (host.stringByteLength(body) as String) + "\r\n\r\n" + body)
+end
+
+def lspResult(id: String, result: String): Void
+  lspSend("{\"jsonrpc\":\"2.0\",\"id\":" + id + ",\"result\":" + result + "}")
+end
+
+def lspError(id: String, code: Int, message: String): Void
+  lspSend("{\"jsonrpc\":\"2.0\",\"id\":" + id + ",\"error\":{\"code\":" + (code as String) + ",\"message\":" + lspQuote(message) + "}}")
+end
+
+def lspLog(message: String): Void
+  lspSend("{\"jsonrpc\":\"2.0\",\"method\":\"window/logMessage\",\"params\":{\"type\":1,\"message\":" + lspQuote(message) + "}}")
+end
+
+def lspPosition(text: String, offset: Int): String
+  let cursor = new IrUtf16Cursor(text)
+  var line = 0
+  var column = 0
+  var index = 0
+  var previous = -1
+  while cursor.hasNext() && index < offset
+    let unit = cursor.nextUnit()
+    if unit == 13
+      line = line + 1
+      column = 0
+    else if unit == 10
+      if previous != 13
+        line = line + 1
+      end
+      column = 0
+    else
+      column = column + 1
+    end
+    previous = unit
+    index = index + 1
+  end
+  return "{\"line\":" + (line as String) + ",\"character\":" + (column as String) + "}"
+end
+
+class LspDocument
+  public uri: String = ""
+  public sourcePath: String = ""
+  public text: String = ""
+  public version: Int = 0
+  public semantic: SemanticModel?
+  public tokens: TokenBuffer?
+  public syntax: SyntaxArena?
+  public syntaxRoot: Int = -1
+  public analysisRevision: Int = 0
+  public requireEntryPoint: Bool = true
+  public forbiddenEntryPointSources: StringBuffer = new StringBuffer()
+  public stdlibDocumentation: LspJson?
+  public sourceUris: StringBuffer = new StringBuffer()
+  public sourceTexts: StringBuffer = new StringBuffer()
+  public sourceStarts: IntBuffer = new IntBuffer()
+  public next: LspDocument?
+end
+
+class LspServer
+  public rootPath: String = ""
+  public sourceSet: String = ""
+  public documentationEnabled: Bool = true
+  public hoverMarkdown: Bool = false
+  public completionMarkdown: Bool = false
+  public nextAnalysisRevision: Int = 1
+  public stdlibDocumentation: LspJson?
+  public initialized: Bool = false
+  public shutdown: Bool = false
+  public documents: LspDocument?
+
+  def find(uri: String): LspDocument?
+    var document = this.documents
+    while document != null
+      if document.uri == uri
+        return document
+      end
+      document = document.next
+    end
+    return null
+  end
+
+  def publish(document: LspDocument, diagnostics: String): Void
+    lspSend("{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{\"uri\":" + lspQuote(document.uri) + ",\"version\":" + (document.version as String) + ",\"diagnostics\":" + diagnostics + "}}")
+  end
+
+  def findPath(path: String): LspDocument?
+    var document = this.documents
+    while document != null
+      if this.resolveDocumentPath(document) == path
+        return document
+      end
+      document = document.next
+    end
+    return null
+  end
+
+  def resolveDocumentPath(document: LspDocument): String
+    if document.sourcePath != ""
+      return document.sourcePath
+    end
+    let candidate = lspPath(document.uri)
+    if candidate == null
+      return ""
+    end
+    let lexical = host.pathAbsolute(candidate)
+    if lexical == null
+      return ""
+    end
+    let canonical = neriCanonicalPath(lexical)
+    document.sourcePath = lexical
+    if canonical != null
+      document.sourcePath = canonical
+    end
+    return document.sourcePath
+  end
+
+  def nearestProjectManifest(path: String): String
+    let absolute = host.pathAbsolute(path)
+    if absolute == null
+      return ""
+    end
+    var boundary = ""
+    if this.rootPath != ""
+      let workspace = host.pathAbsolute(this.rootPath)
+      if workspace != null && bootstrapPathWithin(workspace, absolute)
+        boundary = workspace
+      end
+    end
+    var directory = bootstrapDirectory(absolute)
+    while true
+      let manifest = directory + (directory == "/" ? "neri.json" : "/neri.json")
+      if host.readText(manifest) != null
+        return manifest
+      end
+      if boundary != "" && directory == boundary
+        return ""
+      end
+      let parent = bootstrapDirectory(directory)
+      if parent == directory
+        return ""
+      end
+      directory = parent
+    end
+    return ""
+  end
+
+  def selectedSourceSet(manifest: String): String
+    if this.sourceSet == "" || this.rootPath == ""
+      return ""
+    end
+    let workspaceManifest = host.pathAbsolute(this.rootPath + "/neri.json")
+    return workspaceManifest != null && workspaceManifest == manifest ? this.sourceSet : ""
+  end
+
+  def reanalyze(): Void
+    # Conservative invalidation: each open document sees the current in-memory
+    # versions of all sources in its compilation source set.
+    var document = this.documents
+    while document != null
+      this.analyze(document)
+      document = document.next
+    end
+  end
+
+  def documentUsesPath(document: LspDocument, path: String): Bool
+    let candidate = lspPath(document.uri)
+    if candidate == null
+      return false
+    end
+    let lexical = host.pathAbsolute(candidate)
+    if lexical == null
+      return false
+    end
+    let sourcePath = this.resolveDocumentPath(document)
+    if sourcePath == ""
+      return false
+    end
+    let manifest = this.nearestProjectManifest(lexical)
+    if manifest == ""
+      return false
+    end
+    let project = neriProjectForSource(manifest, sourcePath, this.selectedSourceSet(manifest))
+    return project.error == "" && neriProjectContains(project, sourcePath) && neriProjectContains(project, path)
+  end
+
+  def reanalyzePath(path: String, primaryUri: String = ""): Void
+    let absolute = host.pathAbsolute(path)
+    var document = this.documents
+    while document != null
+      if document.uri == primaryUri || (absolute != null && this.documentUsesPath(document, absolute))
+        this.analyze(document)
+      end
+      document = document.next
+    end
+  end
+
+  def analyze(document: LspDocument): Void
+    # A failed parse or library load must not expose a previous version's model.
+    document.semantic = null
+    document.tokens = null
+    document.syntax = null
+    document.syntaxRoot = -1
+    document.analysisRevision = this.nextAnalysisRevision
+    this.nextAnalysisRevision = this.nextAnalysisRevision + 1
+    document.stdlibDocumentation = this.stdlibDocumentation
+    document.requireEntryPoint = true
+    document.forbiddenEntryPointSources = new StringBuffer()
+    let filePath = lspPath(document.uri)
+    if filePath != null && !neriSourceNameValid(filePath)
+      this.publish(document, "[{\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":0,\"character\":0}},\"severity\":1,\"code\":\"NR_FILE_NAME\",\"source\":\"neri\",\"message\":\".hk file names must not contain whitespace.\"}]")
+      return
+    end
+    # Put the queried document first so its compiler ranges remain local.
+    var source = document.text + "\n"
+    let starts = new IntBuffer()
+    let ids = new StringBuffer()
+    let texts = new StringBuffer()
+    document.sourceUris = ids
+    document.sourceTexts = texts
+    document.sourceStarts = starts
+    starts.add(0)
+    ids.add(document.uri)
+    texts.add(document.text)
+    if filePath != null
+      let lexical = host.pathAbsolute(filePath)
+      if lexical != null
+        let path = this.resolveDocumentPath(document)
+        let manifest = this.nearestProjectManifest(lexical)
+        if manifest != ""
+          let project = neriProjectForSource(manifest, path, this.selectedSourceSet(manifest))
+          if project.error != ""
+            this.publish(document, "[{\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":0,\"character\":0}},\"severity\":1,\"code\":\"NR_PROJECT\",\"source\":\"neri\",\"message\":" + lspQuote(project.error) + "}]")
+            lspLog(project.error)
+            return
+          end
+          if neriProjectContains(project, path)
+            document.requireEntryPoint = false
+            var reference = project.referenceSources.first.nextNode
+            while reference != null
+              document.forbiddenEntryPointSources.add(lspUri(reference.value))
+              reference = reference.nextNode
+            end
+            var entry = project.sources.first.nextNode
+            while entry != null
+              if entry.value != path
+                let opened = this.findPath(entry.value)
+                var text: String? = null
+                if opened != null
+                  text = opened.text
+                else
+                  text = host.readText(entry.value)
+                end
+                if text == null
+                  this.publish(document, "[]")
+                  lspLog("Cannot read project source: " + entry.value)
+                  return
+                end
+                starts.add((new IrSourceMap(source)).utf16Length())
+                ids.add(lspUri(entry.value))
+                texts.add(text)
+                source = source + text + "\n"
+              end
+              entry = entry.nextNode
+            end
+          end
+        end
+      end
+    end
+    let imports = (new BootstrapLexer(source)).lex()
+    for library in ["http", "terminal", "clock"]
+      var needed = false
+      var index = 0
+      while index + 1 < imports.count()
+        if imports.kindAt(index) == "Use" && imports.textAt(index + 1) == library
+          needed = true
+        end
+        index = index + 1
+      end
+      if needed
+        let directory = host.environment("NERI_STDLIB")
+        if directory == null
+          this.publish(document, "[]")
+          lspLog("Neri LSP requires the toolchain launcher (NERI_STDLIB is missing).")
+          return
+        end
+        let text = host.readText(directory + "/" + library + ".hk")
+        if text == null
+          this.publish(document, "[]")
+          lspLog("Cannot read Neri standard library: " + library)
+          return
+        end
+        starts.add((new IrSourceMap(source)).utf16Length())
+        ids.add("@stdlib/" + library + ".hk")
+        texts.add(text)
+        source = source + text + "\n"
+      end
+    end
+    let tokens = (new BootstrapLexer(source)).lex()
+    let parser = new BootstrapParser(tokens)
+    var index = 0
+    while index < starts.size
+      parser.addSourceBoundary(starts.get(index))
+      index = index + 1
+    end
+    let root = parser.parseProgram()
+    document.tokens = tokens
+    document.syntax = parser.arena
+    document.syntaxRoot = root
+    var diagnostics = parser.diagnostics
+    if diagnostics.count() == 0
+      let binder = new BootstrapBinder(parser.arena, root, tokens.startAt(tokens.count() - 1))
+      binder.recordSourceSymbols = true
+      binder.requireEntryPoint = document.requireEntryPoint
+      binder.forbiddenEntryPointSources = document.forbiddenEntryPointSources
+      binder.clearSources()
+      index = 0
+      while index < starts.size
+        binder.addSource(ids.get(index), starts.get(index))
+        index = index + 1
+      end
+      let semantic = binder.bind()
+      document.semantic = semantic
+      diagnostics = semantic.diagnostics
+    end
+    var result = "["
+    var separator = ""
+    index = 0
+    while index < diagnostics.count()
+      let start = diagnostics.starts.get(index)
+      if starts.size == 1 || start < starts.get(1)
+        result = result + separator + "{\"range\":{\"start\":" + lspPosition(document.text, start) + ",\"end\":" + lspPosition(document.text, start + diagnostics.lengths.get(index)) + "},\"severity\":1,\"code\":" + lspQuote(diagnostics.codes.get(index)) + ",\"source\":\"neri\",\"message\":" + lspQuote(diagnostics.messages.get(index)) + "}"
+        separator = ","
+      else
+        var sourceIndex = 0
+        while sourceIndex + 1 < starts.size && starts.get(sourceIndex + 1) <= start
+          sourceIndex = sourceIndex + 1
+        end
+        if diagnostics.codes.get(index) == "NR_PROJECT_ENTRY" && neriProjectListed(document.forbiddenEntryPointSources, ids.get(sourceIndex))
+          result = result + separator + "{\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":0,\"character\":0}},\"severity\":1,\"code\":\"NR_PROJECT_ENTRY\",\"source\":\"neri\",\"message\":" + lspQuote(diagnostics.messages.get(index)) + "}"
+          separator = ","
+        else if bootstrapStartsWith(ids.get(sourceIndex), "@stdlib/")
+          lspLog("Neri standard library diagnostic: " + diagnostics.messages.get(index))
+        end
+      end
+      index = index + 1
+    end
+    this.publish(document, result + "]")
+  end
+
+  def handle(message: LspJson): Bool
+    let method = message.get("method")
+    let requestId = message.get("id")
+    let request = requestId.kind != "missing"
+    var id = "null"
+    if requestId.kind == "string"
+      id = lspQuote(requestId.value)
+    else if requestId.kind == "number" && host.parseInt(requestId.value) != null
+      id = requestId.value
+    else if request
+      lspError("null", -32600, "Invalid request id")
+      return true
+    end
+    if message.kind != "object" || message.get("jsonrpc").value != "2.0" || method.kind != "string"
+      lspError(id, -32600, "Invalid request")
+      return true
+    end
+    if method.value == "exit"
+      host.exit(this.shutdown ? 0 : 1)
+      return false
+    end
+    if method.value == "initialize" && request && !this.initialized
+      this.initialized = true
+      let params = message.get("params")
+      let root = lspPath(params.get("rootUri").value)
+      if root != null
+        this.rootPath = root
+      end
+      let initializationOptions = params.get("initializationOptions")
+      let sourceSet = initializationOptions.get("sourceSet")
+      if sourceSet.kind == "string"
+        this.sourceSet = sourceSet.value
+      end
+      let documentation = initializationOptions.get("documentation")
+      if documentation.kind == "literal" && documentation.value == "false"
+        this.documentationEnabled = false
+      end
+      let textCapabilities = params.get("capabilities").get("textDocument")
+      this.hoverMarkdown = lspJsonArrayContains(textCapabilities.get("hover").get("contentFormat"), "markdown")
+      this.completionMarkdown = lspJsonArrayContains(textCapabilities.get("completion").get("completionItem").get("documentationFormat"), "markdown")
+      this.stdlibDocumentation = lspLoadStdlibDocumentation()
+      lspResult(id, "{\"capabilities\":{\"positionEncoding\":\"utf-16\",\"hoverProvider\":true,\"definitionProvider\":true,\"referencesProvider\":true,\"documentHighlightProvider\":true,\"documentSymbolProvider\":true,\"completionProvider\":{\"triggerCharacters\":[\".\"],\"resolveProvider\":true},\"signatureHelpProvider\":{\"triggerCharacters\":[\"(\",\",\"]},\"textDocumentSync\":{\"openClose\":true,\"change\":2}},\"serverInfo\":{\"name\":\"neri\",\"version\":" + lspQuote(neriVersion()) + "}}")
+      return true
+    end
+    if !this.initialized || this.shutdown
+      if request
+        lspError(id, this.shutdown ? -32600 : -32002, this.shutdown ? "Server has shut down" : "Server not initialized")
+      end
+      return true
+    end
+    if method.value == "shutdown" && request
+      this.shutdown = true
+      lspResult(id, "null")
+      return true
+    end
+    if method.value == "textDocument/documentSymbol" && request
+      let document = this.find(message.get("params").get("textDocument").get("uri").value)
+      if document == null
+        lspResult(id, "[]")
+      else
+        lspResult(id, lspDocumentSymbols(document))
+      end
+      return true
+    end
+    if method.value == "completionItem/resolve" && request
+      let item = message.get("params")
+      let uri = item.get("data").get("uri")
+      var document: LspDocument? = null
+      if uri.kind == "string"
+        document = this.find(uri.value)
+      end
+      lspResult(id, lspResolveCompletion(document, item, this.documentationEnabled, this.completionMarkdown))
+      return true
+    end
+    if (method.value == "textDocument/hover" || method.value == "textDocument/definition" || method.value == "textDocument/references" || method.value == "textDocument/documentHighlight" || method.value == "textDocument/completion" || method.value == "textDocument/signatureHelp") && request
+      let params = message.get("params")
+      let document = this.find(params.get("textDocument").get("uri").value)
+      if document == null
+        lspResult(id, "null")
+      else
+        let offset = lspByteOffset(document.text, params.get("position"))
+        if offset < 0
+          lspError(id, -32602, "Invalid document position")
+        else
+          let position = (new IrSourceMap(host.stringSlice(document.text, 0, offset))).utf16Length()
+          if method.value == "textDocument/references"
+            lspResult(id, lspReferences(document, position, params.get("context").get("includeDeclaration").value == "true"))
+          else if method.value == "textDocument/documentHighlight"
+            lspResult(id, lspHighlights(document, position))
+          else if method.value == "textDocument/completion"
+            lspResult(id, document.tokens == null ? "[]" : lspCompletion(document, position))
+          else if method.value == "textDocument/signatureHelp"
+            lspResult(id, lspSignatureHelp(document, position))
+          else
+            lspResult(id, method.value == "textDocument/hover" ? lspHover(document, position, this.documentationEnabled, this.hoverMarkdown) : lspDefinition(document, position))
+          end
+        end
+      end
+      return true
+    end
+    if request
+      lspError(id, -32601, "Method not found")
+      return true
+    end
+    let params = message.get("params")
+    let item = params.get("textDocument")
+    let uri = item.get("uri")
+    if method.value == "workspace/didChangeWatchedFiles"
+      this.stdlibDocumentation = lspLoadStdlibDocumentation()
+      this.reanalyze()
+      return true
+    end
+    if method.value == "textDocument/didClose"
+      var previous: LspDocument? = null
+      var current = this.documents
+      while current != null
+        if current.uri == uri.value
+          this.publish(current, "[]")
+          if previous == null
+            this.documents = current.next
+          else
+            previous.next = current.next
+          end
+          if current.sourcePath != ""
+            this.reanalyzePath(current.sourcePath)
+          else
+            let closedPath = lspPath(current.uri)
+            if closedPath != null
+              this.reanalyzePath(closedPath)
+            end
+          end
+          return true
+        end
+        previous = current
+        current = current.next
+      end
+    else if method.value == "textDocument/didOpen" || method.value == "textDocument/didChange"
+      if uri.kind != "string" || uri.value == ""
+        return true
+      end
+      let versionNode = item.get("version")
+      let version = host.parseInt(versionNode.value)
+      if versionNode.kind != "number" || version == null
+        return true
+      end
+      var document = this.find(uri.value)
+      var text = item.get("text")
+      if method.value == "textDocument/didChange"
+        if document == null || version <= document.version
+          return true
+        end
+        text = lspApplyChanges(document.text, params.get("contentChanges"))
+        if text.kind != "string"
+          lspLog("Neri LSP rejected invalid document changes; the document and version were preserved.")
+          return true
+        end
+      else if document != null
+        return true
+      end
+      if text.kind != "string"
+        return true
+      end
+      if document == null
+        let opened = new LspDocument()
+        opened.uri = uri.value
+        opened.next = this.documents
+        this.documents = opened
+        document = opened
+      end
+      let current = document
+      if current != null
+        current.text = text.value
+        current.version = version
+        let changedPath = this.resolveDocumentPath(current)
+        if changedPath == ""
+          this.analyze(current)
+        else
+          this.reanalyzePath(changedPath, current.uri)
+        end
+      end
+    end
+    return true
+  end
+end
+
+def lspMain(): Void
+  let server = new LspServer()
+  while true
+    let body = lspReadMessage()
+    if body == null
+      return
+    end
+    let parser = new LspJsonParser(body)
+    let message = parser.parse()
+    parser.spaces()
+    if parser.failed || parser.position != host.stringByteLength(body)
+      lspError("null", -32700, "Parse error")
+    else if !server.handle(message)
+      return
+    end
+  end
+end

@@ -24,7 +24,8 @@ if [[ ! -x "$LLVM_PREFIX/bin/llvm-config" ]] || [[ "$("$LLVM_PREFIX/bin/llvm-con
   echo "Neri requires LLVM 22.1.8." >&2
   exit 2
 fi
-exec env "NERI_CODEGEN=$PACKAGE_ROOT/bin/neri-codegen" \
+exec env "NERI_HOST=$PACKAGE_ROOT/libexec/neri-host" \
+  "NERI_CODEGEN=$PACKAGE_ROOT/bin/neri-codegen" \
   "NERI_RUNTIME_MANIFEST=$PACKAGE_ROOT/lib/neri-runtime.json" \
   "NERI_LINKER=$LLVM_PREFIX/bin/clang++" \
   "NERI_STDLIB=$PACKAGE_ROOT/stdlib" \

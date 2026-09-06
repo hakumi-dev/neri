@@ -1,24 +1,87 @@
 use host
 use console
 
+def usage(): Void
+  fail("usage: install.sh [--prefix <directory>] [--no-doc]")
+end
+
+def manifestPath(line: String): String?
+  if host.stringByteLength(line) <= 66 || host.stringByteAt(line, 64) != 32 as Byte || host.stringByteAt(line, 65) != 32 as Byte
+    return null
+  end
+  return host.stringSlice(line, 66, host.stringByteLength(line) - 66)
+end
+
+def omittedArtifact(path: String): Bool
+  return bytesEqualAt(path, "docs/", 0) || path == "stdlib/documentation.json"
+end
+
+def installManifest(manifest: String, noDocumentation: Bool): String
+  if !noDocumentation
+    return manifest
+  end
+  var result = ""
+  for line in lines(manifest)
+    let path = manifestPath(line)
+    if path == null
+      fail("invalid package artifact manifest")
+    else if !omittedArtifact(path)
+      result = result + line + "\n"
+    end
+  end
+  return result
+end
+
+def manifestHash(helper: String, temporary: String, name: String, path: String): String
+  execute(helper, ["run", "30", temporary + "/" + name, temporary + "/" + name + ".stderr", temporary + "/" + name + ".status",
+    "shasum", "-a", "256", path])
+  if requiredText(temporary + "/" + name + ".status") != "0\n"
+    fail("cannot hash artifact manifest")
+  end
+  let hash = requiredText(temporary + "/" + name)
+  if host.stringByteLength(hash) < 64
+    fail("invalid artifact manifest hash")
+  end
+  return host.stringSlice(hash, 0, 64)
+end
+
 def main(): Void
   let package = envOr("NERI_PACKAGE_ROOT", "")
   if package == ""
     fail("use the package install.sh launcher")
   end
   let userDirectory = envOr("HOME", "")
-  if userDirectory == "" && host.argumentCount() == 0
-    fail("HOME or --prefix is required")
-  end
-  var prefix = userDirectory + "/.neri"
-  if host.argumentCount() != 0
-    let option = host.argumentAt(0)
-    let value = host.argumentAt(1)
-    if host.argumentCount() != 2 || option == null || option != "--prefix" || value == null
-      fail("usage: install.sh [--prefix <directory>]")
+  var prefix = userDirectory == "" ? "" : userDirectory + "/.neri"
+  var prefixProvided = false
+  var noDocumentation = false
+  var index = 0
+  while index < host.argumentCount()
+    let option = host.argumentAt(index)
+    if option == null
+      usage()
+    else if option == "--no-doc"
+      if noDocumentation
+        usage()
+      end
+      noDocumentation = true
+      index = index + 1
+    else if option == "--prefix"
+      let value = host.argumentAt(index + 1)
+      if prefixProvided || value == null
+        usage()
+      else if bytesEqualAt(value, "--", 0)
+        usage()
+      else
+        prefix = value
+        prefixProvided = true
+        index = index + 2
+      end
     else
-      prefix = value
+      usage()
     end
+  end
+  if prefix == ""
+    fail("HOME or --prefix is required")
   end
   let absolute = host.pathAbsolute(prefix)
   if absolute == null
@@ -41,17 +104,35 @@ def main(): Void
   if prefix == package || bytesEqualAt(prefix, package + "/", 0)
     fail("installation prefix must be outside the source package")
   end
+  # Verify the distributed package before creating a mutable installation variant.
   execute("/usr/bin/env", ["-C", package, "shasum", "-a", "256", "-c", "ARTIFACTS.sha256"])
-  execute(helper, ["run", "30", temporary + "/hash", temporary + "/hash.stderr", temporary + "/hash.status",
-    "shasum", "-a", "256", package + "/ARTIFACTS.sha256"])
-  if requiredText(temporary + "/hash.status") != "0\n"
-    fail("cannot hash package manifest")
+  let packageManifest = requiredText(package + "/ARTIFACTS.sha256")
+  let packageHash = manifestHash(helper, temporary, "package-hash", package + "/ARTIFACTS.sha256")
+  let staged = temporary + "/package"
+  execute("cp", ["-R", package, staged])
+  execute("/usr/bin/env", ["-C", staged, "shasum", "-a", "256", "-c", "ARTIFACTS.sha256"])
+  if requiredText(staged + "/ARTIFACTS.sha256") != packageManifest
+    fail("staging artifact manifest changed")
   end
-  let hash = requiredText(temporary + "/hash")
-  if host.stringByteLength(hash) < 64
-    fail("invalid package hash")
+  let manifest = installManifest(packageManifest, noDocumentation)
+  if noDocumentation
+    execute("rm", ["-r", staged + "/docs"])
+    execute("rm", ["-f", staged + "/stdlib/documentation.json"])
+    if !host.writeText(staged + "/ARTIFACTS.sha256", manifest)
+      fail("cannot write installation artifact manifest")
+    end
   end
-  let id = host.stringSlice(hash, 0, 64)
+  if !host.writeText(staged + "/PACKAGE-ARTIFACTS.sha256", packageManifest)
+    fail("cannot preserve package artifact manifest")
+  end
+  execute("/usr/bin/env", ["-C", staged, "shasum", "-a", "256", "-c", "ARTIFACTS.sha256"])
+  let installedHash = manifestHash(helper, temporary, "installed-hash", staged + "/ARTIFACTS.sha256")
+  let installation = "{\n  \"schemaVersion\": 1,\n  \"packageArtifactManifestSha256\": \"" + packageHash + "\",\n  \"installedArtifactManifestSha256\": \"" + installedHash + "\",\n  \"documentationIncluded\": " + (noDocumentation ? "false" : "true") + "\n}\n"
+  if !host.writeText(staged + "/INSTALLATION.json", installation)
+    fail("cannot write installation metadata")
+  end
+  execute("/usr/bin/env", ["-C", staged, "shasum", "-a", "256", "-c", "ARTIFACTS.sha256"])
+  let id = installedHash
   let destination = prefix + "/toolchains/" + id
   let current = prefix + "/bin/neri"
   let exists = host.run("test", ["-e", current])
@@ -68,16 +149,14 @@ def main(): Void
       fail("refusing to replace an unrelated symlink: " + current)
     end
   end
-  execute("cp", ["-R", package, temporary + "/package"])
-  execute("/usr/bin/env", ["-C", temporary + "/package", "shasum", "-a", "256", "-c", "ARTIFACTS.sha256"])
   let installed = host.run("test", ["-d", destination])
   if installed == null
     fail("cannot inspect installed toolchain")
   else if installed == 0
-    execute("cmp", [package + "/ARTIFACTS.sha256", destination + "/ARTIFACTS.sha256"])
+    execute("cmp", [staged + "/ARTIFACTS.sha256", destination + "/ARTIFACTS.sha256"])
     execute("/usr/bin/env", ["-C", destination, "shasum", "-a", "256", "-c", "ARTIFACTS.sha256"])
   else
-    execute(helper, ["replace", temporary + "/package", destination])
+    execute(helper, ["replace", staged, destination])
   end
   execute(destination + "/bin/neri", ["--version"])
   execute("ln", ["-s", "../toolchains/" + id + "/bin/neri", temporary + "/neri"])
