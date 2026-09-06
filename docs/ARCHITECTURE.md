@@ -27,7 +27,7 @@ through the ordinary IR transport and runtime ABI. The signature class is not
 source-constructible, and its fallback invocation traps. A callee's `noreturn`
 property does not propagate to callers or other implementations of its slot.
 
-`compiler/ir/main.hk` is the executable entry point. `frontend/main.hk` and `semantic/main.hk` are standalone development entry points and are excluded from the compiler source set.
+`compiler/ir/main.hk` is the executable entry point. `frontend/main.hk` and `semantic/main.hk` belong to separate development units and are excluded from the compiler unit.
 
 `semantic/readonly.hk` defines transitive readonly views. Binding preserves the
 qualifier on reachable references and checks receiver contracts, assignments,

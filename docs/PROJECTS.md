@@ -1,110 +1,100 @@
 # Compilation projects
 
-A version-1 `neri.json` describes one project for the compiler CLI and language
-server. With no `sourceSets`, it discovers `.hk` files recursively from the
-manifest directory on every analysis:
-
-```json
-{ "version": 1 }
-```
-
-Discovery skips symlinks and directories named `.git`, `.neri`, `.cache`,
-`.idea`, `.bootstrap`, `build`, `out`, `dist`, `target` and `bin`. A descendant
-directory containing its own `neri.json` is a nested-project boundary and is
-not discovered by its parent. Manifest aliases resolve to their canonical paths;
-source discovery does not follow symlinks. `.hk` basenames must not contain whitespace, including Unicode
-whitespace; directory names may contain spaces.
-
-`sourceSets` remains the advanced, compatible form for projects that need named
-compilation units:
+A version-2 `neri.json` contains named compilation units. A unit owns its
+sources and can depend on library units without making namespaces depend on the
+directory layout:
 
 ```json
 {
-  "version": 1,
-  "defaultSourceSet": "application",
-  "sourceSets": {
-    "application": ["src/main.hk", "src/app.hk"],
-    "tests": ["tests/main.hk", "src/app.hk"]
+  "version": 2,
+  "defaultUnit": "web",
+  "units": {
+    "core": {
+      "kind": "library",
+      "sources": ["src/core"],
+      "exclude": [],
+      "references": []
+    },
+    "web": {
+      "kind": "executable",
+      "sources": ["app"],
+      "exclude": [],
+      "references": ["core"]
+    }
   }
 }
 ```
 
-Source entries are relative to the manifest directory. An entry can be an
-explicit `.hk` path, `directory/*.hk` for that directory only, or
-`directory/**/*.hk` for that directory and its descendants. The directory
-prefix is literal: `?`, wildcard directory names, root-wide `**/*.hk`, absolute
-paths and `.` or `..` segments are rejected. Each glob is sorted; an individual
-glob may match no files, but the resolved source set cannot be empty. Duplicate
-paths are rejected. Without an explicit source set, automatic discovery is the
-project's single source set.
-
-## References and libraries
-
-`references` optionally names relative directories containing another
-`neri.json`:
+`defaultUnit` selects the unit used when the command does not pass `--unit`.
+Every unit declares `kind` as `library` or `executable`. A local reference is
+the name of another unit in the same manifest. An external reference names both
+the other manifest and one of its units:
 
 ```json
-{
-  "version": 1,
-  "references": ["../shared", "libraries/collections"]
-}
+{ "project": "../shared/neri.json", "unit": "core" }
 ```
 
-References reject absolute paths, backslashes, empty components and `.`
-components; a relative parent reference such as `../shared` is valid. Every
-target must have its own manifest. A referenced project uses its own automatic
-discovery or own default source set; it never inherits the parent's
-`--source-set` selection.
-The complete reference closure is deterministic: cycles are errors, diamonds
-are loaded once, and a duplicate canonical source path is an error.
+References may target only library units. The complete reference closure is
+deterministic: missing units, cycles and overlapping ownership of a canonical
+source file are configuration errors. A diamond dependency is loaded once.
 
-Referenced projects are source-only libraries and must not define `main`. The
-root project's own sources may omit `main`, which is valid for `check` and the
-language server; executable `build` and `run` require a root entry point.
-Non-executable emission, such as `build --emit=obj`, also permits libraries.
-Multiple root `main` declarations are errors. `namespace` and `use` resolve
-names and standard libraries; they never infer user-project dependencies.
+## Sources and exclusions
+
+Each `sources` entry is relative to the manifest and is either an explicit
+`.hk` file or a directory. Directories, including `.`, are discovered
+recursively. `exclude` entries are literal relative files or directory
+subtrees. Version 2 does not support globs.
+
+Discovery skips symlinks, generated-output directories, and descendant
+directories containing their own `neri.json`. The generated directories are
+`.git`, `.neri`, `.cache`, `.idea`, `.bootstrap`, `build`, `out`, `dist`,
+`target`, and `bin`. Manifest aliases resolve to canonical paths, but discovery
+does not follow symlinks. `.hk` basenames must not contain whitespace, including
+Unicode whitespace; directory names may contain spaces.
+
+Source paths define compilation membership, not namespaces. Files in unrelated
+folders may declare the same namespace, and folder names never create or infer
+namespaces. `namespace` and `use` resolve names inside the selected unit and its
+explicit reference closure; they do not add dependencies.
+
+Libraries must not declare `main`. Executable units must declare exactly one
+`main`; additional entry points are rejected by the binder.
 
 ## Command line
 
 ```sh
-neri build --project neri.json --output build/application
-neri run --project neri.json --source-set tests
-neri check --project neri.json
+neri check --project neri.json --unit core
+neri build --project neri.json --unit web --output build/web
+neri run --project neri.json --unit web
 ```
 
-`--source-set` overrides `defaultSourceSet` and requires `--project`. Explicit
-source arguments cannot be combined with `--project`. Existing commands with
-explicit source arguments retain their behavior. Compiler flags such as
-`--release`, `--target` and `--output` remain independent of source membership.
+`--unit` requires `--project` and overrides `defaultUnit`. Explicit source
+arguments cannot be combined with `--project`. Compiler flags such as
+`--release`, `--target`, and `--output` remain independent of source membership.
 
 ## Language server
 
-The server selects the nearest ancestor `neri.json` for each document, stopping
-at the workspace root for documents inside it. A workspace can contain several
-independent projects. The automatic source set is used when `sourceSets` is omitted. Otherwise the default
-set is preferred for member files; a unique matching set is selected for another
-member, and multiple matches require explicit selection through
-`initializationOptions.sourceSet` for the workspace-root manifest. Nested projects
-use their own defaults and automatic selection. Referenced source-only libraries participate
-transitively. Files outside the selected project sources are analyzed
-independently.
+For each document, the server selects the nearest ancestor `neri.json`, stopping
+at the workspace root for documents inside it. Nested manifests are independent
+project boundaries. Within a v2 manifest, a source is analyzed in the unit that
+owns it. This is important for shared code: opening a library source selects the
+library itself, not an arbitrary executable that references it. A file outside
+all declared units is analyzed independently.
 
-Open documents supply their current in-memory contents, including unsaved edits;
-other members are read from disk. Changes and document close reanalyze open
-documents. Closing an unsaved dependency restores its disk contents for dependent
-analysis. A `workspace/didChangeWatchedFiles` notification triggers reanalysis
-and reloads automatic membership, source sets and references from disk. Clients
-must deliver create, change and delete notifications for closed `.hk` files,
-source directories, and every relevant `neri.json`; this lets new or removed
-matching files and nested-project boundaries take effect without restarting the
-server.
+The selected unit is analyzed with its transitive library references and the
+standard library. Open documents supply their current in-memory contents,
+including dependencies; other members are read from disk. Editing an open
+dependency reanalyzes its open consumers, and closing it restores the disk
+contents for subsequent analysis.
 
-Project diagnostics use per-file ranges and document versions. Hover, definition
-and references retain their documented symbol coverage; multi-file compilation
-does not imply navigation for all symbol kinds. Missing sources or invalid
-configuration produce project diagnostics and invalidate semantic models.
+A `workspace/didChangeWatchedFiles` notification reloads manifests and automatic
+directory membership. Clients must report create, change and delete events for
+closed `.hk` files, source directories, and relevant `neri.json` files. This
+makes newly created or removed sources, exclusions, references, and nested
+project boundaries take effect without restarting the server.
 
-Source membership is not a package manager or editor indexing root. Each project
-closure is reanalyzed as a unit; dependency-graph caching and background
-cancellation are unsupported.
+Compilation units are a source-graph description, not a package manager or a
+general editor indexing root. The compiler currently flattens the selected
+unit's reference closure into one analysis. It does not provide dependency
+artifacts, version resolution, fetching, incremental graph caching, or
+background cancellation.

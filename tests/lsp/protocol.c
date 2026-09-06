@@ -469,36 +469,6 @@ static void project_contract(const char *compiler, const char *root) {
   finish_server();
 }
 
-static void glob_project_cli_contract(const char *compiler, const char *root) {
-  char manifest[4096];
-  snprintf(manifest, sizeof(manifest), "%s/tests/lsp/glob-project/neri.json", root);
-  pid_t child = fork();
-  require(child >= 0, "glob CLI process");
-  if (child == 0) {
-    execl(compiler, compiler, "check", "--project", manifest, (char *)NULL);
-    _exit(127);
-  }
-  int status = 0;
-  require(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0,
-          "CLI expands recursive source globs and excludes generated or unrelated mains");
-  char target[4096];
-  snprintf(symlink_project_source, sizeof(symlink_project_source), "%s/tests/lsp/glob-project/src/linked", root);
-  snprintf(target, sizeof(target), "%s/tests/lsp/project", root);
-  require(unlink(symlink_project_source) == 0 || errno == ENOENT, "reset project glob symlink");
-  require(symlink(target, symlink_project_source) == 0, "create escaping project glob symlink");
-  snprintf(manifest, sizeof(manifest), "%s/tests/lsp/glob-project/invalid-symlink.json", root);
-  child = fork();
-  require(child >= 0, "symlink glob CLI process");
-  if (child == 0) {
-    execl(compiler, compiler, "check", "--project", manifest, (char *)NULL);
-    _exit(127);
-  }
-  require(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 2,
-          "CLI rejects a source glob whose literal prefix is a symlink");
-  require(unlink(symlink_project_source) == 0, "remove project glob symlink");
-  symlink_project_source[0] = 0;
-}
-
 static int project_cli_status(const char *compiler, const char *command, const char *manifest) {
   pid_t child = fork();
   require(child >= 0, "project CLI process");
@@ -515,14 +485,24 @@ static void automatic_project_cli_contract(const char *compiler, const char *roo
   char manifest[8192];
   snprintf(manifest, sizeof(manifest), "%s/tests/lsp/auto-library/neri.json", root);
   require(project_cli_status(compiler, "check", manifest) == 0,
-          "a project without main is a library for check");
-  require(project_cli_status(compiler, "build", manifest) == 1,
-          "building a library as an executable requires an entry point");
+          "a library unit without main is valid for check");
+  require(project_cli_status(compiler, "build", manifest) == 2,
+          "building a library unit requires explicit object emission");
 
   snprintf(manifest, sizeof(manifest), "%s/tests/lsp/auto-project/neri.json", root);
   require(project_cli_status(compiler, "check", manifest) == 0,
-          "automatic discovery excludes nested projects and deduplicates diamond references");
+          "directory discovery excludes generated and nested projects and deduplicates references");
   char target[4096];
+  snprintf(symlink_project_source, sizeof(symlink_project_source),
+           "%s/tests/lsp/auto-project/linked", root);
+  snprintf(target, sizeof(target), "%s/tests/lsp/project", root);
+  require(unlink(symlink_project_source) == 0 || errno == ENOENT, "reset discovered source symlink");
+  require(symlink(target, symlink_project_source) == 0, "create discovered source symlink");
+  require(project_cli_status(compiler, "check", manifest) == 0,
+          "directory discovery does not follow source symlinks");
+  require(unlink(symlink_project_source) == 0, "remove discovered source symlink");
+  symlink_project_source[0] = 0;
+
   snprintf(symlink_project_source, sizeof(symlink_project_source), "%s/tests/lsp/auto-project-alias", root);
   snprintf(target, sizeof(target), "%s/tests/lsp/auto-project", root);
   require(unlink(symlink_project_source) == 0 || errno == ENOENT, "reset project manifest alias");
@@ -542,50 +522,12 @@ static void automatic_project_cli_contract(const char *compiler, const char *roo
           "project reference cycles are configuration errors");
 }
 
-static void glob_project_contract(const char *compiler, const char *root) {
-  start_server(compiler, root);
-  char path[4096], message[16384];
-  snprintf(path, sizeof(path), "%s/tests/lsp/glob-project", root);
-  char *uri = file_uri(path);
-  snprintf(message, sizeof(message), "{\"jsonrpc\":\"2.0\",\"method\":\"initialize\",\"id\":1,"
-    "\"params\":{\"rootUri\":\"%s\",\"capabilities\":{}}}", uri);
-  free(uri);
-  send_message(message, 0);
-  free(receive());
-  snprintf(path, sizeof(path), "%s/tests/lsp/glob-project/cli/main.hk", root);
-  char *main_uri = file_uri(path);
-  snprintf(dynamic_project_source, sizeof(dynamic_project_source), "%s/tests/lsp/glob-project/src/extensions/later.hk", root);
-  require(unlink(dynamic_project_source) == 0 || errno == ENOENT, "reset dynamic glob source");
-  open_document(main_uri, "use sample\ndef main(): Void\n  let value = later()\nend\n", 0);
-  char *reply = receive();
-  require(*spaces(diagnostics(reply) + 1) == '{', "glob source is absent before its file is created");
-  free(reply);
-  FILE *file = fopen(dynamic_project_source, "wb");
-  require(file != NULL, "create dynamic glob source");
-  require(fputs("namespace sample\n\ndef later(): Int\n  return 7\nend\n", file) >= 0 && fclose(file) == 0,
-          "write dynamic glob source");
-  char *later_uri = file_uri(dynamic_project_source);
-  snprintf(message, sizeof(message), "{\"jsonrpc\":\"2.0\",\"method\":\"workspace/didChangeWatchedFiles\","
-    "\"params\":{\"changes\":[{\"uri\":\"%s\",\"type\":1}]}}", later_uri);
-  send_message(message, 0);
-  empty_diagnostics(1);
-  require(unlink(dynamic_project_source) == 0, "remove dynamic glob source");
-  snprintf(message, sizeof(message), "{\"jsonrpc\":\"2.0\",\"method\":\"workspace/didChangeWatchedFiles\","
-    "\"params\":{\"changes\":[{\"uri\":\"%s\",\"type\":3}]}}", later_uri);
-  free(later_uri);
-  send_message(message, 0);
-  reply = receive();
-  require(*spaces(diagnostics(reply) + 1) == '{', "glob membership is reread after file deletion");
-  free(reply);
-  free(main_uri);
-  finish_server();
-}
-
 #include "symbols.inc"
 #include "signature.inc"
 #include "completion.inc"
 #include "documentation.inc"
 #include "auto_project.inc"
+#include "units.inc"
 
 static void source_name_cli_contract(const char *compiler, const char *root) {
   char manifest[4096];
@@ -625,8 +567,8 @@ int main(int argc, char **argv) {
   identify_isolated_compiler(argv[1]);
   prepare_documented_stdlib(argv[2]);
   source_name_cli_contract(argv[1], argv[2]);
-  glob_project_cli_contract(argv[1], argv[2]);
   automatic_project_cli_contract(argv[1], argv[2]);
+  unit_cli_contract(argv[1], argv[2]);
   start_server(argv[1], argv[2]);
 
   send_message("{\"jsonrpc\":\"2.0\",\"method\":\"unknown\",\"id\":0}", 0);
@@ -891,7 +833,7 @@ int main(int argc, char **argv) {
   documentation_disabled_contract(argv[1], argv[2]);
   automatic_project_contract(argv[1], argv[2]);
   project_contract(argv[1], argv[2]);
-  glob_project_contract(argv[1], argv[2]);
+  unit_project_contract(argv[1], argv[2]);
   puts("LSP lifecycle, synchronization, diagnostics, navigation, highlights, symbols, completion and signature help passed.");
   return 0;
 }

@@ -47,7 +47,7 @@ that its capability is implemented; servers advertise only supported features.
 - Real editor validation covers errors appearing and disappearing on unsaved
   edits, incomplete syntax, Unicode and process recovery. Server protocol tests,
   client build success and syntax coloring do not substitute for that validation.
-- Run, Build and Check invoke the configured CLI with consistent source sets and
+- Run, Build and Check invoke the configured CLI with consistent compilation units and
   working directories. Paths and arguments containing spaces, failures and stop
   behavior are covered by execution tests.
 - Reproducible bootstrap and package validation cover the compiler, libraries

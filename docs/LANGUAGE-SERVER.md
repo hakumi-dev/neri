@@ -58,7 +58,7 @@ project owns the JetBrains client, grammar, configuration UI and Run/Build/Check
 - `.hk` basenames containing whitespace produce `NR_FILE_NAME`; directories
   containing spaces remain supported. See [source naming rules](PROJECTS.md).
 - Class construction and direct function calls support definition and references
-  across source-set members, including closed files. Hover displays the resolved
+  across unit members, including closed files. Hover displays the resolved
   class name or callable signature. Source-map locations preserve each file's
   URI and local UTF-16 ranges. Generic instantiations are not covered by this
   contract.
@@ -67,21 +67,23 @@ project owns the JetBrains client, grammar, configuration UI and Run/Build/Check
   the compiler's receiver-adjusted type. Callback parameters, callback-local
   declarations and repeated captures retain their original source identities.
 
-With a [compilation project](PROJECTS.md), each document is analyzed alongside
-its automatic or selected source-set members, transitive source-only references,
-and standard libraries. A manifest without `sourceSets` discovers `.hk` files
-recursively while excluding generated directories, symlinks and nested projects.
-References are explicit relative manifest directories; `use` and `namespace` do
-not infer project dependencies. Open dependencies use their unsaved contents.
-Without a matching project source set, the document is an independent compilation
-unit and references to other user files can be unresolved. The server recomputes
-membership and references after `workspace/didChangeWatchedFiles`; it does not
-combine unrelated programs and negative fixtures into one compilation unit.
-Library roots without `main` remain valid for analysis; executable commands
-require the root project to define its own `main`. See [project sources and
-references](PROJECTS.md).
+With a version-2 [compilation project](PROJECTS.md), each document is analyzed in
+the unit that owns it, alongside that unit's transitive library references and
+the standard library. Opening a library source selects the library's own context,
+not an arbitrary executable consumer. Source folders and namespaces are
+independent: references are explicit, and `use` or `namespace` never infer one.
+Open dependencies use their unsaved contents and invalidate open consumers.
 
-Analysis is synchronous and ordered. Diagnostic versions let clients discard
+Directory sources are rediscovered after `workspace/didChangeWatchedFiles`, so
+reported file creation and deletion updates membership while exclusions,
+symlinks, generated directories, and nested manifests remain outside it. A file
+without an owning unit is analyzed independently. Libraries reject `main`, and
+executable units require exactly one entry point for language-server analysis.
+See [project sources and references](PROJECTS.md).
+
+Analysis is synchronous and ordered. The selected unit's source graph is
+flattened for analysis; units are not packages and no dependency artifacts are
+produced. Diagnostic versions let clients discard
 obsolete results, but there is no background cancellation, debounce,
 incremental semantic cache or incremental analysis yet. The bound model for
 each analyzed document is retained for semantic queries. A large analysis can

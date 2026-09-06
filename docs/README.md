@@ -20,7 +20,7 @@ packages include the language reference for the packaged compiler.
 - [Testing](../tests/README.md) — language contracts and native validation.
 - [Architecture](ARCHITECTURE.md) — compiler, native components and build driver.
 - [Language server](LANGUAGE-SERVER.md) — editor-independent live diagnostics and current limits.
-- [Compilation projects](PROJECTS.md) — automatic source discovery, project references and explicit source sets.
+- [Compilation projects](PROJECTS.md) — compilation units, automatic source discovery and explicit library references.
 - [Bootstrapping](BOOTSTRAP.md) — trusted seed and reproducible compiler generations.
 - [Packaging](PACKAGING.md) — distribution contents, integrity and installation.
 - [Runtime and IR](ABI.md) — layouts, memory management and native boundaries.
