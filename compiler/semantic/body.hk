@@ -568,6 +568,12 @@ class BootstrapBodyBinder
       return this.addBoundSymbol("Assignment", local.typeName, name, local.identity, targetNode, appendChild(emptyInts(), value.boundNode))
     end
     let target = this.bindExpression(targetNode, "")
+    let boundTarget = this.model().bound
+    if boundTarget.kindAt(target.boundNode) == "Member" || boundTarget.kindAt(target.boundNode) == "Index"
+      if semanticIsReadonly(boundTarget.typeAt(boundTarget.childAt(target.boundNode, 0)))
+        this.report("NR240", targetNode, "Cannot write through a readonly view.")
+      end
+    end
     if (this.model().bound.kindAt(target.boundNode) == "NativeField" || this.model().bound.kindAt(target.boundNode) == "NativeIndex") && !nativeFieldWritable(this, target.boundNode)
       this.report("NR141", targetNode, "Native field assignment requires mutable storage.")
     end
@@ -692,6 +698,9 @@ class BootstrapBodyBinder
   def bindBorrow(node: Int, returnType: String): Int
     let ownerNode = this.syntax().childAt(node, 0)
     let value = this.bindExpression(ownerNode, "")
+    if semanticIsReadonly(value.typeName)
+      this.report("NR240", ownerNode, "A readonly view cannot expose mutable borrowed storage.")
+    end
     let pointerName = semanticField(this.syntax().dataAt(node), 0)
     var pointerType = "Error"
     if semanticIsArray(value.typeName)
@@ -821,7 +830,8 @@ class BootstrapBodyBinder
       this.report("NR171", node, "Keyword 'this' is not available inside a static method.")
       return new BoundValue("Error", this.addBound("This", "Error", "", node, emptyInts()))
     end
-    return new BoundValue(classSymbol.fullName, this.addBound("This", classSymbol.fullName, "", node, emptyInts()))
+    let typeName = callable != null && callable.isReadonly ? semanticReadView(classSymbol.fullName) : classSymbol.fullName
+    return new BoundValue(typeName, this.addBound("This", typeName, "", node, emptyInts()))
   end
 
   def bindUnary(node: Int): BoundValue
@@ -1039,7 +1049,7 @@ class BootstrapBodyBinder
     this.owner.validatePointerType(typeNode, this.unsafeDepth > 0)
     let numeric = (semanticIsNumeric(value.typeName) && semanticIsNumeric(target)) || ((value.typeName == "Int" || value.typeName == "Byte" || value.typeName == "Float") && target == "String")
     let pointer = semanticIsPointer(value.typeName) && semanticIsPointer(target)
-    if value.typeName != target && !numeric && !pointer
+    if (semanticIsReadonly(value.typeName) && !semanticIsReadonly(target)) || (value.typeName != target && !numeric && !pointer)
       this.report("NR125", typeNode, "Invalid cast from '" + value.typeName + "' to '" + target + "'.")
     end
     return new BoundValue(target, this.addBound("Cast", target, "", node, appendChild(emptyInts(), value.boundNode)))
@@ -1169,14 +1179,18 @@ class BootstrapBodyBinder
     if nativeValueType(objectValue.typeName) || (semanticIsPointer(objectValue.typeName) && nativeValueType(semanticInnerType(objectValue.typeName)))
       return bindNativeField(this, node, objectValue, name)
     end
-    let classSymbol = this.model().findClass(objectValue.typeName)
+    let classSymbol = this.model().findClass(semanticMutableType(objectValue.typeName))
     if classSymbol != null
       let field = this.findField(classSymbol, name)
       if field != null
         if !this.memberAccessible(field.owner, field.access)
           this.report("NR153", node, "Cannot access " + field.access + " member '" + name + "' of type '" + field.owner + "'.")
         end
-        return new BoundValue(field.typeName, this.addBound("Member", field.typeName, field.owner + "." + name, node, appendChild(emptyInts(), objectValue.boundNode)))
+        if semanticIsReadonly(objectValue.typeName) && semanticContainsPointer(field.typeName)
+          this.report("NR240", node, "A readonly view cannot expose a raw pointer field.")
+        end
+        let typeName = semanticViewMember(objectValue.typeName, field.typeName)
+        return new BoundValue(typeName, this.addBound("Member", typeName, field.owner + "." + name, node, appendChild(emptyInts(), objectValue.boundNode)))
       end
     end
     this.report("NR131", node, "Type '" + objectValue.typeName + "' does not have a member '" + name + "'.")
@@ -1472,6 +1486,10 @@ class BootstrapBodyBinder
         return new BoundValue("Error", this.addBound("Call", "Error", memberName, calleeNode, emptyInts()))
       end
       this.validateCallCount(baseClass.name + "." + memberName, calleeNode, actual, method)
+      let enclosingMethod = this.owner.currentCallable
+      if enclosingMethod != null && enclosingMethod.isReadonly && !method.isReadonly
+        this.report("NR240", calleeNode, "A readonly receiver requires a readonly method.")
+      end
       let arguments = this.bindArguments(node, 1, method.parameterCount, "", baseClass.name + "." + memberName, method)
       var children = appendChild(emptyInts(), this.addBound("This", currentClass.fullName, "", objectNode, emptyInts()))
       for argument in arguments
@@ -1525,7 +1543,7 @@ class BootstrapBodyBinder
       this.report("NR169", objectNode, "Optional value of type '" + instance.typeName + "' must be narrowed before access.")
       return new BoundValue("Error", this.addBound("Call", "Error", memberName, calleeNode, appendChild(emptyInts(), instance.boundNode)))
     end
-    let classSymbol = this.model().findClass(instance.typeName)
+    let classSymbol = this.model().findClass(semanticMutableType(instance.typeName))
     if classSymbol == null
       this.report("NR104", calleeNode, "Unsupported call target.")
       return new BoundValue("Error", this.addBound("Call", "Error", memberName, calleeNode, appendChild(emptyInts(), instance.boundNode)))
@@ -1534,7 +1552,8 @@ class BootstrapBodyBinder
     if method == null
       let field = this.findField(classSymbol, memberName)
       if field != null && this.memberAccessible(field.owner, field.access)
-        let value = new BoundValue(field.typeName, this.addBound("Member", field.typeName, field.owner + "." + field.name, calleeNode, [instance.boundNode]))
+        let typeName = semanticViewMember(instance.typeName, field.typeName)
+        let value = new BoundValue(typeName, this.addBound("Member", typeName, field.owner + "." + field.name, calleeNode, [instance.boundNode]))
         return bindFunctionCall(this, node, value)
       end
       this.report("NR131", calleeNode, "Type '" + classSymbol.fullName + "' does not have a member '" + memberName + "'.")
@@ -1542,6 +1561,9 @@ class BootstrapBodyBinder
     end
     if method.isStatic
       this.report("NR181", calleeNode, "Static method '" + memberName + "' must be called through its class.")
+    end
+    if semanticIsReadonly(instance.typeName) && !method.isReadonly
+      this.report("NR240", calleeNode, "A readonly receiver requires a readonly method.")
     end
     if !this.memberAccessible(method.className, method.access)
       this.report("NR153", calleeNode, "Cannot access " + method.access + " member '" + memberName + "' of type '" + method.className + "'.")

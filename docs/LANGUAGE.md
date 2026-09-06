@@ -68,6 +68,54 @@ Only `T?` accepts `null`. Proven checks such as `x != null` refine optional loca
 on the corresponding control-flow path. Access requires that refinement.
 `T?[]` and `T[]?` differ. `Void?` and repeated optional suffixes are invalid.
 
+### Readonly views
+
+`readonly T` provides a transitive read-only view of a managed object or array.
+The view refers to the original storage: creating it does not copy or freeze the
+object. Other mutable aliases still observe and can modify that storage.
+
+```neri
+class Counter
+  public value: Int = 0
+
+  @readonly
+  public def read(): Int
+    return this.value
+  end
+end
+
+def total(values: readonly Counter[]): Int
+  var result = 0
+  for value in values
+    result = result + value.read()
+  end
+  return result
+end
+```
+
+Fields, array elements, iteration values and narrowed optionals preserve the
+view on references reached through them. Scalar values and immutable strings
+retain their ordinary types. Mutable references may be passed to readonly
+parameters; readonly references cannot be passed or returned as mutable types,
+cast to mutable types, or exposed as writable borrowed storage. Readonly arrays
+retain their element-type identity rather than providing array covariance.
+
+`readonly T[]` restricts both the array and references reached through its
+elements. `(readonly T)[]` is a mutable array of readonly references: slots can
+be replaced, while objects accessed through those slots remain readonly.
+
+`@readonly` applies to an instance method and makes its `this` reference readonly.
+Overrides preserve that receiver contract. Such a method may return a fresh
+mutable object, but an object reached through `this` requires a readonly return
+type. Calls through readonly receivers require readonly methods; ordinary
+callbacks do not carry that receiver contract. A readonly method is not a pure
+function: its other parameters and external effects keep their declared contracts.
+
+Views participate in generic specialization and inference. They are checked by
+the frontend and use the ordinary runtime representation. Native pointer fields
+and writable native borrows are unavailable through a readonly view. A readonly
+view alone is not proof of exclusive access or safe cross-thread sharing.
+
 ## Functions, modules and classes
 
 Functions declare parameter and return types. Trailing default arguments,

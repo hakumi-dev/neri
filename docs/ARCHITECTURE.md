@@ -29,6 +29,16 @@ property does not propagate to callers or other implementations of its slot.
 
 `compiler/ir/main.hk` is the executable entry point. `frontend/main.hk` and `semantic/main.hk` are standalone development entry points and are excluded from the compiler source set.
 
+`semantic/readonly.hk` defines transitive readonly views. Binding preserves the
+qualifier on reachable references and checks receiver contracts, assignments,
+calls, returns and borrowed storage. IR lowering erases view qualifiers without
+copying objects or adding runtime wrappers. No LLVM aliasing or purity property
+is inferred from a readonly view: mutable aliases may exist elsewhere.
+The distinction between read-only access and globally immutable or exclusive
+references follows the separation studied by
+[Gordon et al. (2012)](https://www.microsoft.com/en-us/research/publication/uniqueness-and-reference-immutability-for-safe-parallelism/).
+Neri implements readonly views, not that paper's full isolation type system.
+
 ### Effect summaries
 
 `compiler/ir/effects.hk` computes transitive summaries over the lowered call graph,
