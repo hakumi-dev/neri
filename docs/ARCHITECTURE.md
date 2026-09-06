@@ -62,6 +62,18 @@ absent from serialized IR. Read/write summaries do not distinguish local mutable
 state from shared state and are not a proof that a closure is safe to run on
 another thread.
 
+`compiler/ir/parallel.hk` checks the `parallel fn` effect contract using the same
+worklist solver. Its compiler-local graph preserves receiver types before IR
+upcasts, including inherited implementations and applicable overrides. Calls
+through weaker callback types and unapproved runtime services carry a forbidden
+effect marker. Recursive and indirect calls propagate that marker to callback
+implementations. This analysis runs only when parallel callback types occur.
+
+Serialized IR retains the conservative union of every virtual-slot implementation
+required by the native verifier. The callback analysis graph is discarded after
+checking. Capture access remains a semantic type rule; mutable argument ownership
+and task lifetime are separate contracts.
+
 ## Native boundary
 
 `native/codegen/` is a narrow C++ LLVM consumer. It accepts only verified Neri IR and emits LLVM IR, assembly, or native objects.
@@ -146,7 +158,8 @@ distinguishes measured execution costs from theoretical work/span bounds.
 
 The native caller is responsible for capture safety and synchronization.
 The language's `shared fn` contract restricts access through captured references;
-its callbacks execute sequentially in safe Neri. The versioned ABI reserves the
+`parallel fn` also checks transitive call effects. Callbacks execute sequentially
+in safe Neri. The versioned ABI reserves the
 multiple-mutator feature bit and reports it as unsupported.
 [Disentanglement in Nested-Parallel Programs (2020)](https://www.cs.cmu.edu/~swestric/20/popl-disentangled.pdf)
 distinguishes this memory separation property from race freedom: separation alone

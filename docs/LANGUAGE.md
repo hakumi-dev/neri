@@ -317,6 +317,31 @@ Sequential aliases may still modify the captured objects, and callbacks may
 perform I/O. Shared callbacks alone do not freeze an object graph, establish a
 task lifetime or authorize concurrent native-service access.
 
+### Parallel callback contracts
+
+`parallel fn(Parameters): Result` combines shared capture access with checked
+call effects. Managed allocation, local mutation, checked arithmetic and calls
+to other verified functions are permitted. I/O, host services, C ABI calls,
+native allocation and `unsafe` operations are rejected, including through
+transitive calls. Callback invocations require a `parallel fn` type. The `math`
+builtins and `test` assertions satisfy the runtime-call contract.
+
+```neri
+def apply(value: Int, callback: parallel fn(Int): Int): Int
+  return callback(value)
+end
+```
+
+The expected type supplies the contract to closures, trailing `do` blocks and
+named function values. A parallel callback can widen to `shared fn` or `fn` with
+the same signature. Assignment and casts preserve these capability boundaries;
+shared and ordinary callback values cannot be upgraded to `parallel fn`.
+
+Calls use the ordinary callback calling convention and execute sequentially in
+safe Neri. This type checks captures and effects; it neither schedules tasks nor
+establishes exclusive ownership of explicit mutable arguments. Sequential aliases
+retain access to the captured objects.
+
 ## Unsafe and memory boundary
 
 ### Explicit-width numbers

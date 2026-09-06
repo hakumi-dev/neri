@@ -47,6 +47,7 @@ class IrLowerer
   public adapterTargets: StringBuffer = new StringBuffer()
   public adapterArities: IntBuffer = new IntBuffer()
   public adapterVirtual: IntBuffer = new IntBuffer()
+  public checkParallel: Bool = false
 
   def init(semantic: SemanticModel, syntax: SyntaxArena, source: String, moduleName: String): Void
     this.semantic = semantic
@@ -74,6 +75,11 @@ class IrLowerer
   end
 
   def lower(): IrModule
+    var signature = this.semantic.firstClass
+    while signature != null
+      this.checkParallel = true if signature.isParallelFunction
+      signature = signature.nextClass
+    end
     irLowerNativeRecords(this)
     var typeIndex = 0
     while typeIndex < this.bound.count()
@@ -98,6 +104,10 @@ class IrLowerer
         this.lowerDefaultAdapter(target, this.adapterArities.get(adapter), this.adapterVirtual.get(adapter) == 1)
       end
       adapter = adapter + 1
+    end
+    if this.checkParallel
+      irPropagateEffects(this.module, true)
+      irCheckParallelCallbacks(this)
     end
     irPropagateEffects(this.module)
     return this.module
@@ -229,6 +239,8 @@ class IrLowerer
       end
     end
     let function = new IrFunction(irSymbol(this.module.id, symbolKind, callable.fullName), irType(callable.returnType), functionKind, callable.isUnsafe, this.location(callable.boundNode))
+    function.parallelCallees = new StringBuffer() if this.checkParallel
+    function.parallelUnsafe = callable.isUnsafe
     if callable.className != ""
       function.declaringClass = irSymbol(this.module.id, 1, callable.className)
       if !callable.isStatic && callable.name != "init"
@@ -377,10 +389,10 @@ class IrLowerer
           if callable.baseArguments.size < baseConstructor.parameterCount
             let adapterName = this.requestDefaultAdapter(baseConstructor, callable.baseArguments.size, false)
             context.emitSymbol(28, "void", operands, irSymbol(this.module.id, 4, adapterName), location)
-            context.function.callees.add(adapterName)
+            context.function.addCallee(adapterName)
           else
             context.emitSymbol(29, "void", operands, irSymbol(this.module.id, 3, baseConstructor.fullName), location)
-            context.function.callees.add(baseConstructor.fullName)
+            context.function.addCallee(baseConstructor.fullName)
           end
         else
           this.lowerConstructionDefaults(context, baseClass, receiver, location)
@@ -932,7 +944,7 @@ class IrLowerer
       callTarget = this.requestDefaultAdapter(callable, operands.Length, false)
       callSymbolKind = 4
     end
-    context.function.callees.add(callTarget)
+    context.function.addCallee(callTarget)
     return context.emitSymbol(28, irType(this.bound.typeAt(node)), operands, irSymbol(this.module.id, callSymbolKind, callTarget), this.location(node))
   end
 
@@ -941,6 +953,11 @@ class IrLowerer
     let callable = this.findCallable(this.bound.dataAt(node))
     let receiverNode = this.bound.childAt(node, 0)
     var receiver = this.lowerExpression(context, receiverNode, "")
+    let dispatchType = receiver.typeName
+    let receiverClass = this.semantic.findClass(irTypeInner(dispatchType))
+    if this.checkParallel && receiverClass != null && receiverClass.isFunctionType && !receiverClass.isParallelFunction
+      context.function.parallelUnsafe = true
+    end
     let isDirect = this.bound.valueAt(node) == "direct"
     if callable != null && receiver.typeName != "class|" + callable.className
       let upcastOperands: Int[] = [receiver.id]
@@ -970,7 +987,7 @@ class IrLowerer
     end
     if callable != null && operands.Length - 1 < callable.parameterCount
       let adapterName = this.requestDefaultAdapter(callable, operands.Length - 1, opcode == 30)
-      context.function.callees.add(adapterName)
+      context.function.addCallee(adapterName)
       return context.emitSymbol(28, irType(this.bound.typeAt(node)), operands, irSymbol(this.module.id, 4, adapterName), this.location(node))
     end
     if callable != null && !callable.isStatic && callable.name != "init"
@@ -981,9 +998,9 @@ class IrLowerer
     end
     if opcode == 30
       operands = this.virtualOperands(context, operands, receiver.typeName, targetName)
-      this.addVirtualCallees(context, targetName)
+      this.addVirtualCallees(context, targetName, dispatchType)
     else
-      context.function.callees.add(this.bound.dataAt(node))
+      context.function.addCallee(this.bound.dataAt(node))
     end
     return context.emitSymbol(opcode, irType(this.bound.typeAt(node)), operands, irSymbol(this.module.id, 3, targetName), this.location(node))
   end
@@ -1038,10 +1055,10 @@ class IrLowerer
       if arguments.Length < constructor.parameterCount
         let adapterName = this.requestDefaultAdapter(constructor, arguments.Length, false)
         context.emitSymbol(28, "void", operands, irSymbol(this.module.id, 4, adapterName), this.location(node))
-        context.function.callees.add(adapterName)
+        context.function.addCallee(adapterName)
       else
         context.emitSymbol(29, "void", operands, irSymbol(this.module.id, 3, constructor.fullName), this.location(node))
-        context.function.callees.add(constructor.fullName)
+        context.function.addCallee(constructor.fullName)
       end
     else
       let owner = this.semantic.findClass(className)
@@ -1484,6 +1501,9 @@ class IrLowerer
       this.module.addImport(declaration)
     end
     context.function.localEffects = irEffectUnion(context.function.localEffects, contract.effects)
+    if this.checkParallel && effectiveTarget != "math.abs" && effectiveTarget != "math.max" && effectiveTarget != "math.min" && effectiveTarget != "math.pow" && effectiveTarget != "test.assert" && effectiveTarget != "test.assertTrue" && effectiveTarget != "test.assertFalse"
+      context.function.parallelUnsafe = true
+    end
     return context.emitSymbol(31, resultType, operands, importSymbol, this.location(node))
   end
 
@@ -1554,13 +1574,17 @@ class IrLowerer
     return null
   end
 
-  def addVirtualCallees(context: IrFunctionContext, slotName: String): Void
+  def addVirtualCallees(context: IrFunctionContext, slotName: String, receiverType: String): Void
     var classSymbol = this.semantic.firstClass
     while classSymbol != null
       var method = classSymbol.firstMethod
       while method != null
         if !method.isStatic && method.name != "init" && this.dispatchSlot(classSymbol, method) == slotName
           context.function.callees.add(method.fullName)
+          let precise = context.function.parallelCallees
+          if precise != null && irParallelDispatchTarget(this, irTypeInner(receiverType), classSymbol, method, slotName)
+            precise.add(method.fullName)
+          end
         end
         method = method.nextCallable
       end
@@ -1602,6 +1626,7 @@ class IrLowerer
   def lowerDefaultAdapter(target: SemanticCallable, arity: Int, virtualDispatch: Bool): Void
     let name = target.fullName + "$default$arity" + (arity as String) + (virtualDispatch ? "$virtual" : "")
     let function = new IrFunction(irSymbol(this.module.id, 4, name), irType(target.returnType), 5, false, this.location(target.boundNode))
+    function.parallelCallees = new StringBuffer() if this.checkParallel
     let entry = function.createBlock()
     let context = new IrFunctionContext(function, entry)
     var operands: Int[] = []
@@ -1640,9 +1665,9 @@ class IrLowerer
       end
       operands = this.virtualOperands(context, operands, "class|" + target.className, callTarget)
       opcode = 30
-      this.addVirtualCallees(context, callTarget)
+      this.addVirtualCallees(context, callTarget, "class|" + target.className)
     else
-      function.callees.add(target.fullName)
+      function.addCallee(target.fullName)
     end
     let symbolKind = target.className != "" ? 3 : 4
     let result = context.emitSymbol(opcode, irType(target.returnType), operands, irSymbol(this.module.id, symbolKind, callTarget), this.location(target.boundNode))
