@@ -243,7 +243,43 @@ and pointers. Their raw memory operations follow the unsafe rules below.
 String formatting accepts `Int`, `Byte` and `Float`; explicitly convert a new
 numeric type to an appropriate formatting type when its range permits it.
 
-### Raw memory
+### Native layout declarations
+
+`struct` declares fields in source order with natural C alignment and tail
+padding. `union` places every field at offset zero and uses the largest member
+size, rounded to the largest member alignment. These declarations are distinct
+from managed classes. Fields may contain numeric types, Bool, native pointers,
+other native layouts, and fixed arrays written `T[count]`. Counts are positive
+integer literals. Managed references and recursive inline layouts are rejected;
+recursion through pointers is valid.
+
+```ruby
+struct Point
+  x: Float32
+  y: Float32
+end
+
+union EventStorage
+  point: Point
+  bytes: Byte[128]
+end
+
+def main(): Void
+  let pointSize = native.sizeOf<Point>()
+  let alignment = native.alignOf<EventStorage>()
+  let yOffset = native.offsetOf<Point>("y")
+end
+```
+
+The current interface to these declarations consists of compile-time layout
+queries. `sizeOf` and `alignOf` take one type argument and no value arguments;
+`offsetOf` additionally takes a literal field name. Results are byte counts of
+type `Int`, and the queries are safe operations. Layouts target the supported
+64-bit native platforms, are limited to one GiB and 128 nested types, and use
+four-byte alignment for 32-bit numbers and eight-byte alignment for 64-bit
+numbers and pointers.
+
+### Raw memory operations
 
 Raw pointer operations require `def unsafe` or an `unsafe ... end` block. `T*`
 is non-null; `T*?` requires a null check before access. Raw pointers do not retain

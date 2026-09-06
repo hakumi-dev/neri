@@ -1,0 +1,306 @@
+class NativeField
+  public name: String = ""
+  public typeName: String = ""
+  public offset: Int = 0
+  public syntaxNode: Int = -1
+  public nextField: NativeField?
+  def init(name: String, typeName: String, node: Int): Void
+    this.name = name
+    this.typeName = typeName
+    this.syntaxNode = node
+  end
+end
+
+class NativeRecord
+  public name: String = ""
+  public namespaceName: String = ""
+  public unionType: Bool = false
+  public syntaxNode: Int = -1
+  public size: Int = 0
+  public alignment: Int = 1
+  public layoutState: Int = 0
+  public firstField: NativeField?
+  public lastField: NativeField?
+  public nextRecord: NativeRecord?
+  def init(name: String, namespaceName: String, unionType: Bool, node: Int): Void
+    this.name = name
+    this.namespaceName = namespaceName
+    this.unionType = unionType
+    this.syntaxNode = node
+  end
+  def addField(field: NativeField): Void
+    let last = this.lastField
+    if last == null
+      this.firstField = field
+    else
+      last.nextField = field
+    end
+    this.lastField = field
+  end
+  def findField(name: String): NativeField?
+    var field = this.firstField
+    while field != null
+      if field.name == name
+        return field
+      end
+      field = field.nextField
+    end
+    return null
+  end
+end
+
+def nativeRecordCount(owner: BootstrapBinder): Int
+  return semanticIntField(owner.syntax.dataAt(owner.root), 3)
+end
+
+def nativeRecordNode(owner: BootstrapBinder, index: Int): Int
+  return owner.syntax.childAt(owner.root, owner.useCount() + owner.classCount() + owner.functionCount() + index)
+end
+
+def registerNativeRecordNames(owner: BootstrapBinder): Void
+  var index = 0
+  while index < nativeRecordCount(owner)
+    let node = nativeRecordNode(owner, index)
+    let namespaceName = semanticField(owner.syntax.dataAt(node), 0)
+    let shortName = semanticField(owner.syntax.dataAt(node), 1)
+    let name = semanticQualifiedName(namespaceName, shortName)
+    var genericCollision = false
+    var templateIndex = 0
+    while templateIndex < owner.model.genericTemplates.size
+      let template = owner.model.genericTemplates.get(templateIndex)
+      if owner.syntax.kindAt(template) == "Class" && genericName(owner, template) == name
+        genericCollision = true
+      end
+      templateIndex = templateIndex + 1
+    end
+    if semanticIsBuiltin(shortName) || owner.model.findClass(name) != null || owner.model.findRecord(name) != null || genericCollision
+      owner.report("NR230", node, "Native type '" + name + "' is already defined or reserved.")
+    else
+      let record = new NativeRecord(name, namespaceName, owner.syntax.kindAt(node) == "Union", node)
+      let last = owner.model.lastRecord
+      if last == null
+        owner.model.firstRecord = record
+      else
+        last.nextRecord = record
+      end
+      owner.model.lastRecord = record
+    end
+    index = index + 1
+  end
+end
+
+def registerNativeRecordFields(owner: BootstrapBinder): Void
+  var record = owner.model.firstRecord
+  while record != null
+    var index = 0
+    while index < owner.syntax.childCountAt(record.syntaxNode)
+      let node = owner.syntax.childAt(record.syntaxNode, index)
+      let name = owner.syntax.dataAt(node)
+      let typeName = owner.resolveTypeNode(owner.syntax.childAt(node, 0), record.namespaceName, name)
+      if record.findField(name) != null
+        owner.report("NR230", node, "Duplicate native field '" + name + "'.")
+      else
+        record.addField(new NativeField(name, typeName, node))
+      end
+      index = index + 1
+    end
+    record = record.nextRecord
+  end
+  record = owner.model.firstRecord
+  while record != null
+    layoutNativeRecord(owner, record, 0)
+    record = record.nextRecord
+  end
+end
+
+def nativeRecordType(typeName: String): Bool
+  return host.stringByteLength(typeName) >= 7 && host.stringSlice(typeName, 0, 7) == "record|"
+end
+
+def nativeFixedArray(typeName: String): Bool
+  return semanticEndsWith(typeName, "]") && !semanticEndsWith(typeName, "[]")
+end
+
+def nativeArrayStart(typeName: String): Int
+  var index = host.stringByteLength(typeName) - 2
+  while index > 0
+    if host.stringByteAt(typeName, index) == (91 as Byte)
+      return index
+    end
+    index = index - 1
+  end
+  return 0
+end
+
+def nativeArrayInner(typeName: String): String
+  return host.stringSlice(typeName, 0, nativeArrayStart(typeName))
+end
+
+def nativeArrayCount(typeName: String): Int
+  let start = nativeArrayStart(typeName)
+  let count = host.parseInt(host.stringSlice(typeName, start + 1, host.stringByteLength(typeName) - start - 2))
+  if count != null
+    return count
+  end
+  return 0
+end
+
+def nativeRecordName(typeName: String): String
+  return host.stringSlice(typeName, 7, host.stringByteLength(typeName) - 7)
+end
+
+def nativeTypeAlignment(owner: BootstrapBinder, typeName: String, node: Int, depth: Int): Int
+  if depth >= 128
+    owner.report("NR232", node, "Native layout exceeds 128 nested types.")
+    return 0
+  end
+  if nativeFixedArray(typeName)
+    if nativeArrayCount(typeName) < 1 || nativeArrayCount(typeName) > 1073741824
+      owner.report("NR231", node, "A fixed native array requires a positive bounded element count.")
+      return 0
+    end
+    return nativeTypeAlignment(owner, nativeArrayInner(typeName), node, depth + 1)
+  end
+  if semanticIsPointer(typeName) || (semanticIsOptional(typeName) && semanticIsPointer(semanticInnerType(typeName)))
+    var element = typeName
+    while semanticIsPointer(element) || semanticIsOptional(element)
+      element = semanticInnerType(element)
+    end
+    if !semanticIsNumeric(element) && element != "Bool" && element != "Void" && !nativeRecordType(element)
+      owner.report("NR231", node, "Native fields cannot point to managed types.")
+      return 0
+    end
+    return 8
+  end
+  if typeName == "Bool" || typeName == "Byte"
+    return 1
+  end
+  if typeName == "Int32" || typeName == "UInt32" || typeName == "Float32"
+    return 4
+  end
+  if typeName == "Int" || typeName == "UInt64" || typeName == "Float"
+    return 8
+  end
+  if nativeRecordType(typeName)
+    let record = owner.model.findRecord(nativeRecordName(typeName))
+    if record != null
+      if layoutNativeRecord(owner, record, depth + 1)
+        return record.alignment
+      end
+      return 0
+    end
+  end
+  owner.report("NR231", node, "Type '" + typeName + "' has no C-compatible inline layout.")
+  return 0
+end
+
+def nativeTypeSize(owner: BootstrapBinder, typeName: String, node: Int, depth: Int): Int
+  let alignment = nativeTypeAlignment(owner, typeName, node, depth)
+  if alignment == 0
+    return 0
+  end
+  if nativeFixedArray(typeName)
+    let count = nativeArrayCount(typeName)
+    let size = nativeTypeSize(owner, nativeArrayInner(typeName), node, depth + 1)
+    if size > 1073741824 / count
+      owner.report("NR231", node, "Native array layout exceeds one GiB.")
+      return 0
+    end
+    return size * count
+  end
+  if nativeRecordType(typeName) && !semanticIsPointer(typeName) && !semanticIsOptional(typeName)
+    let record = owner.model.findRecord(nativeRecordName(typeName))
+    if record != null
+      return record.size
+    end
+  end
+  return alignment
+end
+
+def nativeAlign(value: Int, alignment: Int): Int
+  return ((value + alignment - 1) / alignment) * alignment
+end
+
+def layoutNativeRecord(owner: BootstrapBinder, record: NativeRecord, depth: Int): Bool
+  if record.layoutState == 2
+    return true
+  end
+  if record.layoutState == 3
+    return false
+  end
+  if record.layoutState == 1 || depth >= 128
+    owner.report("NR232", record.syntaxNode, "Native layout is recursive by value or exceeds 128 nested types.")
+    record.layoutState = 3
+    return false
+  end
+  record.layoutState = 1
+  if record.firstField == null
+    owner.report("NR231", record.syntaxNode, "A native struct or union requires at least one field.")
+    record.layoutState = 3
+    return false
+  end
+  var field = record.firstField
+  while field != null
+    let alignment = nativeTypeAlignment(owner, field.typeName, field.syntaxNode, depth)
+    let size = nativeTypeSize(owner, field.typeName, field.syntaxNode, depth)
+    if alignment == 0 || size == 0 || size > 1073741824
+      if size > 0
+        owner.report("NR231", field.syntaxNode, "Native layout exceeds one GiB.")
+      end
+      record.layoutState = 3
+      return false
+    end
+    if alignment > record.alignment
+      record.alignment = alignment
+    end
+    if record.unionType
+      field.offset = 0
+      if size > record.size
+        record.size = size
+      end
+    else
+      field.offset = nativeAlign(record.size, alignment)
+      record.size = field.offset + size
+    end
+    field = field.nextField
+  end
+  record.size = nativeAlign(record.size, record.alignment)
+  if record.size > 1073741824
+    owner.report("NR231", record.syntaxNode, "Native layout exceeds one GiB.")
+    record.layoutState = 3
+    return false
+  end
+  record.layoutState = 2
+  return true
+end
+
+def bindNativeLayout(body: BootstrapBodyBinder, node: Int, operation: String, typeName: String, offset: Int): BoundValue
+  var value = 0
+  let count = body.syntax().childCountAt(node) - offset
+  if typeName == "" || (operation == "offsetOf" ? count != 1 : count != 0)
+    body.report("NR233", node, "Native layout query requires one type argument and offsetOf requires one field-name string.")
+  else if operation == "sizeOf"
+    value = nativeTypeSize(body.owner, typeName, node, 0)
+  else if operation == "alignOf"
+    value = nativeTypeAlignment(body.owner, typeName, node, 0)
+  else
+    let argument = body.syntax().childAt(node, offset)
+    var record: NativeRecord? = null
+    if nativeRecordType(typeName)
+      record = body.model().findRecord(nativeRecordName(typeName))
+    end
+    if record == null || body.syntax().kindAt(argument) != "StringLiteral"
+      body.report("NR233", node, "offsetOf requires a native record and a literal field name.")
+    else
+      let raw = body.syntax().dataAt(argument)
+      let name = host.stringSlice(raw, 1, host.stringByteLength(raw) - 2)
+      let field = record.findField(name)
+      if field == null
+        body.report("NR233", argument, "Unknown native field '" + name + "'.")
+      else
+        value = field.offset
+      end
+    end
+  end
+  return new BoundValue("Int", body.addBoundValue("IntLiteral", "Int", "", "i:" + (value as String), node, []))
+end
