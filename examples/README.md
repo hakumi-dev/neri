@@ -40,3 +40,19 @@ for inference, specialization, and type-argument rules.
 From a source checkout, `scripts/neri.sh` can replace `neri` after
 `scripts/build.sh test`. See the [language reference](../docs/LANGUAGE.md) for the
 current syntax, types, and tooling contracts.
+
+## Native libraries
+
+`sdl-events.hk` declares an SDL3 event union, submits a user event, and reads it
+back without a C adapter. Install SDL3 through your platform's package manager
+and run it with a compiler built from this checkout:
+
+```sh
+scripts/neri.sh examples/sdl-events.hk
+# SDL event: 42
+```
+
+`@library("SDL3")` supplies the link dependency. On macOS, the launcher searches
+`/opt/homebrew/lib`; `NERI_LIBRARY_PATH` selects another absolute library directory.
+No application-specific linker command is needed. The declarations follow the
+[SDL3 event interface](https://wiki.libsdl.org/SDL3/SDL_Event).

@@ -271,13 +271,44 @@ def main(): Void
 end
 ```
 
-The current interface to these declarations consists of compile-time layout
-queries. `sizeOf` and `alignOf` take one type argument and no value arguments;
+`sizeOf` and `alignOf` take one type argument and no value arguments;
 `offsetOf` additionally takes a literal field name. Results are byte counts of
 type `Int`, and the queries are safe operations. Layouts target the supported
 64-bit native platforms, are limited to one GiB and 128 nested types, and use
 four-byte alignment for 32-bit numbers and eight-byte alignment for 64-bit
 numbers and pointers.
+
+Native records are value types: copying a record copies its inline fields.
+`stackalloc Record[count]` and `native.allocZeroed<Record>(count)` provide
+contiguous record storage with the declared alignment. Pointer arithmetic uses
+the complete record size, including tail padding. Inside an unsafe block,
+`pointer.field` reads or writes a field and `&pointer.field` obtains its typed
+address. The same syntax accesses nested records and union members. Fixed
+arrays support checked indexing, including when embedded in another record.
+Field assignment on a local record requires a mutable `var` binding.
+
+```ruby
+struct Sample
+  position: Float32[2]
+  code: UInt32
+end
+
+def main(): Void
+  unsafe
+    let sample = native.allocZeroed<Sample>(1)
+    sample.position[0] = 1.5 as Float32
+    sample.code = 42 as UInt32
+    let codeAddress = &sample.code
+    var copy = *sample
+    copy.code = 7 as UInt32
+    native.free(sample)
+  end
+end
+```
+
+Union members share storage and have no automatic active-member tag. Native
+code must establish which member is valid before reading it. C ABI declarations
+exchange records through typed pointers.
 
 ### Raw memory operations
 

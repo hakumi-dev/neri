@@ -74,6 +74,7 @@ class IrLowerer
   end
 
   def lower(): IrModule
+    irLowerNativeRecords(this)
     var typeIndex = 0
     while typeIndex < this.bound.count()
       this.requireType(irType(this.bound.typeAt(typeIndex)))
@@ -112,6 +113,13 @@ class IrLowerer
       return
     end
     let kind = irTypeKind(typeName)
+    if kind == "record" || kind == "fixed-array"
+      this.module.requireFeature("native-records-v1")
+      if kind == "fixed-array"
+        this.requireType(irFixedArrayInner(typeName))
+      end
+      return
+    end
     if kind == "array" || kind == "optional" || kind == "pointer"
       this.requireType(irTypeInner(typeName))
     end
@@ -396,7 +404,8 @@ class IrLowerer
     let kind = this.bound.kindAt(node)
     if kind == "Let" || kind == "Var"
       let value = this.lowerExpression(context, this.bound.childAt(node, 0), irType(this.bound.typeAt(node)))
-      context.addVariable(this.bound.symbolAt(node), 6, this.bound.dataAt(node), irType(this.bound.typeAt(node)), value.id, kind == "Var")
+      let variable = context.addVariable(this.bound.symbolAt(node), 6, this.bound.dataAt(node), irType(this.bound.typeAt(node)), value.id, kind == "Var")
+      irPrepareNativeVariable(this, context, variable, node)
       context.function.addDebugLocal(new IrDebugLocal(this.bound.dataAt(node), value.id, this.location(node)))
     else if kind == "Assignment"
       this.lowerAssignment(context, node)
@@ -459,7 +468,12 @@ class IrLowerer
     else if this.bound.childCountAt(node) == 2
       let targetNode = this.bound.childAt(node, 0)
       let targetKind = this.bound.kindAt(targetNode)
-      if targetKind == "Unary" && this.bound.dataAt(targetNode) == "*"
+      if targetKind == "NativeField" || targetKind == "NativeIndex"
+        let pointer = irNativeStorageAddress(this, context, targetNode)
+        let value = this.lowerExpression(context, this.bound.childAt(node, 1), irType(this.bound.typeAt(node)))
+        context.emitTyped(45, "void", [this.currentUnsafe(context), pointer.id, value.id], value.typeName, this.location(node))
+        context.function.localEffects = irEffectUnion(context.function.localEffects, 66)
+      else if targetKind == "Unary" && this.bound.dataAt(targetNode) == "*"
         let pointer = this.lowerExpression(context, this.bound.childAt(targetNode, 0), "")
         let value = this.lowerExpression(context, this.bound.childAt(node, 1), irType(this.bound.typeAt(node)))
         let operands: Int[] = [this.currentUnsafe(context), pointer.id, value.id]
@@ -495,7 +509,11 @@ class IrLowerer
     let kind = this.bound.kindAt(node)
     let typeName = irType(this.bound.typeAt(node))
     let location = this.location(node)
-    if kind == "Closure"
+    if kind == "NativeField" || kind == "NativeIndex"
+      let pointer = irNativeStorageAddress(this, context, node)
+      context.function.localEffects = irEffectUnion(context.function.localEffects, 65)
+      return context.emitTyped(44, typeName, [this.currentUnsafe(context), pointer.id], typeName, location)
+    else if kind == "Closure"
       return this.lowerClosure(context, node)
     else if kind == "IntLiteral"
       return context.emitConstant("int", 3, host.stringSlice(this.bound.valueAt(node), 2, host.stringByteLength(this.bound.valueAt(node)) - 2), location)
@@ -817,6 +835,9 @@ class IrLowerer
 
   def lowerAddressOf(context: IrFunctionContext, node: Int): IrValue
     let nameNode = this.bound.childAt(node, 0)
+    if this.bound.kindAt(nameNode) == "NativeField" || this.bound.kindAt(nameNode) == "NativeIndex"
+      return irNativeStorageAddress(this, context, nameNode)
+    end
     let variable = context.findVariableIdentity(this.bound.symbolAt(nameNode), this.bound.dataAt(nameNode))
     if variable == null
       return new IrValue(-1, irType(this.bound.typeAt(node)))
@@ -1111,9 +1132,6 @@ class IrLowerer
 
   def lowerIf(context: IrFunctionContext, node: Int): Void
     let conditionNode = this.bound.childAt(node, 0)
-    if this.isUnsupportedOptionalPointerNullComparison(conditionNode)
-      return
-    end
     let condition = this.lowerExpression(context, conditionNode, "bool")
     let incoming = context.snapshot()
     let mutableValues = context.sortedMutableState()
@@ -1166,25 +1184,6 @@ class IrLowerer
     context.restore(incoming)
     this.applyState(merged)
     context.setCurrent(merge)
-  end
-
-  def isUnsupportedOptionalPointerNullComparison(node: Int): Bool
-    if this.bound.kindAt(node) != "Binary"
-      return false
-    end
-    if this.bound.dataAt(node) != "==" && this.bound.dataAt(node) != "!="
-      return false
-    end
-    let left = this.bound.childAt(node, 0)
-    let right = this.bound.childAt(node, 1)
-    var valueNode = left
-    if this.bound.kindAt(left) == "NullLiteral"
-      valueNode = right
-    else if this.bound.kindAt(right) != "NullLiteral"
-      return false
-    end
-    let typeName = irType(this.bound.typeAt(valueNode))
-    return irIsOptional(typeName) && irIsPointer(irTypeInner(typeName))
   end
 
   def lowerWhile(context: IrFunctionContext, node: Int): Void
@@ -1361,6 +1360,11 @@ class IrLowerer
     end
     context.function.localEffects = irEffectUnion(context.function.localEffects, 64)
     context.pushCleanup(42, capability.id, -1)
+    var nativeVariable = context.firstVariable
+    while nativeVariable != null
+      irPrepareNativeVariable(this, context, nativeVariable, node)
+      nativeVariable = nativeVariable.nextVariable
+    end
     var index = 0
     while index < this.bound.childCountAt(node) && !context.terminated
       this.lowerStatement(context, this.bound.childAt(node, index))

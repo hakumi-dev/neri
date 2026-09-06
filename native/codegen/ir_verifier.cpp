@@ -3,6 +3,7 @@
 #include "neri/codegen/reader.h"
 #include "neri/ir_transport.h"
 #include "numeric_types.h"
+#include "native_layout.h"
 
 #include <llvm/Support/ConvertUTF.h>
 
@@ -50,7 +51,7 @@ constexpr std::string_view invalid_source = "NIR010";
 }
 
 [[nodiscard]] bool same_type(const type &left, const type &right) {
-  if (left.tag != right.tag || left.symbol.has_value() != right.symbol.has_value() ||
+  if (left.tag != right.tag || left.element_count != right.element_count || left.symbol.has_value() != right.symbol.has_value() ||
       left.arguments.size() != right.arguments.size()) {
     return false;
   }
@@ -138,6 +139,9 @@ constexpr std::string_view invalid_source = "NIR010";
 
 [[nodiscard]] bool is_pointer_element(const type &value) {
   return is_void(value) || is_scalar(value) ||
+         (value.tag == NERI_IR_TYPE_NATIVE_RECORD_V1 && value.symbol && value.arguments.empty()) ||
+         (value.tag == NERI_IR_TYPE_FIXED_ARRAY_V1 && !value.symbol && value.arguments.size() == 1U && value.element_count > 0U && is_pointer_element(value.arguments.front())) ||
+         is_nullable_pointer(value) ||
          (is_pointer(value) && is_pointer_element(value.arguments.front()));
 }
 
@@ -151,6 +155,8 @@ constexpr std::string_view invalid_source = "NIR010";
 
 [[nodiscard]] bool is_supported_value(const type &value) {
   return is_scalar(value) || is_string(value) || is_class(value) ||
+         (value.tag == NERI_IR_TYPE_NATIVE_RECORD_V1 && is_pointer_element(value)) ||
+         (value.tag == NERI_IR_TYPE_FIXED_ARRAY_V1 && is_pointer_element(value)) ||
          (is_pointer(value) && is_pointer_element(value.arguments.front())) ||
          is_unsafe_capability(value) ||
          (is_borrow_capability(value) &&
@@ -166,6 +172,8 @@ constexpr std::string_view invalid_source = "NIR010";
           !value.symbol.has_value() && value.arguments.size() == 1U &&
           !is_void(value.arguments.front()) &&
           value.arguments.front().tag != NERI_IR_TYPE_OPTIONAL_V1 &&
+          value.arguments.front().tag != NERI_IR_TYPE_NATIVE_RECORD_V1 &&
+          value.arguments.front().tag != NERI_IR_TYPE_FIXED_ARRAY_V1 &&
           is_supported_value(value.arguments.front()));
 }
 
@@ -397,7 +405,14 @@ struct found_field final {
 
 void require_declared_type(const ir_module &module, const type &value,
                            std::string_view description) {
+  if (value.tag != NERI_IR_TYPE_FIXED_ARRAY_V1 && value.element_count != 0U)
+    fail(invalid_type, "Only fixed arrays carry an element count.");
   require_value_type(value, description);
+  if (value.tag == NERI_IR_TYPE_NATIVE_RECORD_V1 || value.tag == NERI_IR_TYPE_FIXED_ARRAY_V1) {
+    if (std::ranges::find(module.required_features, "native-records-v1") == module.required_features.end())
+      fail(unsupported_feature, "Native aggregate types require native-records-v1.");
+    (void)native_layouts(module).layout(value);
+  }
   if (extended_scalar(value.tag) &&
       std::ranges::find(module.required_features, "extended-scalars-v1") == module.required_features.end())
     fail(unsupported_feature, "Extended scalar types require extended-scalars-v1.");
@@ -406,7 +421,8 @@ void require_declared_type(const ir_module &module, const type &value,
          std::string(description) + " references a missing class.");
   }
   for (const auto &argument : value.arguments) {
-    require_declared_type(module, argument, description);
+    if (!(is_pointer(value) && is_void(argument)))
+      require_declared_type(module, argument, description);
   }
 }
 
@@ -910,6 +926,31 @@ void require_binary(const function_context &context, const instruction &value,
       fail(invalid_safety, "unsafe.end requires an unsafe capability.");
     }
     return NERI_IR_EFFECT_UNSAFE_V1;
+  }
+  case NERI_IR_OPCODE_NATIVE_FIELD_ADDRESS_V1: {
+    verify_instruction_shape(value, 1U, 2U, 0U, true, false, false);
+    if (!is_unsafe_capability(definition_type(context, value.operands[0])))
+      fail(invalid_safety, "Native field address requires an unsafe capability.");
+    const auto &pointer = definition_type(context, value.operands[1]);
+    if (!is_pointer(pointer) || pointer.arguments.front().tag != NERI_IR_TYPE_NATIVE_RECORD_V1)
+      fail(invalid_type, "Native field address requires a record pointer.");
+    const auto &record = native_layouts(context.module).declaration(pointer.arguments.front());
+    const auto field = std::ranges::find_if(record.fields, [&](const auto &item) { return same_symbol(item.id, *value.symbol); });
+    if (field == record.fields.end()) fail(invalid_reference, "Native field does not belong to its pointer type.");
+    require_result_type(value, 0U, type{NERI_IR_TYPE_POINTER_V1, std::nullopt, {field->value_type}});
+    return NERI_IR_EFFECT_UNSAFE_V1;
+  }
+  case NERI_IR_OPCODE_NATIVE_INDEX_ADDRESS_CHECKED_V1: {
+    verify_instruction_shape(value, 1U, 3U, 0U, false, false, false);
+    if (!is_unsafe_capability(definition_type(context, value.operands[0])))
+      fail(invalid_safety, "Native array access requires an unsafe capability.");
+    const auto &pointer = definition_type(context, value.operands[1]);
+    if (!is_pointer(pointer) || pointer.arguments.front().tag != NERI_IR_TYPE_FIXED_ARRAY_V1)
+      fail(invalid_type, "Native array access requires a fixed-array pointer.");
+    const auto &array = pointer.arguments.front();
+    require_operand_type(context, value, 2U, type{NERI_IR_TYPE_INT_V1, std::nullopt, {}});
+    require_result_type(value, 0U, type{NERI_IR_TYPE_POINTER_V1, std::nullopt, {array.arguments.front()}});
+    return NERI_IR_EFFECT_UNSAFE_V1 | NERI_IR_EFFECT_MAY_PANIC_V1;
   }
   case NERI_IR_OPCODE_STACK_ALLOC_V1:
   case NERI_IR_OPCODE_POINTER_LOAD_V1:
@@ -1460,10 +1501,30 @@ void verify_supported_module(const ir_module &value) {
            "Required feature '" + feature +
                "' is not a canonical feature identifier.");
     }
-    if (feature != "string-data-v1" && feature != "native-strings-v1" && feature != "native-libraries-v1" && feature != "extended-scalars-v1") {
+    if (feature != "string-data-v1" && feature != "native-strings-v1" && feature != "native-libraries-v1" && feature != "extended-scalars-v1" && feature != "native-records-v1") {
       fail(unsupported_feature,
            "Unknown required semantic feature '" + feature + "'.");
     }
+  }
+
+  if (!value.native_records.empty() && std::ranges::find(value.required_features, "native-records-v1") == value.required_features.end())
+    fail(unsupported_feature, "Native records require native-records-v1.");
+  native_layouts layouts(value);
+  std::set<std::string> native_names;
+  for (const auto &record : value.native_records) {
+    if (record.id.module != value.id || record.id.kind != NERI_IR_SYMBOL_NATIVE_RECORD_V1 ||
+        !native_names.insert(record.id.semantic_name).second)
+      fail(invalid_reference, "Invalid or duplicate native record identity.");
+    std::set<std::string> field_names;
+    for (const auto &field : record.fields) {
+      if (field.id.module != value.id || field.id.kind != NERI_IR_SYMBOL_FIELD_V1 ||
+          !field.id.semantic_name.starts_with(record.id.semantic_name + ".") ||
+          field.access != NERI_IR_ACCESS_PUBLIC_V1 || !field_names.insert(field.id.semantic_name).second)
+        fail(invalid_reference, "Invalid or duplicate native field identity.");
+      require_declared_type(value, field.value_type, "Native field");
+      verify_location(field.location, value);
+    }
+    (void)layouts.layout(type{NERI_IR_TYPE_NATIVE_RECORD_V1, record.id, {}});
   }
 
   const bool has_string_data =

@@ -29,6 +29,7 @@ struct type final {
   std::uint8_t tag{};
   std::optional<symbol_id> symbol;
   std::vector<type> arguments;
+  std::uint32_t element_count{};
 };
 
 struct constant final {
@@ -66,6 +67,12 @@ struct class_declaration final {
   std::vector<field> fields;
   std::vector<method> methods;
   std::optional<source_location> location;
+};
+
+struct native_record final {
+  symbol_id id;
+  bool is_union{};
+  std::vector<field> fields;
 };
 
 struct global_declaration final {
@@ -170,6 +177,7 @@ struct ir_module final {
   std::vector<global_declaration> globals;
   std::vector<import_declaration> imports;
   std::vector<function> functions;
+  std::vector<native_record> native_records;
 };
 
 } // namespace neri::codegen

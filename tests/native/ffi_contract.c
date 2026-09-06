@@ -17,6 +17,21 @@ struct neri_ffi_record { uint8_t tag; float real; uint64_t wide; int32_t coordin
 struct neri_ffi_nested { uint8_t tag; struct neri_ffi_record value; void *next; };
 union neri_ffi_event { uint32_t type; struct neri_ffi_record value; uint8_t padding[128]; };
 struct neri_ffi_node { uint32_t tag; struct neri_ffi_node *next; };
+void neri_ffi_record_fill(struct neri_ffi_record *value) {
+  value->tag = 7;
+  value->real = 1.25f;
+  value->wide = UINT64_MAX;
+  value->coordinates[0] = -10;
+  value->coordinates[1] = 20;
+  value->coordinates[2] = 30;
+}
+int64_t neri_ffi_record_check(const struct neri_ffi_record *value) {
+  return value->tag == 9 && value->real == 2.5f && value->wide == 42;
+}
+void neri_ffi_event_fill(union neri_ffi_event *event) {
+  neri_ffi_record_fill(&event->value);
+}
+void neri_ffi_real_store(float *value) { *value = 2.5f; }
 int64_t neri_ffi_layout(int64_t query) {
   switch (query) {
     case 0: return sizeof(struct neri_ffi_record);

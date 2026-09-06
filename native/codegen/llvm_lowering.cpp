@@ -1,5 +1,6 @@
 #include "llvm_lowering.h"
 #include "llvm_numeric.h"
+#include "native_layout.h"
 
 #include "neri/codegen/emitter.h"
 #include "neri/ir_transport.h"
@@ -150,6 +151,10 @@ void append_qualified_parts(std::vector<std::string_view> &parts,
     return "a" + type_code(value.arguments.front()) + "e";
   case NERI_IR_TYPE_CLASS_V1:
     return "c" + qualified_name(*value.symbol) + "e";
+  case NERI_IR_TYPE_NATIVE_RECORD_V1:
+    return "r" + qualified_name(*value.symbol) + "e";
+  case NERI_IR_TYPE_FIXED_ARRAY_V1:
+    return "f" + std::to_string(value.element_count) + "_" + type_code(value.arguments.front()) + "e";
   case NERI_IR_TYPE_OPTIONAL_V1:
     return "o" + type_code(value.arguments.front()) + "e";
   case NERI_IR_TYPE_POINTER_V1:
@@ -1130,7 +1135,7 @@ private:
       case NERI_IR_OPCODE_OPTIONAL_GET_CHECKED_V1: {
         auto *optional = value(instruction.operands[0]);
         const auto &result_type = instruction.results.front().value_type;
-        if (uses_null_representation(result_type)) {
+        if (uses_null_representation(module_.value_type(input_, instruction.operands[0]))) {
           emit_guard(
               builder_.CreateICmpNE(
                   optional,
@@ -1316,6 +1321,27 @@ private:
             module_.physical_scalar_type(element), value(instruction.operands[1]),
             llvm::Align(module_.storage_alignment(element)), "pointer.load");
         result = from_physical_scalar(loaded, element);
+        break;
+      }
+      case NERI_IR_OPCODE_NATIVE_FIELD_ADDRESS_V1: {
+        const auto &pointer = module_.value_type(input_, instruction.operands[1]);
+        native_layouts layouts(module_.input_);
+        const auto &record = layouts.declaration(pointer.arguments.front());
+        const auto layout = layouts.layout(pointer.arguments.front());
+        std::size_t index = 0U;
+        while (index < record.fields.size() && symbol_key(record.fields[index].id) != symbol_key(*instruction.symbol)) ++index;
+        result = builder_.CreateGEP(builder_.getInt8Ty(), value(instruction.operands[1]),
+                                    builder_.getInt64(layout.offsets.at(index)), "native.field.address");
+        break;
+      }
+      case NERI_IR_OPCODE_NATIVE_INDEX_ADDRESS_CHECKED_V1: {
+        const auto &pointer = module_.value_type(input_, instruction.operands[1]);
+        const auto &array = pointer.arguments.front();
+        auto *index = value(instruction.operands[2]);
+        emit_guard(builder_.CreateICmpULT(index, builder_.getInt64(array.element_count)),
+                   NERI_PANIC_BOUNDS_V1, "Native array index is out of bounds.", instruction.location);
+        auto *offset = builder_.CreateMul(index, builder_.getInt64(module_.storage_size(array.arguments.front())));
+        result = builder_.CreateGEP(builder_.getInt8Ty(), value(instruction.operands[1]), offset, "native.index.address");
         break;
       }
       case NERI_IR_OPCODE_POINTER_STORE_V1: {
@@ -1659,6 +1685,13 @@ private:
 
   [[nodiscard]] llvm::Type *semantic_type(const type &value) const {
     switch (value.tag) {
+    case NERI_IR_TYPE_NATIVE_RECORD_V1: {
+      const auto layout = native_layouts(input_).layout(value);
+      auto *unit = llvm::IntegerType::get(context_, static_cast<unsigned>(layout.alignment * 8U));
+      return llvm::ArrayType::get(unit, layout.size / layout.alignment);
+    }
+    case NERI_IR_TYPE_FIXED_ARRAY_V1:
+      return llvm::ArrayType::get(physical_scalar_type(value.arguments.front()), value.element_count);
     case NERI_IR_TYPE_BOOL_V1:
       return llvm::Type::getInt1Ty(context_);
     case NERI_IR_TYPE_BYTE_V1:

@@ -25,7 +25,7 @@ pointer and a runtime-owned word, occupying 16 bytes. Strings and arrays append 
 eight-byte length. Strings count UTF-8 bytes; arrays count elements.
 
 Scalar optionals carry a presence tag and aligned payload. Optional managed
-references use a null reference for absence. Type descriptors specify payload
+references and optional native pointers use a null pointer for absence. Type descriptors specify payload
 size/alignment, element layout and tracing behavior. Existing descriptor prefixes
 remain accepted according to their declared ABI version and size.
 
@@ -60,13 +60,26 @@ Runtime contract failures panic; no exception unwinds into Neri code.
 
 ## IR transport
 
-The compiler emits canonical Neri IR with transport 1.1, or 1.2 when extended
-scalars or external library metadata are present. The `native-libraries-v1` feature adds a library
+The compiler emits canonical Neri IR with transport 1.1, 1.2 for extended
+scalars or external library metadata, and 1.3 for native records and fixed arrays.
+The `native-libraries-v1` feature adds a library
 name after each import's source location; empty names retain platform-default
 symbol resolution. Only C ABI imports may declare a library. The transport header
 includes versions, flags, payload size and a SHA-256 digest. The native reader
 validates the envelope and the typed program before constructing LLVM objects.
 Malformed, unsupported and incompatible inputs produce stable NIR diagnostics.
+
+`native-records-v1` appends native declarations after the function vector, sorted
+by name. Each declaration carries its identity, struct/union flag and ordered
+fields. Native record references use type tag 20 and symbol kind 10; fixed arrays
+use type tag 21 followed by a 32-bit element count and element type. The backend
+recomputes size, alignment and field offsets, rejects recursive inline layouts,
+and keeps native record identities distinct from managed classes.
+
+`native.field.address` (59) returns the typed address of a declared field.
+`native.index.address.checked` (60) bounds-checks a fixed-array index before
+returning the element address. Both require an unsafe capability. Native records
+use inline value storage; C imports exchange them through pointers.
 
 `neri-codegen` owns LLVM lowering and target emission. Native runtime symbols
 and C imports remain explicit IR imports. Debug and Release preserve checks and

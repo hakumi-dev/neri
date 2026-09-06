@@ -312,6 +312,7 @@ public:
         input_, "required features", [this] { return input_.utf8(); });
     for (const auto &feature : result.required_features) {
       if (feature == "native-libraries-v1") native_libraries_ = true;
+      if (feature == "native-records-v1") native_records_ = true;
     }
     if (native_libraries_ && transport_minor_ < 2U) {
       fail(unsupported_feature, "Native libraries require IR transport 1.2.", input_.offset());
@@ -326,6 +327,17 @@ public:
         input_, "imports", [this] { return read_import(); });
     result.functions = read_vector<function>(
         input_, "functions", [this] { return read_function(); });
+    if (native_records_) {
+      if (transport_minor_ < 3U)
+        fail(unsupported_feature, "Native records require transport 1.3.", input_.offset());
+      result.native_records = read_vector<native_record>(input_, "native records", [this] {
+        native_record record;
+        record.id = read_symbol();
+        record.is_union = input_.boolean();
+        record.fields = read_vector<field>(input_, "native fields", [this] { return read_field(); });
+        return record;
+      });
+    }
     input_.require_end();
     return result;
   }
@@ -344,7 +356,7 @@ private:
     const auto kind_offset = input_.offset();
     value.kind = input_.u8();
     require_tag(value.kind, NERI_IR_SYMBOL_CLASS_V1,
-                NERI_IR_SYMBOL_GLOBAL_V1, "symbol-kind", kind_offset);
+                NERI_IR_SYMBOL_NATIVE_RECORD_V1, "symbol-kind", kind_offset);
     value.semantic_name = identity("Symbol semantic identity");
     return value;
   }
@@ -385,6 +397,15 @@ private:
       return result;
     case NERI_IR_TYPE_CLASS_V1:
       result.symbol = read_symbol();
+      return result;
+    case NERI_IR_TYPE_NATIVE_RECORD_V1:
+      if (transport_minor_ < 3U) fail(unsupported_feature, "Native records require transport 1.3.", tag_offset);
+      result.symbol = read_symbol();
+      return result;
+    case NERI_IR_TYPE_FIXED_ARRAY_V1:
+      if (transport_minor_ < 3U) fail(unsupported_feature, "Fixed arrays require transport 1.3.", tag_offset);
+      result.element_count = input_.u32();
+      result.arguments.push_back(read_type(depth + 1U));
       return result;
     case NERI_IR_TYPE_ARRAY_V1:
     case NERI_IR_TYPE_OPTIONAL_V1:
@@ -563,7 +584,7 @@ private:
     const auto opcode_offset = input_.offset();
     result.opcode = input_.u16();
     require_tag(result.opcode, NERI_IR_OPCODE_CONSTANT_V1,
-                NERI_IR_OPCODE_NUMERIC_CAST_CHECKED_V1, "opcode", opcode_offset);
+                NERI_IR_OPCODE_NATIVE_INDEX_ADDRESS_CHECKED_V1, "opcode", opcode_offset);
     result.results = read_vector<value_definition>(
         input_, "instruction results",
         [this] { return read_value_definition(); });
@@ -673,6 +694,7 @@ private:
   const reader_options &options_;
   std::uint16_t transport_minor_{};
   bool native_libraries_{};
+  bool native_records_{};
 };
 
 void validate_options(const reader_options &options) {
