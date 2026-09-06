@@ -111,6 +111,7 @@ set_target_properties(neri_codegen_cli PROPERTIES OUTPUT_NAME neri-codegen)
 target_compile_definitions(neri_codegen_cli PRIVATE NERI_TOOLCHAIN_VERSION="${NERI_VERSION}")
 target_link_libraries(neri_codegen_cli PRIVATE neri_build_options neri_codegen ${NERI_LLVM_LIBRARIES})
 
+find_package(Threads REQUIRED)
 add_library(neri_runtime STATIC
   native/runtime/entry.cpp
   native/runtime/math.cpp
@@ -121,7 +122,7 @@ add_library(neri_runtime STATIC
 )
 set_target_properties(neri_runtime PROPERTIES OUTPUT_NAME "neri-runtime")
 target_compile_definitions(neri_runtime PRIVATE NERI_RUNTIME_BUILD=1)
-target_link_libraries(neri_runtime PRIVATE neri_build_options)
+target_link_libraries(neri_runtime PRIVATE neri_build_options Threads::Threads)
 target_include_directories(neri_runtime PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/native/include")
 if(NERI_THREAD_SANITIZER)
   target_compile_options(neri_runtime PRIVATE -fsanitize=thread -fno-omit-frame-pointer)
@@ -160,8 +161,8 @@ if(BUILD_TESTING)
   target_link_libraries(neri_gc_pressure PRIVATE neri_build_options neri_runtime)
   add_test(NAME native_gc_pressure COMMAND neri_gc_pressure)
 
-  find_package(Threads REQUIRED)
   add_executable(neri_worker_heaps tests/native/worker_heaps.c)
+  target_include_directories(neri_worker_heaps PRIVATE native/runtime)
   target_link_libraries(neri_worker_heaps PRIVATE neri_build_options neri_runtime Threads::Threads)
   if(NERI_THREAD_SANITIZER)
     target_compile_options(neri_worker_heaps PRIVATE -fsanitize=thread -fno-omit-frame-pointer)

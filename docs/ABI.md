@@ -35,14 +35,18 @@ requires an unavailable capability is rejected during negotiation.
 
 ## Collection and roots
 
-The collector is precise and nonmoving, with one mutator per heap. Native threads
-have independent heap lists, root/borrow stacks, collection state and host-error
-storage. Each thread initializes and shuts down its own runtime state; shutdown
-reclaims only that thread's allocations and requires its roots and borrows to
-have ended. Process-argument views also belong to the calling thread.
+The collector is precise and nonmoving, with one mutator per heap. Runtime
+contexts have independent heap lists, root/borrow stacks, collection state and
+host-error storage. Each native thread initializes and shuts down its base
+context; shutdown reclaims only the active context's allocations and requires its
+roots and borrows to have ended. Process-argument views belong to the context.
 
 Managed allocations carry a private owner identity. Runtime reference stores and
-tracing reject objects from a different heap. Static string literals are immortal
+tracing reject objects from unrelated heaps. The runtime's
+[private scoped-task boundary](ARCHITECTURE.md#execution-and-optimization-boundaries)
+allows child contexts to read suspended ancestor heaps until their scope joins;
+it is not part of the versioned ABI or a managed result-transfer protocol.
+Static string literals are immortal
 and may be referenced by any heap. Ordinary managed strings remain heap-owned,
 even though their content is immutable. Raw native pointers do not provide a
 managed transfer protocol or make arbitrary foreign memory access safe.

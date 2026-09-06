@@ -1,5 +1,6 @@
 #include "neri/runtime_abi.h"
 #include "terminal.h"
+#include "task_heap.h"
 
 #include <algorithm>
 #include <array>
@@ -13,11 +14,13 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <condition_variable>
 #include <filesystem>
 #include <fcntl.h>
 #include <fstream>
 #include <limits>
 #include <locale.h>
+#include <mutex>
 #include <spawn.h>
 #include <string>
 #include <string_view>
@@ -27,6 +30,19 @@
 #include <vector>
 
 extern char **environ;
+
+struct neri_task_scope final {
+  explicit neri_task_scope(void *owner) : parent(owner) {}
+  void *parent;
+  std::mutex mutex;
+  std::condition_variable completed;
+  uint64_t outstanding = 0;
+  bool accepting = true;
+};
+
+struct neri_task_ticket final {
+  neri_task_scope *scope;
+};
 
 namespace {
 constexpr uintptr_t root_frame_cookie = UINT64_C(0x484b524f4f545631);
@@ -83,6 +99,9 @@ struct runtime_state final {
   const char *const *process_arguments;
   bool initialized;
   bool collecting;
+  bool suspended;
+  const runtime_state *read_parent;
+  std::string host_error;
 };
 
 struct mark_stack final {
@@ -91,11 +110,19 @@ struct mark_stack final {
   size_t capacity;
 };
 
-// Each native execution thread owns its heap and tracing stacks. Managed
-// references cannot cross this boundary; immutable static literals can.
-thread_local runtime_state state{};
+// The active context may be a scoped task on a worker or on its waiting parent.
+// Heap identities remain stable while contexts are suspended or helped.
+constinit thread_local runtime_state *active_state = nullptr;
+runtime_state &current_state() {
+  if (active_state == nullptr) [[unlikely]] {
+    // Construct the base context once, outside the hot TLS access path. Its
+    // string destructor must not add a dynamic TLS guard to every heap lookup.
+    thread_local runtime_state base_state{};
+    active_state = &base_state;
+  }
+  return *active_state;
+}
 thread_local mark_stack *active_mark_stack = nullptr;
-thread_local std::string last_host_error;
 std::atomic<uint64_t> temporary_file_counter{0};
 
 const neri_type_descriptor_v1 dynamic_string_type = {
@@ -179,8 +206,11 @@ const neri_runtime_abi_info_v1 runtime_abi = {
 }
 
 void require_initialized() {
-  if (!state.initialized) {
+  if (!current_state().initialized) {
     contract_panic("runtime operation requires successful initialization");
+  }
+  if (current_state().suspended) {
+    contract_panic("managed operations require an active heap, not a suspended task parent");
   }
 }
 
@@ -193,7 +223,7 @@ void require_initialized() {
     return nullptr;
   }
   auto *allocation = reinterpret_cast<managed_allocation *>(object->runtime_word);
-  return allocation != nullptr && allocation->owner == &state &&
+  return allocation != nullptr && allocation->owner == &current_state() &&
                  allocation->object == object
              ? allocation : nullptr;
 }
@@ -203,8 +233,29 @@ void require_initialized() {
          object->type == &neri_rt_v1_string_literal_type;
 }
 
+[[nodiscard]] const managed_allocation *find_readable(neri_ref_v1 object) {
+  if (object == nullptr) {
+    return nullptr;
+  }
+  const auto *allocation =
+      reinterpret_cast<const managed_allocation *>(object->runtime_word);
+  if (allocation == nullptr || allocation->object != object) {
+    return nullptr;
+  }
+  if (allocation->owner == &current_state()) {
+    return allocation;
+  }
+  for (auto *parent = current_state().read_parent; parent != nullptr;
+       parent = parent->read_parent) {
+    if (allocation->owner == parent && parent->suspended) {
+      return allocation;
+    }
+  }
+  return nullptr;
+}
+
 [[nodiscard]] native_allocation *find_native(void *pointer) {
-  for (auto *allocation = state.native_head; allocation != nullptr;
+  for (auto *allocation = current_state().native_head; allocation != nullptr;
        allocation = allocation->next) {
     if (allocation->pointer == pointer) {
       return allocation;
@@ -218,28 +269,28 @@ void assert_consistent() {
   uint64_t managed_count = 0;
   uint64_t managed_bytes = 0;
   managed_allocation *managed_previous = nullptr;
-  for (auto *allocation = state.managed_head; allocation != nullptr;
+  for (auto *allocation = current_state().managed_head; allocation != nullptr;
        allocation = allocation->next) {
     assert(allocation->previous == managed_previous);
     assert(allocation->object != nullptr);
-    assert(allocation->owner == &state);
+    assert(allocation->owner == &current_state());
     managed_previous = allocation;
     ++managed_count;
     managed_bytes += sizeof(neri_object_header_v1) + allocation->payload_size;
   }
-  assert(managed_count == state.managed_object_count);
-  assert(managed_bytes == state.managed_byte_count);
+  assert(managed_count == current_state().managed_object_count);
+  assert(managed_bytes == current_state().managed_byte_count);
 
   uint64_t native_bytes = 0;
   native_allocation *native_previous = nullptr;
-  for (auto *allocation = state.native_head; allocation != nullptr;
+  for (auto *allocation = current_state().native_head; allocation != nullptr;
        allocation = allocation->next) {
     assert(allocation->previous == native_previous);
     assert(allocation->pointer != nullptr);
     native_previous = allocation;
     native_bytes += allocation->byte_count;
   }
-  assert(native_bytes == state.native_byte_count);
+  assert(native_bytes == current_state().native_byte_count);
 #endif
 }
 
@@ -270,6 +321,11 @@ void mark_object(neri_ref_v1 object) {
   }
   auto *allocation = find_managed(object);
   if (allocation == nullptr) {
+    // Ancestor heaps remain intact. Their mark bits and tracing belong to
+    // their suspended owners; child collections never touch them.
+    if (find_readable(object) != nullptr) {
+      return;
+    }
     contract_panic("GC encountered a reference outside the managed heap");
   }
   if (allocation->marked) {
@@ -289,11 +345,11 @@ void mark_slot(neri_ref_v1 *slot, void *) {
   mark_object(*slot);
 }
 
-void unlink_managed(managed_allocation *allocation) {
+void unlink_managed(runtime_state &heap, managed_allocation *allocation) {
   if (allocation->previous != nullptr) {
     allocation->previous->next = allocation->next;
   } else {
-    state.managed_head = allocation->next;
+    heap.managed_head = allocation->next;
   }
   if (allocation->next != nullptr) {
     allocation->next->previous = allocation->previous;
@@ -304,7 +360,7 @@ void unlink_native(native_allocation *allocation) {
   if (allocation->previous != nullptr) {
     allocation->previous->next = allocation->next;
   } else {
-    state.native_head = allocation->next;
+    current_state().native_head = allocation->next;
   }
   if (allocation->next != nullptr) {
     allocation->next->previous = allocation->previous;
@@ -312,18 +368,19 @@ void unlink_native(native_allocation *allocation) {
 }
 
 void collect_impl() {
-  if (state.collecting) {
+  auto &heap = current_state();
+  if (heap.collecting) {
     contract_panic("nested GC collection is not supported by ABI v1.0");
   }
-  state.collecting = true;
-  for (auto *allocation = state.managed_head; allocation != nullptr;
+  heap.collecting = true;
+  for (auto *allocation = heap.managed_head; allocation != nullptr;
        allocation = allocation->next) {
     allocation->marked = false;
   }
 
   mark_stack stack{};
   active_mark_stack = &stack;
-  for (auto *frame = state.root_frame; frame != nullptr;
+  for (auto *frame = heap.root_frame; frame != nullptr;
        frame = frame->previous) {
     if (frame->runtime_cookie != root_frame_cookie ||
         (frame->slot_count != 0 && frame->slots == nullptr)) {
@@ -333,7 +390,7 @@ void collect_impl() {
       mark_object(frame->slots[index]);
     }
   }
-  for (auto *borrow = state.borrow; borrow != nullptr;
+  for (auto *borrow = heap.borrow; borrow != nullptr;
        borrow = reinterpret_cast<neri_gc_borrow_v1 *>(
            borrow->runtime_words[0])) {
     if (borrow->runtime_words[3] != borrow_cookie) {
@@ -352,21 +409,21 @@ void collect_impl() {
   active_mark_stack = nullptr;
   std::free(stack.items);
 
-  for (auto *allocation = state.managed_head; allocation != nullptr;) {
+  for (auto *allocation = heap.managed_head; allocation != nullptr;) {
     auto *next = allocation->next;
     if (!allocation->marked) {
-      unlink_managed(allocation);
-      state.managed_object_count -= 1;
-      state.managed_byte_count -=
+      unlink_managed(heap, allocation);
+      heap.managed_object_count -= 1;
+      heap.managed_byte_count -=
           sizeof(neri_object_header_v1) + allocation->payload_size;
       std::free(allocation);
     }
     allocation = next;
   }
-  state.collection_count += 1;
-  state.next_collection_bytes = std::max(collection_floor_bytes,
-      state.managed_byte_count > UINT64_MAX / 2 ? UINT64_MAX : state.managed_byte_count * 2);
-  state.collecting = false;
+  heap.collection_count += 1;
+  heap.next_collection_bytes = std::max(collection_floor_bytes,
+      heap.managed_byte_count > UINT64_MAX / 2 ? UINT64_MAX : heap.managed_byte_count * 2);
+  heap.collecting = false;
   assert_consistent();
 }
 
@@ -452,17 +509,17 @@ void validate_type(const neri_type_descriptor_v1 *type,
   auto *allocation =
       static_cast<native_allocation *>(std::malloc(sizeof(native_allocation)));
   if (allocation == nullptr ||
-      state.native_byte_count > UINT64_MAX - byte_count) {
+      current_state().native_byte_count > UINT64_MAX - byte_count) {
     std::free(pointer);
     std::free(allocation);
     out_of_memory("native allocation accounting failed");
   }
-  *allocation = {nullptr, state.native_head, pointer, byte_count, alignment};
-  if (state.native_head != nullptr) {
-    state.native_head->previous = allocation;
+  *allocation = {nullptr, current_state().native_head, pointer, byte_count, alignment};
+  if (current_state().native_head != nullptr) {
+    current_state().native_head->previous = allocation;
   }
-  state.native_head = allocation;
-  state.native_byte_count += byte_count;
+  current_state().native_head = allocation;
+  current_state().native_byte_count += byte_count;
   assert_consistent();
   return pointer;
 }
@@ -487,7 +544,7 @@ struct string_view final {
     return {bytes, prefix->byte_length};
   }
 
-  const auto *allocation = find_managed(value);
+  const auto *allocation = find_readable(value);
   if (allocation == nullptr || value->type != &dynamic_string_type ||
       allocation->payload_size < sizeof(uint64_t) + 1U ||
       prefix->byte_length >
@@ -615,7 +672,7 @@ void write_console(FILE *stream, neri_ref_v1 value, bool append_newline,
                                const char *description) {
   const auto inspected = inspect_string(value);
   if (string_has_nul(inspected)) {
-    last_host_error = std::string(description) + " contains a null byte.";
+    current_state().host_error = std::string(description) + " contains a null byte.";
     return false;
   }
   result.assign(reinterpret_cast<const char *>(inspected.bytes),
@@ -631,7 +688,7 @@ struct array_view final {
 
 [[nodiscard]] array_view inspect_array(neri_ref_v1 value) {
   require_initialized();
-  auto *allocation = find_managed(value);
+  const auto *allocation = find_readable(value);
   const auto *type = value == nullptr ? nullptr : value->type;
   if (allocation == nullptr || type == nullptr ||
       type->kind != NERI_TYPE_KIND_ARRAY_V1 || type->element_size == 0U ||
@@ -693,7 +750,7 @@ struct array_view final {
 }
 
 void set_errno_error(std::string_view operation, int error) {
-  last_host_error = std::string(operation) + ": " + std::strerror(error);
+  current_state().host_error = std::string(operation) + ": " + std::strerror(error);
 }
 
 [[nodiscard]] bool write_all(int descriptor, const uint8_t *bytes,
@@ -750,7 +807,7 @@ void set_errno_error(std::string_view operation, int error) {
     set_errno_error("atomic file write failed", failure);
     return false;
   }
-  last_host_error.clear();
+  current_state().host_error.clear();
   return true;
 }
 
@@ -936,6 +993,25 @@ struct formatted_float final {
   }
   return result;
 }
+void release_heap() {
+  require_initialized();
+  auto &heap = current_state();
+  if (heap.root_frame != nullptr || heap.borrow != nullptr || heap.collecting) {
+    contract_panic("runtime shutdown requires no live root frames or borrows");
+  }
+  while (heap.managed_head != nullptr) {
+    auto *allocation = heap.managed_head;
+    heap.managed_head = allocation->next;
+    std::free(allocation);
+  }
+  while (heap.native_head != nullptr) {
+    auto *allocation = heap.native_head;
+    heap.native_head = allocation->next;
+    std::free(allocation->pointer);
+    std::free(allocation);
+  }
+  heap = {};
+}
 } // namespace
 
 extern "C" {
@@ -966,8 +1042,80 @@ NERI_RT_API const neri_runtime_abi_info_v1 *neri_rt_v1_get_abi(void) {
   return &runtime_abi;
 }
 
+void neri_task_scope_run(neri_task_coordinator coordinate, void *context) {
+  require_initialized();
+  auto &parent = current_state();
+  if (coordinate == nullptr || parent.collecting || parent.borrow != nullptr) {
+    contract_panic("task scopes require a coordinator and no active trace or native borrow");
+  }
+  neri_task_scope scope{&parent};
+  parent.suspended = true;
+  coordinate(&scope, context);
+  {
+    std::unique_lock lock(scope.mutex);
+    scope.accepting = false;
+    scope.completed.wait(lock, [&scope] { return scope.outstanding == 0; });
+  }
+  parent.suspended = false;
+}
+
+neri_task_ticket *neri_task_register(neri_task_scope *scope) {
+  if (scope == nullptr || scope->parent != &current_state() ||
+      !current_state().suspended) {
+    contract_panic("only the suspended coordinator may register a task");
+  }
+  auto *ticket = static_cast<neri_task_ticket *>(std::malloc(sizeof(neri_task_ticket)));
+  if (ticket == nullptr) {
+    out_of_memory("task ticket allocation failed");
+  }
+  std::lock_guard lock(scope->mutex);
+  if (!scope->accepting || scope->outstanding == UINT64_MAX) {
+    contract_panic("task registration requires an open scope");
+  }
+  ticket->scope = scope;
+  ++scope->outstanding;
+  return ticket;
+}
+
+void neri_task_execute(neri_task_ticket *ticket, neri_task_body body, void *context) {
+  if (ticket == nullptr || body == nullptr || active_mark_stack != nullptr) {
+    contract_panic("task execution requires a ticket and body outside tracing");
+  }
+  auto *scope = ticket->scope;
+  auto *parent = static_cast<runtime_state *>(scope->parent);
+  {
+    std::lock_guard lock(scope->mutex);
+    if (scope->outstanding == 0 || !parent->suspended) {
+      contract_panic("task execution requires a suspended parent scope");
+    }
+  }
+  runtime_state child{};
+  child.initialized = true;
+  child.read_parent = parent;
+  child.process_argument_count = parent->process_argument_count;
+  child.process_arguments = parent->process_arguments;
+  auto *previous = active_state;
+  active_state = &child;
+  body(context);
+  release_heap();
+  active_state = previous;
+  std::free(ticket);
+  // Release the ticket only after every child object and root is gone. No
+  // access to the scope or its ancestors may follow this critical section.
+  {
+    std::lock_guard lock(scope->mutex);
+    --scope->outstanding;
+    if (scope->outstanding == 0) {
+      scope->completed.notify_all();
+    }
+  }
+}
+
 NERI_RT_API neri_abi_status_v1 neri_rt_v1_initialize(
     const neri_runtime_abi_requirements_v1 *requirements) {
+  if (current_state().suspended) {
+    contract_panic("cannot initialize a suspended task parent");
+  }
   if (requirements == nullptr ||
       requirements->struct_size < sizeof(neri_runtime_abi_requirements_v1)) {
     return NERI_ABI_STATUS_INVALID_ARGUMENT_V1;
@@ -982,8 +1130,8 @@ NERI_RT_API neri_abi_status_v1 neri_rt_v1_initialize(
       requirements->required_features) {
     return NERI_ABI_STATUS_MISSING_FEATURE_V1;
   }
-  state.initialized = true;
-  last_host_error.clear();
+  current_state().initialized = true;
+  current_state().host_error.clear();
   return NERI_ABI_STATUS_OK_V1;
 }
 
@@ -993,41 +1141,26 @@ neri_rt_v1_set_process_arguments(int argc, const char *const *argv) {
   if (argc < 0 || (argc != 0 && argv == nullptr)) {
     contract_panic("invalid process argument vector");
   }
-  state.process_argument_count = argc > 0 ? argc - 1 : 0;
-  state.process_arguments = argc > 0 ? argv + 1 : nullptr;
+  current_state().process_argument_count = argc > 0 ? argc - 1 : 0;
+  current_state().process_arguments = argc > 0 ? argv + 1 : nullptr;
 }
 
 NERI_RT_API void neri_rt_v1_shutdown(void) {
-  if (!state.initialized) {
+  if (!current_state().initialized) {
     return;
   }
-  if (state.root_frame != nullptr || state.borrow != nullptr ||
-      state.collecting) {
-    contract_panic("runtime shutdown requires no live root frames or borrows");
-  }
+  release_heap();
   if (std::fflush(stdout) != 0 || std::fflush(stderr) != 0) {
     contract_panic("console flush failed during runtime shutdown");
   }
-  while (state.managed_head != nullptr) {
-    auto *allocation = state.managed_head;
-    state.managed_head = allocation->next;
-    std::free(allocation);
-  }
-  while (state.native_head != nullptr) {
-    auto *allocation = state.native_head;
-    state.native_head = allocation->next;
-    std::free(allocation->pointer);
-    std::free(allocation);
-  }
-  state = {};
-  last_host_error.clear();
 }
 
 NERI_RT_API neri_ref_v1
 neri_rt_v1_gc_alloc(const neri_type_descriptor_v1 *type,
                       uint64_t payload_size, uint64_t payload_alignment) {
   require_initialized();
-  if (state.collecting) {
+  auto &heap = current_state();
+  if (heap.collecting) {
     contract_panic("managed allocation is not allowed during tracing");
   }
   validate_type(type, payload_size, payload_alignment);
@@ -1037,8 +1170,8 @@ neri_rt_v1_gc_alloc(const neri_type_descriptor_v1 *type,
   if (total_size > SIZE_MAX - managed_prefix_size) {
     out_of_memory("managed allocation size is not representable");
   }
-  if (state.managed_byte_count >= state.next_collection_bytes ||
-      total_size > state.next_collection_bytes - state.managed_byte_count) {
+  if (heap.managed_byte_count >= heap.next_collection_bytes ||
+      total_size > heap.next_collection_bytes - heap.managed_byte_count) {
     collect_impl();
   }
 
@@ -1051,8 +1184,8 @@ neri_rt_v1_gc_alloc(const neri_type_descriptor_v1 *type,
         std::calloc(1, physical_size));
   }
   if (metadata == nullptr ||
-      state.managed_byte_count > UINT64_MAX - total_size ||
-      state.managed_object_count == UINT64_MAX) {
+      heap.managed_byte_count > UINT64_MAX - total_size ||
+      heap.managed_object_count == UINT64_MAX) {
     std::free(metadata);
     out_of_memory("managed allocation failed");
   }
@@ -1060,15 +1193,15 @@ neri_rt_v1_gc_alloc(const neri_type_descriptor_v1 *type,
   auto *object = reinterpret_cast<neri_ref_v1>(
       reinterpret_cast<unsigned char *>(metadata) + managed_prefix_size);
 
-  *metadata = {nullptr, state.managed_head, object, payload_size, &state, false};
-  if (state.managed_head != nullptr) {
-    state.managed_head->previous = metadata;
+  *metadata = {nullptr, heap.managed_head, object, payload_size, &heap, false};
+  if (heap.managed_head != nullptr) {
+    heap.managed_head->previous = metadata;
   }
-  state.managed_head = metadata;
+  heap.managed_head = metadata;
   object->type = type;
   object->runtime_word = reinterpret_cast<uintptr_t>(metadata);
-  state.managed_object_count += 1;
-  state.managed_byte_count += total_size;
+  heap.managed_object_count += 1;
+  heap.managed_byte_count += total_size;
   assert_consistent();
   return object;
 }
@@ -1080,19 +1213,19 @@ neri_rt_v1_gc_root_frame_enter(neri_gc_root_frame_v1 *frame) {
       frame->previous != nullptr || frame->runtime_cookie != 0) {
     contract_panic("invalid GC root frame");
   }
-  frame->previous = state.root_frame;
+  frame->previous = current_state().root_frame;
   frame->runtime_cookie = root_frame_cookie;
-  state.root_frame = frame;
+  current_state().root_frame = frame;
 }
 
 NERI_RT_API void
 neri_rt_v1_gc_root_frame_leave(neri_gc_root_frame_v1 *frame) {
   require_initialized();
-  if (frame == nullptr || frame != state.root_frame ||
+  if (frame == nullptr || frame != current_state().root_frame ||
       frame->runtime_cookie != root_frame_cookie) {
     contract_panic("GC root frames must leave in LIFO order");
   }
-  state.root_frame = frame->previous;
+  current_state().root_frame = frame->previous;
   frame->previous = nullptr;
   frame->runtime_cookie = 0;
 }
@@ -1115,7 +1248,7 @@ NERI_RT_API void neri_rt_v1_gc_store_ref(neri_ref_v1 owner,
       slot_address % alignof(neri_ref_v1) != 0) {
     contract_panic("managed reference slot is outside the owner payload");
   }
-  if (value != nullptr && find_managed(value) == nullptr &&
+  if (value != nullptr && find_readable(value) == nullptr &&
       !is_string_literal(value)) {
     contract_panic("managed reference value is not a live allocation");
   }
@@ -1124,7 +1257,7 @@ NERI_RT_API void neri_rt_v1_gc_store_ref(neri_ref_v1 owner,
 
 NERI_RT_API void neri_rt_v1_gc_keep_alive(neri_ref_v1 object) {
   require_initialized();
-  if (object != nullptr && find_managed(object) == nullptr &&
+  if (object != nullptr && find_readable(object) == nullptr &&
       !is_string_literal(object)) {
     contract_panic("gc.keep_alive requires a live managed reference");
   }
@@ -1143,10 +1276,10 @@ NERI_RT_API void neri_rt_v1_gc_get_stats(neri_gc_stats_v1 *stats) {
     contract_panic("invalid GC stats destination");
   }
   stats->reserved = 0;
-  stats->managed_object_count = state.managed_object_count;
-  stats->managed_byte_count = state.managed_byte_count;
-  stats->collection_count = state.collection_count;
-  stats->native_byte_count = state.native_byte_count;
+  stats->managed_object_count = current_state().managed_object_count;
+  stats->managed_byte_count = current_state().managed_byte_count;
+  stats->collection_count = current_state().collection_count;
+  stats->native_byte_count = current_state().native_byte_count;
 }
 
 NERI_RT_API neri_ref_v1
@@ -1322,7 +1455,7 @@ neri_rt_v1_host_string_from_bytes(neri_ref_v1 bytes) {
     contract_panic("stringFromBytes requires Byte[]");
   }
   if (!is_strict_utf8(initial.elements, static_cast<size_t>(initial.length))) {
-    last_host_error = "Byte array is not valid UTF-8.";
+    current_state().host_error = "Byte array is not valid UTF-8.";
     return nullptr;
   }
   neri_ref_v1 root = bytes;
@@ -1332,7 +1465,7 @@ neri_rt_v1_host_string_from_bytes(neri_ref_v1 bytes) {
   auto *result = create_utf8_string(rooted.elements,
                                     static_cast<size_t>(rooted.length));
   neri_rt_v1_gc_root_frame_leave(&frame);
-  last_host_error.clear();
+  current_state().host_error.clear();
   return result;
 }
 
@@ -1423,27 +1556,27 @@ neri_rt_v1_host_read_text(neri_ref_v1 path) {
   }
   std::ifstream stream(native_path, std::ios::binary | std::ios::ate);
   if (!stream) {
-    last_host_error = "File open failed: " + native_path;
+    current_state().host_error = "File open failed: " + native_path;
     return nullptr;
   }
   const auto end = stream.tellg();
   constexpr std::streamoff maximum_file_size = 128 * 1024 * 1024;
   if (end < 0 || end > maximum_file_size) {
-    last_host_error = "File is larger than the 128 MiB host limit.";
+    current_state().host_error = "File is larger than the 128 MiB host limit.";
     return nullptr;
   }
   std::vector<uint8_t> bytes(static_cast<size_t>(end));
   stream.seekg(0);
   if (!bytes.empty() &&
       !stream.read(reinterpret_cast<char *>(bytes.data()), end)) {
-    last_host_error = "File read failed: " + native_path;
+    current_state().host_error = "File read failed: " + native_path;
     return nullptr;
   }
   if (!is_strict_utf8(bytes.data(), bytes.size())) {
-    last_host_error = "File is not valid UTF-8: " + native_path;
+    current_state().host_error = "File is not valid UTF-8: " + native_path;
     return nullptr;
   }
-  last_host_error.clear();
+  current_state().host_error.clear();
   return create_utf8_string(bytes.data(), bytes.size());
 }
 
@@ -1491,7 +1624,7 @@ neri_rt_v1_host_remove_file(neri_ref_v1 path) {
     set_errno_error("file removal failed", errno);
     return 0;
   }
-  last_host_error.clear();
+  current_state().host_error.clear();
   return 1;
 }
 
@@ -1507,10 +1640,10 @@ NERI_RT_API neri_ref_v1 neri_rt_v1_host_path_join(
   const auto joined = (std::filesystem::path(left_path) / right_path).string();
   if (!is_strict_utf8(reinterpret_cast<const uint8_t *>(joined.data()),
                       joined.size())) {
-    last_host_error = "Joined path is not valid UTF-8.";
+    current_state().host_error = "Joined path is not valid UTF-8.";
     return nullptr;
   }
-  last_host_error.clear();
+  current_state().host_error.clear();
   return create_utf8_string(reinterpret_cast<const uint8_t *>(joined.data()),
                             joined.size());
 }
@@ -1525,11 +1658,11 @@ neri_rt_v1_host_path_absolute(neri_ref_v1 path) {
   std::error_code error;
   const auto absolute = std::filesystem::absolute(native_path, error);
   if (error) {
-    last_host_error = "Absolute path resolution failed: " + error.message();
+    current_state().host_error = "Absolute path resolution failed: " + error.message();
     return nullptr;
   }
   const auto normalized = absolute.lexically_normal().string();
-  last_host_error.clear();
+  current_state().host_error.clear();
   return create_utf8_string(
       reinterpret_cast<const uint8_t *>(normalized.data()), normalized.size());
 }
@@ -1544,33 +1677,33 @@ neri_rt_v1_host_path_file_name(neri_ref_v1 path) {
   const auto name = std::filesystem::path(native_path).filename().string();
   if (!is_strict_utf8(reinterpret_cast<const uint8_t *>(name.data()),
                       name.size())) {
-    last_host_error = "Path file name is not valid UTF-8.";
+    current_state().host_error = "Path file name is not valid UTF-8.";
     return nullptr;
   }
-  last_host_error.clear();
+  current_state().host_error.clear();
   return create_utf8_string(reinterpret_cast<const uint8_t *>(name.data()),
                             name.size());
 }
 
 NERI_RT_API neri_int_v1 neri_rt_v1_host_argument_count(void) {
   require_initialized();
-  return state.process_argument_count;
+  return current_state().process_argument_count;
 }
 
 NERI_RT_API neri_ref_v1
 neri_rt_v1_host_argument_at(neri_int_v1 index) {
   require_initialized();
-  if (index < 0 || index >= state.process_argument_count) {
-    last_host_error.clear();
+  if (index < 0 || index >= current_state().process_argument_count) {
+    current_state().host_error.clear();
     return nullptr;
   }
-  const auto value = std::string_view(state.process_arguments[index]);
+  const auto value = std::string_view(current_state().process_arguments[index]);
   if (!is_strict_utf8(reinterpret_cast<const uint8_t *>(value.data()),
                       value.size())) {
-    last_host_error = "Process argument is not valid UTF-8.";
+    current_state().host_error = "Process argument is not valid UTF-8.";
     return nullptr;
   }
-  last_host_error.clear();
+  current_state().host_error.clear();
   return create_utf8_string(reinterpret_cast<const uint8_t *>(value.data()),
                             value.size());
 }
@@ -1584,16 +1717,16 @@ neri_rt_v1_host_environment(neri_ref_v1 name) {
   }
   const char *value = std::getenv(native_name.c_str());
   if (value == nullptr) {
-    last_host_error.clear();
+    current_state().host_error.clear();
     return nullptr;
   }
   const auto bytes = std::string_view(value);
   if (!is_strict_utf8(reinterpret_cast<const uint8_t *>(bytes.data()),
                       bytes.size())) {
-    last_host_error = "Environment variable is not valid UTF-8.";
+    current_state().host_error = "Environment variable is not valid UTF-8.";
     return nullptr;
   }
-  last_host_error.clear();
+  current_state().host_error.clear();
   return create_utf8_string(reinterpret_cast<const uint8_t *>(bytes.data()),
                             bytes.size());
 }
@@ -1657,7 +1790,7 @@ NERI_RT_API void neri_rt_v1_host_run(neri_optional_int_v1 *result,
                                    : WIFSIGNALED(status)
                                          ? 128 + WTERMSIG(status)
                                          : status;
-  last_host_error.clear();
+  current_state().host_error.clear();
 }
 
 NERI_RT_API void neri_rt_v1_host_exit(neri_int_v1 status) {
@@ -1671,8 +1804,8 @@ NERI_RT_API void neri_rt_v1_host_exit(neri_int_v1 status) {
 NERI_RT_API neri_ref_v1 neri_rt_v1_host_error_message(void) {
   require_initialized();
   return create_utf8_string(
-      reinterpret_cast<const uint8_t *>(last_host_error.data()),
-      last_host_error.size());
+      reinterpret_cast<const uint8_t *>(current_state().host_error.data()),
+      current_state().host_error.size());
 }
 
 NERI_RT_API void *neri_rt_v1_gc_borrow_begin(
@@ -1689,22 +1822,22 @@ NERI_RT_API void *neri_rt_v1_gc_borrow_begin(
       byte_length > allocation->payload_size - payload_offset) {
     contract_panic("invalid managed borrow");
   }
-  borrow->runtime_words[0] = reinterpret_cast<uintptr_t>(state.borrow);
+  borrow->runtime_words[0] = reinterpret_cast<uintptr_t>(current_state().borrow);
   borrow->runtime_words[1] = reinterpret_cast<uintptr_t>(owner);
   borrow->runtime_words[2] = byte_length;
   borrow->runtime_words[3] = borrow_cookie;
-  state.borrow = borrow;
+  current_state().borrow = borrow;
   return reinterpret_cast<uint8_t *>(owner) +
          sizeof(neri_object_header_v1) + payload_offset;
 }
 
 NERI_RT_API void neri_rt_v1_gc_borrow_end(neri_gc_borrow_v1 *borrow) {
   require_initialized();
-  if (borrow == nullptr || borrow != state.borrow ||
+  if (borrow == nullptr || borrow != current_state().borrow ||
       borrow->runtime_words[3] != borrow_cookie) {
     contract_panic("managed borrows must end in LIFO order");
   }
-  state.borrow =
+  current_state().borrow =
       reinterpret_cast<neri_gc_borrow_v1 *>(borrow->runtime_words[0]);
   std::memset(borrow, 0, sizeof(*borrow));
 }
@@ -1751,7 +1884,7 @@ NERI_RT_API void neri_rt_v1_native_free(void *pointer) {
     contract_panic("native free requires a runtime-owned allocation");
   }
   unlink_native(allocation);
-  state.native_byte_count -= allocation->byte_count;
+  current_state().native_byte_count -= allocation->byte_count;
   std::free(allocation->pointer);
   std::free(allocation);
   assert_consistent();

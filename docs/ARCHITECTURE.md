@@ -87,18 +87,33 @@ The bootstrap release contains a Neri compiler plus its matching codegen and run
 
 ## Execution and optimization boundaries
 
-Safe Neri executes with one managed mutator. At the native boundary, each thread
-has an independent heap, root/borrow stacks, collection state and host-error
-storage. Runtime reference stores and tracing enforce heap ownership. Each native
-thread initializes and shuts down explicitly; there is no cross-heap transfer
-protocol. A closure retaining an object does not make it safe to share with
-another thread. The ABI reserves but does not advertise multiple-mutator support;
-safe Neri has no task, atomic, transfer or synchronization API.
+Safe Neri executes with one managed mutator. Native runtime contexts own independent
+heaps, root/borrow stacks, collection state and host-error storage. Each native
+thread initializes and shuts down its base context explicitly. Runtime reference
+stores and tracing enforce context ownership.
+
+The private `native/runtime/task_heap.h` boundary supports scoped child contexts.
+The coordinator suspends its heap and registers each task before publishing it to
+an executor. The scope waits for all registered tasks, including queued tasks,
+before the parent resumes. Each task has a fresh heap and read access to its
+suspended ancestors. Child collections trace only child-owned objects; ancestor
+heaps remain intact and their mark bits are untouched. Managed stores can retain
+ancestor references in child objects, but their destinations must be child-owned.
+Native borrows require ownership of the borrowed object.
+
+Context identity is independent of worker identity: nested execution on a waiting
+parent's thread preserves every suspended heap. Task teardown requires roots and
+borrows to have ended and reclaims all task-owned allocations. Managed results
+cannot escape this boundary. Callbacks are trusted native code; direct pointer
+writes are outside these checks. This boundary supplies no scheduler or language
+capture checking. A closure retaining an object does not make it safe to share.
+The ABI reserves but does not advertise multiple-mutator support; safe Neri has
+no task, atomic, transfer or synchronization API.
 
 Terminal leases and window state are process-wide, thread-confined services.
 Independent heaps do not permit concurrent terminal/window access or remove
 operating-system resource ownership requirements. Native callbacks remain an
-unsafe integration boundary. ThreadSanitizer checks the independent-heap contract;
+unsafe integration boundary. ThreadSanitizer checks independent and scoped heaps;
 it does not prove safety for every native service or arbitrary user callback.
 
 LLVM Release uses the O2 module pipeline and generic target CPU settings for

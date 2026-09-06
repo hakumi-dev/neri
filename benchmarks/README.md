@@ -195,8 +195,27 @@ tradeoff, not a throughput improvement or parallel scaling result.
 `scripts/build.sh native-test --thread-sanitize` instruments runtime heap access
 and the native worker probe with ThreadSanitizer. The probe checks simultaneous
 independent collection and rejects foreign references through stores and roots.
+It also checks ancestor reads during child collection, nested execution on a
+waiting thread, join-before-resume, and rejection of ancestor writes and borrows.
 It uses C because native entry callbacks are not expressible in Neri's current
 C ABI. Address/undefined-behavior checks use the separate `--sanitize` build.
+
+The [ARM64 task-context comparison](task-heaps-macos-arm64.json) contains three
+paired runtime variants, 72 processes and 504 checked kernel samples. Each pair
+links the same program object against the independent-thread baseline and a
+scoped-context runtime. The current variant uses a constant-initialized active
+context pointer, initializes its base context on first access, and retains a heap
+reference throughout allocation and collection. Its median process medians are
+60/60 ms for integer, 16/16 ms for array and 56/59 ms for allocation
+(baseline/current). The roughly 5% allocation cost includes context and ownership
+checks; these measurements do not isolate their individual costs.
+
+The record also includes dynamically initialized TLS and lazy-base variants
+(allocation medians 57/100 and 57/61 ms within their respective pairs).
+Dynamic TLS guards and repeated heap lookup can materially affect an allocation
+path even when the language-level program is unchanged. Results are descriptive
+observations on AC power, not timing gates, confidence intervals or evidence of
+parallel Neri scaling.
 
 ## Analytical foundations
 
