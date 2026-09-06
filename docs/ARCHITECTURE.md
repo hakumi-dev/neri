@@ -156,11 +156,14 @@ Range calls include worker startup, queue access, task execution and joining.
 The [benchmark methodology](../benchmarks/README.md#analytical-foundations)
 distinguishes measured execution costs from theoretical work/span bounds.
 
-The native caller is responsible for capture safety and synchronization.
-The language's `shared fn` contract restricts access through captured references;
-`parallel fn` also checks transitive call effects. Callbacks execute sequentially
-in safe Neri. The versioned ABI reserves the
-multiple-mutator feature bit and reports it as unsupported.
+`tasks.generate` binds an index callback with a `parallel fn` signature. Shared
+capture checking restricts access to ancestors; transitive effect checking
+rejects unsafe operations and native services. The caller is suspended until
+all callbacks finish. The compiler emits a typed adapter into the joined range
+executor; only this adapter writes the fresh, disjoint output slots. Native
+callers of the same boundary remain responsible for capture safety. The
+versioned ABI advertises scoped tasks, while reserving the multiple-mutator
+feature bit for unrestricted shared-heap mutators and reporting it unsupported.
 [Disentanglement in Nested-Parallel Programs (2020)](https://www.cs.cmu.edu/~swestric/20/popl-disentangled.pdf)
 distinguishes this memory separation property from race freedom: separation alone
 does not justify concurrent mutation of shared data.
@@ -186,7 +189,7 @@ Capability boundaries relevant to performance:
 | Concern | Current contract |
 |---|---|
 | Growing collections | Flat append copies the old array; compiler buffers use linked nodes. |
-| CPU parallelism | Safe code uses one managed mutator; scoped native execution requires trusted callbacks. |
+| CPU parallelism | Scoped task generation uses checked parallel callbacks and one mutator per active heap. |
 | Resource lifetime | Native resources require explicit cleanup. |
 | Generic abstraction | Concrete specialization and type inference. |
 | Data modeling | Classes and native records. |

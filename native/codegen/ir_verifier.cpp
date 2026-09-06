@@ -644,6 +644,28 @@ void require_binary(const function_context &context, const instruction &value,
     fail(invalid_type, "Numeric arithmetic requires one result.");
 
   switch (value.opcode) {
+  case NERI_IR_OPCODE_TASK_GENERATE_V1: {
+    verify_instruction_shape(value, 1U, 4U, 1U, true, false, false);
+    if (std::ranges::find(context.module.required_features, "scoped-tasks-v1") == context.module.required_features.end())
+      fail(unsupported_feature, "Task generation requires scoped-tasks-v1.");
+    if (!is_unsafe_capability(definition_type(context, value.operands[0])))
+      fail(invalid_safety, "Task generation requires the compiler's noninterference capability.");
+    const type integer{NERI_IR_TYPE_INT_V1, std::nullopt, {}};
+    require_operand_type(context, value, 1U, integer);
+    require_operand_type(context, value, 2U, integer);
+    require_result_type(value, 0U, type{NERI_IR_TYPE_ARRAY_V1, std::nullopt, {value.type_arguments.front()}});
+    // The capability trusts capture/effect checking by the source compiler;
+    // virtual signature and conservative effect verification remain mandatory.
+    auto callback = value;
+    callback.opcode = NERI_IR_OPCODE_CALL_VIRTUAL_V1;
+    callback.operands = {value.operands[3], value.operands[1]};
+    callback.type_arguments.clear();
+    callback.results.front().value_type = value.type_arguments.front();
+    return verify_virtual_call(context, callback) | NERI_IR_EFFECT_UNSAFE_V1 |
+        NERI_IR_EFFECT_READ_V1 | NERI_IR_EFFECT_WRITE_V1 |
+        NERI_IR_EFFECT_MAY_PANIC_V1 | NERI_IR_EFFECT_MANAGED_ALLOCATE_V1 |
+        NERI_IR_EFFECT_SAFEPOINT_V1;
+  }
   case NERI_IR_OPCODE_CONSTANT_V1:
     verify_instruction_shape(value, 1U, 0U, 0U, false, true, false);
     verify_constant(*value.constant_value, value.results.front().value_type);
@@ -1501,7 +1523,7 @@ void verify_supported_module(const ir_module &value) {
            "Required feature '" + feature +
                "' is not a canonical feature identifier.");
     }
-    if (feature != "string-data-v1" && feature != "native-strings-v1" && feature != "native-libraries-v1" && feature != "extended-scalars-v1" && feature != "native-records-v1") {
+    if (feature != "string-data-v1" && feature != "native-strings-v1" && feature != "native-libraries-v1" && feature != "extended-scalars-v1" && feature != "native-records-v1" && feature != "scoped-tasks-v1") {
       fail(unsupported_feature,
            "Unknown required semantic feature '" + feature + "'.");
     }

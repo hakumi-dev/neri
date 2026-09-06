@@ -1,7 +1,7 @@
 # Runtime and IR boundary
 
 The canonical exported declarations and layouts are in
-[`runtime_abi.h`](../native/include/neri/runtime_abi.h). Runtime ABI 1.9 uses a
+[`runtime_abi.h`](../native/include/neri/runtime_abi.h). Runtime ABI 1.10 uses a
 C calling convention on macOS ARM64 and Linux x86-64. Generated programs negotiate
 major version, minimum minor version and required feature bits before execution.
 The package manifest also identifies the toolchain version and native target.
@@ -13,7 +13,7 @@ and the public session API are implemented in Neri.
 
 ## Representation
 
-ABI 1.9 advertises `EXTENDED_SCALARS` (512). `Int32`, `UInt32`, and `Float32`
+The `EXTENDED_SCALARS` feature (512) defines `Int32`, `UInt32`, and `Float32`, which
 occupy four bytes with four-byte alignment; `UInt64` occupies eight bytes with
 eight-byte alignment. Their array descriptors identify each scalar kind.
 Transport 1.2 carries these types under `extended-scalars-v1`; numeric cast
@@ -46,7 +46,14 @@ tracing reject objects from unrelated heaps. The runtime's
 [private scoped-task boundary](ARCHITECTURE.md#execution-and-optimization-boundaries)
 allows child contexts to read suspended ancestor heaps until their scope joins;
 registered result spans retain child objects for ownership adoption after all
-tasks finish. This trusted native protocol is not part of the versioned ABI.
+tasks finish. The low-level scope protocol is private. ABI 1.10 exposes
+`neri_rt_v1_task_generate` under `SCOPED_TASKS` (16384): the compiler supplies a
+typed callback adapter and an array descriptor. The runtime roots the callback
+and fresh output before suspending the caller. Each child roots its disjoint
+managed-result span; the adapter stores each callback result without an
+intervening safepoint. Join adopts child allocations before the caller resumes.
+The native entry trusts the compiler's capture and effect proof; an arbitrary C
+callback does not acquire memory safety by calling it.
 Static string literals are immortal
 and may be referenced by any heap. Ordinary managed strings remain heap-owned,
 even though their content is immutable. Raw native pointers do not provide a
@@ -84,13 +91,21 @@ Runtime contract failures panic; no exception unwinds into Neri code.
 ## IR transport
 
 The compiler emits canonical Neri IR with transport 1.1, 1.2 for extended
-scalars or external library metadata, and 1.3 for native records and fixed arrays.
+scalars or external library metadata, 1.3 for native records and fixed arrays,
+and 1.4 for `scoped-tasks-v1`.
 The `native-libraries-v1` feature carries a library
 name after each import's source location; empty names retain platform-default
 symbol resolution. Only C ABI imports may declare a library. The transport header
 includes versions, flags, payload size and a SHA-256 digest. The native reader
 validates the envelope and the typed program before constructing LLVM objects.
 Malformed, unsupported and incompatible inputs produce stable NIR diagnostics.
+
+`task.generate<R>` (61) returns `R[]` and carries a virtual invoke-slot symbol,
+an unsafe capability, count, parallelism, and callback. The capability makes the
+source compiler's noninterference proof an explicit trust boundary. Native
+verification checks the callback signature, operand/result types, required
+feature and conservative virtual-call effects. The source compiler separately
+checks shared captures and parallel-call effects before emitting the operation.
 
 `native-records-v1` appends native declarations after the function vector, sorted
 by name. Each declaration carries its identity, struct/union flag and ordered

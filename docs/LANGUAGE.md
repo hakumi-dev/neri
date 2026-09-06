@@ -337,10 +337,40 @@ named function values. A parallel callback can widen to `shared fn` or `fn` with
 the same signature. Assignment and casts preserve these capability boundaries;
 shared and ordinary callback values cannot be upgraded to `parallel fn`.
 
-Calls use the ordinary callback calling convention and execute sequentially in
-safe Neri. This type checks captures and effects; it neither schedules tasks nor
-establishes exclusive ownership of explicit mutable arguments. Sequential aliases
-retain access to the captured objects.
+Direct calls use the ordinary callback calling convention. The type checks
+captures and effects; a direct call does not schedule a task or establish
+exclusive ownership of explicit mutable arguments.
+
+### Scoped task generation
+
+`use tasks` provides `tasks.generate(count, callback)` and
+`tasks.generate(count, parallelism, callback)`. The callback has type
+`parallel fn(Int): R`; the result is a new `R[]` in index order.
+
+```neri
+use tasks
+
+def squares(count: Int): Int[]
+  return tasks.generate(count) do |index|
+    return index * index
+  end
+end
+```
+
+The expected array type, an explicit `tasks.generate<R>` argument, or a typed
+callback supplies `R`. Elements use the array storage contract: scalars, managed
+references, or nullable managed references. An empty range returns an empty array
+without invoking the callback. Count must be nonnegative. Parallelism is an Int
+between zero and 4294967295; zero selects the available hardware parallelism.
+Invalid runtime values panic.
+
+The caller waits for every task. Captures are shared as read-only views without
+copying their object graphs. Each callback may allocate and mutate local objects;
+returned objects remain valid and retain their aliasing after the call. Each
+result slot is exclusive to its index and is invisible to other callbacks.
+Execution order is unspecified; callbacks cannot rely on sibling ordering.
+Nested generation reuses the outer worker pool and makes progress with one
+participant. Each outer call includes worker startup and joining.
 
 ## Unsafe and memory boundary
 

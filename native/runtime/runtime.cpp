@@ -42,7 +42,8 @@ constexpr uint64_t runtime_features =
     NERI_RT_FEATURE_ROOT_FRAMES | NERI_RT_FEATURE_SOURCE_LOCATIONS |
     NERI_RT_FEATURE_NATIVE_STRINGS | NERI_RT_FEATURE_CONSOLE_IO |
     NERI_RT_FEATURE_BOOTSTRAP_HOST | NERI_RT_FEATURE_SOCKETS |
-    NERI_RT_FEATURE_INTERACTIVE_IO | NERI_RT_FEATURE_EXTENDED_SCALARS;
+    NERI_RT_FEATURE_INTERACTIVE_IO | NERI_RT_FEATURE_EXTENDED_SCALARS |
+    NERI_RT_FEATURE_SCOPED_TASKS;
 constexpr uint32_t known_type_flags = NERI_TYPE_FLAG_CONTAINS_REFS_V1 |
                                       NERI_TYPE_FLAG_IMMUTABLE_V1;
 
@@ -1058,6 +1059,21 @@ void adopt_results(neri_task_scope &scope) {
     delete result;
   }
 }
+
+struct generated_range {
+  neri_ref_v1 callback;
+  neri_task_generate_fn_v1 adapter;
+  uint8_t *elements;
+  uint64_t stride;
+};
+
+void generate_range(uint64_t begin, uint64_t end, void *context) {
+  const auto &range = *static_cast<generated_range *>(context);
+  for (auto index = begin; index < end; ++index) {
+    range.adapter(range.callback, static_cast<neri_int_v1>(index),
+                  range.elements + index * range.stride);
+  }
+}
 } // namespace
 
 extern "C" {
@@ -1086,6 +1102,42 @@ NERI_RT_API extern const neri_type_descriptor_v1
 
 NERI_RT_API const neri_runtime_abi_info_v1 *neri_rt_v1_get_abi(void) {
   return &runtime_abi;
+}
+
+NERI_RT_API neri_ref_v1 neri_rt_v1_task_generate(neri_int_v1 count,
+    neri_int_v1 parallelism, const neri_type_descriptor_v1 *array_type,
+    neri_ref_v1 callback, neri_task_generate_fn_v1 adapter) {
+  require_initialized();
+  if (count < 0 || parallelism < 0 || static_cast<uint64_t>(parallelism) > UINT32_MAX ||
+      array_type == nullptr || array_type->kind != NERI_TYPE_KIND_ARRAY_V1 ||
+      array_type->element_size == 0 || callback == nullptr ||
+      find_readable(callback) == nullptr || adapter == nullptr) {
+    contract_panic("invalid task generation contract");
+  }
+  const auto length = static_cast<uint64_t>(count);
+  if (length > (UINT64_MAX - array_type->payload_size) / array_type->element_size) {
+    out_of_memory("task result array size overflow");
+  }
+  const bool references = (array_type->flags & NERI_TYPE_FLAG_CONTAINS_REFS_V1) != 0;
+  if (references && (array_type->element_size != sizeof(neri_ref_v1) ||
+                     array_type->element_alignment != alignof(neri_ref_v1))) {
+    contract_panic("task result references require pointer-sized elements");
+  }
+  neri_ref_v1 roots[2]{callback, nullptr};
+  neri_gc_root_frame_v1 frame{nullptr, roots, 2, 0};
+  neri_rt_v1_gc_root_frame_enter(&frame);
+  roots[1] = neri_rt_v1_gc_alloc(array_type,
+      array_type->payload_size + length * array_type->element_size,
+      array_type->payload_alignment);
+  reinterpret_cast<neri_array_prefix_v1 *>(roots[1])->length = length;
+  auto *elements = reinterpret_cast<uint8_t *>(roots[1]) +
+      sizeof(neri_object_header_v1) + array_type->payload_size;
+  generated_range range{callback, adapter, elements, array_type->element_size};
+  neri_task_parallel_for(length, parallelism == 0 ? UINT32_MAX : static_cast<uint32_t>(parallelism),
+      generate_range, &range, references ? reinterpret_cast<neri_ref_v1 *>(elements) : nullptr,
+      references ? 1 : 0);
+  neri_rt_v1_gc_root_frame_leave(&frame);
+  return roots[1];
 }
 
 void neri_task_scope_run(neri_task_coordinator coordinate, void *context) {

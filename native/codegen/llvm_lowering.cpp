@@ -779,25 +779,7 @@ private:
         const instruction &instruction) {
       const auto &target = module_.find_virtual_signature(*instruction.symbol);
       auto *receiver = value(instruction.operands.front());
-      auto *type_slot = builder_.CreateInBoundsGEP(
-          builder_.getInt8Ty(), receiver, builder_.getInt64(0),
-          "object.type.slot");
-      auto *descriptor = builder_.CreateAlignedLoad(
-          llvm::PointerType::getUnqual(module_.context_), type_slot,
-          llvm::Align(alignof(void *)), "object.type");
-      auto *table_slot = builder_.CreateStructGEP(
-          module_.type_descriptor_type(), descriptor, 10U,
-          "object.method.table.slot");
-      auto *table = builder_.CreateAlignedLoad(
-          llvm::PointerType::getUnqual(module_.context_), table_slot,
-          llvm::Align(alignof(void *)), "object.method.table");
-      auto *method_slot = builder_.CreateInBoundsGEP(
-          llvm::PointerType::getUnqual(module_.context_), table,
-          builder_.getInt64(module_.dispatch_slot_index(*instruction.symbol)),
-          "object.method.slot");
-      auto *callee = builder_.CreateAlignedLoad(
-          llvm::PointerType::getUnqual(module_.context_), method_slot,
-          llvm::Align(alignof(void *)), "object.method");
+      auto *callee = module_.virtual_target(builder_, receiver, *instruction.symbol);
       auto *function_type = module_.physical_function_type(
           target.parameter_types, target.result_type);
       return lower_call_target(instruction, target.parameter_types,
@@ -1304,6 +1286,16 @@ private:
         break;
       case NERI_IR_OPCODE_UNSAFE_END_V1:
         break;
+      case NERI_IR_OPCODE_TASK_GENERATE_V1: {
+        const auto &element = instruction.type_arguments.front();
+        auto *call = builder_.CreateCall(module_.task_generate_function(),
+            {value(instruction.operands[1]), value(instruction.operands[2]),
+             module_.array_descriptor(element), value(instruction.operands[3]),
+             module_.task_adapter(*instruction.symbol)}, "task.results");
+        call->setCallingConv(llvm::CallingConv::C);
+        result = call;
+        break;
+      }
       case NERI_IR_OPCODE_STACK_ALLOC_V1: {
         const auto &element = instruction.type_arguments.front();
         auto *count = value(instruction.operands[1]);
@@ -1652,6 +1644,46 @@ private:
 
   [[nodiscard]] std::size_t dispatch_slot_index(const symbol_id &id) const {
     return dispatch_slot_indices_.at(symbol_key(id));
+  }
+
+  [[nodiscard]] llvm::Value *virtual_target(llvm::IRBuilder<> &builder,
+      llvm::Value *receiver, const symbol_id &slot) {
+    auto *pointer = llvm::PointerType::getUnqual(context_);
+    auto *descriptor = builder.CreateAlignedLoad(pointer, receiver,
+        llvm::Align(alignof(void *)), "object.type");
+    auto *table_slot = builder.CreateStructGEP(type_descriptor_type(), descriptor,
+        10U, "object.method.table.slot");
+    auto *table = builder.CreateAlignedLoad(pointer, table_slot,
+        llvm::Align(alignof(void *)), "object.method.table");
+    auto *method_slot = builder.CreateInBoundsGEP(pointer, table,
+        builder.getInt64(dispatch_slot_index(slot)), "object.method.slot");
+    return builder.CreateAlignedLoad(pointer, method_slot,
+        llvm::Align(alignof(void *)), "object.method");
+  }
+
+  [[nodiscard]] llvm::Function *task_adapter(const symbol_id &slot) {
+    const auto name = ".hk.task.adapter." + qualified_name(slot);
+    if (auto *existing = output_->getFunction(name)) return existing;
+    auto *pointer = llvm::PointerType::getUnqual(context_);
+    auto *adapter = llvm::Function::Create(llvm::FunctionType::get(
+        llvm::Type::getVoidTy(context_), {pointer, llvm::Type::getInt64Ty(context_), pointer}, false),
+        llvm::GlobalValue::PrivateLinkage, name, output_.get());
+    adapter->setCallingConv(llvm::CallingConv::C);
+    llvm::IRBuilder<> builder(llvm::BasicBlock::Create(context_, "entry", adapter));
+    const auto &target = find_virtual_signature(slot);
+    auto *callee = virtual_target(builder, adapter->getArg(0), slot);
+    std::vector<llvm::Value *> arguments;
+    arguments.push_back(adapter->getArg(0));
+    arguments.push_back(adapter->getArg(1));
+    auto *call = builder.CreateCall(physical_function_type(target.parameter_types, target.result_type),
+        callee, arguments);
+    call->setCallingConv(llvm::CallingConv::C);
+    // The runtime roots this child's disjoint result span. No safepoint may
+    // occur between the callback return and the physical element store.
+    builder.CreateAlignedStore(call, adapter->getArg(2),
+        llvm::Align(storage_alignment(target.result_type)));
+    builder.CreateRetVoid();
+    return adapter;
   }
 
   [[nodiscard]] const function &find_virtual_signature(
@@ -2213,6 +2245,10 @@ private:
       minimum_minor = 9;
       required_features |= NERI_RT_FEATURE_EXTENDED_SCALARS;
     }
+    if (std::ranges::find(input_.required_features, "scoped-tasks-v1") != input_.required_features.end()) {
+      minimum_minor = 10;
+      required_features |= NERI_RT_FEATURE_SCOPED_TASKS;
+    }
     if (std::ranges::find(input_.required_features, "native-strings-v1") !=
         input_.required_features.end()) {
       minimum_minor = std::max(minimum_minor, native_string_runtime_minor);
@@ -2464,6 +2500,13 @@ private:
         "neri_rt_v1_gc_root_frame_enter",
         llvm::Type::getVoidTy(context_),
         {llvm::PointerType::getUnqual(context_)});
+  }
+
+  [[nodiscard]] llvm::Function *task_generate_function() {
+    auto *pointer = llvm::PointerType::getUnqual(context_);
+    auto *integer = llvm::Type::getInt64Ty(context_);
+    return runtime_function("neri_rt_v1_task_generate", pointer,
+        {integer, integer, pointer, pointer, pointer});
   }
 
   [[nodiscard]] llvm::Function *root_frame_leave_function() {

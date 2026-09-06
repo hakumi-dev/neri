@@ -183,7 +183,7 @@ set(NERI_MANIFEST_VERSION "${NERI_VERSION}")
 set(NERI_MANIFEST_NAME "neri-runtime-${NERI_TARGET}.json")
   file(GENERATE
     OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/${NERI_MANIFEST_NAME}"
-    CONTENT "{\n  \"schemaVersion\": 2,\n  \"toolchainVersion\": \"${NERI_MANIFEST_VERSION}\",\n  \"irTransportMajor\": 1,\n  \"irTransportMinor\": 1,\n  \"target\": \"${NERI_TARGET}\",\n  \"abiMajor\": 1,\n  \"abiMinor\": 9,\n  \"features\": 15103,\n  \"artifact\": \"$<TARGET_FILE_NAME:neri_runtime>\"\n}\n"
+    CONTENT "{\n  \"schemaVersion\": 2,\n  \"toolchainVersion\": \"${NERI_MANIFEST_VERSION}\",\n  \"irTransportMajor\": 1,\n  \"irTransportMinor\": 1,\n  \"target\": \"${NERI_TARGET}\",\n  \"abiMajor\": 1,\n  \"abiMinor\": 10,\n  \"features\": 31487,\n  \"artifact\": \"$<TARGET_FILE_NAME:neri_runtime>\"\n}\n"
   )
 install(TARGETS neri_codegen_cli neri_runtime RUNTIME DESTINATION bin ARCHIVE DESTINATION lib)
 install(FILES "${CMAKE_CURRENT_BINARY_DIR}/neri-runtime-${NERI_TARGET}.json" DESTINATION lib)

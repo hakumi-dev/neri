@@ -58,15 +58,19 @@ The contracts are:
   `j = 0..r-1`. Changing each count prevents loop-invariant reuse of identical
   pure calls. Each job is independently checked by the logarithmic oracle.
 
-## Multicore reference
+## Multicore execution
 
-Neri currently executes `batch` sequentially. The C# reference accepts an optional
-worker limit and uses a joined `Parallel.For`, one result slot per job, and a
-checked final reduction. The one-worker case is the ordinary sequential loop.
-Scheduling, worker-result storage and the join are included in the timer.
+Both programs accept an optional worker limit for `batch`. Neri uses
+`tasks.generate`; the C# reference uses a joined `Parallel.For`. Both use one
+result slot per job and a checked final reduction. The one-worker case is the
+ordinary sequential loop, so scaling includes the cost of introducing task
+execution. Scheduling, worker-result storage and the join are inside the timer.
+Neri creates and joins its worker threads per call; .NET may reuse pool threads.
 
 ```sh
 ./build/compute batch 2000000 64
+./build/compute batch 2000000 64 4
+./build/compute batch 2000000 64 14
 DOTNET_TieredCompilation=0 dotnet benchmarks/reference-dotnet/bin/Release/net10.0/Compute.dll batch 2000000 64 1
 DOTNET_TieredCompilation=0 dotnet benchmarks/reference-dotnet/bin/Release/net10.0/Compute.dll batch 2000000 64 4
 DOTNET_TieredCompilation=0 dotnet benchmarks/reference-dotnet/bin/Release/net10.0/Compute.dll batch 2000000 64 14
@@ -74,8 +78,8 @@ DOTNET_TieredCompilation=0 dotnet benchmarks/reference-dotnet/bin/Release/net10.
 
 A worker limit is not a promise of that many simultaneously active physical cores.
 Compute `S(p) = T(1)/T(p)` and `E(p) = S(p)/p` within one implementation on one
-machine. C# scaling is a reference for this workload; it does not demonstrate
-parallel Neri execution. Repeat native ARM64 and native x86-64 measurements
+machine. Each language's measurements establish only its own scaling for this
+workload. Repeat native ARM64 and native x86-64 measurements
 separately; emulation is not hardware performance evidence.
 
 ## Repeated native comparison
@@ -84,8 +88,8 @@ separately; emulation is not hardware performance evidence.
 default .NET JIT, optimized JIT with tiering disabled, and .NET NativeAOT. Each
 configuration occupies every position once across four independent process
 repetitions. Worker counts are powers of two up to a supplied limit, including
-the limit itself; their order reverses in alternate repetitions. Neri has only
-the sequential batch case. This is a deterministic balanced order, not a random
+the limit itself; their order reverses in alternate repetitions. This is a
+deterministic balanced order, not a random
 sample of machine conditions.
 
 ```sh

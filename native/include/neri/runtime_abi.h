@@ -21,7 +21,7 @@ extern "C" {
 #endif
 
 #define NERI_RUNTIME_ABI_MAJOR UINT16_C(1)
-#define NERI_RUNTIME_ABI_MINOR UINT16_C(9)
+#define NERI_RUNTIME_ABI_MINOR UINT16_C(10)
 
 #define NERI_RT_FEATURE_PRECISE_GC UINT64_C(1)
 #define NERI_RT_FEATURE_NONMOVING_GC (UINT64_C(1) << 1)
@@ -39,6 +39,7 @@ extern "C" {
 #define NERI_RT_FEATURE_BOOTSTRAP_HOST (UINT64_C(1) << 11)
 #define NERI_RT_FEATURE_SOCKETS (UINT64_C(1) << 12)
 #define NERI_RT_FEATURE_INTERACTIVE_IO (UINT64_C(1) << 13)
+#define NERI_RT_FEATURE_SCOPED_TASKS (UINT64_C(1) << 14)
 
 #define NERI_TYPE_KIND_CLASS_V1 UINT32_C(1)
 #define NERI_TYPE_KIND_STRING_V1 UINT32_C(2)
@@ -229,6 +230,18 @@ NERI_RT_API void neri_rt_v1_gc_store_ref(neri_ref_v1 owner,
 NERI_RT_API void neri_rt_v1_gc_keep_alive(neri_ref_v1 object);
 NERI_RT_API void neri_rt_v1_gc_collect(void);
 NERI_RT_API void neri_rt_v1_gc_get_stats(neri_gc_stats_v1 *stats);
+
+/* Joined generation with a compiler-verified callback. The adapter writes one
+ * element in its physical array layout without allocating after obtaining the
+ * returned value. Captures must be read-only; output slots are fresh, disjoint
+ * and inaccessible through captures. Zero parallelism selects the host limit.
+ * The parent adopts managed results before returning; callers root the result
+ * across subsequent allocating operations. Raw native adapters are trusted. */
+typedef void (*neri_task_generate_fn_v1)(neri_ref_v1 callback, neri_int_v1 index,
+                                        void *output);
+NERI_RT_API neri_ref_v1 neri_rt_v1_task_generate(neri_int_v1 count,
+    neri_int_v1 parallelism, const neri_type_descriptor_v1 *array_type,
+    neri_ref_v1 callback, neri_task_generate_fn_v1 adapter);
 
 /* Immutable UTF-8 strings. Literal objects use the exported immortal type. */
 NERI_RT_API extern const neri_type_descriptor_v1

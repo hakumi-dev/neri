@@ -313,6 +313,8 @@ public:
     for (const auto &feature : result.required_features) {
       if (feature == "native-libraries-v1") native_libraries_ = true;
       if (feature == "native-records-v1") native_records_ = true;
+      if (feature == "scoped-tasks-v1" && transport_minor_ < 4U)
+        fail(unsupported_feature, "Scoped tasks require IR transport 1.4.", input_.offset());
     }
     if (native_libraries_ && transport_minor_ < 2U) {
       fail(unsupported_feature, "Native libraries require IR transport 1.2.", input_.offset());
@@ -584,7 +586,7 @@ private:
     const auto opcode_offset = input_.offset();
     result.opcode = input_.u16();
     require_tag(result.opcode, NERI_IR_OPCODE_CONSTANT_V1,
-                NERI_IR_OPCODE_NATIVE_INDEX_ADDRESS_CHECKED_V1, "opcode", opcode_offset);
+                NERI_IR_OPCODE_TASK_GENERATE_V1, "opcode", opcode_offset);
     result.results = read_vector<value_definition>(
         input_, "instruction results",
         [this] { return read_value_definition(); });
