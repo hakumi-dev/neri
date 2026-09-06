@@ -401,6 +401,95 @@ static void reject_result_boundary(neri_ref_v1 ancestor, neri_task_body body) {
   CHECK(WIFEXITED(status) && WEXITSTATUS(status) == NERI_RUNTIME_PANIC_EXIT_CODE_V1);
 }
 
+enum { range_count = 37 };
+typedef struct range_case {
+  neri_ref_v1 ancestor;
+  neri_ref_v1 results[range_count];
+  unsigned visits[range_count];
+  pthread_t participants[2];
+  unsigned participant_count;
+  unsigned arrivals;
+  unsigned limit;
+  pthread_mutex_t mutex;
+  pthread_cond_t changed;
+} range_case;
+
+static void record_participant(range_case *test) {
+  CHECK(pthread_mutex_lock(&test->mutex) == 0);
+  unsigned index = 0;
+  while (index < test->participant_count && !pthread_equal(test->participants[index], pthread_self())) ++index;
+  if (index == test->participant_count) {
+    CHECK(index < test->limit);
+    test->participants[index] = pthread_self();
+    ++test->participant_count;
+  }
+  CHECK(pthread_mutex_unlock(&test->mutex) == 0);
+}
+
+typedef struct nested_range {
+  range_case *test;
+  neri_ref_v1 parent;
+  neri_ref_v1 results[2];
+} nested_range;
+
+static void nested_range_body(uint64_t begin, uint64_t end, void *context) {
+  nested_range *nested = context;
+  record_participant(nested->test);
+  for (uint64_t index = begin; index < end; ++index) {
+    nested->results[index] = allocate();
+    neri_rt_v1_gc_store_ref(nested->results[index], &payload(nested->results[index])->next, nested->parent);
+  }
+}
+
+static void range_body(uint64_t begin, uint64_t end, void *context) {
+  range_case *test = context;
+  record_participant(test);
+  /* Occupy both participants before nesting. Blocking joins would deadlock. */
+  CHECK(pthread_mutex_lock(&test->mutex) == 0);
+  ++test->arrivals;
+  CHECK(pthread_cond_broadcast(&test->changed) == 0);
+  while (test->arrivals < test->limit) CHECK(pthread_cond_wait(&test->changed, &test->mutex) == 0);
+  CHECK(pthread_mutex_unlock(&test->mutex) == 0);
+  CHECK(begin < end && end <= range_count);
+  for (uint64_t index = begin; index < end; ++index) {
+    ++test->visits[index];
+    test->results[index] = allocate();
+    payload(test->results[index])->value = (int64_t)index;
+    neri_rt_v1_gc_store_ref(test->results[index], &payload(test->results[index])->shared, test->ancestor);
+    nested_range nested = {test, test->results[index], {NULL, NULL}};
+    neri_task_parallel_for(2, test->limit, nested_range_body, &nested, nested.results, 1);
+    neri_rt_v1_gc_store_ref(test->results[index], &payload(test->results[index])->next, nested.results[0]);
+    neri_rt_v1_gc_store_ref(nested.results[0], &payload(nested.results[0])->next, nested.results[1]);
+  }
+}
+
+static void check_bounded_ranges(neri_ref_v1 ancestor, unsigned limit) {
+  range_case test = {0};
+  test.ancestor = ancestor;
+  test.limit = limit;
+  CHECK(pthread_mutex_init(&test.mutex, NULL) == 0);
+  CHECK(pthread_cond_init(&test.changed, NULL) == 0);
+  neri_gc_root_frame_v1 frame = {NULL, test.results, range_count, 0};
+  neri_rt_v1_gc_root_frame_enter(&frame);
+  neri_task_parallel_for(0, limit, range_body, &test, NULL, 1);
+  CHECK(test.arrivals == 0);
+  neri_task_parallel_for(range_count, limit, range_body, &test, test.results, 1);
+  CHECK(test.participant_count == limit);
+  neri_rt_v1_gc_collect();
+  CHECK(stats().managed_object_count == 1 + 3 * range_count);
+  for (unsigned index = 0; index < range_count; ++index) {
+    neri_ref_v1 root = test.results[index];
+    CHECK(test.visits[index] == 1 && payload(root)->value == index);
+    CHECK(payload(root)->shared == ancestor && payload(payload(payload(root)->next)->next)->next == root);
+    test.results[index] = NULL;
+  }
+  neri_rt_v1_gc_collect();
+  CHECK(stats().managed_object_count == 1);
+  neri_rt_v1_gc_root_frame_leave(&frame);
+  CHECK(pthread_cond_destroy(&test.changed) == 0);
+  CHECK(pthread_mutex_destroy(&test.mutex) == 0);
+}
+
 int main(void) {
   initialize();
   neri_ref_v1 root = allocate();
@@ -428,6 +517,8 @@ int main(void) {
   reject_result_boundary(root, leak_result_root);
   reject_result_boundary(root, leak_result_borrow);
   check_result_adoption(root);
+  check_bounded_ranges(root, 1);
+  if (sysconf(_SC_NPROCESSORS_ONLN) > 1) check_bounded_ranges(root, 2);
   neri_rt_v1_gc_root_frame_leave(&frame);
   neri_rt_v1_shutdown();
   return 0;

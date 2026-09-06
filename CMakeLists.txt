@@ -116,6 +116,7 @@ add_library(neri_runtime STATIC
   native/runtime/entry.cpp
   native/runtime/math.cpp
   native/runtime/runtime.cpp
+  native/runtime/task_executor.cpp
   native/runtime/socket.c
   native/runtime/terminal.c
   native/runtime/test_support.cpp

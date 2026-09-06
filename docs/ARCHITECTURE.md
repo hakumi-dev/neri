@@ -101,6 +101,11 @@ heaps remain intact and their mark bits are untouched. Managed stores can retain
 ancestor references in child objects, but their destinations must be child-owned.
 Native borrows require ownership of the borrowed object.
 
+This task-tree/heap-tree organization and ancestor-directed reference discipline
+are described in
+[Hierarchical Memory Management for Parallel Programs (2016)](https://www.cs.cmu.edu/~rraghuna/publications/icfp-2016-hierarchical-memory-management-for-parallel-programs/paper.pdf).
+Neri uses nonmoving collection and deferred ownership adoption.
+
 Context identity is independent of worker identity: nested execution on a waiting
 parent's thread preserves every suspended heap. Tasks may register initialized,
 disjoint result-reference spans whose storage remains valid through join. The
@@ -119,27 +124,37 @@ objects, in addition to final child collection. The parent must keep results
 rooted across subsequent allocating calls. The native caller guarantees that
 output spans are inaccessible through other tasks and captures. Callbacks are
 trusted native code; direct pointer writes are outside these checks.
-This boundary supplies no scheduler or language
-capture checking. A closure retaining an object does not make it safe to share.
-The frontend's `shared fn` contract restricts access through captured references;
-it does not connect a callback to this native task boundary or check parallel
-effects and result transfer.
-The ABI reserves but does not advertise multiple-mutator support; safe Neri has
-no task, atomic, transfer or synchronization API.
 
-[Hierarchical Memory Management for Parallel Programs (2016)](https://www.cs.cmu.edu/~rraghuna/publications/icfp-2016-hierarchical-memory-management-for-parallel-programs/paper.pdf)
-provides the task-tree/heap-tree model and ancestor-only reference discipline.
-Neri's private boundary uses a nonmoving collector and deferred ownership adoption,
-not that paper's copying collector or a proof of its language calculus.
+`native/runtime/task_executor.cpp` provides a joined range executor over this
+boundary. A nonempty outer call creates at most `min(parallelism, hardware, count)`
+participants, including its caller. Nested groups reuse the same pool. Each group
+limits its active range invocations, including those waiting for nested groups;
+the outer pool bounds the total number of executing threads. Separate native
+outer callers own separate pools. Workers are joined when the outer call returns.
+
+A group partitions `[0, count)` into at most four chunks per allowed participant,
+with contiguous, disjoint output spans. A mutex-protected LIFO queue supplies
+eligible chunks. Waiting coordinators execute eligible work from the same pool
+and sleep on a condition variable only when no eligible chunk is queued. This
+allows nested groups to progress with one participant or with every participant
+already inside a task. Callbacks must not depend on sibling execution order or
+block waiting for siblings.
+
+Range calls include worker startup, queue access, task execution and joining.
+The [benchmark methodology](../benchmarks/README.md#analytical-foundations)
+distinguishes measured execution costs from theoretical work/span bounds.
+
+The native caller is responsible for capture safety and synchronization.
+The language's `shared fn` contract restricts access through captured references;
+its callbacks execute sequentially in safe Neri. The versioned ABI reserves the
+multiple-mutator feature bit and reports it as unsupported.
 [Disentanglement in Nested-Parallel Programs (2020)](https://www.cs.cmu.edu/~swestric/20/popl-disentangled.pdf)
 distinguishes this memory separation property from race freedom: separation alone
 does not justify concurrent mutation of shared data.
 
 Terminal leases and window state are process-wide, thread-confined services.
-Independent heaps do not permit concurrent terminal/window access or remove
-operating-system resource ownership requirements. Native callbacks remain an
-unsafe integration boundary. ThreadSanitizer checks independent and scoped heaps;
-it does not prove safety for every native service or arbitrary user callback.
+Native integrations must preserve their operating-system resource ownership and
+synchronization requirements across runtime contexts.
 
 LLVM Release uses the O2 module pipeline and generic target CPU settings for
 ARM64 and x86-64. Checked arithmetic, bounds and strict floating-point semantics
@@ -153,15 +168,15 @@ not independently scheduled tasks. Generic specialization is cached within a
 compilation. The run cache reuses a whole native executable after frontend
 verification, rather than incrementally evaluating compiler queries.
 
-Current capability boundaries relevant to performance:
+Capability boundaries relevant to performance:
 
 | Concern | Current contract |
 |---|---|
-| Growing collections | Flat append copies the old array; compiler buffers use linked nodes. General capacity-based typed collections are tracked in [#28](https://github.com/hakumi-dev/neri/issues/28). |
-| CPU parallelism | One managed mutator; bounded concurrency and sharing rules are tracked in [#32](https://github.com/hakumi-dev/neri/issues/32). |
-| Resource lifetime | Native resources require explicit cleanup; automatic scopes are tracked in [#29](https://github.com/hakumi-dev/neri/issues/29). |
-| Generic abstraction | Concrete specialization and inference; explicit interfaces and constraints are tracked in [#24](https://github.com/hakumi-dev/neri/issues/24). |
-| Data modeling | Classes and native records; immutable domain values and closed sum types are tracked in [#26](https://github.com/hakumi-dev/neri/issues/26) and [#25](https://github.com/hakumi-dev/neri/issues/25). |
+| Growing collections | Flat append copies the old array; compiler buffers use linked nodes. |
+| CPU parallelism | Safe code uses one managed mutator; scoped native execution requires trusted callbacks. |
+| Resource lifetime | Native resources require explicit cleanup. |
+| Generic abstraction | Concrete specialization and type inference. |
+| Data modeling | Classes and native records. |
 | Machine targeting | Generic ARM64/x86-64 emission; no language-level SIMD or per-CPU feature selection. |
 
 The [compute benchmarks](../benchmarks/README.md) separate kernel throughput from

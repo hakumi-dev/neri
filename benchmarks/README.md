@@ -200,6 +200,10 @@ waiting thread, join-before-resume, and rejection of ancestor writes and borrows
 Returned graphs preserve identity and cycles across nested joins, become
 parent-owned, and are reclaimed when their roots disappear. Sibling result
 references and unfinished body roots/borrows are rejected before adoption.
+The range executor probe covers uneven, exactly-once partitioning, an empty group,
+nested result adoption, one-participant progress and a saturated two-participant
+join. It records participating threads to check the outer pool bound. These are
+correctness contracts, not parallel Neri throughput measurements.
 It uses C because native entry callbacks are not expressible in Neri's current
 C ABI. Address/undefined-behavior checks use the separate `--sanitize` build.
 
@@ -231,6 +235,10 @@ parallel Neri scaling.
   fully strict computation/scheduler assumptions, expected time `W/p + O(D)`.
   This is not a guarantee for arbitrary I/O, shared mutable captures or
   heterogeneous cores. The batch reference has independent jobs and a final join.
+  The native range executor uses a shared queue and native-stack helping;
+  the randomized work-stealing bound applies to the paper's scheduler, not to
+  this executor. [Cilk (1995)](https://publications.csail.mit.edu/lcs/pubs/pdf/MIT-LCS-TM-548.pdf)
+  describes explicit continuations and per-processor ready pools.
 - [Williams, Waterman and Patterson, Roofline](https://www2.eecs.berkeley.edu/Pubs/TechRpts/2008/EECS-2008-134.pdf):
   attainable compute throughput is bounded by `min(peak compute, bandwidth *
   arithmetic intensity)`. More workers cannot remove a saturated memory path.
