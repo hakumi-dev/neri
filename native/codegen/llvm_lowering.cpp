@@ -419,6 +419,12 @@ private:
     }
 
     void create_root_frame_storage() {
+      // Verified transitive effects bound every possible collection point.
+      // Foreign/unsafe calls retain roots even without an allocation effect.
+      constexpr auto may_collect = NERI_IR_EFFECT_MANAGED_ALLOCATE_V1 |
+          NERI_IR_EFFECT_NATIVE_ALLOCATE_V1 | NERI_IR_EFFECT_SAFEPOINT_V1 |
+          NERI_IR_EFFECT_UNSAFE_V1;
+      if ((input_.effects & may_collect) == 0U) return;
       std::vector<std::uint32_t> root_ids;
       for (const auto &block : input_.blocks) {
         for (const auto &parameter : block.parameters) {

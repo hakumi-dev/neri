@@ -151,6 +151,7 @@ specified configurations, not a ranking of languages.
 | [Scoped-task ARM64 matrix](scoped-tasks-macos-arm64.json) | 128 processes, 896 checked samples, Neri and .NET worker limits 1, 2, 4, 8 and 14. |
 | [Scoped-task x86-64 matrix](scoped-tasks-linux-x86_64.json) | 96 processes, 672 checked samples, native Intel Xeon VM with four vCPU. |
 | [GC sweep ARM64 comparison](gc-sweep-macos-arm64.json) | 32 paired-variant processes, 224 checked samples, identical program object with separate runtime archives. |
+| [GC leaf-frame ARM64 comparison](gc-leaf-macos-arm64.json) | 32 paired-variant processes, 224 checked samples, effect-proven root-frame omission with the same frontend and runtime. |
 
 Summarize each process by its median, then compare those process summaries.
 Keep process and kernel timers separate. Absolute times require matching workload

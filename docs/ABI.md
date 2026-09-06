@@ -62,7 +62,15 @@ managed transfer protocol or make arbitrary foreign memory access safe.
 Descriptor trace callbacks
 visit managed reference slots. Root frames enter and leave in LIFO order. Live
 managed values must be represented in roots or reachable managed fields across
-allocating calls. Native local pointer variables are not implicit roots.
+calls that can collect, including foreign calls. Native local pointer variables
+are not implicit roots.
+
+The backend omits a function's root frame when its verified transitive effects
+exclude managed allocation, native allocation, safepoints and unsafe operations.
+With one mutator per active heap, such a function cannot trigger collection of
+its local values. Functions with those effects retain their frames. This follows
+the [safepoint-rooting requirement](https://llvm.org/docs/GarbageCollection.html#identifying-gc-roots-on-the-stack);
+Neri uses its explicit root stack, not LLVM statepoints.
 
 Managed stores validate ownership of the destination slot and the stored
 reference. Scoped borrows retain the owning allocation and expose a stable address
