@@ -205,6 +205,11 @@ extern const neri_runtime_abi_requirements_v1
     neri_program_v1_abi_requirements;
 
 NERI_RT_API const neri_runtime_abi_info_v1 *neri_rt_v1_get_abi(void);
+/* Initialization, roots, heaps, arguments and shutdown belong to the calling
+ * native thread. Each thread must initialize and shut down explicitly. Live
+ * managed references remain in their owning heap; no transfer is implied.
+ * MULTIPLE_MUTATORS remains reserved: these disjoint heaps do not provide
+ * shared-heap collection or a language task/capture contract. */
 NERI_RT_API neri_abi_status_v1
 neri_rt_v1_initialize(const neri_runtime_abi_requirements_v1 *requirements);
 NERI_RT_API void neri_rt_v1_set_process_arguments(int argc,

@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cassert>
 #include <cerrno>
 #include <charconv>
@@ -41,11 +42,14 @@ constexpr uint64_t runtime_features =
 constexpr uint32_t known_type_flags = NERI_TYPE_FLAG_CONTAINS_REFS_V1 |
                                       NERI_TYPE_FLAG_IMMUTABLE_V1;
 
+struct runtime_state;
+
 struct managed_allocation final {
   managed_allocation *previous;
   managed_allocation *next;
   neri_ref_v1 object;
   uint64_t payload_size;
+  const runtime_state *owner;
   bool marked;
 };
 
@@ -87,10 +91,12 @@ struct mark_stack final {
   size_t capacity;
 };
 
-runtime_state state{};
-mark_stack *active_mark_stack = nullptr;
-std::string last_host_error;
-uint64_t temporary_file_counter = 0;
+// Each native execution thread owns its heap and tracing stacks. Managed
+// references cannot cross this boundary; immutable static literals can.
+thread_local runtime_state state{};
+thread_local mark_stack *active_mark_stack = nullptr;
+thread_local std::string last_host_error;
+std::atomic<uint64_t> temporary_file_counter{0};
 
 const neri_type_descriptor_v1 dynamic_string_type = {
     sizeof(neri_type_descriptor_v1),
@@ -187,8 +193,9 @@ void require_initialized() {
     return nullptr;
   }
   auto *allocation = reinterpret_cast<managed_allocation *>(object->runtime_word);
-  return allocation != nullptr && allocation->object == object ? allocation
-                                                                : nullptr;
+  return allocation != nullptr && allocation->owner == &state &&
+                 allocation->object == object
+             ? allocation : nullptr;
 }
 
 [[nodiscard]] bool is_string_literal(neri_ref_v1 object) {
@@ -215,6 +222,7 @@ void assert_consistent() {
        allocation = allocation->next) {
     assert(allocation->previous == managed_previous);
     assert(allocation->object != nullptr);
+    assert(allocation->owner == &state);
     managed_previous = allocation;
     ++managed_count;
     managed_bytes += sizeof(neri_object_header_v1) + allocation->payload_size;
@@ -711,7 +719,8 @@ void set_errno_error(std::string_view operation, int error) {
   for (unsigned int attempt = 0; attempt < 100U; ++attempt) {
     temporary = std::string(path) + ".neri-" +
                 std::to_string(static_cast<unsigned long long>(::getpid())) +
-                "-" + std::to_string(temporary_file_counter++) + ".tmp";
+                "-" + std::to_string(temporary_file_counter.fetch_add(
+                    1, std::memory_order_relaxed)) + ".tmp";
     descriptor = ::open(temporary.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0666);
     if (descriptor >= 0 || errno != EEXIST) {
       break;
@@ -1051,7 +1060,7 @@ neri_rt_v1_gc_alloc(const neri_type_descriptor_v1 *type,
   auto *object = reinterpret_cast<neri_ref_v1>(
       reinterpret_cast<unsigned char *>(metadata) + managed_prefix_size);
 
-  *metadata = {nullptr, state.managed_head, object, payload_size, false};
+  *metadata = {nullptr, state.managed_head, object, payload_size, &state, false};
   if (state.managed_head != nullptr) {
     state.managed_head->previous = metadata;
   }

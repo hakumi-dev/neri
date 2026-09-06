@@ -180,6 +180,24 @@ all 40 process measurements, compiler/source hashes and host conditions. Its
 paired variants must satisfy the same canonical-IR contract. Timing values are
 descriptive evidence; no timing threshold is part of the test suite.
 
+## Runtime heap isolation
+
+The [ARM64 heap comparison](runtime-heaps-macos-arm64.json) records four balanced
+process pairs for each of the integer, array and allocation kernels. Each process
+performs one warmup and seven checked samples. Binary/source hashes and parameters
+identify the global-heap and thread-local-heap variants; both use Release mode.
+The median process medians are 92/92 ms for integer, 22.5/22.5 ms for array and
+77/82.5 ms for allocation (global/thread-local). The allocation workload includes
+reference stores and collection; no measurement isolates the cost of TLS lookup
+from ownership checking. These local battery-powered observations quantify a
+tradeoff, not a throughput improvement or parallel scaling result.
+
+`scripts/build.sh native-test --thread-sanitize` instruments runtime heap access
+and the native worker probe with ThreadSanitizer. The probe checks simultaneous
+independent collection and rejects foreign references through stores and roots.
+It uses C because native entry callbacks are not expressible in Neri's current
+C ABI. Address/undefined-behavior checks use the separate `--sanitize` build.
+
 ## Analytical foundations
 
 - [Amdahl (1967)](https://www.cs.cmu.edu/~18742/papers/Amdahl1967.pdf): for an

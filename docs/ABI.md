@@ -35,7 +35,19 @@ requires an unavailable capability is rejected during negotiation.
 
 ## Collection and roots
 
-The collector is precise, nonmoving and single-mutator. Descriptor trace callbacks
+The collector is precise and nonmoving, with one mutator per heap. Native threads
+have independent heap lists, root/borrow stacks, collection state and host-error
+storage. Each thread initializes and shuts down its own runtime state; shutdown
+reclaims only that thread's allocations and requires its roots and borrows to
+have ended. Process-argument views also belong to the calling thread.
+
+Managed allocations carry a private owner identity. Runtime reference stores and
+tracing reject objects from a different heap. Static string literals are immortal
+and may be referenced by any heap. Ordinary managed strings remain heap-owned,
+even though their content is immutable. Raw native pointers do not provide a
+managed transfer protocol or make arbitrary foreign memory access safe.
+
+Descriptor trace callbacks
 visit managed reference slots. Root frames enter and leave in LIFO order. Live
 managed values must be represented in roots or reachable managed fields across
 allocating calls. Native local pointer variables are not implicit roots.
