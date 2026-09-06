@@ -59,9 +59,15 @@ its fixture, so later cases preserve earlier diagnostic evidence.
 
 ## Linux native validation
 
+The Release CI job runs `scripts/build.sh test`: it fetches the pinned Linux seed,
+verifies the native compiler fixed point, and executes the full language and
+native contract suites. Downloading the Actions seed candidate uses a repository
+token with read-only Actions access. Debug and sanitizer jobs run the native
+boundary probes without repeating the language bootstrap.
+
 Linux x86-64 builds the native boundary directly with CMake and Clang/LLVM 22.1.8;
 this gate is independent of the macOS bootstrap seed. The CI job uses Ubuntu 24.04
-and runs Release, Debug and ASan/UBSan configurations. Required development packages
+and runs Release, Debug, ASan/UBSan and ThreadSanitizer configurations. Required development packages
 include zlib, zstd, libedit, libffi and libxml2 alongside `llvm-22-dev`.
 The Linux sanitizer gate uses a native x86-64 runner with ASan shadow-memory
 support; Release/Debug results under cross-architecture emulation cover those
@@ -75,8 +81,9 @@ cmake --build build/linux-native --parallel 2
 ctest --test-dir build/linux-native --output-on-failure --no-tests=error
 ```
 
-These probes validate the current Linux runtime and backend. Self-hosted Linux
-bootstrap additionally requires a separately verified Linux seed.
+The direct probes validate the current Linux runtime and backend independently
+of a bootstrap seed. The Release language gate uses the separately pinned Linux
+seed described in [the Linux setup guide](../docs/LINUX.md).
 
 The compatibility fixtures originate from `hakumi-dev/hakumi-lang-old` commit
 `08124bc579c767a0cc7a56e3c490a5b81dc5fba4`. Their source behavior and ABI contracts
