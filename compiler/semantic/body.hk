@@ -1,5 +1,21 @@
 use host
 
+# Names are enumerated once for semantic tooling. The binder's libraryReturn,
+# libraryParameterCount and libraryParameterType methods remain the authority:
+# clients must validate every entry through those functions.
+def semanticLibraryNames(library: String): String[]
+  if library == "math"
+    return ["abs", "max", "min", "pow"]
+  else if library == "test"
+    return ["assert", "assertEqual", "assertTrue", "assertFalse"]
+  else if library == "console"
+    return ["print", "println", "read"]
+  else if library == "host"
+    return ["exit", "stringByteLength", "argumentCount", "stringByteAt", "stringSlice", "errorMessage", "stringFromBytes", "readText", "pathJoin", "pathAbsolute", "pathFileName", "argumentAt", "environment", "parseInt", "run", "parseFloat", "appendByte", "appendInt", "appendString", "writeText", "writeBytes", "removeFile"]
+  end
+  return []
+end
+
 class BootstrapBodyBinder
   public enclosing: BootstrapBodyBinder?
   public closureClass: SemanticClass?
@@ -104,6 +120,7 @@ class BootstrapBodyBinder
     let position = this.syntax().startAt(syntaxNode)
     let identity = this.currentCallable().fullName + "/local@" + this.owner.sourceIdAt(position) + ":" + ((position - this.owner.sourceStartAt(position)) as String)
     let local = new SemanticLocal(identity, name, typeName, mutable, this.scopeDepth, syntaxNode)
+    this.owner.recordDeclaration(identity, name, typeName, syntaxNode)
     if this.firstLocal == null
       this.firstLocal = local
     else
@@ -129,6 +146,57 @@ class BootstrapBodyBinder
       end
     end
     return ""
+  end
+
+  def addCompletionVariables(site: SemanticCompletionSite): Void
+    let outer = this.enclosing
+    if outer != null
+      outer.addCompletionVariables(site)
+    end
+    let callable = this.owner.currentCallable
+    if callable != null
+      var parameter = callable.firstParameter
+      while parameter != null
+        site.addSymbol(parameter.identity, parameter.name, parameter.typeName, false)
+        parameter = parameter.nextParameter
+      end
+    end
+    var local = this.firstLocal
+    while local != null
+      if local.active
+        site.addSymbol(local.identity, local.name, this.findVariableType(local.name), local.mutable)
+      end
+      local = local.nextLocal
+    end
+  end
+
+  def completionClassName(): String
+    let outer = this.enclosing
+    if outer != null
+      return outer.completionClassName()
+    end
+    let classSymbol = this.owner.currentClass
+    if classSymbol != null
+      return classSymbol.fullName
+    end
+    return ""
+  end
+
+  def recordCompletionSite(node: Int, receiverKind: String = "", receiverType: String = ""): Void
+    if !this.owner.recordCompletionSites
+      return
+    end
+    let site = new SemanticCompletionSite()
+    site.start = this.syntax().startAt(node)
+    site.length = this.syntax().lengthAt(node)
+    site.namespaceName = this.owner.currentNamespace
+    site.className = this.completionClassName()
+    site.callable = this.owner.currentCallable
+    site.receiverKind = receiverKind
+    site.receiverType = receiverType
+    this.addCompletionVariables(site)
+    site.next = this.model().completionSites
+    this.model().completionSites = site
   end
 
   def currentCallable(): SemanticCallable
@@ -803,6 +871,7 @@ class BootstrapBodyBinder
   end
 
   def bindName(node: Int, expectedType: String = ""): BoundValue
+    this.recordCompletionSite(node)
     let name = this.syntax().dataAt(node)
     let enclosing = this.enclosing
     if enclosing != null && this.findVariableIdentity(name) == "" && closureHasVariable(enclosing, name)
@@ -1165,13 +1234,20 @@ class BootstrapBodyBinder
   def bindMember(node: Int, expectedType: String = ""): BoundValue
     let objectNode = this.syntax().childAt(node, 0)
     if this.syntax().kindAt(objectNode) == "Name" && !closureHasVariable(this, this.syntax().dataAt(objectNode))
-      let qualified = this.syntax().dataAt(objectNode) + "." + this.syntax().dataAt(node)
+      let objectName = this.syntax().dataAt(objectNode)
+      if this.owner.knownLibrary(objectName)
+        this.recordCompletionSite(node, "library", objectName)
+      else if this.owner.namespaceExists(objectName)
+        this.recordCompletionSite(node, "namespace", objectName)
+      end
+      let qualified = objectName + "." + this.syntax().dataAt(node)
       let function = this.resolveFunction(qualified)
       if function != null
         return bindFunctionValue(this, node, function, expectedType)
       end
     end
     let objectValue = this.bindExpression(objectNode, "")
+    this.recordCompletionSite(node, "instance", objectValue.typeName)
     let name = this.syntax().dataAt(node)
     if semanticIsOptional(objectValue.typeName)
       this.report("NR169", objectNode, "Optional value of type '" + objectValue.typeName + "' must be narrowed before access.")
@@ -1194,6 +1270,7 @@ class BootstrapBodyBinder
           this.report("NR240", node, "A readonly view cannot expose a raw pointer field.")
         end
         let typeName = semanticViewMember(objectValue.typeName, field.typeName)
+        this.owner.recordOccurrence("field:" + field.owner + "." + name, node, field.owner + "." + name + ": " + typeName)
         return new BoundValue(typeName, this.addBound("Member", typeName, field.owner + "." + name, node, appendChild(emptyInts(), objectValue.boundNode)))
       end
     end
@@ -1442,6 +1519,7 @@ class BootstrapBodyBinder
     let calleeKind = this.syntax().kindAt(calleeNode)
     let actual = this.syntax().childCountAt(node) - 1
     if calleeKind == "Name"
+      this.recordCompletionSite(calleeNode)
       let name = this.syntax().dataAt(calleeNode)
       if closureHasVariable(this, name)
         return bindFunctionCall(this, node, this.bindExpression(calleeNode, ""))
@@ -1453,6 +1531,7 @@ class BootstrapBodyBinder
         return new BoundValue("Error", this.addBound("Call", "Error", name, calleeNode, arguments))
       end
       this.validateCallCount(callable.fullName, calleeNode, actual, callable)
+      this.owner.recordOccurrence("callable:" + callable.fullName, calleeNode)
       let arguments = this.bindArguments(node, 1, callable.parameterCount, "", callable.fullName, callable)
       if callable.isUnsafe && this.unsafeDepth == 0
         this.report("NR189", calleeNode, "Unsafe function or method '" + callable.fullName + "' can be called only from an unsafe declaration or block.")
@@ -1484,12 +1563,14 @@ class BootstrapBodyBinder
         this.report("NR182", objectNode, "Keyword 'super' is valid only inside a derived instance method or constructor.")
         return new BoundValue("Error", this.addBound("Call", "Error", memberName, calleeNode, emptyInts()))
       end
+      this.recordCompletionSite(calleeNode, "super", baseClass.fullName)
       let method = this.findMethod(baseClass, memberName)
       if method == null
         this.report("NR186", calleeNode, "Base type '" + baseClass.fullName + "' does not define an accessible instance method '" + memberName + "'.")
         return new BoundValue("Error", this.addBound("Call", "Error", memberName, calleeNode, emptyInts()))
       end
       this.validateCallCount(baseClass.name + "." + memberName, calleeNode, actual, method)
+      this.owner.recordOccurrence("callable:" + method.fullName, calleeNode)
       let enclosingMethod = this.owner.currentCallable
       if enclosingMethod != null && enclosingMethod.isReadonly && !method.isReadonly
         this.report("NR240", calleeNode, "A readonly receiver requires a readonly method.")
@@ -1504,6 +1585,11 @@ class BootstrapBodyBinder
     if this.syntax().kindAt(objectNode) == "Name"
       let objectName = this.syntax().dataAt(objectNode)
       if !closureHasVariable(this, objectName)
+        if this.owner.knownLibrary(objectName)
+          this.recordCompletionSite(calleeNode, "library", objectName)
+        else if this.owner.namespaceExists(objectName)
+          this.recordCompletionSite(calleeNode, "namespace", objectName)
+        end
         let libraryType = this.libraryReturn(objectName, memberName)
         if libraryType != ""
           if objectName != "Array" && !this.model().hasUse(objectName)
@@ -1518,6 +1604,7 @@ class BootstrapBodyBinder
         end
         let classSymbol = this.resolveClassForCall(objectName)
         if classSymbol != null
+          this.recordCompletionSite(calleeNode, "class", classSymbol.fullName)
           let method = this.findMethod(classSymbol, memberName)
           if method == null
             this.report("NR131", calleeNode, "Type '" + classSymbol.fullName + "' does not have a member '" + memberName + "'.")
@@ -1527,12 +1614,14 @@ class BootstrapBodyBinder
             this.report("NR180", calleeNode, "Instance method '" + memberName + "' must be called through an instance.")
           end
           this.validateCallCount(classSymbol.name + "." + memberName, calleeNode, actual, method)
+          this.owner.recordOccurrence("callable:" + method.fullName, calleeNode)
           let arguments = this.bindArguments(node, 1, method.parameterCount, "", classSymbol.name + "." + memberName, method)
           return new BoundValue(method.returnType, this.addBound("Call", method.returnType, method.fullName, calleeNode, arguments))
         end
         let namespaced = this.resolveFunction(objectName + "." + memberName)
         if namespaced != null
           this.validateCallCount(namespaced.fullName, calleeNode, actual, namespaced)
+          this.owner.recordOccurrence("callable:" + namespaced.fullName, calleeNode)
           let arguments = this.bindArguments(node, 1, namespaced.parameterCount, "", namespaced.fullName, namespaced)
           return new BoundValue(namespaced.returnType, this.addBound("Call", namespaced.returnType, namespaced.fullName, calleeNode, arguments))
         end
@@ -1541,6 +1630,7 @@ class BootstrapBodyBinder
       end
     end
     let instance = this.bindExpression(objectNode, "")
+    this.recordCompletionSite(calleeNode, "instance", instance.typeName)
     if semanticIsOptional(instance.typeName)
       this.report("NR169", objectNode, "Optional value of type '" + instance.typeName + "' must be narrowed before access.")
       return new BoundValue("Error", this.addBound("Call", "Error", memberName, calleeNode, appendChild(emptyInts(), instance.boundNode)))
@@ -1555,6 +1645,7 @@ class BootstrapBodyBinder
       let field = this.findField(classSymbol, memberName)
       if field != null && this.memberAccessible(field.owner, field.access)
         let typeName = semanticViewMember(instance.typeName, field.typeName)
+        this.owner.recordOccurrence("field:" + field.owner + "." + field.name, calleeNode, field.owner + "." + field.name + ": " + typeName)
         let value = new BoundValue(typeName, this.addBound("Member", typeName, field.owner + "." + field.name, calleeNode, [instance.boundNode]))
         return bindFunctionCall(this, node, value)
       end
@@ -1574,6 +1665,7 @@ class BootstrapBodyBinder
       this.report("NR189", calleeNode, "Unsafe function or method '" + classSymbol.name + "." + memberName + "' can be called only from an unsafe declaration or block.")
     end
     this.validateCallCount(classSymbol.name + "." + memberName, calleeNode, actual, method)
+    this.owner.recordOccurrence("callable:" + method.fullName, calleeNode)
     var children = appendChild(emptyInts(), instance.boundNode)
     let arguments = this.bindArguments(node, 1, method.parameterCount, "", classSymbol.name + "." + memberName, method)
     for argument in arguments
@@ -1592,6 +1684,7 @@ class BootstrapBodyBinder
 
   def bindNew(node: Int): BoundValue
     let typeNode = this.syntax().childAt(node, 0)
+    this.recordCompletionSite(typeNode, "type", "")
     let typeName = this.owner.resolveTypeNode(typeNode, this.owner.currentNamespace, "")
     let classSymbol = this.model().findClass(typeName)
     if classSymbol == null
@@ -1599,6 +1692,7 @@ class BootstrapBodyBinder
       return new BoundValue("Error", this.addBound("New", "Error", typeName, node, emptyInts()))
     end
     let constructor = this.owner.findDeclaredMethod(classSymbol, "init")
+    this.owner.recordOccurrence("type:" + classSymbol.fullName, typeNode)
     let actual = this.syntax().childCountAt(node) - 1
     if constructor == null
       if actual > 0
