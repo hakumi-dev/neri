@@ -1,0 +1,94 @@
+name: Linux bootstrap seed candidate
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  transport:
+    name: Verify trusted frontend and export seed IR
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Export from the verified compiler
+        run: |
+          brew install llvm@22 cmake ninja
+          scripts/build.sh export-seed
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: seed-transport
+          path: build/seed-transport/
+          if-no-files-found: error
+
+  linux:
+    name: Native Linux fixed point and reproducible seed
+    needs: transport
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: seed-transport
+          path: build/seed-transport
+      - name: Verify transport and source identity
+        run: |
+          test "$(uname -m)" = x86_64
+          test "$(git rev-parse HEAD)" = "$(cat build/seed-transport/commit.txt)"
+          (cd build/seed-transport && sha256sum -c SHA256SUMS)
+          sha256sum -c build/seed-transport/SOURCE-MANIFEST.sha256
+      - name: Install the declared native tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ca-certificates curl gnupg lsb-release software-properties-common cmake ninja-build build-essential zlib1g-dev libzstd-dev libedit-dev libffi-dev libxml2-dev libarchive-tools
+          curl --fail --location --retry 3 https://raw.githubusercontent.com/opencollab/llvm-jenkins.debian.net/cf853fefa308484749df8a87004c580a6c0fe830/llvm.sh -o /tmp/neri-llvm.sh
+          echo '03878e08f47b66cc95bc4b544b0db3c6d9ce8d60e6cf2492ae357984330a9eae  /tmp/neri-llvm.sh' | sha256sum -c -
+          sudo bash /tmp/neri-llvm.sh 22
+          sudo apt-get install -y llvm-22-dev
+          test "$(llvm-config-22 --version)" = 22.1.8
+      - name: Materialize native entry tools from canonical IR
+        run: |
+          cmake -S . -B build/native/native-release -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang-22 -DCMAKE_CXX_COMPILER=clang++-22 \
+            -DLLVM_DIR=/usr/lib/llvm-22/lib/cmake/llvm -DBUILD_TESTING=ON
+          cmake --build build/native/native-release --parallel 2
+          mkdir -p build/seed-stage0/bin
+          build/native/native-release/neri-codegen --input build/seed-transport/compiler.nir.hex --input-format hex --target linux-x86_64 --optimization release --emit object --output build/seed-stage0/compiler.o
+          clang++-22 build/seed-stage0/compiler.o build/native/native-release/libneri-runtime.a -o build/seed-stage0/bin/neri
+          build/native/native-release/neri-codegen --input build/seed-transport/driver.nir.hex --input-format hex --target linux-x86_64 --optimization release --emit object --output build/seed-stage0/driver.o
+          clang++-22 build/seed-stage0/driver.o build/native/native-release/libneri-runtime.a -o build/seed-stage0/neri-build
+      - name: Bootstrap, test and package with the native Neri driver
+        run: |
+          env -i "PATH=$PATH" "HOME=$HOME" LC_ALL=C LANG=C TZ=UTC \
+            "NERI_ROOT=$PWD" "NERI_SEED_DIR=$PWD/build/seed-stage0" LLVM_PREFIX=/usr/lib/llvm-22 NERI_TARGET=linux-x86_64 \
+            build/seed-stage0/neri-build seed
+      - name: Check the extracted seed through the source launcher
+        run: |
+          mkdir -p .bootstrap/unpacked
+          tar -xzf build/seeds/neri-bootstrap-seed-v1-linux-x86_64.tar.gz -C .bootstrap/unpacked
+          mv .bootstrap/unpacked/neri-bootstrap-seed-v1-linux-x86_64 .bootstrap/linux-x86_64
+          cp build/seeds/linux-x86_64.seed build/seeds/linux-x86_64.files.sha256 bootstrap/
+          scripts/build.sh bootstrap
+          scripts/neri.sh examples/hello.hk
+      - name: Preserve seed candidate and validation evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: linux-seed-candidate
+          path: |
+            build/seeds/
+            build/seed-transport/
+            build/work.*/compiler-sources.txt
+            build/work.*/*.stdout
+            build/work.*/*.stderr
+            build/work.*/*.status
+            build/work.*/*.source
+            build/native/*/Testing/Temporary/
+          if-no-files-found: warn

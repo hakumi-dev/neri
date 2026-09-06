@@ -65,3 +65,30 @@ compiler, codegen and runtime from that immutable directory for the whole invoca
 The archive's `PROVENANCE.json` records its source-manifest digest and artifact hashes. The archive SHA-256 is pinned in `bootstrap/macos-arm64.seed`.
 
 Linux x86-64 remains a supported native target, but it requires a separately built and verified Linux seed before it can be advertised as a bootstrap host.
+
+## Preparing a Linux seed
+
+The manual `Linux bootstrap seed candidate` workflow produces a `linux-x86_64`
+candidate on Ubuntu 24.04 with Clang/LLVM 22.1.8. It has read-only repository
+permissions and publishes workflow artifacts, not a release or a new trust pin.
+
+`scripts/build.sh export-seed` runs the current compiler contracts and exports
+canonical IR for the compiler and Neri build driver. The transport includes the
+source commit, source inventory, frontend artifact hashes and transport hashes.
+The Linux job checks those identities before generating native entry tools.
+
+The native driver performs the fixed-point and language/native contract checks,
+compares its compiler IR with the transported IR, and creates two byte-identical
+normalized seed archives. `tooling/seed.hk` owns this preparation logic. Archive
+normalization uses `bsdtar` from `libarchive-tools` on Linux.
+
+The candidate contains the native compiler, code generator, runtime archive and
+manifest, source inventory and provenance. `build/seeds/` also contains candidate
+archive and extracted-file pins. A final job step extracts the candidate, checks
+its file pins and bootstraps through `scripts/build.sh` on Linux. Publishing a
+trusted seed requires publishing the verified archive and committing its matching
+pins under `bootstrap/`.
+
+Linux source launchers use `/usr/lib/llvm-22` by default; `LLVM_PREFIX` selects
+another installation. The run cache currently supports macOS ARM64. Linux runs
+compile and execute without persistent executable-cache reuse.

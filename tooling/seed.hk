@@ -1,0 +1,84 @@
+# Seed transport carries canonical IR, not executable code for the source host.
+def exportSeed(build: Build): Void
+  build.test()
+  let directory = build.root + "/build/seed-transport"
+  execute("mkdir", ["-p", directory])
+  build.compile(build.compiler, build.sourceFiles(), "neri-ir-hex", directory + "/compiler.nir.hex")
+  var arguments = build.environment()
+  for option in [build.compiler, "build", build.root + "/tooling/build.hk", build.root + "/tooling/common.hk",
+    build.root + "/tooling/seed.hk", build.root + "/compiler/ir/process.hk", "--source-root", build.root,
+    "--module", "neri-build", "--emit=neri-ir-hex", "--output", directory + "/driver.nir.hex"]
+    arguments = host.appendString(arguments, option)
+  end
+  execute("/usr/bin/env", arguments)
+  if build.capture(["git", "-C", build.root, "rev-parse", "HEAD"], "source-commit", 30) != 0
+    fail("cannot identify seed sources")
+  end
+  if !host.writeText(directory + "/commit.txt", requiredText(build.work + "/source-commit.stdout")) || !host.writeText(directory + "/SOURCE-MANIFEST.sha256", build.sourceManifest())
+    fail("cannot record seed source identity")
+  end
+  execute("cp", [build.root + "/build/current/ARTIFACTS.sha256", directory + "/frontend-artifacts.sha256"])
+  var manifest = ""
+  for file in ["compiler.nir.hex", "driver.nir.hex", "commit.txt", "SOURCE-MANIFEST.sha256", "frontend-artifacts.sha256"]
+    manifest = manifest + build.digest(directory + "/" + file) + "  " + file + "\n"
+  end
+  if !host.writeText(directory + "/SHA256SUMS", manifest)
+    fail("cannot record seed transport hashes")
+  end
+end
+
+def seedArchive(build: Build, directory: String, transport: String): String
+  let name = "neri-bootstrap-seed-v1-" + build.target
+  let tree = directory + "/" + name
+  execute("mkdir", ["-p", tree + "/bin", tree + "/lib"])
+  execute("cp", [build.compiler, tree + "/bin/neri"])
+  execute("cp", [build.nativeDirectory() + "/neri-codegen", tree + "/bin/neri-codegen"])
+  execute("cp", [build.nativeDirectory() + "/libneri-runtime.a", tree + "/lib/libneri-runtime.a"])
+  execute("cp", [build.nativeDirectory() + "/neri-runtime-" + build.target + ".json", tree + "/lib/neri-runtime-" + build.target + ".json"])
+  execute("cp", [transport + "/SOURCE-MANIFEST.sha256", tree + "/SOURCE-MANIFEST.sha256"])
+  if build.capture([build.llvm + "/bin/llvm-config", "--version"], "seed-llvm-version", 30) != 0
+    fail("cannot identify native LLVM")
+  end
+  let provenance = "{\n  \"schemaVersion\": 1,\n  \"target\": \"" + build.target + "\",\n  \"sourceCommit\": \"" + lines(requiredText(transport + "/commit.txt"))[0] + "\",\n  \"llvmVersion\": \"" + lines(requiredText(build.work + "/seed-llvm-version.stdout"))[0] + "\",\n  \"verification\": \"transport-identity-native-fixed-point-and-language-contracts\",\n  \"sourceManifestSha256\": \"" + build.digest(tree + "/SOURCE-MANIFEST.sha256") + "\",\n  \"transportManifestSha256\": \"" + build.digest(transport + "/SHA256SUMS") + "\",\n  \"frontendArtifactManifestSha256\": \"" + build.digest(transport + "/frontend-artifacts.sha256") + "\",\n  \"runtimeManifest\": " + requiredText(tree + "/lib/neri-runtime-" + build.target + ".json") + "}\n"
+  if !host.writeText(tree + "/PROVENANCE.json", provenance)
+    fail("cannot record seed provenance")
+  end
+  var hashes = ""
+  var members = ""
+  for file in ["bin/neri", "bin/neri-codegen", "lib/libneri-runtime.a", "lib/neri-runtime-" + build.target + ".json", "SOURCE-MANIFEST.sha256", "PROVENANCE.json"]
+    hashes = hashes + build.digest(tree + "/" + file) + "  " + file + "\n"
+    members = members + name + "/" + file + "\n"
+  end
+  if !host.writeText(directory + "/files.sha256", hashes) || !host.writeText(directory + "/members", members)
+    fail("cannot record seed archive members")
+  end
+  execute("chmod", ["-R", "u=rwX,go=rX", tree])
+  execute(build.nativeDirectory() + "/neri-host", ["stamp", tree, "0"])
+  let archive = directory + "/" + name + ".tar"
+  execute(build.target == "linux-x86_64" ? "bsdtar" : "tar", ["--format=ustar", "--uid", "0", "--gid", "0", "--uname", "root", "--gname", "root", "-cf", archive, "-C", directory, "-T", directory + "/members"])
+  execute("gzip", ["-n", archive])
+  return archive + ".gz"
+end
+
+def prepareSeed(build: Build): Void
+  let transport = build.root + "/build/seed-transport"
+  build.test()
+  if build.sourceManifest() != requiredText(transport + "/SOURCE-MANIFEST.sha256")
+    fail("native seed sources differ from the verified transport")
+  end
+  build.compile(build.compiler, build.sourceFiles(), "neri-ir-hex", build.work + "/native-compiler.nir.hex")
+  execute("cmp", [transport + "/compiler.nir.hex", build.work + "/native-compiler.nir.hex"])
+  let first = seedArchive(build, build.work + "/seed-a", transport)
+  let second = seedArchive(build, build.work + "/seed-b", transport)
+  execute("cmp", [first, second])
+  let directory = build.root + "/build/seeds"
+  execute("mkdir", ["-p", directory])
+  let name = "neri-bootstrap-seed-v1-" + build.target + ".tar.gz"
+  execute("cp", [first, directory + "/" + name])
+  execute("cp", [build.work + "/seed-a/files.sha256", directory + "/" + build.target + ".files.sha256"])
+  let pin = "repository=hakumi-dev/neri\ntag=bootstrap-seed-v1\nasset=" + name + "\nsha256=" + build.digest(first) + "\n"
+  if !host.writeText(directory + "/" + build.target + ".seed", pin)
+    fail("cannot record candidate seed pin")
+  end
+  ConsoleInteraction.println("[seed] Verified candidate: " + directory + "/" + name)
+end

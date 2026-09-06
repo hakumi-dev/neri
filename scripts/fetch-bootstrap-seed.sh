@@ -5,6 +5,7 @@ ROOT_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 
 case "$(uname -s):$(uname -m)" in
   Darwin:arm64) TARGET="macos-arm64" ;;
+  Linux:x86_64) TARGET="linux-x86_64" ;;
   *)
     echo "No trusted bootstrap seed is published for this host." >&2
     exit 2
@@ -12,6 +13,10 @@ case "$(uname -s):$(uname -m)" in
 esac
 
 SEED_FILE="$ROOT_DIR/bootstrap/$TARGET.seed"
+if [[ ! -f "$SEED_FILE" || ! -f "$ROOT_DIR/bootstrap/$TARGET.files.sha256" ]]; then
+  echo "No trusted bootstrap seed is published for $TARGET." >&2
+  exit 2
+fi
 REPOSITORY="$(sed -n 's/^repository=//p' "$SEED_FILE")"
 TAG="$(sed -n 's/^tag=//p' "$SEED_FILE")"
 ASSET="$(sed -n 's/^asset=//p' "$SEED_FILE")"
