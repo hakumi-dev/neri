@@ -11,12 +11,15 @@ packages include the language reference for the packaged compiler.
 - [Serve HTTP requests](HTTP.md).
 - [Build interactive terminal applications](TERMINAL.md).
 - [Install a standalone toolchain](PACKAGING.md#standalone-installer).
+- [Supported platforms](PLATFORMS.md) — native targets and platform limits.
 
 ## Develop Neri
 
 - [Building](BUILDING.md) — tools, source builds and local installation.
 - [Linux setup from GitHub](LINUX.md) — dependencies, verified bootstrap, tests
   and local compiler installation.
+- [Windows setup](WINDOWS.md) — native x64 prerequisites, bootstrap, tests and
+  local compiler installation.
 - [Testing](../tests/README.md) — language contracts and native validation.
 - [Architecture](ARCHITECTURE.md) — compiler, native components and build driver.
 - [Language server](LANGUAGE-SERVER.md) — editor-independent live diagnostics and current limits.

@@ -1,4 +1,8 @@
 #include "neri/codegen/emitter.h"
+#include "neri/host_path.h"
+#if defined(_WIN32)
+#include "../platform/windows_support.h"
+#endif
 #include "neri/codegen/reader.h"
 
 #include <cctype>
@@ -40,7 +44,7 @@ struct arguments final {
 
 void print_usage(std::ostream &stream) {
   stream << "Usage: neri-codegen --input <path> --input-format "
-            "<binary|hex> --target <macos-arm64|linux-x86_64> "
+            "<binary|hex> --target <macos-arm64|linux-x86_64|windows-x86_64> "
             "--optimization <debug|release> "
             "--emit <llvm-ir|assembly|object> --output <path|-> "
             "[--metrics <path>]\n";
@@ -106,13 +110,13 @@ arguments parse_arguments(int argc, char **argv) {
   if (output == "-" && kind == neri::codegen::output_kind::object) {
     usage_error("Object output requires a file path.");
   }
-  return {input,
+  return {neri::host_path(input),
           input_format,
           neri::codegen::parse_target(target),
           neri::codegen::parse_optimization(optimization),
           kind,
-          output,
-          metrics};
+          neri::host_path(output),
+          neri::host_path(metrics)};
 }
 
 std::vector<std::uint8_t> read_file(const std::filesystem::path &path,
@@ -224,6 +228,11 @@ void write_metrics(const std::filesystem::path &path, std::uint64_t input_ns,
 
 int main(int argc, char **argv) {
   try {
+#if defined(_WIN32)
+    neri::windows::command_arguments arguments;
+    argc = static_cast<int>(arguments.storage.size());
+    argv = arguments.pointers.data();
+#endif
     if (argc == 2 && std::string_view(argv[1]) == "--version") {
       std::cout << NERI_TOOLCHAIN_VERSION << '\n';
       return 0;

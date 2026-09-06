@@ -99,6 +99,15 @@ void expect_error(std::span<const std::uint8_t> bytes,
 
 void test_primitive_codegen(const std::vector<std::uint8_t> &bytes) {
   const auto input = neri::codegen::read_verified_module(bytes);
+  const auto windows_target = neri::codegen::parse_target("windows-x86_64");
+  const auto windows_object = neri::codegen::emit_module(input, windows_target,
+      neri::codegen::optimization_mode::release, neri::codegen::output_kind::object);
+  const auto repeated_windows_object = neri::codegen::emit_module(input, windows_target,
+      neri::codegen::optimization_mode::release, neri::codegen::output_kind::object);
+  require(!windows_object.text && windows_object.bytes.size() >= 20 &&
+      windows_object.bytes[0] == 0x64 && windows_object.bytes[1] == 0x86 &&
+      windows_object.bytes == repeated_windows_object.bytes,
+      "object emission is not deterministic Windows x86-64 COFF");
   const auto linux_object = neri::codegen::emit_module(
       input, neri::codegen::target_platform::linux_x86_64,
       neri::codegen::optimization_mode::release,

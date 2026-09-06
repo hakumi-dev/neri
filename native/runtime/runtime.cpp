@@ -1,4 +1,6 @@
 #include "neri/runtime_abi.h"
+#include "neri/host_path.h"
+#include "../platform/host.h"
 #include "terminal.h"
 #include "task_heap.h"
 
@@ -16,21 +18,15 @@
 #include <cstring>
 #include <condition_variable>
 #include <filesystem>
-#include <fcntl.h>
 #include <fstream>
 #include <limits>
-#include <locale.h>
 #include <mutex>
 #include <new>
-#include <spawn.h>
 #include <string>
 #include <string_view>
 #include <system_error>
-#include <sys/wait.h>
-#include <unistd.h>
 #include <vector>
 
-extern char **environ;
 
 namespace {
 constexpr uintptr_t root_frame_cookie = UINT64_C(0x484b524f4f545631);
@@ -135,7 +131,6 @@ runtime_state &current_state() {
   return *active_state;
 }
 thread_local mark_stack *active_mark_stack = nullptr;
-std::atomic<uint64_t> temporary_file_counter{0};
 
 const neri_type_descriptor_v1 dynamic_string_type = {
     sizeof(neri_type_descriptor_v1),
@@ -499,21 +494,7 @@ void validate_type(const neri_type_descriptor_v1 *type,
   }
 
   const size_t physical_size = static_cast<size_t>(requested_size);
-  void *pointer = nullptr;
-  if (alignment <= alignof(std::max_align_t)) {
-    pointer = zeroed ? std::calloc(1, physical_size)
-                     : std::malloc(physical_size);
-  } else {
-    if (alignment > SIZE_MAX ||
-        alignment % sizeof(void *) != 0 ||
-        posix_memalign(&pointer, static_cast<size_t>(alignment),
-                       physical_size) != 0) {
-      pointer = nullptr;
-    }
-    if (pointer != nullptr && zeroed) {
-      std::memset(pointer, 0, physical_size);
-    }
-  }
+  void *pointer = neri::platform::allocate(physical_size, static_cast<size_t>(alignment), zeroed);
   if (pointer == nullptr) {
     out_of_memory("native allocation failed");
   }
@@ -522,7 +503,7 @@ void validate_type(const neri_type_descriptor_v1 *type,
       static_cast<native_allocation *>(std::malloc(sizeof(native_allocation)));
   if (allocation == nullptr ||
       current_state().native_byte_count > UINT64_MAX - byte_count) {
-    std::free(pointer);
+    neri::platform::deallocate(pointer);
     std::free(allocation);
     out_of_memory("native allocation accounting failed");
   }
@@ -761,68 +742,6 @@ struct array_view final {
   return result;
 }
 
-void set_errno_error(std::string_view operation, int error) {
-  current_state().host_error = std::string(operation) + ": " + std::strerror(error);
-}
-
-[[nodiscard]] bool write_all(int descriptor, const uint8_t *bytes,
-                             size_t size) {
-  while (size != 0U) {
-    const auto written = ::write(descriptor, bytes, size);
-    if (written < 0) {
-      if (errno == EINTR) {
-        continue;
-      }
-      return false;
-    }
-    bytes += written;
-    size -= static_cast<size_t>(written);
-  }
-  return true;
-}
-
-[[nodiscard]] bool write_atomic(std::string_view path, const uint8_t *bytes,
-                                size_t size) {
-  std::string temporary;
-  int descriptor = -1;
-  for (unsigned int attempt = 0; attempt < 100U; ++attempt) {
-    temporary = std::string(path) + ".neri-" +
-                std::to_string(static_cast<unsigned long long>(::getpid())) +
-                "-" + std::to_string(temporary_file_counter.fetch_add(
-                    1, std::memory_order_relaxed)) + ".tmp";
-    descriptor = ::open(temporary.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0666);
-    if (descriptor >= 0 || errno != EEXIST) {
-      break;
-    }
-  }
-  if (descriptor < 0) {
-    set_errno_error("temporary file creation failed", errno);
-    return false;
-  }
-
-  bool succeeded = write_all(descriptor, bytes, size);
-  int failure = succeeded ? 0 : errno;
-  if (succeeded && ::fsync(descriptor) != 0) {
-    succeeded = false;
-    failure = errno;
-  }
-  if (::close(descriptor) != 0 && succeeded) {
-    succeeded = false;
-    failure = errno;
-  }
-  if (succeeded && ::rename(temporary.c_str(), std::string(path).c_str()) != 0) {
-    succeeded = false;
-    failure = errno;
-  }
-  if (!succeeded) {
-    static_cast<void>(::unlink(temporary.c_str()));
-    set_errno_error("atomic file write failed", failure);
-    return false;
-  }
-  current_state().host_error.clear();
-  return true;
-}
-
 template <typename Value>
 [[nodiscard]] neri_ref_v1 integer_string(Value value) {
   std::array<char, 32> buffer{};
@@ -878,14 +797,6 @@ struct formatted_float final {
     }
   }
   return index == value.size();
-}
-
-[[nodiscard]] locale_t c_numeric_locale() {
-  static locale_t value = newlocale(LC_NUMERIC_MASK, "C", nullptr);
-  if (value == nullptr) {
-    contract_panic("C numeric locale is unavailable");
-  }
-  return value;
 }
 
 [[nodiscard]] formatted_float format_finite_float(neri_float_v1 value) {
@@ -1009,7 +920,7 @@ void release_native_allocations(runtime_state &heap) {
   while (heap.native_head != nullptr) {
     auto *allocation = heap.native_head;
     heap.native_head = allocation->next;
-    std::free(allocation->pointer);
+    neri::platform::deallocate(allocation->pointer);
     std::free(allocation);
   }
   heap.native_byte_count = 0;
@@ -1638,8 +1549,7 @@ NERI_RT_API void neri_rt_v1_host_parse_float(
   }
   const std::string terminated(text);
   char *converted_end = nullptr;
-  const auto parsed = strtod_l(terminated.c_str(), &converted_end,
-                               c_numeric_locale());
+  const auto parsed = neri::platform::parse_float(terminated.c_str(), &converted_end);
   if (converted_end == terminated.data() + terminated.size() &&
       std::isfinite(parsed)) {
     result->has_value = 1;
@@ -1688,7 +1598,7 @@ neri_rt_v1_host_read_text(neri_ref_v1 path) {
   if (!host_string(path, native_path, "Path")) {
     return nullptr;
   }
-  std::ifstream stream(native_path, std::ios::binary | std::ios::ate);
+  std::ifstream stream(neri::host_path(native_path), std::ios::binary | std::ios::ate);
   if (!stream) {
     current_state().host_error = "File open failed: " + native_path;
     return nullptr;
@@ -1722,8 +1632,8 @@ NERI_RT_API neri_bool_v1 neri_rt_v1_host_write_text(
     return 0;
   }
   const auto text = inspect_string(contents);
-  return write_atomic(native_path, text.bytes,
-                      static_cast<size_t>(text.byte_length))
+  return neri::platform::write_atomic(native_path, text.bytes,
+                      static_cast<size_t>(text.byte_length), current_state().host_error)
              ? 1
              : 0;
 }
@@ -1741,8 +1651,8 @@ NERI_RT_API neri_bool_v1 neri_rt_v1_host_write_bytes(
       bytes.type->element_size != sizeof(neri_byte_v1)) {
     contract_panic("writeBytes requires Byte[]");
   }
-  return write_atomic(native_path, bytes.elements,
-                      static_cast<size_t>(bytes.length))
+  return neri::platform::write_atomic(native_path, bytes.elements,
+                      static_cast<size_t>(bytes.length), current_state().host_error)
              ? 1
              : 0;
 }
@@ -1754,12 +1664,7 @@ neri_rt_v1_host_remove_file(neri_ref_v1 path) {
   if (!host_string(path, native_path, "Path")) {
     return 0;
   }
-  if (::unlink(native_path.c_str()) != 0 && errno != ENOENT) {
-    set_errno_error("file removal failed", errno);
-    return 0;
-  }
-  current_state().host_error.clear();
-  return 1;
+  return neri::platform::remove_file(native_path, current_state().host_error);
 }
 
 NERI_RT_API neri_ref_v1 neri_rt_v1_host_path_join(
@@ -1771,7 +1676,7 @@ NERI_RT_API neri_ref_v1 neri_rt_v1_host_path_join(
       !host_string(right, right_path, "Path")) {
     return nullptr;
   }
-  const auto joined = (std::filesystem::path(left_path) / right_path).string();
+  const auto joined = neri::path_text(neri::host_path(left_path) / neri::host_path(right_path));
   if (!is_strict_utf8(reinterpret_cast<const uint8_t *>(joined.data()),
                       joined.size())) {
     current_state().host_error = "Joined path is not valid UTF-8.";
@@ -1790,12 +1695,12 @@ neri_rt_v1_host_path_absolute(neri_ref_v1 path) {
     return nullptr;
   }
   std::error_code error;
-  const auto absolute = std::filesystem::absolute(native_path, error);
+  const auto absolute = std::filesystem::absolute(neri::host_path(native_path), error);
   if (error) {
     current_state().host_error = "Absolute path resolution failed: " + error.message();
     return nullptr;
   }
-  const auto normalized = absolute.lexically_normal().string();
+  const auto normalized = neri::path_text(absolute.lexically_normal());
   current_state().host_error.clear();
   return create_utf8_string(
       reinterpret_cast<const uint8_t *>(normalized.data()), normalized.size());
@@ -1808,7 +1713,7 @@ neri_rt_v1_host_path_file_name(neri_ref_v1 path) {
   if (!host_string(path, native_path, "Path")) {
     return nullptr;
   }
-  const auto name = std::filesystem::path(native_path).filename().string();
+  const auto name = neri::path_text(neri::host_path(native_path).filename());
   if (!is_strict_utf8(reinterpret_cast<const uint8_t *>(name.data()),
                       name.size())) {
     current_state().host_error = "Path file name is not valid UTF-8.";
@@ -1849,12 +1754,12 @@ neri_rt_v1_host_environment(neri_ref_v1 name) {
   if (!host_string(name, native_name, "Environment variable name")) {
     return nullptr;
   }
-  const char *value = std::getenv(native_name.c_str());
-  if (value == nullptr) {
+  const auto value = neri::platform::environment(native_name);
+  if (!value) {
     current_state().host_error.clear();
     return nullptr;
   }
-  const auto bytes = std::string_view(value);
+  const auto bytes = std::string_view(*value);
   if (!is_strict_utf8(reinterpret_cast<const uint8_t *>(bytes.data()),
                       bytes.size())) {
     current_state().host_error = "Environment variable is not valid UTF-8.";
@@ -1897,34 +1802,8 @@ NERI_RT_API void neri_rt_v1_host_run(neri_optional_int_v1 *result,
     }
     storage.push_back(std::move(argument));
   }
-  std::vector<char *> argv;
-  argv.reserve(storage.size() + 1U);
-  for (auto &item : storage) {
-    argv.push_back(item.data());
-  }
-  argv.push_back(nullptr);
-
-  pid_t process = 0;
-  const int spawn_error = ::posix_spawnp(&process, native_executable.c_str(),
-                                         nullptr, nullptr, argv.data(), environ);
-  if (spawn_error != 0) {
-    set_errno_error("process start failed", spawn_error);
-    return;
-  }
-  int status = 0;
-  while (::waitpid(process, &status, 0) < 0) {
-    if (errno == EINTR) {
-      continue;
-    }
-    set_errno_error("process wait failed", errno);
-    return;
-  }
-  result->has_value = 1;
-  result->value = WIFEXITED(status) ? WEXITSTATUS(status)
-                                   : WIFSIGNALED(status)
-                                         ? 128 + WTERMSIG(status)
-                                         : status;
-  current_state().host_error.clear();
+  const auto status = neri::platform::run(storage, current_state().host_error);
+  if (status) { result->has_value = 1; result->value = *status; }
 }
 
 NERI_RT_API void neri_rt_v1_host_exit(neri_int_v1 status) {
@@ -2019,7 +1898,7 @@ NERI_RT_API void neri_rt_v1_native_free(void *pointer) {
   }
   unlink_native(allocation);
   current_state().native_byte_count -= allocation->byte_count;
-  std::free(allocation->pointer);
+  neri::platform::deallocate(allocation->pointer);
   std::free(allocation);
   assert_consistent();
 }

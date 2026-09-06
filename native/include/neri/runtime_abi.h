@@ -9,7 +9,9 @@ extern "C" {
 #endif
 
 #if defined(_WIN32)
-#if defined(NERI_RUNTIME_BUILD)
+#if defined(NERI_RUNTIME_STATIC)
+#define NERI_RT_API
+#elif defined(NERI_RUNTIME_BUILD)
 #define NERI_RT_API __declspec(dllexport)
 #else
 #define NERI_RT_API __declspec(dllimport)

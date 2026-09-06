@@ -1,6 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 #include "neri/runtime_abi.h"
-#include "terminal.h"
+#include "../runtime/terminal.h"
 #include <errno.h>
 #include <limits.h>
 #include <poll.h>

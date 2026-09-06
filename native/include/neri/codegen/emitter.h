@@ -16,6 +16,7 @@ namespace neri::codegen {
 enum class target_platform {
   macos_arm64,
   linux_x86_64,
+  windows_x86_64,
 };
 
 enum class optimization_mode {

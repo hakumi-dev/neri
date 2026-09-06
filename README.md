@@ -28,6 +28,10 @@ On Linux x86-64, follow [the GitHub source setup guide](docs/LINUX.md).
 It builds, tests and installs the complete compiler using the pinned Linux seed
 candidate from GitHub Actions. Downloading that candidate requires GitHub CLI access.
 
+On native Windows x86-64, follow the [Windows build guide](docs/WINDOWS.md).
+It uses the Win32/MSVC ABI and PowerShell 7; WSL and MinGW are outside the
+supported setup.
+
 Neri is in development. This repository documents its source revision; packaged
 releases include the language reference for their compiler.
 
@@ -59,6 +63,7 @@ Use `neri build main.hk --release` for optimized output. The default is Debug.
 - [Examples](examples/README.md) — output, functions, arrays and program arguments.
 - [Language reference](docs/LANGUAGE.md) — syntax, types and command-line behavior.
 - [Documentation index](docs/README.md) — installation, development and internals.
+- [Supported platforms](docs/PLATFORMS.md) — native targets and platform limits.
 
 ## Development
 
