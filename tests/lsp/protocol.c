@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 #define _XOPEN_SOURCE 700
+#define _DARWIN_C_SOURCE
 #include <ctype.h>
 #include <errno.h>
 #include <poll.h>
@@ -644,8 +645,14 @@ int main(int argc, char **argv) {
   require(strtol(field(field(capabilities, "textDocumentSync"), "change"), NULL, 10) == 2,
           "incremental document synchronization");
   free(reply);
-  send_message("{\"jsonrpc\":\"2.0\",\"method\":\"initialized\",\"params\":{}}", 0);
-  send_message("{\"jsonrpc\":\"2.0\",\"method\":\"unknown\",\"id\":2}", 0);
+  const char *initialized = "{\"jsonrpc\":\"2.0\",\"method\":\"initialized\",\"params\":{}}";
+  const char *unknown = "{\"jsonrpc\":\"2.0\",\"method\":\"unknown\",\"id\":2}";
+  char coalesced[256];
+  int coalesced_size = snprintf(coalesced, sizeof(coalesced),
+      "Content-Length: %zu\r\n\r\n%sContent-Length: %zu\r\n\r\n%s",
+      strlen(initialized), initialized, strlen(unknown), unknown);
+  require(write(input, coalesced, (size_t)coalesced_size) == coalesced_size,
+          "send consecutive frames in one write");
   error_is(-32601);
 
   document_symbols_contract();
