@@ -32,6 +32,7 @@ void neri_ffi_event_fill(union neri_ffi_event *event) {
   neri_ffi_record_fill(&event->value);
 }
 void neri_ffi_real_store(float *value) { *value = 2.5f; }
+int32_t neri_ffi_is_null(const void *value) { return value == NULL; }
 int64_t neri_ffi_layout(int64_t query) {
   switch (query) {
     case 0: return sizeof(struct neri_ffi_record);
