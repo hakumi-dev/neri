@@ -10,7 +10,7 @@ Build both programs once from the repository root:
 
 ```sh
 scripts/neri.sh build benchmarks/compute.hk --release --output build/compute
-dotnet build benchmarks/reference-dotnet/Compute.csproj --configuration Release --configfile benchmarks/reference-dotnet/NuGet.Config
+(cd benchmarks/reference-dotnet && dotnet build --configuration Release --configfile NuGet.Config)
 ```
 
 Run matching cases, sequentially on an otherwise idle host:
@@ -113,8 +113,8 @@ sample of machine conditions.
 ```sh
 scripts/neri.sh build benchmarks/compute.hk --release --output build/compute
 scripts/neri.sh build benchmarks/compute-matrix.hk --release --output build/compute-matrix
-dotnet build benchmarks/reference-dotnet/Compute.csproj --configuration Release --configfile benchmarks/reference-dotnet/NuGet.Config
-dotnet publish benchmarks/reference-dotnet/Compute.csproj --configuration Release --runtime osx-arm64 -p:PublishAot=true --configfile benchmarks/reference-dotnet/NuGet.Config --output build/compute-aot
+(cd benchmarks/reference-dotnet && dotnet build --configuration Release --configfile NuGet.Config)
+(cd benchmarks/reference-dotnet && dotnet publish --configuration Release --runtime osx-arm64 -p:PublishAot=true --configfile NuGet.Config --output ../../build/compute-aot)
 mkdir -p build/compute-results
 ./build/compute-matrix build/native/native-release/neri-host ./build/compute benchmarks/reference-dotnet/bin/Release/net10.0/Compute.dll ./build/compute-aot/Compute build/compute-results 14
 ```
@@ -134,7 +134,14 @@ and reporting; they are not interchangeable with kernel timings. The matrix
 clears tiering/PGO environment overrides before selecting its JIT configuration;
 other runtime settings and host load remain experiment conditions to record.
 Default JIT samples can include tier promotion and are not asserted to be steady
-state. NativeAOT compiles at publish time; see Microsoft's
+state. Build .NET from `reference-dotnet/`: its `global.json` selects SDK 10.0.302
+exactly, while the project selects runtime 10.0.10 with runtime roll-forward
+disabled. Installing an SDK alone does not select it when newer SDKs are present.
+Each C# process records its actual runtime version, process architecture, dynamic
+code support and server-GC setting on stderr, outside the kernel timer. The host
+version in `dotnet --info` is distinct from the application's selected runtime;
+see Microsoft's [version selection rules](https://learn.microsoft.com/en-us/dotnet/core/versions/selection).
+NativeAOT compiles at publish time; see Microsoft's
 [NativeAOT contract](https://learn.microsoft.com/en-us/dotnet/core/deploying/native-aot/).
 
 The manual `Native compute observations` workflow verifies the frontend on
@@ -146,6 +153,58 @@ NativeAOT on the same host with worker limits 1, 2 and 4. No emulation is involv
 the [GitHub-hosted environment](https://docs.github.com/en/actions/reference/runners/github-hosted-runners)
 is a virtual machine, not a dedicated bare-metal PC. This measures kernel
 execution, not a Linux self-hosted frontend, and defines no CI timing threshold.
+
+The [repeated ARM64 observation](compute-matrix-macos-arm64.json) contains all 112
+processes and 784 checked kernel samples on the M4 Pro. Median-of-process-median
+times in milliseconds are:
+
+| Kernel | Neri | Default JIT | Optimized JIT | NativeAOT |
+|---|---:|---:|---:|---:|
+| Integer | 61 | 74.5 | 79 | 77.5 |
+| Array, 10000 rounds | 17 | 19.5 | 17.5 | 17 |
+| Allocation, 16 rounds | 54.5 | 11 | 11 | 11 |
+| Batch, sequential | 382.5 | 485.5 | 512.5 | 496.5 |
+| Batch, worker limit 14 | — | 68.5 | 70.5 | 68 |
+
+The repeated allocation workload retains a roughly 5x gap despite Neri's reduced
+allocation cost. C#'s 14-worker speedups relative to each configuration's own
+sequential case are approximately 7.1x, 7.3x and 7.3x. At 8 workers, corresponding
+times are 68.5, 70 and 71 ms: adding workers does not imply proportional throughput.
+These observations do not identify the best scheduler or core assignment, and
+the serial Neri results do not substitute for a managed parallel execution path.
+
+The [runtime-pinned ARM64 repetition](compute-matrix-macos-arm64-pinned.json)
+retains a second complete 112-process series with runtime 10.0.10 confirmed on
+each C# process. Host conditions varied: the unchanged Neri binary's integer
+process medians were 60, 92, 92 and 92 ms; corresponding default-JIT medians were
+79, 116, 115 and 116 ms. A post-run snapshot showed battery power and background
+CPU activity, but no per-sample power/load telemetry establishes their individual
+contributions. These data are retained, not discarded as outliers. They do not
+show a compiler regression or justify comparing absolute times across runs as if
+the host were controlled. Record power mode and background load before and after
+dedicated workstation measurements; four process repetitions alone do not remove
+such variation.
+
+The [native x86-64 observation](compute-matrix-linux-x86_64.json), from
+[the verified workflow run](https://github.com/hakumi-dev/neri/actions/runs/34034648403),
+contains 88 processes and 616 checked samples. The VM reports an AMD EPYC 7763,
+four virtual CPUs and a two-core/two-thread topology. Application runtime 10.0.10
+is confirmed per C# process; the installed host executable reports 10.0.11, which
+is not the selected application runtime. Median-of-process-median times are:
+
+| Kernel | Neri | Default JIT | Optimized JIT | NativeAOT |
+|---|---:|---:|---:|---:|
+| Integer | 95 | 93 | 93 | 93 |
+| Array, 10000 rounds | 30 | 32 | 32.5 | 31 |
+| Allocation, 16 rounds | 98 | 18.5 | 19 | 17 |
+| Batch, sequential | 611 | 597 | 598 | 598 |
+| Batch, worker limit 4 | — | 156.5 | 161 | 161 |
+
+On this host the integer and small-array cases are close, while the object-heavy
+case retains a substantial gap. The C# reference scales about 3.7–3.8x at four
+workers relative to its own sequential case. Neri's ARM64 integer advantage in
+the local observation is not a cross-platform language ranking; neither these
+virtualized results nor the Mac samples establish dedicated-PC performance.
 
 ## Analytical foundations
 
@@ -176,6 +235,14 @@ execution, not a Linux self-hosted frontend, and defines no CI timing threshold.
   before comparing configurations rather than treating all seven samples as
   independent experiments. Four processes and one binary build do not establish
   confidence intervals across builds, hosts or scheduling conditions.
+  Their [hierarchical random-effects treatment](https://arxiv.org/abs/2007.10899)
+  explains why a ratio of observed times alone does not quantify uncertainty;
+  the descriptive medians here are not that paper's inferential procedure.
+- [Clebsch et al., Orca: GC and Type System Co-Design for Actor Languages (2017)](https://www.ponylang.io/media/papers/orca_gc_and_type_system_co-design_for_actor_languages.pdf):
+  isolation and reference capabilities are part of the collector's correctness
+  assumptions, not just scheduler optimizations. This motivates evaluating Neri's
+  capture/sharing rules and heap ownership together before enabling parallel
+  managed execution. Neri currently implements neither Orca nor an actor type system.
 
 Run-loop, collection-pressure and growing-buffer measurements are documented in
 [PERFORMANCE.md](../docs/PERFORMANCE.md). Current language/runtime boundaries are in
