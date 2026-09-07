@@ -53,6 +53,35 @@ left in a noncanonical mode. Garbage collection is not a session-close mechanism
 
 `terminal.escape(): String` supplies the ASCII Escape character for applications
 that render ANSI control sequences through `console.print`.
+`clock.Duration` represents a nonnegative millisecond duration. Static factories
+`fromMilliseconds` and `fromSeconds` return null for negative values or overflow;
+`milliseconds()` explicitly extracts the unit and `plus` checks addition.
+`clock.Instant.now()` reads the monotonic clock as an optional instant.
+`fromMonotonicMilliseconds` constructs a nonnegative reading for the same clock
+domain, including deterministic tests. `later.since(earlier)` returns an optional
+duration, `instant.plus(duration)` returns an optional deadline, and
+`now.reached(deadline)` includes equality. Reversed time differences and addition
+overflow return null. These types do not represent calendar dates or wall-clock
+timestamps; callers compare readings from the same monotonic clock domain.
+Consecutive readings may be equal, as specified by the
+[clock_gettime contract](https://man7.org/linux/man-pages/man2/clock_gettime.2.html).
+
+`new clock.Clock(read)` accepts a `fn(): clock.Instant?` time source;
+`now()` invokes it once and preserves an unavailable (`null`) reading.
+`clock.Clock.monotonic()` supplies the system monotonic source. Pass a clock to
+code that evaluates elapsed time or deadlines. A custom source supplies
+nondecreasing readings in one clock domain; the wrapper does not enforce this
+condition or synchronize callback state.
+
+`new clock.FakeClock(start)` owns an explicit monotonic reading. Its `clock()`
+returns a source sharing that state, and `advance(duration)` moves time forward.
+Overflow returns false and preserves the previous reading. Fake clocks and their
+sources are confined to one execution thread. They allow deterministic deadline
+tests without sleeping or changing the process clock. Clock injection follows
+the testing principle described by [Java's Clock contract](https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/time/Clock.html);
+Neri's contract here concerns monotonic time, with the units and concurrency
+rules specified above.
+
 `clock.milliseconds(): Int?` returns milliseconds from an arbitrary monotonic epoch,
 or `null` if unavailable. It measures elapsed time, not civil time or timestamps.
 

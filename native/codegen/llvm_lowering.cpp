@@ -2301,6 +2301,14 @@ private:
         minimum_minor = std::max(minimum_minor, uint16_t{7});
         required_features |= NERI_RT_FEATURE_SOCKETS;
       }
+      if (import.link_name.starts_with("neri_rt_v1_file_")) {
+        minimum_minor = std::max(minimum_minor, uint16_t{11});
+        required_features |= NERI_RT_FEATURE_FILES;
+      }
+      if (import.link_name.starts_with("neri_rt_v1_interrupt_")) {
+        minimum_minor = std::max(minimum_minor, uint16_t{12});
+        required_features |= NERI_RT_FEATURE_INTERRUPTS;
+      }
       if (import.link_name.starts_with("neri_rt_v1_terminal_") ||
           import.link_name.starts_with("neri_rt_v1_clock_")) {
         minimum_minor = std::max(minimum_minor, uint16_t{8});

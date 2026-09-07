@@ -39,7 +39,7 @@ constexpr uint64_t runtime_features =
     NERI_RT_FEATURE_NATIVE_STRINGS | NERI_RT_FEATURE_CONSOLE_IO |
     NERI_RT_FEATURE_BOOTSTRAP_HOST | NERI_RT_FEATURE_SOCKETS |
     NERI_RT_FEATURE_INTERACTIVE_IO | NERI_RT_FEATURE_EXTENDED_SCALARS |
-    NERI_RT_FEATURE_SCOPED_TASKS;
+    NERI_RT_FEATURE_SCOPED_TASKS | NERI_RT_FEATURE_FILES | NERI_RT_FEATURE_INTERRUPTS;
 constexpr uint32_t known_type_flags = NERI_TYPE_FLAG_CONTAINS_REFS_V1 |
                                       NERI_TYPE_FLAG_IMMUTABLE_V1;
 
@@ -175,6 +175,7 @@ const neri_runtime_abi_info_v1 runtime_abi = {
 
   static_cast<void>(std::fflush(stdout));
   neri_terminal_restore();
+  neri_interrupt_restore();
   std::fprintf(stderr, "Neri panic NRP%03u", panic->code);
   if (location != nullptr && location->source_name != nullptr &&
       location->source_name_length != 0 &&

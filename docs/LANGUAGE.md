@@ -135,8 +135,10 @@ multiline actions use a block instead. Block `if` bodies begin on the next line;
 
 All supplied source files contribute to one compilation module. `namespace`
 applies to subsequent declarations; `use` exposes a namespace throughout the
-module. `use http`, `use terminal`, and `use clock` load their bundled libraries;
+module. `use http`, `use terminal`, `use clock`, and `use files` load their bundled libraries;
 other namespaces do not load files. Duplicate or ambiguous declarations are errors.
+See [binary file reads](FILES.md) for the bounded file API.
+
 Module scope contains only namespace/use directives and function/class declarations;
 other tokens produce a parse diagnostic.
 
@@ -197,7 +199,10 @@ unresolved types cannot be type arguments. The entry point and C ABI imports hav
 concrete signatures.
 
 The current generic surface consists of module functions and classes with their
-own fields and methods. Method-level type parameters, generic class inheritance,
+own fields and methods. Static methods accept an explicitly specialized class
+receiver, such as `Container<Int>.create(42)` or
+`library.Container<String>.create("value")`; constructor and method visibility
+still apply. Method-level type parameters, generic class inheritance,
 interface constraints and higher-kinded types are outside this surface. Templates
 are supplied as source files in the same compilation invocation, including across
 namespaces. A compiled specialization is concrete; it is not a separately
