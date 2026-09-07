@@ -9,6 +9,11 @@ packages include the language reference for the packaged compiler.
 - [Work through the examples](../examples/README.md).
 - [Look up syntax, types and commands](LANGUAGE.md).
 - [Serve HTTP requests](HTTP.md).
+- [Read bounded binary files](FILES.md).
+- [Use elapsed time and UTC timestamps](CLOCK.md).
+- [Build bounded byte, text and ordered-value buffers](BUFFERS.md).
+- [Hash bytes and obtain operating-system entropy](CRYPTO.md).
+- [Handle typed results and owned failures](RESULT.md).
 - [Build interactive terminal applications](TERMINAL.md).
 - [Install a standalone toolchain](PACKAGING.md#standalone-installer).
 - [Supported platforms](PLATFORMS.md) — native targets and platform limits.

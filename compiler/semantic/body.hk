@@ -477,6 +477,22 @@ class BootstrapBodyBinder
       return this.nodeRangeReturns(node, 0, this.syntax().childCountAt(node))
     else if kind == "BorrowBlock"
       return this.nodeRangeReturns(node, 1, this.syntax().childCountAt(node) - 1)
+    else if kind == "Match"
+      let count = this.syntax().childCountAt(node) - 1
+      if count == 0
+        return false
+      end
+      var index = 0
+      while index < count
+        let branch = this.syntax().childAt(node, index + 1)
+        let bindings = semanticIntField(this.syntax().dataAt(branch), 0)
+        let body = semanticIntField(this.syntax().dataAt(branch), 1)
+        if !this.nodeRangeReturns(branch, 1 + bindings, body)
+          return false
+        end
+        index = index + 1
+      end
+      return true
     end
     return false
   end
@@ -506,6 +522,8 @@ class BootstrapBodyBinder
       return this.nodeRangeTerminates(node, 0, this.syntax().childCountAt(node))
     else if kind == "BorrowBlock"
       return this.nodeRangeTerminates(node, 1, this.syntax().childCountAt(node) - 1)
+    else if kind == "Match"
+      return this.statementReturns(node)
     end
     return false
   end
@@ -538,6 +556,8 @@ class BootstrapBodyBinder
       return this.bindWhile(node, returnType)
     else if kind == "For"
       return this.bindFor(node, returnType)
+    else if kind == "Match"
+      return this.bindMatch(node, returnType)
     else if kind == "Break"
       if this.loopDepth == 0
         this.report("NR132", node, "'break' statement not within a loop.")
@@ -704,6 +724,160 @@ class BootstrapBodyBinder
       this.applyConditionNarrowing(conditionNode, true)
     end
     return this.addBound("If", "Void", (thenCount as String) + "|" + (elseCount as String), node, children)
+  end
+
+  def alternativeCaseIndex(symbol: SemanticClass, name: String): Int
+    var index = 0
+    while index < alternativeCaseCount(this.owner, symbol)
+      if this.syntax().dataAt(alternativeCaseNode(this.owner, symbol, index)) == name
+        return index
+      end
+      index = index + 1
+    end
+    return -1
+  end
+
+  def alternativePayloadType(symbol: SemanticClass, caseIndex: Int, payload: Int): String
+    var field = symbol.firstField
+    var skip = 1
+    var before = 0
+    while before < caseIndex
+      skip = skip + this.syntax().childCountAt(alternativeCaseNode(this.owner, symbol, before))
+      before = before + 1
+    end
+    skip = skip + payload
+    var index = 0
+    while field != null
+      if index == skip
+        return field.typeName
+      end
+      field = field.nextField
+      index = index + 1
+    end
+    return "Error"
+  end
+
+  def matchCaseName(node: Int): String
+    let qualified = this.syntax().dataAt(this.syntax().childAt(node, 0))
+    var index = host.stringByteLength(qualified) - 1
+    while index >= 0
+      if host.stringByteAt(qualified, index) == (46 as Byte)
+        return host.stringSlice(qualified, index + 1, host.stringByteLength(qualified) - index - 1)
+      end
+      index = index - 1
+    end
+    return qualified
+  end
+
+  def matchCaseQualifier(node: Int): String
+    let qualified = this.syntax().dataAt(this.syntax().childAt(node, 0))
+    var index = host.stringByteLength(qualified) - 1
+    while index >= 0
+      if host.stringByteAt(qualified, index) == (46 as Byte)
+        return host.stringSlice(qualified, 0, index)
+      end
+      index = index - 1
+    end
+    return ""
+  end
+
+  def alternativeSourceName(symbol: SemanticClass): String
+    let data = this.syntax().dataAt(symbol.syntaxNode)
+    return semanticQualifiedName(semanticField(data, 0), semanticField(data, 2))
+  end
+
+  def alternativeQualifierMatches(symbol: SemanticClass, qualifier: String): Bool
+    if qualifier == this.alternativeSourceName(symbol)
+      return true
+    end
+    let simple = semanticField(this.syntax().dataAt(symbol.syntaxNode), 2)
+    return qualifier == simple && (symbol.namespaceName == this.owner.currentNamespace || this.model().hasUse(symbol.namespaceName))
+  end
+
+  def bindMatch(node: Int, returnType: String): Int
+    let scrutineeNode = this.syntax().childAt(node, 0)
+    let scrutinee = this.bindExpression(scrutineeNode, "")
+    let symbol = this.model().findClass(semanticMutableType(scrutinee.typeName))
+    if symbol == null || !symbol.isAlternative
+      this.report("NR260", scrutineeNode, "Match requires a closed alternative value, but got '" + scrutinee.typeName + "'.")
+    end
+    var children = appendChild(emptyInts(), scrutinee.boundNode)
+    let count = this.syntax().childCountAt(node) - 1
+    var seen: Int[] = []
+    var branch = 0
+    while branch < count
+      let caseNode = this.syntax().childAt(node, branch + 1)
+      let bindingCount = semanticIntField(this.syntax().dataAt(caseNode), 0)
+      let bodyCount = semanticIntField(this.syntax().dataAt(caseNode), 1)
+      var caseIndex = -1
+      var matchingOwner = false
+      if symbol != null && symbol.isAlternative
+        if this.alternativeQualifierMatches(symbol, this.matchCaseQualifier(caseNode))
+          matchingOwner = true
+          caseIndex = this.alternativeCaseIndex(symbol, this.matchCaseName(caseNode))
+        else
+          this.report("NR260", this.syntax().childAt(caseNode, 0), "Case belongs to '" + this.matchCaseQualifier(caseNode) + "', but the scrutinee has type '" + symbol.fullName + "'.")
+        end
+      end
+      if caseIndex < 0 && matchingOwner
+        this.report("NR260", this.syntax().childAt(caseNode, 0), "Unknown alternative case '" + this.syntax().dataAt(this.syntax().childAt(caseNode, 0)) + "'.")
+      else if caseIndex >= 0
+        var previous = 0
+        while previous < seen.Length
+          if seen[previous] == caseIndex
+            this.report("NR260", caseNode, "Alternative case '" + this.matchCaseName(caseNode) + "' is redundant.")
+          end
+          previous = previous + 1
+        end
+        seen = host.appendInt(seen, caseIndex)
+        if symbol != null
+          let expected = this.syntax().childCountAt(alternativeCaseNode(this.owner, symbol, caseIndex))
+          if bindingCount != expected
+            this.report("NR261", caseNode, "Alternative case '" + this.matchCaseName(caseNode) + "' expects " + (expected as String) + " payload bindings, but got " + (bindingCount as String) + ".")
+          end
+        end
+      end
+      this.enterScope()
+      var boundCase: Int[] = []
+      var payload = 0
+      while payload < bindingCount
+        let binding = this.syntax().childAt(caseNode, 1 + payload)
+        var typeName = "Error"
+        if caseIndex >= 0 && symbol != null
+          typeName = this.alternativePayloadType(symbol, caseIndex, payload)
+        end
+        let local = this.declareLocal(this.syntax().dataAt(binding), typeName, false, binding)
+        boundCase = host.appendInt(boundCase, this.addBoundSymbol("MatchBinding", typeName, alternativePayloadField(caseIndex, payload), local.identity, binding, emptyInts()))
+        payload = payload + 1
+      end
+      var statement = 0
+      while statement < bodyCount
+        boundCase = appendChild(boundCase, this.bindStatement(this.syntax().childAt(caseNode, 1 + bindingCount + statement), returnType))
+        statement = statement + 1
+      end
+      this.leaveScope()
+      let data = (caseIndex as String) + "|" + (bindingCount as String) + "|" + (bodyCount as String)
+      children = host.appendInt(children, this.addBound("MatchCase", "Void", data, caseNode, boundCase))
+      branch = branch + 1
+    end
+    if symbol != null && symbol.isAlternative
+      var missing = 0
+      while missing < alternativeCaseCount(this.owner, symbol)
+        var found = false
+        var index = 0
+        while index < seen.Length
+          if seen[index] == missing
+            found = true
+          end
+          index = index + 1
+        end
+        if !found
+          this.report("NR260", node, "Match is missing alternative case '" + this.syntax().dataAt(alternativeCaseNode(this.owner, symbol, missing)) + "'.")
+        end
+        missing = missing + 1
+      end
+    end
+    return this.addBound("Match", "Void", "", node, children)
   end
 
   def bindWhile(node: Int, returnType: String): Int
@@ -1460,6 +1634,7 @@ class BootstrapBodyBinder
 
   def bindArguments(node: Int, start: Int, expectedCount: Int, library: String, name: String, callable: SemanticCallable?): Int[]
     var children: Int[] = []
+    var firstType = ""
     let actual = this.syntax().childCountAt(node) - start
     var index = 0
     while index < actual
@@ -1474,6 +1649,13 @@ class BootstrapBodyBinder
       end
       let argumentNode = this.syntax().childAt(node, start + index)
       let argument = this.bindExpression(argumentNode, expected)
+      if library == "test" && name == "assertEqual"
+        if index == 0
+          firstType = argument.typeName
+        else if index == 1 && firstType != argument.typeName && firstType != "Error" && argument.typeName != "Error"
+          this.report("NR112", argumentNode, "Arguments to 'test.assertEqual' must have the same type, but got '" + firstType + "' and '" + argument.typeName + "'.")
+        end
+      end
       children = host.appendInt(children, argument.boundNode)
       if expected != "" && expected != "Any" && !semanticAssignable(this.model(), expected, argument.typeName)
         this.report("NR112", argumentNode, "Argument " + ((index + 1) as String) + " of '" + semanticQualifiedName(library, name) + "' expects type '" + expected + "', but got '" + argument.typeName + "'.")
@@ -1548,6 +1730,31 @@ class BootstrapBodyBinder
     return bindFunctionCall(this, node, this.bindExpression(calleeNode, ""))
   end
 
+  def bindAlternativeConstruct(node: Int, calleeNode: Int, symbol: SemanticClass, caseName: String): BoundValue
+    let caseIndex = this.alternativeCaseIndex(symbol, caseName)
+    let actual = this.syntax().childCountAt(node) - 1
+    if caseIndex < 0
+      this.report("NR260", calleeNode, "Type '" + symbol.fullName + "' has no alternative case '" + caseName + "'.")
+      return new BoundValue("Error", this.addBound("AlternativeConstruct", "Error", symbol.fullName + "|-1", calleeNode, emptyInts()))
+    end
+    let expected = this.syntax().childCountAt(alternativeCaseNode(this.owner, symbol, caseIndex))
+    if actual != expected
+      this.reportLength("NR261", calleeNode, 1, "Alternative case '" + caseName + "' expects " + (expected as String) + " arguments, but got " + (actual as String) + ".")
+    end
+    var children: Int[] = []
+    var index = 0
+    while index < actual
+      let typeName = index < expected ? this.alternativePayloadType(symbol, caseIndex, index) : ""
+      let value = this.bindExpression(this.syntax().childAt(node, index + 1), typeName)
+      if index < expected && !semanticAssignable(this.model(), typeName, value.typeName)
+        this.report("NR261", this.syntax().childAt(node, index + 1), "Alternative payload " + ((index + 1) as String) + " for '" + caseName + "' must be '" + typeName + "', but got '" + value.typeName + "'.")
+      end
+      children = host.appendInt(children, value.boundNode)
+      index = index + 1
+    end
+    return new BoundValue(symbol.fullName, this.addBound("AlternativeConstruct", symbol.fullName, symbol.fullName + "|" + (caseIndex as String), calleeNode, children))
+  end
+
   def bindMemberCall(node: Int, calleeNode: Int): BoundValue
     let objectNode = this.syntax().childAt(calleeNode, 0)
     let memberName = this.syntax().dataAt(calleeNode)
@@ -1605,6 +1812,9 @@ class BootstrapBodyBinder
         let classSymbol = this.resolveClassForCall(objectName, objectNode)
         if classSymbol != null
           this.recordCompletionSite(calleeNode, "class", classSymbol.fullName)
+          if classSymbol.isAlternative
+            return this.bindAlternativeConstruct(node, calleeNode, classSymbol, memberName)
+          end
           let method = this.findMethod(classSymbol, memberName)
           if method == null
             this.report("NR131", calleeNode, "Type '" + classSymbol.fullName + "' does not have a member '" + memberName + "'.")
@@ -1646,6 +1856,9 @@ class BootstrapBodyBinder
         let classSymbol = this.resolveClassForCall(this.syntax().dataAt(cursor) + qualified, objectNode)
         if classSymbol != null
           this.recordCompletionSite(calleeNode, "class", classSymbol.fullName)
+          if classSymbol.isAlternative
+            return this.bindAlternativeConstruct(node, calleeNode, classSymbol, memberName)
+          end
           let method = this.findMethod(classSymbol, memberName)
           if method == null
             this.report("NR131", calleeNode, "Type '" + classSymbol.fullName + "' does not have a member '" + memberName + "'.")
@@ -1737,6 +1950,10 @@ class BootstrapBodyBinder
     if classSymbol == null
       this.report("NR126B", node, "Cannot create instance of non-class type '" + this.syntax().dataAt(typeNode) + "'.")
       return new BoundValue("Error", this.addBound("New", "Error", typeName, node, emptyInts()))
+    end
+    if classSymbol.isAlternative
+      this.report("NR260", node, "Closed alternative type '" + classSymbol.fullName + "' can only be constructed through one of its cases.")
+      return new BoundValue("Error", this.addBound("New", "Error", classSymbol.fullName, node, emptyInts()))
     end
     let constructor = this.owner.findDeclaredMethod(classSymbol, "init")
     this.owner.recordOccurrence("type:" + classSymbol.fullName, typeNode)

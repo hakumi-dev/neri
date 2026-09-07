@@ -23,7 +23,7 @@ extern "C" {
 #endif
 
 #define NERI_RUNTIME_ABI_MAJOR UINT16_C(1)
-#define NERI_RUNTIME_ABI_MINOR UINT16_C(12)
+#define NERI_RUNTIME_ABI_MINOR UINT16_C(15)
 
 #define NERI_RT_FEATURE_PRECISE_GC UINT64_C(1)
 #define NERI_RT_FEATURE_NONMOVING_GC (UINT64_C(1) << 1)
@@ -44,6 +44,9 @@ extern "C" {
 #define NERI_RT_FEATURE_SCOPED_TASKS (UINT64_C(1) << 14)
 #define NERI_RT_FEATURE_FILES (UINT64_C(1) << 15)
 #define NERI_RT_FEATURE_INTERRUPTS (UINT64_C(1) << 16)
+#define NERI_RT_FEATURE_WALL_CLOCK (UINT64_C(1) << 17)
+#define NERI_RT_FEATURE_CRYPTO (UINT64_C(1) << 18)
+#define NERI_RT_FEATURE_ROOTED_FILES (UINT64_C(1) << 19)
 
 #define NERI_TYPE_KIND_CLASS_V1 UINT32_C(1)
 #define NERI_TYPE_KIND_STRING_V1 UINT32_C(2)
@@ -327,6 +330,11 @@ NERI_RT_API neri_int_v1 neri_rt_v1_file_size(neri_int_v1 fd);
 NERI_RT_API neri_int_v1 neri_rt_v1_file_read(neri_int_v1 fd, uint8_t *bytes, neri_int_v1 length);
 NERI_RT_API neri_int_v1 neri_rt_v1_file_close(neri_int_v1 fd);
 NERI_RT_API neri_int_v1 neri_rt_v1_file_error(void);
+/* ABI 1.15: descriptor-relative, no-follow rooted opens. Return descriptor or
+ * -1 with OS code and category: missing=1, denied=2, symlink=3, type=4,
+ * other=5, unavailable=6. kind=1 requires a directory, kind=2 opens a file. */
+NERI_RT_API neri_int_v1 neri_rt_v1_file_root_open(const uint8_t *path, neri_int_v1 length, neri_int_v1 *os_code, neri_int_v1 *category);
+NERI_RT_API neri_int_v1 neri_rt_v1_file_root_open_at(neri_int_v1 parent, const uint8_t *name, neri_int_v1 length, neri_int_v1 kind, neri_int_v1 *os_code, neri_int_v1 *category);
 /* ABI 1.12: one serving-thread-owned interrupt lease; 0 means unavailable.
  * Positive generation tokens prevent stale closes affecting a later lease. */
 NERI_RT_API neri_int_v1 neri_rt_v1_interrupt_open(void);
@@ -342,6 +350,11 @@ NERI_RT_API void neri_rt_v1_terminal_close(neri_int_v1 token);
 NERI_RT_API neri_int_v1 neri_rt_v1_terminal_read(neri_int_v1 token, neri_int_v1 timeout);
 NERI_RT_API neri_int_v1 neri_rt_v1_terminal_size(neri_int_v1 token, neri_int_v1 rows);
 NERI_RT_API neri_int_v1 neri_rt_v1_clock_milliseconds(void);
+/* Returns zero and writes signed Unix milliseconds, or -1 on failure. */
+NERI_RT_API neri_int_v1 neri_rt_v1_clock_wall_milliseconds(neri_int_v1 *value);
+/* ABI 1.14: exact-byte SHA-256 and bounded OS entropy; zero succeeds. */
+NERI_RT_API neri_int_v1 neri_rt_v1_crypto_sha256(const uint8_t *input, neri_int_v1 length, uint8_t *digest32);
+NERI_RT_API neri_int_v1 neri_rt_v1_crypto_random(uint8_t *output, neri_int_v1 length);
 NERI_RT_API neri_int_v1 neri_rt_v1_net_configure(neri_int_v1 fd);
 NERI_RT_API neri_int_v1 neri_rt_v1_net_bind(neri_int_v1 fd, neri_int_v1 port);
 NERI_RT_API neri_int_v1 neri_rt_v1_net_listen(neri_int_v1 fd);

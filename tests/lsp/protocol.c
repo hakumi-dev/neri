@@ -28,7 +28,7 @@ static void cleanup(void) {
   if (symlink_project_source[0]) unlink(symlink_project_source);
   if (documented_stdlib[0]) {
     char path[8192];
-    const char *files[] = {"http.hk", "terminal.hk", "clock.hk", "documentation.json"};
+    const char *files[] = {"http.hk", "terminal.hk", "clock.hk", "result.hk", "documentation.json"};
     for (size_t index = 0; index < sizeof(files) / sizeof(files[0]); ++index) {
       snprintf(path, sizeof(path), "%s/%s", documented_stdlib, files[index]);
       unlink(path);
@@ -329,22 +329,23 @@ static void prepare_documented_stdlib(const char *root) {
   snprintf(documented_stdlib, sizeof(documented_stdlib), "%s/build/lsp-documentation-XXXXXX", root);
   require(mkdtemp(documented_stdlib) != NULL, "create isolated documented stdlib");
   char source[8192], destination[8192], output_path[8192];
-  const char *files[] = {"http.hk", "terminal.hk", "clock.hk"};
+  const char *files[] = {"http.hk", "terminal.hk", "clock.hk", "result.hk"};
   for (size_t index = 0; index < sizeof(files) / sizeof(files[0]); ++index) {
     snprintf(source, sizeof(source), "%s/stdlib/%s", root, files[index]);
     snprintf(destination, sizeof(destination), "%s/%s", documented_stdlib, files[index]);
     require(symlink(source, destination) == 0, "link documented standard-library source");
   }
   snprintf(output_path, sizeof(output_path), "%s/documentation.json", documented_stdlib);
-  char http_path[8192], terminal_path[8192], clock_path[8192];
+  char http_path[8192], terminal_path[8192], clock_path[8192], result_path[8192];
   snprintf(http_path, sizeof(http_path), "%s/http.hk", documented_stdlib);
   snprintf(terminal_path, sizeof(terminal_path), "%s/terminal.hk", documented_stdlib);
   snprintf(clock_path, sizeof(clock_path), "%s/clock.hk", documented_stdlib);
+  snprintf(result_path, sizeof(result_path), "%s/result.hk", documented_stdlib);
   pid_t child = fork();
   require(child >= 0, "start documentation index generator");
   if (child == 0) {
     execl(isolated_compiler, isolated_compiler, "documentation-index", "--output", output_path,
-          http_path, terminal_path, clock_path, (char *)NULL);
+          http_path, terminal_path, clock_path, result_path, (char *)NULL);
     _exit(2);
   }
   int status = 0;

@@ -72,6 +72,15 @@ neri run --project neri.json --unit web
 arguments cannot be combined with `--project`. Compiler flags such as
 `--release`, `--target`, and `--output` remain independent of source membership.
 
+## Standard-library sources
+
+The compiler and language server resolve the leading identifier of a `use`
+declaration against `<NERI_STDLIB>/<identifier>.hk`. Available library sources
+are loaded once, including their transitive imports and cycles. Names supplied
+by the program or built-in libraries use ordinary semantic resolution; unresolved
+imports produce compiler diagnostics. The toolchain launcher sets `NERI_STDLIB`
+to its own library directory.
+
 ## Language server
 
 For each document, the server selects the nearest ancestor `neri.json`, stopping

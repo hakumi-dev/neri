@@ -16,6 +16,13 @@ fixed-point compiler and preserve the published toolchain. `native-test` selects
 the native probes. `test` (also named `check`) runs the full suite and publishes
 only after every contract passes.
 
+Standalone value contracts live in `tests/value-contracts/`, one Neri project per
+case. The runner discovers their `neri.json` files in sorted order and builds and
+runs each default executable unit in Debug and Release. Each project discovers
+its own source files, including helpers. Adding a case requires its project and
+assertions; the runner has no case-name registry. Diagnostic fixtures and tests
+requiring external processes or arguments use their corresponding harnesses.
+
 The hello and functions programs in `examples/` run as language cases. The package
 gate additionally checks the documented arguments example through the installed
 launcher. These checks keep the getting-started commands executable.
@@ -72,7 +79,7 @@ boundary probes without repeating the language bootstrap.
 Linux x86-64 builds the native boundary directly with CMake and Clang/LLVM 22.1.8;
 this gate is independent of the macOS bootstrap seed. The CI job uses Ubuntu 24.04
 and runs Release, Debug, ASan/UBSan and ThreadSanitizer configurations. Required development packages
-include zlib, zstd, libedit, libffi and libxml2 alongside `llvm-22-dev`.
+include zlib, zstd, libedit, libffi, libxml2 and OpenSSL (`libssl-dev`) alongside `llvm-22-dev`.
 The Linux sanitizer gate uses a native x86-64 runner with ASan shadow-memory
 support; Release/Debug results under cross-architecture emulation cover those
 configurations only.

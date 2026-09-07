@@ -1,7 +1,7 @@
 # Runtime and IR boundary
 
 The canonical exported declarations and layouts are in
-[`runtime_abi.h`](../native/include/neri/runtime_abi.h). Runtime ABI 1.12 uses a
+[`runtime_abi.h`](../native/include/neri/runtime_abi.h). Runtime ABI 1.15 uses a
 C calling convention on macOS ARM64 and Linux x86-64. Generated programs negotiate
 major version, minimum minor version and required feature bits before execution.
 The package manifest also identifies the toolchain version and native target.
@@ -10,6 +10,18 @@ The `INTERACTIVE_IO` feature (8192) provides generation-scoped terminal
 leases, byte input with bounded waiting, terminal dimensions, and monotonic
 milliseconds. Platform terminal layouts remain inside the runtime. Key decoding
 and the public session API are implemented in Neri.
+
+The `WALL_CLOCK` feature (131072) provides signed Unix epoch milliseconds through
+a status and output pointer. It is separate from monotonic elapsed time and
+requires ABI 1.13. UTC formatting and injectable clocks are implemented in Neri.
+
+The `CRYPTO` feature (262144) requires ABI 1.14 and provides SHA-256 through
+maintained platform libraries and bounded operating-system entropy. Linux
+programs that use this feature link to OpenSSL's `libcrypto`.
+
+The `ROOTED_FILES` feature (524288) requires ABI 1.15 and provides descriptor-relative
+opens with symlink rejection. Neri validates complete relative paths, bounds reads,
+and preserves primary and close failures.
 
 ## Representation
 

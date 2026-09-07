@@ -20,7 +20,7 @@ and the native development dependencies:
 sudo apt-get update
 sudo apt-get install -y git ca-certificates curl gnupg lsb-release \
   software-properties-common cmake ninja-build build-essential \
-  zlib1g-dev libzstd-dev libedit-dev libffi-dev libxml2-dev libarchive-tools gh
+  zlib1g-dev libzstd-dev libedit-dev libffi-dev libxml2-dev libssl-dev libarchive-tools gh
 ```
 
 Clang/LLVM 22 must be available from your configured package repositories before
