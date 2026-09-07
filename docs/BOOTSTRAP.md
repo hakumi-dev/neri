@@ -49,8 +49,10 @@ the compiler identity and Release configuration across native build invocations.
 
 The pinned compiler uses the `0.2.0-dev` toolchain label. Seed, Stage1 and Stage2
 calls all receive the current native runtime manifest; artifact compatibility
-checks and fixed-point comparisons remain enabled. The initial build-driver
-compilation uses the pinned package's own codegen and runtime.
+checks and fixed-point comparisons remain enabled. The seed emits the Stage1
+object through current codegen; the driver links it with the current runtime.
+Stage1 and later compilers validate and link the current manifest directly.
+The initial build-driver compilation uses the pinned package's own codegen and runtime.
 
 Both generations use the executable basename `neri` in separate directories.
 The macOS linker embeds that basename in its ad-hoc signing identifier, so the

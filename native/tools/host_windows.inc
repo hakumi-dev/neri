@@ -10,12 +10,16 @@ struct windows_handle {
 };
 void run(int argc, char **argv) {
   if (argc < 7) throw std::runtime_error("run <seconds> <stdout> <stderr> <status> <executable> [args...]");
+  const bool has_input = argc >= 9 && std::string(argv[6]) == "--stdin";
+  const int executable_index = has_input ? 8 : 6;
+  if (argc <= executable_index)
+    throw std::runtime_error("run requires an executable after --stdin <path>");
   size_t consumed = 0;
   const auto seconds = std::stoi(argv[2], &consumed);
   if (consumed != std::strlen(argv[2]) || seconds < 1 || seconds > 3600)
     throw std::runtime_error("timeout must be 1..3600 seconds");
   SECURITY_ATTRIBUTES attributes{sizeof(attributes), nullptr, TRUE};
-  windows_handle input(CreateFileW(L"NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, &attributes, OPEN_EXISTING, 0, nullptr));
+  windows_handle input(CreateFileW(has_input ? neri::windows::wide(argv[7]).c_str() : L"NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, &attributes, OPEN_EXISTING, 0, nullptr));
   windows_handle output(CreateFileW(neri::windows::wide(argv[3]).c_str(), GENERIC_WRITE, FILE_SHARE_READ, &attributes, CREATE_ALWAYS, 0, nullptr));
   windows_handle errors(CreateFileW(neri::windows::wide(argv[4]).c_str(), GENERIC_WRITE, FILE_SHARE_READ, &attributes, CREATE_ALWAYS, 0, nullptr));
   windows_handle job(CreateJobObjectW(nullptr, nullptr));
@@ -24,7 +28,7 @@ void run(int argc, char **argv) {
   if (!SetInformationJobObject(job.value, JobObjectExtendedLimitInformation, &limits, sizeof(limits)))
     throw std::runtime_error("cannot configure process job");
   std::wstring command;
-  for (int index = 6; index < argc; ++index) {
+  for (int index = executable_index; index < argc; ++index) {
     if (!command.empty()) command += L' ';
     command += neri::windows::quote(neri::windows::wide(argv[index]));
   }

@@ -23,7 +23,7 @@ extern "C" {
 #endif
 
 #define NERI_RUNTIME_ABI_MAJOR UINT16_C(1)
-#define NERI_RUNTIME_ABI_MINOR UINT16_C(20)
+#define NERI_RUNTIME_ABI_MINOR UINT16_C(21)
 
 #define NERI_RT_FEATURE_PRECISE_GC UINT64_C(1)
 #define NERI_RT_FEATURE_NONMOVING_GC (UINT64_C(1) << 1)
@@ -52,6 +52,8 @@ extern "C" {
 #define NERI_RT_FEATURE_SOCKET_CLOSE_RESULT (UINT64_C(1) << 22)
 /* Bit 23 is reserved for ABI 1.19 session support. */
 #define NERI_RT_FEATURE_DRAIN (UINT64_C(1) << 24)
+#define NERI_RT_FEATURE_SESSION_MODULES (UINT64_C(1) << 23)
+#define NERI_RT_FEATURE_OPTIONAL_CONSOLE_READ (UINT64_C(1) << 25)
 
 #define NERI_TYPE_KIND_CLASS_V1 UINT32_C(1)
 #define NERI_TYPE_KIND_STRING_V1 UINT32_C(2)
@@ -99,6 +101,50 @@ typedef struct neri_object_header_v1 {
 } neri_object_header_v1;
 
 typedef neri_object_header_v1 *neri_ref_v1;
+
+typedef neri_ref_v1 (*neri_session_entry_fn_v1)(neri_ref_v1 previous);
+
+typedef struct neri_session_layout_v1 {
+  const char *type_id;
+  const char *canonical_layout;
+  uint32_t kind;
+  uint32_t flags;
+  uint64_t payload_size;
+  uint64_t payload_alignment;
+  const uint64_t *trace_offsets;
+  uint64_t trace_offset_count;
+} neri_session_layout_v1;
+
+typedef struct neri_session_module_metadata_v1 {
+  uint32_t struct_size;
+  uint16_t version_major;
+  uint16_t version_minor;
+  const char *entry_name;
+  neri_session_entry_fn_v1 entry;
+  const char *source_type_id;
+  const char *target_type_id;
+  const neri_session_layout_v1 *layouts;
+  uint64_t layout_count;
+} neri_session_module_metadata_v1;
+
+typedef const neri_session_module_metadata_v1 *(*neri_session_module_accessor_v1)(void);
+
+#define NERI_SESSION_OK_V1 INT64_C(0)
+#define NERI_SESSION_INVALID_HANDLE_V1 INT64_C(1)
+#define NERI_SESSION_LOAD_FAILED_V1 INT64_C(2)
+#define NERI_SESSION_INVALID_METADATA_V1 INT64_C(3)
+#define NERI_SESSION_INCOMPATIBLE_LAYOUT_V1 INT64_C(4)
+#define NERI_SESSION_INCOMPATIBLE_FRAME_V1 INT64_C(5)
+#define NERI_SESSION_INVOKE_STATE_V1 INT64_C(6)
+
+NERI_RT_API neri_int_v1 neri_rt_v1_session_create(void);
+NERI_RT_API neri_int_v1 neri_rt_v1_session_identity(void);
+NERI_RT_API neri_ref_v1 neri_rt_v1_session_owner(neri_int_v1 handle);
+NERI_RT_API neri_int_v1 neri_rt_v1_session_load_execute(
+    neri_int_v1 handle, neri_ref_v1 module_path);
+NERI_RT_API neri_int_v1 neri_rt_v1_session_reset(neri_int_v1 handle);
+NERI_RT_API neri_int_v1 neri_rt_v1_session_destroy(neri_int_v1 handle);
+NERI_RT_API neri_ref_v1 neri_rt_v1_session_error(neri_int_v1 handle);
 
 typedef struct neri_optional_bool_v1 {
   neri_bool_v1 has_value;
@@ -274,6 +320,7 @@ NERI_RT_API void neri_rt_v1_stdout_write(neri_ref_v1 value);
 NERI_RT_API void neri_rt_v1_stdout_write_line(neri_ref_v1 value);
 NERI_RT_API void neri_rt_v1_stderr_write(neri_ref_v1 value);
 NERI_RT_API neri_ref_v1 neri_rt_v1_stdin_read_line(void);
+NERI_RT_API neri_ref_v1 neri_rt_v1_stdin_read_line_optional(void);
 
 /* UTF-8, collections, filesystem, path, environment, and process services. */
 NERI_RT_API neri_int_v1

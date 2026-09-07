@@ -1,0 +1,122 @@
+use test
+
+def hasBinding(prepared: PreparedSubmission, name: String, typeName: String): Bool
+  var binding = prepared.firstBinding
+  while binding != null
+    if binding.name == name && binding.typeName == typeName
+      return true
+    end
+    binding = binding.next
+  end
+  return false
+end
+
+def diagnosticCode(prepared: PreparedSubmission): String
+  let diagnostic = prepared.diagnostics
+  if diagnostic != null
+    return diagnostic.code
+  end
+  return ""
+end
+
+def preparationContracts(): Void
+  let session = new SessionEnvironment("test-owner")
+  let incomplete = session.prepare("if true\n")
+  test.assertEqual(incomplete.status, "incomplete")
+  test.assertEqual(session.currentGeneration(), 0)
+
+  let returned = session.prepare("if true\n  return\nend\n")
+  test.assertEqual(returned.status, "invalid")
+  test.assertEqual(diagnosticCode(returned), "NR_SESSION_RETURN")
+
+  let first = session.prepare("class Counter\n  public value: Int = 1\nend\n\nlet counter = new Counter()\nlet alias = counter\nlet boxed = [counter]\nlet callback = fn(): Int\n  return counter.value\nend\n")
+  test.assertEqual(first.status, "complete")
+  test.assertTrue(hasBinding(first, "counter", "Counter"))
+  test.assertTrue(hasBinding(first, "alias", "Counter"))
+  test.assertTrue(hasBinding(first, "boxed", "Counter[]"))
+  test.assertTrue(hasBinding(first, "callback", "fn():(Int)"))
+  test.assertTrue(session.commit(first))
+  test.assertTrue(!session.commit(first))
+  test.assertEqual(session.currentGeneration(), 1)
+  test.assertEqual(session.bindingCount(), 4)
+
+  let invalid = session.prepare("counter.value = \"wrong\"\n")
+  test.assertEqual(invalid.status, "invalid")
+  test.assertEqual(session.currentGeneration(), 1)
+  test.assertEqual(session.bindingCount(), 4)
+  test.assertTrue(session.discard(invalid))
+
+  let mappedSource = "class Extra\nend\nlet bad = missing\n"
+  let mapped = session.prepare(mappedSource)
+  let mappedDiagnostic = mapped.diagnostics
+  test.assertTrue(mappedDiagnostic != null)
+  if mappedDiagnostic != null
+    test.assertEqual(mappedDiagnostic.start, utf16Length("class Extra\nend\nlet bad = "))
+  end
+
+  let second = session.prepare("let observed = alias.value + boxed[0].value + callback()\n")
+  test.assertEqual(second.status, "complete")
+  test.assertTrue(hasBinding(second, "observed", "Int"))
+  test.assertTrue(session.commit(second))
+  test.assertEqual(session.currentGeneration(), 2)
+  test.assertEqual(session.bindingCount(), 5)
+
+  let mutableSession = new SessionEnvironment("test-owner")
+  let mutableFirst = mutableSession.prepare("var changing = 1\n")
+  test.assertTrue(mutableSession.commit(mutableFirst))
+  let mutableSecond = mutableSession.prepare("changing = changing + 1\nlet snapshot = changing\n")
+  test.assertEqual(mutableSecond.status, "complete")
+  test.assertTrue(bootstrapFindText(mutableSecond.executionSource, "__neri_session_previous.changing = changing") >= 0)
+  test.assertTrue(hasBinding(mutableSecond, "snapshot", "Int"))
+
+  let mixedSession = new SessionEnvironment("test-owner")
+  let mixed = mixedSession.prepare("let before = 1\nclass Later\n  public value: Int = 2\nend\nlet after = new Later()\n")
+  test.assertEqual(mixed.status, "complete")
+  test.assertTrue(hasBinding(mixed, "before", "Int"))
+  test.assertTrue(hasBinding(mixed, "after", "Later"))
+
+  let projectSnapshot = new SessionSourceSnapshot()
+  projectSnapshot.add("app.hk", "def projectValue(): Int\n  return 41\nend\ndef main(): Void\nend\n")
+  let projectSession = new SessionEnvironment("project-owner", projectSnapshot)
+  let projectUse = projectSession.prepare("let fromProject = projectValue() + 1\n")
+  test.assertEqual(projectUse.status, "complete")
+  test.assertTrue(hasBinding(projectUse, "fromProject", "Int"))
+
+  let foreign = new SessionEnvironment("foreign-owner")
+  test.assertTrue(!foreign.commit(projectUse))
+  let collidingOwner = new SessionEnvironment("project-owner")
+  test.assertTrue(!collidingOwner.commit(projectUse))
+  projectUse.declarations = "class Forged\nend\n"
+  projectUse.status = "invalid"
+  test.assertTrue(projectSession.commit(projectUse))
+  let afterMutation = projectSession.prepare("let retained = fromProject\n")
+  test.assertEqual(afterMutation.status, "complete")
+
+  let reserved = new SessionEnvironment("reserved-owner").prepare("let __neri_session_fake = 1\n")
+  test.assertEqual(diagnosticCode(reserved), "NR_SESSION_RESERVED")
+
+  let stale = session.prepare("let later = observed\n")
+  let competing = session.prepare("let other = observed\n")
+  test.assertTrue(session.commit(stale))
+  test.assertTrue(!session.commit(competing))
+
+  let initializer = new SessionEnvironment("test-owner")
+  let initializerSource = new SessionSourceSnapshot()
+  initializerSource.add("initializer.hk", "class Service\n  public value: Int = 7\nend\n\ndef createService(): Service\n  return new Service()\nend\n\ndef main(): Void\n  let applicationMarker = 1\nend\n")
+  let initialized = initializer.validateInitializer(initializerSource, "createService")
+  test.assertEqual(initialized.status, "complete")
+  test.assertTrue(hasBinding(initialized, "service", "Service"))
+  test.assertEqual(initialized.declarationCount, 3)
+  test.assertTrue(bootstrapFindText(initialized.executionSource, "createService()") >= 0)
+  test.assertTrue(initializer.commit(initialized))
+
+  let unsafeInitializerSource = new SessionSourceSnapshot()
+  unsafeInitializerSource.add("unsafe-initializer.hk", "def unsafe create(): Int\n  return 1\nend\n")
+  let badInitializer = new SessionEnvironment("test-owner").validateInitializer(unsafeInitializerSource, "create")
+  test.assertEqual(badInitializer.status, "invalid")
+  test.assertEqual(diagnosticCode(badInitializer), "NR_SESSION_INITIALIZER")
+
+  session.dispose()
+  let disposed = session.prepare("let value = 1\n")
+  test.assertEqual(diagnosticCode(disposed), "NR_SESSION_DISPOSED")
+end

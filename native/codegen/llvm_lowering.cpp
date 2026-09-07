@@ -204,6 +204,7 @@ public:
     declare_imports();
     declare_functions();
     declare_class_metadata();
+    emit_session_exports();
     lower_functions();
     if (debug_builder_ != nullptr) {
       debug_builder_->finalize();
@@ -2248,15 +2249,163 @@ private:
     }
   }
 
+  [[nodiscard]] llvm::GlobalVariable *session_text(std::string_view value,
+                                                    std::string_view suffix) {
+    auto *bytes = llvm::ConstantDataArray::getString(context_, value, true);
+    auto *global = new llvm::GlobalVariable(*output_, bytes->getType(), true,
+        llvm::GlobalValue::PrivateLinkage, bytes, ".hk.session.text." + std::string(suffix));
+    global->setUnnamedAddr(llvm::GlobalValue::UnnamedAddr::Global);
+    global->setAlignment(llvm::Align(1));
+    return global;
+  }
+
+  [[nodiscard]] std::string session_type_id(const type &value) const {
+    auto result = std::string("neri:type:v1:");
+    if (value.symbol.has_value()) {
+      result += "m" + std::to_string(value.symbol->module.size()) + "_";
+      append_hex(result, value.symbol->module);
+      result += ":";
+    }
+    result += type_code(value);
+    return result;
+  }
+
+  [[nodiscard]] std::string session_symbol_id(const symbol_id &value) const {
+    std::string result = "m" + std::to_string(value.module.size()) + "_";
+    append_hex(result, value.module);
+    result += "k" + std::to_string(value.kind) + "n" +
+              std::to_string(value.semantic_name.size()) + "_";
+    append_hex(result, value.semantic_name);
+    return result;
+  }
+
+  [[nodiscard]] std::string session_canonical_type(const type &value) const {
+    std::string result = std::to_string(value.tag);
+    if (value.symbol.has_value()) result += "{" + session_symbol_id(*value.symbol) + "}";
+    if (value.element_count != 0) result += "#" + std::to_string(value.element_count);
+    result += "[";
+    for (const auto &argument : value.arguments)
+      result += session_canonical_type(argument) + ";";
+    return result + "]";
+  }
+
+  [[nodiscard]] std::string session_layout_fingerprint(const lowered_class &layout) const {
+    std::string result = "class-v1:" + session_symbol_id(layout.value->id);
+    if (layout.value->base.has_value()) result += ":base=" + session_symbol_id(*layout.value->base);
+    result += ":fields=";
+    for (const auto &field : layout.fields)
+      result += session_symbol_id(field.value->id) + "=" +
+                session_canonical_type(field.value->value_type) + "@" +
+                std::to_string(field.offset) + ";";
+    result += ":dispatch=";
+    for (const auto &[slot, dispatch_index] : layout.dispatch_slots) {
+      const auto *implementation = layout.virtual_methods.at(dispatch_index);
+      result += std::get<0>(slot) + "#" + std::to_string(std::get<1>(slot)) +
+                "#" + std::get<2>(slot) + "=>" +
+                session_symbol_id(implementation->id) + "(";
+      for (const auto &parameter : implementation->parameter_types)
+        result += session_canonical_type(parameter) + ",";
+      result += ")->" + session_canonical_type(implementation->result_type) + ";";
+    }
+    return result;
+  }
+
+  void emit_session_exports() {
+    if (!input_.session.has_value()) return;
+    const auto &session = *input_.session;
+    auto *pointer = llvm::PointerType::getUnqual(context_);
+    auto *trampoline = llvm::Function::Create(
+        llvm::FunctionType::get(pointer, {pointer}, false),
+        llvm::GlobalValue::ExternalLinkage, "neri_session_entry_v1", output_.get());
+    trampoline->setCallingConv(llvm::CallingConv::C);
+    trampoline->addFnAttr(llvm::Attribute::NoUnwind);
+    auto *block = llvm::BasicBlock::Create(context_, "entry", trampoline);
+    llvm::IRBuilder<> builder(block);
+    auto *typed_entry = functions_.at(symbol_key(session.entry));
+    auto *call = session.source_type.tag == NERI_IR_TYPE_VOID_V1
+                     ? builder.CreateCall(typed_entry, {})
+                     : builder.CreateCall(typed_entry, {trampoline->getArg(0)});
+    call->setCallingConv(llvm::CallingConv::C);
+    builder.CreateRet(call);
+
+    auto *i32 = llvm::Type::getInt32Ty(context_);
+    auto *i64 = llvm::Type::getInt64Ty(context_);
+    auto *layout_type = llvm::StructType::get(context_, {pointer, pointer, i32, i32, i64, i64, pointer, i64});
+    std::vector<llvm::Constant *> values;
+    std::size_t index = 0;
+    for (const auto &declaration : input_.classes) {
+      const auto &layout = layout_for_class(declaration.id);
+      std::vector<llvm::Constant *> offsets;
+      for (const auto &field : layout.fields)
+        if (is_managed_reference(field.value->value_type))
+          offsets.push_back(llvm::ConstantInt::get(i64, field.offset));
+      llvm::Constant *offsets_pointer = llvm::ConstantPointerNull::get(pointer);
+      if (!offsets.empty()) {
+        auto *offset_type = llvm::ArrayType::get(i64, offsets.size());
+        auto *offset_data = new llvm::GlobalVariable(*output_, offset_type, true,
+            llvm::GlobalValue::PrivateLinkage, llvm::ConstantArray::get(offset_type, offsets),
+            ".hk.session.trace." + std::to_string(index));
+        offset_data->setAlignment(llvm::Align(8));
+        offsets_pointer = offset_data;
+      }
+      auto *name = session_text(session_type_id(
+          type{NERI_IR_TYPE_CLASS_V1, declaration.id, {}}),
+          "type." + std::to_string(index));
+      auto *fingerprint = session_text(session_layout_fingerprint(layout),
+          "layout." + std::to_string(index));
+      values.push_back(llvm::ConstantStruct::get(layout_type,
+          {name, fingerprint, llvm::ConstantInt::get(i32, NERI_TYPE_KIND_CLASS_V1),
+           llvm::ConstantInt::get(i32, offsets.empty() ? 0U : NERI_TYPE_FLAG_CONTAINS_REFS_V1),
+           llvm::ConstantInt::get(i64, layout.payload_size),
+           llvm::ConstantInt::get(i64, layout.payload_alignment), offsets_pointer,
+           llvm::ConstantInt::get(i64, offsets.size())}));
+      ++index;
+    }
+    auto *array_type = llvm::ArrayType::get(layout_type, values.size());
+    auto *layouts = new llvm::GlobalVariable(*output_, array_type, true,
+        llvm::GlobalValue::PrivateLinkage, llvm::ConstantArray::get(array_type, values),
+        ".hk.session.layouts");
+    layouts->setAlignment(llvm::Align(8));
+    const auto source_id = session.source_type.tag == NERI_IR_TYPE_VOID_V1
+        ? std::string("neri:type:v1:void")
+        : session_type_id(session.source_type);
+    const auto target_id = session_type_id(session.target_type);
+    auto *entry_name = session_text("neri_session_entry_v1", "entry");
+    auto *source_name = session_text(source_id, "source");
+    auto *target_name = session_text(target_id, "target");
+    auto *i16 = llvm::Type::getInt16Ty(context_);
+    auto *metadata_type = llvm::StructType::get(context_,
+        {i32, i16, i16, pointer, pointer, pointer, pointer, pointer, i64});
+    auto *metadata = new llvm::GlobalVariable(*output_, metadata_type, true,
+        llvm::GlobalValue::PrivateLinkage,
+        llvm::ConstantStruct::get(metadata_type,
+            {llvm::ConstantInt::get(i32, sizeof(neri_session_module_metadata_v1)),
+             llvm::ConstantInt::get(i16, 1), llvm::ConstantInt::get(i16, 0),
+             entry_name, trampoline, source_name, target_name, layouts,
+             llvm::ConstantInt::get(i64, values.size())}), ".hk.session.metadata");
+    metadata->setAlignment(llvm::Align(8));
+    auto *accessor = llvm::Function::Create(llvm::FunctionType::get(pointer, {}, false),
+        llvm::GlobalValue::ExternalLinkage, "neri_session_module_v1", output_.get());
+    accessor->setCallingConv(llvm::CallingConv::C);
+    accessor->addFnAttr(llvm::Attribute::NoUnwind);
+    auto *accessor_block = llvm::BasicBlock::Create(context_, "entry", accessor);
+    llvm::IRBuilder<> accessor_builder(accessor_block);
+    accessor_builder.CreateRet(metadata);
+  }
+
   void emit_program_requirements() {
     std::uint16_t minimum_minor = source_location_runtime_minor;
     std::uint64_t required_features = NERI_RT_FEATURE_SOURCE_LOCATIONS;
+    if (input_.session.has_value()) {
+      minimum_minor = 19;
+      required_features |= NERI_RT_FEATURE_SESSION_MODULES;
+    }
     if (std::ranges::find(input_.required_features, "extended-scalars-v1") != input_.required_features.end()) {
-      minimum_minor = 9;
+      minimum_minor = std::max(minimum_minor, uint16_t{9});
       required_features |= NERI_RT_FEATURE_EXTENDED_SCALARS;
     }
     if (std::ranges::find(input_.required_features, "scoped-tasks-v1") != input_.required_features.end()) {
-      minimum_minor = 10;
+      minimum_minor = std::max(minimum_minor, uint16_t{10});
       required_features |= NERI_RT_FEATURE_SCOPED_TASKS;
     }
     if (std::ranges::find(input_.required_features, "native-strings-v1") !=
@@ -2341,6 +2490,14 @@ private:
         minimum_minor = std::max(minimum_minor, uint16_t{20});
         required_features |= NERI_RT_FEATURE_DRAIN;
       }
+      if (import.link_name.starts_with("neri_rt_v1_session_")) {
+        minimum_minor = std::max(minimum_minor, uint16_t{19});
+        required_features |= NERI_RT_FEATURE_SESSION_MODULES;
+      }
+      if (import.link_name == "neri_rt_v1_stdin_read_line_optional") {
+        minimum_minor = std::max(minimum_minor, uint16_t{21});
+        required_features |= NERI_RT_FEATURE_OPTIONAL_CONSOLE_READ;
+      }
       if (import.link_name.starts_with("neri_rt_v1_terminal_") ||
           import.link_name.starts_with("neri_rt_v1_clock_")) {
         minimum_minor = std::max(minimum_minor, uint16_t{8});
@@ -2370,7 +2527,9 @@ private:
          llvm::ConstantInt::get(llvm::Type::getInt64Ty(context_),
                                 required_features)});
     auto *declaration = new llvm::GlobalVariable(
-        *output_, requirements_type, true, llvm::GlobalValue::ExternalLinkage,
+        *output_, requirements_type, true,
+        input_.session.has_value() ? llvm::GlobalValue::InternalLinkage
+                                   : llvm::GlobalValue::ExternalLinkage,
         requirements, "neri_program_v1_abi_requirements");
     declaration->setAlignment(llvm::Align(8));
   }
@@ -2454,7 +2613,9 @@ private:
       auto *declaration = llvm::Function::Create(
           physical_function_type(function.parameter_types,
                                  function.result_type),
-          llvm::GlobalValue::ExternalLinkage, mangle_function(function),
+          input_.session.has_value() ? llvm::GlobalValue::InternalLinkage
+                                     : llvm::GlobalValue::ExternalLinkage,
+          mangle_function(function),
           output_.get());
       declaration->setCallingConv(llvm::CallingConv::C);
       declaration->addFnAttr(llvm::Attribute::NoUnwind);

@@ -313,6 +313,7 @@ public:
     for (const auto &feature : result.required_features) {
       if (feature == "native-libraries-v1") native_libraries_ = true;
       if (feature == "native-records-v1") native_records_ = true;
+      if (feature == "session-module-v1") session_module_ = true;
       if (feature == "scoped-tasks-v1" && transport_minor_ < 4U)
         fail(unsupported_feature, "Scoped tasks require IR transport 1.4.", input_.offset());
     }
@@ -339,6 +340,11 @@ public:
         record.fields = read_vector<field>(input_, "native fields", [this] { return read_field(); });
         return record;
       });
+    }
+    if (session_module_) {
+      if (transport_minor_ < 5U)
+        fail(unsupported_feature, "Session modules require transport 1.5.", input_.offset());
+      result.session = session_export{read_symbol(), read_type(), read_type()};
     }
     input_.require_end();
     return result;
@@ -697,6 +703,7 @@ private:
   std::uint16_t transport_minor_{};
   bool native_libraries_{};
   bool native_records_{};
+  bool session_module_{};
 };
 
 void validate_options(const reader_options &options) {

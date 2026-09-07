@@ -168,6 +168,12 @@ struct function final {
   std::vector<debug_local> debug_locals;
 };
 
+struct session_export final {
+  symbol_id entry;
+  type source_type;
+  type target_type;
+};
+
 struct ir_module final {
   version semantic_version;
   std::string id;
@@ -178,6 +184,7 @@ struct ir_module final {
   std::vector<import_declaration> imports;
   std::vector<function> functions;
   std::vector<native_record> native_records;
+  std::optional<session_export> session;
 };
 
 } // namespace neri::codegen

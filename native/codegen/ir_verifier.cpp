@@ -1531,10 +1531,30 @@ void verify_supported_module(const ir_module &value) {
            "Required feature '" + feature +
                "' is not a canonical feature identifier.");
     }
-    if (feature != "string-data-v1" && feature != "native-strings-v1" && feature != "native-libraries-v1" && feature != "extended-scalars-v1" && feature != "native-records-v1" && feature != "scoped-tasks-v1") {
+    if (feature != "string-data-v1" && feature != "native-strings-v1" && feature != "native-libraries-v1" && feature != "extended-scalars-v1" && feature != "native-records-v1" && feature != "scoped-tasks-v1" && feature != "session-module-v1") {
       fail(unsupported_feature,
            "Unknown required semantic feature '" + feature + "'.");
     }
+  }
+
+  if (value.session.has_value()) {
+    const auto &session = *value.session;
+    const auto found = std::ranges::find_if(value.functions, [&](const function &item) {
+      return item.id.module == session.entry.module && item.id.kind == session.entry.kind &&
+             item.id.semantic_name == session.entry.semantic_name;
+    });
+    if (found == value.functions.end() || found->id.semantic_name != "__neri_session_entry" ||
+        found->parameter_types.size() > 1U ||
+        (found->parameter_types.empty() ? session.source_type.tag != NERI_IR_TYPE_VOID_V1
+                                        : !same_type(found->parameter_types.front(), session.source_type)) ||
+        !same_type(found->result_type, session.target_type) ||
+        session.target_type.tag != NERI_IR_TYPE_CLASS_V1 ||
+        (!found->parameter_types.empty() && session.source_type.tag != NERI_IR_TYPE_CLASS_V1)) {
+      fail(invalid_reference, "Session export does not match the generated entry signature.");
+    }
+    require_declared_type(value, session.target_type, "Session target frame");
+    if (session.source_type.tag != NERI_IR_TYPE_VOID_V1)
+      require_declared_type(value, session.source_type, "Session source frame");
   }
 
   if (!value.native_records.empty() && std::ranges::find(value.required_features, "native-records-v1") == value.required_features.end())

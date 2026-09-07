@@ -1,7 +1,7 @@
 # Runtime and IR boundary
 
 The canonical exported declarations and layouts are in
-[`runtime_abi.h`](../native/include/neri/runtime_abi.h). Runtime ABI 1.20 uses a
+[`runtime_abi.h`](../native/include/neri/runtime_abi.h). Runtime ABI 1.21 uses a
 C calling convention on macOS ARM64 and Linux x86-64. Generated programs negotiate
 major version, minimum minor version and required feature bits before execution.
 The package manifest also identifies the toolchain version and native target.
@@ -31,7 +31,11 @@ to an open directory and preserves operating-system and close errors.
 The `SOCKET_CLOSE_RESULT` feature (4194304), introduced in ABI 1.18, reports socket
 close failure. The `DRAIN` feature (16777216), introduced in ABI 1.20, provides a
 native watchdog for explicitly configured whole-process termination after stop.
-Bit 23 remains reserved and is absent from the runtime's advertised features.
+The `SESSION_MODULES` feature (8388608), introduced in ABI 1.19, provides the
+versioned session metadata and coordinator bridge. The
+`OPTIONAL_CONSOLE_READ` feature (33554432), introduced in ABI 1.21, adds
+`console.readLine(): String?`: EOF before any byte returns none, while a blank
+line returns an empty string. The existing `console.read()` contract is unchanged.
 
 ## Representation
 
