@@ -1,6 +1,7 @@
 #include "neri/codegen/emitter.h"
 #include "neri/codegen/reader.h"
 #include "neri/ir_transport.h"
+#include "../../native/codegen/ir_verifier.h"
 
 #include <llvm/ADT/ArrayRef.h>
 #include <llvm/Support/SHA256.h>
@@ -60,6 +61,63 @@ void require(bool condition, std::string_view message) {
   if (!condition) {
     throw std::runtime_error(std::string(message));
   }
+}
+
+void test_unsafe_call_boundary() {
+  using namespace neri::codegen;
+  ir_module module;
+  module.semantic_version = {1, 0};
+  module.id = "unsafe-call-contract";
+  const type capability{NERI_IR_TYPE_UNSAFE_CAPABILITY_V1, std::nullopt, {}};
+  function target;
+  target.id = {module.id, NERI_IR_SYMBOL_FUNCTION_V1, "aaa_owned"};
+  target.kind = NERI_IR_FUNCTION_V1;
+  target.result_type.tag = NERI_IR_TYPE_VOID_V1;
+  target.unsafe_call = true;
+  target.unsafe_root = value_definition{0, capability};
+  block body;
+  body.ending.tag = NERI_IR_TERMINATOR_RETURN_V1;
+  target.blocks.push_back(body);
+  module.functions.push_back(target);
+
+  function caller;
+  caller.id = {module.id, NERI_IR_SYMBOL_FUNCTION_V1, "bbb_caller"};
+  caller.kind = NERI_IR_FUNCTION_V1;
+  caller.result_type.tag = NERI_IR_TYPE_VOID_V1;
+  caller.effects = NERI_IR_EFFECT_UNSAFE_V1;
+  instruction begin;
+  begin.opcode = NERI_IR_OPCODE_UNSAFE_BEGIN_V1;
+  begin.results.push_back({0, capability});
+  instruction call;
+  call.opcode = NERI_IR_OPCODE_CALL_UNSAFE_V1;
+  call.operands.push_back(0);
+  call.symbol = target.id;
+  instruction end;
+  end.opcode = NERI_IR_OPCODE_UNSAFE_END_V1;
+  end.operands.push_back(0);
+  body.instructions = {begin, call, end};
+  caller.blocks.push_back(body);
+  module.functions.push_back(caller);
+  verify_supported_module(module);
+
+  auto rejected = [](const ir_module &candidate) {
+    try {
+      verify_supported_module(candidate);
+    } catch (const reader_error &) {
+      return;
+    }
+    throw std::runtime_error("unsafe call escaped native capability validation");
+  };
+  auto malformed = module;
+  malformed.functions[1].blocks[0].instructions[1].operands.clear();
+  rejected(malformed);
+  malformed = module;
+  malformed.functions[1].blocks[0].instructions[1].opcode = NERI_IR_OPCODE_CALL_V1;
+  malformed.functions[1].blocks[0].instructions[1].operands.clear();
+  rejected(malformed);
+  malformed = module;
+  malformed.functions[0].unsafe_root.reset();
+  rejected(malformed);
 }
 
 void write_u16(std::vector<std::uint8_t> &bytes, std::size_t offset,
@@ -230,6 +288,7 @@ int main(int argc, char **argv) {
     static_cast<void>(neri::codegen::read_verified_module(bytes));
     test_envelope_rejections(bytes);
     test_payload_rejections(bytes);
+    test_unsafe_call_boundary();
     test_primitive_codegen(read_hex(argv[2]));
     return 0;
   } catch (const std::exception &error) {

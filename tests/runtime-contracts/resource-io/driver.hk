@@ -1,0 +1,191 @@
+use files
+use host
+use process
+use resources
+use result
+use test
+
+@cabi("open")
+def unsafe posixOpen(path: Byte*, flags: Int32): Int32
+end
+@cabi("close")
+def unsafe posixClose(fd: Int32): Int32
+end
+@cabi("kill")
+def unsafe posixKill(pid: Int32, signal: Int32): Int32
+end
+
+def openNull(): Int
+  let path = [47 as Byte, 100 as Byte, 101 as Byte, 118 as Byte, 47 as Byte, 110 as Byte, 117 as Byte, 108 as Byte, 108 as Byte, 0 as Byte]
+  unsafe
+    borrow path as pointer
+      return posixOpen(pointer, 0 as Int32) as Int
+    end
+  end
+end
+
+def closeFd(fd: Int): Void
+  unsafe
+    test.assertEqual(posixClose(fd as Int32) as Int, 0)
+  end
+end
+
+def earlyRoot(path: String, expectedFd: Int): resources.Outcome<Int, result.Failure>
+  using root <- files.ScopedRoot.open(path)
+    let next = openNull()
+    test.assertEqual(next, expectedFd + 1)
+    closeFd(next)
+    return 17
+  end
+  return 0
+end
+
+def partialRoot(path: String, missing: String): resources.Outcome<Int, result.Failure>
+  using root <- files.ScopedRoot.open(path)
+    using child <- process.ScopedChild.spawn(new process.SpawnOptions(missing))
+      return 1
+    end
+  end
+  return 0
+end
+
+def explicitRoot(path: String): resources.Outcome<Int, result.Failure>
+  using root <- files.ScopedRoot.open(path)
+    test.assertTrue(root.close() == null)
+    test.assertTrue(root.close() == null)
+    let read = root.readBytes("sample", 1024)
+    let readFailure = read.failure
+    test.assertTrue(readFailure != null)
+    if readFailure != null
+      test.assertEqual(readFailure.code, "closed")
+    end
+    return 23
+  end
+  return 0
+end
+
+def scopedChild(fixture: String): resources.Outcome<Int, result.Failure>
+  using child <- process.ScopedChild.spawn(new process.SpawnOptions(fixture))
+    var pid = -1
+    var attempt = 0
+    while attempt < 50 && pid < 0
+      let snapshot = child.wait(20)
+      test.assertTrue(snapshot.failure == null)
+      if snapshot.stdout.Length > 1
+        let text = host.stringFromBytes(snapshot.stdout)
+        if text != null
+          let parsed = host.parseInt(host.stringSlice(text, 0, host.stringByteLength(text) - 1))
+          pid = parsed if parsed != null
+        end
+      end
+      attempt = attempt + 1
+    end
+    test.assertTrue(pid > 0)
+    return pid
+  end
+  return -1
+end
+
+class RollbackState
+  public pid: Int = -1
+end
+
+def rollbackChild(fixture: String, missing: String, state: RollbackState): resources.Outcome<Int, result.Failure>
+  using primary <- process.ScopedChild.spawn(new process.SpawnOptions(fixture))
+    var attempt = 0
+    while attempt < 50 && state.pid < 0
+      let snapshot = primary.wait(20)
+      test.assertTrue(snapshot.failure == null)
+      if snapshot.stdout.Length > 1
+        let text = host.stringFromBytes(snapshot.stdout)
+        if text != null
+          let parsed = host.parseInt(host.stringSlice(text, 0, host.stringByteLength(text) - 1))
+          state.pid = parsed if parsed != null
+        end
+      end
+      attempt = attempt + 1
+    end
+    test.assertTrue(state.pid > 0)
+    using secondary <- process.ScopedChild.spawn(new process.SpawnOptions(missing))
+      return 1
+    end
+  end
+  return 0
+end
+
+def assertDead(pid: Int): Void
+  unsafe
+    test.assertEqual(posixKill(pid as Int32, 0 as Int32) as Int, -1)
+  end
+end
+
+def main(): Void
+  let dataDir = host.argumentAt(0)
+  let fixture = host.argumentAt(1)
+  let target = host.argumentAt(2)
+  test.assertTrue(dataDir != null && fixture != null && target != null)
+  if dataDir == null || fixture == null || target == null
+    return
+  end
+  test.assertTrue(target == "linux-x86_64" || target == "macos-arm64")
+
+  let lowest = openNull()
+  test.assertTrue(lowest >= 0)
+  closeFd(lowest)
+  let early = earlyRoot(dataDir, lowest)
+  match early.completion
+    case resources.Completion.Value(value)
+      test.assertEqual(value, 17)
+    case resources.Completion.Failure(failure)
+      test.assertTrue(false)
+  end
+  test.assertEqual(early.closeFailures.count(), 0)
+  let afterEarly = openNull()
+  test.assertEqual(afterEarly, lowest)
+  closeFd(afterEarly)
+
+  let missing = fixture + ".missing"
+  let partial = partialRoot(dataDir, missing)
+  match partial.completion
+    case resources.Completion.Value(value)
+      test.assertTrue(false)
+    case resources.Completion.Failure(failure)
+      test.assertTrue(failure != null)
+      if failure != null
+        test.assertEqual(failure.code, "spawn_failed")
+      end
+  end
+  test.assertEqual(partial.closeFailures.count(), 0)
+  let afterPartial = openNull()
+  test.assertEqual(afterPartial, lowest)
+  closeFd(afterPartial)
+
+  let explicit = explicitRoot(dataDir)
+  test.assertEqual(explicit.closeFailures.count(), 0)
+
+  let childOutcome = scopedChild(fixture)
+  var childPid = -1
+  match childOutcome.completion
+    case resources.Completion.Value(pid)
+      childPid = pid
+    case resources.Completion.Failure(failure)
+      test.assertTrue(false)
+  end
+  test.assertEqual(childOutcome.closeFailures.count(), 0)
+  assertDead(childPid)
+
+  let rollback = new RollbackState()
+  let failed = rollbackChild(fixture, missing, rollback)
+  match failed.completion
+    case resources.Completion.Value(value)
+      test.assertTrue(false)
+    case resources.Completion.Failure(failure)
+      test.assertTrue(failure != null)
+      if failure != null
+        test.assertEqual(failure.code, "spawn_failed")
+        test.assertEqual(failure.operation, "process.spawn")
+      end
+  end
+  test.assertEqual(failed.closeFailures.count(), 0)
+  assertDead(rollback.pid)
+end

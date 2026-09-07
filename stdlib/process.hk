@@ -1,0 +1,431 @@
+use buffers
+use host
+use result
+use tasks
+namespace process
+
+class Failure
+  private value: String
+  public osCode: Int
+  public operation: String
+  private def init(code: String, osCode: Int = 0, operation: String = ""): Void
+    this.value = code
+    this.osCode = osCode
+    this.operation = operation
+  end
+  def static fromCode(code: String, osCode: Int = 0, operation: String = ""): Failure
+    return new Failure(code, osCode, operation)
+  end
+  def code(): String
+    return this.value
+  end
+end
+
+class EnvironmentEntry
+  public name: String
+  public value: String
+  def init(name: String, value: String): Void
+    this.name = name
+    this.value = value
+  end
+end
+
+class SpawnOptions
+  public executable: String
+  public arguments: String[] = []
+  public environment: EnvironmentEntry[] = []
+  public inheritEnvironment: Bool = true
+  public workingDirectory: String = ""
+  public stdoutLimit: Int = 1048576
+  public stderrLimit: Int = 1048576
+  def init(executable: String): Void
+    this.executable = executable
+  end
+end
+
+class ExitStatus
+  public kind: String
+  public value: Int
+  def init(kind: String, value: Int): Void
+    this.kind = kind
+    this.value = value
+  end
+end
+
+class PollResult
+  public running: Bool = false
+  public exit: ExitStatus?
+  public stdout: Byte[] = []
+  public stderr: Byte[] = []
+  public stdoutTruncated: Bool = false
+  public stderrTruncated: Bool = false
+  public failure: Failure?
+end
+
+class SpawnResult
+  private value: Child?
+  private problem: Failure?
+  private def init(value: Child?, problem: Failure?): Void
+    this.value = value
+    this.problem = problem
+  end
+  def static success(value: Child): SpawnResult
+    return new SpawnResult(value, null)
+  end
+  def static failed(code: String, osCode: Int = 0, operation: String = ""): SpawnResult
+    return new SpawnResult(null, Failure.fromCode(code, osCode, operation))
+  end
+  def child(): Child?
+    return this.value
+  end
+  def failure(): Failure?
+    return this.problem
+  end
+end
+
+@cabi("neri_rt_v1_process_spawn")
+def unsafe nativeSpawn(config: Byte*, length: Int, token: Int*, osCode: Int*): Int
+end
+@cabi("neri_rt_v1_process_poll")
+def unsafe nativePoll(token: Int, waitMilliseconds: Int, state: Int*, osCode: Int*): Int
+end
+@cabi("neri_rt_v1_process_read")
+def unsafe nativeRead(token: Int, channel: Int, offset: Int, output: Byte*, capacity: Int, count: Int*): Int
+end
+@cabi("neri_rt_v1_process_cancel")
+def unsafe nativeCancel(token: Int, osCode: Int*): Int
+end
+@cabi("neri_rt_v1_process_dispose")
+def unsafe nativeDispose(token: Int, osCode: Int*): Int
+end
+
+resource class ScopedChild
+  private child: Child
+
+  private def init(child: Child): Void
+    this.child = child
+  end
+
+  def static spawn(options: SpawnOptions): result.Result<ScopedChild, result.Failure>
+    let started = process.spawn(options)
+    let failure = started.failure()
+    if failure != null
+      return result.Result<ScopedChild, result.Failure>.Error(asResultFailure(failure, "process.spawn"))
+    end
+    let child = started.child()
+    if child == null
+      return result.Result<ScopedChild, result.Failure>.Error(new result.Failure("missing_child", "process.spawn"))
+    end
+    let owned = new ScopedChild(child)
+    return result.Result<ScopedChild, result.Failure>.Ok(transfer owned)
+  end
+
+  def close(): result.Failure?
+    match this.child.disposeOutcome()
+      case result.Result.Ok(disposed)
+        return null
+      case result.Result.Error(failure)
+        return failure
+    end
+  end
+
+  def poll(): PollResult
+    return this.child.poll()
+  end
+
+  def wait(milliseconds: Int): PollResult
+    return this.child.wait(milliseconds)
+  end
+
+  def cancel(): result.Result<Bool, result.Failure>
+    return this.child.cancelOutcome()
+  end
+end
+
+class Child
+  private token: Int
+  private disposed: Bool = false
+
+  private def init(token: Int): Void
+    this.token = token
+  end
+
+  def static start(config: Byte[]): SpawnResult
+    unsafe
+      let token = stackalloc Int[1]
+      let osCode = stackalloc Int[1]
+      borrow config as pointer
+        if nativeSpawn(pointer, config.Length, token, osCode) != 0
+          return SpawnResult.failed("spawn_failed", osCode[0], "process.spawn")
+        end
+      end
+      return SpawnResult.success(new Child(token[0]))
+    end
+  end
+
+  def poll(): PollResult
+    return this.wait(0)
+  end
+
+  def wait(milliseconds: Int): PollResult
+    let result = new PollResult()
+    if this.disposed
+      result.failure = Failure.fromCode("disposed", 0, "process.poll")
+      return result
+    end
+    if milliseconds < 0 || milliseconds > 60000
+      result.failure = Failure.fromCode("invalid_timeout", 0, "process.poll")
+      return result
+    end
+    unsafe
+      let state = stackalloc Int[7]
+      let osCode = stackalloc Int[1]
+      if nativePoll(this.token, milliseconds, state, osCode) != 0
+        result.failure = Failure.fromCode("poll_failed", osCode[0], "process.poll")
+        return result
+      end
+      result.running = state[0] == 0
+      if !result.running
+        var kind = "exit"
+        kind = "signal" if state[1] == 2
+        kind = "cancelled" if state[1] == 3
+        result.exit = new ExitStatus(kind, state[2])
+      end
+      result.stdout = this.readChannel(1, state[3])
+      result.stderr = this.readChannel(2, state[4])
+      if result.stdout.Length != state[3] || result.stderr.Length != state[4]
+        result.failure = Failure.fromCode("read_failed", 0, "process.read")
+        return result
+      end
+      result.stdoutTruncated = state[5] != 0
+      result.stderrTruncated = state[6] != 0
+    end
+    return result
+  end
+
+  def cancel(): Bool
+    if this.disposed
+      return true
+    end
+    unsafe
+      let osCode = stackalloc Int[1]
+      return nativeCancel(this.token, osCode) == 0
+    end
+  end
+
+  def dispose(): Bool
+    if this.disposed
+      return true
+    end
+    unsafe
+      let osCode = stackalloc Int[1]
+      if nativeDispose(this.token, osCode) != 0
+        return false
+      end
+    end
+    this.disposed = true
+    return true
+  end
+
+  def cancelOutcome(): result.Result<Bool, result.Failure>
+    if this.disposed
+      return result.Result<Bool, result.Failure>.Ok(true)
+    end
+    unsafe
+      let osCode = stackalloc Int[1]
+      if nativeCancel(this.token, osCode) != 0
+        return result.Result<Bool, result.Failure>.Error(new result.Failure("cancel_failed", "process.cancel", "", 0, osCode[0]))
+      end
+    end
+    return result.Result<Bool, result.Failure>.Ok(true)
+  end
+
+  def disposeOutcome(): result.Result<Bool, result.Failure>
+    if this.disposed
+      return result.Result<Bool, result.Failure>.Ok(true)
+    end
+    unsafe
+      let osCode = stackalloc Int[1]
+      if nativeDispose(this.token, osCode) != 0
+        return result.Result<Bool, result.Failure>.Error(new result.Failure("dispose_failed", "process.dispose", "", 0, osCode[0]))
+      end
+    end
+    this.disposed = true
+    return result.Result<Bool, result.Failure>.Ok(true)
+  end
+
+  private def readChannel(channel: Int, length: Int): Byte[]
+    if length == 0
+      return []
+    end
+    let output: Byte[] = tasks.generate(length, 1) do |index|
+      return 0 as Byte
+    end
+    unsafe
+      let count = stackalloc Int[1]
+      borrow output as pointer
+        if nativeRead(this.token, channel, 0, pointer, length, count) != 0 || count[0] != length
+          return []
+        end
+      end
+    end
+    return output
+  end
+end
+
+def spawn(options: SpawnOptions): SpawnResult
+  let config = encodeOptions(options)
+  if config == null
+    return SpawnResult.failed("invalid_options")
+  end
+  return Child.start(config)
+end
+
+def asResultFailure(failure: Failure, fallbackOperation: String): result.Failure
+  var operation = failure.operation
+  operation = fallbackOperation if operation == ""
+  return new result.Failure(failure.code(), operation, "", 0, failure.osCode)
+end
+
+def spawnOutcome(options: SpawnOptions): result.Result<Child, result.Failure>
+  let value = spawn(options)
+  let failure = value.failure()
+  if failure != null
+    return result.Result<Child, result.Failure>.Error(asResultFailure(failure, "process.spawn"))
+  end
+  let child = value.child()
+  if child == null
+    return result.Result<Child, result.Failure>.Error(new result.Failure("missing_child", "process.spawn"))
+  end
+  return result.Result<Child, result.Failure>.Ok(child)
+end
+
+def pollOutcome(child: Child): result.Result<PollResult, result.Failure>
+  return waitOutcome(child, 0)
+end
+
+def waitOutcome(child: Child, milliseconds: Int): result.Result<PollResult, result.Failure>
+  let value = child.wait(milliseconds)
+  let failure = value.failure
+  if failure != null
+    return result.Result<PollResult, result.Failure>.Error(asResultFailure(failure, "process.poll"))
+  end
+  return result.Result<PollResult, result.Failure>.Ok(value)
+end
+
+def encodeOptions(options: SpawnOptions): Byte[]?
+  let invalidExecutable = host.stringByteLength(options.executable) == 0 || containsNul(options.executable)
+  let invalidCounts = options.arguments.Length > 1023 || options.environment.Length > 1024
+  let invalidLimits = options.stdoutLimit < 0 || options.stdoutLimit > 134217728 || options.stderrLimit < 0 || options.stderrLimit > 134217728
+  if invalidExecutable || containsNul(options.workingDirectory) || invalidCounts || invalidLimits
+    return null
+  end
+  var index = 0
+  while index < options.arguments.Length
+    if containsNul(options.arguments[index])
+      return null
+    end
+    index = index + 1
+  end
+  index = 0
+  while index < options.environment.Length
+    let entry = options.environment[index]
+    if host.stringByteLength(entry.name) == 0 || containsNul(entry.name) || containsNul(entry.value) || containsEquals(entry.name)
+      return null
+    end
+    var previous = 0
+    while previous < index
+      if asciiLower(options.environment[previous].name) == asciiLower(entry.name)
+        return null
+      end
+      previous = previous + 1
+    end
+    index = index + 1
+  end
+  let output = buffers.ByteBuffer.create(1048576)
+  if output == null
+    return null
+  end
+  if !output.appendText("NPR1") || !output.append(options.inheritEnvironment ? 1 as Byte : 0 as Byte)
+    return null
+  end
+  if !appendU32(output, options.stdoutLimit) || !appendU32(output, options.stderrLimit)
+    return null
+  end
+  if !appendText(output, options.workingDirectory) || !appendU32(output, options.arguments.Length + 1) || !appendText(output, options.executable)
+    return null
+  end
+  for argument in options.arguments
+    if !appendText(output, argument)
+      return null
+    end
+  end
+  if !appendU32(output, options.environment.Length)
+    return null
+  end
+  for entry in options.environment
+    if !appendText(output, entry.name) || !appendText(output, entry.value)
+      return null
+    end
+  end
+  return output.snapshot()
+end
+
+def appendText(output: buffers.ByteBuffer, value: String): Bool
+  return appendU32(output, host.stringByteLength(value)) && output.appendText(value)
+end
+
+def appendU32(output: buffers.ByteBuffer, value: Int): Bool
+  if value < 0 || value > 4294967295
+    return false
+  end
+  if !output.append((value - (value / 256) * 256) as Byte)
+    return false
+  end
+  if !output.append(((value / 256) - (value / 65536) * 256) as Byte)
+    return false
+  end
+  if !output.append(((value / 65536) - (value / 16777216) * 256) as Byte)
+    return false
+  end
+  return output.append((value / 16777216) as Byte)
+end
+
+def containsNul(value: String): Bool
+  var index = 0
+  while index < host.stringByteLength(value)
+    if host.stringByteAt(value, index) == (0 as Byte)
+      return true
+    end
+    index = index + 1
+  end
+  return false
+end
+
+def containsEquals(value: String): Bool
+  var index = 0
+  while index < host.stringByteLength(value)
+    if host.stringByteAt(value, index) == (61 as Byte)
+      return true
+    end
+    index = index + 1
+  end
+  return false
+end
+
+def asciiLower(value: String): String
+  var bytes: Byte[] = []
+  var index = 0
+  while index < host.stringByteLength(value)
+    var byte = host.stringByteAt(value, index)
+    let numeric = byte as Int
+    byte = (numeric + 32) as Byte if numeric >= 65 && numeric <= 90
+    bytes = host.appendByte(bytes, byte)
+    index = index + 1
+  end
+  let result = host.stringFromBytes(bytes)
+  if result == null
+    return ""
+  end
+  return result
+end

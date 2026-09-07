@@ -229,10 +229,18 @@ EOF and socket failures close the connection. Extra requests on the same connect
 are not dispatched. Request bodies, keep-alive, routing, TLS, HTTP/2, streaming,
 and concurrent handlers are outside this API.
 
-The handler runs synchronously without an execution deadline. Fatal panic or
+The handler runs synchronously. The [stop and drain policy](HTTP-DRAIN.md) permits
+an explicit whole-process deadline after a stop request. Fatal panic or
 forced process termination does not unwind application scopes; the operating
 system reclaims the process's sockets. On supported returns and I/O error paths,
 the Neri library closes each accepted descriptor explicitly.
+
+`Options.onConnection` receives `result.Result<Exchange, ExchangeFailure>` once
+after the accepted socket is closed. `Exchange` records consumed request bytes,
+written response bytes, and response status. `ExchangeFailure` preserves the
+primary failure, any failure sending a rejection response, and an ordered
+`closeFailures` collection. Binary responses and response headers share one write deadline.
+`serveOutcome` exposes listener completion through `result.Result`.
 
 ## Implementation boundary
 
@@ -240,5 +248,6 @@ Protocol parsing, response construction, retries, deadlines, and descriptor
 ownership are implemented in [Neri](../stdlib/http.hk). A small
 [C adapter](../native/platform/socket_posix.c) supplies platform socket layouts,
 constants, monotonic time, and individual system calls. These unsafe imports
-require runtime ABI 1.12 with sockets and interrupts features. The toolchain includes and
+require runtime ABI 1.20 with sockets, interrupts, socket-close-result, and drain
+features. The toolchain includes and
 checksums the standard-library source alongside its native artifacts.

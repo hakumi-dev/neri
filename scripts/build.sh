@@ -35,7 +35,7 @@ while IFS= read -r -d '' source; do
 done < <(find "$ROOT_DIR/tooling" -mindepth 1 \
     \( -type d \( -name .git -o -name .neri -o -name .cache -o -name .idea \
       -o -name .bootstrap -o -name build -o -name out -o -name dist \
-      -o -name target -o -name bin -o -exec test -f '{}/neri.json' \; \) -prune \) \
+      -o -name target -o -name bin -o -exec test -f '{}/manifest.json' \; -o -exec test -f '{}/neri.json' \; \) -prune \) \
     -o \( -type f -name '*.hk' -print0 \))
 env -i "PATH=$PATH" "HOME=$HOME" LC_ALL=C LANG=C TZ=UTC "SDKROOT=$SDKROOT" \
   "NERI_CODEGEN=$SEED_DIR/bin/neri-codegen" \

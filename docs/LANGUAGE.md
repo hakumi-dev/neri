@@ -561,6 +561,35 @@ The runtime [ABI and collection contract](ABI.md) defines roots and allocation
 boundaries. Bounds and arithmetic failures panic with exit status 70. Compile
 errors produce diagnostics and prevent artifact emission.
 
+## Resources
+
+A `resource class` owns a value that is acquired with `using` and released when
+its scope ends. A resource defines `close(): result.Failure?`. Nested resources
+close in reverse acquisition order, including after `return`, `break`, or
+`continue`.
+
+`transfer name` moves a local resource when it is the returned value of a
+callable with the same resource return type. Resource values cannot be copied,
+stored, captured, passed to ordinary calls, or cast.
+
+A callable containing `using` returns `resources.Outcome<T, E>`. Its
+`completion` contains the value or body failure, and `closeFailures` contains
+each cleanup failure in close order. A `using` acquisition may return a resource
+or `result.Result<Resource, E>`; the result error type matches the enclosing
+outcome error type.
+
+Factories may return `Result<R, E>.Ok(transfer owned)` from a fresh local `R`.
+The move invalidates the local binding. Static factories have no owned receiver.
+When `T` and `E` are the same type, return an explicit `Outcome` to distinguish
+a value from a failure. The compiler requires every cleanup failure to remain
+observable in the returned outcome.
+
+Resource implementations make `close` idempotent and reject operations after
+closure. The standard-library scoped handles report `closed` or `disposed` for
+such operations. Recoverable returns and cooperative cancellation run cleanup;
+fatal panic and forced process termination reclaim descriptors through the OS
+without executing language cleanup.
+
 ## Tooling
 
 `check` validates and emits canonical NIR by default. A source file without a

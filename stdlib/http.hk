@@ -1,11 +1,57 @@
 use host
 use result
+use resources
 namespace http
+
+# Socket owns one native descriptor. Its handle remains available only to
+# unsafe implementation code; callers use the typed HTTP APIs.
+resource class Socket
+  private fd: Int
+  private closed: Bool = false
+
+  private def init(fd: Int): Void
+    this.fd = fd
+  end
+
+  public def static unsafe own(fd: Int): result.Result<Socket, ExchangeFailure>
+    if fd < 0
+      return result.Result<Socket, ExchangeFailure>.Error(new ExchangeFailure(new result.Failure("socket_error", "socket.own", socketError()), new Exchange()))
+    end
+    let owned = new Socket(fd)
+    return result.Result<Socket, ExchangeFailure>.Ok(transfer owned)
+  end
+
+  public def static unsafe ownListener(fd: Int): result.Result<Socket, Failure>
+    if fd < 0
+      return result.Result<Socket, Failure>.Error(new Failure("socket_error", "listen.open", socketError()))
+    end
+    let owned = new Socket(fd)
+    return result.Result<Socket, Failure>.Ok(transfer owned)
+  end
+
+  public def close(): result.Failure?
+    if this.closed
+      return null
+    end
+    this.closed = true
+    unsafe
+      if netCloseResult(this.fd) < 0
+        return new result.Failure("close_failed", "socket.close", socketError())
+      end
+    end
+    return null
+  end
+
+  public def unsafe nativeHandle(): Int
+    return this.fd
+  end
+end
 
 class Failure
   public code: String
   public operation: String
   public detail: String
+  public closeFailures: resources.CloseFailures = new resources.CloseFailures()
 
   def init(code: String, operation: String, detail: String = ""): Void
     this.code = code
@@ -19,18 +65,218 @@ class Options
   public log: (fn(String): Void)?
   public stop: Stop?
   public handleInterrupts: Bool = false
+  # Opt-in fatal boundary: after stop is requested, allow the active request to
+  # finish for this duration, then terminate the process with status 124.
+  public forceExitAfterStopMilliseconds: Int?
+  public onConnection: (fn(result.Result<Exchange, ExchangeFailure>): Void)?
+end
+
+class Exchange
+  public bytesRead: Int = 0
+  public bytesWritten: Int = 0
+  public status: Int = 0
+end
+
+class ExchangeFailure
+  public cause: result.Failure
+  public exchange: Exchange
+  public responseFailure: result.Failure?
+  public closeFailures: resources.CloseFailures = new resources.CloseFailures()
+
+  def init(cause: result.Failure, exchange: Exchange): Void
+    this.cause = cause
+    this.exchange = exchange
+  end
+end
+
+def transportFailure(failure: Failure, transferred: Int): result.Failure
+  let converted = new result.Failure(failure.code, failure.operation, failure.detail, transferred)
+  let chain = new CleanupFailureChain(converted)
+  failure.closeFailures.each() do |closed|
+    chain.append(closed)
+  end
+  return converted
+end
+
+class CleanupFailureChain
+  private tail: result.Failure
+
+  def init(primary: result.Failure): Void
+    this.tail = primary
+  end
+
+  def append(failure: result.Failure): Void
+    var source: result.Failure? = failure
+    while source != null
+      let copied = new result.Failure(source.code, source.operation, source.detail, source.transferred, source.osCode, source.cause)
+      this.tail.closeFailure = copied
+      this.tail = copied
+      source = source.closeFailure
+    end
+  end
+end
+
+def reportConnection(options: Options?, outcome: result.Result<Exchange, ExchangeFailure>): Void
+  if options != null
+    let observer = options.onConnection
+    observer(outcome) if observer != null
+  end
+  match outcome
+    case result.Result.Ok(exchange)
+      report(options, "Response " + (exchange.status as String))
+    case result.Result.Error(failure)
+      report(options, failure.cause.operation + ": " + failure.cause.code)
+  end
+end
+
+def sendResponseOutcome(fd: Int, response: Response, head: Bool): result.Result<Exchange, ExchangeFailure>
+  let output = wire(response, head)
+  let exchange = new Exchange()
+  let status = host.parseInt(host.stringSlice(output.headers, 9, 3))
+  exchange.status = status if status != null
+  unsafe
+    let started = netMilliseconds()
+    if started < 0
+      return result.Result<Exchange, ExchangeFailure>.Error(new ExchangeFailure(new result.Failure("clock_error", "response.clock", socketError()), exchange))
+    end
+    let deadline = started + 2000
+    let headers = writePayloadResult(fd, output.headers, null, deadline)
+    exchange.bytesWritten = headers.bytesWritten
+    let headerFailure = headers.failure
+    if headerFailure != null
+      return result.Result<Exchange, ExchangeFailure>.Error(new ExchangeFailure(transportFailure(headerFailure, exchange.bytesWritten), exchange))
+    end
+    let body = writePayloadResult(fd, output.text, output.bytes, deadline)
+    exchange.bytesWritten = exchange.bytesWritten + body.bytesWritten
+    let bodyFailure = body.failure
+    if bodyFailure != null
+      return result.Result<Exchange, ExchangeFailure>.Error(new ExchangeFailure(transportFailure(bodyFailure, exchange.bytesWritten), exchange))
+    end
+  end
+  return result.Result<Exchange, ExchangeFailure>.Ok(exchange)
+end
+
+def connectionOutcome(fd: Int, handler: fn(Request): Response): result.Result<Exchange, ExchangeFailure>
+  let head = readHead(fd)
+  let exchange = new Exchange()
+  exchange.bytesRead = head.bytesRead
+  let readFailure = head.failure
+  var primary: result.Failure? = null
+  if readFailure != null
+    primary = transportFailure(readFailure, head.bytesRead)
+  end
+  if head.status == 0
+    let cause = primary
+    if cause != null
+      return result.Result<Exchange, ExchangeFailure>.Error(new ExchangeFailure(cause, exchange))
+    end
+    return result.Result<Exchange, ExchangeFailure>.Error(new ExchangeFailure(new result.Failure("peer_closed", "read", "", head.bytesRead), exchange))
+  end
+  var response = text(head.status, "Request rejected")
+  var isHead = false
+  if head.status == 200
+    let parsed = parse(head.text, true)
+    isHead = parsed.head
+    let request = parsed.request
+    if request != null
+      response = handler(request)
+    else
+      response = text(parsed.status, "Request rejected")
+      let rejected = parsed.failure
+      if rejected != null
+        primary = transportFailure(rejected, head.bytesRead)
+      end
+    end
+  end
+  match sendResponseOutcome(fd, response, isHead)
+    case result.Result.Ok(sent)
+      sent.bytesRead = head.bytesRead
+      let cause = primary
+      if cause != null
+        return result.Result<Exchange, ExchangeFailure>.Error(new ExchangeFailure(cause, sent))
+      end
+      return result.Result<Exchange, ExchangeFailure>.Ok(sent)
+    case result.Result.Error(failed)
+      failed.exchange.bytesRead = head.bytesRead
+      let cause = primary
+      if cause != null
+        let combined = new ExchangeFailure(cause, failed.exchange)
+        combined.responseFailure = failed.cause
+        return result.Result<Exchange, ExchangeFailure>.Error(combined)
+      end
+      return result.Result<Exchange, ExchangeFailure>.Error(failed)
+  end
+end
+
+def unsafe scopedConnection(fd: Int, handler: fn(Request): Response): resources.Outcome<Exchange, ExchangeFailure>
+  using socket <- Socket.own(fd)
+    unsafe
+      let descriptor = socket.nativeHandle()
+      if netConfigure(descriptor) < 0
+        return new ExchangeFailure(new result.Failure("socket_error", "connection.configure", socketError()), new Exchange())
+      end
+      match connectionOutcome(descriptor, handler)
+        case result.Result.Ok(exchange)
+          return exchange
+        case result.Result.Error(failure)
+          return failure
+      end
+    end
+  end
+  return new ExchangeFailure(new result.Failure("connection_unavailable", "connection"), new Exchange())
+end
+
+def reportScopedConnection(options: Options?, outcome: resources.Outcome<Exchange, ExchangeFailure>): Void
+  match outcome.completion
+    case resources.Completion.Value(exchange)
+      if outcome.closeFailures.count() == 0
+        reportConnection(options, result.Result<Exchange, ExchangeFailure>.Ok(exchange))
+      else
+        let failure = new ExchangeFailure(new result.Failure("close_failed", "connection.close"), exchange)
+        failure.closeFailures = outcome.closeFailures
+        reportConnection(options, result.Result<Exchange, ExchangeFailure>.Error(failure))
+      end
+    case resources.Completion.Failure(primary)
+      if primary != null
+        primary.closeFailures = outcome.closeFailures
+        reportConnection(options, result.Result<Exchange, ExchangeFailure>.Error(primary))
+      else
+        let failure = new ExchangeFailure(new result.Failure("connection_failed", "connection"), new Exchange())
+        failure.closeFailures = outcome.closeFailures
+        reportConnection(options, result.Result<Exchange, ExchangeFailure>.Error(failure))
+      end
+  end
 end
 
 # Requested synchronously from callbacks on the serving thread.
 class Stop
   private requested: Bool = false
+  private drainToken: Int = 0
 
   def request(): Void
     this.requested = true
+    if this.drainToken > 0
+      unsafe
+        drainRequest(this.drainToken)
+      end
+    end
   end
 
   def isRequested(): Bool
     return this.requested
+  end
+
+  def attachDrain(token: Int): Void
+    this.drainToken = token
+    if this.requested && token > 0
+      unsafe
+        drainRequest(token)
+      end
+    end
+  end
+
+  def detachDrain(token: Int): Void
+    this.drainToken = 0 if this.drainToken == token
   end
 end
 
@@ -455,40 +701,20 @@ def wire(response: Response, head: Bool): EncodedResponse
 end
 
 def sendResponse(fd: Int, response: Response, head: Bool, options: Options?): Void
-  let output = wire(response, head)
-  var written = false
-  unsafe
-    let started = netMilliseconds()
-    if started >= 0
-      let deadline = started + 2000
-      written = writePayload(fd, output.headers, null, deadline) && writePayload(fd, output.text, output.bytes, deadline)
-    end
-  end
-  if written
-    report(options, "Response " + host.stringSlice(output.headers, 9, 3))
-  else
-    report(options, "Response write failed or timed out")
+  match sendResponseOutcome(fd, response, head)
+    case result.Result.Ok(exchange)
+      report(options, "Response " + (exchange.status as String))
+    case result.Result.Error(failure)
+      report(options, failure.cause.operation + ": " + failure.cause.code)
   end
 end
 
 def connection(fd: Int, handler: fn(Request): Response, options: Options?): Void
-  unsafe
-    let head = readHead(fd)
-    if head.status == 0
-      report(options, "Connection closed before request headers completed")
-      return
-    end
-    if head.status != 200
-      sendResponse(fd, text(head.status, "Request rejected"), false, options)
-      return
-    end
-    let parsed = parse(head.text, true)
-    let request = parsed.request
-    var response = text(parsed.status, "Request rejected")
-    if request != null
-      response = handler(request)
-    end
-    sendResponse(fd, response, parsed.head, options)
+  match connectionOutcome(fd, handler)
+    case result.Result.Ok(exchange)
+      report(options, "Response " + (exchange.status as String))
+    case result.Result.Error(failure)
+      report(options, failure.cause.operation + ": " + failure.cause.code)
   end
 end
 
@@ -503,6 +729,14 @@ end
 
 def serveResult(address: String, handler: fn(Request): Response, options: Options? = null): Failure?
   var token = 0
+  var drainToken = 0
+  var forceAfter: Int? = null
+  if options != null
+    forceAfter = options.forceExitAfterStopMilliseconds
+    if forceAfter != null && (forceAfter < 1 || forceAfter > 60000)
+      return new Failure("invalid_timeout", "listen.drain", "forceExitAfterStopMilliseconds must be 1..60000")
+    end
+  end
   if options != null && options.handleInterrupts
     unsafe
       token = interruptOpen()
@@ -511,16 +745,56 @@ def serveResult(address: String, handler: fn(Request): Response, options: Option
       return new Failure("interrupt_unavailable", "listen.interrupt", "Process interrupt handling is already owned or unavailable")
     end
   end
-  let result = serveLoop(address, handler, options, token)
+  if forceAfter != null
+    unsafe
+      drainToken = drainOpen(forceAfter, token > 0 ? 1 : 0)
+    end
+    if drainToken == 0
+      unsafe
+        interruptClose(token) if token > 0
+      end
+      return new Failure("drain_unavailable", "listen.drain", "Could not start the forced-exit deadline watcher")
+    end
+    if options != null
+      let stop = options.stop
+      stop.attachDrain(drainToken) if stop != null
+    end
+  end
+  let outcome = serveLoop(address, handler, options, token)
+  if drainToken > 0
+    if options != null
+      let stop = options.stop
+      stop.detachDrain(drainToken) if stop != null
+    end
+    unsafe
+      drainClose(drainToken)
+    end
+  end
   if token > 0
     unsafe
       interruptClose(token)
     end
   end
-  return result
+  match outcome.completion
+    case resources.Completion.Value(stopped)
+      if outcome.closeFailures.count() == 0
+        return null
+      end
+      let failure = new Failure("close_failed", "listen.close")
+      failure.closeFailures = outcome.closeFailures
+      return failure
+    case resources.Completion.Failure(primary)
+      if primary != null
+        primary.closeFailures = outcome.closeFailures
+        return primary
+      end
+      let failure = new Failure("listen_failed", "listen")
+      failure.closeFailures = outcome.closeFailures
+      return failure
+  end
 end
 
-def serveLoop(address: String, handler: fn(Request): Response, options: Options?, interruptToken: Int): Failure?
+def serveLoop(address: String, handler: fn(Request): Response, options: Options?, interruptToken: Int): resources.Outcome<Bool, Failure>
   if host.stringByteLength(address) < 11 || find(address, "127.0.0.1:", 0) != 0
     return new Failure("invalid_address", "listen", "Address must be 127.0.0.1:<port>")
   end
@@ -530,56 +804,41 @@ def serveLoop(address: String, handler: fn(Request): Response, options: Options?
     return new Failure("invalid_port", "listen", "Port must be an integer from 1 to 65535")
   end
   if stopRequested(options, interruptToken)
-    return null
+    return true
   end
   unsafe
-    let listener = netOpen()
-    if listener < 0
-      return new Failure("socket_error", "listen.open", socketError())
-    end
-    var failure: Failure? = null
-    if netConfigure(listener) < 0
-      failure = new Failure("socket_error", "listen.configure", socketError())
-    else if netBind(listener, port) < 0
-      failure = new Failure("socket_error", "listen.bind", socketError())
-    else if netListen(listener) < 0
-      failure = new Failure("socket_error", "listen.start", socketError())
-    end
-    if failure != null
-      netClose(listener)
-      return failure
-    end
-    if options != null
-      let onListening = options.onListening
-      onListening(address) if onListening != null
-    end
-    while !stopRequested(options, interruptToken)
-      let ready = netPoll(listener, 0, interruptToken > 0 ? 50 : -1)
-      if ready == -1
-        let error = new Failure("socket_error", "listen.wait", socketError())
-        netClose(listener)
-        return error
+    using listener <- Socket.ownListener(netOpen())
+      let descriptor = listener.nativeHandle()
+      if netConfigure(descriptor) < 0
+        return new Failure("socket_error", "listen.configure", socketError())
+      else if netBind(descriptor, port) < 0
+        return new Failure("socket_error", "listen.bind", socketError())
+      else if netListen(descriptor) < 0
+        return new Failure("socket_error", "listen.start", socketError())
       end
-      if ready > 0 && !stopRequested(options, interruptToken)
-        let fd = netAccept(listener)
-        if fd == -1
-          let error = new Failure("socket_error", "listen.accept", socketError())
-          netClose(listener)
-          return error
+      if options != null
+        let onListening = options.onListening
+        onListening(address) if onListening != null
+      end
+      while !stopRequested(options, interruptToken)
+        let ready = netPoll(descriptor, 0, interruptToken > 0 ? 50 : -1)
+        if ready == -1
+          return new Failure("socket_error", "listen.wait", socketError())
         end
-        if fd >= 0
-          if netConfigure(fd) == 0
-            connection(fd, handler, options)
-          else
-            report(options, "Configure connection: " + socketError())
+        if ready > 0 && !stopRequested(options, interruptToken)
+          let fd = netAccept(descriptor)
+          if fd == -1
+            return new Failure("socket_error", "listen.accept", socketError())
           end
-          netClose(fd)
+          if fd >= 0
+            reportScopedConnection(options, scopedConnection(fd, handler))
+          end
         end
       end
+      return true
     end
-    netClose(listener)
   end
-  return null
+  return true
 end
 
 @cabi("neri_rt_v1_interrupt_open")
@@ -590,6 +849,15 @@ def unsafe interruptPending(token: Int): Int
 end
 @cabi("neri_rt_v1_interrupt_close")
 def unsafe interruptClose(token: Int): Void
+end
+@cabi("neri_rt_v1_drain_open")
+def unsafe drainOpen(timeoutMilliseconds: Int, watchInterrupt: Int): Int
+end
+@cabi("neri_rt_v1_drain_request")
+def unsafe drainRequest(token: Int): Int
+end
+@cabi("neri_rt_v1_drain_close")
+def unsafe drainClose(token: Int): Int
 end
 
 @cabi("neri_rt_v1_net_open")
@@ -618,6 +886,9 @@ def unsafe netWrite(fd: Int, bytes: Byte*, length: Int): Int
 end
 @cabi("neri_rt_v1_net_close")
 def unsafe netClose(fd: Int): Void
+end
+@cabi("neri_rt_v1_net_close_result")
+def unsafe netCloseResult(fd: Int): Int
 end
 @cabi("neri_rt_v1_net_milliseconds")
 def unsafe netMilliseconds(): Int
@@ -908,7 +1179,7 @@ end
 def serveOutcome(address: String, handler: fn(Request): Response, options: Options? = null): result.Result<Bool, result.Failure>
   let failure = http.serveResult(address, handler, options)
   if failure != null
-    return result.Result<Bool, result.Failure>.Error(new result.Failure(failure.code, failure.operation, failure.detail))
+    return result.Result<Bool, result.Failure>.Error(transportFailure(failure, 0))
   end
   return result.Result<Bool, result.Failure>.Ok(true)
 end

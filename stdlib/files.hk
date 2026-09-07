@@ -30,6 +30,21 @@ class ReadResult
   public bytesRead: Int = 0
 end
 
+class DirectoryEntry
+  public name: String
+  public kind: String
+  def init(name: String, kind: String): Void
+    this.name = name
+    this.kind = kind
+  end
+end
+
+class ListResult
+  public entries: DirectoryEntry[] = []
+  public failure: Failure?
+  public closeFailure: Failure?
+end
+
 @cabi("neri_rt_v1_file_open")
 def unsafe openFile(path: Byte*, length: Int): Int
 end
@@ -51,6 +66,15 @@ end
 @cabi("neri_rt_v1_file_root_open_at")
 def unsafe rootOpenAt(parent: Int, name: Byte*, length: Int, kind: Int, osCode: Int*, category: Int*): Int
 end
+@cabi("neri_rt_v1_file_directory_open")
+def unsafe directoryOpen(parent: Int, token: Int*, osCode: Int*, closeCode: Int*): Int
+end
+@cabi("neri_rt_v1_file_directory_next")
+def unsafe directoryNext(token: Int, name: Byte*, capacity: Int, length: Int*, kind: Int*, osCode: Int*): Int
+end
+@cabi("neri_rt_v1_file_directory_close")
+def unsafe directoryClose(token: Int, osCode: Int*): Int
+end
 
 def rootedFailure(category: Int, osCode: Int, operation: String, component: Int): Failure
   var code = "open_failed"
@@ -60,6 +84,52 @@ def rootedFailure(category: Int, osCode: Int, operation: String, component: Int)
   code = "wrong_type" if category == 4
   code = "unavailable" if category == 6
   return new Failure(code, osCode, operation, component)
+end
+
+resource class ScopedRoot
+  private root: Root
+
+  private def init(root: Root): Void
+    this.root = root
+  end
+
+  def static open(path: String): result.Result<ScopedRoot, result.Failure>
+    let opened = Root.open(path)
+    let failure = opened.failure
+    if failure != null
+      return result.Result<ScopedRoot, result.Failure>.Error(asReadFailure(failure, 0, "root.open"))
+    end
+    let root = opened.root
+    if root == null
+      return result.Result<ScopedRoot, result.Failure>.Error(new result.Failure("missing_root", "root.open"))
+    end
+    let owned = new ScopedRoot(root)
+    return result.Result<ScopedRoot, result.Failure>.Ok(transfer owned)
+  end
+
+  def close(): result.Failure?
+    let failure = this.root.close()
+    if failure != null
+      return asReadFailure(failure, 0, "root.close")
+    end
+    return null
+  end
+
+  def isClosed(): Bool
+    return this.root.isClosed()
+  end
+
+  def readBytes(path: String, limit: Int): ReadResult
+    return this.root.readBytes(path, limit)
+  end
+
+  def readBytesOutcome(path: String, limit: Int): result.Result<Byte[], ReadFailure>
+    return this.root.readBytesOutcome(path, limit)
+  end
+
+  def list(path: String = "", limit: Int = 4096): ListResult
+    return this.root.list(path, limit)
+  end
 end
 
 class Root
@@ -202,6 +272,148 @@ class Root
   def readBytesOutcome(path: String, limit: Int): result.Result<Byte[], ReadFailure>
     return readOutcome(this.readBytes(path, limit))
   end
+
+  def list(path: String, limit: Int = 4096): ListResult
+    let result = new ListResult()
+    if this.closed
+      result.failure = new Failure("closed", 0, "root.list")
+      return result
+    end
+    if limit < 0 || limit > 4096 || (path != "" && !validRelativePath(path))
+      result.failure = new Failure(path == "" || validRelativePath(path) ? "invalid_limit" : "invalid_path", 0, "root.list")
+      return result
+    end
+    var parent = this.fd
+    var ownsParent = false
+    var component = 0
+    var start = 0
+    let pathLength = host.stringByteLength(path)
+    while start < pathLength
+      var endAt = start
+      while endAt < pathLength && host.stringByteAt(path, endAt) != (47 as Byte)
+        endAt = endAt + 1
+      end
+      let name = host.stringSlice(path, start, endAt - start)
+      unsafe
+        let osCode = stackalloc Int[1]
+        let category = stackalloc Int[1]
+        let nameLength = host.stringByteLength(name)
+        let bytes = native.alloc<Byte>(nameLength)
+        var index = 0
+        while index < nameLength
+          bytes[index] = host.stringByteAt(name, index)
+          index = index + 1
+        end
+        let opened = rootOpenAt(parent, bytes, nameLength, 1, osCode, category)
+        native.free(bytes)
+        if opened < 0
+          result.failure = rootedFailure(category[0], osCode[0], "root.list.open_directory", component)
+          closeListParent(parent, ownsParent, result)
+          return result
+        end
+        if !closeListParent(parent, ownsParent, result)
+          closeListParent(opened, true, result)
+          return result
+        end
+        parent = opened
+        ownsParent = true
+      end
+      start = endAt + 1
+      component = component + 1
+    end
+    unsafe
+      let token = stackalloc Int[1]
+      let osCode = stackalloc Int[1]
+      let closeCode = stackalloc Int[1]
+      let opened = directoryOpen(parent, token, osCode, closeCode)
+      if opened != 0
+        result.failure = new Failure(opened == -2 ? "unavailable" : "list_failed", osCode[0], "root.list.open", component)
+        if closeCode[0] != 0
+          result.closeFailure = new Failure("close_failed", closeCode[0], "root.list.close", component)
+        end
+        closeListParent(parent, ownsParent, result)
+        return result
+      end
+      let entries: DirectoryEntry[] = tasks.generate(limit, 1) do |index|
+        return new DirectoryEntry("", "other")
+      end
+      var count = 0
+      let buffer: Byte[] = tasks.generate(4096, 1) do |index|
+        return 0 as Byte
+      end
+      var done = false
+        while !done
+          let length = stackalloc Int[1]
+          let kind = stackalloc Int[1]
+          var status = 0
+          borrow buffer as pointer
+            status = directoryNext(token[0], pointer, buffer.Length, length, kind, osCode)
+          end
+          if status == 1
+            done = true
+          else if status != 0
+            result.failure = new Failure("list_failed", osCode[0], "root.list.next", component)
+            done = true
+          else if count == limit
+            result.failure = new Failure("limit_exceeded", 0, "root.list", component)
+            done = true
+          else
+            let nameBytes: Byte[] = tasks.generate(length[0], 1) do |index|
+              return buffer[index]
+            end
+            let text = host.stringFromBytes(nameBytes)
+            if text == null
+              result.failure = new Failure("invalid_name", 0, "root.list.next", component)
+              done = true
+            else
+              var kindName = "other"
+              kindName = "file" if kind[0] == 1
+              kindName = "directory" if kind[0] == 2
+              kindName = "symlink" if kind[0] == 3
+              entries[count] = new DirectoryEntry(text, kindName)
+              count = count + 1
+            end
+          end
+        end
+      if directoryClose(token[0], osCode) != 0
+        result.closeFailure = new Failure("close_failed", osCode[0], "root.list.close", component)
+      end
+      closeListParent(parent, ownsParent, result)
+      if result.failure == null && result.closeFailure == null
+        result.entries = tasks.generate(count, 1) do |index|
+          return new DirectoryEntry(entries[index].name, entries[index].kind)
+        end
+      end
+    end
+    return result
+  end
+end
+
+def closeListParent(fd: Int, owned: Bool, result: ListResult): Bool
+  if !owned
+    return true
+  end
+  unsafe
+    if closeFile(fd) < 0
+      let failure = new Failure("close_failed", fileError(), "root.list.close_component")
+      if result.closeFailure == null
+        result.closeFailure = failure
+      else
+        var cursor = result.closeFailure
+        while cursor != null
+          let next = cursor.closeFailure
+          if next == null
+            cursor.closeFailure = failure
+            cursor = null
+          else
+            cursor = next
+          end
+        end
+      end
+      return false
+    end
+  end
+  return true
 end
 
 def validRelativePath(path: String): Bool

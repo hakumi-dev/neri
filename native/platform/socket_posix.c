@@ -71,6 +71,7 @@ int64_t neri_rt_v1_net_write(int64_t fd, uint8_t *bytes, int64_t length) {
   return io_result(send((int)fd, bytes, (size_t)length, flags));
 }
 void neri_rt_v1_net_close(int64_t fd) { close((int)fd); }
+int64_t neri_rt_v1_net_close_result(int64_t fd) { return close((int)fd); }
 int64_t neri_rt_v1_net_milliseconds(void) {
   struct timespec now = {0};
   if (clock_gettime(CLOCK_MONOTONIC, &now) < 0) return -1;

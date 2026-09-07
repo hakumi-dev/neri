@@ -18,7 +18,7 @@
 #define fsync _commit
 #define getpid _getpid
 #else
-#include <spawn.h>
+#include "posix_launch.h"
 #include <sys/wait.h>
 #include <unistd.h>
 extern char **environ;
@@ -176,10 +176,12 @@ std::optional<int64_t> run(std::vector<std::string> &arguments, std::string &err
   return status;
 #else
   pid_t process = 0;
-  const int spawn_error = ::posix_spawnp(&process, arguments.front().c_str(),
-                                         nullptr, nullptr, argv.data(), environ);
-  if (spawn_error != 0) {
-    error = "process start failed: " + std::string(std::strerror(spawn_error));
+  posix_launch_options options;
+  options.arguments = arguments;
+  for (char **item = environ; *item; ++item) options.environment.emplace_back(*item);
+  int launch_error = 0;
+  if (!posix_launch(options, process, launch_error)) {
+    error = "process start failed: " + std::string(std::strerror(launch_error));
     return std::nullopt;
   }
   int status = 0;

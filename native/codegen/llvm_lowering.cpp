@@ -778,7 +778,8 @@ private:
       auto *callee = module_.functions_.at(symbol_key(*instruction.symbol));
       return lower_call_target(instruction, target.parameter_types,
                                target.result_type, callee,
-                               callee->getFunctionType());
+                               callee->getFunctionType(),
+                               has_capability ? 1U : 0U);
     }
 
     [[nodiscard]] llvm::Value *lower_virtual_call(
@@ -1200,6 +1201,9 @@ private:
       case NERI_IR_OPCODE_CALL_V1:
       case NERI_IR_OPCODE_CALL_DIRECT_V1:
         result = lower_call(instruction, false);
+        break;
+      case NERI_IR_OPCODE_CALL_UNSAFE_V1:
+        result = lower_call(instruction, false, true);
         break;
       case NERI_IR_OPCODE_CALL_VIRTUAL_V1:
         result = lower_virtual_call(instruction);
@@ -2320,6 +2324,22 @@ private:
       if (import.link_name.starts_with("neri_rt_v1_file_root_")) {
         minimum_minor = std::max(minimum_minor, uint16_t{15});
         required_features |= NERI_RT_FEATURE_ROOTED_FILES;
+      }
+      if (import.link_name.starts_with("neri_rt_v1_process_")) {
+        minimum_minor = std::max(minimum_minor, uint16_t{16});
+        required_features |= NERI_RT_FEATURE_PROCESS;
+      }
+      if (import.link_name.starts_with("neri_rt_v1_file_directory_")) {
+        minimum_minor = std::max(minimum_minor, uint16_t{17});
+        required_features |= NERI_RT_FEATURE_DIRECTORY;
+      }
+      if (import.link_name == "neri_rt_v1_net_close_result") {
+        minimum_minor = std::max(minimum_minor, uint16_t{18});
+        required_features |= NERI_RT_FEATURE_SOCKET_CLOSE_RESULT;
+      }
+      if (import.link_name.starts_with("neri_rt_v1_drain_")) {
+        minimum_minor = std::max(minimum_minor, uint16_t{20});
+        required_features |= NERI_RT_FEATURE_DRAIN;
       }
       if (import.link_name.starts_with("neri_rt_v1_terminal_") ||
           import.link_name.starts_with("neri_rt_v1_clock_")) {

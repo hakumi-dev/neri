@@ -66,6 +66,9 @@ int64_t neri_rt_v1_net_write(int64_t fd, uint8_t *bytes, int64_t length) {
   return io_result(send((SOCKET)fd, (const char *)bytes, (int)(length > INT_MAX ? INT_MAX : length), 0));
 }
 void neri_rt_v1_net_close(int64_t fd) { closesocket((SOCKET)fd); }
+int64_t neri_rt_v1_net_close_result(int64_t fd) {
+  return closesocket((SOCKET)fd) == 0 ? 0 : -1;
+}
 int64_t neri_rt_v1_net_milliseconds(void) { return (int64_t)GetTickCount64(); }
 int64_t neri_rt_v1_net_error(uint8_t *bytes, int64_t capacity) {
   const DWORD error = (DWORD)WSAGetLastError();

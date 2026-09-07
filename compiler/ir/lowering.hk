@@ -283,6 +283,9 @@ class IrLowerer
         this.lowerConstructorPreamble(context, callable, owner, receiver.value, function.location)
       end
     end
+    if this.resourceOutcome(function.resultType)
+      this.ensureCloseFailures(context)
+    end
     var index = 0
     while index < this.bound.childCountAt(callable.boundNode) && !context.terminated
       this.lowerStatement(context, this.bound.childAt(callable.boundNode, index))
@@ -426,9 +429,13 @@ class IrLowerer
         this.emitScopeCleanups(context, 0)
         context.returnValue(-1, this.location(node))
       else
-        let value = this.lowerExpression(context, this.bound.childAt(node, 0), context.function.resultType)
-        this.emitScopeCleanups(context, 0)
-        context.returnValue(value.id, this.location(node))
+        if this.resourceOutcome(context.function.resultType)
+          this.lowerOutcomeReturn(context, node)
+        else
+          let value = this.lowerExpression(context, this.bound.childAt(node, 0), context.function.resultType)
+          this.emitScopeCleanups(context, 0)
+          context.returnValue(value.id, this.location(node))
+        end
       end
     else if kind == "ExpressionStatement"
       this.lowerExpression(context, this.bound.childAt(node, 0), "")
@@ -448,7 +455,91 @@ class IrLowerer
       this.lowerUnsafeBlock(context, node)
     else if kind == "BorrowBlock"
       this.lowerBorrowBlock(context, node)
+    else if kind == "UsingBlock"
+      this.lowerUsingBlock(context, node)
     end
+  end
+
+  def lowerUsingBlock(context: IrFunctionContext, node: Int): Void
+    let acquired = this.lowerExpression(context, this.bound.childAt(node, 0), "")
+    if semanticField(this.bound.dataAt(node), 1) == "result"
+      this.lowerResultUsingBlock(context, node, acquired)
+      return
+    end
+    context.enterScope()
+    context.addVariable(this.bound.symbolAt(node), 6, semanticField(this.bound.dataAt(node), 0), irType(this.bound.typeAt(this.bound.childAt(node, 0))), acquired.id, false)
+    context.pushResourceCleanup(acquired.id, this.bound.typeAt(this.bound.childAt(node, 0)), this.bound.symbolAt(node))
+    var index = 1
+    while index < this.bound.childCountAt(node) && !context.terminated
+      this.lowerStatement(context, this.bound.childAt(node, index))
+      index = index + 1
+    end
+    if !context.terminated
+      this.emitScopeCleanups(context, context.cleanupDepth - 1)
+    end
+    context.popCleanup()
+    context.leaveScope()
+  end
+
+  def lowerResultUsingBlock(context: IrFunctionContext, node: Int, acquired: IrValue): Void
+    this.ensureCloseFailures(context)
+    let resultName = semanticMutableType(this.bound.typeAt(this.bound.childAt(node, 0)))
+    let tag = context.emitSymbol(39, "int", [acquired.id], irSymbol(this.module.id, 2, resultName + ".$alternativeTag"), this.location(node))
+    let ok = context.emitConstant("int", 3, "0", this.location(node))
+    let isOk = context.emitCompare(tag.id, ok.id, 1, this.location(node))
+    let success = context.function.createBlock()
+    let failure = context.function.createBlock()
+    context.conditional(isOk.id, success, irEmptyInts(), failure, irEmptyInts(), this.location(node))
+    context.setCurrent(failure)
+    let error = context.emitSymbol(39, irType(this.resultErrorType(resultName)), [acquired.id], irSymbol(this.module.id, 2, resultName + ".$alternative1_0"), this.location(node))
+    this.emitResultAcquisitionFailure(context, node, error)
+    context.setCurrent(success)
+    let value = context.emitSymbol(39, irType(this.bound.typeAt(node)), [acquired.id], irSymbol(this.module.id, 2, resultName + ".$alternative0_0"), this.location(node))
+    context.enterScope()
+    context.addVariable(this.bound.symbolAt(node), 6, semanticField(this.bound.dataAt(node), 0), irType(this.bound.typeAt(node)), value.id, false)
+    context.pushResourceCleanup(value.id, this.bound.typeAt(node), this.bound.symbolAt(node))
+    var index = 1
+    while index < this.bound.childCountAt(node) && !context.terminated
+      this.lowerStatement(context, this.bound.childAt(node, index))
+      index = index + 1
+    end
+    if !context.terminated
+      this.emitScopeCleanups(context, context.cleanupDepth - 1)
+    end
+    context.popCleanup()
+    context.leaveScope()
+  end
+
+  def resultErrorType(resultName: String): String
+    let result = this.semantic.findClass(resultName)
+    if result != null && result.genericArguments.Length > 1
+      return result.genericArguments[1]
+    end
+    return "Error"
+  end
+
+  def emitResultAcquisitionFailure(context: IrFunctionContext, node: Int, error: IrValue): Void
+    let outcomeName = semanticMutableType(irTypeInner(context.function.resultType))
+    let outcome = this.semantic.findClass(outcomeName)
+    let completionField = this.findField(outcomeName + ".completion")
+    if outcome == null || completionField == null
+      context.returnValue(-1, this.location(node))
+      return
+    end
+    let completionName = completionField.typeName
+    let completion = context.emitSymbol(38, irType(completionName), irEmptyInts(), irSymbol(this.module.id, 1, completionName), this.location(node))
+    let tag = context.emitConstant("int", 3, "1", this.location(node))
+    context.emitSymbol(40, "void", [completion.id, tag.id], irSymbol(this.module.id, 2, completionName + ".$alternativeTag"), this.location(node))
+    let errorOptional = context.emitValue(22, "optional|" + error.typeName, [error.id], this.location(node))
+    context.emitSymbol(40, "void", [completion.id, errorOptional.id], irSymbol(this.module.id, 2, completionName + ".$alternative1_0"), this.location(node))
+    let collector = this.ensureCloseFailures(context)
+    this.emitScopeCleanups(context, 0)
+    let wrapped = context.emitSymbol(38, context.function.resultType, irEmptyInts(), irSymbol(this.module.id, 1, outcomeName), this.location(node))
+    let initializer = this.findCallable(outcomeName + ".init")
+    if initializer != null
+      context.emitSymbol(29, "void", [wrapped.id, completion.id, collector], irSymbol(this.module.id, 3, initializer.fullName), this.location(node))
+    end
+    context.returnValue(wrapped.id, this.location(node))
   end
 
   def lowerMatch(context: IrFunctionContext, node: Int): Void
@@ -612,9 +703,12 @@ class IrLowerer
         resultType = typeName
       end
       return context.emit(1, resultType, irEmptyInts(), irEmptyStrings(), null, 5, "", 0, false, location)
-    else if kind == "Name"
+    else if kind == "Name" || kind == "Transfer"
       let variable = context.findVariableIdentity(this.bound.symbolAt(node), this.bound.dataAt(node))
       if variable != null
+        if kind == "Transfer"
+          context.releaseResourceCleanup(variable.identity)
+        end
         if variable.addressedPointer >= 0
           let operands: Int[] = [this.currentUnsafe(context), variable.addressedPointer]
           context.function.localEffects = irEffectUnion(context.function.localEffects, 65)
@@ -742,6 +836,12 @@ class IrLowerer
     end
     if this.bound.kindAt(rightNode) == "NullLiteral"
       rightExpected = irType(this.bound.typeAt(leftNode))
+    end
+    if semanticIsOptional(this.bound.typeAt(leftNode)) && this.bound.typeAt(rightNode) == semanticInnerType(this.bound.typeAt(leftNode))
+      rightExpected = irType(this.bound.typeAt(leftNode))
+    end
+    if semanticIsOptional(this.bound.typeAt(rightNode)) && this.bound.typeAt(leftNode) == semanticInnerType(this.bound.typeAt(rightNode))
+      leftExpected = irType(this.bound.typeAt(rightNode))
     end
     let left = this.lowerExpression(context, leftNode, leftExpected)
     let right = this.lowerExpression(context, rightNode, rightExpected)
@@ -1019,6 +1119,13 @@ class IrLowerer
       callSymbolKind = 4
     end
     context.function.addCallee(callTarget)
+    if callable != null && callable.isUnsafe
+      var unsafeOperands: Int[] = [this.currentUnsafe(context)]
+      for operand in operands
+        unsafeOperands = host.appendInt(unsafeOperands, operand)
+      end
+      return context.emitSymbol(32, irType(this.bound.typeAt(node)), unsafeOperands, irSymbol(this.module.id, callSymbolKind, callTarget), this.location(node))
+    end
     return context.emitSymbol(28, irType(this.bound.typeAt(node)), operands, irSymbol(this.module.id, callSymbolKind, callTarget), this.location(node))
   end
 
@@ -1059,6 +1166,11 @@ class IrLowerer
     if isDirect
       opcode = 29
     end
+    if callable != null && callable.isUnsafe && receiverClass != null && receiverClass.isResource
+      # Resource classes cannot be inherited, so this receiver has one concrete
+      # target and can use the capability-carrying direct call form.
+      opcode = 32
+    end
     if callable != null && operands.Length - 1 < callable.parameterCount
       let adapterName = this.requestDefaultAdapter(callable, operands.Length - 1, opcode == 30)
       context.function.addCallee(adapterName)
@@ -1069,6 +1181,14 @@ class IrLowerer
       if owner != null
         targetName = this.dispatchSlot(owner, callable)
       end
+    end
+    if callable != null && callable.isUnsafe && opcode != 30
+      var unsafeOperands: Int[] = [this.currentUnsafe(context)]
+      for operand in operands
+        unsafeOperands = host.appendInt(unsafeOperands, operand)
+      end
+      context.function.addCallee(this.bound.dataAt(node))
+      return context.emitSymbol(32, irType(this.bound.typeAt(node)), unsafeOperands, irSymbol(this.module.id, 3, targetName), this.location(node))
     end
     if opcode == 30
       operands = this.virtualOperands(context, operands, receiver.typeName, targetName)
@@ -1152,18 +1272,28 @@ class IrLowerer
     context.emitSymbol(40, "void", [receiver.id, tag.id], irSymbol(this.module.id, 2, className + ".$alternativeTag"), this.location(node))
     var index = 0
     while index < this.bound.childCountAt(node)
-      let fieldName = className + "." + alternativePayloadField(caseIndex, index)
-      let field = this.findField(fieldName)
-      var expected = ""
-      if field != null
-        expected = irType(field.typeName)
-      end
+      let expected = irType(this.alternativePayloadType(className, caseIndex, index))
       let value = this.lowerExpression(context, this.bound.childAt(node, index), expected)
-      context.emitSymbol(40, "void", [receiver.id, value.id], irSymbol(this.module.id, 2, fieldName), this.location(node))
+      context.emitSymbol(40, "void", [receiver.id, value.id], irSymbol(this.module.id, 2, className + "." + alternativePayloadField(caseIndex, index)), this.location(node))
       index = index + 1
     end
     context.function.localEffects = irEffectUnion(context.function.localEffects, 2)
     return receiver
+  end
+
+  def alternativePayloadType(className: String, caseIndex: Int, payloadIndex: Int): String
+    let symbol = this.semantic.findClass(className)
+    if symbol != null
+      let name = alternativePayloadField(caseIndex, payloadIndex)
+      var field = symbol.firstField
+      while field != null
+        if field.name == name
+          return field.typeName
+        end
+        field = field.nextField
+      end
+    end
+    return this.bound.typeAt(0)
   end
 
   def lowerString(context: IrFunctionContext, node: Int): IrValue
@@ -1396,7 +1526,12 @@ class IrLowerer
     var cleanup = context.cleanup
     var depth = context.cleanupDepth
     while cleanup != null && depth > fromDepth
-      if cleanup.opcode == 54
+      if cleanup.opcode == 55
+        if cleanup.active
+          let failure = this.emitResourceClose(context, cleanup.ownedValue, cleanup.resourceType)
+          this.collectCloseFailure(context, failure)
+        end
+      else if cleanup.opcode == 54
         let borrowOperands: Int[] = [cleanup.capability, cleanup.token]
         context.emitValue(54, "void", borrowOperands, irNoLocation())
       else
@@ -1406,6 +1541,123 @@ class IrLowerer
       cleanup = cleanup.previous
       depth = depth - 1
     end
+  end
+
+  def emitResourceClose(context: IrFunctionContext, ownedValue: Int, resourceType: String): IrValue
+    let owner = this.semantic.findClass(semanticMutableType(resourceType))
+    if owner == null
+      return new IrValue(-1, "optional|class|result.Failure")
+    end
+    var method = owner.firstMethod
+    while method != null
+      if method.name == "close" && !method.isStatic && method.parameterCount == 0
+        let receiver = new IrValue(ownedValue, "class|" + owner.fullName)
+        let target = this.dispatchSlot(owner, method)
+        let virtualOperands = this.virtualOperands(context, [receiver.id], receiver.typeName, target)
+        this.addVirtualCallees(context, target, receiver.typeName)
+        return context.emitSymbol(30, irType(method.returnType), virtualOperands, irSymbol(this.module.id, 3, target), context.function.location)
+      end
+      method = method.nextCallable
+    end
+    return new IrValue(-1, "optional|class|result.Failure")
+  end
+
+  def ensureCloseFailures(context: IrFunctionContext): Int
+    if context.closeFailures >= 0
+      return context.closeFailures
+    end
+    let collector = context.emitSymbol(38, "class|resources.CloseFailures", irEmptyInts(), irSymbol(this.module.id, 1, "resources.CloseFailures"), context.function.location)
+    let initializer = this.findCallable("resources.CloseFailures.init")
+    if initializer != null
+      context.emitSymbol(29, "void", [collector.id], irSymbol(this.module.id, 3, initializer.fullName), context.function.location)
+      context.function.addCallee(initializer.fullName)
+    end
+    context.closeFailures = collector.id
+    return collector.id
+  end
+
+  def collectCloseFailure(context: IrFunctionContext, failure: IrValue): Void
+    if failure.id < 0
+      return
+    end
+    let hasFailure = context.emitValue(23, "bool", [failure.id], context.function.location)
+    let present = context.function.createBlock()
+    let next = context.function.createBlock()
+    context.conditional(hasFailure.id, present, irEmptyInts(), next, irEmptyInts(), context.function.location)
+    context.setCurrent(present)
+    let value = context.emitValue(24, "class|result.Failure", [failure.id], context.function.location)
+    let collector = this.ensureCloseFailures(context)
+    let add = this.findCallable("resources.CloseFailures.add")
+    let owner = this.semantic.findClass("resources.CloseFailures")
+    if add != null && owner != null
+      let target = this.dispatchSlot(owner, add)
+      let operands = this.virtualOperands(context, [collector, value.id], "class|resources.CloseFailures", target)
+      this.addVirtualCallees(context, target, "class|resources.CloseFailures")
+      context.emitSymbol(30, "void", operands, irSymbol(this.module.id, 3, target), context.function.location)
+    end
+    context.branch(next, irEmptyInts(), context.function.location)
+    context.setCurrent(next)
+  end
+
+  def resourceOutcome(typeName: String): Bool
+    let owner = this.semantic.findClass(semanticMutableType(irTypeInner(typeName)))
+    return owner != null && semanticStartsWith(owner.fullName, "resources.Outcome<")
+  end
+
+  def lowerOutcomeReturn(context: IrFunctionContext, node: Int): Void
+    let child = this.bound.childAt(node, 0)
+    let returned = this.lowerExpression(context, child, "")
+    let outcomeName = semanticMutableType(irTypeInner(context.function.resultType))
+    let outcome = this.semantic.findClass(outcomeName)
+    if outcome == null || outcome.genericArguments.Length < 2
+      this.emitScopeCleanups(context, 0)
+      context.returnValue(returned.id, this.location(node))
+      return
+    end
+    let valueType = outcome.genericArguments[0]
+    let failureType = outcome.genericArguments[1]
+    let completionField = this.findField(outcomeName + ".completion")
+    let failuresField = this.findField(outcomeName + ".closeFailures")
+    let collector = this.ensureCloseFailures(context)
+    var completion = new IrValue(-1, "class|Error")
+    if this.bound.typeAt(child) == outcomeName
+      if completionField != null
+        completion = context.emitSymbol(39, irType(completionField.typeName), [returned.id], irSymbol(this.module.id, 2, completionField.owner + ".completion"), this.location(node))
+      else
+        completion = returned
+      end
+      if failuresField != null
+        let previous = context.emitSymbol(39, irType(failuresField.typeName), [returned.id], irSymbol(this.module.id, 2, failuresField.owner + ".closeFailures"), this.location(node))
+        let append = this.findCallable("resources.CloseFailures.append")
+        let collectorOwner = this.semantic.findClass("resources.CloseFailures")
+        if append != null && collectorOwner != null
+          let target = this.dispatchSlot(collectorOwner, append)
+          let operands = this.virtualOperands(context, [collector, previous.id], "class|resources.CloseFailures", target)
+          this.addVirtualCallees(context, target, "class|resources.CloseFailures")
+          context.emitSymbol(30, "void", operands, irSymbol(this.module.id, 3, target), this.location(node))
+        end
+      end
+    else
+      var completionName = "resources.Completion<" + valueType + "," + failureType + ">"
+      if completionField != null
+        completionName = completionField.typeName
+      end
+      completion = context.emitSymbol(38, irType(completionName), irEmptyInts(), irSymbol(this.module.id, 1, completionName), this.location(node))
+      let isFailure = semanticAssignable(this.semantic, failureType, this.bound.typeAt(child)) && !semanticAssignable(this.semantic, valueType, this.bound.typeAt(child))
+      let tag = context.emitConstant("int", 3, isFailure ? "1" : "0", this.location(node))
+      context.emitSymbol(40, "void", [completion.id, tag.id], irSymbol(this.module.id, 2, completionName + ".$alternativeTag"), this.location(node))
+      let payload = isFailure ? ".$alternative1_0" : ".$alternative0_0"
+      let payloadValue = isFailure ? context.emitValue(22, "optional|" + irType(failureType), [returned.id], this.location(node)) : returned
+      context.emitSymbol(40, "void", [completion.id, payloadValue.id], irSymbol(this.module.id, 2, completionName + payload), this.location(node))
+    end
+    this.emitScopeCleanups(context, 0)
+    let wrapped = context.emitSymbol(38, context.function.resultType, irEmptyInts(), irSymbol(this.module.id, 1, outcomeName), this.location(node))
+    let initializer = this.findCallable(outcomeName + ".init")
+    if initializer != null
+      context.emitSymbol(29, "void", [wrapped.id, completion.id, collector], irSymbol(this.module.id, 3, initializer.fullName), this.location(node))
+      context.function.addCallee(initializer.fullName)
+    end
+    context.returnValue(wrapped.id, this.location(node))
   end
 
   def emitLoopContinue(context: IrFunctionContext, frame: IrLoopFrame?, branchLocation: IrLocation): Void

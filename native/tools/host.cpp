@@ -101,7 +101,8 @@ void list_project_files(const char *project, const char *relative, const char *s
     }
     if (entry->is_directory()) {
       if (generated_directory(entry->path()) ||
-          (entry->path() != root && std::filesystem::exists(entry->path() / "neri.json")))
+          (entry->path() != root && (std::filesystem::exists(entry->path() / "manifest.json") ||
+                                     std::filesystem::exists(entry->path() / "neri.json"))))
         entry.disable_recursion_pending();
       continue;
     }

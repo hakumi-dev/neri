@@ -1,7 +1,7 @@
 # Runtime and IR boundary
 
 The canonical exported declarations and layouts are in
-[`runtime_abi.h`](../native/include/neri/runtime_abi.h). Runtime ABI 1.15 uses a
+[`runtime_abi.h`](../native/include/neri/runtime_abi.h). Runtime ABI 1.20 uses a
 C calling convention on macOS ARM64 and Linux x86-64. Generated programs negotiate
 major version, minimum minor version and required feature bits before execution.
 The package manifest also identifies the toolchain version and native target.
@@ -22,6 +22,16 @@ programs that use this feature link to OpenSSL's `libcrypto`.
 The `ROOTED_FILES` feature (524288) requires ABI 1.15 and provides descriptor-relative
 opens with symlink rejection. Neri validates complete relative paths, bounds reads,
 and preserves primary and close failures.
+
+The `PROCESS` feature (1048576), introduced in ABI 1.16, owns child execution
+domains and bounded binary output capture behind generation tokens. The
+`DIRECTORY` feature (2097152), introduced in ABI 1.17, enumerates entries relative
+to an open directory and preserves operating-system and close errors.
+
+The `SOCKET_CLOSE_RESULT` feature (4194304), introduced in ABI 1.18, reports socket
+close failure. The `DRAIN` feature (16777216), introduced in ABI 1.20, provides a
+native watchdog for explicitly configured whole-process termination after stop.
+Bit 23 remains reserved and is absent from the runtime's advertised features.
 
 ## Representation
 
