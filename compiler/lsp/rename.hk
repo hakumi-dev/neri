@@ -1,0 +1,491 @@
+# Rename is a semantic transformation over one complete, immutable analysis
+# snapshot.  It never searches source text for matching spellings.
+
+class LspRenameEdit
+  public sourceIndex: Int = 0
+  public start: Int = 0
+  public length: Int = 0
+  public next: LspRenameEdit?
+end
+
+class LspRenameResult
+  public value: String = "null"
+  public error: String = ""
+end
+
+def lspRenameIdentifierValid(name: String): Bool
+  let tokens = (new BootstrapLexer(name)).lex()
+  return tokens.count() == 2 && tokens.kindAt(0) == "Identifier" && tokens.startAt(0) == 0 && tokens.lengthAt(0) == (new IrSourceMap(name)).utf16Length() && tokens.kindAt(1) == "EndOfFile"
+end
+
+def lspRenameIdentityLocal(identity: String): Bool
+  return bootstrapFindText(identity, "/local@") >= 0 || bootstrapFindText(identity, "/parameter") >= 0
+end
+
+def lspRenameDeclaration(semantic: SemanticModel, identity: String): SemanticDeclaration?
+  var result: SemanticDeclaration? = null
+  var declaration = semantic.declarations
+  while declaration != null
+    if declaration.identity == identity
+      if result != null
+        return null
+      end
+      result = declaration
+    end
+    declaration = declaration.next
+  end
+  return result
+end
+
+def lspRenameSourceIndex(snapshot: LspSemanticSnapshot, position: Int): Int
+  var index = 0
+  while index + 1 < snapshot.sourceStarts.size && snapshot.sourceStarts.get(index + 1) <= position
+    index = index + 1
+  end
+  return index
+end
+
+def lspRenameAddEdit(first: LspRenameEdit?, snapshot: LspSemanticSnapshot, start: Int, length: Int): LspRenameEdit?
+  let sourceIndex = lspRenameSourceIndex(snapshot, start)
+  if sourceIndex < 0 || sourceIndex >= snapshot.sourceStarts.size
+    return first
+  end
+  let relative = start - snapshot.sourceStarts.get(sourceIndex)
+  var current = first
+  while current != null
+    if current.sourceIndex == sourceIndex && current.start == relative && current.length == length
+      return first
+    end
+    current = current.next
+  end
+  let edit = new LspRenameEdit()
+  edit.sourceIndex = sourceIndex
+  edit.start = relative
+  edit.length = length
+  edit.next = first
+  return edit
+end
+
+def lspRenameEdits(snapshot: LspSemanticSnapshot, identity: String): LspRenameEdit?
+  let semantic = snapshot.semantic
+  if semantic == null || semantic.diagnostics.count() != 0
+    return null
+  end
+  var first: LspRenameEdit? = null
+  var declaration = semantic.declarations
+  while declaration != null
+    if declaration.identity == identity
+      first = lspRenameAddEdit(first, snapshot, declaration.start, declaration.length)
+    end
+    declaration = declaration.next
+  end
+  var occurrence = semantic.occurrences
+  while occurrence != null
+    if occurrence.identity == identity
+      first = lspRenameAddEdit(first, snapshot, occurrence.start, occurrence.length)
+    end
+    occurrence = occurrence.next
+  end
+  var node = semantic.bound.first.nextNode
+  while node != null
+    if (node.kind == "Name" || node.kind == "Assignment") && node.symbol == identity
+      first = lspRenameAddEdit(first, snapshot, node.start, node.length)
+    end
+    node = node.nextNode
+  end
+  return first
+end
+
+def lspRenameLazyReferencesSafe(snapshot: LspSemanticSnapshot, edits: LspRenameEdit?, oldName: String, newName: String): Bool
+  let semantic = snapshot.semantic
+  if semantic == null
+    return false
+  end
+  var source = ""
+  var index = 0
+  while index < snapshot.sourceTexts.size
+    source = source + snapshot.sourceTexts.get(index) + "\n"
+    index = index + 1
+  end
+  let tokens = (new BootstrapLexer(source)).lex()
+  index = 0
+  while index < tokens.count()
+    if tokens.kindAt(index) == "Identifier" && (tokens.textAt(index) == oldName || tokens.textAt(index) == newName)
+      let start = tokens.startAt(index)
+      if lspSymbolAt(semantic, start) == ""
+        let sourceIndex = lspRenameSourceIndex(snapshot, start)
+        let relative = start - snapshot.sourceStarts.get(sourceIndex)
+        if tokens.textAt(index) == newName || !lspRenameHasEdit(edits, sourceIndex, relative, tokens.lengthAt(index))
+          return false
+        end
+      end
+    end
+    index = index + 1
+  end
+  return true
+end
+
+def lspRenameHasEdit(edits: LspRenameEdit?, sourceIndex: Int, start: Int, length: Int): Bool
+  var edit: LspRenameEdit? = edits
+  while edit != null
+    if edit.sourceIndex == sourceIndex && edit.start == start && edit.length == length
+      return true
+    end
+    edit = edit.next
+  end
+  return false
+end
+
+def lspRenameMappedOffset(edits: LspRenameEdit?, sourceIndex: Int, position: Int, replacementLength: Int): Int
+  var result = position
+  var edit = edits
+  while edit != null
+    if edit.sourceIndex == sourceIndex && edit.start < position
+      result = result + replacementLength - edit.length
+    end
+    edit = edit.next
+  end
+  return result
+end
+
+def lspRenameText(source: String, edits: LspRenameEdit?, sourceIndex: Int, name: String): String
+  var result = source
+  var before = (new IrSourceMap(source)).utf16Length() + 1
+  while true
+    var selected: LspRenameEdit? = null
+    var edit = edits
+    while edit != null
+      if edit.sourceIndex == sourceIndex && edit.start < before && (selected == null || edit.start > selected.start)
+        selected = edit
+      end
+      edit = edit.next
+    end
+    if selected == null
+      return result
+    end
+    let map = new IrSourceMap(result)
+    let byteStart = map.offsetAt(selected.start)
+    let byteEnd = map.offsetAt(selected.start + selected.length)
+    result = host.stringSlice(result, 0, byteStart) + name + host.stringSlice(result, byteEnd, host.stringByteLength(result) - byteEnd)
+    before = selected.start
+  end
+  return result
+end
+
+def lspAnalyzeRenameSnapshot(snapshot: LspSemanticSnapshot, edits: LspRenameEdit?, name: String): LspSnapshotAnalysis
+  let texts = new StringBuffer()
+  var index = 0
+  while index < snapshot.sourceTexts.size
+    texts.add(lspRenameText(snapshot.sourceTexts.get(index), edits, index, name))
+    index = index + 1
+  end
+  return lspAnalyzeSnapshotTexts(snapshot, texts)
+end
+
+def lspRenameAbsolute(snapshot: LspSemanticSnapshot, analysis: LspSnapshotAnalysis, edits: LspRenameEdit?, oldStart: Int, replacementLength: Int): Int
+  let sourceIndex = lspRenameSourceIndex(snapshot, oldStart)
+  let relative = oldStart - snapshot.sourceStarts.get(sourceIndex)
+  return analysis.sourceStarts.get(sourceIndex) + lspRenameMappedOffset(edits, sourceIndex, relative, replacementLength)
+end
+
+def lspRenameSameDeclaration(snapshot: LspSemanticSnapshot, analysis: LspSnapshotAnalysis, edits: LspRenameEdit?, oldIdentity: String, newIdentity: String, replacementLength: Int): Bool
+  let oldSemantic = snapshot.semantic
+  let newSemantic = analysis.semantic
+  if oldSemantic == null || newSemantic == null
+    return false
+  end
+  var oldFound = false
+  var oldDeclaration = oldSemantic.declarations
+  while oldDeclaration != null
+    if oldDeclaration.identity == oldIdentity
+      oldFound = true
+      let mapped = lspRenameAbsolute(snapshot, analysis, edits, oldDeclaration.start, replacementLength)
+      var newDeclaration = newSemantic.declarations
+      while newDeclaration != null
+        if newDeclaration.identity == newIdentity && newDeclaration.start == mapped
+          return true
+        end
+        newDeclaration = newDeclaration.next
+      end
+    end
+    oldDeclaration = oldDeclaration.next
+  end
+  if oldFound
+    return false
+  end
+  var newDeclaration = newSemantic.declarations
+  while newDeclaration != null
+    if newDeclaration.identity == newIdentity
+      return false
+    end
+    newDeclaration = newDeclaration.next
+  end
+  return oldIdentity == newIdentity
+end
+
+def lspRenameBindingPreserved(snapshot: LspSemanticSnapshot, analysis: LspSnapshotAnalysis, edits: LspRenameEdit?, targetIdentity: String, newIdentity: String, oldStart: Int, oldLength: Int, oldIdentity: String, replacementLength: Int): Bool
+  # Generic specializations also leave generated bound records at the source
+  # range. Their canonical template occurrence at that same range is checked.
+  if lspSourceSymbolIsGenerated(oldIdentity)
+    return true
+  end
+  let oldSemantic = snapshot.semantic
+  if oldSemantic == null || lspSymbolAt(oldSemantic, oldStart) != oldIdentity
+    return true
+  end
+  let sourceIndex = lspRenameSourceIndex(snapshot, oldStart)
+  let relative = oldStart - snapshot.sourceStarts.get(sourceIndex)
+  let transformed = lspRenameAbsolute(snapshot, analysis, edits, oldStart, replacementLength)
+  let semantic = analysis.semantic
+  if semantic == null
+    return false
+  end
+  let resolved = lspSymbolAt(semantic, transformed)
+  if lspRenameHasEdit(edits, sourceIndex, relative, oldLength)
+    return oldIdentity == targetIdentity && resolved == newIdentity
+  end
+  return resolved != "" && lspRenameSameDeclaration(snapshot, analysis, edits, oldIdentity, resolved, replacementLength)
+end
+
+def lspRenameMethodInHierarchy(semantic: SemanticModel, identity: String): Bool
+  if !bootstrapStartsWith(identity, "callable:")
+    return false
+  end
+  let fullName = host.stringSlice(identity, 9, host.stringByteLength(identity) - 9)
+  var targetName = ""
+  var target = semantic.firstClass
+  while target != null
+    var method = target.firstMethod
+    while method != null
+      if method.fullName == fullName
+        targetName = method.name
+        if method.hasOverride
+          return true
+        end
+      end
+      method = method.nextCallable
+    end
+    target = target.nextClass
+  end
+  if targetName == ""
+    return false
+  end
+  var classSymbol = semantic.firstClass
+  while classSymbol != null
+    if classSymbol.baseName != ""
+      var method = classSymbol.firstMethod
+      while method != null
+        if method.name == targetName
+          return true
+        end
+        method = method.nextCallable
+      end
+    end
+    classSymbol = classSymbol.nextClass
+  end
+  return false
+end
+
+def lspRenameBindingsPreserved(snapshot: LspSemanticSnapshot, analysis: LspSnapshotAnalysis, edits: LspRenameEdit?, targetIdentity: String, newIdentity: String, replacementLength: Int): Bool
+  let semantic = snapshot.semantic
+  if semantic == null
+    return false
+  end
+  var declaration = semantic.declarations
+  while declaration != null
+    if !lspRenameBindingPreserved(snapshot, analysis, edits, targetIdentity, newIdentity, declaration.start, declaration.length, declaration.identity, replacementLength)
+      return false
+    end
+    declaration = declaration.next
+  end
+  var occurrence = semantic.occurrences
+  while occurrence != null
+    if !lspRenameBindingPreserved(snapshot, analysis, edits, targetIdentity, newIdentity, occurrence.start, occurrence.length, occurrence.identity, replacementLength)
+      return false
+    end
+    occurrence = occurrence.next
+  end
+  var node = semantic.bound.first.nextNode
+  while node != null
+    if (node.kind == "Name" || node.kind == "Assignment") && node.typeName != "Error" && node.symbol != ""
+      if !lspRenameBindingPreserved(snapshot, analysis, edits, targetIdentity, newIdentity, node.start, node.length, node.symbol, replacementLength)
+        return false
+      end
+    end
+    node = node.nextNode
+  end
+  return true
+end
+
+def lspRenameUri(snapshot: LspSemanticSnapshot, sourceIndex: Int): String
+  let uri = snapshot.sourceUris.get(sourceIndex)
+  if bootstrapStartsWith(uri, "@stdlib/")
+    return ""
+  end
+  return uri
+end
+
+def lspRenameOwned(snapshot: LspSemanticSnapshot, sourceIndex: Int): Bool
+  if sourceIndex < 0 || sourceIndex >= snapshot.sourceUris.size
+    return false
+  end
+  let uri = snapshot.sourceUris.get(sourceIndex)
+  var current = snapshot.renameOwnedSourceUris.first.nextNode
+  while current != null
+    if current.value == uri
+      return true
+    end
+    current = current.nextNode
+  end
+  return false
+end
+
+def lspRenameEditJson(snapshot: LspSemanticSnapshot, edit: LspRenameEdit, name: String): String
+  let text = snapshot.sourceTexts.get(edit.sourceIndex)
+  return "{\"range\":{\"start\":" + lspPosition(text, edit.start) + ",\"end\":" + lspPosition(text, edit.start + edit.length) + "},\"newText\":" + lspQuote(name) + "}"
+end
+
+def lspRenameWorkspaceEdit(snapshot: LspSemanticSnapshot, edits: LspRenameEdit?, name: String): String
+  let documents = new StringBuffer()
+  var documentCount = 0
+  var sourceIndex = 0
+  while sourceIndex < snapshot.sourceUris.size
+    let uri = lspRenameUri(snapshot, sourceIndex)
+    var parts = ""
+    var separator = ""
+    var edit = edits
+    while edit != null
+      if edit.sourceIndex == sourceIndex
+        parts = parts + separator + lspRenameEditJson(snapshot, edit, name)
+        separator = ","
+      end
+      edit = edit.next
+    end
+    if parts != "" && uri != ""
+      let version = sourceIndex < snapshot.sourceVersions.size ? snapshot.sourceVersions.get(sourceIndex) : -1
+      if documentCount > 0
+        documents.add(",")
+      end
+      documents.add("{\"textDocument\":{\"uri\":" + lspQuote(uri) + ",\"version\":" + (version < 0 ? "null" : version as String) + "},\"edits\":[" + parts + "]}")
+      documentCount = documentCount + 1
+    end
+    sourceIndex = sourceIndex + 1
+  end
+  return "{\"documentChanges\":[" + lspJoin(documents, 0, documents.size) + "]}"
+end
+
+def lspPrepareRename(snapshot: LspSemanticSnapshot, position: Int): LspRenameResult
+  let result = new LspRenameResult()
+  let semantic = snapshot.semantic
+  if semantic == null
+    result.error = "Rename requires a successful current project analysis."
+    return result
+  end
+  let identity = lspSnapshotIdentityAt(snapshot, position)
+  let declaration = lspRenameDeclaration(semantic, identity)
+  if identity == "" || declaration == null
+    result.error = "The selected symbol does not have one editable source declaration."
+    return result
+  end
+  if lspRenameMethodInHierarchy(semantic, identity)
+    result.error = "Methods that participate in an inheritance hierarchy cannot be renamed safely yet."
+    return result
+  end
+  if !lspRenameIdentityLocal(identity) && !snapshot.renameClosedWorld
+    result.error = "Rename cannot prove that all references to this project symbol are available."
+    return result
+  end
+  if !lspRenameOwned(snapshot, lspRenameSourceIndex(snapshot, declaration.start))
+    result.error = "The selected declaration is not owned by this project unit."
+    return result
+  end
+  let sourceIndex = lspRenameSourceIndex(snapshot, position)
+  if lspRenameUri(snapshot, sourceIndex) == ""
+    result.error = "Standard library symbols cannot be renamed from this project."
+    return result
+  end
+  let relative = position - snapshot.sourceStarts.get(sourceIndex)
+  let edits = lspRenameEdits(snapshot, identity)
+  var selected: LspRenameEdit? = null
+  var edit = edits
+  while edit != null
+    if edit.sourceIndex == sourceIndex && edit.start <= relative && relative < edit.start + edit.length
+      if selected != null
+        result.error = "The selected source range resolves ambiguously."
+        return result
+      end
+      selected = edit
+    end
+    edit = edit.next
+  end
+  if selected == null
+    result.error = "The selected symbol does not have an editable source range."
+    return result
+  end
+  let text = snapshot.sourceTexts.get(sourceIndex)
+  let range = lspPosition(text, selected.start) + ",\"end\":" + lspPosition(text, selected.start + selected.length)
+  result.value = "{\"range\":{\"start\":" + range + "},\"placeholder\":" + lspQuote(declaration.name) + "}"
+  return result
+end
+
+def lspRename(snapshot: LspSemanticSnapshot, position: Int, name: String): LspRenameResult
+  let result = new LspRenameResult()
+  if !lspRenameIdentifierValid(name)
+    result.error = "The new name must be one Neri identifier and cannot be a keyword."
+    return result
+  end
+  let semantic = snapshot.semantic
+  if semantic == null || semantic.diagnostics.count() != 0
+    result.error = "Rename requires a successful current project analysis."
+    return result
+  end
+  let identity = lspSnapshotIdentityAt(snapshot, position)
+  let declaration = lspRenameDeclaration(semantic, identity)
+  if identity == "" || declaration == null
+    result.error = "The selected symbol does not have one editable source declaration."
+    return result
+  end
+  if lspRenameMethodInHierarchy(semantic, identity)
+    result.error = "Methods that participate in an inheritance hierarchy cannot be renamed safely yet."
+    return result
+  end
+  if !lspRenameIdentityLocal(identity) && !snapshot.renameClosedWorld
+    result.error = "Rename cannot prove that all references to this project symbol are available."
+    return result
+  end
+  if !lspRenameOwned(snapshot, lspRenameSourceIndex(snapshot, declaration.start))
+    result.error = "The selected declaration is not owned by this project unit."
+    return result
+  end
+  let edits = lspRenameEdits(snapshot, identity)
+  if edits == null
+    result.error = "The selected symbol has no editable references."
+    return result
+  end
+  if !lspRenameLazyReferencesSafe(snapshot, edits, declaration.name, name)
+    result.error = "Rename cannot verify references inside an unanalyzed generic body."
+    return result
+  end
+  var edit: LspRenameEdit? = edits
+  while edit != null
+    if lspRenameUri(snapshot, edit.sourceIndex) == "" || !lspRenameOwned(snapshot, edit.sourceIndex)
+      result.error = "The symbol has references outside the editable project sources."
+      return result
+    end
+    edit = edit.next
+  end
+  let analysis = lspAnalyzeRenameSnapshot(snapshot, edits, name)
+  let renamedDeclarationStart = lspRenameAbsolute(snapshot, analysis, edits, declaration.start, (new IrSourceMap(name)).utf16Length())
+  let rebound = analysis.semantic
+  if rebound == null
+    result.error = "The renamed project does not analyze successfully."
+    return result
+  end
+  let newIdentity = lspSymbolAt(rebound, renamedDeclarationStart)
+  if newIdentity == "" || lspRenameDeclaration(rebound, newIdentity) == null || !lspRenameBindingsPreserved(snapshot, analysis, edits, identity, newIdentity, (new IrSourceMap(name)).utf16Length())
+    result.error = "The rename would capture or change another symbol binding."
+    return result
+  end
+  result.value = lspRenameWorkspaceEdit(snapshot, edits, name)
+  return result
+end

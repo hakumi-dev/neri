@@ -51,23 +51,132 @@ def lspLocation(document: LspDocument, start: Int, length: Int): String
   return "{\"uri\":" + lspQuote(uri) + ",\"range\":{\"start\":" + lspPosition(text, start - offset) + ",\"end\":" + lspPosition(text, start - offset + length) + "}}"
 end
 
-def lspDefinition(document: LspDocument, position: Int): String
-  let semantic = document.semantic
-  if semantic == null
+def lspNavigationSnapshot(document: LspDocument): LspSemanticSnapshot
+  let snapshot = new LspSemanticSnapshot()
+  snapshot.projectKey = document.projectKey == "" ? document.uri : document.projectKey
+  snapshot.projectRevision = document.analysisRevision
+  snapshot.semantic = document.semantic
+  snapshot.sourceUris = document.sourceUris
+  snapshot.sourceTexts = document.sourceTexts
+  snapshot.sourceStarts = document.sourceStarts
+  snapshot.sourceVersions = document.sourceVersions
+  snapshot.requireEntryPoint = document.requireEntryPoint
+  snapshot.forbiddenEntryPointSources = document.forbiddenEntryPointSources
+  snapshot.renameClosedWorld = document.renameClosedWorld
+  snapshot.renameOwnedSourceUris = document.renameOwnedSourceUris
+  return snapshot
+end
+
+def lspNavigationIndex(document: LspDocument): LspSemanticIndex
+  let cached = document.queryIndex
+  if cached != null
+    return cached
+  end
+  let snapshot = lspNavigationSnapshot(document)
+  let index = new LspSemanticIndex()
+  index.begin(snapshot.projectKey, snapshot.projectRevision)
+  index.addSnapshot(snapshot)
+  document.queryIndex = index
+  return index
+end
+
+def lspQueryLocationJson(location: LspQueryLocation): String
+  let snapshot = location.snapshot
+  if snapshot == null
     return "null"
   end
-  let identity = lspSymbolAt(semantic, position)
+  var index = 0
+  while index + 1 < snapshot.sourceStarts.size && snapshot.sourceStarts.get(index + 1) <= location.start
+    index = index + 1
+  end
+  if index < 0 || index >= snapshot.sourceUris.size || index >= snapshot.sourceTexts.size
+    return "null"
+  end
+  var uri = snapshot.sourceUris.get(index)
+  if bootstrapStartsWith(uri, "@stdlib/")
+    let directory = host.environment("NERI_STDLIB")
+    if directory == null
+      return "null"
+    end
+    uri = lspUri(directory + "/" + host.stringSlice(uri, 8, host.stringByteLength(uri) - 8))
+  end
+  let text = snapshot.sourceTexts.get(index)
+  return "{\"uri\":" + lspQuote(uri) + ",\"range\":{\"start\":" + lspPosition(text, location.sourceOffset) + ",\"end\":" + lspPosition(text, location.sourceOffset + location.length) + "}}"
+end
+
+def lspDefinition(document: LspDocument, position: Int): String
+  let snapshot = lspNavigationSnapshot(document)
+  let identity = lspQueryCanonicalIdentity(snapshot, lspSnapshotIdentityAt(snapshot, position))
   if identity == ""
     return "null"
   end
-  var declaration = semantic.declarations
-  while declaration != null
-    if declaration.identity == identity
-      return lspLocation(document, declaration.start, declaration.length)
-    end
-    declaration = declaration.next
+  let location = lspIndexDefinition(lspNavigationIndex(document), identity)
+  if location != null
+    return lspQueryLocationJson(location)
   end
   return "null"
+end
+
+def lspTypeAt(semantic: SemanticModel, position: Int): String
+  var best: BoundNode? = null
+  var node = semantic.bound.first.nextNode
+  while node != null
+    if node.typeName != "" && node.typeName != "Error" && node.start <= position && position < node.start + node.length
+      if best == null || node.length < best.length
+        best = node
+      end
+    end
+    node = node.nextNode
+  end
+  if best == null
+    return ""
+  end
+  return best.typeName
+end
+
+def lspTypeIdentity(semantic: SemanticModel, typeName: String): String
+  var base = semanticMutableType(typeName)
+  while semanticIsArray(base) || nativeFixedArray(base) || semanticIsOptional(base) || semanticIsPointer(base)
+    base = semanticInnerType(base)
+  end
+  if nativeRecordType(base)
+    let name = host.stringSlice(base, 7, host.stringByteLength(base) - 7)
+    return semantic.findRecord(name) == null ? "" : "record:" + name
+  end
+  if semantic.findClass(base) == null
+    return ""
+  end
+  return "type:" + lspGenericTemplateName(base)
+end
+
+def lspGenericTemplateName(typeName: String): String
+  var index = 0
+  while index < host.stringByteLength(typeName)
+    if (host.stringByteAt(typeName, index) as Int) == 60
+      return host.stringSlice(typeName, 0, index)
+    end
+    index = index + 1
+  end
+  return typeName
+end
+
+# Type definition resolves the compiler-inferred type at an expression. Builtin
+# and structural types have no source declaration and deliberately return null.
+def lspTypeDefinition(document: LspDocument, position: Int): String
+  let snapshot = lspNavigationSnapshot(document)
+  let semantic = snapshot.semantic
+  if semantic == null
+    return "null"
+  end
+  let identity = lspTypeIdentity(semantic, lspTypeAt(semantic, position))
+  if identity == ""
+    return "null"
+  end
+  let location = lspIndexDefinition(lspNavigationIndex(document), lspQueryCanonicalIdentity(snapshot, identity))
+  if location == null
+    return "null"
+  end
+  return lspQueryLocationJson(location)
 end
 
 def lspAddLocation(locations: StringBuffer, location: String): Void
@@ -81,38 +190,12 @@ def lspAddLocation(locations: StringBuffer, location: String): Void
   locations.add(location)
 end
 
-def lspReferences(document: LspDocument, position: Int, includeDeclaration: Bool): String
-  let semantic = document.semantic
-  if semantic == null
-    return "[]"
-  end
-  let identity = lspSymbolAt(semantic, position)
-  if identity == ""
-    return "[]"
-  end
+def lspNavigationReferences(document: LspDocument, identity: String, includeDeclaration: Bool): String
   let locations = new StringBuffer()
-  if includeDeclaration
-    var declaration = semantic.declarations
-    while declaration != null
-      if declaration.identity == identity
-        lspAddLocation(locations, lspLocation(document, declaration.start, declaration.length))
-      end
-      declaration = declaration.next
-    end
-  end
-  var node = semantic.bound.first.nextNode
-  while node != null
-    if (node.kind == "Name" || node.kind == "Assignment") && node.symbol == identity
-      lspAddLocation(locations, lspLocation(document, node.start, node.length))
-    end
-    node = node.nextNode
-  end
-  var occurrence = semantic.occurrences
-  while occurrence != null
-    if occurrence.identity == identity
-      lspAddLocation(locations, lspLocation(document, occurrence.start, occurrence.length))
-    end
-    occurrence = occurrence.next
+  var location = lspIndexReferences(lspNavigationIndex(document), identity, includeDeclaration)
+  while location != null
+    lspAddLocation(locations, lspQueryLocationJson(location))
+    location = location.next
   end
   let parts = new StringBuffer()
   var current = locations.first.nextNode
@@ -124,4 +207,13 @@ def lspReferences(document: LspDocument, position: Int, includeDeclaration: Bool
     current = current.nextNode
   end
   return "[" + lspJoin(parts, 0, parts.size) + "]"
+end
+
+def lspReferences(document: LspDocument, position: Int, includeDeclaration: Bool): String
+  let snapshot = lspNavigationSnapshot(document)
+  let identity = lspQueryCanonicalIdentity(snapshot, lspSnapshotIdentityAt(snapshot, position))
+  if identity == ""
+    return "[]"
+  end
+  return lspNavigationReferences(document, identity, includeDeclaration)
 end

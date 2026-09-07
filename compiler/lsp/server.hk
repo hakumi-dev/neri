@@ -173,6 +173,12 @@ class LspDocument
   public syntax: SyntaxArena?
   public syntaxRoot: Int = -1
   public analysisRevision: Int = 0
+  public projectKey: String = ""
+  public sourceVersions: IntBuffer = new IntBuffer()
+  public queryIndex: LspSemanticIndex?
+  public publishDiagnostics: Bool = true
+  public renameClosedWorld: Bool = true
+  public renameOwnedSourceUris: StringBuffer = new StringBuffer()
   public requireEntryPoint: Bool = true
   public forbiddenEntryPointSources: StringBuffer = new StringBuffer()
   public stdlibDocumentation: LspJson?
@@ -182,17 +188,45 @@ class LspDocument
   public next: LspDocument?
 end
 
+def lspUnusedUseDiagnostics(document: LspDocument, semantic: SemanticModel, primaryEnd: Int, includeTag: Bool): String
+  let syntax = document.syntax
+  if syntax == null
+    return ""
+  end
+  var result = ""
+  var separator = ""
+  let useCount = semanticIntField(syntax.dataAt(document.syntaxRoot), 0)
+  var index = 0
+  while index < useCount
+    let useNode = syntax.childAt(document.syntaxRoot, index)
+    let name = syntax.dataAt(useNode)
+    let start = syntax.startAt(useNode)
+    if (primaryEnd < 0 || start < primaryEnd) && semantic.hasUse(name) && !semantic.useReferenced(name)
+      let tags = includeTag ? ",\"tags\":[1]" : ""
+      result = result + separator + "{\"range\":{\"start\":" + lspPosition(document.text, start) + ",\"end\":" + lspPosition(document.text, start + syntax.lengthAt(useNode)) + "},\"severity\":4,\"code\":\"NR_UNUSED_USE\",\"source\":\"neri\",\"message\":\"Unused import: " + name + ".\"" + tags + "}"
+      separator = ","
+    end
+    index = index + 1
+  end
+  return result
+end
+
 class LspServer
   public rootPath: String = ""
   public unit: String = ""
   public documentationEnabled: Bool = true
   public hoverMarkdown: Bool = false
   public completionMarkdown: Bool = false
+  public unnecessaryDiagnosticTags: Bool = false
+  public codeActionLiterals: Bool = false
+  public versionedWorkspaceEdits: Bool = false
   public nextAnalysisRevision: Int = 1
   public stdlibDocumentation: LspJson?
   public initialized: Bool = false
   public shutdown: Bool = false
   public documents: LspDocument?
+  public workspaceSymbols: LspWorkspaceSymbol?
+  public workspaceSymbolsReady: Bool = false
 
   def find(uri: String): LspDocument?
     var document = this.documents
@@ -206,6 +240,9 @@ class LspServer
   end
 
   def publish(document: LspDocument, diagnostics: String): Void
+    if !document.publishDiagnostics
+      return
+    end
     lspSend("{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{\"uri\":" + lspQuote(document.uri) + ",\"version\":" + (document.version as String) + ",\"diagnostics\":" + diagnostics + "}}")
   end
 
@@ -218,6 +255,14 @@ class LspServer
       document = document.next
     end
     return null
+  end
+
+  def sourceUri(path: String): String
+    let opened = this.findPath(path)
+    if opened != null
+      return opened.uri
+    end
+    return lspUri(path)
   end
 
   def resolveDocumentPath(document: LspDocument): String
@@ -335,6 +380,15 @@ class LspServer
   def analyze(document: LspDocument): Void
     # A failed parse or library load must not expose a previous version's model.
     document.semantic = null
+    this.workspaceSymbolsReady = false
+    this.workspaceSymbols = null
+    document.queryIndex = null
+    document.projectKey = document.uri
+    document.sourceVersions = new IntBuffer()
+    document.sourceVersions.add(document.version)
+    document.renameClosedWorld = true
+    document.renameOwnedSourceUris = new StringBuffer()
+    document.renameOwnedSourceUris.add(document.uri)
     document.tokens = null
     document.syntax = null
     document.syntaxRoot = -1
@@ -376,6 +430,22 @@ class LspServer
             return
           end
           if neriProjectContains(project, path)
+            document.renameClosedWorld = project.kind == "executable"
+            var ownIndex = 0
+            while ownIndex < project.ownSources.size
+              let ownPath = project.ownSources.get(ownIndex)
+              if ownPath != path
+                document.renameOwnedSourceUris.add(this.sourceUri(ownPath))
+              end
+              ownIndex = ownIndex + 1
+            end
+            var ownerIndex = 0
+            while ownerIndex < project.sources.size
+              if project.sources.get(ownerIndex) == path
+                document.projectKey = project.sourceOwners.get(ownerIndex)
+              end
+              ownerIndex = ownerIndex + 1
+            end
             implicitProject = project.implicit
             document.requireEntryPoint = project.kind == "executable"
             if project.kind == "library"
@@ -383,13 +453,13 @@ class LspServer
               document.forbiddenEntryPointSources.add(document.uri)
               var own = project.ownSources.first.nextNode
               while own != null
-                document.forbiddenEntryPointSources.add(lspUri(own.value))
+                document.forbiddenEntryPointSources.add(this.sourceUri(own.value))
                 own = own.nextNode
               end
             end
             var reference = project.referenceSources.first.nextNode
             while reference != null
-              document.forbiddenEntryPointSources.add(lspUri(reference.value))
+              document.forbiddenEntryPointSources.add(this.sourceUri(reference.value))
               reference = reference.nextNode
             end
             var entry = project.sources.first.nextNode
@@ -408,8 +478,13 @@ class LspServer
                   return
                 end
                 starts.add((new IrSourceMap(source)).utf16Length())
-                ids.add(lspUri(entry.value))
+                ids.add(this.sourceUri(entry.value))
                 texts.add(text)
+                var sourceVersion = -1
+                if opened != null
+                  sourceVersion = opened.version
+                end
+                document.sourceVersions.add(sourceVersion)
                 source = source + text + "\n"
               end
               entry = entry.nextNode
@@ -437,6 +512,7 @@ class LspServer
             starts.add((new IrSourceMap(source)).utf16Length())
             ids.add("@stdlib/" + library + ".hk")
             texts.add(text)
+            document.sourceVersions.add(-1)
             source = source + text + "\n"
             pendingLibraries = true
           end
@@ -468,6 +544,7 @@ class LspServer
       end
       let semantic = binder.bind()
       document.semantic = semantic
+      document.queryIndex = lspNavigationIndex(document)
       diagnostics = semantic.diagnostics
     end
     var result = "["
@@ -493,6 +570,15 @@ class LspServer
         end
       end
       index = index + 1
+    end
+    let semantic = document.semantic
+    if semantic != null && diagnostics.count() == 0
+      let primaryEnd = starts.size == 1 ? -1 : starts.get(1)
+      let unused = lspUnusedUseDiagnostics(document, semantic, primaryEnd, this.unnecessaryDiagnosticTags)
+      if unused != ""
+        result = result + separator + unused
+        separator = ","
+      end
     end
     this.publish(document, result + "]")
   end
@@ -537,8 +623,13 @@ class LspServer
       let textCapabilities = params.get("capabilities").get("textDocument")
       this.hoverMarkdown = lspJsonArrayContains(textCapabilities.get("hover").get("contentFormat"), "markdown")
       this.completionMarkdown = lspJsonArrayContains(textCapabilities.get("completion").get("completionItem").get("documentationFormat"), "markdown")
+      this.unnecessaryDiagnosticTags = lspJsonArrayContainsNumber(textCapabilities.get("publishDiagnostics").get("tagSupport").get("valueSet"), "1")
+      this.versionedWorkspaceEdits = params.get("capabilities").get("workspace").get("workspaceEdit").get("documentChanges").value == "true"
+      this.codeActionLiterals = this.versionedWorkspaceEdits && textCapabilities.get("codeAction").get("codeActionLiteralSupport").get("codeActionKind").get("valueSet").kind == "array"
       this.stdlibDocumentation = lspLoadStdlibDocumentation()
-      lspResult(id, "{\"capabilities\":{\"positionEncoding\":\"utf-16\",\"hoverProvider\":true,\"definitionProvider\":true,\"referencesProvider\":true,\"documentHighlightProvider\":true,\"documentSymbolProvider\":true,\"completionProvider\":{\"triggerCharacters\":[\".\"],\"resolveProvider\":true},\"signatureHelpProvider\":{\"triggerCharacters\":[\"(\",\",\"]},\"textDocumentSync\":{\"openClose\":true,\"change\":2}},\"serverInfo\":{\"name\":\"neri\",\"version\":" + lspQuote(neriVersion()) + "}}")
+      let actions = (this.codeActionLiterals ? ",\"codeActionProvider\":{\"codeActionKinds\":[\"quickfix\",\"source.organizeImports\"]}" : "") + ",\"workspaceSymbolProvider\":true,\"typeDefinitionProvider\":true"
+      let rename = this.versionedWorkspaceEdits ? ",\"renameProvider\":{\"prepareProvider\":true}" : ""
+      lspResult(id, "{\"capabilities\":{\"positionEncoding\":\"utf-16\",\"hoverProvider\":true,\"definitionProvider\":true,\"referencesProvider\":true,\"documentHighlightProvider\":true,\"documentSymbolProvider\":true,\"completionProvider\":{\"triggerCharacters\":[\".\"],\"resolveProvider\":true},\"signatureHelpProvider\":{\"triggerCharacters\":[\"(\",\",\"]},\"textDocumentSync\":{\"openClose\":true,\"change\":2}" + actions + rename + "},\"serverInfo\":{\"name\":\"neri\",\"version\":" + lspQuote(neriVersion()) + "}}")
       return true
     end
     if !this.initialized || this.shutdown
@@ -550,6 +641,66 @@ class LspServer
     if method.value == "shutdown" && request
       this.shutdown = true
       lspResult(id, "null")
+      return true
+    end
+    if method.value == "workspace/symbol" && request
+      let query = message.get("params").get("query")
+      if query.kind != "string"
+        lspError(id, -32602, "Expected a symbol query")
+      else
+        lspResult(id, lspWorkspaceSymbols(this, query.value))
+      end
+      return true
+    end
+    if method.value == "textDocument/codeAction" && request
+      let params = message.get("params")
+      let document = this.find(params.get("textDocument").get("uri").value)
+      if !this.codeActionLiterals || document == null
+        lspResult(id, "[]")
+        return true
+      end
+      let start = lspByteOffset(document.text, params.get("range").get("start"))
+      let finish = lspByteOffset(document.text, params.get("range").get("end"))
+      if start < 0 || finish < start
+        lspError(id, -32602, "Invalid document range")
+        return true
+      end
+      let only = params.get("context").get("only")
+      let all = only.kind == "missing"
+      let quickFix = all || lspJsonArrayContains(only, "") || lspJsonArrayContains(only, "quickfix")
+      let organize = all || lspJsonArrayContains(only, "") || lspJsonArrayContains(only, "source") || lspJsonArrayContains(only, "source.organizeImports")
+      let startPosition = (new IrSourceMap(host.stringSlice(document.text, 0, start))).utf16Length()
+      let endPosition = (new IrSourceMap(host.stringSlice(document.text, 0, finish))).utf16Length()
+      lspResult(id, lspUnusedUseActions(document, startPosition, endPosition, quickFix, organize))
+      return true
+    end
+    if (method.value == "textDocument/prepareRename" || method.value == "textDocument/rename") && request
+      let params = message.get("params")
+      let document = this.find(params.get("textDocument").get("uri").value)
+      if !this.versionedWorkspaceEdits || document == null
+        lspResult(id, "null")
+        return true
+      end
+      let offset = lspByteOffset(document.text, params.get("position"))
+      if offset < 0
+        lspError(id, -32602, "Invalid document position")
+        return true
+      end
+      let position = (new IrSourceMap(host.stringSlice(document.text, 0, offset))).utf16Length()
+      let snapshot = lspNavigationSnapshot(document)
+      var result = lspPrepareRename(snapshot, position)
+      if method.value == "textDocument/rename"
+        if params.get("newName").kind != "string"
+          lspError(id, -32602, "Expected a new identifier")
+          return true
+        end
+        result = lspRename(snapshot, position, params.get("newName").value)
+      end
+      if result.error != ""
+        lspError(id, -32803, result.error)
+      else
+        lspResult(id, result.value)
+      end
       return true
     end
     if method.value == "textDocument/documentSymbol" && request
@@ -571,7 +722,7 @@ class LspServer
       lspResult(id, lspResolveCompletion(document, item, this.documentationEnabled, this.completionMarkdown))
       return true
     end
-    if (method.value == "textDocument/hover" || method.value == "textDocument/definition" || method.value == "textDocument/references" || method.value == "textDocument/documentHighlight" || method.value == "textDocument/completion" || method.value == "textDocument/signatureHelp") && request
+    if (method.value == "textDocument/hover" || method.value == "textDocument/definition" || method.value == "textDocument/typeDefinition" || method.value == "textDocument/references" || method.value == "textDocument/documentHighlight" || method.value == "textDocument/completion" || method.value == "textDocument/signatureHelp") && request
       let params = message.get("params")
       let document = this.find(params.get("textDocument").get("uri").value)
       if document == null
@@ -584,6 +735,8 @@ class LspServer
           let position = (new IrSourceMap(host.stringSlice(document.text, 0, offset))).utf16Length()
           if method.value == "textDocument/references"
             lspResult(id, lspReferences(document, position, params.get("context").get("includeDeclaration").value == "true"))
+          else if method.value == "textDocument/typeDefinition"
+            lspResult(id, lspTypeDefinition(document, position))
           else if method.value == "textDocument/documentHighlight"
             lspResult(id, lspHighlights(document, position))
           else if method.value == "textDocument/completion"
@@ -605,11 +758,15 @@ class LspServer
     let item = params.get("textDocument")
     let uri = item.get("uri")
     if method.value == "workspace/didChangeWatchedFiles"
+      this.workspaceSymbolsReady = false
+      this.workspaceSymbols = null
       this.stdlibDocumentation = lspLoadStdlibDocumentation()
       this.reanalyze()
       return true
     end
     if method.value == "textDocument/didClose"
+      this.workspaceSymbolsReady = false
+      this.workspaceSymbols = null
       var previous: LspDocument? = null
       var current = this.documents
       while current != null

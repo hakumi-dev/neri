@@ -669,7 +669,7 @@ int main(int argc, char **argv) {
   reply = receive();
   require(*spaces(diagnostics(reply) + 1) == '{', "incomplete do block diagnostics");
   free(reply);
-  open_document("file:///clock.hk", "use clock\ndef main(): Void\nend\n", 0);
+  open_document("file:///clock.hk", "use clock\ndef main(): Void\n  clock.milliseconds()\nend\n", 0);
   empty_diagnostics(1);
 
   const char *unit = "abc😀é";
