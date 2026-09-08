@@ -137,7 +137,16 @@ the first captured library. Their aggregate snapshot is limited to 1 MiB.
 `SessionToolchain` selects Debug or Release module compilation. A project
 initializer is loaded through the normal project manifest, validated as a safe
 zero-argument non-`Void` function, and executed independently of the project's
-`main`. `SessionTerminal` is a small frontend over this API. It accepts optional
+`main`. `initializeProject(projectPath, unit, functionName, bindingName, imports)`
+accepts an optional binding name (default `service`) and a string containing only
+`use` declarations (default empty). The imports and named initializer result are
+available in the first committed generation, using one compiled module. The
+initializer still executes once per successful initialization. Names must be
+single identifiers outside the reserved session namespace; executable statements
+are rejected in `imports`. Reset discards the instance and allows initialization
+of a fresh one. Existing three-argument callers keep the `service` binding.
+
+`SessionTerminal` is a small frontend over this API. It accepts optional
 context before the first prompt, collects multiline input through a line
 containing only `.`, formats preparation and execution diagnostics, handles
 `:reset`, and disposes the session on EOF. The `session-console` unit reads its
