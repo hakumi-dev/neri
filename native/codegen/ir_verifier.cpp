@@ -480,7 +480,9 @@ void require_operand_type(const function_context &context,
                           const type &expected) {
   if (index >= value.operands.size() ||
       !same_type(definition_type(context, value.operands[index]), expected)) {
-    fail(invalid_type, "Instruction operand has the wrong semantic type.");
+    fail(invalid_type, "Instruction operand has the wrong semantic type in " +
+         context.value.id.semantic_name + " (opcode " +
+         std::to_string(value.opcode) + ", operand " + std::to_string(index) + ").");
   }
 }
 

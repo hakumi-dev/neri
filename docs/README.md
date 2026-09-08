@@ -8,6 +8,7 @@ packages include the language reference for the packaged compiler.
 - [Install and run a program](../README.md#install).
 - [Work through the examples](../examples/README.md).
 - [Look up syntax, types and commands](LANGUAGE.md).
+- [Configure code style and automatic corrections](CODESTYLE.md).
 - [Serve HTTP requests](HTTP.md).
 - [Read bounded binary files](FILES.md).
 - [Use elapsed time and UTC timestamps](CLOCK.md).

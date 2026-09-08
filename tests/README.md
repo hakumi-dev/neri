@@ -10,6 +10,14 @@ The full suite also uses a native C stdio client to exercise
 `neri lsp` against the freshly built compiler. See the
 [language-server contract](../docs/LANGUAGE-SERVER.md) for scope and standalone commands.
 
+The build discovers top-level `lsp-*-contract.hk` and `codestyle-*-contract.hk`
+sources and runs their registered executable units. Contract arguments are the
+repository root, compiler executable and work directory. CodeStyle contracts
+exercise rule behavior, EditorConfig inheritance, actual CLI writes and LSP
+responses. The native protocol fixture requests language diagnostics only;
+Neri LSP contracts verify style diagnostics and corrections with the default
+client settings.
+
 `smoke-test` selects the documented run/argument contracts; `negative-test` selects
 compiler diagnostics and runtime panics. Both commands first build a current
 fixed-point compiler and preserve the published toolchain. `native-test` selects

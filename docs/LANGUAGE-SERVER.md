@@ -24,6 +24,9 @@ project owns the JetBrains client, grammar, configuration UI and Run/Build/Check
 - Versioned `publishDiagnostics`; old/duplicate change versions are ignored.
   Each publication replaces the previous diagnostics. Analysis with no findings
   and document close publish an empty diagnostic list.
+- [Neri CodeStyle](CODESTYLE.md) diagnostics share the CLI rule engine and
+  `.editorconfig` policy. Document formatting returns minimal edits; versioned
+  quick fixes and `source.fixAll.neri` apply safe style corrections.
 - Unused `use` directives produce an `NR_UNUSED_USE` hint after successful
   semantic analysis. Clients that advertise support receive
   `DiagnosticTag.Unnecessary`, allowing the editor to fade the directive.
