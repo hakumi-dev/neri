@@ -34,8 +34,13 @@ operators and conditional expressions evaluate only the required branch.
 
 `use console` provides terminal input and output: `console.print(value)` writes
 without a newline, `console.println(value)` appends a newline, and
-`console.read()` reads a line as a string. Output accepts strings and numeric
-values. End of input produces an empty string. Output is flushed after each call.
+`console.read()` reads a line as a string. Both output functions require a
+`String`; convert numeric values explicitly with `as String`. End of input
+produces an empty string. Output is flushed after each call.
+
+`use test` provides assertions. `test.assert`, `test.assertTrue`, and
+`test.assertFalse` require a `Bool`. `test.assertEqual` requires two arguments
+of the same type, with equality supported by the language's `==` operator.
 
 ## Values and variables
 
@@ -51,6 +56,12 @@ values. End of input produces an empty string. Output is flushed after each call
 | `T[]` | Homogeneous fixed-length array, checked indexing, `Length`, and `for` iteration. |
 | `T?` | Explicit optional value. |
 | Class | Managed reference to an instance. |
+
+Neri has no built-in `Any` type or dynamic escape hatch. A user-defined class
+named `Any` is an ordinary class. Generic type parameters preserve the type
+relationships established by their arguments.
+Built-in type names and the compiler's `Error` and `Null` type markers are
+reserved in type declarations and generic parameter lists.
 
 Integer division truncates toward zero; division by zero and minimum Int divided
 by -1 panic. Float arithmetic follows IEEE-754 without fast-math.
