@@ -23,7 +23,7 @@ extern "C" {
 #endif
 
 #define NERI_RUNTIME_ABI_MAJOR UINT16_C(1)
-#define NERI_RUNTIME_ABI_MINOR UINT16_C(21)
+#define NERI_RUNTIME_ABI_MINOR UINT16_C(22)
 
 #define NERI_RT_FEATURE_PRECISE_GC UINT64_C(1)
 #define NERI_RT_FEATURE_NONMOVING_GC (UINT64_C(1) << 1)
@@ -54,6 +54,9 @@ extern "C" {
 #define NERI_RT_FEATURE_DRAIN (UINT64_C(1) << 24)
 #define NERI_RT_FEATURE_SESSION_MODULES (UINT64_C(1) << 23)
 #define NERI_RT_FEATURE_OPTIONAL_CONSOLE_READ (UINT64_C(1) << 25)
+#define NERI_RT_FEATURE_PROCESS_IO (UINT64_C(1) << 26)
+#define NERI_RT_FEATURE_FILESYSTEM_MUTATION (UINT64_C(1) << 27)
+#define NERI_RT_FEATURE_SOCKET_ENDPOINTS (UINT64_C(1) << 28)
 
 #define NERI_TYPE_KIND_CLASS_V1 UINT32_C(1)
 #define NERI_TYPE_KIND_STRING_V1 UINT32_C(2)
@@ -397,6 +400,16 @@ NERI_RT_API neri_int_v1 neri_rt_v1_process_poll(neri_int_v1 token, neri_int_v1 w
 NERI_RT_API neri_int_v1 neri_rt_v1_process_read(neri_int_v1 token, neri_int_v1 channel, neri_int_v1 offset, uint8_t *output, neri_int_v1 capacity, neri_int_v1 *count);
 NERI_RT_API neri_int_v1 neri_rt_v1_process_cancel(neri_int_v1 token, neri_int_v1 *os_code);
 NERI_RT_API neri_int_v1 neri_rt_v1_process_dispose(neri_int_v1 token, neri_int_v1 *os_code);
+/* ABI 1.22: bounded initial stdin and graceful child-domain interruption. */
+NERI_RT_API neri_int_v1 neri_rt_v1_process_spawn_input(const uint8_t *config, neri_int_v1 length, neri_int_v1 *token, neri_int_v1 *os_code);
+NERI_RT_API neri_int_v1 neri_rt_v1_process_interrupt(neri_int_v1 token, neri_int_v1 *os_code);
+/* ABI 1.22: owned temporary directories and filesystem operations. */
+NERI_RT_API neri_int_v1 neri_rt_v1_file_mutation_temp_directory(const uint8_t *prefix, neri_int_v1 prefix_length, uint8_t *output, neri_int_v1 capacity, neri_int_v1 *output_length, neri_int_v1 *os_code);
+NERI_RT_API neri_int_v1 neri_rt_v1_file_mutation_mkdir(const uint8_t *path, neri_int_v1 length, neri_int_v1 parents, neri_int_v1 *os_code);
+NERI_RT_API neri_int_v1 neri_rt_v1_file_mutation_rename(const uint8_t *source, neri_int_v1 source_length, const uint8_t *destination, neri_int_v1 destination_length, neri_int_v1 *os_code);
+NERI_RT_API neri_int_v1 neri_rt_v1_file_mutation_remove(const uint8_t *path, neri_int_v1 length, neri_int_v1 kind, neri_int_v1 *os_code);
+NERI_RT_API neri_int_v1 neri_rt_v1_file_mutation_status(const uint8_t *path, neri_int_v1 length, neri_int_v1 *exists, neri_int_v1 *kind, neri_int_v1 *executable, neri_int_v1 *symlink, neri_int_v1 *os_code);
+NERI_RT_API neri_int_v1 neri_rt_v1_file_mutation_copy(const uint8_t *source, neri_int_v1 source_length, const uint8_t *destination, neri_int_v1 destination_length, neri_int_v1 *os_code);
 /* ABI 1.12: one serving-thread-owned interrupt lease; 0 means unavailable.
  * Positive generation tokens prevent stale closes affecting a later lease. */
 NERI_RT_API neri_int_v1 neri_rt_v1_interrupt_open(void);
@@ -425,6 +438,8 @@ NERI_RT_API neri_int_v1 neri_rt_v1_net_configure(neri_int_v1 fd);
 NERI_RT_API neri_int_v1 neri_rt_v1_net_bind(neri_int_v1 fd, neri_int_v1 port);
 NERI_RT_API neri_int_v1 neri_rt_v1_net_listen(neri_int_v1 fd);
 NERI_RT_API neri_int_v1 neri_rt_v1_net_connect(neri_int_v1 fd, neri_int_v1 port);
+NERI_RT_API neri_int_v1 neri_rt_v1_net_connect_timeout(neri_int_v1 fd, neri_int_v1 port, neri_int_v1 timeout_ms);
+NERI_RT_API neri_int_v1 neri_rt_v1_net_local_port(neri_int_v1 fd);
 NERI_RT_API neri_int_v1 neri_rt_v1_net_accept(neri_int_v1 fd);
 NERI_RT_API neri_int_v1 neri_rt_v1_net_poll(neri_int_v1 fd, neri_int_v1 writing, neri_int_v1 milliseconds);
 NERI_RT_API neri_int_v1 neri_rt_v1_net_read(neri_int_v1 fd, uint8_t *bytes, neri_int_v1 length);
