@@ -89,3 +89,51 @@ handle traversal rather than string-prefix canonicalization. Windows
 and [`GetFinalPathNameByHandleW`](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getfinalpathnamebyhandlew)
 document the relevant handle and resolved-path behavior, but resolved-path checks
 alone are not the containment primitive promised here.
+
+## Filesystem mutation
+
+`files.TemporaryDirectory.create(prefix)` creates a unique private temporary directory
+and returns `result.Result<TemporaryDirectory, result.Failure>`. The prefix is a
+nonempty UTF-8 label without `/`, `\\` or NUL. The returned
+`TemporaryDirectory` is a resource: use `using` where possible, or call its
+idempotent `close()` to remove the whole tree. `path()` exposes the created
+path while cleanup retains its private, immutable selection of that path.
+Temporary directories are created
+with owner-only permissions on POSIX. The cleanup walk removes symbolic links
+themselves and never follows them.
+Cleanup can still fail when another process changes permissions or retains a
+directory entry; its `result.Failure` reports `remove_tree_failed` and its OS
+code.
+
+The general path APIs accept nonempty UTF-8 paths up to 1 MiB without embedded
+NUL. They report a `files.OperationResult`, whose `failure` is null on success:
+`createDirectory(path, parents)`, `move(source, destination)`,
+`removeFile(path)`, `removeDirectory(path)`, `removeTree(path)` and
+`copyFile(source, destination)`. `createDirectory` uses owner-only mode on
+POSIX; with `parents` it creates each missing component. `move` has native
+rename semantics, including replacement of an existing compatible destination.
+`removeDirectory` requires an empty directory. `removeTree` does not traverse
+symbolic links. Removal paths cannot end in a separator, `.` or `..`; this keeps
+the final entry from being normalized into a symbolic-link target. The POSIX
+removal walk bounds nesting to 256 directory levels and reports `ELOOP` when
+that bound is reached. `copyFile` copies a regular source file to a destination which
+does not yet exist; on POSIX it refuses a source symbolic link and creates the
+destination exclusively. These APIs are filesystem operations, not a
+containment capability: their parent path components use the host's usual path
+resolution rules. Use `Root` for untrusted relative read paths.
+
+`status(path)` returns `StatusResult`; successful statuses contain `exists`,
+`kind` (`missing`, `file`, `directory`, `symlink` or `other`), `executable` and
+`symlink`. It observes the directory entry itself rather than following its
+final symbolic link. POSIX execution means at least one execute permission bit
+on a regular file. Windows reports executable file extensions (`.exe`, `.com`,
+`.bat`, `.cmd`) and treats reparse points as symbolic links for this API.
+
+These mutations require runtime ABI 1.22 and `FILESYSTEM_MUTATION`. POSIX
+temporary creation uses [POSIX `mkdtemp`](https://pubs.opengroup.org/onlinepubs/9799919799/functions/mkdtemp.html), and removal and status use the final-link
+behavior specified for [POSIX `unlink`](https://pubs.opengroup.org/onlinepubs/9799919799/functions/unlink.html) and
+[POSIX `lstat`](https://pubs.opengroup.org/onlinepubs/9799919799/functions/lstat.html).
+Windows temporary creation uses cryptographic system randomness and
+[`CreateDirectoryW`](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createdirectoryw); move and metadata follow
+[`MoveFileExW`](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-movefileexw)
+and [`GetFileAttributesW`](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getfileattributesw).
