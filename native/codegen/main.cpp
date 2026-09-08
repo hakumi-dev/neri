@@ -14,6 +14,7 @@
 #include <fstream>
 #include <iostream>
 #include <span>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -36,6 +37,7 @@ struct arguments final {
   neri::codegen::output_kind kind{};
   std::filesystem::path output;
   std::filesystem::path metrics;
+  neri::codegen::debug_source_paths debug_sources;
 };
 
 [[noreturn]] void usage_error(std::string message) {
@@ -47,7 +49,7 @@ void print_usage(std::ostream &stream) {
             "<binary|hex> --target <macos-arm64|linux-x86_64|windows-x86_64> "
             "--optimization <debug|release> "
             "--emit <llvm-ir|assembly|object> --output <path|-> "
-            "[--metrics <path>]\n";
+            "[--metrics <path>] [--debug-source <id> <path>]\n";
 }
 
 arguments parse_arguments(int argc, char **argv) {
@@ -63,11 +65,23 @@ arguments parse_arguments(int argc, char **argv) {
   std::string emit;
   std::string output;
   std::string metrics;
+  neri::codegen::debug_source_paths debug_sources;
   for (int index = 1; index < argc; index += 2) {
+    const std::string_view option(argv[index]);
+    if (option == "--debug-source") {
+      if (index + 2 >= argc) {
+        usage_error("Debug source requires an ID and a path.");
+      }
+      if (argv[index + 1][0] == '\0' || argv[index + 2][0] == '\0') {
+        usage_error("Debug source ID and path must not be empty.");
+      }
+      debug_sources.emplace_back(argv[index + 1], argv[index + 2]);
+      ++index;
+      continue;
+    }
     if (index + 1 >= argc) {
       usage_error("Every option requires a value.");
     }
-    const std::string_view option(argv[index]);
     auto &destination = [&]() -> std::string & {
       if (option == "--input") {
         return input;
@@ -110,13 +124,21 @@ arguments parse_arguments(int argc, char **argv) {
   if (output == "-" && kind == neri::codegen::output_kind::object) {
     usage_error("Object output requires a file path.");
   }
+  std::set<std::string> debug_source_ids;
+  for (const auto &[id, ignored] : debug_sources) {
+    static_cast<void>(ignored);
+    if (!debug_source_ids.insert(id).second) {
+      usage_error("Debug source ID was repeated.");
+    }
+  }
   return {neri::host_path(input),
           input_format,
           neri::codegen::parse_target(target),
           neri::codegen::parse_optimization(optimization),
           kind,
           neri::host_path(output),
-          neri::host_path(metrics)};
+          neri::host_path(metrics),
+          std::move(debug_sources)};
 }
 
 std::vector<std::uint8_t> read_file(const std::filesystem::path &path,
@@ -253,7 +275,8 @@ int main(int argc, char **argv) {
     write_output(options.output,
                  neri::codegen::emit_module(module, options.target,
                                               options.optimization,
-                                              options.kind, &metrics));
+                                              options.kind, &metrics,
+                                              options.debug_sources));
     write_metrics(
         options.metrics,
         static_cast<std::uint64_t>(

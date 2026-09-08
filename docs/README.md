@@ -9,6 +9,7 @@ packages include the language reference for the packaged compiler.
 - [Work through the examples](../examples/README.md).
 - [Look up syntax, types and commands](LANGUAGE.md).
 - [Configure code style and automatic corrections](CODESTYLE.md).
+- [Debug with LLDB and IDEs](DEBUGGING.md).
 - [Serve HTTP requests](HTTP.md).
 - [Read files and manage temporary filesystem state](FILES.md).
 - [Use elapsed time and UTC timestamps](CLOCK.md).

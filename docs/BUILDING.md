@@ -57,6 +57,8 @@ build driver. The driver builds the native components, compiles three generation
 of the compiler and requires matching output. It then runs the language and
 native tests before selecting the verified toolchain at `build/current`.
 See [bootstrapping](BOOTSTRAP.md) and [testing](../tests/README.md) for details.
+The opt-in `scripts/build.sh debugger-test` command verifies real LLDB debugging
+on macOS; see [debugging](DEBUGGING.md) for setup and the supported contract.
 
 Use that toolchain without changing your installed `neri` command:
 

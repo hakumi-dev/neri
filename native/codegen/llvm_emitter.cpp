@@ -240,13 +240,15 @@ std::string_view output_kind_name(output_kind kind) noexcept {
 
 artifact emit_module(const verified_module &input, target_platform target,
                      optimization_mode optimization, output_kind kind,
-                     emission_metrics *metrics) {
+                     emission_metrics *metrics,
+                     const debug_source_paths &debug_sources) {
   auto machine = create_target_machine(target, optimization);
   llvm::LLVMContext context;
   const llvm::Triple triple(std::string(target_triple(target)));
   const auto lowering_started = std::chrono::steady_clock::now();
   auto module = lower_to_llvm(input, context, triple, machine->createDataLayout(),
-                              optimization == optimization_mode::debug);
+                              optimization == optimization_mode::debug,
+                              debug_sources);
 
   verify_module(*module, "before optimization");
   const auto optimization_started = std::chrono::steady_clock::now();

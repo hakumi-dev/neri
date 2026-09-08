@@ -32,6 +32,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <span>
 #include <string>
 #include <string_view>
@@ -129,6 +130,11 @@ void append_qualified_parts(std::vector<std::string_view> &parts,
   return result;
 }
 
+[[nodiscard]] std::string_view unqualified_name(std::string_view value) {
+  const auto separator = value.find_last_of('.');
+  return separator == std::string_view::npos ? value : value.substr(separator + 1U);
+}
+
 [[nodiscard]] std::string type_code(const type &value) {
   switch (value.tag) {
   case NERI_IR_TYPE_VOID_V1:
@@ -188,15 +194,22 @@ class module_lowerer final {
 public:
   module_lowerer(const ir_module &input, llvm::LLVMContext &context,
                  const llvm::Triple &triple, const llvm::DataLayout &layout,
-                 bool emit_debug_information)
+                 bool emit_debug_information,
+                 const std::vector<std::pair<std::string, std::string>>
+                     &debug_sources)
       : input_(input), context_(context),
         output_(std::make_unique<llvm::Module>(input.id, context)),
-        emit_debug_information_(emit_debug_information) {
+        emit_debug_information_(emit_debug_information),
+        debug_sources_(debug_sources) {
     output_->setTargetTriple(triple);
     output_->setDataLayout(layout);
   }
 
   [[nodiscard]] std::unique_ptr<llvm::Module> lower() {
+    for (const auto &[id, path] : debug_sources_) {
+      static_cast<void>(path);
+      static_cast<void>(find_source(id));
+    }
     initialize_debug_information();
     build_class_layouts();
     emit_program_requirements();
@@ -237,11 +250,19 @@ private:
     return *found;
   }
 
-  [[nodiscard]] static std::string debug_filename(std::string_view id) {
+  [[nodiscard]] static std::pair<std::string, std::string>
+  debug_path(std::string_view id) {
     const auto separator = id.find_last_of("/\\");
-    auto name = std::string(id.substr(
-        separator == std::string_view::npos ? 0U : separator + 1U));
-    return name.empty() ? "main.hk" : name;
+    if (separator == std::string_view::npos) {
+      return {".", id.empty() ? "main.hk" : std::string(id)};
+    }
+    auto directory = std::string(id.substr(0U, separator));
+    if (directory.empty() && id.front() == '/') {
+      directory = "/";
+    }
+    auto filename = std::string(id.substr(separator + 1U));
+    return {directory.empty() ? "." : std::move(directory),
+            filename.empty() ? "main.hk" : std::move(filename)};
   }
 
   [[nodiscard]] llvm::DIFile *debug_file(std::string_view source_id) {
@@ -252,7 +273,15 @@ private:
     const auto &source = find_source(source_id);
     const auto text = std::string(
         reinterpret_cast<const char *>(source.utf8.data()), source.utf8.size());
-    auto *file = debug_builder_->createFile(debug_filename(source_id), ".",
+    const auto mapped = std::ranges::find_if(
+        debug_sources_, [source_id](const auto &item) {
+          return item.first == source_id;
+        });
+    const auto [directory, filename] = mapped == debug_sources_.end()
+                                           ? std::pair{std::string("."),
+                                                       std::string(source_id)}
+                                           : debug_path(mapped->second);
+    auto *file = debug_builder_->createFile(filename, directory,
                                             std::nullopt, text);
     debug_files_.emplace(source.id, file);
     return file;
@@ -294,6 +323,10 @@ private:
     if (const auto found = debug_types_.find(key); found != debug_types_.end()) {
       return found->second;
     }
+    if (debug_types_in_progress_.contains(key)) {
+      return debug_builder_->createUnspecifiedType(key);
+    }
+    debug_types_in_progress_.insert(key);
     llvm::DIType *result = nullptr;
     switch (value.tag) {
     case NERI_IR_TYPE_BOOL_V1:
@@ -317,6 +350,86 @@ private:
           debug_type(value.arguments.front()), 64U, 64U, std::nullopt,
           "Pointer");
       break;
+    case NERI_IR_TYPE_FIXED_ARRAY_V1: {
+      auto *subrange =
+          debug_builder_->getOrCreateSubrange(0, value.element_count);
+      result = debug_builder_->createArrayType(
+          storage_size(value) * 8U,
+          static_cast<std::uint32_t>(storage_alignment(value) * 8U),
+          debug_type(value.arguments.front()),
+          debug_builder_->getOrCreateArray({subrange}));
+      break;
+    }
+    case NERI_IR_TYPE_NATIVE_RECORD_V1: {
+      const auto &record = native_layouts(input_).declaration(value);
+      const auto layout = native_layouts(input_).layout(value);
+      auto *file = debug_file(input_.sources.front().id);
+      llvm::DICompositeType *composite =
+          record.is_union
+              ? debug_builder_->createUnionType(
+                    file, record.id.semantic_name, file, 0U,
+                    layout.size * 8U,
+                    static_cast<std::uint32_t>(layout.alignment * 8U),
+                    llvm::DINode::FlagZero,
+                    debug_builder_->getOrCreateArray({}))
+              : debug_builder_->createStructType(
+                    file, record.id.semantic_name, file, 0U,
+                    layout.size * 8U,
+                    static_cast<std::uint32_t>(layout.alignment * 8U),
+                    llvm::DINode::FlagZero, nullptr,
+                    debug_builder_->getOrCreateArray({}));
+      debug_types_.emplace(key, composite);
+      std::vector<llvm::Metadata *> members;
+      for (std::size_t index = 0; index < record.fields.size(); ++index) {
+        const auto &field = record.fields[index];
+        auto *member_file = file;
+        unsigned line = 0U;
+        if (field.location.has_value()) {
+          member_file = debug_file(field.location->source);
+          line = source_coordinates(*field.location).first;
+        }
+        members.push_back(debug_builder_->createMemberType(
+            composite, unqualified_name(field.id.semantic_name), member_file, line,
+            storage_size(field.value_type) * 8U,
+            static_cast<std::uint32_t>(storage_alignment(field.value_type) * 8U),
+            layout.offsets[index] * 8U, llvm::DINode::FlagZero,
+            debug_type(field.value_type)));
+      }
+      debug_builder_->replaceArrays(
+          composite, debug_builder_->getOrCreateArray(members));
+      result = composite;
+      break;
+    }
+    case NERI_IR_TYPE_OPTIONAL_V1:
+      if (uses_null_representation(value)) {
+        result = debug_type(value.arguments.front());
+        break;
+      }
+      {
+        auto *storage = llvm::cast<llvm::StructType>(semantic_type(value));
+        const auto *layout = output_->getDataLayout().getStructLayout(storage);
+        auto *file = debug_file(input_.sources.front().id);
+        std::vector<llvm::Metadata *> members;
+        members.push_back(debug_builder_->createMemberType(
+            file, "is_some", file, 0U, 8U, 8U, 0U,
+            llvm::DINode::FlagZero,
+            debug_builder_->createBasicType("Bool", 8U,
+                                             llvm::dwarf::DW_ATE_boolean)));
+        members.push_back(debug_builder_->createMemberType(
+            file, "value", file, 0U,
+            storage_size(value.arguments.front()) * 8U,
+            static_cast<std::uint32_t>(
+                storage_alignment(value.arguments.front()) * 8U),
+            layout->getElementOffset(storage->getNumElements() - 1U) * 8U,
+            llvm::DINode::FlagZero,
+            debug_type(value.arguments.front())));
+        result = debug_builder_->createStructType(
+            file, "Optional", file, 0U, storage_size(value) * 8U,
+            static_cast<std::uint32_t>(storage_alignment(value) * 8U),
+            llvm::DINode::FlagZero, nullptr,
+            debug_builder_->getOrCreateArray(members));
+      }
+      break;
     case NERI_IR_TYPE_INT32_V1:
     case NERI_IR_TYPE_UINT32_V1:
     case NERI_IR_TYPE_UINT64_V1:
@@ -325,16 +438,77 @@ private:
           floating_scalar(value.tag) ? llvm::dwarf::DW_ATE_float :
           unsigned_scalar(value.tag) ? llvm::dwarf::DW_ATE_unsigned : llvm::dwarf::DW_ATE_signed);
       break;
-    case NERI_IR_TYPE_STRING_V1:
-    case NERI_IR_TYPE_ARRAY_V1:
-    case NERI_IR_TYPE_CLASS_V1:
+    case NERI_IR_TYPE_STRING_V1: {
+      auto *file = debug_file(input_.sources.front().id);
+      std::vector<llvm::Metadata *> members;
+      members.push_back(debug_builder_->createMemberType(
+          file, "byte_length", file, 0U, 64U, 64U, 128U,
+          llvm::DINode::FlagZero,
+          debug_builder_->createBasicType("UInt64", 64U,
+                                           llvm::dwarf::DW_ATE_unsigned)));
       result = debug_builder_->createPointerType(
-          debug_builder_->createUnspecifiedType(key), 64U, 64U);
+          debug_builder_->createStructType(
+              file, "String", file, 0U, sizeof(neri_string_prefix_v1) * 8U,
+              alignof(neri_string_prefix_v1) * 8U, llvm::DINode::FlagZero,
+              nullptr, debug_builder_->getOrCreateArray(members)),
+          64U, 64U);
       break;
+    }
+    case NERI_IR_TYPE_ARRAY_V1: {
+      auto *file = debug_file(input_.sources.front().id);
+      std::vector<llvm::Metadata *> members;
+      members.push_back(debug_builder_->createMemberType(
+          file, "length", file, 0U, 64U, 64U, 128U,
+          llvm::DINode::FlagZero,
+          debug_builder_->createBasicType("UInt64", 64U,
+                                           llvm::dwarf::DW_ATE_unsigned)));
+      result = debug_builder_->createPointerType(
+          debug_builder_->createStructType(
+              file, "Array<" + type_code(value.arguments.front()) + ">",
+              file, 0U, sizeof(neri_array_prefix_v1) * 8U,
+              alignof(neri_array_prefix_v1) * 8U, llvm::DINode::FlagZero,
+              nullptr, debug_builder_->getOrCreateArray(members)),
+          64U, 64U);
+      break;
+    }
+    case NERI_IR_TYPE_CLASS_V1: {
+      const auto &class_layout = layout_for_class(*value.symbol);
+      auto *file = debug_file(input_.sources.front().id);
+      auto *composite = debug_builder_->createStructType(
+          file, value.symbol->semantic_name, file, 0U,
+          (sizeof(neri_object_header_v1) + class_layout.payload_size) * 8U,
+          static_cast<std::uint32_t>(
+              std::max<std::uint64_t>(alignof(neri_object_header_v1),
+                                      class_layout.payload_alignment) * 8U),
+          llvm::DINode::FlagZero, nullptr,
+          debug_builder_->getOrCreateArray({}));
+      result = debug_builder_->createPointerType(composite, 64U, 64U);
+      debug_types_.emplace(key, result);
+      std::vector<llvm::Metadata *> members;
+      for (const auto &item : class_layout.fields) {
+        auto *member_file = file;
+        unsigned line = 0U;
+        if (item.value->location.has_value()) {
+          member_file = debug_file(item.value->location->source);
+          line = source_coordinates(*item.value->location).first;
+        }
+        members.push_back(debug_builder_->createMemberType(
+            composite, unqualified_name(item.value->id.semantic_name), member_file, line,
+            storage_size(item.value->value_type) * 8U,
+            static_cast<std::uint32_t>(
+                storage_alignment(item.value->value_type) * 8U),
+            item.offset * 8U, llvm::DINode::FlagZero,
+            debug_type(item.value->value_type)));
+      }
+      debug_builder_->replaceArrays(
+          composite, debug_builder_->getOrCreateArray(members));
+      break;
+    }
     default:
       result = debug_builder_->createUnspecifiedType(key);
       break;
     }
+    debug_types_in_progress_.erase(key);
     debug_types_.emplace(key, result);
     return result;
   }
@@ -375,11 +549,13 @@ private:
         builder_.SetInsertPoint(blocks_.at(block.id));
         for (const auto &instruction : block.instructions) {
           builder_.SetCurrentDebugLocation(
-              module_.debug_location(instruction.location, subprogram_));
+              module_.debug_location(instruction.location,
+                                     debug_scope(instruction.debug_scope_id)));
           lower_instruction(instruction);
         }
         builder_.SetCurrentDebugLocation(
-            module_.debug_location(block.ending.location, subprogram_));
+            module_.debug_location(block.ending.location,
+                                   debug_scope(block.ending.debug_scope_id)));
         lower_terminator(block.ending);
       }
     }
@@ -498,6 +674,17 @@ private:
 
     void create_blocks_and_parameters() {
       subprogram_ = module_.debug_subprogram(input_, output_);
+      for (const auto &scope : input_.debug_scopes) {
+        if (subprogram_ == nullptr) break;
+        auto *parent = scope.parent_id == 0U
+                           ? static_cast<llvm::DIScope *>(subprogram_)
+                           : debug_scopes_.at(scope.parent_id);
+        const auto [line, column] = module_.source_coordinates(scope.location);
+        debug_scopes_.emplace(
+            scope.id, module_.debug_builder_->createLexicalBlock(
+                          parent, module_.debug_file(scope.location.source),
+                          line, column));
+      }
       for (const auto &block : input_.blocks) {
         blocks_.emplace(block.id,
                         llvm::BasicBlock::Create(module_.context_,
@@ -553,6 +740,7 @@ private:
         }
         for (const auto &[id, phi] : block_phis) {
           root_value(id, phi);
+          emit_debug_local(id, phi);
         }
       }
     }
@@ -567,16 +755,55 @@ private:
           continue;
         }
         const auto coordinates = module_.source_coordinates(local.location);
-        auto *variable = module_.debug_builder_->createAutoVariable(
-            subprogram_, local.name, module_.debug_file(local.location.source),
-            coordinates.first,
-            module_.debug_type(module_.value_type(input_, local.value)), true);
+        const auto key = std::tuple(local.name, local.scope_id,
+                                    local.location.source,
+                                    local.location.utf8_start,
+                                    local.location.utf8_length);
+        auto [found, inserted] = debug_variables_.try_emplace(key, nullptr);
+        if (inserted) {
+          auto *scope = local.scope_id == 0U
+                            ? static_cast<llvm::DIScope *>(subprogram_)
+                            : debug_scopes_.at(local.scope_id);
+          const auto parameter = parameter_index(local.value);
+          if (parameter.has_value() && local.scope_id == 0U) {
+            found->second = module_.debug_builder_->createParameterVariable(
+                scope, local.name, *parameter,
+                module_.debug_file(local.location.source), coordinates.first,
+                module_.debug_type(module_.value_type(input_, local.value)),
+                true);
+          } else {
+            found->second = module_.debug_builder_->createAutoVariable(
+                scope, local.name, module_.debug_file(local.location.source),
+                coordinates.first,
+                module_.debug_type(module_.value_type(input_, local.value)),
+                true);
+          }
+        }
         module_.debug_builder_->insertDbgValueIntrinsic(
-            value, variable, module_.debug_builder_->createExpression(),
+            value, found->second, module_.debug_builder_->createExpression(),
             llvm::DILocation::get(module_.context_, coordinates.first,
-                                  coordinates.second, subprogram_),
+                                  coordinates.second,
+                                  local.scope_id == 0U
+                                      ? static_cast<llvm::DIScope *>(subprogram_)
+                                      : debug_scopes_.at(local.scope_id)),
             builder_.GetInsertBlock());
       }
+    }
+
+    [[nodiscard]] llvm::DIScope *debug_scope(std::uint32_t id) const {
+      if (id == 0U || subprogram_ == nullptr) return subprogram_;
+      return debug_scopes_.at(id);
+    }
+
+    [[nodiscard]] std::optional<unsigned>
+    parameter_index(std::uint32_t id) const {
+      const auto &parameters = input_.blocks.front().parameters;
+      for (std::size_t index = 0; index < parameters.size(); ++index) {
+        if (parameters[index].id == id) {
+          return static_cast<unsigned>(index + 1U);
+        }
+      }
+      return std::nullopt;
     }
 
     void emit_guard(llvm::Value *condition, std::uint32_t code,
@@ -1540,6 +1767,11 @@ private:
     std::map<std::uint32_t, llvm::Value *> values_;
     std::map<std::uint32_t, llvm::PHINode *> phis_;
     std::map<std::uint32_t, llvm::Value *> root_slots_;
+    std::map<std::tuple<std::string, std::uint32_t, std::string, std::uint32_t,
+                        std::uint32_t>,
+             llvm::DILocalVariable *>
+        debug_variables_;
+    std::map<std::uint32_t, llvm::DIScope *> debug_scopes_;
   };
 
   struct lowered_field final {
@@ -2940,9 +3172,11 @@ private:
   llvm::LLVMContext &context_;
   std::unique_ptr<llvm::Module> output_;
   bool emit_debug_information_{};
+  const std::vector<std::pair<std::string, std::string>> &debug_sources_;
   std::unique_ptr<llvm::DIBuilder> debug_builder_;
   std::map<std::string, llvm::DIFile *> debug_files_;
   std::map<std::string, llvm::DIType *> debug_types_;
+  std::set<std::string> debug_types_in_progress_;
   std::map<decltype(symbol_key(symbol_id{})), llvm::GlobalVariable *> globals_;
   std::map<decltype(symbol_key(symbol_id{})), llvm::Function *> imports_;
   std::map<decltype(symbol_key(symbol_id{})), llvm::Function *> functions_;
@@ -2972,9 +3206,11 @@ private:
 std::unique_ptr<llvm::Module>
 lower_to_llvm(const verified_module &input, llvm::LLVMContext &context,
               const llvm::Triple &triple, const llvm::DataLayout &layout,
-              bool emit_debug_information) {
+              bool emit_debug_information,
+              const std::vector<std::pair<std::string, std::string>>
+                  &debug_sources) {
   return module_lowerer(input.value(), context, triple, layout,
-                        emit_debug_information)
+                        emit_debug_information, debug_sources)
       .lower();
 }
 
