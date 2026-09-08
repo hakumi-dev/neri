@@ -55,11 +55,16 @@ neri_blank_line_after_declarations = true
 neri_blank_line_before_assertions = true
 neri_diagnostic.NRSTYLE001.severity = warning
 neri_diagnostic.NRSTYLE002.severity = warning
-neri_assertion_helpers = test.assert*, assert
+neri_assertion_helpers = test/assert*, assert
 ```
 
 Severity values are `none`, `suggestion`, `warning` and `error`. Assertion helper
-names are case-sensitive qualified names; a final `*` matches a name prefix.
+names are case-sensitive. Use `/` between name components in configuration:
+`test/assert*` matches calls whose qualified name starts with `test.assert`.
+A final `*` matches a name prefix. Each matching section replaces the whole
+helper list; `unset` restores the defaults (`test/assert*`, `assert`).
+Neri also accepts dot-qualified values. Slash qualification keeps each helper
+as one value identifier in Rider's EditorConfig parser.
 Severity `none` suppresses reporting while keeping the formatting preference.
 Set a rule's boolean option to `false` to disable its analysis and correction.
 
@@ -107,6 +112,10 @@ rule requests, multiline expressions, comments and UTF-16 editor coordinates.
   Neri retains its original source alongside the compiler's syntax and tokens.
 - [EditorConfig specification](https://spec.editorconfig.org/)
   defines configuration discovery, matching and precedence.
+- [JetBrains EditorConfig grammar](https://github.com/JetBrains/intellij-community/blob/f1f6e824dca999f1543601821ebd12537fd483c2/plugins/editorconfig/common/EditorConfig.bnf#L150)
+  defines the value identifiers accepted by Rider. Slash qualification is a
+  Neri convention compatible with that grammar; EditorConfig itself leaves
+  custom property values to their consumers.
 - [LSP formatting contract](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#textDocument_formatting)
   defines the editor request and returned text edits;
   [code actions](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#textDocument_codeAction)
