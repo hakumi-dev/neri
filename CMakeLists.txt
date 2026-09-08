@@ -85,6 +85,7 @@ if(APPLE)
 endif()
 
 llvm_map_components_to_libnames(NERI_LLVM_LIBRARIES Core Passes Support Target AArch64 X86)
+llvm_map_components_to_libnames(NERI_SESSION_LINKER_LIBRARIES OrcJIT JITLink Object Support)
 option(NERI_SANITIZERS "Instrument native components with address and undefined-behavior sanitizers" OFF)
 option(NERI_THREAD_SANITIZER "Instrument runtime heap concurrency with ThreadSanitizer" OFF)
 if(NERI_SANITIZERS AND NERI_THREAD_SANITIZER)
@@ -122,6 +123,14 @@ add_executable(neri_codegen_cli native/codegen/main.cpp)
 set_target_properties(neri_codegen_cli PROPERTIES OUTPUT_NAME neri-codegen)
 target_compile_definitions(neri_codegen_cli PRIVATE NERI_TOOLCHAIN_VERSION="${NERI_VERSION}")
 target_link_libraries(neri_codegen_cli PRIVATE neri_build_options neri_codegen ${NERI_LLVM_LIBRARIES})
+
+if(APPLE)
+  add_library(neri_session_object_linker SHARED native/session/object_linker.cpp)
+  set_target_properties(neri_session_object_linker PROPERTIES OUTPUT_NAME "neri-session-object-linker")
+  target_include_directories(neri_session_object_linker PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/native/include")
+  target_include_directories(neri_session_object_linker SYSTEM PRIVATE ${LLVM_INCLUDE_DIRS})
+  target_link_libraries(neri_session_object_linker PRIVATE neri_build_options ${NERI_SESSION_LINKER_LIBRARIES})
+endif()
 
 find_package(Threads REQUIRED)
 if(WIN32)
@@ -251,7 +260,10 @@ set(NERI_MANIFEST_VERSION "${NERI_VERSION}")
 set(NERI_MANIFEST_NAME "neri-runtime-${NERI_TARGET}.json")
   file(GENERATE
     OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/${NERI_MANIFEST_NAME}"
-    CONTENT "{\n  \"schemaVersion\": 2,\n  \"toolchainVersion\": \"${NERI_MANIFEST_VERSION}\",\n  \"irTransportMajor\": 1,\n  \"irTransportMinor\": 6,\n  \"target\": \"${NERI_TARGET}\",\n  \"abiMajor\": 1,\n  \"abiMinor\": 22,\n  \"features\": 536869631,\n  \"artifact\": \"$<TARGET_FILE_NAME:neri_runtime>\"\n}\n"
+    CONTENT "{\n  \"schemaVersion\": 2,\n  \"toolchainVersion\": \"${NERI_MANIFEST_VERSION}\",\n  \"irTransportMajor\": 1,\n  \"irTransportMinor\": 7,\n  \"target\": \"${NERI_TARGET}\",\n  \"abiMajor\": 1,\n  \"abiMinor\": 24,\n  \"features\": 536869631,\n  \"artifact\": \"$<TARGET_FILE_NAME:neri_runtime>\"\n}\n"
   )
 install(TARGETS neri_codegen_cli neri_runtime RUNTIME DESTINATION bin ARCHIVE DESTINATION lib)
+if(APPLE)
+  install(TARGETS neri_session_object_linker LIBRARY DESTINATION lib)
+endif()
 install(FILES "${CMAKE_CURRENT_BINARY_DIR}/neri-runtime-${NERI_TARGET}.json" DESTINATION lib)

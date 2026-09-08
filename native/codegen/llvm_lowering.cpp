@@ -199,6 +199,8 @@ public:
                      &debug_sources)
       : input_(input), context_(context),
         output_(std::make_unique<llvm::Module>(input.id, context)),
+        retained_modules_(std::ranges::find(input.required_features,
+                              "retained-modules-v1") != input.required_features.end()),
         emit_debug_information_(emit_debug_information),
         debug_sources_(debug_sources) {
     output_->setTargetTriple(triple);
@@ -2416,7 +2418,11 @@ private:
           type{NERI_IR_TYPE_CLASS_V1, declaration.id, {}});
       auto *descriptor = new llvm::GlobalVariable(
           *output_, type_descriptor_type(), true,
-          llvm::GlobalValue::PrivateLinkage, nullptr, ".hk.type." + key);
+          declaration.retained ? llvm::GlobalValue::ExternalLinkage
+                               : (retained_modules_
+                                      ? llvm::GlobalValue::ExternalLinkage
+                                      : llvm::GlobalValue::PrivateLinkage),
+          nullptr, retained_modules_ ? "hk1_t_" + key : ".hk.type." + key);
       descriptor->setAlignment(llvm::Align(8));
       class_descriptors_.emplace(symbol_key(declaration.id), descriptor);
       type_descriptors_.emplace(key, descriptor);
@@ -2425,6 +2431,7 @@ private:
     auto *pointer = llvm::PointerType::getUnqual(context_);
     auto *null_pointer = llvm::ConstantPointerNull::get(pointer);
     for (const auto &declaration : input_.classes) {
+      if (declaration.retained) continue;
       const auto &layout = layout_for_class(declaration.id);
       const auto key = type_code(
           type{NERI_IR_TYPE_CLASS_V1, declaration.id, {}});
@@ -2545,10 +2552,18 @@ private:
   void emit_session_exports() {
     if (!input_.session.has_value()) return;
     const auto &session = *input_.session;
+    std::string artifact_suffix;
+    append_hex(artifact_suffix, session.artifact_identity);
+    const auto entry_link_name = session.artifact_identity.empty()
+                                     ? std::string("neri_session_entry_v1")
+                                     : "neri_session_entry_v2_" + artifact_suffix;
+    const auto accessor_link_name = session.artifact_identity.empty()
+                                        ? std::string("neri_session_module_v1")
+                                        : "neri_session_module_v2_" + artifact_suffix;
     auto *pointer = llvm::PointerType::getUnqual(context_);
     auto *trampoline = llvm::Function::Create(
         llvm::FunctionType::get(pointer, {pointer}, false),
-        llvm::GlobalValue::ExternalLinkage, "neri_session_entry_v1", output_.get());
+        llvm::GlobalValue::ExternalLinkage, entry_link_name, output_.get());
     trampoline->setCallingConv(llvm::CallingConv::C);
     trampoline->addFnAttr(llvm::Attribute::NoUnwind);
     auto *block = llvm::BasicBlock::Create(context_, "entry", trampoline);
@@ -2598,26 +2613,46 @@ private:
         llvm::GlobalValue::PrivateLinkage, llvm::ConstantArray::get(array_type, values),
         ".hk.session.layouts");
     layouts->setAlignment(llvm::Align(8));
+    std::uint64_t display_offset = UINT64_MAX;
+    const auto &target_layout = layout_for_class(*session.target_type.symbol);
+    for (const auto &field : target_layout.fields) {
+      if (field.value->id.semantic_name.ends_with(".__neri_session_display") &&
+          field.value->value_type.tag == NERI_IR_TYPE_STRING_V1) {
+        display_offset = field.offset;
+        break;
+      }
+    }
     const auto source_id = session.source_type.tag == NERI_IR_TYPE_VOID_V1
         ? std::string("neri:type:v1:void")
         : session_type_id(session.source_type);
     const auto target_id = session_type_id(session.target_type);
-    auto *entry_name = session_text("neri_session_entry_v1", "entry");
+    auto *entry_name = session_text(entry_link_name, "entry");
     auto *source_name = session_text(source_id, "source");
     auto *target_name = session_text(target_id, "target");
     auto *i16 = llvm::Type::getInt16Ty(context_);
-    auto *metadata_type = llvm::StructType::get(context_,
-        {i32, i16, i16, pointer, pointer, pointer, pointer, pointer, i64});
+    std::vector<llvm::Type *> metadata_fields{
+        i32, i16, i16, pointer, pointer, pointer, pointer, pointer, i64};
+    if (!session.artifact_identity.empty()) metadata_fields.push_back(i64);
+    auto *metadata_type = llvm::StructType::get(context_, metadata_fields);
+    std::vector<llvm::Constant *> metadata_values{
+        llvm::ConstantInt::get(
+            i32, session.artifact_identity.empty()
+                     ? offsetof(neri_session_module_metadata_v1, display_offset)
+                     : sizeof(neri_session_module_metadata_v1)),
+        llvm::ConstantInt::get(i16, 1),
+        llvm::ConstantInt::get(i16,
+                               session.artifact_identity.empty() ? 0 : 1),
+        entry_name, trampoline, source_name, target_name, layouts,
+        llvm::ConstantInt::get(i64, values.size())};
+    if (!session.artifact_identity.empty())
+      metadata_values.push_back(llvm::ConstantInt::get(i64, display_offset));
     auto *metadata = new llvm::GlobalVariable(*output_, metadata_type, true,
         llvm::GlobalValue::PrivateLinkage,
-        llvm::ConstantStruct::get(metadata_type,
-            {llvm::ConstantInt::get(i32, sizeof(neri_session_module_metadata_v1)),
-             llvm::ConstantInt::get(i16, 1), llvm::ConstantInt::get(i16, 0),
-             entry_name, trampoline, source_name, target_name, layouts,
-             llvm::ConstantInt::get(i64, values.size())}), ".hk.session.metadata");
+        llvm::ConstantStruct::get(metadata_type, metadata_values),
+        ".hk.session.metadata");
     metadata->setAlignment(llvm::Align(8));
     auto *accessor = llvm::Function::Create(llvm::FunctionType::get(pointer, {}, false),
-        llvm::GlobalValue::ExternalLinkage, "neri_session_module_v1", output_.get());
+        llvm::GlobalValue::ExternalLinkage, accessor_link_name, output_.get());
     accessor->setCallingConv(llvm::CallingConv::C);
     accessor->addFnAttr(llvm::Attribute::NoUnwind);
     auto *accessor_block = llvm::BasicBlock::Create(context_, "entry", accessor);
@@ -2859,8 +2894,10 @@ private:
       auto *declaration = llvm::Function::Create(
           physical_function_type(function.parameter_types,
                                  function.result_type),
-          input_.session.has_value() ? llvm::GlobalValue::InternalLinkage
-                                     : llvm::GlobalValue::ExternalLinkage,
+          function.retained || retained_modules_
+              ? llvm::GlobalValue::ExternalLinkage
+              : (input_.session.has_value() ? llvm::GlobalValue::InternalLinkage
+                                            : llvm::GlobalValue::ExternalLinkage),
           mangle_function(function),
           output_.get());
       declaration->setCallingConv(llvm::CallingConv::C);
@@ -2874,6 +2911,7 @@ private:
 
   void lower_functions() {
     for (const auto &function : input_.functions) {
+      if (function.retained) continue;
       function_lowerer(*this, function, *functions_.at(symbol_key(function.id)))
           .lower();
     }
@@ -3171,6 +3209,7 @@ private:
   const ir_module &input_;
   llvm::LLVMContext &context_;
   std::unique_ptr<llvm::Module> output_;
+  bool retained_modules_{};
   bool emit_debug_information_{};
   const std::vector<std::pair<std::string, std::string>> &debug_sources_;
   std::unique_ptr<llvm::DIBuilder> debug_builder_;

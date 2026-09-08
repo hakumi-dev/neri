@@ -64,6 +64,7 @@ struct class_declaration final {
   symbol_id id;
   std::optional<symbol_id> base;
   std::uint8_t access{};
+  bool retained{};
   std::vector<field> fields;
   std::vector<method> methods;
   std::optional<source_location> location;
@@ -168,6 +169,7 @@ struct function final {
   std::uint8_t kind{};
   std::uint32_t effects{};
   bool unsafe_call{};
+  bool retained{};
   std::uint32_t entry_block{};
   std::optional<value_definition> unsafe_root;
   std::optional<symbol_id> declaring_class;
@@ -182,6 +184,7 @@ struct session_export final {
   symbol_id entry;
   type source_type;
   type target_type;
+  std::string artifact_identity;
 };
 
 struct ir_module final {

@@ -168,6 +168,45 @@ void test_debug_scope_validation() {
   rejected(malformed);
 }
 
+void test_retained_module_lowering() {
+  using namespace neri::codegen;
+  ir_module module;
+  module.semantic_version = {1, 0};
+  module.id = "retained-contract";
+  module.required_features = {"retained-modules-v1"};
+
+  class_declaration retained_class;
+  retained_class.id = {module.id, NERI_IR_SYMBOL_CLASS_V1, "Prior"};
+  retained_class.access = NERI_IR_ACCESS_INTERNAL_V1;
+  retained_class.retained = true;
+  module.classes.push_back(retained_class);
+
+  function retained;
+  retained.id = {module.id, NERI_IR_SYMBOL_FUNCTION_V1, "prior"};
+  retained.result_type.tag = NERI_IR_TYPE_VOID_V1;
+  retained.kind = NERI_IR_FUNCTION_V1;
+  retained.retained = true;
+  function caller;
+  caller.id = {module.id, NERI_IR_SYMBOL_FUNCTION_V1, "current"};
+  caller.result_type.tag = NERI_IR_TYPE_VOID_V1;
+  caller.kind = NERI_IR_FUNCTION_V1;
+  block body;
+  body.ending.tag = NERI_IR_TERMINATOR_RETURN_V1;
+  caller.blocks.push_back(body);
+  module.functions.push_back(caller);
+  module.functions.push_back(retained);
+
+  verify_supported_module(module);
+  auto malformed = module;
+  malformed.functions.back().blocks.push_back(body);
+  try {
+    verify_supported_module(malformed);
+  } catch (const reader_error &) {
+    return;
+  }
+  throw std::runtime_error("retained function body escaped verification");
+}
+
 void write_u16(std::vector<std::uint8_t> &bytes, std::size_t offset,
                std::uint16_t value) {
   bytes.at(offset) = static_cast<std::uint8_t>(value);
@@ -351,6 +390,7 @@ int main(int argc, char **argv) {
     test_payload_rejections(bytes);
     test_unsafe_call_boundary();
     test_debug_scope_validation();
+    test_retained_module_lowering();
     test_primitive_codegen(read_hex(argv[2]));
     return 0;
   } catch (const std::exception &error) {

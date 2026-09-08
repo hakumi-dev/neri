@@ -23,7 +23,7 @@ extern "C" {
 #endif
 
 #define NERI_RUNTIME_ABI_MAJOR UINT16_C(1)
-#define NERI_RUNTIME_ABI_MINOR UINT16_C(22)
+#define NERI_RUNTIME_ABI_MINOR UINT16_C(24)
 
 #define NERI_RT_FEATURE_PRECISE_GC UINT64_C(1)
 #define NERI_RT_FEATURE_NONMOVING_GC (UINT64_C(1) << 1)
@@ -128,6 +128,7 @@ typedef struct neri_session_module_metadata_v1 {
   const char *target_type_id;
   const neri_session_layout_v1 *layouts;
   uint64_t layout_count;
+  uint64_t display_offset;
 } neri_session_module_metadata_v1;
 
 typedef const neri_session_module_metadata_v1 *(*neri_session_module_accessor_v1)(void);
@@ -145,9 +146,16 @@ NERI_RT_API neri_int_v1 neri_rt_v1_session_identity(void);
 NERI_RT_API neri_ref_v1 neri_rt_v1_session_owner(neri_int_v1 handle);
 NERI_RT_API neri_int_v1 neri_rt_v1_session_load_execute(
     neri_int_v1 handle, neri_ref_v1 module_path);
+NERI_RT_API neri_int_v1 neri_rt_v1_session_load_execute_retained(
+    neri_int_v1 handle, neri_ref_v1 module_path,
+    neri_ref_v1 artifact_identity);
+NERI_RT_API neri_int_v1 neri_rt_v1_session_load_execute_object(
+    neri_int_v1 handle, neri_ref_v1 object_path,
+    neri_ref_v1 artifact_identity, neri_ref_v1 linker_path);
 NERI_RT_API neri_int_v1 neri_rt_v1_session_reset(neri_int_v1 handle);
 NERI_RT_API neri_int_v1 neri_rt_v1_session_destroy(neri_int_v1 handle);
 NERI_RT_API neri_ref_v1 neri_rt_v1_session_error(neri_int_v1 handle);
+NERI_RT_API neri_ref_v1 neri_rt_v1_session_result(neri_int_v1 handle);
 
 typedef struct neri_optional_bool_v1 {
   neri_bool_v1 has_value;
@@ -356,6 +364,8 @@ NERI_RT_API neri_ref_v1 neri_rt_v1_host_path_join(
     neri_ref_v1 left, neri_ref_v1 right);
 NERI_RT_API neri_ref_v1
 neri_rt_v1_host_path_absolute(neri_ref_v1 path);
+NERI_RT_API neri_int_v1 neri_rt_v1_host_canonical_path(
+    const neri_byte_v1 *path, neri_byte_v1 *output, neri_int_v1 capacity);
 NERI_RT_API neri_ref_v1
 neri_rt_v1_host_path_file_name(neri_ref_v1 path);
 NERI_RT_API neri_int_v1 neri_rt_v1_host_argument_count(void);

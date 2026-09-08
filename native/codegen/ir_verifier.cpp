@@ -1422,7 +1422,7 @@ void verify_function(const ir_module &module, const function &value) {
       value.kind > NERI_IR_DEFAULT_ADAPTER_V1) {
     fail(malformed_module, "Function has an invalid function kind.");
   }
-  if (value.unsafe_call != value.unsafe_root.has_value()) {
+  if (!value.retained && value.unsafe_call != value.unsafe_root.has_value()) {
     fail(invalid_safety,
          "Unsafe function call contract disagrees with its capability root.");
   }
@@ -1457,6 +1457,15 @@ void verify_function(const ir_module &module, const function &value) {
   require_result_type(value.result_type, "Function result");
   if (!is_void(value.result_type)) {
     require_declared_type(module, value.result_type, "Function result");
+  }
+
+  if (value.retained) {
+    if (!value.blocks.empty() || value.unsafe_root.has_value() ||
+        !value.debug_scopes.empty() || !value.debug_locals.empty()) {
+      fail(malformed_module,
+           "Retained function declarations cannot contain a body or debug state.");
+    }
+    return;
   }
 
   function_context context{module, value};
@@ -1578,7 +1587,7 @@ void verify_supported_module(const ir_module &value) {
            "Required feature '" + feature +
                "' is not a canonical feature identifier.");
     }
-    if (feature != "string-data-v1" && feature != "native-strings-v1" && feature != "native-libraries-v1" && feature != "extended-scalars-v1" && feature != "native-records-v1" && feature != "scoped-tasks-v1" && feature != "session-module-v1" && feature != "debug-scopes-v1") {
+    if (feature != "string-data-v1" && feature != "native-strings-v1" && feature != "native-libraries-v1" && feature != "extended-scalars-v1" && feature != "native-records-v1" && feature != "scoped-tasks-v1" && feature != "session-module-v1" && feature != "debug-scopes-v1" && feature != "retained-modules-v1") {
       fail(unsupported_feature,
            "Unknown required semantic feature '" + feature + "'.");
     }
@@ -1586,6 +1595,11 @@ void verify_supported_module(const ir_module &value) {
 
   if (value.session.has_value()) {
     const auto &session = *value.session;
+    const auto retained = std::ranges::find(value.required_features,
+                              "retained-modules-v1") != value.required_features.end();
+    if (retained != !session.artifact_identity.empty())
+      fail(invalid_reference,
+           "Retained session module requires one artifact identity.");
     const auto found = std::ranges::find_if(value.functions, [&](const function &item) {
       return item.id.module == session.entry.module && item.id.kind == session.entry.kind &&
              item.id.semantic_name == session.entry.semantic_name;
