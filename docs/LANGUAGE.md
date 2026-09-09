@@ -32,6 +32,7 @@ operators and conditional expressions evaluate only the required branch.
 
 ## Console
 
+Standard-library namespaces are source declarations loaded by `use`.
 `use console` provides terminal input and output: `console.print(value)` writes
 without a newline, `console.println(value)` appends a newline, and
 `console.read()` reads a line as a string. Both output functions require a
@@ -88,13 +89,28 @@ selects the registered storage for the canonical public `String` declaration in
 `@stdlib/core.hk`. That declaration has methods and no fields, base, type
 parameters or constructor. Literal and factory construction maintain its storage
 invariants. `@intrinsic` module functions have registered exact signatures and
-empty bodies; the compiler supplies their runtime calls.
+empty bodies; the compiler supplies their runtime calls. An intrinsic identifier
+selects a closed compiler registry entry containing its native symbol, effects,
+runtime version and feature requirements. A source declaration cannot introduce
+an arbitrary native symbol through `@intrinsic`.
+
+`@exact` marks a generic or non-generic module function whose arguments must
+have exactly the instantiated parameter types. Ordinary functions continue to
+accept assignable subtype arguments. The standard-library `test.assertEqual<T>`
+uses this rule, evaluates its arguments once from left to right, and applies the
+ordinary `==` operation for `T`.
+
+This split follows the established compiler-library boundary in Rust: language
+items let source libraries provide compiler-known operations, while compiler
+intrinsics are registered implementation details normally exposed through
+library wrappers ([Rust compiler language items](https://rustc-dev-guide.rust-lang.org/lang-items.html),
+[Rust core intrinsics](https://doc.rust-lang.org/core/intrinsics/)).
 
 The dedicated immutable representation follows the public string contracts in
 [.NET String.cs](https://github.com/dotnet/runtime/blob/main/src/libraries/System.Private.CoreLib/src/System/String.cs)
 and [OpenJDK 25 String.java](https://github.com/openjdk/jdk/blob/jdk-25-ga/src/java.base/share/classes/java/lang/String.java).
 Keeping the representation behind a source-level class applies the abstraction
-boundary described by [Liskov and Zilles](https://dl.acm.org/doi/10.1145/360168.360175).
+boundary described by [Liskov and Zilles, Programming with Abstract Data Types (1974)](https://gleitzman.com/media/docs/adt-liskov.pdf).
 
 `let` and parameters are immutable bindings; `var` permits reassignment. Binding
 immutability does not freeze the fields of an object. An explicit annotation
@@ -445,8 +461,8 @@ task lifetime or authorize concurrent native-service access.
 call effects. Managed allocation, local mutation, checked arithmetic and calls
 to other verified functions are permitted. I/O, host services, C ABI calls,
 native allocation and `unsafe` operations are rejected, including through
-transitive calls. Callback invocations require a `parallel fn` type. The `math`
-builtins and `test` assertions satisfy the runtime-call contract.
+transitive calls. Callback invocations require a `parallel fn` type. Verified
+`math` declarations and `test` assertions satisfy the runtime-call contract.
 
 ```neri
 def apply(value: Int, callback: parallel fn(Int): Int): Int
@@ -468,6 +484,11 @@ exclusive ownership of explicit mutable arguments.
 `use tasks` provides `tasks.generate(count, callback)` and
 `tasks.generate(count, parallelism, callback)`. The callback has type
 `parallel fn(Int): R`; the result is a new `R[]` in index order.
+The generic source declaration carries `@operation("tasks.generate")`; this
+closed operation identifier selects task-generation binding while source
+navigation and completion use the declaration's namespace and function name.
+Its required shape is `(Int, Int = 0, parallel fn(Int): R): R[]` with an empty,
+safe body.
 
 ```neri
 use tasks
