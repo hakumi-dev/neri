@@ -81,6 +81,11 @@ source larger than 1 MiB returns `limit`.
 values. Each item has `name`, `insertText`, `category`, `detail`, and the
 UTF-8-byte replacement range `replacementStart` and `replacementEnd`. The
 range is half-open: replace bytes in `[replacementStart, replacementEnd)`.
+`cursorByteOffset` positions the cursor within the inserted UTF-8 text: the new
+source offset is `replacementStart + cursorByteOffset`. Functions and methods
+insert `()` in call contexts; the cursor goes inside when there are parameters
+and after the closing parenthesis otherwise. Existing call or generic suffixes
+are preserved. Variables, types, and functions expected as values insert names.
 Categories are `method`, `function`, `field`, `variable`, `type`, `namespace`,
 `keyword`, or `symbol`. The result contains at most 128 items. `truncated`
 reports that matching candidates were left out at that bound. `disposed` and
