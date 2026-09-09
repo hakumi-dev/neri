@@ -1,0 +1,469 @@
+class SemanticCompletionTarget
+  public valid: Bool = false
+  public start: Int = 0
+  public length: Int = 0
+  public prefix: String = ""
+  public kind: String = "name"
+  public receiverType: String = ""
+  public addCall: Bool = true
+end
+
+def semanticBuiltinLibraries(): String[]
+  return ["host", "math", "test", "console", "tasks", "Array"]
+end
+
+class SemanticCompletionCandidate
+  public name: String = ""
+  public insertText: String = ""
+  public kind: Int = 0
+  public detail: String = ""
+  public identity: String = ""
+  public next: SemanticCompletionCandidate?
+end
+
+class SemanticCompletionList
+  public first: SemanticCompletionCandidate?
+  public last: SemanticCompletionCandidate?
+  public count: Int = 0
+  public limit: Int = 128
+  public truncated: Bool = false
+
+  def init(limit: Int = 128): Void
+    if limit > 0 && limit < 128
+      this.limit = limit
+    end
+  end
+end
+
+def semanticCompletionUtf16Slice(text: String, start: Int, length: Int): String
+  let map = new IrSourceMap(text)
+  let first = map.offsetAt(start)
+  let last = map.offsetAt(start + length)
+  return host.stringSlice(text, first, last - first)
+end
+
+def semanticCompletionTarget(text: String, position: Int): SemanticCompletionTarget
+  let result = new SemanticCompletionTarget()
+  let tokens = (new BootstrapLexer(text)).lex()
+  var tokenIndex = -1
+  var index = 0
+
+  while index + 1 < tokens.count()
+    let start = tokens.startAt(index)
+    let finish = start + tokens.lengthAt(index)
+
+    if tokens.kindAt(index) == "Identifier" && start <= position && position <= finish
+      tokenIndex = index
+      break
+    end
+    if start < position && position < finish
+      return result
+    end
+    index = index + 1
+  end
+  var previous = -1
+  var following = -1
+
+  if tokenIndex >= 0
+    result.start = tokens.startAt(tokenIndex)
+    result.length = tokens.lengthAt(tokenIndex)
+    result.prefix = semanticCompletionUtf16Slice(text, result.start, position - result.start)
+    previous = tokenIndex - 1
+    following = tokenIndex + 1
+  else
+    result.start = position
+    index = 0
+    while index + 1 < tokens.count()
+      if tokens.startAt(index) + tokens.lengthAt(index) <= position
+        previous = index
+      else if tokens.startAt(index) >= position
+        following = index
+        break
+      end
+      index = index + 1
+    end
+  end
+  if previous >= 0 && tokens.kindAt(previous) == "Dot"
+    result.kind = "member"
+  else if previous >= 0 && tokens.kindAt(previous) == "New"
+    result.kind = "type"
+    result.addCall = false
+  end
+  var importIndex = previous
+  var importPrefix = ""
+
+  while importIndex >= 1 && tokens.kindAt(importIndex) == "Dot" && tokens.kindAt(importIndex - 1) == "Identifier"
+    let part = tokens.textAt(importIndex - 1)
+
+    importPrefix = importPrefix == "" ? part : part + "." + importPrefix
+    importIndex = importIndex - 2
+  end
+  if importIndex >= 0 && tokens.kindAt(importIndex) == "Use"
+    result.kind = "import"
+    result.receiverType = importPrefix
+  end
+  result.addCall = false if result.kind == "import"
+  result.addCall = false if following >= 0 && tokens.kindAt(following) == "LParen"
+  result.valid = true
+  return result
+end
+
+def semanticCompletionSite(model: SemanticModel, target: SemanticCompletionTarget): SemanticCompletionSite?
+  var selected: SemanticCompletionSite? = null
+  var ambiguous = false
+  var site = model.completionSites
+
+  while site != null
+    let kindMatches = target.kind == "member" ? site.receiverKind != "" && site.receiverKind != "type" : site.receiverKind == target.kind || (target.kind == "name" && site.receiverKind == "")
+
+    if kindMatches && site.start == target.start
+      if selected == null
+        selected = site
+      else
+        let selectedCallable = selected.callable
+        let siteCallable = site.callable
+        let callableDiffers = (selectedCallable == null && siteCallable != null) || (selectedCallable != null && siteCallable == null) || (selectedCallable != null && siteCallable != null && selectedCallable.fullName != siteCallable.fullName)
+
+        if callableDiffers || selected.receiverKind != site.receiverKind || selected.receiverType != site.receiverType || selected.namespaceName != site.namespaceName || selected.className != site.className
+          ambiguous = true
+        end
+      end
+    end
+    site = site.next
+  end
+  if ambiguous
+    return null
+  end
+  return selected
+end
+
+def semanticCompletionHas(values: SemanticCompletionList, name: String): Bool
+  var value = values.first
+
+  while value != null
+    if value.name == name
+      return true
+    end
+    value = value.next
+  end
+  return false
+end
+
+def semanticCompletionAdd(values: SemanticCompletionList, prefix: String, name: String, insertText: String, kind: Int, detail: String, identity: String = ""): Void
+  if name == "" || bootstrapStartsWith(name, "__neri_") || bootstrapStartsWith(name, "__NeriSession") || !bootstrapStartsWith(name, prefix) || semanticCompletionHas(values, name)
+    return
+  end
+  if values.count >= values.limit
+    values.truncated = true
+    return
+  end
+  let candidate = new SemanticCompletionCandidate()
+
+  candidate.name = name
+  candidate.insertText = insertText
+  candidate.kind = kind
+  candidate.detail = detail
+  candidate.identity = identity
+  if values.first == null
+    values.first = candidate
+  else
+    let last = values.last
+
+    if last != null
+      last.next = candidate
+    end
+  end
+  values.last = candidate
+  values.count = values.count + 1
+end
+
+def semanticCompletionCallableDetail(callable: SemanticCallable): String
+  var result = callable.fullName + "("
+  var parameter = callable.firstParameter
+  var separator = ""
+
+  while parameter != null
+    result = result + separator + parameter.name + ": " + parameter.typeName
+    separator = ", "
+    parameter = parameter.nextParameter
+  end
+  return result + "): " + callable.returnType
+end
+
+def semanticCompletionResolveFunction(model: SemanticModel, namespaceName: String, name: String): String
+  let local = model.findFunction(semanticQualifiedName(namespaceName, name))
+
+  if local != null
+    return local.fullName
+  end
+  var candidate = ""
+  var index = 0
+
+  while index < model.usedNames.size
+    let imported = model.findFunction(semanticQualifiedName(model.usedNames.get(index), name))
+
+    if imported != null
+      if candidate != ""
+        return ""
+      end
+      candidate = imported.fullName
+    end
+    index = index + 1
+  end
+  if candidate != ""
+    return candidate
+  end
+  let global = model.findFunction(name)
+
+  if global != null
+    return global.fullName
+  end
+  return ""
+end
+
+def semanticCompletionAccessible(model: SemanticModel, site: SemanticCompletionSite, owner: String, access: String): Bool
+  if access == "public" || access == "internal"
+    return true
+  end
+  if site.className == ""
+    return false
+  end
+  if site.className == owner
+    return true
+  end
+  return access == "protected" && semanticClassAssignable(model, owner, site.className)
+end
+
+def semanticCompletionAddClassMembers(values: SemanticCompletionList, model: SemanticModel, site: SemanticCompletionSite, prefix: String, className: String, staticOnly: Bool): Void
+  var current = model.findClass(className)
+  var steps = 0
+
+  while current != null && steps < 256
+    if !staticOnly
+      var field = current.firstField
+      while field != null
+        if semanticCompletionAccessible(model, site, field.owner, field.access) && !(semanticIsReadonly(site.receiverType) && semanticContainsPointer(field.typeName))
+          semanticCompletionAdd(values, prefix, field.name, field.name, 5, field.owner + "." + field.name + ": " + semanticViewMember(site.receiverType, field.typeName), "field:" + field.owner + "." + field.name)
+        end
+        field = field.nextField
+      end
+    end
+    var method = current.firstMethod
+    while method != null
+      let receiverMatches = staticOnly ? method.isStatic : !method.isStatic
+      let readonlyMatches = staticOnly || !semanticIsReadonly(site.receiverType) || method.isReadonly
+      if method.name != "init" && receiverMatches && readonlyMatches && semanticCompletionAccessible(model, site, method.className, method.access)
+        semanticCompletionAdd(values, prefix, method.name, method.name, 2, semanticCompletionCallableDetail(method), "callable:" + method.fullName)
+      end
+      method = method.nextCallable
+    end
+    current = model.findClass(current.baseName)
+    steps = steps + 1
+  end
+end
+
+def semanticCompletionLibraryDetail(body: BootstrapBodyBinder, library: String, name: String): String
+  let count = body.libraryParameterCount(library, name)
+  let returnType = body.libraryReturn(library, name)
+  var result = library + "." + name + "("
+  var index = 0
+  var separator = ""
+
+  while index < count
+    result = result + separator + body.libraryParameterType(library, name, index)
+    separator = ", "
+    index = index + 1
+  end
+  return result + "): " + returnType
+end
+
+def semanticCompletionAddLibrary(values: SemanticCompletionList, site: SemanticCompletionSite, prefix: String): Void
+  let library = site.receiverType
+  let evaluator = new BootstrapBodyBinder(new BootstrapBinder(new SyntaxArena(), 0, 0))
+
+  for name in semanticLibraryNames(library)
+    if evaluator.libraryReturn(library, name) != "" && evaluator.libraryParameterCount(library, name) >= 0
+      semanticCompletionAdd(values, prefix, name, name, 3, semanticCompletionLibraryDetail(evaluator, library, name))
+    end
+  end
+end
+
+def semanticCompletionFunctions(values: SemanticCompletionList, model: SemanticModel, site: SemanticCompletionSite, prefix: String, namespaceOnly: Bool): Void
+  var current: SemanticModel? = model
+
+  while current != null && !values.truncated
+    var function = current.firstFunction
+
+    while function != null && !values.truncated
+      if bootstrapStartsWith(function.name, prefix) && !semanticCompletionHas(values, function.name)
+        let visible = namespaceOnly ? function.namespaceName == site.receiverType : semanticCompletionResolveFunction(model, site.namespaceName, function.name) == function.fullName
+
+        if visible
+          semanticCompletionAdd(values, prefix, function.name, function.name, 3, semanticCompletionCallableDetail(function), "callable:" + function.fullName)
+        end
+      end
+      function = function.nextCallable
+    end
+    current = current.parent
+  end
+end
+
+def semanticCompletionGenericDetail(syntax: SyntaxArena, node: Int): String
+  let parameters = syntax.nodeAt(node).typeParameters
+  var result = genericSyntaxName(syntax, node) + "<"
+  var index = 0
+
+  while index < parameters.Length
+    result = result + ", " if index > 0
+    result = result + parameters[index]
+    index = index + 1
+  end
+  return result + ">"
+end
+
+def semanticCompletionGenerics(values: SemanticCompletionList, model: SemanticModel, site: SemanticCompletionSite, prefix: String, kind: String, namespaceOnly: Bool): Void
+  let syntax = model.syntax
+
+  if syntax == null
+    return
+  end
+  var index = 0
+
+  while index < model.genericTemplates.size && !values.truncated
+    let node = model.genericTemplates.get(index)
+
+    if syntax.kindAt(node) == kind
+      let data = syntax.dataAt(node)
+      let name = semanticField(data, kind == "Class" ? 2 : 1)
+
+      if bootstrapStartsWith(name, prefix)
+        let namespaceName = semanticField(data, 0)
+        let visible = namespaceOnly ? namespaceName == site.receiverType : findGenericTemplateReadOnly(model, syntax, name, site.namespaceName, kind) == node
+
+        if visible
+          let candidateKind = kind == "Class" ? 7 : 3
+          let label = kind == "Class" ? "class " : "function "
+
+          semanticCompletionAdd(values, prefix, name, name, candidateKind, label + semanticCompletionGenericDetail(syntax, node), "generic:" + genericSyntaxName(syntax, node))
+        end
+      end
+    end
+    index = index + 1
+  end
+end
+
+def semanticCompletionClasses(values: SemanticCompletionList, model: SemanticModel, site: SemanticCompletionSite, prefix: String): Void
+  var current: SemanticModel? = model
+
+  while current != null && !values.truncated
+    var classSymbol = current.firstClass
+
+    while classSymbol != null && !values.truncated
+      if bootstrapStartsWith(classSymbol.name, prefix) && !semanticCompletionHas(values, classSymbol.name) && !classSymbol.isClosure && !classSymbol.isFunctionType && classSymbol.genericOrigin < 0 && semanticResolveType(model, classSymbol.name, site.namespaceName) == classSymbol.fullName
+        semanticCompletionAdd(values, prefix, classSymbol.name, classSymbol.name, 7, "class " + classSymbol.fullName, "type:" + classSymbol.fullName)
+      end
+      classSymbol = classSymbol.nextClass
+    end
+    current = current.parent
+  end
+end
+
+def semanticCompletionImportCandidates(values: SemanticCompletionList, model: SemanticModel, prefix: String, namespacePrefix: String): Void
+  if namespacePrefix == ""
+    for library in semanticBuiltinLibraries()
+      semanticCompletionAdd(values, prefix, library, library, 9, "library " + library, "namespace:" + library)
+    end
+  end
+  var current: SemanticModel? = model
+
+  while current != null
+    var index = 0
+    while index < current.declaredNamespaces.size
+      let namespaceName = current.declaredNamespaces.get(index)
+      var name = namespaceName
+
+      if namespacePrefix != ""
+        let prefixLength = host.stringByteLength(namespacePrefix)
+        if !bootstrapStartsWith(namespaceName, namespacePrefix + ".")
+          index = index + 1
+          continue
+        end
+        name = host.stringSlice(namespaceName, prefixLength + 1, host.stringByteLength(namespaceName) - prefixLength - 1)
+      end
+      semanticCompletionAdd(values, prefix, name, name, 9, "namespace " + namespaceName, "namespace:" + namespaceName)
+      index = index + 1
+    end
+    index = 0
+    while index < current.usedNames.size
+      let name = current.usedNames.get(index)
+
+      if namespacePrefix == "" && name != "__neri_completion_site_7f31__"
+        semanticCompletionAdd(values, prefix, name, name, 9, "import " + name, "namespace:" + name)
+      end
+      index = index + 1
+    end
+    current = current.parent
+  end
+end
+
+def semanticCompletionCandidates(model: SemanticModel, site: SemanticCompletionSite, prefix: String, limit: Int = 128, availableImports: StringBuffer? = null): SemanticCompletionList
+  let values = new SemanticCompletionList(limit)
+
+  if site.receiverKind == "instance"
+    if site.receiverType == "Error" || semanticIsOptional(site.receiverType)
+      return values
+    end
+    if semanticIsArray(site.receiverType)
+      semanticCompletionAdd(values, prefix, "Length", "Length", 5, "Array.Length: Int")
+    end
+    semanticCompletionAddClassMembers(values, model, site, prefix, semanticMutableType(site.receiverType), false)
+  else if site.receiverKind == "class"
+    semanticCompletionAddClassMembers(values, model, site, prefix, site.receiverType, true)
+  else if site.receiverKind == "super"
+    semanticCompletionAddClassMembers(values, model, site, prefix, site.receiverType, false)
+  else if site.receiverKind == "namespace"
+    semanticCompletionFunctions(values, model, site, prefix, true)
+    semanticCompletionGenerics(values, model, site, prefix, "Function", true)
+  else if site.receiverKind == "library"
+    if site.receiverType == "Array" || model.hasUse(site.receiverType)
+      semanticCompletionAddLibrary(values, site, prefix)
+    end
+  else if site.receiverKind == "type"
+    semanticCompletionClasses(values, model, site, prefix)
+    semanticCompletionGenerics(values, model, site, prefix, "Class", false)
+  else if site.receiverKind == "import"
+    semanticCompletionImportCandidates(values, model, prefix, site.receiverType)
+    if availableImports != null && site.receiverType == ""
+      var name = availableImports.first.nextNode
+
+      while name != null && !values.truncated
+        semanticCompletionAdd(values, prefix, name.value, name.value, 9, "import " + name.value)
+        name = name.nextNode
+      end
+    end
+  else
+    var symbol = site.firstSymbol
+    while symbol != null
+      semanticCompletionAdd(values, prefix, symbol.name, symbol.name, 6, symbol.name + ": " + symbol.typeName, symbol.identity)
+      symbol = symbol.next
+    end
+    let callable = site.callable
+    if site.className != "" && callable != null && !callable.isStatic
+      semanticCompletionAdd(values, prefix, "this", "this", 14, "this: " + site.className)
+    end
+    semanticCompletionFunctions(values, model, site, prefix, false)
+    semanticCompletionGenerics(values, model, site, prefix, "Function", false)
+    semanticCompletionClasses(values, model, site, prefix)
+    semanticCompletionGenerics(values, model, site, prefix, "Class", false)
+    var used = model.usedNames.first.nextNode
+
+    while used != null && !values.truncated
+      semanticCompletionAdd(values, prefix, used.value, used.value, 9, "namespace " + used.value)
+      used = used.nextNode
+    end
+    for keyword in ["false", "null", "true"]
+      semanticCompletionAdd(values, prefix, keyword, keyword, 14, "keyword")
+    end
+  end
+  return values
+end
