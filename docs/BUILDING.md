@@ -3,6 +3,22 @@
 Use this guide to build the compiler from a source checkout. To write programs
 with an installed toolchain, start with the [installation instructions](../README.md#install).
 
+## Supported platforms
+
+| Target | Native ABI and development path |
+| --- | --- |
+| `macos-arm64` | Apple silicon macOS; bootstrap and package workflow below |
+| `linux-x86_64` | Native Linux with Clang/LLVM 22.1.8; [Linux setup](LINUX.md) |
+| `windows-x86_64` | Native Windows x64 with Win32 APIs and the MSVC ABI; [Windows setup](WINDOWS.md) |
+
+Windows support targets native execution. WSL and MinGW are outside the supported
+setup. POSIX worker and PTY helpers require platform-specific replacements;
+Windows-specific coverage remains in progress.
+
+CI runs macOS and Linux jobs and Windows Debug and Release jobs. The required
+`Required / supported platforms` check combines all three platform results;
+branch protection for `main` enforces it on remote pull requests.
+
 ## Requirements
 
 On macOS Apple silicon, install the Xcode Command Line

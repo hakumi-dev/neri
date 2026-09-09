@@ -91,15 +91,16 @@ data abstraction model in [Liskov and Zilles (1974)](https://gleitzman.com/media
 Neri's annotations are a concrete design choice, not an implementation of that
 paper's CLU operation clusters or a proof of representation independence.
 
-`String` is a builtin immutable UTF-8 managed type. Its storage contains a byte
-length and encoded bytes; it is distinct from mutable `Byte[]`, and is not a
-subclass of a byte or Unicode scalar. Literals, runtime allocation, tracing,
-concatenation, equality and existing formatting conversions retain compiler and
-runtime support. The [text library](TEXT.md) supplies checked slicing, copied
-byte access, scalar traversal and a validated ordinary `Scalar` class in Neri.
-This boundary preserves the existing String ABI and avoids a second wrapper
-allocation for every literal. General user classes still have their ordinary
-managed class representation, not the String storage layout.
+`core.hk` declares `String` as an immutable UTF-8 managed class. Its storage
+contains a byte length and encoded bytes; it is distinct from mutable `Byte[]`,
+and is not a subclass of a byte or Unicode scalar. Its source methods provide
+concatenation and equality through checked intrinsic declarations. The compiler
+and runtime own literals, object layout, allocation, tracing and those intrinsic
+operations. The [text library](TEXT.md) supplies checked slicing, copied byte
+access, scalar traversal and a validated ordinary `Scalar` class in Neri. This
+boundary preserves the existing String ABI and avoids a second wrapper allocation
+for every literal. General user classes still have their ordinary managed class
+representation, not the String storage layout.
 
 The runtime ABI is the boundary for managed values and garbage collection.
 Ordinary C ABI imports accept native scalar/pointer signatures; a managed String
@@ -115,6 +116,41 @@ C++. Generated programs link to its static archive through the versioned
 [runtime ABI](ABI.md).
 
 Language syntax, binding, type rules, diagnostics, and Neri IR lowering are owned by `compiler/`.
+
+### Source and intrinsic boundary
+
+Ordinary APIs come from source declarations. A standard-library declaration
+defines its namespace, name, parameters, result type, documentation, navigation,
+completion and import requirement; runtime symbol names do not define that
+surface.
+
+| Belongs to | Current rule | Reason |
+| --- | --- | --- |
+| Source library | Namespaces and callable signatures such as `console`, `math`, `host`, `test`, and `tasks`, plus contracts such as `Equality` | Source controls the user-facing API and editor information. |
+| Intrinsic registry | Intrinsic ID, native symbol, exact signature, effects, ABI minor, runtime features, and parallel safety | Lowering emits only verified ABI imports. |
+| Compiler and runtime | Primitive and structural types, managed String and Array layouts, GC roots, pointers, native records, and serialized IR types | These determine memory layout and transport. |
+| Compiler | Literal types, explicit numeric casts, primitive operators, indexing, and the built-in array `Length` member | These operations belong to the primitive and structural type surface. |
+| Core library loader | Automatic `core.hk` loading and the registered `String` declaration | Every compilation and session starts with the same literal representation. |
+| Compiler and runtime | Scoped task operation, callback proof, and disjoint result slots | The runtime relies on the compiler's parallel-safety proof. |
+| Source contract checker | Contract signatures and structural implementation matching | Generic source code receives a static callable surface. |
+
+`@intrinsic("id")` identifies a compiler-recognized operation. Its registry is
+authoritative for the native link symbol, exact signature, effects, minimum runtime
+ABI minor version, required features and parallel-safety property. The binder
+requires an exact matching declaration before lowering emits an import. This
+prevents source from claiming an arbitrary native symbol or weaker effects; it
+does not define public library names. Standard-library declarations select their
+intrinsic IDs in source.
+
+The compiler and runtime jointly verify managed representations across the ABI.
+Source declarations provide the scoped-task operation and user-facing signature;
+the compiler proves callback and capture requirements, emits its IR operation,
+and the runtime writes verified disjoint output slots.
+
+This follows the normal intrinsic boundary: LLVM defines intrinsic semantics and
+restrictions in its [Language Reference](https://llvm.org/docs/LangRef.html#intrinsic-functions)
+and recommends intrinsics for extensions expressible as calls in its [extension guide](https://llvm.org/docs/ExtendingLLVM.html).
+Rust provides a related model with compiler-recognized marked [library items](https://rustc-dev-guide.rust-lang.org/lang-items.html).
 
 ## Build driver
 
