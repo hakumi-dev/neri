@@ -28,7 +28,7 @@ static void cleanup(void) {
   if (symlink_project_source[0]) unlink(symlink_project_source);
   if (documented_stdlib[0]) {
     char path[8192];
-    const char *files[] = {"http.hk", "terminal.hk", "clock.hk", "result.hk", "documentation.json"};
+    const char *files[] = {"core.hk", "http.hk", "terminal.hk", "clock.hk", "result.hk", "documentation.json"};
     for (size_t index = 0; index < sizeof(files) / sizeof(files[0]); ++index) {
       snprintf(path, sizeof(path), "%s/%s", documented_stdlib, files[index]);
       unlink(path);
@@ -329,7 +329,7 @@ static void prepare_documented_stdlib(const char *root) {
   snprintf(documented_stdlib, sizeof(documented_stdlib), "%s/build/lsp-documentation-XXXXXX", root);
   require(mkdtemp(documented_stdlib) != NULL, "create isolated documented stdlib");
   char source[8192], destination[8192], output_path[8192];
-  const char *files[] = {"http.hk", "terminal.hk", "clock.hk", "result.hk"};
+  const char *files[] = {"core.hk", "http.hk", "terminal.hk", "clock.hk", "result.hk"};
   for (size_t index = 0; index < sizeof(files) / sizeof(files[0]); ++index) {
     snprintf(source, sizeof(source), "%s/stdlib/%s", root, files[index]);
     snprintf(destination, sizeof(destination), "%s/%s", documented_stdlib, files[index]);

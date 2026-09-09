@@ -51,7 +51,7 @@ of the same type, with equality supported by the language's `==` operator.
 | `Float` | IEEE-754 binary64, including infinities, NaN and signed zero. |
 | `Byte` | Unsigned 8-bit integer. |
 | `Bool` | Boolean logic and equality. |
-| `String` | Immutable UTF-8, concatenation and ordinal value equality. |
+| `String` | Sealed core class with specialized immutable UTF-8 storage, concatenation, and ordinal value equality. |
 | `Void` | No returned value. |
 | `T[]` | Homogeneous fixed-length array, checked indexing, `Length`, and `for` iteration. |
 | `T?` | Explicit optional value. |
@@ -70,6 +70,31 @@ Numeric casts are explicit: `Int`/`Float`, checked `Int` to `Byte`, and lossless
 Float-to-Int truncates and panics for unrepresentable values. Numeric `as String`
 conversions are locale-independent. Arrays have no equality operator. Classes
 can define equality through an annotated instance method.
+
+`String` is loaded from the core library without a `use` directive. It is a
+source-declared, sealed class whose storage remains the runtime UTF-8 string;
+it is not a wrapper around another text value. String literals and
+`String.fromBytes(bytes)` create values. `fromBytes` returns `null` for invalid
+UTF-8. `new String()` and inheritance from `String` are unavailable.
+
+Readonly instance methods expose byte length, nullable byte access, checked
+byte slices, scalar boundaries, scalar count, scalar access, concatenation, and
+equality. A scalar is a Unicode scalar value rather than a grapheme cluster.
+The `text` library retains matching namespace functions and `text.Scalar` for
+explicit scalar construction and UTF-8 encoding.
+
+`@sealed` closes an ordinary class to inheritance. `@representation("utf8")`
+selects the registered storage for the canonical public `String` declaration in
+`@stdlib/core.hk`. That declaration has methods and no fields, base, type
+parameters or constructor. Literal and factory construction maintain its storage
+invariants. `@intrinsic` module functions have registered exact signatures and
+empty bodies; the compiler supplies their runtime calls.
+
+The dedicated immutable representation follows the public string contracts in
+[.NET String.cs](https://github.com/dotnet/runtime/blob/main/src/libraries/System.Private.CoreLib/src/System/String.cs)
+and [OpenJDK 25 String.java](https://github.com/openjdk/jdk/blob/jdk-25-ga/src/java.base/share/classes/java/lang/String.java).
+Keeping the representation behind a source-level class applies the abstraction
+boundary described by [Liskov and Zilles](https://dl.acm.org/doi/10.1145/360168.360175).
 
 `let` and parameters are immutable bindings; `var` permits reassignment. Binding
 immutability does not freeze the fields of an object. An explicit annotation

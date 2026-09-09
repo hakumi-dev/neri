@@ -131,6 +131,18 @@ class BootstrapBinder
     this.registerUses()
     registerGenericTemplates(this)
     this.registerClassNames()
+    var sourceIndex = 0
+
+    while sourceIndex < this.sourceIds.size
+      if this.sourceIds.get(sourceIndex) == "@stdlib/core.hk"
+        let textClass = this.model.findClass("String")
+
+        if textClass == null || textClass.representation != "utf8"
+          this.report("NR245", this.root, "The core library must declare String with its registered UTF-8 representation.")
+        end
+      end
+      sourceIndex = sourceIndex + 1
+    end
     registerNativeRecordNames(this)
     registerNativeRecordFields(this)
     this.registerClassMembers()
@@ -273,8 +285,10 @@ class BootstrapBinder
       let access = semanticField(data, 1)
       let name = semanticField(data, 2)
       let fullName = semanticQualifiedName(namespaceName, name)
+      let representation = this.classRepresentation(node)
+      let representedBuiltin = representation != "" && semanticRepresentationType(representation) == fullName && this.sourceIdAt(this.syntax.startAt(node)) == "@stdlib/core.hk"
 
-      if semanticReservedTypeName(name)
+      if semanticReservedTypeName(name) && !representedBuiltin
         this.report("NR156", node, "Type '" + fullName + "' is reserved.")
       else if this.model.findClass(fullName) != null
         this.report("NR156", node, "Type '" + fullName + "' is already defined.")
@@ -283,11 +297,60 @@ class BootstrapBinder
 
         symbol.isAlternative = semanticField(data, 4) == "enum"
         symbol.isResource = semanticField(data, 4) == "resource"
+        symbol.representation = representation
+        symbol.isSealed = representation != "" || this.classSealed(node)
         this.model.addClass(symbol)
         this.recordDeclaration("type:" + fullName, name, fullName, node, "class " + fullName)
       end
       index = index + 1
     end
+  end
+
+  def classAnnotationArgument(annotation: Int): String
+    if this.syntax.childCountAt(annotation) != 1
+      return ""
+    end
+    let written = this.syntax.dataAt(this.syntax.childAt(annotation, 0))
+
+    if host.stringByteLength(written) < 2
+      return ""
+    end
+    return host.stringSlice(written, 1, host.stringByteLength(written) - 2)
+  end
+
+  def classRepresentation(node: Int): String
+    var result = ""
+
+    for annotation in this.syntax.nodeAt(node).classAnnotations
+      let name = this.syntax.dataAt(annotation)
+
+      if name == "representation"
+        let value = this.classAnnotationArgument(annotation)
+
+        if result != "" || semanticRepresentationType(value) == ""
+          this.report("NR245", annotation, "Annotation '@representation' requires one unique supported representation name.")
+        else
+          result = value
+        end
+      else if name != "sealed"
+        this.report("NR245", annotation, "Unknown class annotation '@" + name + "'.")
+      end
+    end
+    return result
+  end
+
+  def classSealed(node: Int): Bool
+    var found = false
+
+    for annotation in this.syntax.nodeAt(node).classAnnotations
+      if this.syntax.dataAt(annotation) == "sealed"
+        if found || this.syntax.childCountAt(annotation) != 0
+          this.report("NR246", annotation, "Annotation '@sealed' applies once to a class, without arguments.")
+        end
+        found = true
+      end
+    end
+    return found
   end
 
   def classForNode(node: Int): SemanticClass?
@@ -515,6 +578,9 @@ class BootstrapBinder
           end
           offset = offset + 1
         end
+        if classSymbol.representation != "" && (classSymbol.fullName != semanticRepresentationType(classSymbol.representation) || this.sourceIdAt(this.syntax.startAt(classNode)) != "@stdlib/core.hk" || classSymbol.access != "public" || classSymbol.isResource || this.syntax.nodeAt(classNode).typeParameters.Length > 0 || this.classBaseNode(classNode) >= 0 || classSymbol.firstField != null || this.findDeclaredMethod(classSymbol, "init") != null)
+          this.report("NR245", classNode, "A represented class requires its canonical trusted standard-library declaration, public access, and no base, fields, type parameters, resource role, or constructor.")
+        end
       end
       index = index + 1
     end
@@ -648,6 +714,8 @@ class BootstrapBinder
         else
           callable.conversion = true
         end
+      else if annotationName == "intrinsic"
+        this.report("NR247", annotationNode, "Annotation '@intrinsic' applies only to a module function.")
       else if annotationName != "override"
         this.report("NR172", annotationNode, "Unknown method annotation '@" + annotationName + "'.")
       else if seenOverride || this.syntax.childCountAt(annotationNode) != 0
@@ -691,12 +759,22 @@ class BootstrapBinder
     var annotationIndex = 0
     var sawCAbi = false
     var sawLibrary = false
+    var sawIntrinsic = false
 
     while annotationIndex < annotationCount
       let annotationNode = this.syntax.childAt(functionNode, annotationIndex)
       let annotationName = this.syntax.dataAt(annotationNode)
 
-      if annotationName == "library"
+      if annotationName == "intrinsic"
+        if sawIntrinsic
+          this.report("NR247", annotationNode, "Annotation '@intrinsic' cannot be repeated.")
+        end
+        sawIntrinsic = true
+        callable.intrinsicName = this.classAnnotationArgument(annotationNode)
+        if semanticIntrinsic(callable.intrinsicName) == null
+          this.report("NR247", annotationNode, "Annotation '@intrinsic' requires one supported intrinsic name.")
+        end
+      else if annotationName == "library"
         if sawLibrary
           this.report("NR213", annotationNode, "Annotation '@library' cannot be repeated.")
         end
@@ -766,6 +844,27 @@ class BootstrapBinder
       this.recordDeclaration(identity, parameterName, parameterType, parameterNode)
       index = index + 1
     end
+    if callable.intrinsicName != ""
+      let intrinsic = semanticIntrinsic(callable.intrinsicName)
+      var valid = false
+
+      if intrinsic != null
+        valid = classSymbol == null && !isUnsafe && bodyCount == 0 && !sawCAbi && !sawLibrary && callable.returnType == intrinsic.resultType && callable.parameterCount == intrinsic.parameterTypes.Length
+      end
+
+      if intrinsic != null && callable.parameterCount == intrinsic.parameterTypes.Length
+        index = 0
+        while index < callable.parameterCount
+          let parameter = callable.parameterAt(index)
+
+          valid = false if parameter == null || parameter.typeName != intrinsic.parameterTypes[index] || parameter.hasDefault
+          index = index + 1
+        end
+      end
+      if !valid
+        this.report("NR247", functionNode, "An intrinsic must be a safe empty-body module function with the exact registered parameter and result types and no defaults, C ABI, or library annotation.")
+      end
+    end
     if this.recordSourceSymbols
       var display = "def " + fullName + "("
       var parameter = callable.firstParameter
@@ -817,7 +916,9 @@ class BootstrapBinder
           else
             let base = this.model.findClass(resolved)
 
-            if base != null && base.isAlternative
+            if base != null && base.isSealed
+              this.report("NR159", baseNode, "Sealed class '" + resolved + "' cannot be inherited.")
+            else if base != null && base.isAlternative
               this.report("NR260", baseNode, "Closed alternative type '" + resolved + "' cannot be inherited.")
             else if base != null && base.isResource
               this.report("NR262", baseNode, "Resource classes cannot be inherited.")

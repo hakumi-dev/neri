@@ -6,6 +6,17 @@ C calling convention on macOS ARM64 and Linux x86-64. Generated programs negotia
 major version, minimum minor version and required feature bits before execution.
 The package manifest also identifies the toolchain version and native target.
 
+`String` is declared in `stdlib/core.hk` with the registered `utf8` representation.
+Its semantic methods lower to direct functions with an explicit IR `string`
+receiver. The runtime string header, UTF-8 payload, tracing and literal allocation
+retain their existing ABI. Represented classes use their registered storage;
+ordinary classes use class descriptors and method dispatch slots.
+
+The compiler's typed intrinsic registry maps empty-body module declarations to
+reviewed runtime exports, with exact parameter/result types, effects and ABI
+requirements. String primitives use this mechanism. Native managed-reference
+calls use runtime imports; the unmanaged C ABI import contract remains separate.
+
 The `INTERACTIVE_IO` feature (8192) provides generation-scoped terminal
 leases, byte input with bounded waiting, terminal dimensions, and monotonic
 milliseconds. Platform terminal layouts remain inside the runtime. Key decoding
