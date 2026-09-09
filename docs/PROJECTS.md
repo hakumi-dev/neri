@@ -1,5 +1,10 @@
 # Compilation projects
 
+`neri project-units --project <directory|manifest.json>` lists each executable
+unit with each owned source, separated by a tab. Automation can select source
+roles from this validated membership instead of deriving a unit name from a
+source filename.
+
 `neri run --project .` discovers the directory's `.hk` sources as one executable
 unit named `main` when the directory has no project manifest. The same source
 exclusions and nested-project boundaries apply to inferred and explicit units.
