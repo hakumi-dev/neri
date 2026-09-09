@@ -74,6 +74,38 @@ required by the native verifier. The callback analysis graph is discarded after
 checking. Capture access remains a semantic type rule; mutable argument ownership
 and task lifetime are separate contracts.
 
+## Data abstraction and library types
+
+Classes provide nominal identity, private representation, checked construction,
+generic parameters and ordinary virtual methods. Operator and explicit conversion
+annotations attach metadata to those methods. The semantic binder resolves them
+to the same instance calls used by named methods; lowering, effect analysis,
+debug information and code generation share the existing call infrastructure.
+The mechanism is owned by the declaring class and has no global registry of
+user type names.
+Builtin operand types retain their existing operations without traversing the
+class registry for every arithmetic expression.
+
+This separates the operations of a type from its representation, following the
+data abstraction model in [Liskov and Zilles (1974)](https://gleitzman.com/media/docs/adt-liskov.pdf).
+Neri's annotations are a concrete design choice, not an implementation of that
+paper's CLU operation clusters or a proof of representation independence.
+
+`String` is a builtin immutable UTF-8 managed type. Its storage contains a byte
+length and encoded bytes; it is distinct from mutable `Byte[]`, and is not a
+subclass of a byte or Unicode scalar. Literals, runtime allocation, tracing,
+concatenation, equality and existing formatting conversions retain compiler and
+runtime support. The [text library](TEXT.md) supplies checked slicing, copied
+byte access, scalar traversal and a validated ordinary `Scalar` class in Neri.
+This boundary preserves the existing String ABI and avoids a second wrapper
+allocation for every literal. General user classes still have their ordinary
+managed class representation, not the String storage layout.
+
+The runtime ABI is the boundary for managed values and garbage collection.
+Ordinary C ABI imports accept native scalar/pointer signatures; a managed String
+or array is not a portable C argument. Text operations reuse the reviewed runtime
+entry points through the existing host services.
+
 ## Native boundary
 
 `native/codegen/` is a narrow C++ LLVM consumer. It accepts only verified Neri IR and emits LLVM IR, assembly, or native objects.

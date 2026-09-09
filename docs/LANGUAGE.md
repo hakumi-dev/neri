@@ -68,7 +68,8 @@ by -1 panic. Float arithmetic follows IEEE-754 without fast-math.
 Float equality considers two NaNs equal; ordered comparisons with NaN are false.
 Numeric casts are explicit: `Int`/`Float`, checked `Int` to `Byte`, and lossless `Byte` to `Int`.
 Float-to-Int truncates and panics for unrepresentable values. Numeric `as String`
-conversions are locale-independent. Arrays and objects have no equality operator.
+conversions are locale-independent. Arrays have no equality operator. Classes
+can define equality through an annotated instance method.
 
 `let` and parameters are immutable bindings; `var` permits reassignment. Binding
 immutability does not freeze the fields of an object. An explicit annotation
@@ -171,6 +172,44 @@ Construction initializes base classes before derived classes. `init` is not
 inherited. An explicit `super(args)` starts a derived initializer when the base
 requires arguments. A valid zero-argument base call is implicit. Inherited fields
 cannot be redeclared.
+An explicit `super(args)` occurs once, as the first statement of a derived
+`init`; it is invalid inside another control-flow body or an ordinary method.
+
+A class without `init` has an implicit zero-argument constructor. Construction
+initializes its ancestors first, invoking the nearest declared initializer with
+its default arguments, then initializes the remaining fields in inheritance
+order. That initializer must be accessible from the derived class and accept
+zero supplied arguments. Intermediate classes cannot skip initialization or
+constructor visibility.
+
+### Library operators and explicit conversions
+
+Public, safe instance methods on ordinary classes can expose operators using
+`@operator("+")`. The annotation belongs to the class that implements the
+operation. Binary operators take one parameter of exactly that class type;
+unary operators take none. Arithmetic operators return that class type;
+comparison operators and unary `!` return `Bool`.
+
+Supported binary tokens are `+`, `-`, `*`, `/`, `==`, `!=`, `<`, `<=`, `>`, and
+`>=`; unary tokens are `+`, `-`, and `!`. Each token and arity has one declaration
+per class. `==` and `!=` are independent operations. Logical `&&` and `||` retain
+their language-defined short-circuit behavior.
+
+`@conversion` marks a public, safe instance method with no parameters and a
+non-`Void` return type. The return annotation supplies the target of `value as T`.
+There is one conversion per target type in a class. Identity conversions and
+conversions that remove a readonly view retain the ordinary type rules.
+Assignments, arguments and returns require their declared types; the compiler
+does not insert calls to conversion methods.
+
+These annotations use ordinary instance dispatch, source methods and generic
+specialization. Operands are evaluated once, in order. Readonly receivers require
+`@readonly` methods. Resource classes use their ownership operations and cannot
+declare these annotations. Operator and conversion methods remain callable by
+name. Adding a library type requires no new compiler case for its name.
+
+See [text](TEXT.md) for `text.Scalar`, a library class with validated construction,
+explicit conversion to `Int` and Unicode encoding implemented in Neri.
 
 ## Generics
 
