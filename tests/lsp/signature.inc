@@ -44,8 +44,8 @@ static void signature_help_contract(void) {
   reply = receive();
   result = field(reply, "result");
   signature = spaces(field(result, "signatures") + 1);
-  require(string_is(field(signature, "label"), "console.println(String): Void"),
-          "signature help uses the compiler intrinsic contract");
+  require(string_is(field(signature, "label"), "def console.println(value: String): Void"),
+          "signature help uses the declared library callable");
   free(reply);
 
   open_document("file:///signature-equality.hk",
@@ -59,8 +59,8 @@ static void signature_help_contract(void) {
   reply = receive();
   result = field(reply, "result");
   signature = spaces(field(result, "signatures") + 1);
-  require(string_is(field(signature, "label"), "test.assertEqual(T, T): Void"),
-          "signature help preserves the equality type parameter relationship");
+  require(string_is(field(signature, "label"), "def test.assertEqual<Int>(left: Int, right: Int): Void"),
+          "signature help resolves the generic library callable");
   free(reply);
 
   open_document("file:///signature-nested.hk",

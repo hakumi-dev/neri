@@ -185,11 +185,26 @@ copies the previous contents on each append and causes quadratic copying.
 ## Validate
 
 `scripts/build.sh test` runs the protocol suite against the freshly bootstrapped
-compiler, alongside existing compiler and native tests. To run it separately:
+compiler, alongside existing compiler and native tests. To run the adapter
+separately, prepare an isolated standard-library directory and index every
+source it contains:
 
 ```sh
-build/native/native-release/neri-lsp-test "$HOME/.neri/bin/neri" "$PWD"
+fixture="$(mktemp -d)"
+cp "$PWD"/stdlib/*.hk "$fixture"/
+"$HOME/.neri/bin/neri" documentation-index \
+  --toolchain-version "$(cat VERSION)" \
+  --output "$fixture/documentation.json" "$fixture"/*.hk
+NERI_LSP_TEST_STDLIB="$fixture" \
+  build/native/native-release/neri-lsp-test "$HOME/.neri/bin/neri" "$PWD"
 ```
+
+The full test command prepares an isolated standard-library directory and its
+documentation index with Neri tooling, then passes its path to the adapter in
+`NERI_LSP_TEST_STDLIB`. The prepared directory contains every installed `.hk`
+standard-library source and a matching `documentation.json`. The adapter
+requires this variable; its no-sidecar contract temporarily uses the repository
+standard library without the sidecar.
 
 The tests exercise framing/lifecycle, recovery, real type errors, incomplete
 blocks, the existing callback fixture, standard-library loading, Unicode ranges,
@@ -206,7 +221,8 @@ not an empty document). Each edit must produce empty diagnostics with its exact
 version. The current server still reparses and binds the whole document.
 
 ```sh
-build/native/native-release/neri-lsp-test /path/to/current/compiler "$PWD" --benchmark
+NERI_LSP_TEST_STDLIB="$fixture" \
+  build/native/native-release/neri-lsp-test /path/to/current/compiler "$PWD" --benchmark
 ```
 
 Output reports nearest-rank p50/p95/p99 and maximum milliseconds from sending
