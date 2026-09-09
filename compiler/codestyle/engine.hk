@@ -25,6 +25,9 @@ end
 
 class NeriCodeStyleContext
   public text: String = ""
+  public sourceMap: IrSourceMap?
+  public tokenStarts: ArenaCheckpointIndex<Int>?
+  public newline: String = ""
   public tokens: TokenBuffer?
   public syntax: SyntaxArena?
   public root: Int = -1
@@ -37,6 +40,7 @@ class NeriCodeStyleResult
   public error: String = ""
   public findings: NeriCodeStyleFinding?
   public edits: NeriCodeStyleEdit?
+  public findingInsertionCursor: NeriCodeStyleFinding?
 end
 
 class NeriCodeStyleApplyResult
@@ -123,18 +127,57 @@ def neriCodeStyleIsAssertion(arena: SyntaxArena, node: Int, options: NeriCodeSty
 end
 
 def neriCodeStyleNewline(context: NeriCodeStyleContext): String
+  if context.newline != ""
+    return context.newline
+  end
   let map = new IrSourceMap(context.text)
+
+  return neriCodeStyleDetectNewline(context.text, map)
+end
+
+def neriCodeStyleDetectNewline(text: String, map: IrSourceMap): String
   var index = 0
 
   while index < map.utf16Length()
     let byte = map.offsetAt(index)
 
-    if (host.stringByteAt(context.text, byte) as Int) == 13
+    if (host.stringByteAt(text, byte) as Int) == 13
       return "\r\n"
     end
     index = index + 1
   end
   return "\n"
+end
+
+def neriCodeStyleTokenAtOrAfter(context: NeriCodeStyleContext, position: Int): Int
+  let tokens = context.tokens
+  let starts = context.tokenStarts
+
+  if tokens == null || starts == null
+    return 0
+  end
+  var first = 0
+  var last = tokens.count()
+
+  while first < last
+    let middle = first + (last - first) / 2
+
+    if starts.get(middle) < position
+      first = middle + 1
+    else
+      last = middle
+    end
+  end
+  return first
+end
+
+def neriCodeStylePositionBefore(map: IrSourceMap, byte: Int, position: Int): Int
+  var cursor = position
+
+  while cursor > 0 && map.offsetAt(cursor) > byte
+    cursor = cursor - 1
+  end
+  return cursor
 end
 
 def neriCodeStyleGap(context: NeriCodeStyleContext, previousStart: Int, nextStart: Int): Int
@@ -143,7 +186,7 @@ def neriCodeStyleGap(context: NeriCodeStyleContext, previousStart: Int, nextStar
   if tokens == null || nextStart <= previousStart
     return -1
   end
-  var index = 0
+  var index = neriCodeStyleTokenAtOrAfter(context, previousStart)
   var last = -1
   var lastKind = ""
   var newlines = 0
@@ -174,7 +217,11 @@ def neriCodeStyleGap(context: NeriCodeStyleContext, previousStart: Int, nextStar
 end
 
 def neriCodeStyleGapNeedsBlank(context: NeriCodeStyleContext, gap: Int, nextStart: Int): Bool
-  let map = new IrSourceMap(context.text)
+  let map = context.sourceMap
+
+  if map == null
+    return false
+  end
   let first = map.offsetAt(gap)
   let last = map.offsetAt(nextStart)
   var index = first
@@ -210,7 +257,11 @@ def neriCodeStyleGapNeedsBlank(context: NeriCodeStyleContext, gap: Int, nextStar
 end
 
 def neriCodeStyleGapSafe(context: NeriCodeStyleContext, start: Int, finish: Int): Bool
-  let map = new IrSourceMap(context.text)
+  let map = context.sourceMap
+
+  if map == null
+    return false
+  end
   let first = map.offsetAt(start)
   let last = map.offsetAt(finish)
   var index = first
@@ -232,7 +283,11 @@ def neriCodeStyleGapSafe(context: NeriCodeStyleContext, start: Int, finish: Int)
 end
 
 def neriCodeStyleLineStart(context: NeriCodeStyleContext, position: Int): Int
-  let map = new IrSourceMap(context.text)
+  let map = context.sourceMap
+
+  if map == null
+    return position
+  end
   var byte = map.offsetAt(position)
 
   while byte > 0
@@ -243,11 +298,15 @@ def neriCodeStyleLineStart(context: NeriCodeStyleContext, position: Int): Int
     end
     byte = byte - 1
   end
-  return (new IrSourceMap(host.stringSlice(context.text, 0, byte))).utf16Length()
+  return neriCodeStylePositionBefore(map, byte, position)
 end
 
 def neriCodeStyleInsertionStart(context: NeriCodeStyleContext, gap: Int, nextStart: Int): Int
-  let map = new IrSourceMap(context.text)
+  let map = context.sourceMap
+
+  if map == null
+    return nextStart
+  end
   let first = map.offsetAt(gap)
   let last = map.offsetAt(nextStart)
   var byte = first
@@ -265,7 +324,7 @@ def neriCodeStyleInsertionStart(context: NeriCodeStyleContext, gap: Int, nextSta
         lineStart = lineStart - 1
       end
       if lineStart >= first
-        return (new IrSourceMap(host.stringSlice(context.text, 0, lineStart))).utf16Length()
+        return neriCodeStylePositionBefore(map, lineStart, nextStart)
       end
     end
     byte = byte + 1
@@ -327,7 +386,7 @@ def neriCodeStyleFindingLength(context: NeriCodeStyleContext, start: Int): Int
   if tokens == null
     return 1
   end
-  var index = 0
+  var index = neriCodeStyleTokenAtOrAfter(context, start)
 
   while index < tokens.count()
     let tokenStart = tokens.startAt(index)
@@ -363,8 +422,16 @@ def neriCodeStyleFindingBefore(left: NeriCodeStyleFinding, right: NeriCodeStyleF
 end
 
 def neriCodeStyleInsertFinding(result: NeriCodeStyleResult, finding: NeriCodeStyleFinding): Void
-  var previous: NeriCodeStyleFinding? = null
+  var previous = result.findingInsertionCursor
+
+  if previous != null && !neriCodeStyleFindingBefore(previous, finding)
+    previous = null
+  end
   var current = result.findings
+
+  if previous != null
+    current = previous.next
+  end
 
   while current != null && neriCodeStyleFindingBefore(current, finding)
     previous = current
@@ -376,6 +443,7 @@ def neriCodeStyleInsertFinding(result: NeriCodeStyleResult, finding: NeriCodeSty
   else
     previous.next = finding
   end
+  result.findingInsertionCursor = finding
 end
 
 class NeriCodeStyleDeclarationSpacingRule: NeriCodeStyleRule
@@ -480,11 +548,23 @@ def neriCodeStyleContext(text: String): NeriCodeStyleContext
   let context = new NeriCodeStyleContext()
 
   context.text = text
+  let sourceMap = new IrSourceMap(text)
+
+  context.sourceMap = sourceMap
+  context.newline = neriCodeStyleDetectNewline(text, sourceMap)
   let tokens = (new BootstrapLexer(text)).lex()
+  let tokenStarts = new ArenaCheckpointIndex<Int>(0)
+  var tokenIndex = 0
+
+  while tokenIndex < tokens.count()
+    tokenStarts.add(tokens.startAt(tokenIndex))
+    tokenIndex = tokenIndex + 1
+  end
   let parser = new BootstrapParser(tokens)
   let root = parser.parseProgram()
 
   context.tokens = tokens
+  context.tokenStarts = tokenStarts
   context.syntax = parser.arena
   context.root = root
   if parser.diagnostics.count() != 0
@@ -507,6 +587,7 @@ def neriCodeStyleAnalyzeWithRules(context: NeriCodeStyleContext, options: NeriCo
 
   while rule != null
     if rule.enabled(options)
+      result.findingInsertionCursor = null
       rule.evaluate(context, options, result)
     end
     rule = rule.next
@@ -530,7 +611,9 @@ def neriCodeStyleApplyChecked(text: String, edits: NeriCodeStyleEdit?): NeriCode
   let context = new NeriCodeStyleContext()
 
   context.text = text
-  let newline = neriCodeStyleNewline(context)
+  context.sourceMap = originalMap
+  context.newline = neriCodeStyleDetectNewline(text, originalMap)
+  let newline = context.newline
   var previousStart = originalMap.utf16Length() + 1
 
   while edit != null
