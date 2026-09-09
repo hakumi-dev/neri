@@ -5,7 +5,7 @@ with an installed toolchain, start with the [installation instructions](../READM
 
 ## Requirements
 
-The bootstrap host is macOS on Apple silicon. Install the Xcode Command Line
+On macOS Apple silicon, install the Xcode Command Line
 Tools and these dependencies:
 
 - LLVM 22.1.8 and zstd.
@@ -52,11 +52,10 @@ scripts/build.sh doctor
 scripts/build.sh test
 ```
 
-The launcher verifies a prebuilt seed compiler and uses it to compile the Neri
-build driver. The driver builds the native components, compiles three generations
-of the compiler and requires matching output. It then runs the language and
-native tests before selecting the verified toolchain at `build/current`.
-See [bootstrapping](BOOTSTRAP.md) and [testing](../tests/README.md) for details.
+`scripts/build.sh test` builds and validates the current checkout, then selects
+its verified toolchain at `build/current`. See [bootstrapping](BOOTSTRAP.md) for
+generation checks and [testing](../tests/README.md) for suite composition.
+
 The opt-in `scripts/build.sh debugger-test` command verifies real LLDB debugging
 on macOS; see [debugging](DEBUGGING.md) for setup and the supported contract.
 
@@ -114,10 +113,5 @@ scripts/build.sh package
 scripts/build.sh install
 ```
 
-Packaging runs the full validation suite and produces two byte-identical archives.
-Verified packages are stored in `build/packages/` with their SHA-256 in the filename.
-Installation builds and validates a package, then installs it under `~/.neri` by
-default. `scripts/build.sh install --prefix /your/directory` selects another prefix.
-The standalone installer accepts `--no-doc` together with `--prefix` in either
-order when the packaged documentation and documentation sidecar are not needed.
-See [packaging and installation](PACKAGING.md) for integrity checks and PATH setup.
+See [packaging and installation](PACKAGING.md) for verified archives, installer
+options, integrity checks and PATH setup.
