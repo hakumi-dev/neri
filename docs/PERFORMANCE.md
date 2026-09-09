@@ -13,6 +13,20 @@ insertion order for equal keys, following the standard
 [merge sort](https://www.nist.gov/dads/HTML/mergesort.html) and
 [merge](https://www.nist.gov/dads/HTML/merge.html) definitions.
 
+Syntax and bound arenas retain original node objects in linked lists. A binary
+index stores a checkpoint for every 128 nodes. Adjacent accesses use the cached
+cursor in `O(1)` time; other accesses take `O(log(1 + N / 128) + 128)` steps for
+`N` local nodes. Index storage is `O(1 + N / 128)`, and parent arenas retain their
+own indexes. Appending a checkpoint grows the binary index by doubling its
+capacity when full, following the standard
+[doubling and amortized-analysis technique](https://ocw.mit.edu/courses/6-046j-introduction-to-algorithms-sma-5503-fall-2005/resources/lecture-13-amortized-algorithms-table-doubling-potential-method/).
+
+The isolated [macOS ARM64 measurement](../benchmarks/arena-index-macos-arm64.json)
+reduced the Sumi console frontend from 15.049 s to 3.632 s and the complete build
+from 26.07 s to 14.69 s, with the same native backend. Native generation remained
+about 10.7 s. This is a sequential local comparison, not a latency percentile or
+a general memory-reduction claim.
+
 Transport bytes occupy linked 256-byte arrays, with `ceil(N / 256)` chunks
 and less than 256 bytes of unused tail capacity for `N` bytes. Each buffer
 constructs one zero template; copying that template creates independent chunks.
