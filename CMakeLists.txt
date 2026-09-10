@@ -258,9 +258,16 @@ endif()
 
 set(NERI_MANIFEST_VERSION "${NERI_VERSION}")
 set(NERI_MANIFEST_NAME "neri-runtime-${NERI_TARGET}.json")
+set(NERI_ABI_HEADER "${CMAKE_CURRENT_SOURCE_DIR}/native/include/neri/runtime_abi.h")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${NERI_ABI_HEADER}")
+file(STRINGS "${NERI_ABI_HEADER}" NERI_ABI_MINOR_DEFINE REGEX "^#define NERI_RUNTIME_ABI_MINOR ")
+if(NOT NERI_ABI_MINOR_DEFINE MATCHES "^#define NERI_RUNTIME_ABI_MINOR UINT16_C\\(([0-9]+)\\)$")
+  message(FATAL_ERROR "Cannot read the runtime ABI minor version")
+endif()
+set(NERI_ABI_MINOR "${CMAKE_MATCH_1}")
   file(GENERATE
     OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/${NERI_MANIFEST_NAME}"
-    CONTENT "{\n  \"schemaVersion\": 2,\n  \"toolchainVersion\": \"${NERI_MANIFEST_VERSION}\",\n  \"irTransportMajor\": 1,\n  \"irTransportMinor\": 7,\n  \"target\": \"${NERI_TARGET}\",\n  \"abiMajor\": 1,\n  \"abiMinor\": 24,\n  \"features\": 536869631,\n  \"artifact\": \"$<TARGET_FILE_NAME:neri_runtime>\"\n}\n"
+    CONTENT "{\n  \"schemaVersion\": 2,\n  \"toolchainVersion\": \"${NERI_MANIFEST_VERSION}\",\n  \"irTransportMajor\": 1,\n  \"irTransportMinor\": 7,\n  \"target\": \"${NERI_TARGET}\",\n  \"abiMajor\": 1,\n  \"abiMinor\": ${NERI_ABI_MINOR},\n  \"features\": 536869631,\n  \"artifact\": \"$<TARGET_FILE_NAME:neri_runtime>\"\n}\n"
   )
 install(TARGETS neri_codegen_cli neri_runtime RUNTIME DESTINATION bin ARCHIVE DESTINATION lib)
 if(APPLE)
