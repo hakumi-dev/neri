@@ -42,6 +42,10 @@ project owns the JetBrains client, grammar, configuration UI and Run/Build/Check
   document, including reads and assignments. Declaration locations identify the
   name, not the declaration keyword. Queries use binding identity, distinguish
   same-spelling symbols and honor `includeDeclaration` for references.
+  Navigation indexes are built on demand and retained for the current analysis
+  generation. Hash tables deduplicate locations and resolve canonical identities;
+  sorted source boundaries support binary search. Document changes discard both
+  the index and its snapshot. Completion and diagnostics do not build this index.
 - Document highlights use the same binding identities and remain within the
   queried document. Highlights use the text kind; read/write classification
   is not provided.

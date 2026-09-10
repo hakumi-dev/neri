@@ -2,6 +2,16 @@
 # The server supplies complete project snapshots; this layer never reads files,
 # reparses text, resolves names, or formats LSP JSON.
 
+class LspSnapshotSource
+  public start: Int
+  public uri: String
+
+  def init(start: Int, uri: String): Void
+    this.start = start
+    this.uri = uri
+  end
+end
+
 class LspSemanticSnapshot
   public projectKey: String = ""
   public projectRevision: Int = 0
@@ -17,6 +27,78 @@ class LspSemanticSnapshot
   # contains every editable project source that can reference them.
   public renameClosedWorld: Bool = false
   public renameOwnedSourceUris: StringBuffer = new StringBuffer()
+  private canonicalIdentities: StringTable<String>?
+  private indexedSources: LspSnapshotSource[] = []
+  private sourcesReady: Bool = false
+
+  def sourceAt(position: Int): LspSnapshotSource?
+    if !this.sourcesReady
+      this.indexedSources = tasks.generate(this.sourceStarts.size, 1) do |index|
+        return new LspSnapshotSource(0, "")
+      end
+      var index = 0
+
+      while index < this.indexedSources.Length
+        let source = this.indexedSources[index]
+
+        source.start = this.sourceStarts.get(index)
+        source.uri = index < this.sourceUris.size ? this.sourceUris.get(index) : ""
+        index = index + 1
+      end
+      this.sourcesReady = true
+    end
+    if this.indexedSources.Length == 0
+      return null
+    end
+    var low = 0
+    var high = this.indexedSources.Length
+
+    while low + 1 < high
+      let middle = low + (high - low) / 2
+
+      if this.indexedSources[middle].start <= position
+        low = middle
+      else
+        high = middle
+      end
+    end
+    return this.indexedSources[low]
+  end
+
+  def canonicalIdentity(identity: String): String
+    if identity == ""
+      return ""
+    end
+    let resolved = this.identityTable().find(identity)
+
+    if resolved != null
+      return resolved.value
+    end
+    return identity + "|unresolved|" + lspSnapshotKey(this)
+  end
+
+  private def identityTable(): StringTable<String>
+    let cached = this.canonicalIdentities
+
+    if cached != null
+      return cached
+    end
+    let identities = new StringTable<String>()
+    let semantic = this.semantic
+
+    if semantic != null
+      var declaration = semantic.declarations
+
+      while declaration != null
+        let canonical = declaration.identity + "|" + lspSnapshotSourceKey(this, declaration.start) + "|" + (lspSnapshotSourceOffset(this, declaration.start) as String)
+
+        identities.add(declaration.identity, canonical)
+        declaration = declaration.next
+      end
+    end
+    this.canonicalIdentities = identities
+    return identities
+  end
 end
 
 class LspQueryLocation
@@ -58,6 +140,7 @@ class LspSemanticIndex
   public projectRevision: Int = 0
   public first: LspSemanticQueryEntry?
   public last: LspSemanticQueryEntry?
+  private entries: StringTable<LspSemanticQueryEntry> = new StringTable<LspSemanticQueryEntry>()
 
   # A caller replaces the whole project generation after any source or project
   # change. This prevents queries from mixing models from different versions.
@@ -69,36 +152,40 @@ class LspSemanticIndex
     this.projectRevision = projectRevision
     this.first = null
     this.last = null
+    this.entries = new StringTable<LspSemanticQueryEntry>()
   end
 
   def contains(identity: String, snapshot: LspSemanticSnapshot, start: Int, length: Int, declaration: Bool): Bool
     let sourceKey = lspSnapshotSourceKey(snapshot, start)
     let sourceOffset = lspSnapshotSourceOffset(snapshot, start)
-    var entry = this.first
-    while entry != null
-      if entry.identity == identity && entry.sourceKey == sourceKey && entry.sourceOffset == sourceOffset && entry.length == length && entry.declaration == declaration
-        return true
-      end
-      entry = entry.next
-    end
-    return false
+
+    return this.entries.find(lspQueryEntryKey(identity, sourceKey, sourceOffset, length, declaration)) != null
   end
 
   def add(identity: String, name: String, kind: Int, snapshot: LspSemanticSnapshot, start: Int, length: Int, declaration: Bool): Void
-    if identity == "" || length <= 0 || this.contains(identity, snapshot, start, length, declaration)
+    if identity == "" || length <= 0
+      return
+    end
+    let sourceKey = lspSnapshotSourceKey(snapshot, start)
+    let sourceOffset = lspSnapshotSourceOffset(snapshot, start)
+    let key = lspQueryEntryKey(identity, sourceKey, sourceOffset, length, declaration)
+
+    if this.entries.find(key) != null
       return
     end
     let entry = new LspSemanticQueryEntry()
+
     entry.identity = identity
     entry.name = name
     entry.kind = kind
     entry.start = start
-    entry.sourceOffset = lspSnapshotSourceOffset(snapshot, start)
+    entry.sourceOffset = sourceOffset
     entry.length = length
     entry.declaration = declaration
     entry.snapshot = snapshot
     entry.snapshotKey = lspSnapshotKey(snapshot)
-    entry.sourceKey = lspSnapshotSourceKey(snapshot, start)
+    entry.sourceKey = sourceKey
+    this.entries.add(key, entry)
     let tail = this.last
     if tail == null
       this.first = entry
@@ -139,31 +226,32 @@ class LspSemanticIndex
   end
 end
 
+def lspQueryEntryKey(identity: String, sourceKey: String, sourceOffset: Int, length: Int, declaration: Bool): String
+  # Length prefixes preserve tuple equality even when a URI contains delimiters.
+  return (host.stringByteLength(identity) as String) + ":" + identity + (host.stringByteLength(sourceKey) as String) + ":" + sourceKey + ":" + (sourceOffset as String) + ":" + (length as String) + ":" + (declaration ? "1" : "0")
+end
+
 def lspSnapshotKey(snapshot: LspSemanticSnapshot): String
   let uri = snapshot.sourceUris.size > 0 ? snapshot.sourceUris.get(0) : ""
   return snapshot.projectKey + "|" + (snapshot.projectRevision as String) + "|" + uri
 end
 
 def lspSnapshotSourceKey(snapshot: LspSemanticSnapshot, position: Int): String
-  var index = 0
-  while index + 1 < snapshot.sourceStarts.size && snapshot.sourceStarts.get(index + 1) <= position
-    index = index + 1
-  end
-  if index < 0 || index >= snapshot.sourceUris.size || index >= snapshot.sourceStarts.size
+  let source = snapshot.sourceAt(position)
+
+  if source == null
     return ""
   end
-  return snapshot.sourceUris.get(index)
+  return source.uri
 end
 
 def lspSnapshotSourceOffset(snapshot: LspSemanticSnapshot, position: Int): Int
-  var index = 0
-  while index + 1 < snapshot.sourceStarts.size && snapshot.sourceStarts.get(index + 1) <= position
-    index = index + 1
-  end
-  if index < 0 || index >= snapshot.sourceStarts.size
+  let source = snapshot.sourceAt(position)
+
+  if source == null
     return -1
   end
-  return position - snapshot.sourceStarts.get(index)
+  return position - source.start
 end
 
 # Semantic identities for locals are intentionally compact and can repeat in
@@ -171,21 +259,7 @@ end
 # identity to its canonical declaration source location. This also gives a
 # generated generic occurrence the template declaration it already resolves to.
 def lspQueryCanonicalIdentity(snapshot: LspSemanticSnapshot, identity: String): String
-  if identity == ""
-    return ""
-  end
-  let semantic = snapshot.semantic
-  if semantic == null
-    return identity + "|unresolved|" + lspSnapshotKey(snapshot)
-  end
-  var declaration = semantic.declarations
-  while declaration != null
-    if declaration.identity == identity
-      return identity + "|" + lspSnapshotSourceKey(snapshot, declaration.start) + "|" + (lspSnapshotSourceOffset(snapshot, declaration.start) as String)
-    end
-    declaration = declaration.next
-  end
-  return identity + "|unresolved|" + lspSnapshotKey(snapshot)
+  return snapshot.canonicalIdentity(identity)
 end
 
 def lspQueryLocation(snapshot: LspSemanticSnapshot, start: Int, length: Int): LspQueryLocation?
