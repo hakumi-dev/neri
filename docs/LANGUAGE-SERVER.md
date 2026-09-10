@@ -49,6 +49,13 @@ project owns the JetBrains client, grammar, configuration UI and Run/Build/Check
 - Document highlights use the same binding identities and remain within the
   queried document. Highlights use the text kind; read/write classification
   is not provided.
+- On-type formatting on newline uses the parser's block metadata to indent the
+  new body line and insert a missing `end`. Existing closures are retained;
+  abstract method signatures have no body. Branches share their enclosing
+  terminator. The query parses only the current document and returns UTF-16 edits
+  for its blank current line, preserving line endings and the client's indentation
+  options (`tabSize` from 1 to 32). Clients retain the caret on the body line and
+  discard edits if the document or caret changed while waiting.
 - Document symbols return flat `SymbolInformation` entries ordered by source
   position, using compiler declarations and identifier ranges. Generated
   specializations are excluded. Hierarchical declaration ranges are not provided.
