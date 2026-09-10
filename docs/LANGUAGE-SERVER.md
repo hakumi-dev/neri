@@ -136,18 +136,23 @@ without an owning unit is analyzed independently. Libraries reject `main`, and
 executable units require exactly one entry point for language-server analysis.
 See [project sources and references](PROJECTS.md).
 
-Analysis is synchronous and ordered. The selected unit's source graph is
-flattened for analysis; units are not packages and no dependency artifacts are
-produced. Diagnostic versions let clients discard
-obsolete results, but there is no background cancellation, debounce,
-incremental semantic cache or incremental analysis yet. The bound model for
-each analyzed document is retained for semantic queries. A large analysis can
-delay later messages.
+Text changes apply immediately in protocol order and invalidate affected models.
+Consecutive changes coalesce into one pending analysis per document. Semantic
+queries analyze their current document on demand; newline formatting uses only
+its current syntax. After 150 ms without pending input, the server analyzes one
+dirty document for diagnostics, then checks input again. The last edited document
+has priority. Source membership is retained across text edits and rediscovered
+after open, close and watched-file notifications.
+
+The selected unit's source graph is flattened for synchronous analysis, and its
+bound model is retained for queries. A single large analysis can still delay
+later messages; background cancellation and incremental semantic analysis remain
+unsupported. Diagnostic versions let clients discard obsolete results.
 Transport limits are 2 MiB per message, 8 KiB of headers and 64 nested JSON
 containers. Malformed framing terminates the session; malformed JSON gets a
 parse-error reply. Protocol notices use `window/logMessage`.
 
-Rename and semantic tokens are not advertised or implemented. Built-in types
+Semantic tokens are not advertised or implemented. Built-in types
 and intrinsic operations without source declarations have no definition location.
 Completion and signature repairs do not
 provide general error-tolerant analysis. Background cancellation is unsupported.
