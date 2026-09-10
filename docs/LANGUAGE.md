@@ -84,7 +84,7 @@ equality. A scalar is a Unicode scalar value rather than a grapheme cluster.
 The `text` library retains matching namespace functions and `text.Scalar` for
 explicit scalar construction and UTF-8 encoding.
 
-`@sealed` closes an ordinary class to inheritance. `@representation("utf8")`
+`sealed` closes an ordinary class to inheritance. `@representation("utf8")`
 selects the registered storage for the canonical public `String` declaration in
 `@stdlib/core.hk`. That declaration has methods and no fields, base, type
 parameters or constructor. Literal and factory construction maintain its storage
@@ -131,8 +131,7 @@ object. Other mutable aliases still observe and can modify that storage.
 class Counter
   public value: Int = 0
 
-  @readonly
-  public def read(): Int
+  public readonly def read(): Int
     return this.value
   end
 end
@@ -157,7 +156,7 @@ retain their element-type identity rather than providing array covariance.
 elements. `(readonly T)[]` is a mutable array of readonly references: slots can
 be replaced, while objects accessed through those slots remain readonly.
 
-`@readonly` applies to an instance method and makes its `this` reference readonly.
+`readonly` applies to an instance method and makes its `this` reference readonly.
 Overrides preserve that receiver contract. Such a method may return a fresh
 mutable object, but an object reached through `this` requires a readonly return
 type. Calls through readonly receivers require readonly methods; ordinary
@@ -200,21 +199,27 @@ See [binary file reads](FILES.md) for the bounded file API.
 Module scope contains only namespace/use directives and function/class declarations;
 other tokens produce a parse diagnostic.
 
+Declaration modifiers are keywords before `class` or `def`. When combined, they
+use this order: access (`public`, `internal`, `protected`, or `private`),
+`abstract` or `sealed`, `override`, `static`, `readonly`, `unsafe`, `resource`,
+then `class` or `def`. Only modifiers supported by that declaration kind may
+appear. Compiler annotations such as `@cabi`, `@intrinsic`, `@operator`,
+`@conversion`, `@exact`, `@operation`, and `@representation` remain annotations.
+
 Classes have single inheritance. Classes default to `internal`, fields to
 `private`, and methods to `public`. `internal` is module visibility, `private`
 is declaring-class visibility, and `protected` includes derived classes.
 Instance methods dispatch virtually; exact name and signature override a base
-method. `@override` asserts that relationship. `def static` declares a method
+method. `override` asserts that relationship. `static def` declares a method
 without a receiver. `super.method()` dispatches directly to the base method.
 Omitted arguments use defaults from the statically resolved declaration; supplying
 those defaults preserves virtual dispatch to the receiver's implementation.
 
-`@abstract` has no arguments and appears at most once on a declaration. It marks
-an ordinary class as incomplete, so the class cannot be constructed directly.
-An abstract class may declare abstract instance methods with `@abstract`; these
-declarations are safe, have an empty body, and cannot be `init`, static, or
-private. Abstract classes cannot also be sealed, resources, represented classes,
-or enums.
+`abstract` marks an ordinary class as incomplete, so the class cannot be
+constructed directly. An abstract class may declare abstract instance methods.
+Each abstract method is a signature without a body or its own `end`; it is safe
+and cannot be `init`, static, or private. Abstract classes cannot also be sealed,
+resources, represented classes, or enums.
 
 A concrete subclass implements every inherited method whose nearest declaration
 is abstract. An implementation follows the ordinary override rules: its name,
@@ -223,23 +228,20 @@ abstract declaration exactly. An abstract subclass may leave an obligation
 unimplemented or replace it with another abstract declaration.
 `super.method()` requires a concrete implementation in the resolved base method.
 
-```ruby
-@abstract
-class Shape
-  @abstract
-  def area(): Int
-  end
+```neri
+abstract class Shape
+  abstract def area(): Int
 end
 
 class Square: Shape
-  @override
-  def area(): Int
+  override def area(): Int
     return 4
   end
 end
 ```
 
 This completeness model follows the established rules for abstract
+[types and methods in Crystal](https://crystal-lang.org/reference/1.20/syntax_and_semantics/virtual_and_abstract_types.html),
 [classes](https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/language-specification/classes#15222-abstract-classes)
 and [methods](https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/language-specification/classes#1567-abstract-methods)
 in the C# language specification and the Java Language Specification rules for
@@ -282,7 +284,7 @@ does not insert calls to conversion methods.
 
 These annotations use ordinary instance dispatch, source methods and generic
 specialization. Operands are evaluated once, in order. Readonly receivers require
-`@readonly` methods. Resource classes use their ownership operations and cannot
+`readonly` methods. Resource classes use their ownership operations and cannot
 declare these annotations. Operator and conversion methods remain callable by
 name. Adding a library type requires no new compiler case for its name.
 
@@ -337,8 +339,7 @@ A source-declared contract names the operations a type parameter may use:
 
 ```neri
 contract Named
-  @readonly
-  def label(): String
+  readonly def label(): String
   end
 end
 
@@ -348,15 +349,15 @@ end
 ```
 
 Each requirement is a unique public, safe instance signature with no body,
-defaults, static modifier, or type parameters. A requirement can use `Self`,
-`Self?`, or `Self[]`; a nested generic use such as `Box<Self>` is not supported.
+defaults, abstract or static modifier, or type parameters. A requirement can use
+`Self`, `Self?`, or `Self[]`; a nested generic use such as `Box<Self>` is not supported.
 A contract itself has no type parameters. A generic module function may put one
 source-declared contract after each type parameter's colon. Class bounds and
 generic compiler operations do not accept contracts.
 
 Requirements match structurally. An implementing class supplies an accessible
 public instance method with the exact parameter and result types after replacing
-`Self`; matching does not insert conversions. A `@readonly` requirement requires
+`Self`; matching does not insert conversions. A `readonly` requirement requires
 a readonly implementation. Contract requirements have no runtime value and do
 not introduce dynamic dispatch. Rename does not support contract requirements,
 because structural implementations do not declare their relation to a contract.
@@ -709,7 +710,7 @@ exchange records through typed pointers.
 
 ### Raw memory operations
 
-Raw pointer operations require `def unsafe` or an `unsafe ... end` block. `T*`
+Raw pointer operations require `unsafe def` or an `unsafe ... end` block. `T*`
 is non-null; `T*?` requires a null check before access. Raw pointers do not retain
 managed allocations. Address-of applies to mutable unmanaged locals.
 
@@ -739,7 +740,7 @@ available to the operating system's loader when running the program.
 ```ruby
 @library("m")
 @cabi("cos")
-def unsafe cosine(value: Float): Float
+unsafe def cosine(value: Float): Float
 end
 ```
 
