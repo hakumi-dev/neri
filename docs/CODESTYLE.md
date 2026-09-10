@@ -89,8 +89,9 @@ requests remain available. The default is `true`.
 ## Extending the engine
 
 Implement a `NeriCodeStyleRule` in Neri and register it in
-`neriCodeStyleRules()`. A rule supplies an identifier, option key, category,
-default severity and an evaluator that produces typed findings and edits.
+`neriCodeStyleRules()`. `NeriCodeStyleRule` is abstract, and every concrete rule
+implements `evaluate` as required by the compiler. A rule supplies an identifier,
+option key, category, default severity and typed findings and edits.
 `validateOption` defines the accepted values for its configuration key.
 The CLI and LSP consume those descriptors and results through the shared
 engine. Add a behavior contract for the rule's intended change and important

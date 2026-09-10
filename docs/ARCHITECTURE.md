@@ -86,6 +86,20 @@ user type names.
 Builtin operand types retain their existing operations without traversing the
 class registry for every arithmetic expression.
 
+Abstractness is semantic state on class and method symbols. Binding rejects
+abstract construction and requires a concrete class to close each nearest
+inherited abstract method slot. Abstract source methods contribute no body;
+lowering fills their virtual entries with typed panic stubs, while concrete
+implementations use the existing virtual slots, object layout, and dispatch path.
+The semantic rules keep those stubs unreachable in valid programs. This keeps
+class completeness separate from runtime representation.
+The terminating entry follows the precedent of the
+[Itanium ABI pure-virtual function API (§3.2.6)](https://itanium-cxx-abi.github.io/cxx-abi/abi.html#vcall).
+For valid overrides, the pending virtual slots satisfy
+`O(C) = (O(base(C)) − I(C)) ∪ A(C)`, where `I` contains concrete implementations
+declared in `C` and `A` its abstract declarations. A concrete class requires
+`O(C) = ∅`; binding retains that result on the class symbol.
+
 This separates the operations of a type from its representation, following the
 data abstraction model in [Liskov and Zilles (1974)](https://gleitzman.com/media/docs/adt-liskov.pdf).
 Neri's annotations are a concrete design choice, not an implementation of that
@@ -164,6 +178,11 @@ compiler source list, build graph or language expectations.
 ## Trusted seed
 
 The bootstrap release contains a Neri compiler plus its matching codegen and runtime. It compiles the current sources, and the resulting compiler performs the next verified generation.
+Only the pinned seed stage substitutes compiler paths that have mirrored
+`bootstrap/compiler/*` declarations; this bridges the older seed parser's class
+annotation support and does not enumerate compiler sources. Stage 1 and later
+compile the canonical sources from the current manifest, and bootstrap
+verification compares canonical IR, objects, and binaries to a fixed point.
 
 ## Execution and optimization boundaries
 

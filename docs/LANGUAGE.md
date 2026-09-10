@@ -209,6 +209,43 @@ without a receiver. `super.method()` dispatches directly to the base method.
 Omitted arguments use defaults from the statically resolved declaration; supplying
 those defaults preserves virtual dispatch to the receiver's implementation.
 
+`@abstract` has no arguments and appears at most once on a declaration. It marks
+an ordinary class as incomplete, so the class cannot be constructed directly.
+An abstract class may declare abstract instance methods with `@abstract`; these
+declarations are safe, have an empty body, and cannot be `init`, static, or
+private. Abstract classes cannot also be sealed, resources, represented classes,
+or enums.
+
+A concrete subclass implements every inherited method whose nearest declaration
+is abstract. An implementation follows the ordinary override rules: its name,
+parameter and result types, visibility, and readonly receiver contract match the
+abstract declaration exactly. An abstract subclass may leave an obligation
+unimplemented or replace it with another abstract declaration.
+`super.method()` requires a concrete implementation in the resolved base method.
+
+```ruby
+@abstract
+class Shape
+  @abstract
+  def area(): Int
+  end
+end
+
+class Square: Shape
+  @override
+  def area(): Int
+    return 4
+  end
+end
+```
+
+This completeness model follows the established rules for abstract
+[classes](https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/language-specification/classes#15222-abstract-classes)
+and [methods](https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/language-specification/classes#1567-abstract-methods)
+in the C# language specification and the Java Language Specification rules for
+abstract [classes](https://docs.oracle.com/javase/specs/jls/se8/html/jls-8.html#jls-8.1.1.1)
+and [methods](https://docs.oracle.com/javase/specs/jls/se8/html/jls-8.html#jls-8.4.3.1).
+
 Construction initializes base classes before derived classes. `init` is not
 inherited. An explicit `super(args)` starts a derived initializer when the base
 requires arguments. A valid zero-argument base call is implicit. Inherited fields
