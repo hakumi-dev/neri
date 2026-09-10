@@ -100,6 +100,24 @@ project owns the JetBrains client, grammar, configuration UI and Run/Build/Check
 - `completionItem/resolve` supplies documentation on demand. Items identify the
   document version and analysis revision; changes invalidate earlier requests
   for enrichment. Types and insertion edits do not depend on documentation.
+- Declaration completion offers `class` and `def` templates at the end of a
+  single-line header. Written names, parameters and generic headers are retained.
+  Snippet-capable clients expose editable name, parameter and return-type fields,
+  then place the caret in the body. Body insertion shares the parser-backed
+  newline formatter, preserves existing `end` tokens and follows `.editorconfig`
+  indentation, defaulting to two spaces. Abstract methods remain bodyless.
+  After a parameter or return-type colon, candidates include visible named types,
+  scalar types and in-scope type parameters; `Void` is offered for returns.
+  Inside a class, `override` or `override def` offers unimplemented inherited
+  methods with resolved parameter and return types, visibility and required
+  modifiers. Private methods, constructors, static methods and unresolved bases
+  are excluded. Generated bodies are empty and parameters have no copied default
+  expressions. The developer supplies the implementation.
+  Declaration templates run before project analysis; type and override queries
+  use the existing compiler query path. Space, colon and closing parenthesis
+  trigger contextual completion. Dynamic templates use `isIncomplete` so clients
+  refresh edits as the header changes. Multiline and nested type-annotation
+  completion are outside this declaration-assistance contract.
 - Signature help uses resolved calls, constructors and intrinsic contracts,
   with parameter labels and the active argument. Nested calls and commas inside
   literals are distinguished. A limited delimiter repair supports incomplete
@@ -198,6 +216,14 @@ The server and protocol tests use Neri and C and the compiler's existing native
 toolchain. Transport and semantic analysis have no editor-specific dependencies.
 Semantic features use compiler symbol identity, types and source ranges rather
 than inferring meaning from syntax coloring or CLI output.
+
+Declaration providers live in `compiler/lsp/declarations.hk`,
+`declaration-types.hk` and `declaration-members.hk`. They share current syntax
+context in `declaration-context.hk`, protocol snippet encoding in `snippets.hk`,
+and semantic candidate rules in `compiler/semantic/`. Extensions add contextual
+providers and insertion contracts in `tests/lsp-declaration-contract.hk`.
+Editable fields and refresh behavior follow the
+[LSP completion contract](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#textDocument_completion).
 
 Streaming input uses bounded byte-array chunks, decoded at UTF-8 boundaries,
 and a balanced string join. Repeated `host.appendByte` on an ever-growing array
