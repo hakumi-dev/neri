@@ -135,8 +135,8 @@ Rename and semantic tokens are not advertised or implemented. Built-in types
 and intrinsic operations without source declarations have no definition location.
 Completion and signature repairs do not
 provide general error-tolerant analysis. Background cancellation is unsupported.
-See [acceptance criteria](LSP-ACCEPTANCE.md)
-for language-service quality requirements.
+Language-service improvements and acceptance requirements are tracked in the
+[Kanban](https://github.com/hakumi-dev/neri/issues/55).
 
 ## Optional symbol documentation
 

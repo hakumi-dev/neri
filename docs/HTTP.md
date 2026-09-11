@@ -50,6 +50,8 @@ configuration uses `invalid_address` or `invalid_port`. Socket failures use
 `listen.configure`, `listen.bind`, `listen.start`, `listen.wait` and
 `listen.accept`.
 
+### Stop and drain
+
 Set `options.stop` to an `http.Stop` and call its `request()` synchronously from
 `onListening`, the handler or the log callback to finish serving. A request in
 progress completes its response under the existing I/O deadline; then the server
@@ -59,8 +61,8 @@ requested before serving skips socket acquisition after configuration validation
 Stop objects remain requested and can be inspected with `isRequested()`.
 
 This stop object is confined to the serving thread. It does not preempt an
-application handler. Handler execution remains synchronous and has no imposed
-deadline.
+application handler. Handler execution remains synchronous; a fatal deadline
+requires the explicit option below.
 
 `options.handleInterrupts = true` requests a process interrupt lease for the
 duration of `serveResult`/`serve`. POSIX handles SIGINT and SIGTERM; Windows
@@ -82,7 +84,25 @@ and [SetConsoleCtrlHandler](https://learn.microsoft.com/en-us/windows/console/se
 for platform behavior. The signal path is verified on macOS; Windows console
 delivery requires separate execution evidence.
 
-`http.Options` has two optional callbacks and the optional `stop` object:
+`Options.forceExitAfterStopMilliseconds` opts into a fatal deadline of 1 through
+60000 milliseconds. After `Stop.request()` or a pending owned interrupt, the
+active request may finish normally until the deadline. If it is still running,
+a native watchdog requests whole-process termination with `_Exit(124)`,
+independently of handler cooperation.
+
+Forced exit skips handler unwinding, user cleanup, flush callbacks and runtime
+shutdown. The operating system reclaims process descriptors; close work and
+scheduling mean the deadline is not a real-time termination guarantee. Child
+processes remain the responsibility of their process-group supervisor. See
+[`_exit(2)`](https://man7.org/linux/man-pages/man2/exit.2.html) for Linux's
+process-wide exit semantics.
+
+Without this option, stop is cooperative and cannot bound a handler that loops
+or blocks forever.
+
+### Callbacks
+
+`http.Options` provides optional callbacks for listener startup and logging:
 
 - `onListening: (fn(String): Void)?` receives the address once, after successful
   bind and listen and before accepting connections. Startup failures skip it.
@@ -105,6 +125,8 @@ options.log = fn(message)
   console.println(message)
 end
 ```
+
+### Requests and responses
 
 `Request` exposes `method`, `path`, and `query` as strings. Accepted requests have
 method `GET` or `HEAD`, preserving the received method for the handler. The path keeps percent escapes exactly as received, and ends before
@@ -229,7 +251,7 @@ EOF and socket failures close the connection. Extra requests on the same connect
 are not dispatched. Request bodies, keep-alive, routing, TLS, HTTP/2, streaming,
 and concurrent handlers are outside this API.
 
-The handler runs synchronously. The [stop and drain policy](HTTP-DRAIN.md) permits
+The handler runs synchronously. The [stop and drain policy](#stop-and-drain) permits
 an explicit whole-process deadline after a stop request. Fatal panic or
 forced process termination does not unwind application scopes; the operating
 system reclaims the process's sockets. On supported returns and I/O error paths,
