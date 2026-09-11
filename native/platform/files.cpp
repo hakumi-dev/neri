@@ -15,6 +15,7 @@
 #include <io.h>
 #else
 #include <dirent.h>
+#include <poll.h>
 #include <unistd.h>
 #endif
 
@@ -62,6 +63,38 @@ neri_int_v1 neri_rt_v1_file_close(neri_int_v1 fd) {
   return _close(static_cast<int>(fd));
 #else
   return close(static_cast<int>(fd));
+#endif
+}
+
+neri_int_v1 neri_rt_v1_file_wait_readable(neri_int_v1 fd, neri_int_v1 milliseconds) {
+  if (fd < 0 || fd > INT_MAX || milliseconds < 0 || milliseconds > INT_MAX) {
+    errno = EINVAL; return -1;
+  }
+#if defined(_WIN32)
+  const auto handle = reinterpret_cast<HANDLE>(_get_osfhandle(static_cast<int>(fd)));
+  if (handle == INVALID_HANDLE_VALUE) { errno = EBADF; return -1; }
+  const auto type = GetFileType(handle);
+  if (type == FILE_TYPE_DISK) return 1;
+  if (type != FILE_TYPE_PIPE) { errno = EINVAL; return -1; }
+  const auto deadline = GetTickCount64() + static_cast<ULONGLONG>(milliseconds);
+  for (;;) {
+    DWORD available = 0;
+    if (!PeekNamedPipe(handle, nullptr, 0, nullptr, &available, nullptr)) {
+      if (GetLastError() == ERROR_BROKEN_PIPE) return 1;
+      errno = EIO; return -1;
+    }
+    if (available != 0) return 1;
+    const auto now = GetTickCount64();
+    if (now >= deadline) return 0;
+    const auto remaining = deadline - now;
+    Sleep(static_cast<DWORD>(remaining < 10 ? remaining : 10));
+  }
+#else
+  pollfd descriptor{static_cast<int>(fd), POLLIN, 0};
+  const int result = poll(&descriptor, 1, static_cast<int>(milliseconds));
+  if (result < 0) return errno == EINTR ? -2 : -1;
+  if (descriptor.revents & POLLNVAL) { errno = EBADF; return -1; }
+  return result == 0 ? 0 : 1;
 #endif
 }
 

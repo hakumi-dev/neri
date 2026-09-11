@@ -1,10 +1,17 @@
 # Runtime and IR boundary
 
 The canonical exported declarations and layouts are in
-[`runtime_abi.h`](../native/include/neri/runtime_abi.h). Runtime ABI 1.24 uses a
+[`runtime_abi.h`](../native/include/neri/runtime_abi.h). Runtime ABI 1.25 uses a
 C calling convention on macOS ARM64 and Linux x86-64. Generated programs negotiate
 major version, minimum minor version and required feature bits before execution.
 The package manifest also identifies the toolchain version and native target.
+
+`neri_rt_v1_file_wait_readable(fd, milliseconds)` waits without consuming input.
+It returns `1` for readable input or EOF, `0` for timeout, `-2` for interruption
+and `-1` for failure. The timeout is a nonnegative millisecond count. POSIX uses
+[`poll`](https://pubs.opengroup.org/onlinepubs/9799919799/functions/poll.html);
+Windows supports file and pipe descriptors with
+[`PeekNamedPipe`](https://learn.microsoft.com/en-us/windows/win32/api/namedpipeapi/nf-namedpipeapi-peeknamedpipe).
 
 `String` is declared in `stdlib/core.hk` with the registered `utf8` representation.
 Its semantic methods lower to direct functions with an explicit IR `string`

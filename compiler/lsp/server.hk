@@ -20,6 +20,9 @@ class LspInput
       unsafe
         borrow buffer as pointer
           count = lspRead(0, pointer, buffer.Length)
+          while count == -2
+            count = lspRead(0, pointer, buffer.Length)
+          end
         end
       end
       if count <= 0
@@ -32,6 +35,16 @@ class LspInput
 
     this.position = this.position + 1
     return value
+  end
+
+  def waitReadable(milliseconds: Int): Bool
+    if this.position < this.available
+      return true
+    end
+    unsafe
+      # Errors and EOF go through readByte, which terminates the input loop.
+      return lspWaitReadable(0, milliseconds) != 0
+    end
   end
 end
 
@@ -181,6 +194,8 @@ class LspDocument
   public syntax: SyntaxArena?
   public syntaxRoot: Int = -1
   public analysisRevision: Int = 0
+  public analysisPending: Bool = false
+  public dependencyPaths: StringBuffer?
   public projectKey: String = ""
   public sourceVersions: IntBuffer = new IntBuffer()
   public queryIndex: LspSemanticIndex?
@@ -242,6 +257,7 @@ class LspServer
   public documents: LspDocument?
   public workspaceSymbols: LspWorkspaceSymbol?
   public workspaceSymbolsReady: Bool = false
+  public priorityDocument: LspDocument?
 
   def find(uri: String): LspDocument?
     var document = this.documents
@@ -369,35 +385,18 @@ class LspServer
     var document = this.documents
 
     while document != null
-      this.analyze(document)
+      document.dependencyPaths = null
+      this.invalidate(document)
       document = document.next
     end
   end
 
   def documentUsesPath(document: LspDocument, path: String): Bool
-    let candidate = lspPath(document.uri)
+    let dependencies = document.dependencyPaths
 
-    if candidate == null
-      return false
-    end
-    let lexical = host.pathAbsolute(candidate)
-
-    if lexical == null
-      return false
-    end
-    let sourcePath = this.resolveDocumentPath(document)
-
-    if sourcePath == ""
-      return false
-    end
-    let projectPath = this.nearestProjectRoot(lexical)
-
-    if projectPath == ""
-      return false
-    end
-    let project = neriProjectForSource(projectPath, sourcePath, this.selectedUnit(projectPath))
-
-    return project.error == "" && neriProjectContains(project, sourcePath) && neriProjectContains(project, path)
+    # Unknown membership is conservatively invalidated until analysis succeeds.
+    # Editing text preserves membership; open/close and watched files reset it.
+    return dependencies == null || neriProjectListed(dependencies, path)
   end
 
   def reanalyzePath(path: String, primaryUri: String = ""): Void
@@ -406,13 +405,51 @@ class LspServer
 
     while document != null
       if document.uri == primaryUri || (absolute != null && this.documentUsesPath(document, absolute))
-        this.analyze(document)
+        this.invalidate(document)
       end
       document = document.next
     end
   end
 
+  def invalidate(document: LspDocument): Void
+    document.analysisPending = true
+    document.semantic = null
+    document.tokens = null
+    document.syntax = null
+    document.syntaxRoot = -1
+    document.queryIndex = null
+    document.querySnapshot = null
+    document.analysisRevision = this.nextAnalysisRevision
+    this.nextAnalysisRevision = this.nextAnalysisRevision + 1
+    this.workspaceSymbolsReady = false
+    this.workspaceSymbols = null
+  end
+
+  def ensureAnalyzed(document: LspDocument?): Void
+    if document != null && document.analysisPending
+      this.analyze(document)
+    end
+  end
+
+  def pendingAnalysis(): LspDocument?
+    let priority = this.priorityDocument
+
+    if priority != null && priority.analysisPending
+      return priority
+    end
+    var document = this.documents
+
+    while document != null
+      if document.analysisPending
+        return document
+      end
+      document = document.next
+    end
+    return null
+  end
+
   def analyze(document: LspDocument): Void
+    document.analysisPending = false
     # A failed parse or library load must not expose a previous version's model.
     document.semantic = null
     this.workspaceSymbolsReady = false
@@ -435,6 +472,8 @@ class LspServer
     document.forbiddenEntryPointSources = new StringBuffer()
     var implicitProject = false
     let filePath = lspPath(document.uri)
+
+    document.dependencyPaths = null
 
     if filePath != null && !neriSourceNameValid(filePath)
       this.publish(document, "[{\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":0,\"character\":0}},\"severity\":1,\"code\":\"NR_FILE_NAME\",\"source\":\"neri\",\"message\":\".hk file names must not contain whitespace.\"}]")
@@ -482,6 +521,7 @@ class LspServer
             return
           end
           if neriProjectContains(project, path)
+            document.dependencyPaths = project.sources
             document.renameClosedWorld = project.kind == "executable"
             var ownIndex = 0
 
@@ -794,6 +834,8 @@ class LspServer
       let params = message.get("params")
       let document = this.find(params.get("textDocument").get("uri").value)
 
+      this.ensureAnalyzed(document)
+
       if !this.codeActionLiterals || document == null
         lspResult(id, "[]")
         return true
@@ -821,6 +863,8 @@ class LspServer
     if (method.value == "textDocument/prepareRename" || method.value == "textDocument/rename") && request
       let params = message.get("params")
       let document = this.find(params.get("textDocument").get("uri").value)
+
+      this.ensureAnalyzed(document)
 
       if !this.versionedWorkspaceEdits || document == null
         lspResult(id, "null")
@@ -853,6 +897,8 @@ class LspServer
     if method.value == "textDocument/documentSymbol" && request
       let document = this.find(message.get("params").get("textDocument").get("uri").value)
 
+      this.ensureAnalyzed(document)
+
       if document == null
         lspResult(id, "[]")
       else
@@ -874,6 +920,8 @@ class LspServer
     if (method.value == "textDocument/hover" || method.value == "textDocument/definition" || method.value == "textDocument/typeDefinition" || method.value == "textDocument/references" || method.value == "textDocument/documentHighlight" || method.value == "textDocument/completion" || method.value == "textDocument/signatureHelp") && request
       let params = message.get("params")
       let document = this.find(params.get("textDocument").get("uri").value)
+
+      this.ensureAnalyzed(document)
 
       if document == null
         lspResult(id, "null")
@@ -926,20 +974,13 @@ class LspServer
       while current != null
         if current.uri == uri.value
           this.publish(current, "[]")
+          this.priorityDocument = null
           if previous == null
             this.documents = current.next
           else
             previous.next = current.next
           end
-          if current.sourcePath != ""
-            this.reanalyzePath(current.sourcePath)
-          else
-            let closedPath = lspPath(current.uri)
-
-            if closedPath != null
-              this.reanalyzePath(closedPath)
-            end
-          end
+          this.reanalyze()
           return true
         end
         previous = current
@@ -986,10 +1027,13 @@ class LspServer
       if current != null
         current.text = text.value
         current.version = version
+        this.priorityDocument = current
         let changedPath = this.resolveDocumentPath(current)
 
-        if changedPath == ""
-          this.analyze(current)
+        if method.value == "textDocument/didOpen" && changedPath != ""
+          this.reanalyze()
+        else if changedPath == ""
+          this.invalidate(current)
         else
           this.reanalyzePath(changedPath, current.uri)
         end
@@ -1004,6 +1048,14 @@ def lspMain(): Void
   let input = new LspInput()
 
   while true
+    let pending = server.pendingAnalysis()
+
+    # Drain notifications and serve queries before idle diagnostics. Consecutive
+    # edits replace the pending generation, so each pause analyzes current text.
+    if pending != null && !input.waitReadable(150)
+      server.analyze(pending)
+      continue
+    end
     let body = lspReadMessage(input)
 
     if body == null

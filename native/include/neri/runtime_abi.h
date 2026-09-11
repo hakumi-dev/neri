@@ -23,7 +23,7 @@ extern "C" {
 #endif
 
 #define NERI_RUNTIME_ABI_MAJOR UINT16_C(1)
-#define NERI_RUNTIME_ABI_MINOR UINT16_C(24)
+#define NERI_RUNTIME_ABI_MINOR UINT16_C(25)
 
 #define NERI_RT_FEATURE_PRECISE_GC UINT64_C(1)
 #define NERI_RT_FEATURE_NONMOVING_GC (UINT64_C(1) << 1)
@@ -393,6 +393,9 @@ NERI_RT_API neri_int_v1 neri_rt_v1_net_open(void);
 NERI_RT_API neri_int_v1 neri_rt_v1_file_open(const uint8_t *path, neri_int_v1 length);
 NERI_RT_API neri_int_v1 neri_rt_v1_file_size(neri_int_v1 fd);
 NERI_RT_API neri_int_v1 neri_rt_v1_file_read(neri_int_v1 fd, uint8_t *bytes, neri_int_v1 length);
+/* ABI 1.25: wait without consuming input. 1 means readable/EOF, 0 timeout,
+ * -2 interrupted, -1 error. The timeout is a nonnegative millisecond count. */
+NERI_RT_API neri_int_v1 neri_rt_v1_file_wait_readable(neri_int_v1 fd, neri_int_v1 milliseconds);
 NERI_RT_API neri_int_v1 neri_rt_v1_file_close(neri_int_v1 fd);
 NERI_RT_API neri_int_v1 neri_rt_v1_file_error(void);
 /* ABI 1.15: descriptor-relative, no-follow rooted opens. Return descriptor or
