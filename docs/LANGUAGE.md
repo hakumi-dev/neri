@@ -135,8 +135,13 @@ multiline actions use a block instead. Block `if` bodies begin on the next line;
 
 All supplied source files contribute to one compilation module. `namespace`
 applies to subsequent declarations; `use` exposes a namespace throughout the
-module. `use http`, `use terminal`, `use clock`, and `use files` load their bundled libraries;
-other namespaces do not load files. Duplicate or ambiguous declarations are errors.
+module. A `use` matching a bundled standard-library source loads that library and
+its transitive imports. Other namespaces do not load files. Duplicate or ambiguous
+declarations are errors.
+An unqualified function name resolves in the current namespace before imported
+namespaces, including when an imported function is generic. Explicit type
+arguments apply to the selected declaration; a selected ordinary function reports
+`NR220` when given type arguments. Qualified names select their stated namespace.
 See [binary file reads](FILES.md) for the bounded file API.
 
 Module scope contains only namespace/use directives and function/class declarations;
