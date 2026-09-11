@@ -289,17 +289,50 @@ produce a type error; inference introduces no numeric or unchecked conversions.
 
 Signatures name every parameter and return type. Each used specialization is
 type-checked with concrete arguments, including its body and initializers, and
-compiled once per compilation module. Unused generic bodies are checked when
+compiled once per compilation module. Unconstrained generic bodies are checked when
 specialized. Type parameters accept safe value types; `Void`, raw pointers and
 unresolved types cannot be type arguments. The entry point and C ABI imports have
 concrete signatures.
+
+A module function can require the built-in `Equality` capability with an inline
+bound:
+
+```neri
+def same<T: Equality>(left: T, right: T): Bool
+  return left == right
+end
+```
+
+The compiler checks a constrained template at its declaration, with `T` opaque.
+Its body may compare `T` values, but cannot assume fields, arbitrary methods,
+arithmetic, or conversions. Calls validate the bound for inferred and explicit
+type arguments. Scalars, `Bool`, `String`, and the existing optional forms of
+those built-in equality types satisfy `Equality`; an optional custom class does
+not inherit the capability automatically. A class satisfies it by declaring an
+exact same-type `@operator("==")` method that returns `Bool`. Arrays and classes
+without that operator do not satisfy the capability.
+`test.assertEqual<T: Equality>` uses the same rule.
+Both `==` and `!=` are available through the capability. For a class with a typed
+`==` operator, `!=` negates that comparison when no matching `!=` operator is
+declared. Each operand is evaluated once.
+
+Unconstrained generic functions retain specialization-time checking, so their
+body is checked when concrete arguments are known. `Equality` is a single built-in
+structural capability, not a general trait or interface system. It requires the
+operator shape only; it does not promise reflexivity, symmetry, transitivity, or
+other algebraic properties of a user-defined equality method. User-defined
+interface bounds, method bounds, and class bounds remain outside the current
+surface. The form follows the common practice of declaring generic requirements at
+the parameter, described by [Siek and Lumsdaine](https://arxiv.org/pdf/0708.2255),
+[Rust trait bounds](https://doc.rust-lang.org/book/ch10-02-traits.html), and
+[C# type-parameter constraints](https://learn.microsoft.com/en-us/dotnet/csharp/programming-guide/generics/constraints-on-type-parameters).
 
 The current generic surface consists of module functions and classes with their
 own fields and methods. Static methods accept an explicitly specialized class
 receiver, such as `Container<Int>.create(42)` or
 `library.Container<String>.create("value")`; constructor and method visibility
 still apply. Method-level type parameters, generic class inheritance,
-interface constraints and higher-kinded types are outside this surface. Templates
+user-defined interface constraints and higher-kinded types are outside this surface. Templates
 are supplied as source files in the same compilation invocation, including across
 namespaces. A compiled specialization is concrete; it is not a separately
 importable generic template or a package ABI promise.
