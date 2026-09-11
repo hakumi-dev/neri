@@ -25,5 +25,10 @@ the complete resulting values and error nodes. Keep descriptor validation as
 a separate check. Treat an empty MCP problem list as the connector's result,
 not proof that editor highlighting is clean.
 
+Exercise the production descriptor provider as well as the parser. Read bundled
+plugin schemas through the plugin classloader. The [IntelliJ VFS snapshot](https://plugins.jetbrains.com/docs/intellij/virtual-file-system.html)
+persists across sessions and uses timestamps to detect changes, while reproducible
+archives retain fixed entry timestamps.
+
 ## When to Apply
 When adding or changing EditorConfig properties, schemas, or serialized values.
