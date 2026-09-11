@@ -1,0 +1,342 @@
+@cabi("neri_rt_v1_session_create")
+def unsafe sessionBridgeCreate(): Int
+end
+
+@cabi("neri_rt_v1_session_owner")
+def unsafe sessionBridgeOwner(handle: Int): String
+end
+
+@cabi("neri_rt_v1_session_load_execute")
+def unsafe sessionBridgeLoadExecute(handle: Int, path: String): Int
+end
+
+@cabi("neri_rt_v1_session_reset")
+def unsafe sessionBridgeReset(handle: Int): Int
+end
+
+@cabi("neri_rt_v1_session_destroy")
+def unsafe sessionBridgeDestroy(handle: Int): Int
+end
+
+@cabi("neri_rt_v1_session_error")
+def unsafe sessionBridgeError(handle: Int): String
+end
+
+class SessionExecutionResult
+  public succeeded: Bool
+  public status: Int
+  public message: String
+
+  def init(status: Int, message: String = ""): Void
+    this.status = status
+    this.succeeded = status == 0
+    this.message = message
+  end
+end
+
+class SessionToolchain
+  public compiler: String
+  public linker: String
+  public target: String
+  public workRoot: String
+  public release: Bool
+
+  def init(compiler: String, linker: String, target: String, workRoot: String, release: Bool = false): Void
+    this.compiler = compiler
+    this.linker = linker
+    this.target = target
+    this.workRoot = workRoot
+    this.release = release
+  end
+end
+
+class SessionArtifact
+  public directory: String
+  public source: String
+  public object: String
+  public module: String
+  public next: SessionArtifact?
+  public extraSources: StringBuffer = new StringBuffer()
+
+  def init(directory: String, source: String, object: String, module: String): Void
+    this.directory = directory
+    this.source = source
+    this.object = object
+    this.module = module
+  end
+end
+
+class SessionResponse
+  public prepared: PreparedSubmission
+  public execution: SessionExecutionResult
+
+  def init(prepared: PreparedSubmission, execution: SessionExecutionResult): Void
+    this.prepared = prepared
+    this.execution = execution
+  end
+
+  def format(): String
+    if this.execution.succeeded
+      var bindings = ""
+      var binding = this.prepared.firstBinding
+      while binding != null
+        bindings = bindings + (bindings == "" ? "" : "\n") + binding.name + ": " + binding.typeName
+        binding = binding.next
+      end
+      return bindings == "" ? "ok" : bindings
+    end
+    var result = this.execution.message
+    var diagnostic = this.prepared.diagnostics
+    while diagnostic != null
+      result = result + (result == "" ? "" : "\n") + diagnostic.code + ": " + diagnostic.message
+      diagnostic = diagnostic.next
+    end
+    return result == "" ? "session failed with status " + (this.execution.status as String) : result
+  end
+end
+
+class ExecutableSession
+  private handle: Int
+  private initializerApplied: Bool = false
+  private disposed: Bool = false
+  private artifacts: SessionArtifact?
+  private toolchain: SessionToolchain
+  private ownerIdentity: String
+  private environment: SessionEnvironment
+
+  def init(toolchain: SessionToolchain): Void
+    this.toolchain = toolchain
+    unsafe
+      this.handle = sessionBridgeCreate()
+      this.ownerIdentity = sessionBridgeOwner(this.handle)
+    end
+    this.environment = new SessionEnvironment(this.ownerIdentity)
+  end
+
+  def prepare(source: String): PreparedSubmission
+    return this.environment.prepare(source)
+  end
+
+  private def compile(executionSource: String, snapshot: SessionSourceSnapshot?): String?
+    let directory = bootstrapTemporaryDirectory(this.toolchain.workRoot, "session-module")
+    if directory == null
+      return null
+    end
+    let source = directory + "/submission.hk"
+    let object = directory + "/submission.o"
+    let module = directory + (this.toolchain.target == "windows-x86_64" ? "/submission.dll" : "/submission.module")
+    let artifact = new SessionArtifact(directory, source, object, module)
+    artifact.next = this.artifacts
+    this.artifacts = artifact
+    if !host.writeText(source, executionSource)
+      this.rollbackArtifact(artifact)
+      return null
+    end
+    var compileArguments = ["build"]
+    if snapshot != null
+      var index = 0
+      while index < snapshot.count()
+        let copied = directory + "/source-" + (index as String) + ".hk"
+        artifact.extraSources.add(copied)
+        if !host.writeText(copied, snapshot.sourceAt(index))
+          this.rollbackArtifact(artifact)
+          return null
+        end
+        compileArguments = host.appendString(compileArguments, copied)
+        index = index + 1
+      end
+      index = 0
+      while index < snapshot.libraryCount()
+        let library = directory + "/" + snapshot.libraryNameAt(index) + ".hk"
+        artifact.extraSources.add(library)
+        if !host.writeText(library, snapshot.librarySourceAt(index))
+          this.rollbackArtifact(artifact)
+          return null
+        end
+        index = index + 1
+      end
+    end
+    compileArguments = host.appendString(compileArguments, source)
+    for option in ["--source-root", directory,
+      "--module", this.ownerIdentity, "--session-module", "--target", this.toolchain.target,
+      "--no-cache", "--quiet", "--emit=obj", "--output", object]
+      compileArguments = host.appendString(compileArguments, option)
+    end
+    if this.toolchain.release
+      compileArguments = host.appendString(compileArguments, "--release")
+    end
+    var invocation = ["NERI_STDLIB=" + directory, this.toolchain.compiler]
+    for argument in compileArguments
+      invocation = host.appendString(invocation, argument)
+    end
+    let compileStatus = host.run("/usr/bin/env", invocation)
+    if compileStatus == null || compileStatus != 0
+      this.rollbackArtifact(artifact)
+      return null
+    end
+    var linkArguments = [object, "-o", module]
+    if this.toolchain.target == "macos-arm64"
+      linkArguments = host.appendString(linkArguments, "-dynamiclib")
+      linkArguments = host.appendString(linkArguments, "-Wl,-undefined,dynamic_lookup")
+    else if this.toolchain.target == "linux-x86_64"
+      linkArguments = host.appendString(linkArguments, "-shared")
+      linkArguments = host.appendString(linkArguments, "-Wl,-Bsymbolic")
+    else
+      linkArguments = host.appendString(linkArguments, "-shared")
+    end
+    let linkStatus = host.run(this.toolchain.linker, linkArguments)
+    if linkStatus == null || linkStatus != 0
+      this.rollbackArtifact(artifact)
+      return null
+    end
+    return module
+  end
+
+  private def rollbackArtifact(artifact: SessionArtifact): Void
+    this.artifacts = artifact.next
+    host.removeFile(artifact.module)
+    host.removeFile(artifact.object)
+    host.removeFile(artifact.source)
+    var extra = artifact.extraSources.first.nextNode
+    while extra != null
+      host.removeFile(extra.value)
+      extra = extra.nextNode
+    end
+    bootstrapRemoveRunDirectory(artifact.directory)
+  end
+
+  private def executeModule(prepared: PreparedSubmission, modulePath: String): SessionExecutionResult
+    if this.disposed
+      return new SessionExecutionResult(6, "submission is not executable")
+    end
+    var status = 1
+    var message = ""
+    unsafe
+      status = sessionBridgeLoadExecute(this.handle, modulePath)
+      if status != 0
+        message = sessionBridgeError(this.handle)
+      end
+    end
+    if status == 0 && !this.environment.commit(prepared)
+      return new SessionExecutionResult(6, "prepared submission became stale")
+    end
+    return new SessionExecutionResult(status, message)
+  end
+
+  def execute(prepared: PreparedSubmission): SessionExecutionResult
+    if this.disposed
+      return new SessionExecutionResult(6, "submission is not executable")
+    end
+    let executionSource = this.environment.claimExecution(prepared)
+    if executionSource == null
+      return new SessionExecutionResult(6, "submission is not executable")
+    end
+    let module = this.compile(executionSource, this.environment.claimedSnapshot(prepared))
+    if module == null
+      this.environment.releaseExecution(prepared)
+      return new SessionExecutionResult(7, "session module compilation failed")
+    end
+    let result = this.executeModule(prepared, module)
+    if !result.succeeded
+      this.environment.releaseExecution(prepared)
+    end
+    return result
+  end
+
+  def submit(source: String): SessionResponse
+    let prepared = this.prepare(source)
+    if prepared.status != "complete"
+      return new SessionResponse(prepared, new SessionExecutionResult(6, prepared.status))
+    end
+    return new SessionResponse(prepared, this.execute(prepared))
+  end
+
+  def initialize(prepared: PreparedSubmission): SessionExecutionResult
+    if this.initializerApplied
+      return new SessionExecutionResult(6, "initializer has already run")
+    end
+    let result = this.execute(prepared)
+    if result.succeeded
+      this.initializerApplied = true
+    end
+    return result
+  end
+
+  def initializeProject(projectPath: String, unit: String, functionName: String): SessionExecutionResult
+    if this.disposed
+      return new SessionExecutionResult(1, "session is disposed")
+    end
+    let project = neriLoadProject(projectPath, unit)
+    if project.error != ""
+      return new SessionExecutionResult(6, project.error)
+    end
+    let snapshot = sessionSnapshotFromProject(project)
+    if snapshot.error != ""
+      return new SessionExecutionResult(6, snapshot.error)
+    end
+    let prepared = this.environment.validateInitializer(snapshot, functionName)
+    if prepared.status != "complete"
+      var message = "invalid initializer"
+      let diagnostic = prepared.diagnostics
+      if diagnostic != null
+        message = diagnostic.message
+      end
+      return new SessionExecutionResult(6, message)
+    end
+    return this.initialize(prepared)
+  end
+
+  private def removeArtifacts(): Void
+    var artifact = this.artifacts
+    while artifact != null
+      host.removeFile(artifact.module)
+      host.removeFile(artifact.object)
+      host.removeFile(artifact.source)
+      var extra = artifact.extraSources.first.nextNode
+      while extra != null
+        host.removeFile(extra.value)
+        extra = extra.nextNode
+      end
+      bootstrapRemoveRunDirectory(artifact.directory)
+      artifact = artifact.next
+    end
+    this.artifacts = null
+  end
+
+  def reset(): SessionExecutionResult
+    if this.disposed
+      return new SessionExecutionResult(1, "session is disposed")
+    end
+    var status = 1
+    var message = ""
+    unsafe
+      status = sessionBridgeReset(this.handle)
+      if status != 0
+        message = sessionBridgeError(this.handle)
+      end
+    end
+    if status == 0
+      this.removeArtifacts()
+      this.environment.dispose()
+      this.environment = new SessionEnvironment(this.ownerIdentity)
+      this.initializerApplied = false
+    end
+    return new SessionExecutionResult(status, message)
+  end
+
+  def dispose(): SessionExecutionResult
+    if this.disposed
+      return new SessionExecutionResult(0)
+    end
+    var status = 1
+    unsafe
+      status = sessionBridgeDestroy(this.handle)
+    end
+    if status == 0
+      this.removeArtifacts()
+      this.environment.dispose()
+      this.disposed = true
+    end
+    return new SessionExecutionResult(status)
+  end
+end

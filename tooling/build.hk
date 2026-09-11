@@ -1,3 +1,14 @@
+def packageParentDirectory(path: String): String
+  var slash = -1
+  var index = 0
+  while index < host.stringByteLength(path)
+    if host.stringByteAt(path, index) == (47 as Byte)
+      slash = index
+    end
+    index = index + 1
+  end
+  return slash < 0 ? "." : host.stringSlice(path, 0, slash)
+end
 
 class Build
   public root: String = ""
@@ -26,7 +37,7 @@ class Build
   end
 
   def packageDocuments(): String[]
-    return ["LANGUAGE.md", "ABI.md", "PERFORMANCE.md", "HTTP.md", "HTTP-DRAIN.md", "TERMINAL.md", "FILES.md", "CLOCK.md", "BUFFERS.md", "CRYPTO.md", "RESULT.md", "PROCESS.md", "CHANGES.md"]
+    return ["LANGUAGE.md", "ABI.md", "PERFORMANCE.md", "HTTP.md", "HTTP-DRAIN.md", "TERMINAL.md", "FILES.md", "CLOCK.md", "BUFFERS.md", "CRYPTO.md", "RESULT.md", "PROCESS.md", "CHANGES.md", "SESSIONS.md"]
   end
 
   def init(root: String, seed: String, llvm: String, target: String, mode: String): Void
@@ -101,7 +112,7 @@ class Build
     execute(this.nativeDirectory() + "/neri-host", ["list", this.root + "/compiler", ".hk", inventory])
     var sources: String[] = []
     for path in lines(requiredText(inventory))
-      if !endsWith(path, "/frontend/main.hk") && !endsWith(path, "/semantic/main.hk")
+      if !endsWith(path, "/frontend/main.hk") && !endsWith(path, "/semantic/main.hk") && !contains(path, "/compiler/session/")
         sources = host.appendString(sources, path)
       end
     end
@@ -112,6 +123,15 @@ class Build
   end
 
   def compile(compiler: String, sources: String[], emit: String, output: String): Void
+    if compiler == this.seedCompiler() && emit == "executable"
+      # The seed's linker validates its original manifest schema. Its object
+      # output is verified by current codegen and linked with the current runtime.
+      let object = output + ".seed.o"
+      this.compile(compiler, sources, "obj", object)
+      let triple = this.target == "macos-arm64" ? "arm64-apple-macos" : "x86_64-unknown-linux-gnu"
+      execute(this.llvm + "/bin/clang++", ["--target=" + triple, object, this.nativeDirectory() + "/libneri-runtime.a", "-o", output])
+      return
+    end
     var arguments = this.environment()
     arguments = host.appendString(arguments, compiler)
     arguments = host.appendString(arguments, "build")
@@ -207,6 +227,27 @@ class Build
   def capture(arguments: String[], name: String, seconds: Int): Int
     var command = ["run", seconds as String, this.work + "/" + name + ".stdout",
       this.work + "/" + name + ".stderr", this.work + "/" + name + ".status", "/usr/bin/env"]
+    for argument in arguments command = host.appendString(command, argument) end
+    execute(this.nativeDirectory() + "/neri-host", command)
+    let statuses = lines(requiredText(this.work + "/" + name + ".status"))
+    if statuses.Length != 1
+      fail("invalid child status") return 1
+    end
+    let status = host.parseInt(statuses[0])
+    if status == null
+      fail("invalid child exit code") return 1
+    end
+    return status
+  end
+
+  def captureInput(arguments: String[], name: String, seconds: Int, input: String): Int
+    let inputPath = this.work + "/" + name + ".stdin"
+    if !host.writeText(inputPath, input)
+      fail("cannot write child input") return 1
+    end
+    var command = ["run", seconds as String, this.work + "/" + name + ".stdout",
+      this.work + "/" + name + ".stderr", this.work + "/" + name + ".status",
+      "--stdin", inputPath, "/usr/bin/env"]
     for argument in arguments command = host.appendString(command, argument) end
     execute(this.nativeDirectory() + "/neri-host", command)
     let statuses = lines(requiredText(this.work + "/" + name + ".status"))
@@ -358,21 +399,49 @@ class Build
     return manifest
   end
 
+  def copySessionProject(tree: String): Void
+    let destination = tree + "/share/neri"
+    execute(this.nativeDirectory() + "/neri-host", ["list", this.root + "/compiler", ".hk", this.work + "/session-sources"])
+    for source in lines(requiredText(this.work + "/session-sources"))
+      let relative = host.stringSlice(source, host.stringByteLength(this.root) + 1, host.stringByteLength(source) - host.stringByteLength(this.root) - 1)
+      let output = destination + "/" + relative
+      execute("mkdir", ["-p", packageParentDirectory(output)])
+      execute("cp", [source, output])
+    end
+    execute("cp", [this.root + "/tooling/session-package.json", destination + "/manifest.json"])
+  end
+
+  def artifactDirectoryHashes(tree: String, relative: String): String
+    execute(this.nativeDirectory() + "/neri-host", ["list", tree + "/" + relative, "", this.work + "/artifact-inventory"])
+    var hashes = ""
+    for path in lines(requiredText(this.work + "/artifact-inventory"))
+      let member = host.stringSlice(path, host.stringByteLength(tree) + 1, host.stringByteLength(path) - host.stringByteLength(tree) - 1)
+      hashes = hashes + this.digest(path) + "  " + member + "\n"
+    end
+    return hashes
+  end
+
   def packageTree(directory: String, name: String, sources: String): String
     let tree = directory + "/" + name
-    execute("mkdir", ["-p", tree + "/bin", tree + "/lib", tree + "/libexec", tree + "/docs", tree + "/examples", tree + "/stdlib"])
+    execute("mkdir", ["-p", tree + "/bin", tree + "/lib", tree + "/libexec", tree + "/docs", tree + "/examples/session-consumer", tree + "/stdlib", tree + "/share/neri"])
     for library in this.standardLibraries()
       execute("cp", [this.root + "/stdlib/" + library + ".hk", tree + "/stdlib/" + library + ".hk"])
     end
     this.documentationIndex(tree)
     execute("cp", [this.compiler, tree + "/libexec/neri"])
     execute("cp", [this.root + "/tooling/package-launcher.sh", tree + "/bin/neri"])
+    execute("cp", [this.root + "/tooling/session-launcher.sh", tree + "/bin/neri-session"])
     execute("cp", [this.root + "/tooling/install-launcher.sh", tree + "/install.sh"])
     execute("cp", [this.work + "/neri-install", tree + "/libexec/neri-install"])
     execute("cp", [this.nativeDirectory() + "/neri-host", tree + "/libexec/neri-host"])
+    execute("cp", [this.work + "/neri-session-console", tree + "/libexec/neri-session-console"])
     execute("cp", [this.nativeDirectory() + "/neri-codegen", tree + "/bin/neri-codegen"])
     execute("cp", [this.nativeDirectory() + "/libneri-runtime.a", tree + "/lib/libneri-runtime.a"])
     execute("cp", [this.nativeDirectory() + "/neri-runtime-" + this.target + ".json", tree + "/lib/neri-runtime.json"])
+    this.copySessionProject(tree)
+    for file in ["manifest.json", "main.hk", "service.hk"]
+      execute("cp", [this.root + "/tests/session-package-consumer/" + file, tree + "/examples/session-consumer/" + file])
+    end
     for doc in this.packageDocuments()
       execute("cp", [this.root + "/docs/" + doc, tree + "/docs/" + doc])
     end
@@ -388,10 +457,12 @@ class Build
       execute("cp", [this.root + "/examples/" + example, tree + "/examples/" + example])
       hashes = hashes + this.digest(tree + "/examples/" + example) + "  examples/" + example + "\n"
     end
+    hashes = hashes + this.artifactDirectoryHashes(tree, "share/neri")
+    hashes = hashes + this.artifactDirectoryHashes(tree, "examples/session-consumer")
     for doc in this.packageDocuments()
       hashes = hashes + this.digest(tree + "/docs/" + doc) + "  docs/" + doc + "\n"
     end
-    for artifact in ["bin/neri", "bin/neri-codegen", "libexec/neri", "libexec/neri-install", "libexec/neri-host", "install.sh", "lib/libneri-runtime.a", "lib/neri-runtime.json", "SOURCE-MANIFEST.sha256"]
+    for artifact in ["bin/neri", "bin/neri-session", "bin/neri-codegen", "libexec/neri", "libexec/neri-session-console", "libexec/neri-install", "libexec/neri-host", "install.sh", "lib/libneri-runtime.a", "lib/neri-runtime.json", "SOURCE-MANIFEST.sha256"]
       hashes = hashes + this.digest(tree + "/" + artifact) + "  " + artifact + "\n"
     end
     if !host.writeText(tree + "/ARTIFACTS.sha256", hashes)
@@ -402,7 +473,7 @@ class Build
       fail("cannot write provenance")
     end
     execute("chmod", ["-R", "u=rwX,go=rX", tree])
-    execute("chmod", ["755", tree + "/bin/neri", tree + "/bin/neri-codegen", tree + "/libexec/neri", tree + "/libexec/neri-install", tree + "/libexec/neri-host", tree + "/install.sh"])
+    execute("chmod", ["755", tree + "/bin/neri", tree + "/bin/neri-session", tree + "/bin/neri-codegen", tree + "/libexec/neri", tree + "/libexec/neri-session-console", tree + "/libexec/neri-install", tree + "/libexec/neri-host", tree + "/install.sh"])
     execute(this.nativeDirectory() + "/neri-host", ["stamp", tree, "0"])
     execute(this.nativeDirectory() + "/neri-host", ["list", tree, "", this.work + "/members"])
     var members = ""
@@ -458,6 +529,13 @@ class Build
       installer = host.appendString(installer, option)
     end
     execute("/usr/bin/env", installer)
+    var sessionConsole = this.environment()
+    for option in [this.compiler, "build", "--project", this.root + "/manifest.json", "--unit", "session-console",
+      "--source-root", this.root, "--module", "neri-session-console",
+      "--target", this.target, "--release", "--output", this.work + "/neri-session-console"]
+      sessionConsole = host.appendString(sessionConsole, option)
+    end
+    execute("/usr/bin/env", sessionConsole)
     if this.sourceManifest() != sources
       fail("sources changed during package validation")
     end
@@ -523,6 +601,26 @@ class Build
     end
     let documentedToolchain = this.installedToolchain(prefix, "installed-documentation-link")
     execute("test", ["-d", documentedToolchain + "/docs"])
+    execute("test", ["-x", prefix + "/bin/neri-session"])
+    let sessionConsumerProject = documentedToolchain + "/examples/session-consumer/manifest.json"
+    let sessionConsumer = this.work + "/installed-session-consumer"
+    let sessionBuild = ["-i", "PATH=" + envOr("PATH", "/usr/bin:/bin"), "LC_ALL=C", "LLVM_PREFIX=" + this.llvm,
+      launcher, "build", "--project", sessionConsumerProject, "--unit", "consumer", "--release", "--output", sessionConsumer]
+    if this.capture(sessionBuild, "installed-session-build", 60) != 0
+      fail("installed package session library cannot build an independent consumer")
+    end
+    let sessionRun = ["-i", "PATH=" + envOr("PATH", "/usr/bin:/bin"), "LC_ALL=C", "TZ=UTC",
+      "SDKROOT=" + envOr("SDKROOT", ""),
+      "NERI_HOST=" + documentedToolchain + "/libexec/neri-host",
+      "NERI_CODEGEN=" + documentedToolchain + "/bin/neri-codegen",
+      "NERI_RUNTIME_MANIFEST=" + documentedToolchain + "/lib/neri-runtime.json",
+      "NERI_STDLIB=" + documentedToolchain + "/stdlib", "NERI_LIBRARY_PATH=" + documentedToolchain + "/lib",
+      "NERI_LINKER=" + this.llvm + "/bin/clang++",
+      sessionConsumer, documentedToolchain + "/libexec/neri", this.llvm + "/bin/clang++", this.target,
+      this.work, sessionConsumerProject]
+    if this.capture(sessionRun, "installed-session-run", 60) != 0 || requiredText(this.work + "/installed-session-run.stdout") != "17\n"
+      fail("installed package session library cannot initialize and submit")
+    end
     execute(this.packagedTree + "/install.sh", ["--no-doc", "--prefix", prefix])
     let noDocumentationToolchain = this.installedToolchain(prefix, "installed-no-documentation-link")
     if documentedToolchain == noDocumentationToolchain
@@ -830,6 +928,83 @@ class Build
     end
   end
 
+  def sessionProbe(directory: String, name: String, source: String, module: String): Void
+    var arguments = this.environment()
+    for argument in [this.compiler, "build", this.root + "/tests/" + source, "--module", module, "--session-module", "--emit=obj", "--release", "--output", directory + "/" + name + ".o"]
+      arguments = host.appendString(arguments, argument)
+    end
+    execute("/usr/bin/env", arguments)
+    var link = [directory + "/" + name + ".o", "-o", directory + "/" + name + ".module"]
+    if this.target == "macos-arm64"
+      link = host.appendString(link, "-dynamiclib")
+      link = host.appendString(link, "-Wl,-undefined,dynamic_lookup")
+    else
+      link = host.appendString(link, "-shared")
+      link = host.appendString(link, "-Wl,-Bsymbolic")
+    end
+    execute(this.llvm + "/bin/clang++", link)
+  end
+
+  def sessionContracts(): Void
+    let directory = this.work + "/session-contracts"
+    execute("mkdir", ["-p", directory])
+    this.sessionProbe(directory, "probe", "session-probe.hk", "session-probe")
+    this.sessionProbe(directory, "probe-next", "session-probe-next.hk", "session-probe")
+    this.sessionProbe(directory, "probe-mismatch", "session-probe-next.hk", "session-other")
+    this.sessionProbe(directory, "probe-layout-mismatch", "session-probe-layout-mismatch.hk", "session-probe")
+    execute("mkdir", ["-p", directory + "/stdlib"])
+    for library in this.standardLibraries()
+      execute("cp", [this.root + "/stdlib/" + library + ".hk", directory + "/stdlib/" + library + ".hk"])
+    end
+    var arguments = this.environment()
+    for argument in [this.compiler, "build", "--project", this.root + "/manifest.json", "--unit", "session-contracts", "--output", directory + "/driver"]
+      arguments = host.appendString(arguments, argument)
+    end
+    execute("/usr/bin/env", arguments)
+    var run = this.environment()
+    run = host.appendString(run, "NERI_STDLIB=" + directory + "/stdlib")
+    for argument in [directory + "/driver", this.compiler, this.llvm + "/bin/clang++", this.target, directory, this.root]
+      run = host.appendString(run, argument)
+    end
+    if this.capture(run, "session-contracts", 180) != 0
+      fail("session contracts failed")
+    end
+    this.sessionTerminalContracts()
+  end
+
+  def sessionTerminalContracts(): Void
+    let directory = this.work + "/session-contracts"
+    var readBuild = this.environment()
+    for argument in [this.compiler, "build", this.root + "/tests/console-readline-contract.hk", "--output", directory + "/console-readline-contract"]
+      readBuild = host.appendString(readBuild, argument)
+    end
+    execute("/usr/bin/env", readBuild)
+    var readRun = this.environment()
+    readRun = host.appendString(readRun, directory + "/console-readline-contract")
+    if this.captureInput(readRun, "console-readline-contract", 30, "\nvalue\n") != 0
+      fail("optional console line contract failed")
+    end
+
+    var consoleBuild = this.environment()
+    for argument in [this.compiler, "build", "--project", this.root + "/manifest.json", "--unit", "session-console", "--output", directory + "/session-console"]
+      consoleBuild = host.appendString(consoleBuild, argument)
+    end
+    execute("/usr/bin/env", consoleBuild)
+    var consoleRun = this.environment()
+    for argument in ["NERI_SESSION_COMPILER=" + this.compiler,
+      "NERI_LINKER=" + this.llvm + "/bin/clang++", "NERI_TARGET=" + this.target,
+      "NERI_SESSION_WORK=" + directory, directory + "/session-console"]
+      consoleRun = host.appendString(consoleRun, argument)
+    end
+    if this.captureInput(consoleRun, "session-console", 60, "\nlet value = 1\n.\n:reset\n") != 0
+      fail("session console failed")
+    end
+    let output = requiredText(this.work + "/session-console.stdout")
+    if !contains(output, "value: Int\n") || !contains(output, "reset\n")
+      fail("session console did not format bindings and reset")
+    end
+  end
+
   def test(): Void
     this.bootstrap(false)
     var lspArguments = this.environment()
@@ -844,6 +1019,7 @@ class Build
     execute("/usr/bin/env", projectArguments)
     this.unicodeProjectContracts()
     this.projectManifestContracts()
+    this.sessionContracts()
     this.standardLibraryContracts()
     this.fileContracts()
     execute("ctest", ["--test-dir", this.nativeDirectory(), "--output-on-failure", "--no-tests=error"])

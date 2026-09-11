@@ -153,6 +153,10 @@ void stamp(const char *root, const char *epoch) {
 #else
 void run(int argc, char **argv) {
   if (argc < 7) throw std::runtime_error("run <seconds> <stdout> <stderr> <status> <executable> [args...]");
+  const bool has_input = argc >= 9 && std::string(argv[6]) == "--stdin";
+  const int executable_index = has_input ? 8 : 6;
+  if (argc <= executable_index)
+    throw std::runtime_error("run requires an executable after --stdin <path>");
   std::size_t consumed = 0;
   const int seconds = std::stoi(argv[2], &consumed);
   if (consumed != std::strlen(argv[2]) || seconds < 1 || seconds > 3600)
@@ -162,16 +166,17 @@ void run(int argc, char **argv) {
   check(posix_spawn_file_actions_init(&actions), "file actions");
   check(posix_spawnattr_init(&attributes), "spawn attributes");
   try {
-    check(posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, "/dev/null", O_RDONLY, 0), "stdin");
+    check(posix_spawn_file_actions_addopen(&actions, STDIN_FILENO,
+                                           has_input ? argv[7] : "/dev/null", O_RDONLY, 0), "stdin");
     check(posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, argv[3], O_WRONLY | O_CREAT | O_TRUNC, 0600), "stdout");
     check(posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, argv[4], O_WRONLY | O_CREAT | O_TRUNC, 0600), "stderr");
     check(posix_spawnattr_setflags(&attributes, POSIX_SPAWN_SETPGROUP), "process group flags");
     check(posix_spawnattr_setpgroup(&attributes, 0), "process group");
     std::vector<char *> arguments;
-    for (int index = 6; index < argc; ++index) arguments.push_back(argv[index]);
+    for (int index = executable_index; index < argc; ++index) arguments.push_back(argv[index]);
     arguments.push_back(nullptr);
     pid_t child = 0;
-    check(posix_spawnp(&child, argv[6], &actions, &attributes, arguments.data(), environ), "spawn");
+    check(posix_spawnp(&child, argv[executable_index], &actions, &attributes, arguments.data(), environ), "spawn");
     const auto started = std::chrono::steady_clock::now();
     const auto deadline = started + std::chrono::seconds(seconds);
     int status = 0;
