@@ -14,7 +14,34 @@ class SemanticCompletionCandidate
   public kind: Int = 0
   public detail: String = ""
   public identity: String = ""
+  public hasParameters: Bool = false
   public next: SemanticCompletionCandidate?
+end
+
+class SemanticCompletionFilter
+  public marker: String = ""
+
+  def excludes(name: String, identity: String): Bool
+    return this.marker != "" && name == this.marker
+  end
+end
+
+class SemanticCompletionInsertion
+  public text: String = ""
+  public cursorByteOffset: Int = 0
+end
+
+# Adapters share the edit decision; only a protocol adapter encodes snippets.
+def semanticCompletionInsertion(candidate: SemanticCompletionCandidate, target: SemanticCompletionTarget, site: SemanticCompletionSite): SemanticCompletionInsertion
+  let result = new SemanticCompletionInsertion()
+
+  result.text = candidate.insertText
+  result.cursorByteOffset = host.stringByteLength(result.text)
+  if (candidate.kind == 2 || candidate.kind == 3) && target.addCall && !site.expectsFunction
+    result.text = result.text + "()"
+    result.cursorByteOffset = result.cursorByteOffset + (candidate.hasParameters ? 1 : 2)
+  end
+  return result
 end
 
 class SemanticCompletionList
@@ -23,6 +50,7 @@ class SemanticCompletionList
   public count: Int = 0
   public limit: Int = 128
   public truncated: Bool = false
+  public filter: SemanticCompletionFilter?
 
   def init(limit: Int = 128): Void
     if limit > 0 && limit < 128
@@ -35,6 +63,7 @@ def semanticCompletionUtf16Slice(text: String, start: Int, length: Int): String
   let map = new IrSourceMap(text)
   let first = map.offsetAt(start)
   let last = map.offsetAt(start + length)
+
   return host.stringSlice(text, first, last - first)
 end
 
@@ -124,7 +153,12 @@ def semanticCompletionTarget(text: String, position: Int): SemanticCompletionTar
     result.addCall = false
   end
   result.addCall = false if result.kind == "import"
-  result.addCall = false if following >= 0 && tokens.kindAt(following) == "LParen"
+  if following >= 0
+    let parser = new BootstrapParser(tokens)
+
+    parser.position = following
+    result.addCall = false if tokens.kindAt(following) == "LParen" || parser.genericSuffix()
+  end
   result.valid = true
   return result
 end
@@ -148,7 +182,7 @@ def semanticCompletionSite(model: SemanticModel, target: SemanticCompletionTarge
         let siteCallable = site.callable
         let callableDiffers = (selectedCallable == null && siteCallable != null) || (selectedCallable != null && siteCallable == null) || (selectedCallable != null && siteCallable != null && selectedCallable.fullName != siteCallable.fullName)
 
-        if callableDiffers || selected.receiverKind != site.receiverKind || selected.receiverType != site.receiverType || selected.namespaceName != site.namespaceName || selected.className != site.className
+        if callableDiffers || selected.receiverKind != site.receiverKind || selected.receiverType != site.receiverType || selected.namespaceName != site.namespaceName || selected.className != site.className || selected.expectsFunction != site.expectsFunction
           ambiguous = true
         end
       end
@@ -176,8 +210,10 @@ def semanticCompletionHas(values: SemanticCompletionList, name: String): Bool
   return false
 end
 
-def semanticCompletionAdd(values: SemanticCompletionList, prefix: String, name: String, insertText: String, kind: Int, detail: String, identity: String = ""): Void
-  if name == "" || bootstrapStartsWith(name, "__neri_") || bootstrapStartsWith(name, "__NeriSession") || !bootstrapStartsWith(name, prefix) || semanticCompletionHas(values, name)
+def semanticCompletionAdd(values: SemanticCompletionList, prefix: String, name: String, insertText: String, kind: Int, detail: String, identity: String = "", hasParameters: Bool = false): Void
+  let filter = values.filter
+
+  if name == "" || (filter != null && filter.excludes(name, identity)) || !bootstrapStartsWith(name, prefix) || semanticCompletionHas(values, name)
     return
   end
   if values.count >= values.limit
@@ -191,6 +227,7 @@ def semanticCompletionAdd(values: SemanticCompletionList, prefix: String, name: 
   candidate.kind = kind
   candidate.detail = detail
   candidate.identity = identity
+  candidate.hasParameters = hasParameters
   if values.first == null
     values.first = candidate
   else
@@ -268,6 +305,7 @@ def semanticCompletionAddClassMembers(values: SemanticCompletionList, model: Sem
   while current != null && steps < 256
     if !staticOnly
       var field = current.firstField
+
       while field != null
         if semanticCompletionAccessible(model, site, field.owner, field.access) && !(semanticIsReadonly(site.receiverType) && semanticContainsPointer(field.typeName))
           semanticCompletionAdd(values, prefix, field.name, field.name, 5, field.owner + "." + field.name + ": " + semanticViewMember(site.receiverType, field.typeName), "field:" + field.owner + "." + field.name)
@@ -276,11 +314,13 @@ def semanticCompletionAddClassMembers(values: SemanticCompletionList, model: Sem
       end
     end
     var method = current.firstMethod
+
     while method != null
       let receiverMatches = staticOnly ? method.isStatic : !method.isStatic
       let readonlyMatches = staticOnly || !semanticIsReadonly(site.receiverType) || method.isReadonly
+
       if method.name != "init" && receiverMatches && readonlyMatches && semanticCompletionAccessible(model, site, method.className, method.access)
-        semanticCompletionAdd(values, prefix, method.name, method.name, 2, semanticCompletionCallableDetail(method), "callable:" + method.fullName)
+        semanticCompletionAdd(values, prefix, method.name, method.name, 2, semanticCompletionCallableDetail(method), "callable:" + method.fullName, method.parameterCount > 0)
       end
       method = method.nextCallable
     end
@@ -300,7 +340,7 @@ def semanticCompletionFunctions(values: SemanticCompletionList, model: SemanticM
         let visible = namespaceOnly ? function.namespaceName == site.receiverType : semanticCompletionResolveFunction(model, site.namespaceName, function.name) == function.fullName
 
         if visible
-          semanticCompletionAdd(values, prefix, function.name, function.name, 3, semanticCompletionCallableDetail(function), "callable:" + function.fullName)
+          semanticCompletionAdd(values, prefix, function.name, function.name, 3, semanticCompletionCallableDetail(function), "callable:" + function.fullName, function.parameterCount > 0)
         end
       end
       function = function.nextCallable
@@ -351,7 +391,14 @@ def semanticCompletionGenerics(values: SemanticCompletionList, model: SemanticMo
           let candidateKind = kind == "Class" ? 7 : 3
           let label = kind == "Class" ? "class " : "function "
 
-          semanticCompletionAdd(values, prefix, name, name, candidateKind, label + semanticCompletionGenericDetail(syntax, node), "generic:" + genericSyntaxName(syntax, node))
+          var hasParameters = false
+          var childIndex = 0
+
+          while childIndex < syntax.childCountAt(node)
+            hasParameters = true if syntax.kindAt(syntax.childAt(node, childIndex)) == "Parameter"
+            childIndex = childIndex + 1
+          end
+          semanticCompletionAdd(values, prefix, name, name, candidateKind, label + semanticCompletionGenericDetail(syntax, node), "generic:" + genericSyntaxName(syntax, node), hasParameters)
         end
       end
     end
@@ -403,12 +450,14 @@ def semanticCompletionImportCandidates(values: SemanticCompletionList, model: Se
 
   while current != null
     var index = 0
+
     while index < current.declaredNamespaces.size
       let namespaceName = current.declaredNamespaces.get(index)
       var name = namespaceName
 
       if namespacePrefix != ""
         let prefixLength = host.stringByteLength(namespacePrefix)
+
         if !bootstrapStartsWith(namespaceName, namespacePrefix + ".")
           index = index + 1
           continue
@@ -422,7 +471,7 @@ def semanticCompletionImportCandidates(values: SemanticCompletionList, model: Se
     while index < current.usedNames.size
       let name = current.usedNames.get(index)
 
-      if namespacePrefix == "" && name != "__neri_completion_site_7f31__"
+      if namespacePrefix == ""
         semanticCompletionAdd(values, prefix, name, name, 9, "import " + name, "namespace:" + name)
       end
       index = index + 1
@@ -431,9 +480,10 @@ def semanticCompletionImportCandidates(values: SemanticCompletionList, model: Se
   end
 end
 
-def semanticCompletionCandidates(model: SemanticModel, site: SemanticCompletionSite, prefix: String, limit: Int = 128, availableImports: StringBuffer? = null): SemanticCompletionList
+def semanticCompletionCandidates(model: SemanticModel, site: SemanticCompletionSite, prefix: String, limit: Int = 128, availableImports: StringBuffer? = null, filter: SemanticCompletionFilter? = null): SemanticCompletionList
   let values = new SemanticCompletionList(limit)
 
+  values.filter = filter
   if site.receiverKind == "instance"
     if site.receiverType == "Error" || semanticIsOptional(site.receiverType)
       return values
@@ -450,7 +500,7 @@ def semanticCompletionCandidates(model: SemanticModel, site: SemanticCompletionS
 
       while requirement != null
         if requirement.operatorName == ""
-          semanticCompletionAdd(values, prefix, requirement.name, requirement.name, 2, semanticCompletionCallableDetail(requirement), "contract-member:" + contract.fullName + "." + requirement.name)
+          semanticCompletionAdd(values, prefix, requirement.name, requirement.name, 2, semanticCompletionCallableDetail(requirement), "contract-member:" + contract.fullName + "." + requirement.name, requirement.parameterCount > 0)
         end
         requirement = requirement.nextCallable
       end
@@ -482,11 +532,13 @@ def semanticCompletionCandidates(model: SemanticModel, site: SemanticCompletionS
     end
   else
     var symbol = site.firstSymbol
+
     while symbol != null
       semanticCompletionAdd(values, prefix, symbol.name, symbol.name, 6, symbol.name + ": " + symbol.typeName, symbol.identity)
       symbol = symbol.next
     end
     let callable = site.callable
+
     if site.className != "" && callable != null && !callable.isStatic
       semanticCompletionAdd(values, prefix, "this", "this", 14, "this: " + site.className)
     end
