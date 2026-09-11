@@ -44,8 +44,8 @@ working directory, selected SDK/developer tools, deployment target and PATH.
 File identities include device/inode, permissions, size and nanosecond mtime/ctime
 for codegen, the linker, runtime archive and selected platform link inputs.
 Access time is excluded. This cache assumes installed LLVM and SDK distributions
-are immutable; use `--no-cache` when developing or modifying their internal
-dependencies. External `@library` dependencies and custom search/injection
+and their transitive native dependencies are immutable; use `--no-cache` when
+developing or modifying these dependencies. External `@library` dependencies and custom search/injection
 environments are uncached. Other host ABIs use the uncached path.
 
 Each entry contains the executable and its file-identity receipt, under a
@@ -133,6 +133,13 @@ recorded 15.67 s with an empty object cache and 5.21 s with all five objects
 reused. Maximum resident memory was 830 MB and 472 MB respectively. Frontend
 work remained about 3.7 s in both builds. These are single sequential build
 observations, not complete `sumi c` startup measurements or latency percentiles.
+
+With the validated toolchain installed, Sumi's separate `prepare-console` command
+took 17.90 s. Two subsequent `sumi c` invocations reached `app ready` and exited
+on EOF in 2.35 s and 0.84 s. These include application initialization and shutdown.
+Object keys include owner and configuration paths; Sumi's fresh preparation
+directory can therefore cause conservative misses between preparations. The
+stable-project cache measurement above isolates Neri's object reuse.
 
 ## Executable sessions
 
