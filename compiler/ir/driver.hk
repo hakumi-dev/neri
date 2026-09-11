@@ -303,7 +303,7 @@ def bootstrapCodegenEmitName(emit: String): String
   return "llvm-ir"
 end
 
-def bootstrapInvokeCodegen(module: IrModule, emit: String, output: String, target: String, release: Bool, debugSources: BootstrapSourceInput? = null, metricsPath: String = ""): Bool
+def bootstrapInvokeCodegen(module: IrModule, emit: String, output: String, target: String, release: Bool, debugSources: BootstrapSourceInput? = null, metricsPath: String = "", serializedInput: String = ""): Bool
   let optionalCodegen = host.environment("NERI_CODEGEN")
 
   if optionalCodegen == null || optionalCodegen == ""
@@ -315,7 +315,7 @@ def bootstrapInvokeCodegen(module: IrModule, emit: String, output: String, targe
   var serializeStarted = 0
 
   serializeStarted = runCacheTime() if metricsPath != ""
-  let serialized = irSerializeEnvelopeHex(module)
+  let serialized = serializedInput == "" ? irSerializeEnvelopeHex(module) : serializedInput
   var serializeMilliseconds = 0
 
   serializeMilliseconds = runCacheTime() - serializeStarted if metricsPath != ""
@@ -374,6 +374,13 @@ def bootstrapInvokeCodegen(module: IrModule, emit: String, output: String, targe
 end
 
 def bootstrapLinkExecutable(module: IrModule, objectPath: String, output: String, target: String): Bool
+  let objects = new StringBuffer()
+
+  objects.add(objectPath)
+  return bootstrapLinkObjects(module, objects, output, target)
+end
+
+def bootstrapLinkObjects(module: IrModule, objects: StringBuffer, output: String, target: String): Bool
   let optionalManifest = host.environment("NERI_RUNTIME_MANIFEST")
 
   if optionalManifest == null || optionalManifest == ""
@@ -437,7 +444,7 @@ def bootstrapLinkExecutable(module: IrModule, objectPath: String, output: String
     linker = configuredLinker
   end
   let sessionRuntime = bootstrapFeaturePresent(requiredFeatures, 8388608)
-  var arguments = platformLinkArguments(target, objectPath, optionalRuntime, output, sessionRuntime)
+  var arguments = platformLinkObjectsArguments(target, objects, optionalRuntime, output, sessionRuntime)
 
   # Session-loaded code can use crypto even when the host object has no direct
   # crypto call, so Linux must link libcrypto for a session host as well.
@@ -504,7 +511,14 @@ def bootstrapEmitNative(module: IrModule, emit: String, output: String, target: 
   let linked = bootstrapLinkExecutable(module, objectPath, output, target)
 
   runCacheReport(timings, "link", linkStarted)
-  if linked && !release && target == "macos-arm64"
+  let symbols = !linked || bootstrapExecutableSymbols(output, target, release)
+
+  host.removeFile(objectPath)
+  return linked && symbols
+end
+
+def bootstrapExecutableSymbols(output: String, target: String, release: Bool): Bool
+  if !release && target == "macos-arm64"
     var symbolTool = "dsymutil"
     let configured = host.environment("NERI_DSYMUTIL")
 
@@ -517,6 +531,141 @@ def bootstrapEmitNative(module: IrModule, emit: String, output: String, target: 
       return false
     end
   end
-  host.removeFile(objectPath)
-  return linked
+  return true
+end
+
+def bootstrapUnitSources(module: IrModule, sources: BootstrapSourceInput?): BootstrapSourceInput?
+  var first: BootstrapSourceInput? = null
+  var last: BootstrapSourceInput? = null
+  var source = sources
+
+  while source != null
+    var declared = module.firstSource
+
+    while declared != null && declared.id != source.id
+      declared = declared.nextSource
+    end
+    if declared != null
+      let copy = new BootstrapSourceInput(source.path, source.id, source.text)
+      let tail = last
+
+      if tail == null
+        first = copy
+      else
+        tail.nextInput = copy
+      end
+      last = copy
+    end
+    source = source.nextInput
+  end
+  return first
+end
+
+def bootstrapAotConfiguration(owners: StringBuffer): String?
+  let manifests = new StringBuffer()
+  var result = ""
+  var owner = owners.first.nextNode
+
+  while owner != null
+    var separator = host.stringByteLength(owner.value) - 1
+
+    while separator >= 0 && host.stringByteAt(owner.value, separator) != (35 as Byte)
+      separator = separator - 1
+    end
+    if separator > 0
+      let path = host.stringSlice(owner.value, 0, separator)
+
+      if !neriProjectListed(manifests, path)
+        let contents = host.readText(path)
+
+        if contents == null
+          return null
+        end
+        manifests.add(path)
+        result = result + runCacheFrame(path) + runCacheFrame(contents)
+      end
+    end
+    owner = owner.nextNode
+  end
+  return result
+end
+
+def bootstrapCompileUnit(unit: IrCompilationUnit, target: String, release: Bool, timings: Bool, noCache: Bool, sources: BootstrapSourceInput?, configuration: String, temporaryDirectories: StringBuffer): String?
+  let started = runCacheTime()
+  let payload = irSerializePayload(unit.module)
+  let payloadDigest = sha256FastWire(payload.bytes)
+  let cache = new RunCache()
+  let unitSources = bootstrapUnitSources(unit.module, sources)
+
+  if !noCache
+    cache.prepare(unit.module, target, release, unitSources, "neri-aot-object-cache-v2",
+      runCacheFrame(unit.owner) + runCacheFrame(configuration), [], payloadDigest, true)
+  end
+  let hit = cache.hit()
+
+  runCacheReport(timings, hit ? "object-cache-hit" : "object-cache-miss", started)
+  if hit
+    return cache.executable
+  end
+  var directory: String? = null
+
+  if cache.directory != ""
+    directory = bootstrapTemporaryDirectory(bootstrapDirectory(cache.directory), "pending-object")
+  end
+  directory = bootstrapRunDirectory() if directory == null
+
+  if directory == null
+    console.println("could not create temporary object directory")
+    return null
+  end
+  let path = directory + "/program"
+  let codegenStarted = runCacheTime()
+  let serialized = irSerializeEnvelopePayloadHex(unit.module, payload, payloadDigest)
+
+  if !bootstrapInvokeCodegen(unit.module, "obj", path, target, release, unitSources, "", serialized)
+    bootstrapRemoveRunDirectory(directory)
+    return null
+  end
+  runCacheReport(timings, "object-codegen", codegenStarted)
+  if cache.publish(directory)
+    return cache.executable
+  end
+  if cache.hit()
+    bootstrapRemoveRunDirectory(directory)
+    return cache.executable
+  end
+  temporaryDirectories.add(directory)
+  return path
+end
+
+def bootstrapEmitCompilationUnits(module: IrModule, units: IrCompilationUnit, output: String, target: String, release: Bool, timings: Bool, noCache: Bool, sources: BootstrapSourceInput?, configuration: String): Bool
+  let objects = new StringBuffer()
+  let temporaryDirectories = new StringBuffer()
+  var unit: IrCompilationUnit? = units
+  var succeeded = true
+
+  while unit != null && succeeded
+    let object = bootstrapCompileUnit(unit, target, release, timings, noCache, sources, configuration, temporaryDirectories)
+
+    if object == null
+      succeeded = false
+    else
+      objects.add(object)
+    end
+    unit = unit.next
+  end
+  if succeeded
+    let started = runCacheTime()
+
+    succeeded = bootstrapLinkObjects(module, objects, output, target)
+    runCacheReport(timings, "link", started)
+    succeeded = bootstrapExecutableSymbols(output, target, release) if succeeded
+  end
+  var temporary = temporaryDirectories.first.nextNode
+
+  while temporary != null
+    bootstrapRemoveRunDirectory(temporary.value)
+    temporary = temporary.nextNode
+  end
+  return succeeded
 end

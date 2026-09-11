@@ -201,6 +201,7 @@ public:
         output_(std::make_unique<llvm::Module>(input.id, context)),
         retained_modules_(std::ranges::find(input.required_features,
                               "retained-modules-v1") != input.required_features.end()),
+        aot_unit_(retained_modules_ && !input.session.has_value()),
         emit_debug_information_(emit_debug_information),
         debug_sources_(debug_sources) {
     output_->setTargetTriple(triple);
@@ -2412,6 +2413,12 @@ private:
     return class_descriptors_.at(symbol_key(id));
   }
 
+  void apply_aot_symbol_visibility(llvm::GlobalValue &value) const {
+    if (!aot_unit_) return;
+    value.setVisibility(llvm::GlobalValue::HiddenVisibility);
+    value.setDSOLocal(true);
+  }
+
   void declare_class_metadata() {
     for (const auto &declaration : input_.classes) {
       const auto key = type_code(
@@ -2424,6 +2431,7 @@ private:
                                       : llvm::GlobalValue::PrivateLinkage),
           nullptr, retained_modules_ ? "hk1_t_" + key : ".hk.type." + key);
       descriptor->setAlignment(llvm::Align(8));
+      apply_aot_symbol_visibility(*descriptor);
       class_descriptors_.emplace(symbol_key(declaration.id), descriptor);
       type_descriptors_.emplace(key, descriptor);
     }
@@ -2661,7 +2669,23 @@ private:
   }
 
   void emit_program_requirements() {
+    if (aot_unit_) {
+      const auto owns_entry = std::ranges::any_of(
+          input_.functions, [&](const auto &function) {
+            return !function.retained && function.id.module == input_.id &&
+                   function.id.kind == NERI_IR_SYMBOL_FUNCTION_V1 &&
+                   function.id.semantic_name == "main" &&
+                   function.kind == NERI_IR_FUNCTION_V1 &&
+                   function.parameter_types.empty() &&
+                   function.result_type.tag == NERI_IR_TYPE_VOID_V1;
+          });
+      if (!owns_entry) return;
+    }
     std::uint16_t minimum_minor = source_location_runtime_minor;
+    if (aot_unit_) {
+      minimum_minor = std::max(minimum_minor, native_array_runtime_minor);
+      minimum_minor = std::max(minimum_minor, native_class_runtime_minor);
+    }
     std::uint64_t required_features = NERI_RT_FEATURE_SOURCE_LOCATIONS;
     if (input_.session.has_value()) {
       minimum_minor = 19;
@@ -2813,6 +2837,7 @@ private:
                                    : llvm::GlobalValue::ExternalLinkage,
         requirements, "neri_program_v1_abi_requirements");
     declaration->setAlignment(llvm::Align(8));
+    apply_aot_symbol_visibility(*declaration);
   }
 
   [[nodiscard]] llvm::GlobalVariable *string_literal_descriptor() {
@@ -2901,6 +2926,7 @@ private:
           mangle_function(function),
           output_.get());
       declaration->setCallingConv(llvm::CallingConv::C);
+      apply_aot_symbol_visibility(*declaration);
       declaration->addFnAttr(llvm::Attribute::NoUnwind);
       if ((function.effects & NERI_IR_EFFECT_NO_RETURN_V1) != 0U) {
         declaration->addFnAttr(llvm::Attribute::NoReturn);
@@ -3210,6 +3236,7 @@ private:
   llvm::LLVMContext &context_;
   std::unique_ptr<llvm::Module> output_;
   bool retained_modules_{};
+  bool aot_unit_{};
   bool emit_debug_information_{};
   const std::vector<std::pair<std::string, std::string>> &debug_sources_;
   std::unique_ptr<llvm::DIBuilder> debug_builder_;

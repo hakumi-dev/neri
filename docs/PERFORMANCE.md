@@ -82,6 +82,58 @@ fraction `p` accelerated by a factor `s`, overall speedup is
 `1 / ((1 - p) + p / s)`; optimize measured dominant phases first.
 This is the application of [Amdahl's law](https://www.cs.cmu.edu/~18742/papers/Amdahl1967.pdf).
 
+## Project object builds
+
+Executable projects partition verified IR by manifest unit. Automatically loaded
+standard-library sources form another unit. The compiler gives each class and
+its methods one owner; generic specializations and synthetic classes belong to
+the executable consumer. Other units carry the external declarations and layouts
+needed to call them. Each object uses the same logical module identity, with
+strong, executable-local function and class-descriptor symbols.
+
+An object contains its owned function bodies, referenced private string literals,
+native imports, and required external declarations. Partition views share immutable
+instruction graphs and previously built source maps. The unit containing `main(): Void` supplies
+the whole program's runtime import and feature requirements. Other units derive
+their feature requirements from their own code and required declarations. This AOT mode has
+a conservative minimum runtime ABI of 1.4 for native arrays and classes; imported
+capabilities can raise that minimum. Session modules retain their own ABI contract.
+
+On macOS ARM64, object reuse uses the private cache and dependency receipts
+described above, with a separate object-cache key domain. The key includes the
+unit's canonical transport, manifest contents, owner, target, optimization mode,
+runtime manifest, and native tool identities. Native library binaries are resolved
+at the final link, which runs on every project build. `--no-cache` compiles every
+object. Other supported targets use the same partitioned link without this cache.
+Cache lookup hashes the packed canonical payload. A hit skips hexadecimal
+transport encoding; a miss reuses that payload and digest to construct the
+unchanged transport envelope for the native backend.
+
+The frontend still reads, checks, and lowers the complete project before selecting
+objects. This is native-object reuse, not persisted semantic-analysis reuse.
+Source tables are tracked per file: a consumer specializing a generic template
+depends on that template's source file as well as its generated IR. Splitting
+stable definitions from consumer specializations follows the
+[Rust compiler's code-generation-unit design](https://rustc-dev-guide.rust-lang.org/backend/monomorph.html).
+The correctness of reuse depends on recording all inputs to each compilation
+task, as formalized in
+[Build Systems à la Carte](https://simon.peytonjones.org/assets/pdfs/build-systems-original.pdf).
+
+For units `U`, misses `M`, and frontend cost `F`, the build cost is
+`F + partition + sum(hash(U)) + sum(codegen(M)) + link`. A cache hit removes native
+generation for that unit while retaining partition and validation costs. The
+granularity tradeoff between reusable results and dependency-tracking overhead
+is described in
+[Constructing Hybrid Incremental Compilers](https://arxiv.org/pdf/2002.06183),
+section 4.1. End-to-end measurements include these costs; cache-hit counts alone
+do not establish a latency improvement.
+
+The [macOS ARM64 project measurement](../benchmarks/aot-project-macos-arm64.json)
+recorded 15.67 s with an empty object cache and 5.21 s with all five objects
+reused. Maximum resident memory was 830 MB and 472 MB respectively. Frontend
+work remained about 3.7 s in both builds. These are single sequential build
+observations, not complete `sumi c` startup measurements or latency percentiles.
+
 ## Executable sessions
 
 The Neri-owned session benchmark measures an application initializer and typed
