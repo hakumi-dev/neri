@@ -27,7 +27,7 @@ fi
 trap 'rm -rf "$LAUNCH_DIR"' EXIT
 # The trusted seed predates project manifests. The build unit includes tooling
 # helpers but not the installer entry point, plus the process support library.
-BOOTSTRAP_SOURCES=("$ROOT_DIR/compiler/ir/process.hk")
+BOOTSTRAP_SOURCES=("$ROOT_DIR/compiler/ir/process.hk" "$ROOT_DIR/bootstrap/compiler/ir/process_native.hk")
 while IFS= read -r -d '' source; do
   if [[ "$source" != "$ROOT_DIR/tooling/install.hk" ]]; then
     BOOTSTRAP_SOURCES+=("$source")

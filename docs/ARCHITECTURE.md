@@ -179,10 +179,11 @@ compiler source list, build graph or language expectations.
 
 The bootstrap release contains a Neri compiler plus its matching codegen and runtime. It compiles the current sources, and the resulting compiler performs the next verified generation.
 Only the pinned seed stage substitutes compiler paths that have mirrored
-`bootstrap/compiler/*` declarations; this bridges the older seed parser's class
-annotation support and does not enumerate compiler sources. Stage 1 and later
-compile the canonical sources from the current manifest, and bootstrap
-verification compares canonical IR, objects, and binaries to a fixed point.
+`bootstrap/compiler/*` declarations. The mirrors express declaration modifiers
+and native imports in syntax accepted by the pinned seed; they do not enumerate
+compiler sources. Stage 1 and later compile the canonical sources from the
+current manifest, and bootstrap verification compares canonical IR, objects,
+and binaries to a fixed point.
 
 ## Execution and optimization boundaries
 

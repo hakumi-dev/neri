@@ -22,7 +22,7 @@ static void completion_contract(void) {
     "  public def read(): Int\n"
     "    return this.value\n"
     "  end\n"
-    "  public def static create(): Widget\n"
+    "  public static def create(): Widget\n"
     "    return new Widget()\n"
     "  end\n"
     "end\n"
