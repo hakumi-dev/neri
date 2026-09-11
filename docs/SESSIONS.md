@@ -67,6 +67,71 @@ contract described by [JEP 222](https://openjdk.org/jeps/222), while Neri initia
 rejects declaration replacement. Runtime module loading and root ownership are
 separate session execution contracts.
 
+## Completion
+
+`SessionEnvironment.complete(source, cursorByteOffset)` analyzes the request
+with the typed semantic rules and committed context used for preparation. It
+does not create a candidate, execute source, change the generation, or retain
+declarations. The cursor is a UTF-8 byte offset in `source`. An offset outside
+the source or inside a multibyte UTF-8 sequence returns `invalid-position`;
+source larger than 1 MiB returns `limit`.
+
+`SessionCompletionResult` contains its observed `generation`, `status`,
+`count`, `truncated`, and a linked `first` list of `SessionCompletionItem`
+values. Each item has `name`, `insertText`, `category`, `detail`, and the
+UTF-8-byte replacement range `replacementStart` and `replacementEnd`. The
+range is half-open: replace bytes in `[replacementStart, replacementEnd)`.
+Categories are `method`, `function`, `field`, `variable`, `type`, `namespace`,
+`keyword`, or `symbol`. The result contains at most 128 items. `truncated`
+reports that matching candidates were left out at that bound. `disposed` and
+`unavailable` report that the environment cannot analyze the request; a complete
+result may have no items.
+
+`ExecutableSession.complete(source, cursorByteOffset)` exposes the same result
+for native sessions. Its `completionGeneration()` is a monotonic revision:
+every successful execution and every successful `reset()` advances it. A
+completion result reports that revision. Preparing, completing, a failed
+execution, and a failed reset leave it unchanged. The wrapped
+`SessionEnvironment.currentGeneration()` is a separate state-frame generation;
+reset creates a new environment whose frame generation starts again at zero.
+
+A client may prepare a candidate, request completion, and then execute that
+candidate. Completion does not consume or alter the candidate. A successful
+`execute(prepared)` consumes and runs the candidate once; a second execution of
+the same candidate fails. This preserves the single execution of a final value
+expression while allowing completion between preparation and execution.
+
+Completion analyzes the submitted text against the immutable project snapshot,
+committed declarations, and visible session bindings. It proposes names, types,
+members, namespaces, imported library members, keywords, and `use` targets when
+the current syntactic position and semantic binding provide them. Local and
+child-model names take precedence over parent names with the same spelling.
+Generated session names are excluded. The service does not claim that its list
+is a proof of every syntactically or semantically valid insertion.
+
+Installed-toolchain `use` completion adds names read only from
+`ARTIFACTS.sha256` entries under `stdlib/`; it does not list the standard-library
+directory or parse unimported library sources. The normal source lookup still
+binds explicit imports independently of this completion catalog.
+
+The language server serializes the same typed candidates into LSP completion
+items. It returns a normal array when the list is complete and an LSP
+`CompletionList` with `isIncomplete: true` when it is truncated. This follows
+the [Language Server Protocol completion
+model](https://microsoft.github.io/language-server-protocol/specifications/specification-current/#textDocument_completion).
+The shared semantic query has the same separation between language-aware
+candidate construction and presentation used by Roslyn's
+[CompletionService](https://github.com/dotnet/roslyn/blob/main/src/Features/Core/Portable/Completion/CompletionService.cs).
+The stricter soundness and completeness goals studied in
+[Language-parametric static semantic code completion](https://doi.org/10.1145/3527329)
+are useful criteria, but are not guarantees made by this API.
+Repairing a temporary copy with a completion marker uses the existing parser
+and binder. This follows the separation of incomplete syntax and semantic
+queries discussed in [Principled Syntactic Code Completion using
+Placeholders](https://www.mathematik.uni-marburg.de/~seba/publications/completion-syntactic-placeholders.pdf).
+Neri uses its existing recovery rules and does not implement that paper's
+grammar-derived completion algorithm.
+
 ## Session module code generation
 
 `neri build --session-module` is a dedicated compiler mode for prepared

@@ -76,6 +76,11 @@ project owns the JetBrains client, grammar, configuration UI and Run/Build/Check
   unsupported repairs and ambiguous specializations produce no candidates.
   Function and method details contain signatures without the `def` keyword;
   completion kinds identify functions, methods, classes, fields and variables.
+  Generic templates are available before instantiation. The candidate engine is
+  shared with [persistent session completion](SESSIONS.md#completion); the LSP
+  adapter supplies protocol positions and edits. Results are bounded to 128
+  candidates and use `CompletionList.isIncomplete` when truncated. Import
+  targets include known namespaces and the installed standard-library inventory.
 - `completionItem/resolve` supplies documentation on demand. Items identify the
   document version and analysis revision; changes invalidate earlier requests
   for enrichment. Types and insertion edits do not depend on documentation.
