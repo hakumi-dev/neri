@@ -1,0 +1,240 @@
+use buffers
+use crypto
+use files
+use host
+use result
+use tasks
+namespace changes
+
+class PollResult
+  public changed: Bool = false
+  public digest: Byte[]?
+  public failure: result.Failure?
+end
+
+class Scanner
+  public entryLimit: Int = 4096
+  public byteLimit: Int = 134217728
+  public depthLimit: Int = 64
+  private baseline: Byte[]?
+
+  def poll(root: files.Root, relative: String = ""): PollResult
+    let output = new PollResult()
+    if this.entryLimit < 0 || this.entryLimit > 4096 || this.byteLimit < 0 || this.byteLimit > 134217728 || this.depthLimit < 0 || this.depthLimit > 64
+      output.failure = new result.Failure("invalid_limit", "changes.poll")
+      return output
+    end
+    let buffer = buffers.ByteBuffer.create(134217728)
+    if buffer == null
+      output.failure = new result.Failure("allocation_failed", "changes.poll")
+      return output
+    end
+    let state = new ScanState(this.entryLimit, this.byteLimit, this.depthLimit, buffer)
+    state.visit(root, relative, 0)
+    if state.failure != null
+      output.failure = state.failure
+      return output
+    end
+    let encoded = state.encoded.snapshot()
+    match crypto.sha256Outcome(encoded)
+      case result.Result.Ok(candidate)
+        let previous = this.baseline
+        output.changed = previous != null && !sameBytes(previous, candidate)
+        output.digest = copyBytes(candidate)
+        this.baseline = candidate
+      case result.Result.Error(failure)
+        output.failure = new result.Failure(failure.code, "changes.hash", "", encoded.Length, failure.osCode, failure)
+    end
+    return output
+  end
+end
+
+class ScanState
+  public remainingEntries: Int
+  public remainingBytes: Int
+  public depthLimit: Int
+  public encoded: buffers.ByteBuffer
+  public failure: result.Failure?
+
+  def init(entries: Int, bytes: Int, depth: Int, encoded: buffers.ByteBuffer): Void
+    this.remainingEntries = entries
+    this.remainingBytes = bytes
+    this.depthLimit = depth
+    this.encoded = encoded
+  end
+
+  def visit(root: files.Root, path: String, depth: Int): Void
+    if this.failure != null
+      return
+    end
+    if depth > this.depthLimit
+      this.failure = new result.Failure("depth_exceeded", "changes.enumerate", path)
+      return
+    end
+    let listed = root.list(path, this.remainingEntries)
+    if listed.failure != null || listed.closeFailure != null
+      this.failure = combinedFailure(listed.failure, listed.closeFailure, path, 0)
+      return
+    end
+    let ordered = sortEntries(listed.entries)
+    for entry in ordered
+      if this.remainingEntries == 0
+        this.failure = new result.Failure("entry_limit_exceeded", "changes.enumerate", path)
+        return
+      end
+      this.remainingEntries = this.remainingEntries - 1
+      let child = path == "" ? entry.name : path + "/" + entry.name
+      if entry.kind == "directory"
+        if !appendRecord(this.encoded, 2, child, [])
+          this.failure = new result.Failure("snapshot_limit_exceeded", "changes.hash", child)
+          return
+        end
+        this.visit(root, child, depth + 1)
+      else if entry.kind == "file"
+        let read = root.readBytes(child, this.remainingBytes)
+        if read.failure != null || read.closeFailure != null
+          this.failure = combinedFailure(read.failure, read.closeFailure, child, read.bytesRead)
+          return
+        end
+        let bytes = read.bytes
+        if bytes == null
+          this.failure = new result.Failure("missing_bytes", "changes.read", child)
+          return
+        end
+        if bytes.Length > this.remainingBytes
+          this.failure = new result.Failure("byte_limit_exceeded", "changes.read", child)
+          return
+        end
+        this.remainingBytes = this.remainingBytes - bytes.Length
+        match crypto.sha256Outcome(bytes)
+          case result.Result.Ok(digest)
+            if !appendRecord(this.encoded, 1, child, digest)
+              this.failure = new result.Failure("snapshot_limit_exceeded", "changes.hash", child)
+              return
+            end
+          case result.Result.Error(failure)
+            this.failure = new result.Failure(failure.code, "changes.hash", child, bytes.Length, failure.osCode, failure)
+            return
+        end
+      else
+        this.failure = new result.Failure("unsupported_entry", "changes.enumerate", child)
+        return
+      end
+      if this.failure != null
+        return
+      end
+    end
+  end
+end
+
+def sortEntries(input: files.DirectoryEntry[]): files.DirectoryEntry[]
+  let source = input
+  let output = tasks.generate<files.DirectoryEntry>(source.Length, 1) do |index|
+    return new files.DirectoryEntry(source[index].name, source[index].kind)
+  end
+  var index = 1
+  while index < output.Length
+    let value = output[index]
+    var position = index
+    while position > 0 && compareText(value.name, output[position - 1].name) < 0
+      output[position] = output[position - 1]
+      position = position - 1
+    end
+    output[position] = value
+    index = index + 1
+  end
+  return output
+end
+
+def compareText(left: String, right: String): Int
+  let leftLength = host.stringByteLength(left)
+  let rightLength = host.stringByteLength(right)
+  var index = 0
+  while index < leftLength && index < rightLength
+    let a = host.stringByteAt(left, index) as Int
+    let b = host.stringByteAt(right, index) as Int
+    if a < b
+      return -1
+    end
+    if a > b
+      return 1
+    end
+    index = index + 1
+  end
+  return leftLength < rightLength ? -1 : leftLength > rightLength ? 1 : 0
+end
+
+def appendRecord(output: buffers.ByteBuffer, kind: Int, path: String, digest: Byte[]): Bool
+  let length = host.stringByteLength(path)
+  if !output.append(kind as Byte) || !appendU32(output, length) || !output.appendText(path) || !appendU32(output, digest.Length)
+    return false
+  end
+  return output.appendBytes(digest)
+end
+
+def combinedFailure(primary: files.Failure?, closed: files.Failure?, detail: String, transferred: Int): result.Failure?
+  var failure: result.Failure? = null
+  if primary != null
+    failure = convertFailure(primary, detail, transferred)
+  end
+  if closed != null
+    let closeFailure = convertFailure(closed, detail, transferred)
+    if failure == null
+      failure = closeFailure
+    else
+      var cursor: result.Failure? = failure
+      while cursor != null
+        let next = cursor.closeFailure
+        if next == null
+          cursor.closeFailure = closeFailure
+          cursor = null
+        else
+          cursor = next
+        end
+      end
+    end
+  end
+  return failure
+end
+
+def convertFailure(source: files.Failure, detail: String, transferred: Int): result.Failure
+  let output = new result.Failure(source.code, source.operation, detail, transferred, source.osCode)
+  let closed = source.closeFailure
+  if closed != null
+    output.closeFailure = convertFailure(closed, detail, transferred)
+  end
+  return output
+end
+
+def copyBytes(source: Byte[]): Byte[]
+  return tasks.generate(source.Length, 1) do |index|
+    return source[index]
+  end
+end
+
+def appendU32(output: buffers.ByteBuffer, value: Int): Bool
+  if !output.append((value - (value / 256) * 256) as Byte)
+    return false
+  end
+  if !output.append(((value / 256) - (value / 65536) * 256) as Byte)
+    return false
+  end
+  if !output.append(((value / 65536) - (value / 16777216) * 256) as Byte)
+    return false
+  end
+  return output.append((value / 16777216) as Byte)
+end
+
+def sameBytes(left: Byte[], right: Byte[]): Bool
+  if left.Length != right.Length
+    return false
+  end
+  var index = 0
+  while index < left.Length
+    if left[index] != right[index]
+      return false
+    end
+    index = index + 1
+  end
+  return true
+end

@@ -10,6 +10,7 @@ static DWORD saved_input, saved_output;
 static int active, registered;
 static volatile LONG interrupted;
 static int64_t generation;
+int neri_terminal_active(void) { return active; }
 static unsigned char pending[16];
 static size_t pending_count;
 static BOOL WINAPI interrupt_session(DWORD event) {
@@ -29,7 +30,7 @@ void neri_terminal_restore(void) {
   active = 0;
 }
 int64_t neri_rt_v1_terminal_open(void) {
-  if (active || generation == INT64_MAX) return 0;
+  if (active || neri_interrupt_active() || generation == INT64_MAX) return 0;
   input = GetStdHandle(STD_INPUT_HANDLE);
   output = GetStdHandle(STD_OUTPUT_HANDLE);
   if (!GetConsoleMode(input, &saved_input) || !GetConsoleMode(output, &saved_output)) return 0;
@@ -107,3 +108,27 @@ int64_t neri_rt_v1_terminal_size(int64_t token, int64_t rows) {
   return rows ? info.srWindow.Bottom - info.srWindow.Top + 1 : info.srWindow.Right - info.srWindow.Left + 1;
 }
 int64_t neri_rt_v1_clock_milliseconds(void) { return (int64_t)GetTickCount64(); }
+
+int64_t neri_rt_v1_clock_wall_milliseconds(int64_t *value) {
+  if (value == NULL) return -1;
+  FILETIME file_time;
+  GetSystemTimePreciseAsFileTime(&file_time);
+  ULARGE_INTEGER ticks;
+  ticks.LowPart = file_time.dwLowDateTime;
+  ticks.HighPart = file_time.dwHighDateTime;
+  /* FILETIME counts 100-nanosecond intervals since 1601-01-01 UTC. */
+  const ULONGLONG unix_epoch_ticks = 116444736000000000ULL;
+  if (ticks.QuadPart >= unix_epoch_ticks) {
+    const ULONGLONG milliseconds = (ticks.QuadPart - unix_epoch_ticks) / 10000ULL;
+    if (milliseconds > INT64_MAX) return -1;
+    *value = (int64_t)milliseconds;
+  } else {
+    const ULONGLONG before_epoch = unix_epoch_ticks - ticks.QuadPart;
+    const ULONGLONG milliseconds = before_epoch / 10000ULL +
+        (before_epoch % 10000ULL != 0);
+    if (milliseconds > (ULONGLONG)INT64_MAX + 1ULL) return -1;
+    *value = milliseconds == (ULONGLONG)INT64_MAX + 1ULL
+        ? INT64_MIN : -(int64_t)milliseconds;
+  }
+  return 0;
+}

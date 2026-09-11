@@ -18,17 +18,20 @@ class BootstrapBinder
   public recordSourceSymbols: Bool = false
   public recordCompletionSites: Bool = false
   public requireEntryPoint: Bool = true
+  public allowSessionEntryReplacement: Bool = false
   public forbiddenEntryPointSources: StringBuffer = new StringBuffer()
 
-  def recordDeclaration(identity: String, name: String, typeName: String, node: Int, display: String = ""): Void
+  def recordDeclaration(identity: String, name: String, typeName: String, node: Int, display: String = "", symbolKind: Int = 0): Void
     if !this.recordSourceSymbols
       return
     end
     let declaration = new SemanticDeclaration()
+
     declaration.identity = identity
     declaration.name = name
     declaration.typeName = typeName
     declaration.display = display
+    declaration.symbolKind = symbolKind
     declaration.start = this.syntax.startAt(node)
     declaration.length = this.syntax.lengthAt(node)
     declaration.next = this.model.declarations
@@ -40,6 +43,7 @@ class BootstrapBinder
       return
     end
     let occurrence = new SemanticOccurrence()
+
     occurrence.identity = identity
     occurrence.display = display
     occurrence.start = this.syntax.startAt(node)
@@ -48,10 +52,15 @@ class BootstrapBinder
     this.model.occurrences = occurrence
   end
 
-  def init(syntax: SyntaxArena, root: Int, sourceLength: Int): Void
+  def init(syntax: SyntaxArena, root: Int, sourceLength: Int, parentModel: SemanticModel? = null): Void
     this.syntax = syntax
     this.root = root
     this.sourceLength = sourceLength
+    this.model = new SemanticModel(parentModel)
+    this.model.syntax = syntax
+    if parentModel != null
+      this.model.bound = new BoundArena(parentModel.bound)
+    end
     this.addSource("main", 0)
   end
 
@@ -68,6 +77,7 @@ class BootstrapBinder
   def sourceIdAt(position: Int): String
     var result = "main"
     var index = 0
+
     while index < this.sourceStarts.size && position >= this.sourceStarts.get(index)
       result = this.sourceIds.get(index)
       index = index + 1
@@ -78,6 +88,7 @@ class BootstrapBinder
   def sourceStartAt(position: Int): Int
     var result = 0
     var index = 0
+
     while index < this.sourceStarts.size && position >= this.sourceStarts.get(index)
       result = this.sourceStarts.get(index)
       index = index + 1
@@ -103,31 +114,54 @@ class BootstrapBinder
 
   def addBoundValue(kind: String, typeName: String, data: String, value: String, syntaxNode: Int, children: Int[]): Int
     let node = this.addBound(kind, typeName, data, syntaxNode, children)
+
     this.model.bound.setValue(node, value)
     return node
   end
 
   def addBoundSymbol(kind: String, typeName: String, data: String, symbol: String, syntaxNode: Int, children: Int[]): Int
     let node = this.addBound(kind, typeName, data, syntaxNode, children)
+
     this.model.bound.setSymbol(node, symbol)
     return node
   end
 
   def bind(): SemanticModel
     this.registerNamespaces()
+    registerContractNames(this)
     this.registerUses()
     registerGenericTemplates(this)
+    validateGenericOperations(this)
     this.registerClassNames()
+    var sourceIndex = 0
+
+    while sourceIndex < this.sourceIds.size
+      if this.sourceIds.get(sourceIndex) == "@stdlib/core.hk"
+        let textClass = this.model.findClass("String")
+
+        if textClass == null || textClass.representation != "utf8"
+          this.report("NR245", this.root, "The core library must declare String with its registered UTF-8 representation.")
+        end
+      end
+      sourceIndex = sourceIndex + 1
+    end
     registerNativeRecordNames(this)
     registerNativeRecordFields(this)
     this.registerClassMembers()
+    registerAlternativeFields(this)
     this.resolveInheritance()
     this.validateInheritedMembers()
+    validateAbstractClasses(this)
     this.registerFunctions()
+    registerContractRequirements(this)
+    referenceGenericTemplateUses(this)
+    validateConstrainedGenericFunctions(this)
     this.validateEntryPoint()
     let bodies = new BootstrapBodyBinder(this)
+
     while true
       let instances = this.model.genericInstances
+
       bodies.bindClassBodies()
       bodies.bindFunctionBodies()
       if instances == this.model.genericInstances
@@ -135,6 +169,12 @@ class BootstrapBinder
       end
     end
     return this.model
+  end
+
+  # The parser root supplied to a child binder contains only newly parsed
+  # declarations. Its model can resolve retained declarations through parentModel.
+  def bindChild(): SemanticModel
+    return this.bind()
   end
 
   def useCount(): Int
@@ -159,19 +199,29 @@ class BootstrapBinder
 
   def registerNamespaces(): Void
     var recordIndex = 0
+
     while recordIndex < nativeRecordCount(this)
       this.addNamespace(semanticField(this.syntax.dataAt(nativeRecordNode(this, recordIndex)), 0))
       recordIndex = recordIndex + 1
     end
+    var contractIndex = 0
+
+    while contractIndex < semanticContractCount(this)
+      this.addNamespace(semanticField(this.syntax.dataAt(semanticContractNode(this, contractIndex)), 0))
+      contractIndex = contractIndex + 1
+    end
     var index = 0
+
     while index < this.classCount()
       let node = this.classNodeAt(index)
+
       this.addNamespace(semanticField(this.syntax.dataAt(node), 0))
       index = index + 1
     end
     index = 0
     while index < this.functionCount()
       let node = this.functionNodeAt(index)
+
       this.addNamespace(semanticField(this.syntax.dataAt(node), 0))
       index = index + 1
     end
@@ -182,6 +232,7 @@ class BootstrapBinder
       return
     end
     var index = 0
+
     while index < this.model.declaredNamespaces.size
       if this.model.declaredNamespaces.get(index) == name
         return
@@ -193,6 +244,7 @@ class BootstrapBinder
 
   def namespaceExists(name: String): Bool
     var index = 0
+
     while index < this.model.declaredNamespaces.size
       if this.model.declaredNamespaces.get(index) == name
         return true
@@ -202,21 +254,19 @@ class BootstrapBinder
     return false
   end
 
-  def knownLibrary(name: String): Bool
-    return name == "host" || name == "math" || name == "test" || name == "console" || name == "tasks" || name == "Array"
-  end
-
   def registerUses(): Void
     var index = 0
+
     while index < this.useCount()
       let node = this.syntax.childAt(this.root, index)
       let name = this.syntax.dataAt(node)
-      if this.knownLibrary(name) || this.namespaceExists(name)
+
+      if this.namespaceExists(name)
         if !this.model.hasUse(name)
           this.model.usedNames.add(name)
         end
       else
-        this.report("NR101A", node, "Unknown import '" + name + "'. Available imports: Libraries/Classes: Array, console, host, math, tasks, test")
+        this.report("NR101A", node, "Unknown import '" + name + "'. Add its source or dependency to the project.")
       end
       index = index + 1
     end
@@ -224,8 +274,10 @@ class BootstrapBinder
 
   def registerClassNames(): Void
     var index = 0
+
     while index < this.classCount()
       let node = this.classNodeAt(index)
+
       if this.syntax.nodeAt(node).typeParameters.Length > 0
         index = index + 1
         continue
@@ -235,18 +287,71 @@ class BootstrapBinder
       let access = semanticField(data, 1)
       let name = semanticField(data, 2)
       let fullName = semanticQualifiedName(namespaceName, name)
-      if this.model.findClass(fullName) != null
+      let representation = this.classRepresentation(node)
+      let abstract = validateAbstractClass(this, node)
+      let representedBuiltin = representation != "" && semanticRepresentationType(representation) == fullName && this.sourceIdAt(this.syntax.startAt(node)) == "@stdlib/core.hk"
+
+      if semanticReservedTypeName(name) && !representedBuiltin
+        this.report("NR156", node, "Type '" + fullName + "' is reserved.")
+      else if this.model.findClass(fullName) != null || this.model.findContract(fullName) != null
         this.report("NR156", node, "Type '" + fullName + "' is already defined.")
       else
-        this.model.addClass(new SemanticClass(fullName, name, namespaceName, access, node))
-        this.recordDeclaration("type:" + fullName, name, fullName, node, "class " + fullName)
+        let symbol = new SemanticClass(fullName, name, namespaceName, access, node)
+
+        symbol.isAlternative = semanticField(data, 4) == "enum"
+        symbol.isResource = semanticField(data, 4) == "resource"
+        symbol.representation = representation
+        symbol.isSealed = representation != "" || this.classSealed(node)
+        symbol.isAbstract = abstract
+        this.model.addClass(symbol)
+        this.recordDeclaration("type:" + fullName, name, fullName, node, abstract ? "abstract class " + fullName : "class " + fullName)
       end
       index = index + 1
     end
   end
 
+  def classAnnotationArgument(annotation: Int): String
+    if this.syntax.childCountAt(annotation) != 1
+      return ""
+    end
+    let written = this.syntax.dataAt(this.syntax.childAt(annotation, 0))
+
+    if host.stringByteLength(written) < 2
+      return ""
+    end
+    return host.stringSlice(written, 1, host.stringByteLength(written) - 2)
+  end
+
+  def classRepresentation(node: Int): String
+    var result = ""
+
+    for annotation in this.syntax.nodeAt(node).classAnnotations
+      let name = this.syntax.dataAt(annotation)
+
+      if name == "representation"
+        let value = this.classAnnotationArgument(annotation)
+
+        if semanticField(this.syntax.dataAt(node), 4) == "enum"
+          this.report("NR245", annotation, "Annotation '@representation' requires an ordinary class.")
+        else if result != "" || semanticRepresentationType(value) == ""
+          this.report("NR245", annotation, "Annotation '@representation' requires one unique supported representation name.")
+        else
+          result = value
+        end
+      else
+        this.report("NR245", annotation, "Unknown class annotation '@" + name + "'.")
+      end
+    end
+    return result
+  end
+
+  def classSealed(node: Int): Bool
+    return syntaxHasModifier(this.syntax, node, "sealed")
+  end
+
   def classForNode(node: Int): SemanticClass?
     var current = this.model.firstClass
+
     while current != null
       if current.syntaxNode == node
         return current
@@ -259,6 +364,7 @@ class BootstrapBinder
   def classBaseNode(node: Int): Int
     if this.syntax.childCountAt(node) > 0
       let first = this.syntax.childAt(node, 0)
+
       if this.syntax.kindAt(first) == "Type"
         return first
       end
@@ -276,6 +382,7 @@ class BootstrapBinder
   def resolveTypeNode(node: Int, namespaceName: String, fieldName: String): String
     if this.syntax.dataAt(node) == "#readonly"
       let inner = this.resolveTypeNode(this.syntax.childAt(node, 0), namespaceName, fieldName)
+
       if semanticContainsPointer(inner) || nativeValueType(inner) || nativeFixedArray(inner) || inner == "Void"
         this.report("NR240", node, "Readonly views require managed references or scalar values.")
         return "Error"
@@ -286,17 +393,21 @@ class BootstrapBinder
       var parameters = new StringBuffer()
       var index = 0
       let count = this.syntax.childCountAt(node)
+
       while index < count - 1
         let parameter = this.resolveTypeNode(this.syntax.childAt(node, index), namespaceName, "")
+
         parameters.add(parameter)
         index = index + 1
       end
       let result = this.resolveTypeNode(this.syntax.childAt(node, count - 1), namespaceName, "")
+
       return semanticFunctionType(this, parameters, result, node, this.syntax.dataAt(node) != "fn", this.syntax.dataAt(node) == "parallel fn").fullName
     end
     let written = this.syntax.dataAt(node)
     var resolved = ""
     var baseName = written
+
     while semanticIsArray(baseName) || nativeFixedArray(baseName) || semanticIsOptional(baseName) || semanticIsPointer(baseName)
       baseName = semanticInnerType(baseName)
     end
@@ -305,15 +416,18 @@ class BootstrapBinder
     end
     if this.syntax.nodeAt(node).typeArguments.Length > 0
       let arguments = new StringBuffer()
+
       for argument in this.syntax.nodeAt(node).typeArguments
         arguments.add(this.resolveTypeNode(argument, namespaceName, ""))
       end
       let template = findGenericTemplate(this, baseName, namespaceName, "Class")
+
       if template < 0
         this.report("NR220", node, "Type '" + baseName + "' is not a generic class.")
         return "Error"
       end
       let specialized = instantiateGenericClass(this, template, arguments, node)
+
       if specialized == null
         return "Error"
       end
@@ -341,12 +455,65 @@ class BootstrapBinder
       this.report("NR167", node, "Type 'Void' cannot be optional.")
       return "Error"
     end
+    this.recordTypeOccurrence(resolved, node)
     return resolved
+  end
+
+  # Specializations are generated symbols. Source navigation must point at the
+  # generic declaration the programmer wrote, while ordinary classes keep
+  # their resolved declaration identity.
+  def recordTypeOccurrence(resolved: String, node: Int): Void
+    var base = semanticMutableType(resolved)
+
+    while semanticIsArray(base) || nativeFixedArray(base) || semanticIsOptional(base) || semanticIsPointer(base)
+      base = semanticInnerType(base)
+    end
+    if nativeRecordType(base)
+      let name = host.stringSlice(base, 7, host.stringByteLength(base) - 7)
+
+      if this.model.findRecord(name) != null
+        this.recordOccurrence("record:" + name, node)
+      end
+      return
+    end
+    let classSymbol = this.model.findClass(base)
+
+    if classSymbol == null
+      return
+    end
+    let declarationName = classSymbol.genericOrigin >= 0 ? genericName(this, classSymbol.genericOrigin) : classSymbol.fullName
+
+    this.recordOccurrence("type:" + declarationName, node)
+  end
+
+  def callableSourceIdentity(callable: SemanticCallable): String
+    if callable.genericOrigin >= 0
+      return "callable:" + genericName(this, callable.genericOrigin)
+    end
+    if callable.className == ""
+      return "callable:" + callable.fullName
+    end
+    let classSymbol = this.model.findClass(callable.className)
+
+    if classSymbol != null && classSymbol.genericOrigin >= 0
+      return "callable:" + genericName(this, classSymbol.genericOrigin) + "." + callable.name
+    end
+    return "callable:" + callable.fullName
+  end
+
+  def fieldSourceIdentity(field: SemanticField): String
+    let classSymbol = this.model.findClass(field.owner)
+
+    if classSymbol != null && classSymbol.genericOrigin >= 0
+      return "field:" + genericName(this, classSymbol.genericOrigin) + "." + field.name
+    end
+    return "field:" + field.owner + "." + field.name
   end
 
   def writtenTypeName(node: Int): String
     let written = this.syntax.dataAt(node)
     var baseName = written
+
     while semanticIsArray(baseName) || nativeFixedArray(baseName) || semanticIsOptional(baseName) || semanticIsPointer(baseName)
       baseName = semanticInnerType(baseName)
     end
@@ -358,6 +525,7 @@ class BootstrapBinder
 
   def validatePointerType(node: Int, unsafeAllowed: Bool): Void
     let typeName = this.writtenTypeName(node)
+
     if !semanticContainsPointer(typeName)
       return
     end
@@ -369,10 +537,12 @@ class BootstrapBinder
 
   def validatePointerElement(node: Int): Void
     let typeName = this.writtenTypeName(node)
+
     if !semanticContainsPointer(typeName)
       return
     end
     var baseName = typeName
+
     while semanticIsArray(baseName) || nativeFixedArray(baseName) || semanticIsOptional(baseName) || semanticIsPointer(baseName)
       baseName = semanticInnerType(baseName)
     end
@@ -383,21 +553,32 @@ class BootstrapBinder
 
   def registerClassMembers(): Void
     var index = 0
+
     while index < this.classCount()
       let classNode = this.classNodeAt(index)
       let classSymbol = this.classForNode(classNode)
+
       if classSymbol != null
+        if classSymbol.isAlternative
+          index = index + 1
+          continue
+        end
         this.currentNamespace = classSymbol.namespaceName
         let start = this.classMemberStart(classNode)
         var offset = start
+
         while offset < this.syntax.childCountAt(classNode)
           let member = this.syntax.childAt(classNode, offset)
+
           if this.syntax.kindAt(member) == "Field"
             this.registerField(classSymbol, member)
           else if this.syntax.kindAt(member) == "Method"
             this.registerMethod(classSymbol, member)
           end
           offset = offset + 1
+        end
+        if classSymbol.representation != "" && (classSymbol.fullName != semanticRepresentationType(classSymbol.representation) || this.sourceIdAt(this.syntax.startAt(classNode)) != "@stdlib/core.hk" || classSymbol.access != "public" || classSymbol.isResource || this.syntax.nodeAt(classNode).typeParameters.Length > 0 || this.classBaseNode(classNode) >= 0 || classSymbol.firstField != null || this.findDeclaredMethod(classSymbol, "init") != null)
+          this.report("NR245", classNode, "A represented class requires its canonical trusted standard-library declaration, public access, and no base, fields, type parameters, resource role, or constructor.")
         end
       end
       index = index + 1
@@ -407,6 +588,7 @@ class BootstrapBinder
 
   def findDeclaredField(classSymbol: SemanticClass, name: String): SemanticField?
     var field = classSymbol.firstField
+
     while field != null
       if field.name == name
         return field
@@ -418,6 +600,7 @@ class BootstrapBinder
 
   def findDeclaredMethod(classSymbol: SemanticClass, name: String): SemanticCallable?
     var method = classSymbol.firstMethod
+
     while method != null
       if method.name == name
         return method
@@ -431,31 +614,48 @@ class BootstrapBinder
     let data = this.syntax.dataAt(node)
     let access = semanticField(data, 0)
     let name = semanticField(data, 1)
+
     if this.findDeclaredField(classSymbol, name) != null
       this.report("NR155A", node, "Field '" + name + "' is already defined in class '" + classSymbol.fullName + "'.")
       return
     end
     let typeNode = this.syntax.childAt(node, 0)
     let typeName = this.resolveTypeNode(typeNode, classSymbol.namespaceName, name)
+
+    if semanticContainsResource(this.model, typeName)
+      this.report("NR262", node, "Resource ownership cannot be stored in a field.")
+    end
     this.validatePointerType(typeNode, true)
     classSymbol.addField(new SemanticField(classSymbol.fullName, name, typeName, access, node))
     this.recordDeclaration("field:" + classSymbol.fullName + "." + name, name, typeName, node, classSymbol.fullName + "." + name + ": " + typeName)
   end
 
-  def registerMethod(classSymbol: SemanticClass, node: Int): Void
+  def registerMethod(classSymbol: SemanticClass, node: Int, validateAbstract: Bool = true): Void
     let access = semanticField(this.syntax.dataAt(node), 0)
     let annotationCount = semanticIntField(this.syntax.dataAt(node), 1)
     let functionNode = this.syntax.childAt(node, annotationCount)
+    let abstract = validateAbstractMethod(this, node, classSymbol.isAbstract, validateAbstract)
+
     if this.syntax.nodeAt(functionNode).typeParameters.Length > 0
       this.report("NR220", functionNode, "Method type parameters are not supported; declare parameters on the class or a module function.")
       return
     end
     let name = semanticField(this.syntax.dataAt(functionNode), 1)
+
     if this.findDeclaredMethod(classSymbol, name) != null
       this.report("NR155", functionNode, "Method '" + name + "' is already defined in class '" + classSymbol.fullName + "'.")
       return
     end
-    let callable = this.createCallable(functionNode, classSymbol, access)
+    let callable = this.createCallable(functionNode, classSymbol, access, abstract)
+
+    callable.isReadonly = syntaxHasModifier(this.syntax, functionNode, "readonly")
+    callable.hasOverride = syntaxHasModifier(this.syntax, functionNode, "override")
+    if callable.isReadonly && (name == "init" || callable.isStatic)
+      this.report("NR240", syntaxModifierNode(this.syntax, functionNode, "readonly"), "Modifier 'readonly' requires an instance method other than a constructor.")
+    end
+    if classSymbol.isResource && !callable.isStatic && semanticContainsResource(this.model, callable.returnType)
+      this.report("NR262", functionNode, "A resource method cannot expose an owned resource value.")
+    end
     if name == "init" && callable.returnType != "Void"
       this.report("NR154B", functionNode, "Constructor 'init' in class '" + classSymbol.name + "' must return Void.")
     end
@@ -463,30 +663,69 @@ class BootstrapBinder
       this.report("NR179", functionNode, "Constructor 'init' cannot be static.")
     end
     var annotation = 0
-    var seenOverride = false
+
     while annotation < annotationCount
       let annotationNode = this.syntax.childAt(node, annotation)
       let annotationName = this.syntax.dataAt(annotationNode)
-      if annotationName == "readonly"
-        if callable.isReadonly || this.syntax.childCountAt(annotationNode) != 0 || name == "init" || callable.isStatic
-          this.report("NR240", annotationNode, "Annotation '@readonly' applies once to an instance method, without arguments.")
+
+      if annotationName == "operator"
+        var operation = ""
+
+        if this.syntax.childCountAt(annotationNode) == 1
+          let written = this.syntax.dataAt(this.syntax.childAt(annotationNode, 0))
+
+          if host.stringByteLength(written) >= 2
+            operation = host.stringSlice(written, 1, host.stringByteLength(written) - 2)
+          end
         end
-        callable.isReadonly = true
-      else if annotationName != "override"
+        let supported = operation == "+" || operation == "-" || operation == "*" || operation == "/" || operation == "==" || operation == "!=" || operation == "<" || operation == "<=" || operation == ">" || operation == ">=" || operation == "!"
+        let arity = callable.parameterCount
+        var valid = supported && callable.operatorName == "" && (arity == 0 || arity == 1) && callable.access == "public" && !callable.isStatic && !callable.isUnsafe && !classSymbol.isResource && name != "init"
+        let comparison = operation == "==" || operation == "!=" || operation == "<" || operation == "<=" || operation == ">" || operation == ">=" || operation == "!"
+
+        valid = false if arity == 0 && operation != "+" && operation != "-" && operation != "!"
+        valid = false if arity == 1 && operation == "!"
+        valid = false if callable.returnType != (comparison ? "Bool" : classSymbol.fullName)
+        let parameter = callable.firstParameter
+
+        valid = false if arity == 1 && (parameter == null || parameter.typeName != classSymbol.fullName)
+        var existing = classSymbol.firstMethod
+
+        while existing != null
+          valid = false if existing.operatorName == operation && existing.parameterCount == arity
+          existing = existing.nextCallable
+        end
+        if !valid
+          this.report("NR243", annotationNode, "Annotation '@operator' requires one supported operator and a unique public safe non-resource instance method with its exact receiver, operand, and result types.")
+        else
+          callable.operatorName = operation
+        end
+      else if annotationName == "conversion"
+        var valid = this.syntax.childCountAt(annotationNode) == 0 && !callable.conversion && callable.parameterCount == 0 && callable.returnType != "Void" && semanticMutableType(callable.returnType) != classSymbol.fullName && callable.access == "public" && !callable.isStatic && !callable.isUnsafe && !classSymbol.isResource && name != "init"
+        var existing = classSymbol.firstMethod
+
+        while existing != null
+          valid = false if existing.conversion && existing.returnType == callable.returnType
+          existing = existing.nextCallable
+        end
+        if !valid
+          this.report("NR244", annotationNode, "Annotation '@conversion' requires a unique public safe non-resource zero-argument instance method with a distinct non-Void result type.")
+        else
+          callable.conversion = true
+        end
+      else if annotationName == "intrinsic"
+        this.report("NR247", annotationNode, "Annotation '@intrinsic' applies only to a module function.")
+      else if annotationName == "exact"
+        this.report("NR248", annotationNode, "Annotation '@exact' applies only to a module function.")
+      else
         this.report("NR172", annotationNode, "Unknown method annotation '@" + annotationName + "'.")
-      else if seenOverride
-        this.report("NR173", annotationNode, "Method annotation '@override' cannot be repeated.")
-      end
-      if annotationName == "override"
-        seenOverride = true
       end
       annotation = annotation + 1
     end
-    callable.hasOverride = seenOverride
     classSymbol.addMethod(callable)
   end
 
-  def createCallable(functionNode: Int, classSymbol: SemanticClass?, access: String): SemanticCallable
+  def createCallable(functionNode: Int, classSymbol: SemanticClass?, access: String, isAbstract: Bool = false): SemanticCallable
     let data = this.syntax.dataAt(functionNode)
     var namespaceName = semanticField(data, 0)
     let name = semanticField(data, 1)
@@ -497,31 +736,57 @@ class BootstrapBinder
     let isUnsafe = semanticBoolField(data, 6)
     var className = ""
     var fullName = semanticQualifiedName(namespaceName, name)
+
     if classSymbol != null
       className = classSymbol.fullName
       namespaceName = classSymbol.namespaceName
       fullName = classSymbol.fullName + "." + name
+    else if this.syntax.nodeAt(functionNode).typeParameters.Length == 0
+      semanticValidateModuleModifiers(this, functionNode)
     end
     let returnNode = this.syntax.childAt(functionNode, annotationCount + parameterCount)
     let returnType = this.resolveTypeNode(returnNode, namespaceName, "")
+
     this.validatePointerType(returnNode, isUnsafe)
     this.validatePointerElement(returnNode)
     let callable = new SemanticCallable(fullName, name, namespaceName, className, returnType, isStatic, isUnsafe, access, functionNode)
+
+    callable.isAbstract = isAbstract
     callable.bodyStart = annotationCount + parameterCount + 1
     callable.bodyCount = bodyCount
     var annotationIndex = 0
     var sawCAbi = false
     var sawLibrary = false
+    var sawIntrinsic = false
+    var sawExact = false
+
     while annotationIndex < annotationCount
       let annotationNode = this.syntax.childAt(functionNode, annotationIndex)
       let annotationName = this.syntax.dataAt(annotationNode)
-      if annotationName == "library"
+
+      if annotationName == "exact"
+        if sawExact || this.syntax.childCountAt(annotationNode) != 0 || classSymbol != null
+          this.report("NR248", annotationNode, "Annotation '@exact' applies once to a module function, without arguments.")
+        end
+        sawExact = true
+        callable.exactArguments = true
+      else if annotationName == "intrinsic"
+        if sawIntrinsic
+          this.report("NR247", annotationNode, "Annotation '@intrinsic' cannot be repeated.")
+        end
+        sawIntrinsic = true
+        callable.intrinsicName = this.classAnnotationArgument(annotationNode)
+        if semanticIntrinsic(this.model, callable.intrinsicName) == null
+          this.report("NR247", annotationNode, "Annotation '@intrinsic' requires one supported intrinsic name.")
+        end
+      else if annotationName == "library"
         if sawLibrary
           this.report("NR213", annotationNode, "Annotation '@library' cannot be repeated.")
         end
         sawLibrary = true
         if this.syntax.childCountAt(annotationNode) == 1
           let rawLibrary = this.syntax.dataAt(this.syntax.childAt(annotationNode, 0))
+
           if host.stringByteLength(rawLibrary) >= 2
             callable.nativeLibrary = host.stringSlice(rawLibrary, 1, host.stringByteLength(rawLibrary) - 2)
           end
@@ -537,6 +802,7 @@ class BootstrapBinder
         sawCAbi = true
         if this.syntax.childCountAt(annotationNode) == 1
           let rawSymbol = this.syntax.dataAt(this.syntax.childAt(annotationNode, 0))
+
           if host.stringByteLength(rawSymbol) >= 2
             callable.cAbiSymbol = host.stringSlice(rawSymbol, 1, host.stringByteLength(rawSymbol) - 2)
           end
@@ -545,7 +811,7 @@ class BootstrapBinder
           this.report("NR210", annotationNode, "Annotation '@cabi' requires exactly one portable C symbol string.")
         end
         if !isUnsafe
-          this.report("NR207", functionNode, "A '@cabi' declaration must use 'def unsafe'.")
+          this.report("NR207", functionNode, "A '@cabi' declaration must use 'unsafe def'.")
         end
         if bodyCount > 0
           this.report("NR208", functionNode, "A '@cabi' declaration describes an external symbol and must have an empty body.")
@@ -558,13 +824,16 @@ class BootstrapBinder
     end
     var index = 0
     var sawDefault = false
+
     while index < parameterCount
       let parameterNode = this.syntax.childAt(functionNode, annotationCount + index)
       let parameterName = this.syntax.dataAt(parameterNode)
       let parameterType = this.resolveTypeNode(this.syntax.childAt(parameterNode, 0), namespaceName, "")
+
       this.validatePointerType(this.syntax.childAt(parameterNode, 0), isUnsafe)
       this.validatePointerElement(this.syntax.childAt(parameterNode, 0))
       let hasDefault = this.syntax.childCountAt(parameterNode) > 1
+
       if !hasDefault && sawDefault
         this.report("NR107A", parameterNode, "Parameter '" + parameterName + "' is missing a default value after a defaulted parameter.")
       end
@@ -575,14 +844,37 @@ class BootstrapBinder
         this.report("NR107", parameterNode, "Duplicate parameter '" + parameterName + "'.")
       end
       let identity = fullName + "/parameter[" + (index as String) + "]"
+
       callable.addParameter(new SemanticParameter(identity, parameterName, parameterType, hasDefault, parameterNode))
       this.recordDeclaration(identity, parameterName, parameterType, parameterNode)
       index = index + 1
     end
+    if callable.intrinsicName != ""
+      let intrinsic = semanticIntrinsic(this.model, callable.intrinsicName)
+      var valid = false
+
+      if intrinsic != null
+        valid = intrinsic.linkName != "" && classSymbol == null && !isUnsafe && bodyCount == 0 && !sawCAbi && !sawLibrary && callable.returnType == intrinsic.resultType && callable.parameterCount == intrinsic.parameterTypes.Length
+      end
+
+      if intrinsic != null && callable.parameterCount == intrinsic.parameterTypes.Length
+        index = 0
+        while index < callable.parameterCount
+          let parameter = callable.parameterAt(index)
+
+          valid = false if parameter == null || parameter.typeName != intrinsic.parameterTypes[index] || parameter.hasDefault
+          index = index + 1
+        end
+      end
+      if !valid
+        this.report("NR247", functionNode, "An intrinsic must be a safe empty-body module function with the exact registered parameter and result types and no defaults, C ABI, or library annotation.")
+      end
+    end
     if this.recordSourceSymbols
-      var display = "def " + fullName + "("
+      var display = (callable.isAbstract ? "abstract " : "") + "def " + fullName + "("
       var parameter = callable.firstParameter
       var separator = ""
+
       while parameter != null
         display = display + separator + parameter.name + ": " + parameter.typeName
         separator = ", "
@@ -596,6 +888,7 @@ class BootstrapBinder
 
   def findParameter(callable: SemanticCallable, name: String): SemanticParameter?
     var parameter = callable.firstParameter
+
     while parameter != null
       if parameter.name == name
         return parameter
@@ -607,28 +900,46 @@ class BootstrapBinder
 
   def resolveInheritance(): Void
     var index = 0
+
     while index < this.classCount()
       let node = this.classNodeAt(index)
       let symbol = this.classForNode(node)
       let baseNode = this.classBaseNode(node)
+
       if symbol != null && baseNode >= 0
         let written = this.syntax.dataAt(baseNode)
+
         if semanticIsBuiltin(written) || semanticIsArray(written) || semanticIsOptional(written) || semanticIsPointer(written)
           this.report("NR159", baseNode, "Base type '" + written + "' must be a class.")
         else
           let resolved = semanticResolveType(this.model, written, symbol.namespaceName)
+
           if resolved == "Unknown"
             this.report("NR158", baseNode, "Base class '" + written + "' was not found.")
           else if resolved == symbol.fullName
             this.report("NR160", baseNode, "Class '" + symbol.name + "' cannot inherit from itself.")
           else
-            symbol.baseName = resolved
+            let base = this.model.findClass(resolved)
+
+            if base != null && base.isSealed
+              this.report("NR159", baseNode, "Sealed class '" + resolved + "' cannot be inherited.")
+            else if base != null && base.isAlternative
+              this.report("NR260", baseNode, "Closed alternative type '" + resolved + "' cannot be inherited.")
+            else if base != null && base.isResource
+              this.report("NR262", baseNode, "Resource classes cannot be inherited.")
+            else if symbol.isResource
+              this.report("NR262", baseNode, "A resource class cannot inherit from another class.")
+            else
+              symbol.baseName = resolved
+              this.recordTypeOccurrence(resolved, baseNode)
+            end
           end
         end
       end
       index = index + 1
     end
     var current = this.model.firstClass
+
     while current != null
       if this.hasInheritanceCycle(current)
         this.report("NR161", current.syntaxNode, "Inheritance cycle detected for class '" + current.name + "'.")
@@ -641,6 +952,7 @@ class BootstrapBinder
   def hasInheritanceCycle(classSymbol: SemanticClass): Bool
     var current = this.model.findClass(classSymbol.baseName)
     var steps = 0
+
     while current != null && steps < 256
       if current.fullName == classSymbol.fullName
         return true
@@ -654,8 +966,10 @@ class BootstrapBinder
   def findBaseField(classSymbol: SemanticClass, name: String): SemanticField?
     var current = this.model.findClass(classSymbol.baseName)
     var steps = 0
+
     while current != null && steps < 256
       let field = this.findDeclaredField(current, name)
+
       if field != null
         return field
       end
@@ -666,29 +980,22 @@ class BootstrapBinder
   end
 
   def findBaseMethod(classSymbol: SemanticClass, name: String): SemanticCallable?
-    var current = this.model.findClass(classSymbol.baseName)
-    var steps = 0
-    while current != null && steps < 256
-      let method = this.findDeclaredMethod(current, name)
-      if method != null && method.name != "init" && method.access != "private"
-        return method
-      end
-      current = this.model.findClass(current.baseName)
-      steps = steps + 1
-    end
-    return null
+    return semanticFindBaseMethod(this.model, classSymbol, name)
   end
 
   def compatibleMethods(left: SemanticCallable, right: SemanticCallable, sharedSignature: Bool = false): Bool
     # Only the synthetic shared-function subtype strengthens its invoke contract.
     let readonlyCompatible = left.isReadonly == right.isReadonly || (sharedSignature && left.isReadonly && !right.isReadonly)
+
     if left.access != right.access || left.isUnsafe != right.isUnsafe || !readonlyCompatible || left.returnType != right.returnType || left.parameterCount != right.parameterCount
       return false
     end
     var index = 0
+
     while index < left.parameterCount
       let leftParameter = left.parameterAt(index)
       let rightParameter = right.parameterAt(index)
+
       if leftParameter == null || rightParameter == null || leftParameter.typeName != rightParameter.typeName
         return false
       end
@@ -699,28 +1006,33 @@ class BootstrapBinder
 
   def validateInheritedMembers(): Void
     var classSymbol = this.model.firstClass
+
     while classSymbol != null
       var field = classSymbol.firstField
+
       while field != null
         let inherited = this.findBaseField(classSymbol, field.name)
+
         if inherited != null
           this.report("NR178", field.syntaxNode, "Field '" + field.name + "' cannot redeclare the inherited field from '" + inherited.owner + "'.")
         end
         field = field.nextField
       end
       var method = classSymbol.firstMethod
+
       while method != null
         if method.name == "init"
           if method.hasOverride
-            this.report("NR176", method.syntaxNode, "Constructor 'init' cannot be marked '@override'.")
+            this.report("NR176", method.syntaxNode, "Constructor 'init' cannot use 'override'.")
           end
         else if method.isStatic && method.hasOverride
           this.report("NR175", method.syntaxNode, "Static method '" + method.name + "' cannot override or be overridden.")
         else
           let inherited = this.findBaseMethod(classSymbol, method.name)
+
           if inherited == null
             if method.hasOverride
-              this.report("NR174", method.syntaxNode, "Method '" + method.name + "' is marked '@override', but no compatible base method exists.")
+              this.report("NR174", method.syntaxNode, "Method '" + method.name + "' uses 'override', but no compatible base method exists.")
             end
           else if method.isStatic || inherited.isStatic
             this.report("NR175", method.syntaxNode, "Static method '" + method.name + "' cannot override or be overridden.")
@@ -736,8 +1048,10 @@ class BootstrapBinder
 
   def registerFunctions(): Void
     var index = 0
+
     while index < this.functionCount()
       let node = this.functionNodeAt(index)
+
       if semanticField(this.syntax.dataAt(node), 1) == "main" && this.isForbiddenEntryPoint(node)
         this.report("NR_PROJECT_ENTRY", node, "Library sources cannot declare a 'main' entry point.")
         index = index + 1
@@ -751,13 +1065,13 @@ class BootstrapBinder
       let namespaceName = semanticField(data, 0)
       let name = semanticField(data, 1)
       let fullName = semanticQualifiedName(namespaceName, name)
-      if this.model.findFunction(fullName) != null
+      let existing = this.model.findFunction(fullName)
+
+      if existing != null && !(this.allowSessionEntryReplacement && fullName == "__neri_session_entry" && !this.model.ownsFunction(existing))
         this.report("NR105", node, "Function '" + name + "' is already defined.")
       else
         let callable = this.createCallable(node, null, "internal")
-        if callable.isStatic
-          this.report("NR170", node, "Modifier 'static' is valid only on methods declared inside a class.")
-        end
+
         this.model.addFunction(callable)
       end
       index = index + 1
@@ -767,6 +1081,7 @@ class BootstrapBinder
   def isForbiddenEntryPoint(node: Int): Bool
     let source = this.sourceIdAt(this.syntax.irStartAt(node))
     var entry = this.forbiddenEntryPointSources.first.nextNode
+
     while entry != null
       if entry.value == source
         return true
@@ -779,6 +1094,7 @@ class BootstrapBinder
   def validateEntryPoint(): Void
     var mainCount = 0
     var current = this.model.firstFunction
+
     while current != null
       if current.name == "main"
         if current.namespaceName != ""
@@ -793,6 +1109,7 @@ class BootstrapBinder
           end
           if current.returnType != "Void"
             let returnNode = this.syntax.childAt(current.syntaxNode, semanticIntField(this.syntax.dataAt(current.syntaxNode), 2) + current.parameterCount)
+
             this.report("NR106", returnNode, "Function 'main' must return Void, not '" + current.returnType + "'.")
           end
         end

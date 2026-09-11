@@ -313,8 +313,14 @@ public:
     for (const auto &feature : result.required_features) {
       if (feature == "native-libraries-v1") native_libraries_ = true;
       if (feature == "native-records-v1") native_records_ = true;
+      if (feature == "session-module-v1") session_module_ = true;
+      if (feature == "retained-modules-v1") retained_modules_ = true;
+      if (feature == "retained-modules-v1" && transport_minor_ < 7U)
+        fail(unsupported_feature, "Retained modules require IR transport 1.7.", input_.offset());
       if (feature == "scoped-tasks-v1" && transport_minor_ < 4U)
         fail(unsupported_feature, "Scoped tasks require IR transport 1.4.", input_.offset());
+      if (feature == "debug-scopes-v1" && transport_minor_ < 6U)
+        fail(unsupported_feature, "Debug scopes require IR transport 1.6.", input_.offset());
     }
     if (native_libraries_ && transport_minor_ < 2U) {
       fail(unsupported_feature, "Native libraries require IR transport 1.2.", input_.offset());
@@ -339,6 +345,12 @@ public:
         record.fields = read_vector<field>(input_, "native fields", [this] { return read_field(); });
         return record;
       });
+    }
+    if (session_module_) {
+      if (transport_minor_ < 5U)
+        fail(unsupported_feature, "Session modules require transport 1.5.", input_.offset());
+      result.session = session_export{read_symbol(), read_type(), read_type(),
+                                      retained_modules_ ? identity("Session artifact identity") : ""};
     }
     input_.require_end();
     return result;
@@ -505,6 +517,7 @@ private:
     require_tag(result.access, NERI_IR_ACCESS_PUBLIC_V1,
                 NERI_IR_ACCESS_INTERNAL_V1, "access-modifier",
                 access_offset);
+    if (retained_modules_) result.retained = input_.boolean();
     result.fields = read_vector<field>(input_, "class fields",
                                        [this] { return read_field(); });
     result.methods = read_vector<method>(input_, "class methods",
@@ -609,6 +622,9 @@ private:
     });
     result.flag = input_.boolean();
     result.location = read_location();
+    if (transport_minor_ >= 6U) {
+      result.debug_scope_id = input_.model_id("instruction debug scope");
+    }
     return result;
   }
 
@@ -639,6 +655,9 @@ private:
            tag_offset);
     }
     result.location = read_location();
+    if (transport_minor_ >= 6U) {
+      result.debug_scope_id = input_.model_id("terminator debug scope");
+    }
     return result;
   }
 
@@ -665,6 +684,7 @@ private:
                 NERI_IR_DEFAULT_ADAPTER_V1, "function-kind", kind_offset);
     result.effects = read_effects();
     result.unsafe_call = input_.boolean();
+    if (retained_modules_) result.retained = input_.boolean();
     result.entry_block = input_.model_id("block ID");
     result.unsafe_root = read_optional<value_definition>(
         input_, [this] { return read_value_definition(); });
@@ -675,11 +695,29 @@ private:
     result.location = read_location();
     result.blocks = read_vector<block>(input_, "function blocks",
                                        [this] { return read_block(); });
+    if (transport_minor_ >= 6U) {
+      result.debug_scopes = read_vector<debug_scope>(
+          input_, "debug scopes", [this] {
+            debug_scope value{input_.model_id("debug scope ID"),
+                              input_.model_id("debug scope parent"), {}};
+            const auto location = read_location();
+            if (!location.has_value()) {
+              fail(malformed_module, "Debug scope requires a source location.",
+                   input_.offset());
+            }
+            value.location = *location;
+            return value;
+          });
+    }
     if (transport_minor_ >= 1U) {
       result.debug_locals = read_vector<debug_local>(
           input_, "debug locals", [this] {
             debug_local value{input_.utf8(),
-                              input_.model_id("debug local value"), {}};
+                              input_.model_id("debug local value"),
+                              transport_minor_ >= 6U
+                                  ? input_.model_id("debug local scope")
+                                  : 0U,
+                              {}};
             const auto location = read_location();
             if (!location.has_value()) {
               fail(malformed_module, "Debug local requires a source location.",
@@ -697,6 +735,8 @@ private:
   std::uint16_t transport_minor_{};
   bool native_libraries_{};
   bool native_records_{};
+  bool session_module_{};
+  bool retained_modules_{};
 };
 
 void validate_options(const reader_options &options) {

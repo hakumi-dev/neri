@@ -1,5 +1,10 @@
 # Toolchain packages
 
+The package includes the public language, ABI, library and session references.
+The package driver owns that explicit document selection and verifies each
+selected source plus inline links to relative `.md` targets in that selection
+before it builds the archive.
+
 `scripts/build.sh package` produces a Release toolchain archive for the bootstrap
 host. The command builds the current native components, reaches the compiler
 fixed point, and passes the native and language contracts before packaging.
@@ -16,8 +21,14 @@ records:
   the command.
 - `ARTIFACTS.sha256` hashes packaged executables, libraries, documentation, examples and the
   source manifest.
-- `PROVENANCE.json` records the target, LLVM version, ABI and IR versions, validation
-  gate, source/artifact manifest digests and trusted seed provenance digest.
+- `PROVENANCE.json` schema 2 records the target, LLVM version, the packaged
+  `runtimeManifest` with ABI/IR versions and feature bits, validation gate,
+  source/artifact manifest digests and trusted seed provenance digest.
+
+The package includes and hashes every `.hk` library source directly under
+`stdlib/`, discovered in sorted order. Library membership comes from those
+files; the compiler, language server and package driver have no library-name
+registry.
 
 The driver creates two separate trees, normalizes permissions and timestamps,
 writes sorted USTAR members with fixed owner/group metadata, and compresses with

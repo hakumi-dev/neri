@@ -33,7 +33,7 @@ int64_t neri_rt_v1_net_configure(int64_t fd) {
                     (const char *)&enabled, sizeof(enabled));
 }
 static int64_t address_operation(int64_t fd, int64_t port, int connecting) {
-  if (port < 1 || port > 65535) { WSASetLastError(WSAEINVAL); return -1; }
+  if (port < (connecting ? 1 : 0) || port > 65535) { WSASetLastError(WSAEINVAL); return -1; }
   struct sockaddr_in address = {0};
   address.sin_family = AF_INET;
   address.sin_port = htons((uint16_t)port);
@@ -42,8 +42,43 @@ static int64_t address_operation(int64_t fd, int64_t port, int connecting) {
                     : bind((SOCKET)fd, (struct sockaddr *)&address, sizeof(address));
 }
 int64_t neri_rt_v1_net_bind(int64_t fd, int64_t port) { return address_operation(fd, port, 0); }
+int64_t neri_rt_v1_net_local_port(int64_t fd) {
+  if (fd < 0) { WSASetLastError(WSAEINVAL); return -1; }
+  struct sockaddr_in address = {0};
+  int length = sizeof(address);
+  if (getsockname((SOCKET)fd, (struct sockaddr *)&address, &length) != 0 ||
+      length < (int)sizeof(address) || address.sin_family != AF_INET) return -1;
+  return ntohs(address.sin_port);
+}
 int64_t neri_rt_v1_net_connect(int64_t fd, int64_t port) {
   return io_result((int)address_operation(fd, port, 1));
+}
+int64_t neri_rt_v1_net_connect_timeout(int64_t fd, int64_t port, int64_t milliseconds) {
+  if (fd < 0 || port < 1 || port > 65535 || milliseconds < 0 || milliseconds > INT_MAX) {
+    WSASetLastError(WSAEINVAL); return -1;
+  }
+  u_long nonblocking = 1;
+  if (!SetHandleInformation((HANDLE)(uintptr_t)fd, HANDLE_FLAG_INHERIT, 0) ||
+      ioctlsocket((SOCKET)fd, FIONBIO, &nonblocking) != 0) return -1;
+  const int connected = (int)address_operation(fd, port, 1);
+  if (connected == 0) return 0;
+  const int started = WSAGetLastError();
+  if (started != WSAEWOULDBLOCK && started != WSAEINPROGRESS &&
+      started != WSAEALREADY && started != WSAEINTR) return -1;
+  WSAPOLLFD item = {(SOCKET)fd, POLLWRNORM, 0};
+  const ULONGLONG deadline = GetTickCount64() + (ULONGLONG)milliseconds;
+  int ready;
+  do {
+    const ULONGLONG now = GetTickCount64();
+    if (now >= deadline) { WSASetLastError(WSAETIMEDOUT); return -2; }
+    ready = WSAPoll(&item, 1, (int)(deadline - now));
+  } while (ready < 0 && WSAGetLastError() == WSAEINTR);
+  if (ready <= 0) { if (ready == 0) { WSASetLastError(WSAETIMEDOUT); return -2; } return -1; }
+  int error = 0;
+  int length = sizeof(error);
+  if (getsockopt((SOCKET)fd, SOL_SOCKET, SO_ERROR, (char *)&error, &length) != 0) return -1;
+  if (error != 0) { WSASetLastError(error); return -1; }
+  return 0;
 }
 int64_t neri_rt_v1_net_listen(int64_t fd) { return listen((SOCKET)fd, 16); }
 int64_t neri_rt_v1_net_accept(int64_t fd) {
@@ -66,6 +101,9 @@ int64_t neri_rt_v1_net_write(int64_t fd, uint8_t *bytes, int64_t length) {
   return io_result(send((SOCKET)fd, (const char *)bytes, (int)(length > INT_MAX ? INT_MAX : length), 0));
 }
 void neri_rt_v1_net_close(int64_t fd) { closesocket((SOCKET)fd); }
+int64_t neri_rt_v1_net_close_result(int64_t fd) {
+  return closesocket((SOCKET)fd) == 0 ? 0 : -1;
+}
 int64_t neri_rt_v1_net_milliseconds(void) { return (int64_t)GetTickCount64(); }
 int64_t neri_rt_v1_net_error(uint8_t *bytes, int64_t capacity) {
   const DWORD error = (DWORD)WSAGetLastError();

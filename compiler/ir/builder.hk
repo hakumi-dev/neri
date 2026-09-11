@@ -19,9 +19,11 @@ class IrVariable
   public depth: Int = 0
   public addressedPointer: Int = -1
   public addressedDepth: Int = -1
+  public declarationLocation: IrLocation = new IrLocation(false, 0, 0)
+  public debugScopeId: Int = 0
   public nextVariable: IrVariable?
 
-  def init(identity: String, symbolKind: Int, name: String, typeName: String, value: Int, mutable: Bool, depth: Int): Void
+  def init(identity: String, symbolKind: Int, name: String, typeName: String, value: Int, mutable: Bool, depth: Int, declarationLocation: IrLocation): Void
     this.identity = identity
     this.symbolKind = symbolKind
     this.name = name
@@ -29,11 +31,12 @@ class IrVariable
     this.value = value
     this.mutable = mutable
     this.depth = depth
+    this.declarationLocation = declarationLocation
   end
 end
 
 class IrStateEntry
-  public variable: IrVariable = new IrVariable("error", 6, "error", "int", -1, false, 0)
+  public variable: IrVariable = new IrVariable("error", 6, "error", "int", -1, false, 0, new IrLocation(false, 0, 0))
   public value: Int = -1
   public nextEntry: IrStateEntry?
 
@@ -54,10 +57,12 @@ class IrState
 
   def add(variable: IrVariable, value: Int): Void
     let entry = new IrStateEntry(variable, value)
+
     if this.first == null
       this.first = entry
     else
       let last = this.last
+
       if last != null
         last.nextEntry = entry
       end
@@ -68,6 +73,7 @@ class IrState
 
   def valueFor(variable: IrVariable): Int
     var entry = this.first
+
     while entry != null
       if entry.variable.identity == variable.identity
         return entry.value
@@ -114,6 +120,10 @@ class IrCleanup
   public opcode: Int = 42
   public capability: Int = -1
   public token: Int = -1
+  public ownedValue: Int = -1
+  public resourceType: String = ""
+  public identity: String = ""
+  public active: Bool = true
   public previous: IrCleanup?
 
   def init(opcode: Int, capability: Int, token: Int, previous: IrCleanup?): Void
@@ -135,9 +145,12 @@ class IrFunctionContext
   public unsafeDepth: Int = 0
   public cleanup: IrCleanup?
   public cleanupDepth: Int = 0
+  public closeFailures: Int = -1
   public loop: IrLoopFrame?
   public thisOverride: Int = -1
   public thisOverrideType: String = ""
+  public debugScopeId: Int = 0
+  public debugScopeStack: IntBuffer = new IntBuffer()
 
   def init(function: IrFunction, entry: IrBlock): Void
     this.function = function
@@ -149,20 +162,54 @@ class IrFunctionContext
     this.cleanupDepth = this.cleanupDepth + 1
   end
 
+  def pushResourceCleanup(ownedValue: Int, resourceType: String, identity: String): Void
+    let cleanup = new IrCleanup(55, -1, -1, this.cleanup)
+
+    cleanup.ownedValue = ownedValue
+    cleanup.resourceType = resourceType
+    cleanup.identity = identity
+    this.cleanup = cleanup
+    this.cleanupDepth = this.cleanupDepth + 1
+  end
+
+  def releaseResourceCleanup(identity: String): Void
+    var current = this.cleanup
+
+    while current != null
+      if current.opcode == 55 && current.identity == identity
+        current.active = false
+        return
+      end
+      current = current.previous
+    end
+  end
+
   def popCleanup(): Void
     let currentCleanup = this.cleanup
+
     if currentCleanup != null
       this.cleanup = currentCleanup.previous
     end
     this.cleanupDepth = this.cleanupDepth - 1
   end
 
-  def enterScope(): Void
+  def enterScope(location: IrLocation): Void
+    if this.debugScopeStack.size == this.scopeDepth
+      this.debugScopeStack.add(this.debugScopeId)
+    else
+      this.debugScopeStack.set(this.scopeDepth, this.debugScopeId)
+    end
     this.scopeDepth = this.scopeDepth + 1
+    if location.present && location.length > 0
+      let scope = this.function.addDebugScope(this.debugScopeId, location)
+
+      this.debugScopeId = scope.id
+    end
   end
 
   def leaveScope(): Void
     var variable = this.firstVariable
+
     while variable != null
       if variable.depth == this.scopeDepth
         variable.active = false
@@ -170,25 +217,33 @@ class IrFunctionContext
       variable = variable.nextVariable
     end
     this.scopeDepth = this.scopeDepth - 1
+    this.debugScopeId = this.debugScopeStack.get(this.scopeDepth)
   end
 
-  def addVariable(identity: String, symbolKind: Int, name: String, typeName: String, value: Int, mutable: Bool): IrVariable
-    let variable = new IrVariable(identity, symbolKind, name, typeName, value, mutable, this.scopeDepth)
+  def addVariable(identity: String, symbolKind: Int, name: String, typeName: String, value: Int, mutable: Bool, declarationLocation: IrLocation): IrVariable
+    let variable = new IrVariable(identity, symbolKind, name, typeName, value, mutable, this.scopeDepth, declarationLocation)
+
+    variable.debugScopeId = this.debugScopeId
     if this.firstVariable == null
       this.firstVariable = variable
     else
       let last = this.lastVariable
+
       if last != null
         last.nextVariable = variable
       end
     end
     this.lastVariable = variable
+    if declarationLocation.present
+      this.function.addDebugLocal(new IrDebugLocal(name, value, declarationLocation, this.debugScopeId))
+    end
     return variable
   end
 
   def snapshot(): IrState
     let result = new IrState()
     var variable = this.firstVariable
+
     while variable != null
       if variable.active
         result.add(variable, variable.value)
@@ -200,6 +255,7 @@ class IrFunctionContext
 
   def restore(state: IrState): Void
     var entry = state.first
+
     while entry != null
       entry.variable.value = entry.value
       entry = entry.nextEntry
@@ -210,6 +266,7 @@ class IrFunctionContext
     let result = new IrState()
     var remaining = 0
     var variable = this.firstVariable
+
     while variable != null
       if variable.active && variable.mutable
         remaining = remaining + 1
@@ -219,11 +276,14 @@ class IrFunctionContext
     var previousKind = -1
     var previousName = ""
     var emitted = 0
+
     while emitted < remaining
       var best: IrVariable? = null
+
       variable = this.firstVariable
       while variable != null
         let afterPrevious = variable.symbolKind > previousKind || (variable.symbolKind == previousKind && irCompareText(variable.identity, previousName) > 0)
+
         if variable.active && variable.mutable && afterPrevious && (best == null || variable.symbolKind < best.symbolKind || (variable.symbolKind == best.symbolKind && irCompareText(variable.identity, best.identity) < 0))
           best = variable
         end
@@ -242,6 +302,7 @@ class IrFunctionContext
   def arguments(state: IrState): Int[]
     var result: Int[] = []
     var entry = state.first
+
     while entry != null
       result = host.appendInt(result, entry.variable.value)
       entry = entry.nextEntry
@@ -252,8 +313,10 @@ class IrFunctionContext
   def addParameters(block: IrBlock, variables: IrState, location: IrLocation): IrState
     let result = new IrState()
     var entry = variables.first
+
     while entry != null
       let id = this.function.allocateValue()
+
       block.addParameter(new IrParameter(id, entry.variable.typeName, location))
       result.add(entry.variable, id)
       entry = entry.nextEntry
@@ -264,6 +327,7 @@ class IrFunctionContext
   def findVariable(name: String): IrVariable?
     var current = this.firstVariable
     var result: IrVariable? = null
+
     while current != null
       if current.active && current.name == name
         result = current
@@ -275,6 +339,7 @@ class IrFunctionContext
 
   def findVariableIdentity(identity: String, fallbackName: String): IrVariable?
     var current = this.firstVariable
+
     while current != null
       if current.active && current.identity == identity
         return current
@@ -286,10 +351,14 @@ class IrFunctionContext
 
   def emit(opcode: Int, resultType: String, operands: Int[], typeArguments: String[], symbol: IrSymbol?, constantKind: Int, constantValue: String, predicate: Int, flag: Bool, location: IrLocation): IrValue
     var resultId = -1
+
     if resultType != "void"
       resultId = this.function.allocateValue()
     end
-    this.current.addInstruction(new IrInstruction(opcode, resultId, resultType, operands, typeArguments, symbol, constantKind, constantValue, predicate, flag, location))
+    let instruction = new IrInstruction(opcode, resultId, resultType, operands, typeArguments, symbol, constantKind, constantValue, predicate, flag, location)
+
+    instruction.debugScopeId = this.debugScopeId
+    this.current.addInstruction(instruction)
     return new IrValue(resultId, resultType)
   end
 
@@ -299,6 +368,7 @@ class IrFunctionContext
 
   def emitTyped(opcode: Int, resultType: String, operands: Int[], typeArgument: String, location: IrLocation): IrValue
     let types: String[] = [typeArgument]
+
     return this.emit(opcode, resultType, operands, types, null, 0, "", 0, false, location)
   end
 
@@ -307,6 +377,8 @@ class IrFunctionContext
     let first = this.function.allocateValue()
     let second = this.function.allocateValue()
     let instruction = new IrInstruction(opcode, first, firstType, operands, types, null, 0, "", 0, false, location)
+
+    instruction.debugScopeId = this.debugScopeId
     instruction.secondResultId = second
     instruction.secondResultType = secondType
     this.current.addInstruction(instruction)
@@ -323,11 +395,14 @@ class IrFunctionContext
 
   def emitCompare(left: Int, right: Int, predicate: Int, location: IrLocation): IrValue
     let operands: Int[] = [left, right]
+
     return this.emit(15, "bool", operands, irEmptyStrings(), null, 0, "", predicate, false, location)
   end
 
   def returnValue(value: Int, location: IrLocation): Void
     let terminator = new IrTerminator(3, location)
+
+    terminator.debugScopeId = this.debugScopeId
     terminator.value = value
     this.current.terminator = terminator
     this.terminated = true
@@ -335,6 +410,8 @@ class IrFunctionContext
 
   def branch(target: IrBlock, arguments: Int[], location: IrLocation): Void
     let terminator = new IrTerminator(1, location)
+
+    terminator.debugScopeId = this.debugScopeId
     terminator.firstTarget = target.id
     terminator.firstArguments = arguments
     this.current.terminator = terminator
@@ -343,6 +420,8 @@ class IrFunctionContext
 
   def conditional(condition: Int, whenTrue: IrBlock, trueArguments: Int[], whenFalse: IrBlock, falseArguments: Int[], location: IrLocation): Void
     let terminator = new IrTerminator(2, location)
+
+    terminator.debugScopeId = this.debugScopeId
     terminator.condition = condition
     terminator.firstTarget = whenTrue.id
     terminator.firstArguments = trueArguments

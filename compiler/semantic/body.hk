@@ -1,21 +1,5 @@
 use host
 
-# Names are enumerated once for semantic tooling. The binder's libraryReturn,
-# libraryParameterCount and libraryParameterType methods remain the authority:
-# clients must validate every entry through those functions.
-def semanticLibraryNames(library: String): String[]
-  if library == "math"
-    return ["abs", "max", "min", "pow"]
-  else if library == "test"
-    return ["assert", "assertEqual", "assertTrue", "assertFalse"]
-  else if library == "console"
-    return ["print", "println", "read"]
-  else if library == "host"
-    return ["exit", "stringByteLength", "argumentCount", "stringByteAt", "stringSlice", "errorMessage", "stringFromBytes", "readText", "pathJoin", "pathAbsolute", "pathFileName", "argumentAt", "environment", "parseInt", "run", "parseFloat", "appendByte", "appendInt", "appendString", "writeText", "writeBytes", "removeFile"]
-  end
-  return []
-end
-
 class BootstrapBodyBinder
   public enclosing: BootstrapBodyBinder?
   public closureClass: SemanticClass?
@@ -26,12 +10,14 @@ class BootstrapBodyBinder
   public lastLocal: SemanticLocal?
   public scopeDepth: Int = 0
   public loopDepth: Int = 0
+  public loopResourceDepth: Int = -1
   public unsafeDepth: Int = 0
   public flowNames: StringBuffer = new StringBuffer()
   public flowTypes: StringBuffer = new StringBuffer()
   public flowDepths: IntBuffer = new IntBuffer()
   public flowActive: IntBuffer = new IntBuffer()
   public flowDepth: Int = 0
+  public returnTransferDepth: Int = 0
 
   def init(owner: BootstrapBinder): Void
     this.owner = owner
@@ -70,12 +56,14 @@ class BootstrapBodyBinder
     this.lastLocal = null
     this.scopeDepth = 0
     this.loopDepth = 0
+    this.loopResourceDepth = -1
     this.unsafeDepth = 0
     this.flowNames = new StringBuffer()
     this.flowTypes = new StringBuffer()
     this.flowDepths = new IntBuffer()
     this.flowActive = new IntBuffer()
     this.flowDepth = 0
+    this.returnTransferDepth = 0
   end
 
   def enterScope(): Void
@@ -84,8 +72,12 @@ class BootstrapBodyBinder
 
   def leaveScope(): Void
     var local = this.firstLocal
+
     while local != null
       if local.depth == this.scopeDepth
+        if this.directResourceType(local.typeName) && (!local.resourceMoved || local.resourceMaybeMoved) && !local.resourceScoped
+          this.report("NR262", local.syntaxNode, "Owned resource must be acquired with 'using' or transferred before its scope ends.")
+        end
         local.active = false
       end
       local = local.nextLocal
@@ -95,6 +87,7 @@ class BootstrapBodyBinder
 
   def localInCurrentScope(name: String): Bool
     var local = this.firstLocal
+
     while local != null
       if local.active && local.depth == this.scopeDepth && local.name == name
         return true
@@ -107,6 +100,7 @@ class BootstrapBodyBinder
   def findLocal(name: String): SemanticLocal?
     var local = this.firstLocal
     var found: SemanticLocal? = null
+
     while local != null
       if local.active && local.name == name
         found = local
@@ -116,15 +110,29 @@ class BootstrapBodyBinder
     return found
   end
 
+  def findLocalByIdentity(identity: String): SemanticLocal?
+    var local = this.firstLocal
+
+    while local != null
+      if local.active && local.identity == identity
+        return local
+      end
+      local = local.nextLocal
+    end
+    return null
+  end
+
   def declareLocal(name: String, typeName: String, mutable: Bool, syntaxNode: Int): SemanticLocal
     let position = this.syntax().startAt(syntaxNode)
     let identity = this.currentCallable().fullName + "/local@" + this.owner.sourceIdAt(position) + ":" + ((position - this.owner.sourceStartAt(position)) as String)
     let local = new SemanticLocal(identity, name, typeName, mutable, this.scopeDepth, syntaxNode)
+
     this.owner.recordDeclaration(identity, name, typeName, syntaxNode)
     if this.firstLocal == null
       this.firstLocal = local
     else
       let last = this.lastLocal
+
       if last != null
         last.nextLocal = local
       end
@@ -135,12 +143,15 @@ class BootstrapBodyBinder
 
   def findVariableIdentity(name: String): String
     let local = this.findLocal(name)
+
     if local != null
       return local.identity
     end
     let callable = this.owner.currentCallable
+
     if callable != null
       let parameter = this.owner.findParameter(callable, name)
+
       if parameter != null
         return parameter.identity
       end
@@ -150,18 +161,22 @@ class BootstrapBodyBinder
 
   def addCompletionVariables(site: SemanticCompletionSite): Void
     let outer = this.enclosing
+
     if outer != null
       outer.addCompletionVariables(site)
     end
     let callable = this.owner.currentCallable
+
     if callable != null
       var parameter = callable.firstParameter
+
       while parameter != null
         site.addSymbol(parameter.identity, parameter.name, parameter.typeName, false)
         parameter = parameter.nextParameter
       end
     end
     var local = this.firstLocal
+
     while local != null
       if local.active
         site.addSymbol(local.identity, local.name, this.findVariableType(local.name), local.mutable)
@@ -172,21 +187,24 @@ class BootstrapBodyBinder
 
   def completionClassName(): String
     let outer = this.enclosing
+
     if outer != null
       return outer.completionClassName()
     end
     let classSymbol = this.owner.currentClass
+
     if classSymbol != null
       return classSymbol.fullName
     end
     return ""
   end
 
-  def recordCompletionSite(node: Int, receiverKind: String = "", receiverType: String = ""): Void
+  def recordCompletionSite(node: Int, receiverKind: String = "", receiverType: String = "", expectedType: String = ""): Void
     if !this.owner.recordCompletionSites
       return
     end
     let site = new SemanticCompletionSite()
+
     site.start = this.syntax().startAt(node)
     site.length = this.syntax().lengthAt(node)
     site.namespaceName = this.owner.currentNamespace
@@ -194,6 +212,7 @@ class BootstrapBodyBinder
     site.callable = this.owner.currentCallable
     site.receiverKind = receiverKind
     site.receiverType = receiverType
+    site.expectsFunction = semanticExpectedFunction(this, expectedType) != null
     this.addCompletionVariables(site)
     site.next = this.model().completionSites
     this.model().completionSites = site
@@ -201,6 +220,7 @@ class BootstrapBodyBinder
 
   def currentCallable(): SemanticCallable
     let callable = this.owner.currentCallable
+
     if callable != null
       return callable
     end
@@ -210,23 +230,28 @@ class BootstrapBodyBinder
   def findVariableType(name: String): String
     var baseType = ""
     let callable = this.owner.currentCallable
+
     if callable != null
       let parameter = this.owner.findParameter(callable, name)
+
       if parameter != null
         baseType = parameter.typeName
       end
     end
     if baseType == ""
       let local = this.findLocal(name)
+
       if local != null
         baseType = local.typeName
       end
     end
     if baseType == ""
       let closure = this.closureClass
+
       if closure != null
         var field = closure.firstField
         var capture = 0
+
         while field != null
           if this.captureNames.get(capture) == name
             baseType = field.typeName
@@ -237,6 +262,7 @@ class BootstrapBodyBinder
       end
     end
     var index = this.flowNames.size - 1
+
     while index >= 0
       if this.flowActive.get(index) == 1 && this.flowDepths.get(index) <= this.flowDepth && this.flowNames.get(index) == name
         return this.flowTypes.get(index)
@@ -252,6 +278,7 @@ class BootstrapBodyBinder
 
   def leaveFlow(): Void
     var index = 0
+
     while index < this.flowNames.size
       if this.flowDepths.get(index) == this.flowDepth
         this.flowActive.set(index, 0)
@@ -270,6 +297,7 @@ class BootstrapBodyBinder
 
   def invalidateNarrowing(name: String): Void
     var index = 0
+
     while index < this.flowNames.size
       if this.flowActive.get(index) == 1 && this.flowNames.get(index) == name
         this.flowActive.set(index, 0)
@@ -280,6 +308,7 @@ class BootstrapBodyBinder
 
   def applyConditionNarrowing(node: Int, whenTrue: Bool): Void
     let kind = this.syntax().kindAt(node)
+
     if kind == "Unary" && this.syntax().dataAt(node) == "Bang"
       this.applyConditionNarrowing(this.syntax().childAt(node, 0), !whenTrue)
       return
@@ -288,6 +317,7 @@ class BootstrapBodyBinder
       return
     end
     let operation = this.syntax().dataAt(node)
+
     if operation == "AmpAmp" && whenTrue
       this.applyConditionNarrowing(this.syntax().childAt(node, 0), true)
       this.applyConditionNarrowing(this.syntax().childAt(node, 1), true)
@@ -302,14 +332,17 @@ class BootstrapBodyBinder
     end
     var nameNode = this.syntax().childAt(node, 0)
     var nullNode = this.syntax().childAt(node, 1)
+
     if this.syntax().kindAt(nameNode) != "Name" || this.syntax().kindAt(nullNode) != "NullLiteral"
       nameNode = this.syntax().childAt(node, 1)
       nullNode = this.syntax().childAt(node, 0)
     end
     let provesNonNull = (operation == "BangEqual" && whenTrue) || (operation == "EqualEqual" && !whenTrue)
+
     if provesNonNull && this.syntax().kindAt(nameNode) == "Name" && this.syntax().kindAt(nullNode) == "NullLiteral"
       let name = this.syntax().dataAt(nameNode)
       let typeName = this.findVariableType(name)
+
       if semanticIsOptional(typeName)
         this.addNarrowing(name, semanticInnerType(typeName))
       end
@@ -318,6 +351,7 @@ class BootstrapBodyBinder
 
   def bindClassBodies(): Void
     var classSymbol = this.model().firstClass
+
     while classSymbol != null
       if !classSymbol.isFunctionType && !classSymbol.isClosure && !classSymbol.bodiesBound
         classSymbol.bodiesBound = true
@@ -327,14 +361,18 @@ class BootstrapBodyBinder
         this.resetLocals()
         let classNode = classSymbol.syntaxNode
         var memberOffset = this.owner.classMemberStart(classNode)
+
         while memberOffset < this.syntax().childCountAt(classNode)
           let fieldNode = this.syntax().childAt(classNode, memberOffset)
+
           if this.syntax().kindAt(fieldNode) == "Field"
             let fieldName = semanticField(this.syntax().dataAt(fieldNode), 1)
             let field = this.owner.findDeclaredField(classSymbol, fieldName)
+
             if field != null && this.syntax().childCountAt(fieldNode) > 1
               let initializerNode = this.syntax().childAt(fieldNode, 1)
               let value = this.bindExpression(initializerNode, field.typeName)
+
               field.boundInitializer = value.boundNode
               if !semanticAssignable(this.model(), field.typeName, value.typeName)
                 this.report("NR142", initializerNode, "Cannot assign expression of type '" + value.typeName + "' to variable '" + field.name + "' of type '" + field.typeName + "'.")
@@ -344,6 +382,7 @@ class BootstrapBodyBinder
           memberOffset = memberOffset + 1
         end
         var method = classSymbol.firstMethod
+
         while method != null
           this.bindCallable(method)
           method = method.nextCallable
@@ -358,6 +397,7 @@ class BootstrapBodyBinder
 
   def bindFunctionBodies(): Void
     var function = this.model().firstFunction
+
     while function != null
       this.owner.currentClass = null
       this.owner.currentNamespace = function.namespaceName
@@ -377,10 +417,12 @@ class BootstrapBodyBinder
       this.unsafeDepth = 1
     end
     var parameter = callable.firstParameter
+
     while parameter != null
       if parameter.hasDefault && this.syntax().childCountAt(parameter.syntaxNode) > 1
         let defaultNode = this.syntax().childAt(parameter.syntaxNode, 1)
         let defaultValue = this.bindExpression(defaultNode, parameter.typeName)
+
         parameter.boundDefault = defaultValue.boundNode
         if !semanticAssignable(this.model(), parameter.typeName, defaultValue.typeName)
           this.report("NR107B", defaultNode, "Default value for parameter '" + parameter.name + "' must be of type '" + parameter.typeName + "', but got '" + defaultValue.typeName + "'.")
@@ -390,59 +432,222 @@ class BootstrapBodyBinder
     end
     var bodyChildren: Int[] = []
     var index = 0
+
     while index < callable.bodyCount
       let statement = this.syntax().childAt(callable.syntaxNode, callable.bodyStart + index)
+
       if this.syntax().kindAt(statement) == "SuperConstructorCall"
-        this.bindBaseConstructorCall(callable, statement)
+        let owner = this.owner.currentClass
+
+        if callable.name != "init" || owner == null || owner.baseName == "" || index != 0 || callable.hasBaseConstructorCall
+          this.rejectBaseConstructorCall(statement)
+        else
+          this.bindBaseConstructorCall(callable, statement)
+        end
       else
         let boundStatement = this.bindStatement(statement, callable.returnType)
+
         bodyChildren = appendChild(bodyChildren, boundStatement)
       end
       index = index + 1
     end
-    if callable.cAbiSymbol == "" && callable.returnType != "Void" && !this.statementsReturn(callable)
+    if callable.name == "init" && !callable.hasBaseConstructorCall
+      this.validateImplicitBaseConstructor(callable)
+    end
+    if !callable.isAbstract && callable.cAbiSymbol == "" && callable.intrinsicName == "" && callable.returnType != "Void" && !this.statementsReturn(callable)
       this.report("NR108", callable.syntaxNode, "Not all code paths return a value in function '" + this.callableDisplayName(callable) + "'.")
     end
+    this.validateOwnedLocals(callable.syntaxNode)
+    if callable.fullName == "__neri_session_entry"
+      var local = this.firstLocal
+
+      while local != null
+        if local.depth == 0
+          callable.addSessionLocal(new SemanticLocal(local.identity, local.name, local.typeName, local.mutable, 0, local.syntaxNode))
+        end
+        local = local.nextLocal
+      end
+    end
     callable.boundNode = this.addBound("Function", callable.returnType, callable.fullName, callable.syntaxNode, bodyChildren)
+  end
+
+  def validateOwnedLocals(node: Int): Void
+    var local = this.firstLocal
+
+    while local != null
+      if local.active && this.directResourceType(local.typeName) && (!local.resourceMoved || local.resourceMaybeMoved) && !local.resourceScoped
+        this.report("NR262", node, "Owned resource must be acquired with 'using' or transferred before returning.")
+      end
+      local = local.nextLocal
+    end
+  end
+
+  def directResourceType(typeName: String): Bool
+    let symbol = this.model().findClass(semanticMutableType(typeName))
+
+    return symbol != null && symbol.isResource
+  end
+
+  def resourceMoveSnapshot(): Int[]
+    var values: Int[] = []
+    var local = this.firstLocal
+
+    while local != null
+      values = host.appendInt(values, local.resourceMoved ? 2 : (local.resourceMaybeMoved ? 1 : 0))
+      local = local.nextLocal
+    end
+    return values
+  end
+
+  def restoreResourceMoves(values: Int[]): Void
+    var local = this.firstLocal
+    var index = 0
+
+    while local != null && index < values.Length
+      local.resourceMoved = values[index] == 2
+      local.resourceMaybeMoved = values[index] == 1
+      local = local.nextLocal
+      index = index + 1
+    end
+  end
+
+  def joinResourceMoves(left: Int[], right: Int[]): Void
+    var local = this.firstLocal
+    var index = 0
+
+    while local != null && index < left.Length && index < right.Length
+      local.resourceMoved = left[index] == 2 && right[index] == 2
+      local.resourceMaybeMoved = !local.resourceMoved && (left[index] != 0 || right[index] != 0)
+      local = local.nextLocal
+      index = index + 1
+    end
   end
 
   def bindBaseConstructorCall(callable: SemanticCallable, node: Int): Void
     callable.hasBaseConstructorCall = true
     let owner = this.owner.currentClass
+
     if owner == null
       return
     end
     let baseClass = this.model().findClass(owner.baseName)
+
     if baseClass == null
       return
     end
     let constructor = this.owner.findDeclaredMethod(baseClass, "init")
+
     if constructor == null
+      let actual = this.syntax().childCountAt(node)
+      let inherited = this.inheritedConstructor(owner)
+
+      if inherited != null
+        if !this.memberAccessible(inherited.className, inherited.access)
+          this.report("NR153", node, "Cannot access " + inherited.access + " constructor of type '" + inherited.className + "'.")
+        end
+        this.validateCallCount(inherited.className + ".init", node, 0, inherited)
+      end
+      if actual > 0
+        this.reportLength("NR111", node, 1, "Function '" + baseClass.name + ".init' expects 0 arguments, but got " + (actual as String) + ".")
+      end
+      var index = 0
+
+      while index < actual
+        this.bindExpression(this.syntax().childAt(node, index), "")
+        index = index + 1
+      end
       return
+    end
+    if !this.memberAccessible(constructor.className, constructor.access)
+      this.report("NR153", node, "Cannot access " + constructor.access + " constructor of type '" + baseClass.fullName + "'.")
     end
     callable.baseConstructorName = constructor.fullName
     let actual = this.syntax().childCountAt(node)
+
     this.validateCallCount(baseClass.name + ".init", node, actual, constructor)
     var index = 0
+
     while index < actual
       var expected = ""
       let parameter = constructor.parameterAt(index)
+
       if parameter != null
         expected = parameter.typeName
       end
       let argument = this.bindExpression(this.syntax().childAt(node, index), expected)
+
       callable.baseArguments.add(argument.boundNode)
       index = index + 1
     end
   end
 
+  def rejectBaseConstructorCall(node: Int): Void
+    this.report("NR182", node, "Base constructor call 'super(...)' must be the first statement of a derived constructor and cannot be repeated.")
+    var index = 0
+
+    while index < this.syntax().childCountAt(node)
+      this.bindExpression(this.syntax().childAt(node, index), "")
+      index = index + 1
+    end
+  end
+
+  def validateImplicitBaseConstructor(callable: SemanticCallable): Void
+    let owner = this.owner.currentClass
+
+    if owner == null
+      return
+    end
+    let baseClass = this.model().findClass(owner.baseName)
+
+    if baseClass == null
+      return
+    end
+    let constructor = this.inheritedConstructor(owner)
+
+    if constructor == null
+      return
+    end
+    if !this.memberAccessible(constructor.className, constructor.access)
+      this.report("NR153", callable.syntaxNode, "Cannot access " + constructor.access + " constructor of type '" + constructor.className + "'.")
+    end
+    this.validateCallCount(constructor.className + ".init", callable.syntaxNode, 0, constructor)
+  end
+
+  def inheritedConstructor(classSymbol: SemanticClass): SemanticCallable?
+    var baseClass = this.model().findClass(classSymbol.baseName)
+    var steps = 0
+
+    while baseClass != null && steps < 256
+      let constructor = this.owner.findDeclaredMethod(baseClass, "init")
+
+      if constructor != null
+        return constructor
+      end
+      baseClass = this.model().findClass(baseClass.baseName)
+      steps = steps + 1
+    end
+    return null
+  end
+
+  def inheritedConstructorAccessible(classSymbol: SemanticClass, constructor: SemanticCallable): Bool
+    if constructor.access == "public" || constructor.access == "internal"
+      return true
+    end
+    if constructor.access == "protected"
+      return semanticClassAssignable(this.model(), constructor.className, classSymbol.fullName)
+    end
+    return false
+  end
+
   def callableDisplayName(callable: SemanticCallable): String
     let owner = this.model().findClass(callable.className)
+
     if owner != null && owner.isClosure
       return "callback"
     end
     if callable.className != ""
       let classSymbol = this.model().findClass(callable.className)
+
       if classSymbol != null
         return classSymbol.name + "." + callable.name
       end
@@ -452,8 +657,10 @@ class BootstrapBodyBinder
 
   def statementsReturn(callable: SemanticCallable): Bool
     var index = 0
+
     while index < callable.bodyCount
       let statement = this.syntax().childAt(callable.syntaxNode, callable.bodyStart + index)
+
       if this.statementReturns(statement)
         return true
       end
@@ -464,11 +671,13 @@ class BootstrapBodyBinder
 
   def statementReturns(node: Int): Bool
     let kind = this.syntax().kindAt(node)
+
     if kind == "Return"
       return true
     else if kind == "If"
       let thenCount = semanticIntField(this.syntax().dataAt(node), 0)
       let elseCount = semanticIntField(this.syntax().dataAt(node), 1)
+
       if elseCount == 0
         return false
       end
@@ -477,12 +686,32 @@ class BootstrapBodyBinder
       return this.nodeRangeReturns(node, 0, this.syntax().childCountAt(node))
     else if kind == "BorrowBlock"
       return this.nodeRangeReturns(node, 1, this.syntax().childCountAt(node) - 1)
+    else if kind == "Match"
+      let count = this.syntax().childCountAt(node) - 1
+
+      if count == 0
+        return false
+      end
+      var index = 0
+
+      while index < count
+        let branch = this.syntax().childAt(node, index + 1)
+        let bindings = semanticIntField(this.syntax().dataAt(branch), 0)
+        let body = semanticIntField(this.syntax().dataAt(branch), 1)
+
+        if !this.nodeRangeReturns(branch, 1 + bindings, body)
+          return false
+        end
+        index = index + 1
+      end
+      return true
     end
     return false
   end
 
   def nodeRangeReturns(parent: Int, start: Int, count: Int): Bool
     var index = 0
+
     while index < count
       if this.statementReturns(this.syntax().childAt(parent, start + index))
         return true
@@ -494,6 +723,7 @@ class BootstrapBodyBinder
 
   def statementTerminates(node: Int): Bool
     let kind = this.syntax().kindAt(node)
+
     if kind == "Return"
       return true
     else if kind == "Break" || kind == "Continue"
@@ -501,17 +731,21 @@ class BootstrapBodyBinder
     else if kind == "If"
       let thenCount = semanticIntField(this.syntax().dataAt(node), 0)
       let elseCount = semanticIntField(this.syntax().dataAt(node), 1)
+
       return elseCount > 0 && this.nodeRangeTerminates(node, 1, thenCount) && this.nodeRangeTerminates(node, 1 + thenCount, elseCount)
     else if kind == "UnsafeBlock"
       return this.nodeRangeTerminates(node, 0, this.syntax().childCountAt(node))
     else if kind == "BorrowBlock"
       return this.nodeRangeTerminates(node, 1, this.syntax().childCountAt(node) - 1)
+    else if kind == "Match"
+      return this.statementReturns(node)
     end
     return false
   end
 
   def nodeRangeTerminates(parent: Int, start: Int, count: Int): Bool
     var index = 0
+
     while index < count
       if this.statementTerminates(this.syntax().childAt(parent, start + index))
         return true
@@ -523,6 +757,7 @@ class BootstrapBodyBinder
 
   def bindStatement(node: Int, returnType: String): Int
     let kind = this.syntax().kindAt(node)
+
     if kind == "Let" || kind == "Var"
       return this.bindVariable(node, kind == "Var")
     else if kind == "Assignment"
@@ -531,6 +766,10 @@ class BootstrapBodyBinder
       return this.bindReturn(node, returnType)
     else if kind == "ExpressionStatement"
       let value = this.bindExpression(this.syntax().childAt(node, 0), "")
+
+      if semanticContainsResource(this.model(), value.typeName)
+        this.report("NR262", node, "Resource-bearing expressions must be acquired with 'using' or returned with an explicit transfer.")
+      end
       return this.addBound("ExpressionStatement", "Void", "", node, appendChild(emptyInts(), value.boundNode))
     else if kind == "If"
       return this.bindIf(node, returnType)
@@ -538,6 +777,8 @@ class BootstrapBodyBinder
       return this.bindWhile(node, returnType)
     else if kind == "For"
       return this.bindFor(node, returnType)
+    else if kind == "Match"
+      return this.bindMatch(node, returnType)
     else if kind == "Break"
       if this.loopDepth == 0
         this.report("NR132", node, "'break' statement not within a loop.")
@@ -551,11 +792,15 @@ class BootstrapBodyBinder
     else if kind == "UnsafeBlock"
       this.unsafeDepth = this.unsafeDepth + 1
       let body = this.bindBlock(node, 0, this.syntax().childCountAt(node), returnType, true)
+
       this.unsafeDepth = this.unsafeDepth - 1
       return this.addBound("UnsafeBlock", "Void", "", node, body)
     else if kind == "BorrowBlock"
       return this.bindBorrow(node, returnType)
+    else if kind == "UsingBlock"
+      return this.bindUsing(node, returnType)
     else if kind == "SuperConstructorCall"
+      this.rejectBaseConstructorCall(node)
       return this.addBound("SuperConstructorCall", "Void", "", node, emptyInts())
     end
     this.report("NR134", node, "Unsupported statement '" + kind + "'.")
@@ -566,8 +811,10 @@ class BootstrapBodyBinder
     let name = this.syntax().dataAt(node)
     var explicitType = ""
     var initializerOffset = 0
+
     if this.syntax().kindAt(this.syntax().childAt(node, 0)) == "Type"
       let explicitTypeNode = this.syntax().childAt(node, 0)
+
       explicitType = this.owner.resolveTypeNode(explicitTypeNode, this.owner.currentNamespace, "")
       this.owner.validatePointerType(explicitTypeNode, this.unsafeDepth > 0)
       initializerOffset = 1
@@ -575,6 +822,7 @@ class BootstrapBodyBinder
     let initializerNode = this.syntax().childAt(node, initializerOffset)
     let value = this.bindExpression(initializerNode, explicitType)
     var typeName = value.typeName
+
     if explicitType != ""
       typeName = explicitType
       if !semanticAssignable(this.model(), explicitType, value.typeName)
@@ -590,32 +838,133 @@ class BootstrapBodyBinder
       this.report("NR137", node, "Type annotation required; cannot infer type from initializer.")
       typeName = "Int"
     end
+    if semanticContainsResource(this.model(), value.typeName) && value.resourceIdentity != ""
+      this.report("NR262", initializerNode, "Resource ownership cannot be copied; acquire it with 'using' or transfer it explicitly.")
+    end
+    if (semanticContainsResource(this.model(), value.typeName) && !this.directResourceType(value.typeName)) || (semanticContainsResource(this.model(), typeName) && !this.directResourceType(typeName))
+      this.report("NR262", initializerNode, "Resource-bearing values cannot be bound; acquire them with 'using' or return with an explicit transfer.")
+    end
     if this.localInCurrentScope(name)
       this.report("NR138", node, "Local '" + name + "' is already declared in this scope.")
     end
     let local = this.declareLocal(name, typeName, mutable, node)
     var children = appendChild(emptyInts(), value.boundNode)
     var boundKind = "Let"
+
     if mutable
       boundKind = "Var"
     end
     return this.addBoundSymbol(boundKind, typeName, name, local.identity, node, children)
   end
 
+  def bindUsing(node: Int, returnType: String): Int
+    let data = this.syntax().dataAt(node)
+    let name = semanticField(data, 0)
+    let acquisitionNode = this.syntax().childAt(node, 0)
+    let acquisition = this.bindExpression(acquisitionNode, "")
+    let acquisitionClass = this.model().findClass(semanticMutableType(acquisition.typeName))
+    var isResult = false
+    var acquiredType = acquisition.typeName
+    var resultErrorType = ""
+
+    if acquisitionClass != null && semanticStartsWith(acquisitionClass.fullName, "result.Result<") && acquisitionClass.genericArguments.Length == 2
+      isResult = true
+      acquiredType = acquisitionClass.genericArguments[0]
+      resultErrorType = acquisitionClass.genericArguments[1]
+    end
+    if !this.isResourceOutcome(returnType)
+      this.report("NR262", node, "A callable with 'using' must return resources.Outcome<T, E> so close failures remain observable.")
+    end
+    let resourceClass = this.model().findClass(semanticMutableType(acquiredType))
+
+    if resourceClass == null || !resourceClass.isResource
+      this.report("NR262", acquisitionNode, "A using acquisition must produce a direct resource or Result<Resource, E>.")
+    else
+      let close = this.resourceCloseMethod(resourceClass)
+
+      if close == null
+        this.report("NR262", acquisitionNode, "A resource used by 'using' must define a public safe 'close(): result.Failure?'.")
+      end
+    end
+    if acquisition.resourceIdentity != ""
+      let source = this.findLocalByIdentity(acquisition.resourceIdentity)
+
+      if source != null
+        if this.loopResourceDepth >= 0 && source.depth <= this.loopResourceDepth
+          this.report("NR262", acquisitionNode, "A resource declared outside a loop cannot be consumed inside the loop; acquire it within each iteration.")
+        end
+        source.resourceMoved = true
+        source.resourceMaybeMoved = false
+      end
+    end
+    if isResult && this.resourceOutcomeArgument(returnType, 1) != resultErrorType
+      this.report("NR262", acquisitionNode, "A Result acquisition error type must match the enclosing Outcome error type.")
+    end
+    this.enterScope()
+    let local = this.declareLocal(name, acquiredType, false, node)
+
+    local.resourceScoped = true
+    let body = this.bindBlock(node, 1, this.syntax().childCountAt(node) - 1, returnType, false)
+
+    this.leaveScope()
+    var children = appendChild(emptyInts(), acquisition.boundNode)
+
+    for statement in body
+      children = appendChild(children, statement)
+    end
+    let resultFlag = isResult ? "result" : "resource"
+
+    return this.addBoundSymbol("UsingBlock", acquiredType, name + "|" + resultFlag, local.identity, node, children)
+  end
+
+  def isResourceOutcome(typeName: String): Bool
+    let symbol = this.model().findClass(semanticMutableType(typeName))
+
+    return symbol != null && symbol.genericOrigin >= 0 && symbol.fullName != "" && semanticStartsWith(symbol.fullName, "resources.Outcome<")
+  end
+
+  def resourceOutcomeArgument(typeName: String, index: Int): String
+    let symbol = this.model().findClass(semanticMutableType(typeName))
+
+    if symbol != null && index >= 0 && index < symbol.genericArguments.Length
+      return symbol.genericArguments[index]
+    end
+    return "Error"
+  end
+
+  def resourceCloseMethod(resourceClass: SemanticClass): SemanticCallable?
+    var method = resourceClass.firstMethod
+
+    while method != null
+      if method.name == "close" && method.access == "public" && !method.isStatic && !method.isUnsafe && method.parameterCount == 0 && method.returnType == "result.Failure?"
+        return method
+      end
+      method = method.nextCallable
+    end
+    return null
+  end
+
   def bindAssignment(node: Int): Int
     let targetNode = this.syntax().childAt(node, 0)
     let valueNode = this.syntax().childAt(node, 1)
     let targetKind = this.syntax().kindAt(targetNode)
+
     if targetKind == "Name"
       let name = this.syntax().dataAt(targetNode)
       let local = this.findLocal(name)
       var expectedType = ""
+
       if local != null
         expectedType = local.typeName
       end
       let value = this.bindExpression(valueNode, expectedType)
+
+      if semanticContainsResource(this.model(), value.typeName)
+        this.report("NR262", valueNode, "Resource ownership cannot be assigned; use 'transfer' into an ownership-approved return.")
+      end
       if local == null
         let callable = this.owner.currentCallable
+
         if callable != null && this.owner.findParameter(callable, name) != null
           this.report("NR139", targetNode, "Cannot assign to parameter '" + name + "'. Parameters are immutable.")
         else
@@ -637,6 +986,7 @@ class BootstrapBodyBinder
     end
     let target = this.bindExpression(targetNode, "")
     let boundTarget = this.model().bound
+
     if boundTarget.kindAt(target.boundNode) == "Member" || boundTarget.kindAt(target.boundNode) == "Index"
       if semanticIsReadonly(boundTarget.typeAt(boundTarget.childAt(target.boundNode, 0)))
         this.report("NR240", targetNode, "Cannot write through a readonly view.")
@@ -646,10 +996,15 @@ class BootstrapBodyBinder
       this.report("NR141", targetNode, "Native field assignment requires mutable storage.")
     end
     let value = this.bindExpression(valueNode, target.typeName)
+
+    if semanticContainsResource(this.model(), value.typeName)
+      this.report("NR262", valueNode, "Resource ownership cannot be stored through a member or index.")
+    end
     if !semanticAssignable(this.model(), target.typeName, value.typeName)
       this.report("NR142", valueNode, "Cannot assign expression of type '" + value.typeName + "' to variable 'target' of type '" + target.typeName + "'.")
     end
     var children = appendChild(emptyInts(), target.boundNode)
+
     children = appendChild(children, value.boundNode)
     return this.addBound("Assignment", target.typeName, "", node, children)
   end
@@ -662,8 +1017,26 @@ class BootstrapBodyBinder
       return this.addBound("Return", "Void", "", node, emptyInts())
     end
     let expressionNode = this.syntax().childAt(node, 0)
-    let value = this.bindExpression(expressionNode, returnType)
-    if !semanticAssignable(this.model(), returnType, value.typeName)
+
+    this.returnTransferDepth = this.returnTransferDepth + 1
+    let value = this.syntax().kindAt(expressionNode) == "Transfer" ? this.bindTransfer(expressionNode, returnType, true) : this.bindExpression(expressionNode, returnType)
+
+    this.returnTransferDepth = this.returnTransferDepth - 1
+    this.validateOwnedLocals(node)
+    let resultError = this.model().bound.kindAt(value.boundNode) == "AlternativeConstruct" && semanticStartsWith(value.typeName, "result.Result<") && semanticIntField(this.model().bound.dataAt(value.boundNode), 1) == 1
+
+    if semanticContainsResource(this.model(), value.typeName) && !this.expressionTransfersResource(expressionNode) && !resultError
+      this.report("NR262", expressionNode, "Returning an owned resource requires an explicit transfer.")
+    end
+    let outcomeReturn = this.isResourceOutcome(returnType)
+    let bodyValueType = this.resourceOutcomeArgument(returnType, 0)
+    let bodyFailureType = this.resourceOutcomeArgument(returnType, 1)
+    let acceptableOutcomeValue = outcomeReturn && (semanticAssignable(this.model(), bodyValueType, value.typeName) || semanticAssignable(this.model(), bodyFailureType, value.typeName) || semanticAssignable(this.model(), returnType, value.typeName))
+
+    if outcomeReturn && value.typeName != returnType && semanticAssignable(this.model(), bodyValueType, value.typeName) && semanticAssignable(this.model(), bodyFailureType, value.typeName)
+      this.report("NR262", expressionNode, "Ambiguous Outcome return; return an explicit resources.Completion or resources.Outcome value.")
+    end
+    if !semanticAssignable(this.model(), returnType, value.typeName) && !acceptableOutcomeValue
       if value.typeName == "Null" && !semanticIsOptional(returnType)
         this.report("NR150", expressionNode, "Cannot assign null to non-optional type '" + returnType + "'.")
       else
@@ -673,52 +1046,272 @@ class BootstrapBodyBinder
     return this.addBound("Return", returnType, "", node, appendChild(emptyInts(), value.boundNode))
   end
 
+  def expressionTransfersResource(node: Int): Bool
+    if this.syntax().kindAt(node) == "Transfer"
+      return true
+    end
+    var index = 0
+
+    while index < this.syntax().childCountAt(node)
+      if this.expressionTransfersResource(this.syntax().childAt(node, index))
+        return true
+      end
+      index = index + 1
+    end
+    return false
+  end
+
   def bindIf(node: Int, returnType: String): Int
     let conditionNode = this.syntax().childAt(node, 0)
     let condition = this.bindExpression(conditionNode, "Bool")
+
     if condition.typeName != "Bool" && condition.typeName != "Error"
       this.report("NR145", conditionNode, "If condition must be of type 'Bool', but got '" + condition.typeName + "'.")
     end
     let thenCount = semanticIntField(this.syntax().dataAt(node), 0)
     let elseCount = semanticIntField(this.syntax().dataAt(node), 1)
     var children = appendChild(emptyInts(), condition.boundNode)
+    let beforeMoves = this.resourceMoveSnapshot()
+
     this.enterFlow()
     this.applyConditionNarrowing(conditionNode, true)
     let thenBody = this.bindBlock(node, 1, thenCount, returnType, true)
+
     this.leaveFlow()
+    let thenMoves = this.resourceMoveSnapshot()
+
     for statement in thenBody
       children = host.appendInt(children, statement)
     end
+    this.restoreResourceMoves(beforeMoves)
     this.enterFlow()
     this.applyConditionNarrowing(conditionNode, false)
     let elseBody = this.bindBlock(node, 1 + thenCount, elseCount, returnType, true)
+
     this.leaveFlow()
+    let elseMoves = this.resourceMoveSnapshot()
+
     for statement in elseBody
       children = host.appendInt(children, statement)
     end
     let thenTerminates = this.nodeRangeTerminates(node, 1, thenCount)
     let elseTerminates = elseCount > 0 && this.nodeRangeTerminates(node, 1 + thenCount, elseCount)
+
     if thenTerminates && !elseTerminates
+      this.restoreResourceMoves(elseMoves)
       this.applyConditionNarrowing(conditionNode, false)
     else if elseTerminates && !thenTerminates
+      this.restoreResourceMoves(thenMoves)
       this.applyConditionNarrowing(conditionNode, true)
+    else if !thenTerminates && !elseTerminates
+      this.joinResourceMoves(thenMoves, elseMoves)
+    else
+      # Every path returned and each return validated its own ownership state.
+      this.restoreResourceMoves(thenMoves)
     end
     return this.addBound("If", "Void", (thenCount as String) + "|" + (elseCount as String), node, children)
+  end
+
+  def alternativeCaseIndex(symbol: SemanticClass, name: String): Int
+    var index = 0
+
+    while index < alternativeCaseCount(this.owner, symbol)
+      if this.syntax().dataAt(alternativeCaseNode(this.owner, symbol, index)) == name
+        return index
+      end
+      index = index + 1
+    end
+    return -1
+  end
+
+  def alternativePayloadType(symbol: SemanticClass, caseIndex: Int, payload: Int): String
+    var field = symbol.firstField
+    var skip = 1
+    var before = 0
+
+    while before < caseIndex
+      skip = skip + this.syntax().childCountAt(alternativeCaseNode(this.owner, symbol, before))
+      before = before + 1
+    end
+    skip = skip + payload
+    var index = 0
+
+    while field != null
+      if index == skip
+        return field.typeName
+      end
+      field = field.nextField
+      index = index + 1
+    end
+    return "Error"
+  end
+
+  def matchCaseName(node: Int): String
+    let qualified = this.syntax().dataAt(this.syntax().childAt(node, 0))
+    var index = host.stringByteLength(qualified) - 1
+
+    while index >= 0
+      if host.stringByteAt(qualified, index) == (46 as Byte)
+        return host.stringSlice(qualified, index + 1, host.stringByteLength(qualified) - index - 1)
+      end
+      index = index - 1
+    end
+    return qualified
+  end
+
+  def matchCaseQualifier(node: Int): String
+    let qualified = this.syntax().dataAt(this.syntax().childAt(node, 0))
+    var index = host.stringByteLength(qualified) - 1
+
+    while index >= 0
+      if host.stringByteAt(qualified, index) == (46 as Byte)
+        return host.stringSlice(qualified, 0, index)
+      end
+      index = index - 1
+    end
+    return ""
+  end
+
+  def alternativeSourceName(symbol: SemanticClass): String
+    let data = this.syntax().dataAt(symbol.syntaxNode)
+
+    return semanticQualifiedName(semanticField(data, 0), semanticField(data, 2))
+  end
+
+  def alternativeQualifierMatches(symbol: SemanticClass, qualifier: String): Bool
+    if qualifier == this.alternativeSourceName(symbol)
+      this.model().referenceQualifiedUse(qualifier)
+      return true
+    end
+    let simple = semanticField(this.syntax().dataAt(symbol.syntaxNode), 2)
+
+    return qualifier == simple && (symbol.namespaceName == this.owner.currentNamespace || this.model().hasUse(symbol.namespaceName))
+  end
+
+  def bindMatch(node: Int, returnType: String): Int
+    let scrutineeNode = this.syntax().childAt(node, 0)
+    let scrutinee = this.bindExpression(scrutineeNode, "")
+    let symbol = this.model().findClass(semanticMutableType(scrutinee.typeName))
+
+    if symbol == null || !symbol.isAlternative
+      this.report("NR260", scrutineeNode, "Match requires a closed alternative value, but got '" + scrutinee.typeName + "'.")
+    end
+    var children = appendChild(emptyInts(), scrutinee.boundNode)
+    let count = this.syntax().childCountAt(node) - 1
+    var seen: Int[] = []
+    var branch = 0
+
+    while branch < count
+      let caseNode = this.syntax().childAt(node, branch + 1)
+      let bindingCount = semanticIntField(this.syntax().dataAt(caseNode), 0)
+      let bodyCount = semanticIntField(this.syntax().dataAt(caseNode), 1)
+      var caseIndex = -1
+      var matchingOwner = false
+
+      if symbol != null && symbol.isAlternative
+        if this.alternativeQualifierMatches(symbol, this.matchCaseQualifier(caseNode))
+          matchingOwner = true
+          caseIndex = this.alternativeCaseIndex(symbol, this.matchCaseName(caseNode))
+        else
+          this.report("NR260", this.syntax().childAt(caseNode, 0), "Case belongs to '" + this.matchCaseQualifier(caseNode) + "', but the scrutinee has type '" + symbol.fullName + "'.")
+        end
+      end
+      if caseIndex < 0 && matchingOwner
+        this.report("NR260", this.syntax().childAt(caseNode, 0), "Unknown alternative case '" + this.syntax().dataAt(this.syntax().childAt(caseNode, 0)) + "'.")
+      else if caseIndex >= 0
+        if symbol != null
+          this.owner.recordOccurrence(alternativeSourceIdentity(this.owner, symbol, this.matchCaseName(caseNode)), this.syntax().childAt(caseNode, 0))
+        end
+        var previous = 0
+
+        while previous < seen.Length
+          if seen[previous] == caseIndex
+            this.report("NR260", caseNode, "Alternative case '" + this.matchCaseName(caseNode) + "' is redundant.")
+          end
+          previous = previous + 1
+        end
+        seen = host.appendInt(seen, caseIndex)
+        if symbol != null
+          let expected = this.syntax().childCountAt(alternativeCaseNode(this.owner, symbol, caseIndex))
+
+          if bindingCount != expected
+            this.report("NR261", caseNode, "Alternative case '" + this.matchCaseName(caseNode) + "' expects " + (expected as String) + " payload bindings, but got " + (bindingCount as String) + ".")
+          end
+        end
+      end
+      this.enterScope()
+      var boundCase: Int[] = []
+      var payload = 0
+
+      while payload < bindingCount
+        let binding = this.syntax().childAt(caseNode, 1 + payload)
+        var typeName = "Error"
+
+        if caseIndex >= 0 && symbol != null
+          typeName = this.alternativePayloadType(symbol, caseIndex, payload)
+        end
+        let local = this.declareLocal(this.syntax().dataAt(binding), typeName, false, binding)
+
+        boundCase = host.appendInt(boundCase, this.addBoundSymbol("MatchBinding", typeName, alternativePayloadField(caseIndex, payload), local.identity, binding, emptyInts()))
+        payload = payload + 1
+      end
+      var statement = 0
+
+      while statement < bodyCount
+        boundCase = appendChild(boundCase, this.bindStatement(this.syntax().childAt(caseNode, 1 + bindingCount + statement), returnType))
+        statement = statement + 1
+      end
+      this.leaveScope()
+      let data = (caseIndex as String) + "|" + (bindingCount as String) + "|" + (bodyCount as String)
+
+      children = host.appendInt(children, this.addBound("MatchCase", "Void", data, caseNode, boundCase))
+      branch = branch + 1
+    end
+    if symbol != null && symbol.isAlternative
+      var missing = 0
+
+      while missing < alternativeCaseCount(this.owner, symbol)
+        var found = false
+        var index = 0
+
+        while index < seen.Length
+          if seen[index] == missing
+            found = true
+          end
+          index = index + 1
+        end
+        if !found
+          this.report("NR260", node, "Match is missing alternative case '" + this.syntax().dataAt(alternativeCaseNode(this.owner, symbol, missing)) + "'.")
+        end
+        missing = missing + 1
+      end
+    end
+    return this.addBound("Match", "Void", "", node, children)
   end
 
   def bindWhile(node: Int, returnType: String): Int
     let conditionNode = this.syntax().childAt(node, 0)
     let condition = this.bindExpression(conditionNode, "Bool")
+
     if condition.typeName != "Bool" && condition.typeName != "Error"
       this.report("NR146", conditionNode, "While condition must be of type 'Bool', but got '" + condition.typeName + "'.")
     end
+    let moves = this.resourceMoveSnapshot()
+    let previousLoopResourceDepth = this.loopResourceDepth
+
+    this.loopResourceDepth = this.scopeDepth
     this.loopDepth = this.loopDepth + 1
     this.enterFlow()
     this.applyConditionNarrowing(conditionNode, true)
     let body = this.bindBlock(node, 1, this.syntax().childCountAt(node) - 1, returnType, true)
+
     this.leaveFlow()
     this.loopDepth = this.loopDepth - 1
+    this.loopResourceDepth = previousLoopResourceDepth
+    # A loop may execute zero times, so its body cannot consume an outer owner.
+    this.restoreResourceMoves(moves)
     var children = appendChild(emptyInts(), condition.boundNode)
+
     for statement in body
       children = host.appendInt(children, statement)
     end
@@ -729,6 +1322,7 @@ class BootstrapBodyBinder
     let name = semanticField(this.syntax().dataAt(node), 0)
     var offset = 0
     var explicitType = ""
+
     if this.syntax().kindAt(this.syntax().childAt(node, 0)) == "Type"
       explicitType = this.owner.resolveTypeNode(this.syntax().childAt(node, 0), this.owner.currentNamespace, "")
       offset = 1
@@ -736,6 +1330,7 @@ class BootstrapBodyBinder
     let collectionNode = this.syntax().childAt(node, offset)
     let collection = this.bindExpression(collectionNode, "")
     var elementType = "Error"
+
     if semanticIsArray(collection.typeName)
       elementType = semanticInnerType(collection.typeName)
     else if semanticIsOptional(collection.typeName)
@@ -749,14 +1344,23 @@ class BootstrapBodyBinder
       end
       elementType = explicitType
     end
+    let moves = this.resourceMoveSnapshot()
+    let previousLoopResourceDepth = this.loopResourceDepth
+
+    this.loopResourceDepth = this.scopeDepth
     this.enterScope()
     let iterator = this.declareLocal(name, elementType, false, node)
+
     this.loopDepth = this.loopDepth + 1
     let bodyStart = offset + 1
     let body = this.bindBlock(node, bodyStart, this.syntax().childCountAt(node) - bodyStart, returnType, false)
+
     this.loopDepth = this.loopDepth - 1
     this.leaveScope()
+    this.loopResourceDepth = previousLoopResourceDepth
+    this.restoreResourceMoves(moves)
     var children = appendChild(emptyInts(), collection.boundNode)
+
     for statement in body
       children = host.appendInt(children, statement)
     end
@@ -766,13 +1370,16 @@ class BootstrapBodyBinder
   def bindBorrow(node: Int, returnType: String): Int
     let ownerNode = this.syntax().childAt(node, 0)
     let value = this.bindExpression(ownerNode, "")
+
     if semanticIsReadonly(value.typeName)
       this.report("NR240", ownerNode, "A readonly view cannot expose mutable borrowed storage.")
     end
     let pointerName = semanticField(this.syntax().dataAt(node), 0)
     var pointerType = "Error"
+
     if semanticIsArray(value.typeName)
       let elementType = semanticInnerType(value.typeName)
+
       if semanticIsNumeric(elementType) || elementType == "Bool"
         pointerType = elementType + "*"
       else
@@ -784,8 +1391,10 @@ class BootstrapBodyBinder
     this.enterScope()
     let pointer = this.declareLocal(pointerName, pointerType, false, node)
     let body = this.bindBlock(node, 1, this.syntax().childCountAt(node) - 1, returnType, false)
+
     this.leaveScope()
     var children = appendChild(emptyInts(), value.boundNode)
+
     for statement in body
       children = host.appendInt(children, statement)
     end
@@ -798,6 +1407,7 @@ class BootstrapBodyBinder
     end
     var result: Int[] = []
     var index = 0
+
     while index < count
       result = appendChild(result, this.bindStatement(this.syntax().childAt(parent, start + index), returnType))
       index = index + 1
@@ -811,12 +1421,15 @@ class BootstrapBodyBinder
   def bindExpression(node: Int, expectedType: String): BoundValue
     let kind = this.syntax().kindAt(node)
     let data = this.syntax().dataAt(node)
+
     if kind == "Call"
       let task = bindTaskGenerate(this, node, expectedType)
+
       return task if task != null
     end
     if kind == "Call" || kind == "Name" || kind == "Member"
       let generic = bindGenericExpression(this, node, expectedType)
+
       if generic != null
         return generic
       end
@@ -838,6 +1451,8 @@ class BootstrapBodyBinder
       return new BoundValue("Null", this.addBound("NullLiteral", "Null", "", node, emptyInts()))
     else if kind == "Name"
       return this.bindName(node, expectedType)
+    else if kind == "Transfer"
+      return this.bindTransfer(node, expectedType, false)
     else if kind == "This"
       return this.bindThis(node)
     else if kind == "Super"
@@ -858,7 +1473,7 @@ class BootstrapBodyBinder
     else if kind == "Member"
       return this.bindMember(node, expectedType)
     else if kind == "Call"
-      return this.bindCall(node)
+      return this.bindCall(node, expectedType)
     else if kind == "New"
       return this.bindNew(node)
     else if kind == "StackAlloc"
@@ -871,22 +1486,61 @@ class BootstrapBodyBinder
   end
 
   def bindName(node: Int, expectedType: String = ""): BoundValue
-    this.recordCompletionSite(node)
+    this.recordCompletionSite(node, "", "", expectedType)
     let name = this.syntax().dataAt(node)
     let enclosing = this.enclosing
+
     if enclosing != null && this.findVariableIdentity(name) == "" && closureHasVariable(enclosing, name)
       return bindCapture(this, node, name)
     end
     let typeName = this.findVariableType(name)
+
     if typeName == ""
       let function = this.resolveFunction(name)
+
       if function != null
         return bindFunctionValue(this, node, function, expectedType)
       end
       this.report("NR113", node, "Undefined name '" + name + "'.")
       return new BoundValue("Error", this.addBound("Name", "Error", name, node, emptyInts()))
     end
-    return new BoundValue(typeName, this.addBoundSymbol("Name", typeName, name, this.findVariableIdentity(name), node, emptyInts()))
+    let local = this.findLocal(name)
+
+    if local != null && (local.resourceMoved || local.resourceMaybeMoved)
+      this.report("NR262", node, "Resource ownership was already transferred or released.")
+    end
+    let identity = this.findVariableIdentity(name)
+    var resourceIdentity = ""
+
+    if semanticContainsResource(this.model(), typeName)
+      resourceIdentity = identity
+    end
+    return new BoundValue(typeName, this.addBoundSymbol("Name", typeName, name, identity, node, emptyInts()), resourceIdentity)
+  end
+
+  def bindTransfer(node: Int, expectedType: String, returnPosition: Bool): BoundValue
+    let name = this.syntax().dataAt(node)
+    let local = this.findLocal(name)
+
+    if !returnPosition
+      this.report("NR262", node, "A resource transfer is valid only as a return value.")
+    end
+    if local == null || !semanticContainsResource(this.model(), this.findVariableType(name))
+      this.report("NR262", node, "Transfer requires an owned local resource.")
+      return new BoundValue("Error", this.addBound("Transfer", "Error", name, node, emptyInts()))
+    end
+    if local.resourceMoved || local.resourceMaybeMoved
+      this.report("NR262", node, "Resource ownership was already transferred or released.")
+    end
+    if this.loopResourceDepth >= 0 && local.depth <= this.loopResourceDepth
+      this.report("NR262", node, "A resource declared outside a loop cannot be transferred inside the loop; acquire it within each iteration.")
+    end
+    if expectedType != local.typeName
+      this.report("NR262", node, "Transfer requires a matching owned-resource return type.")
+    end
+    local.resourceMoved = true
+    local.resourceMaybeMoved = false
+    return new BoundValue(local.typeName, this.addBoundSymbol("Transfer", local.typeName, name, local.identity, node, emptyInts()), local.identity)
   end
 
   def bindThis(node: Int): BoundValue
@@ -895,6 +1549,7 @@ class BootstrapBodyBinder
     end
     let classSymbol = this.owner.currentClass
     let callable = this.owner.currentCallable
+
     if classSymbol == null
       this.report("NR126A", node, "Keyword 'this' can only be used inside a class method or constructor.")
       return new BoundValue("Error", this.addBound("This", "Error", "", node, emptyInts()))
@@ -904,6 +1559,7 @@ class BootstrapBodyBinder
       return new BoundValue("Error", this.addBound("This", "Error", "", node, emptyInts()))
     end
     let typeName = callable != null && callable.isReadonly ? semanticReadView(classSymbol.fullName) : classSymbol.fullName
+
     return new BoundValue(typeName, this.addBound("This", typeName, "", node, emptyInts()))
   end
 
@@ -912,14 +1568,20 @@ class BootstrapBodyBinder
     let operandNode = this.syntax().childAt(node, 0)
     let operand = this.bindExpression(operandNode, "")
     var resultType = operand.typeName
+    let annotated = semanticOperatorMethod(this.model(), operand.typeName, this.operationText(operation), 0)
+
+    if annotated != null
+      return new BoundValue(annotated.returnType, this.addBound("InstanceCall", annotated.returnType, annotated.fullName, node, [operand.boundNode]))
+    end
     if operation == "Bang"
       resultType = "Bool"
-      if operand.typeName != "Bool" && operand.typeName != "Error"
+      if semanticBuiltinOperatorResult(operand.typeName, "!", 0) == "" && operand.typeName != "Error"
         this.report("NR114", node, "Unary operator '!' requires operand of type Bool, but got '" + operand.typeName + "'.")
       end
     else if operation == "Plus" || operation == "Minus"
-      if !semanticIsArithmetic(operand.typeName) && operand.typeName != "Error"
+      if semanticBuiltinOperatorResult(operand.typeName, this.operationText(operation), 0) == "" && operand.typeName != "Error"
         var text = "-"
+
         if operation == "Plus"
           text = "+"
         end
@@ -932,6 +1594,7 @@ class BootstrapBodyBinder
       end
       let name = this.syntax().dataAt(operandNode)
       let local = this.findLocal(name)
+
       if (this.model().bound.kindAt(operand.boundNode) == "NativeField" || this.model().bound.kindAt(operand.boundNode) == "NativeIndex") && nativeFieldWritable(this, operand.boundNode)
         resultType = operand.typeName + "*"
       else if local == null || !local.mutable || !(semanticIsNumeric(local.typeName) || local.typeName == "Bool" || nativeValueType(local.typeName))
@@ -1016,6 +1679,7 @@ class BootstrapBodyBinder
     let rightNode = this.syntax().childAt(node, 1)
     let left = this.bindExpression(leftNode, "")
     var right = new BoundValue("Error", -1)
+
     if operationKind == "AmpAmp" || operationKind == "PipePipe"
       this.enterFlow()
       this.applyConditionNarrowing(leftNode, operationKind == "AmpAmp")
@@ -1024,6 +1688,32 @@ class BootstrapBodyBinder
     else
       right = this.bindExpression(rightNode, "")
     end
+    var annotated: SemanticCallable? = null
+
+    if operation != "&&" && operation != "||"
+      annotated = semanticOperatorMethod(this.model(), left.typeName, operation, 1)
+    end
+
+    if annotated != null
+      let parameter = annotated.firstParameter
+
+      if parameter != null && right.typeName == parameter.typeName
+        return new BoundValue(annotated.returnType, this.addBound("InstanceCall", annotated.returnType, annotated.fullName, node, [left.boundNode, right.boundNode]))
+      end
+    end
+    if operation == "!=" && left.typeName == right.typeName
+      let equal = semanticOperatorMethod(this.model(), left.typeName, "==", 1)
+
+      if equal != null && equal.returnType == "Bool"
+        let parameter = equal.firstParameter
+
+        if parameter != null && parameter.typeName == right.typeName
+          let comparison = this.addBound("InstanceCall", "Bool", equal.fullName, node, [left.boundNode, right.boundNode])
+
+          return new BoundValue("Bool", this.addBound("Unary", "Bool", "!", node, [comparison]))
+        end
+      end
+    end
     var resultType = "Int"
     let arithmetic = operation == "+" || operation == "-" || operation == "*" || operation == "/"
     let equality = operation == "==" || operation == "!="
@@ -1031,11 +1721,13 @@ class BootstrapBodyBinder
     let logical = operation == "&&" || operation == "||"
     let leftPointer = semanticIsPointer(left.typeName) || (semanticIsOptional(left.typeName) && semanticIsPointer(semanticInnerType(left.typeName)))
     let rightPointer = semanticIsPointer(right.typeName) || (semanticIsOptional(right.typeName) && semanticIsPointer(semanticInnerType(right.typeName)))
+
     if leftPointer || rightPointer
       if this.unsafeDepth == 0
         this.report("NR192", node, "Unsafe operation '" + operation + "' requires an unsafe declaration or block.")
       end
       let nullableNull = equality && ((semanticIsOptional(left.typeName) && semanticIsPointer(semanticInnerType(left.typeName)) && right.typeName == "Null") || (semanticIsOptional(right.typeName) && semanticIsPointer(semanticInnerType(right.typeName)) && left.typeName == "Null"))
+
       if semanticIsOptional(left.typeName) && semanticIsPointer(semanticInnerType(left.typeName)) && right.typeName != "Null"
         this.report("NR193", leftNode, "Nullable raw pointer '" + left.typeName + "' must be narrowed before pointer access.")
       end
@@ -1044,8 +1736,10 @@ class BootstrapBodyBinder
       end
       var pointerResult = "Bool"
       var pointerChildren = appendChild(emptyInts(), left.boundNode)
+
       pointerChildren = appendChild(pointerChildren, right.boundNode)
       var validPointerOperation = nullableNull
+
       if semanticIsPointer(left.typeName) && right.typeName == "Int" && (operation == "+" || operation == "-")
         pointerResult = left.typeName
         validPointerOperation = true
@@ -1066,7 +1760,7 @@ class BootstrapBodyBinder
       return new BoundValue(pointerResult, this.addBound("Binary", pointerResult, operation, node, pointerChildren))
     end
     if arithmetic
-      if left.typeName == right.typeName && (semanticIsArithmetic(left.typeName) || (operation == "+" && left.typeName == "String"))
+      if left.typeName == right.typeName && semanticBuiltinOperatorResult(left.typeName, operation, 1) != ""
         resultType = left.typeName
       else if semanticIsPointer(left.typeName) && right.typeName == "Int" && (operation == "+" || operation == "-")
         resultType = left.typeName
@@ -1076,14 +1770,15 @@ class BootstrapBodyBinder
     else if equality
       resultType = "Bool"
       let optionalNull = (semanticIsOptional(left.typeName) && right.typeName == "Null") || (semanticIsOptional(right.typeName) && left.typeName == "Null")
+
       if !optionalNull && left.typeName != right.typeName
         this.report("NR118", node, "Equality operator '" + operation + "' requires both operands to have the same type, but got (" + left.typeName + ", " + right.typeName + ").")
-      else if !optionalNull && !semanticEqualityComparable(left.typeName) && left.typeName != "Error"
+      else if !optionalNull && semanticBuiltinOperatorResult(left.typeName, operation, 1) == "" && left.typeName != "Error"
         this.report("NR119", node, "Type '" + left.typeName + "' does not support equality comparison.")
       end
     else if comparison
       resultType = "Bool"
-      if left.typeName != right.typeName || !semanticIsArithmetic(left.typeName)
+      if left.typeName != right.typeName || semanticBuiltinOperatorResult(left.typeName, operation, 1) == ""
         this.report("NR120", node, "Comparison operator '" + operation + "' requires matching arithmetic numeric types, but got (" + left.typeName + ", " + right.typeName + ").")
       end
     else if logical
@@ -1095,6 +1790,7 @@ class BootstrapBodyBinder
       this.report("NR122", node, "Unsupported binary operator '" + operation + "'.")
     end
     var children = appendChild(emptyInts(), left.boundNode)
+
     children = appendChild(children, right.boundNode)
     return new BoundValue(resultType, this.addBound("Binary", resultType, operation, node, children))
   end
@@ -1103,26 +1799,49 @@ class BootstrapBodyBinder
     let condition = this.bindExpression(this.syntax().childAt(node, 0), "Bool")
     let thenValue = this.bindExpression(this.syntax().childAt(node, 1), "")
     let elseValue = this.bindExpression(this.syntax().childAt(node, 2), thenValue.typeName)
+
     if condition.typeName != "Bool"
       this.report("NR123", this.syntax().childAt(node, 0), "Ternary condition must be of type 'Bool', but got '" + condition.typeName + "'.")
     end
     if thenValue.typeName != elseValue.typeName
       this.report("NR124", this.syntax().childAt(node, 2), "Ternary branches must have the same type, but got '" + thenValue.typeName + "' and '" + elseValue.typeName + "'.")
     end
+    # A conditional can select different owners. It is never a move.
+    var resourceIdentity = ""
+
+    if semanticContainsResource(this.model(), thenValue.typeName) && (thenValue.resourceIdentity != "" || elseValue.resourceIdentity != "")
+      resourceIdentity = "<conditional-resource>"
+    end
     var children = appendChild(emptyInts(), condition.boundNode)
+
     children = appendChild(children, thenValue.boundNode)
     children = appendChild(children, elseValue.boundNode)
-    return new BoundValue(thenValue.typeName, this.addBound("Ternary", thenValue.typeName, "", node, children))
+    return new BoundValue(thenValue.typeName, this.addBound("Ternary", thenValue.typeName, "", node, children), resourceIdentity)
   end
 
   def bindCast(node: Int): BoundValue
     let value = this.bindExpression(this.syntax().childAt(node, 0), "")
     let typeNode = this.syntax().childAt(node, 1)
     let target = this.owner.resolveTypeNode(typeNode, this.owner.currentNamespace, "")
+
+    if semanticContainsResource(this.model(), value.typeName) || semanticContainsResource(this.model(), target)
+      this.report("NR262", node, "Resource ownership cannot be cast.")
+    end
     this.owner.validatePointerType(typeNode, this.unsafeDepth > 0)
+    var conversion: SemanticCallable? = null
+    let dropsReadView = semanticIsReadonly(value.typeName) && !semanticIsReadonly(target) && semanticMutableType(value.typeName) == semanticMutableType(target)
+
+    if value.typeName != target && !dropsReadView
+      conversion = semanticConversionMethod(this.model(), value.typeName, target)
+    end
+
+    if conversion != null
+      return new BoundValue(target, this.addBound("InstanceCall", target, conversion.fullName, node, [value.boundNode]))
+    end
     let numeric = (semanticIsNumeric(value.typeName) && semanticIsNumeric(target)) || ((value.typeName == "Int" || value.typeName == "Byte" || value.typeName == "Float") && target == "String")
     let pointer = semanticIsPointer(value.typeName) && semanticIsPointer(target)
-    if (semanticIsReadonly(value.typeName) && !semanticIsReadonly(target)) || (value.typeName != target && !numeric && !pointer)
+
+    if dropsReadView || (value.typeName != target && !numeric && !pointer)
       this.report("NR125", typeNode, "Invalid cast from '" + value.typeName + "' to '" + target + "'.")
     end
     return new BoundValue(target, this.addBound("Cast", target, "", node, appendChild(emptyInts(), value.boundNode)))
@@ -1130,6 +1849,7 @@ class BootstrapBodyBinder
 
   def bindArray(node: Int, expectedType: String): BoundValue
     let count = this.syntax().childCountAt(node)
+
     if count == 0
       if semanticIsArray(expectedType)
         return new BoundValue(expectedType, this.addBound("ArrayLiteral", expectedType, "0", node, emptyInts()))
@@ -1140,11 +1860,17 @@ class BootstrapBodyBinder
     var children: Int[] = []
     let first = this.bindExpression(this.syntax().childAt(node, 0), "")
     let elementType = first.typeName
+
+    if semanticContainsResource(this.model(), elementType)
+      this.report("NR262", this.syntax().childAt(node, 0), "Resource ownership cannot be stored in an array.")
+    end
     children = host.appendInt(children, first.boundNode)
     var index = 1
+
     while index < count
       let elementNode = this.syntax().childAt(node, index)
       let element = this.bindExpression(elementNode, elementType)
+
       children = host.appendInt(children, element.boundNode)
       if element.typeName != elementType
         this.report("NR128", elementNode, "Array element type mismatch. Expected '" + elementType + "', but got '" + element.typeName + "'.")
@@ -1152,6 +1878,7 @@ class BootstrapBodyBinder
       index = index + 1
     end
     let typeName = elementType + "[]"
+
     return new BoundValue(typeName, this.addBound("ArrayLiteral", typeName, count as String, node, children))
   end
 
@@ -1160,10 +1887,12 @@ class BootstrapBodyBinder
     let indexNode = this.syntax().childAt(node, 1)
     let collection = this.bindExpression(collectionNode, "")
     let indexValue = this.bindExpression(indexNode, "Int")
+
     if indexValue.typeName != "Int"
       this.report("NR129", node, "Array index must be of type 'Int', but got '" + indexValue.typeName + "'.")
     end
     var typeName = "Error"
+
     if semanticIsArray(collection.typeName) || semanticIsPointer(collection.typeName) || nativeFixedArray(collection.typeName)
       typeName = semanticInnerType(collection.typeName)
     else if semanticIsOptional(collection.typeName)
@@ -1172,6 +1901,7 @@ class BootstrapBodyBinder
       this.report("NR130", collectionNode, "Cannot index into non-array type '" + collection.typeName + "'.")
     end
     var children = appendChild(emptyInts(), collection.boundNode)
+
     children = appendChild(children, indexValue.boundNode)
     if nativeFixedArray(collection.typeName)
       if this.unsafeDepth == 0
@@ -1185,8 +1915,10 @@ class BootstrapBodyBinder
   def findField(classSymbol: SemanticClass, name: String): SemanticField?
     var current: SemanticClass? = classSymbol
     var steps = 0
+
     while current != null && steps < 256
       let field = this.owner.findDeclaredField(current, name)
+
       if field != null
         return field
       end
@@ -1199,8 +1931,10 @@ class BootstrapBodyBinder
   def findMethod(classSymbol: SemanticClass, name: String): SemanticCallable?
     var current: SemanticClass? = classSymbol
     var steps = 0
+
     while current != null && steps < 256
       let method = this.owner.findDeclaredMethod(current, name)
+
       if method != null
         return method
       end
@@ -1212,6 +1946,7 @@ class BootstrapBodyBinder
 
   def memberAccessible(ownerName: String, access: String): Bool
     let outer = this.enclosing
+
     if outer != null && outer.memberAccessible(ownerName, access)
       return true
     end
@@ -1219,6 +1954,7 @@ class BootstrapBodyBinder
       return true
     end
     let current = this.owner.currentClass
+
     if current == null
       return false
     end
@@ -1233,35 +1969,42 @@ class BootstrapBodyBinder
 
   def bindMember(node: Int, expectedType: String = ""): BoundValue
     let objectNode = this.syntax().childAt(node, 0)
+
     if this.syntax().kindAt(objectNode) == "Name" && !closureHasVariable(this, this.syntax().dataAt(objectNode))
       let objectName = this.syntax().dataAt(objectNode)
-      if this.owner.knownLibrary(objectName)
-        this.recordCompletionSite(node, "library", objectName)
-      else if this.owner.namespaceExists(objectName)
-        this.recordCompletionSite(node, "namespace", objectName)
+
+      if this.owner.namespaceExists(objectName)
+        this.recordCompletionSite(node, "namespace", objectName, expectedType)
       end
       let qualified = objectName + "." + this.syntax().dataAt(node)
       let function = this.resolveFunction(qualified)
+
       if function != null
         return bindFunctionValue(this, node, function, expectedType)
       end
     end
     let objectValue = this.bindExpression(objectNode, "")
-    this.recordCompletionSite(node, "instance", objectValue.typeName)
+
+    this.recordCompletionSite(node, "instance", objectValue.typeName, expectedType)
     let name = this.syntax().dataAt(node)
+
     if semanticIsOptional(objectValue.typeName)
       this.report("NR169", objectNode, "Optional value of type '" + objectValue.typeName + "' must be narrowed before access.")
       return new BoundValue("Error", this.addBound("Member", "Error", name, node, appendChild(emptyInts(), objectValue.boundNode)))
     end
-    if semanticIsArray(objectValue.typeName) && name == "Length"
-      return new BoundValue("Int", this.addBound("Call", "Int", "Array.Length", node, appendChild(emptyInts(), objectValue.boundNode)))
+    let intrinsic = semanticIntrinsicMember(this.model(), objectValue.typeName, name)
+
+    if intrinsic != null
+      return new BoundValue(intrinsic.resultType, this.addBound("IntrinsicMember", intrinsic.resultType, intrinsic.id, node, appendChild(emptyInts(), objectValue.boundNode)))
     end
     if nativeValueType(objectValue.typeName) || (semanticIsPointer(objectValue.typeName) && nativeValueType(semanticInnerType(objectValue.typeName)))
       return bindNativeField(this, node, objectValue, name)
     end
     let classSymbol = this.model().findClass(semanticMutableType(objectValue.typeName))
+
     if classSymbol != null
       let field = this.findField(classSymbol, name)
+
       if field != null
         if !this.memberAccessible(field.owner, field.access)
           this.report("NR153", node, "Cannot access " + field.access + " member '" + name + "' of type '" + field.owner + "'.")
@@ -1270,7 +2013,8 @@ class BootstrapBodyBinder
           this.report("NR240", node, "A readonly view cannot expose a raw pointer field.")
         end
         let typeName = semanticViewMember(objectValue.typeName, field.typeName)
-        this.owner.recordOccurrence("field:" + field.owner + "." + name, node, field.owner + "." + name + ": " + typeName)
+
+        this.owner.recordOccurrence(this.owner.fieldSourceIdentity(field), node, field.owner + "." + name + ": " + typeName)
         return new BoundValue(typeName, this.addBound("Member", typeName, field.owner + "." + name, node, appendChild(emptyInts(), objectValue.boundNode)))
       end
     end
@@ -1280,17 +2024,26 @@ class BootstrapBodyBinder
 
   def resolveFunction(name: String): SemanticCallable?
     if semanticField(name, 1) != ""
-      return this.model().findFunction(name)
+      let function = this.model().findFunction(name)
+
+      if function != null
+        this.model().referenceQualifiedUse(name)
+      end
+      return function
     end
     let localName = semanticQualifiedName(this.owner.currentNamespace, name)
     let local = this.model().findFunction(localName)
+
     if local != null
+      this.model().referenceQualifiedUse(name)
       return local
     end
     var candidate: SemanticCallable? = null
     var index = 0
+
     while index < this.model().usedNames.size
       let imported = this.model().findFunction(semanticQualifiedName(this.model().usedNames.get(index), name))
+
       if imported != null
         if candidate != null
           return null
@@ -1300,182 +2053,42 @@ class BootstrapBodyBinder
       index = index + 1
     end
     if candidate != null
+      var usedIndex = 0
+
+      while usedIndex < this.model().usedNames.size
+        if candidate.fullName == semanticQualifiedName(this.model().usedNames.get(usedIndex), name)
+          this.model().referenceUse(this.model().usedNames.get(usedIndex))
+        end
+        usedIndex = usedIndex + 1
+      end
       return candidate
     end
     return this.model().findFunction(name)
-  end
-
-  def libraryReturn(library: String, name: String): String
-    if library == "math"
-      if name == "abs" || name == "max" || name == "min" || name == "pow"
-        return "Int"
-      end
-    else if library == "test"
-      if name == "assert" || name == "assertEqual" || name == "assertTrue" || name == "assertFalse"
-        return "Void"
-      end
-    else if library == "console"
-      if name == "print" || name == "println"
-        return "Void"
-      end
-      if name == "read"
-        return "String"
-      end
-    else if library == "host"
-      if name == "exit"
-        return "Void"
-      end
-      if name == "stringByteLength" || name == "argumentCount"
-        return "Int"
-      end
-      if name == "stringByteAt"
-        return "Byte"
-      end
-      if name == "stringSlice" || name == "errorMessage"
-        return "String"
-      end
-      if name == "stringFromBytes" || name == "readText" || name == "pathJoin" || name == "pathAbsolute" || name == "pathFileName" || name == "argumentAt" || name == "environment"
-        return "String?"
-      end
-      if name == "parseInt" || name == "run"
-        return "Int?"
-      end
-      if name == "parseFloat"
-        return "Float?"
-      end
-      if name == "appendByte"
-        return "Byte[]"
-      end
-      if name == "appendInt"
-        return "Int[]"
-      end
-      if name == "appendString"
-        return "String[]"
-      end
-      if name == "writeText" || name == "writeBytes" || name == "removeFile"
-        return "Bool"
-      end
-    end
-    return ""
-  end
-
-  def libraryParameterCount(library: String, name: String): Int
-    if library == "math"
-      if name == "abs"
-        return 1
-      end
-      if name == "max" || name == "min" || name == "pow"
-        return 2
-      end
-    else if library == "test"
-      if name == "assert" || name == "assertTrue" || name == "assertFalse"
-        return 1
-      end
-      if name == "assertEqual"
-        return 2
-      end
-    else if library == "console"
-      if name == "print" || name == "println"
-        return 1
-      end
-      if name == "read"
-        return 0
-      end
-    else if library == "host"
-      if name == "argumentCount" || name == "errorMessage"
-        return 0
-      end
-      if name == "stringByteLength" || name == "stringFromBytes" || name == "parseInt" || name == "parseFloat" || name == "readText" || name == "removeFile" || name == "pathAbsolute" || name == "pathFileName" || name == "argumentAt" || name == "environment" || name == "exit"
-        return 1
-      end
-      if name == "stringByteAt" || name == "appendByte" || name == "appendInt" || name == "appendString" || name == "writeText" || name == "writeBytes" || name == "pathJoin" || name == "run"
-        return 2
-      end
-      if name == "stringSlice"
-        return 3
-      end
-    end
-    return -1
-  end
-
-  def libraryParameterType(library: String, name: String, index: Int): String
-    if library == "math"
-      return "Int"
-    end
-    if library == "test"
-      if name == "assert" || name == "assertTrue" || name == "assertFalse"
-        return "Bool"
-      end
-      return "Any"
-    end
-    if library == "console"
-      if name == "print" || name == "println"
-        return "Any"
-      end
-      return "Error"
-    end
-    if library == "host"
-      if name == "exit"
-        return "Int"
-      end
-      if name == "stringByteLength" || name == "parseInt" || name == "parseFloat" || name == "readText" || name == "removeFile" || name == "pathAbsolute" || name == "pathFileName" || name == "environment"
-        return "String"
-      end
-      if name == "argumentAt"
-        return "Int"
-      end
-      if name == "stringFromBytes"
-        return "Byte[]"
-      end
-      if name == "stringByteAt"
-        return index == 0 ? "String" : "Int"
-      end
-      if name == "stringSlice"
-        return index == 0 ? "String" : "Int"
-      end
-      if name == "appendByte"
-        return index == 0 ? "Byte[]" : "Byte"
-      end
-      if name == "appendInt"
-        return index == 0 ? "Int[]" : "Int"
-      end
-      if name == "appendString"
-        return index == 0 ? "String[]" : "String"
-      end
-      if name == "writeText"
-        return "String"
-      end
-      if name == "writeBytes"
-        return index == 0 ? "String" : "Byte[]"
-      end
-      if name == "pathJoin"
-        return "String"
-      end
-      if name == "run"
-        return index == 0 ? "String" : "String[]"
-      end
-    end
-    return "Error"
   end
 
   def bindArguments(node: Int, start: Int, expectedCount: Int, library: String, name: String, callable: SemanticCallable?): Int[]
     var children: Int[] = []
     let actual = this.syntax().childCountAt(node) - start
     var index = 0
+
     while index < actual
       var expected = ""
+
       if callable != null
         let parameter = callable.parameterAt(index)
+
         if parameter != null
           expected = parameter.typeName
         end
-      else if library != ""
-        expected = this.libraryParameterType(library, name, index)
       end
       let argumentNode = this.syntax().childAt(node, start + index)
       let argument = this.bindExpression(argumentNode, expected)
+
+      if semanticContainsResource(this.model(), argument.typeName)
+        this.report("NR262", argumentNode, "Resource ownership cannot be passed to an ordinary call.")
+      end
       children = host.appendInt(children, argument.boundNode)
-      if expected != "" && expected != "Any" && !semanticAssignable(this.model(), expected, argument.typeName)
+      if expected != "" && ((callable != null && callable.exactArguments && expected != argument.typeName) || ((callable == null || !callable.exactArguments) && !semanticAssignable(this.model(), expected, argument.typeName)))
         this.report("NR112", argumentNode, "Argument " + ((index + 1) as String) + " of '" + semanticQualifiedName(library, name) + "' expects type '" + expected + "', but got '" + argument.typeName + "'.")
       end
       index = index + 1
@@ -1486,6 +2099,7 @@ class BootstrapBodyBinder
   def requiredParameterCount(callable: SemanticCallable): Int
     var count = 0
     var parameter = callable.firstParameter
+
     while parameter != null
       if parameter.hasDefault
         return count
@@ -1498,11 +2112,14 @@ class BootstrapBodyBinder
 
   def validateCallCount(displayName: String, node: Int, actual: Int, callable: SemanticCallable): Void
     let required = this.requiredParameterCount(callable)
+
     if actual < required
       var missing = ""
       var index = actual
+
       while index < required
         let parameter = callable.parameterAt(index)
+
         if parameter != null
           missing = semanticJoin(missing, ", ", parameter.name + ": " + parameter.typeName)
         end
@@ -1514,69 +2131,119 @@ class BootstrapBodyBinder
     end
   end
 
-  def bindCall(node: Int): BoundValue
+  def bindCall(node: Int, expectedType: String = ""): BoundValue
     let calleeNode = this.syntax().childAt(node, 0)
     let calleeKind = this.syntax().kindAt(calleeNode)
     let actual = this.syntax().childCountAt(node) - 1
+
     if calleeKind == "Name"
-      this.recordCompletionSite(calleeNode)
+      this.recordCompletionSite(calleeNode, "", "", expectedType)
       let name = this.syntax().dataAt(calleeNode)
+
       if closureHasVariable(this, name)
         return bindFunctionCall(this, node, this.bindExpression(calleeNode, ""))
       end
       let callable = this.resolveFunction(name)
+
       if callable == null
         this.reportLength("NR110", calleeNode, 1, "Undefined function '" + name + "'.")
         let arguments = this.bindArguments(node, 1, actual, "", name, null)
+
         return new BoundValue("Error", this.addBound("Call", "Error", name, calleeNode, arguments))
       end
       this.validateCallCount(callable.fullName, calleeNode, actual, callable)
-      this.owner.recordOccurrence("callable:" + callable.fullName, calleeNode)
+      this.owner.recordOccurrence(this.owner.callableSourceIdentity(callable), calleeNode)
       let arguments = this.bindArguments(node, 1, callable.parameterCount, "", callable.fullName, callable)
+
       if callable.isUnsafe && this.unsafeDepth == 0
         this.report("NR189", calleeNode, "Unsafe function or method '" + callable.fullName + "' can be called only from an unsafe declaration or block.")
       end
       var targetName = callable.fullName
+
       if callable.cAbiSymbol != ""
         targetName = callable.cAbiSymbol
         return new BoundValue(callable.returnType, this.addBoundSymbol("Call", callable.returnType, targetName, callable.fullName, calleeNode, arguments))
       end
       return new BoundValue(callable.returnType, this.addBound("Call", callable.returnType, targetName, calleeNode, arguments))
     else if calleeKind == "Member"
-      return this.bindMemberCall(node, calleeNode)
+      return this.bindMemberCall(node, calleeNode, expectedType)
     end
     return bindFunctionCall(this, node, this.bindExpression(calleeNode, ""))
   end
 
-  def bindMemberCall(node: Int, calleeNode: Int): BoundValue
+  def bindAlternativeConstruct(node: Int, calleeNode: Int, symbol: SemanticClass, caseName: String): BoundValue
+    let caseIndex = this.alternativeCaseIndex(symbol, caseName)
+    let actual = this.syntax().childCountAt(node) - 1
+
+    if caseIndex < 0
+      this.report("NR260", calleeNode, "Type '" + symbol.fullName + "' has no alternative case '" + caseName + "'.")
+      return new BoundValue("Error", this.addBound("AlternativeConstruct", "Error", symbol.fullName + "|-1", calleeNode, emptyInts()))
+    end
+    let expected = this.syntax().childCountAt(alternativeCaseNode(this.owner, symbol, caseIndex))
+
+    this.owner.recordOccurrence(alternativeSourceIdentity(this.owner, symbol, caseName), calleeNode)
+    if actual != expected
+      this.reportLength("NR261", calleeNode, 1, "Alternative case '" + caseName + "' expects " + (expected as String) + " arguments, but got " + (actual as String) + ".")
+    end
+    var children: Int[] = []
+    var index = 0
+
+    while index < actual
+      let typeName = index < expected ? this.alternativePayloadType(symbol, caseIndex, index) : ""
+      let argumentNode = this.syntax().childAt(node, index + 1)
+      let isTransfer = this.syntax().kindAt(argumentNode) == "Transfer"
+      let value = isTransfer && this.returnTransferDepth > 0 ? this.bindTransfer(argumentNode, typeName, true) : this.bindExpression(argumentNode, typeName)
+
+      if semanticContainsResource(this.model(), value.typeName) && value.resourceIdentity != "" && !isTransfer
+        this.report("NR262", this.syntax().childAt(node, index + 1), "Resource ownership cannot be copied into an alternative payload.")
+      end
+      if index < expected && !semanticAssignable(this.model(), typeName, value.typeName)
+        this.report("NR261", this.syntax().childAt(node, index + 1), "Alternative payload " + ((index + 1) as String) + " for '" + caseName + "' must be '" + typeName + "', but got '" + value.typeName + "'.")
+      end
+      children = host.appendInt(children, value.boundNode)
+      index = index + 1
+    end
+    return new BoundValue(symbol.fullName, this.addBound("AlternativeConstruct", symbol.fullName, symbol.fullName + "|" + (caseIndex as String), calleeNode, children))
+  end
+
+  def bindMemberCall(node: Int, calleeNode: Int, expectedType: String = ""): BoundValue
     let objectNode = this.syntax().childAt(calleeNode, 0)
     let memberName = this.syntax().dataAt(calleeNode)
     let actual = this.syntax().childCountAt(node) - 1
+
     if this.syntax().kindAt(objectNode) == "Super"
       let currentClass = this.owner.currentClass
+
       if currentClass == null || currentClass.baseName == ""
         this.report("NR182", objectNode, "Keyword 'super' is valid only inside a derived instance method or constructor.")
         return new BoundValue("Error", this.addBound("Call", "Error", memberName, calleeNode, emptyInts()))
       end
       let baseClass = this.model().findClass(currentClass.baseName)
+
       if baseClass == null
         this.report("NR182", objectNode, "Keyword 'super' is valid only inside a derived instance method or constructor.")
         return new BoundValue("Error", this.addBound("Call", "Error", memberName, calleeNode, emptyInts()))
       end
-      this.recordCompletionSite(calleeNode, "super", baseClass.fullName)
+      this.recordCompletionSite(calleeNode, "super", baseClass.fullName, expectedType)
       let method = this.findMethod(baseClass, memberName)
+
       if method == null
         this.report("NR186", calleeNode, "Base type '" + baseClass.fullName + "' does not define an accessible instance method '" + memberName + "'.")
         return new BoundValue("Error", this.addBound("Call", "Error", memberName, calleeNode, emptyInts()))
       end
       this.validateCallCount(baseClass.name + "." + memberName, calleeNode, actual, method)
-      this.owner.recordOccurrence("callable:" + method.fullName, calleeNode)
+      this.owner.recordOccurrence(this.owner.callableSourceIdentity(method), calleeNode)
+      if method.isAbstract
+        this.report("NR256", calleeNode, "Abstract method '" + method.fullName + "' has no implementation to call through 'super'.")
+      end
       let enclosingMethod = this.owner.currentCallable
+
       if enclosingMethod != null && enclosingMethod.isReadonly && !method.isReadonly
         this.report("NR240", calleeNode, "A readonly receiver requires a readonly method.")
       end
       let arguments = this.bindArguments(node, 1, method.parameterCount, "", baseClass.name + "." + memberName, method)
       var children = appendChild(emptyInts(), this.addBound("This", currentClass.fullName, "", objectNode, emptyInts()))
+
       for argument in arguments
         children = host.appendInt(children, argument)
       end
@@ -1584,28 +2251,30 @@ class BootstrapBodyBinder
     end
     if this.syntax().kindAt(objectNode) == "Name"
       let objectName = this.syntax().dataAt(objectNode)
+
       if !closureHasVariable(this, objectName)
-        if this.owner.knownLibrary(objectName)
-          this.recordCompletionSite(calleeNode, "library", objectName)
-        else if this.owner.namespaceExists(objectName)
-          this.recordCompletionSite(calleeNode, "namespace", objectName)
+        let namespaced = this.resolveFunction(objectName + "." + memberName)
+
+        if namespaced != null
+          this.recordCompletionSite(calleeNode, "namespace", objectName, expectedType)
+          this.validateCallCount(namespaced.fullName, calleeNode, actual, namespaced)
+          this.owner.recordOccurrence(this.owner.callableSourceIdentity(namespaced), calleeNode)
+          let arguments = this.bindArguments(node, 1, namespaced.parameterCount, "", namespaced.fullName, namespaced)
+
+          return new BoundValue(namespaced.returnType, this.addBound("Call", namespaced.returnType, namespaced.fullName, calleeNode, arguments))
         end
-        let libraryType = this.libraryReturn(objectName, memberName)
-        if libraryType != ""
-          if objectName != "Array" && !this.model().hasUse(objectName)
-            this.report("NR102", objectNode, "Library '" + objectName + "' is not imported.")
-          end
-          let expectedCount = this.libraryParameterCount(objectName, memberName)
-          if actual != expectedCount
-            this.reportLength("NR111", calleeNode, 1, "Function '" + objectName + "." + memberName + "' expects " + (expectedCount as String) + " arguments, but got " + (actual as String) + ".")
-          end
-          let arguments = this.bindArguments(node, 1, expectedCount, objectName, memberName, null)
-          return new BoundValue(libraryType, this.addBound("Call", libraryType, objectName + "." + memberName, calleeNode, arguments))
+        if this.owner.namespaceExists(objectName)
+          this.recordCompletionSite(calleeNode, "namespace", objectName, expectedType)
         end
-        let classSymbol = this.resolveClassForCall(objectName)
+        let classSymbol = this.resolveClassForCall(objectName, objectNode)
+
         if classSymbol != null
-          this.recordCompletionSite(calleeNode, "class", classSymbol.fullName)
+          this.recordCompletionSite(calleeNode, "class", classSymbol.fullName, expectedType)
+          if classSymbol.isAlternative
+            return this.bindAlternativeConstruct(node, calleeNode, classSymbol, memberName)
+          end
           let method = this.findMethod(classSymbol, memberName)
+
           if method == null
             this.report("NR131", calleeNode, "Type '" + classSymbol.fullName + "' does not have a member '" + memberName + "'.")
             return new BoundValue("Error", this.addBound("Call", "Error", classSymbol.fullName + "." + memberName, calleeNode, emptyInts()))
@@ -1613,40 +2282,102 @@ class BootstrapBodyBinder
           if !method.isStatic
             this.report("NR180", calleeNode, "Instance method '" + memberName + "' must be called through an instance.")
           end
+          if !this.memberAccessible(method.className, method.access)
+            this.report("NR153", calleeNode, "Cannot access " + method.access + " member '" + memberName + "' of type '" + method.className + "'.")
+          end
+          if method.isUnsafe && this.unsafeDepth == 0
+            this.report("NR189", calleeNode, "Unsafe method requires an unsafe declaration or block.")
+          end
           this.validateCallCount(classSymbol.name + "." + memberName, calleeNode, actual, method)
-          this.owner.recordOccurrence("callable:" + method.fullName, calleeNode)
+          this.owner.recordOccurrence(this.owner.callableSourceIdentity(method), calleeNode)
           let arguments = this.bindArguments(node, 1, method.parameterCount, "", classSymbol.name + "." + memberName, method)
+
           return new BoundValue(method.returnType, this.addBound("Call", method.returnType, method.fullName, calleeNode, arguments))
-        end
-        let namespaced = this.resolveFunction(objectName + "." + memberName)
-        if namespaced != null
-          this.validateCallCount(namespaced.fullName, calleeNode, actual, namespaced)
-          this.owner.recordOccurrence("callable:" + namespaced.fullName, calleeNode)
-          let arguments = this.bindArguments(node, 1, namespaced.parameterCount, "", namespaced.fullName, namespaced)
-          return new BoundValue(namespaced.returnType, this.addBound("Call", namespaced.returnType, namespaced.fullName, calleeNode, arguments))
         end
         this.report("NR103", objectNode, "Unknown object or library '" + objectName + "'.")
         return new BoundValue("Error", this.addBound("Call", "Error", objectName + "." + memberName, calleeNode, emptyInts()))
       end
     end
+    if this.syntax().kindAt(objectNode) == "Member"
+      var cursor = objectNode
+      var qualified = ""
+
+      while this.syntax().kindAt(cursor) == "Member"
+        qualified = "." + this.syntax().dataAt(cursor) + qualified
+        cursor = this.syntax().childAt(cursor, 0)
+      end
+      if this.syntax().kindAt(cursor) == "Name" && !closureHasVariable(this, this.syntax().dataAt(cursor))
+        let classSymbol = this.resolveClassForCall(this.syntax().dataAt(cursor) + qualified, objectNode)
+
+        if classSymbol != null
+          this.recordCompletionSite(calleeNode, "class", classSymbol.fullName, expectedType)
+          if classSymbol.isAlternative
+            return this.bindAlternativeConstruct(node, calleeNode, classSymbol, memberName)
+          end
+          let method = this.findMethod(classSymbol, memberName)
+
+          if method == null
+            this.report("NR131", calleeNode, "Type '" + classSymbol.fullName + "' does not have a member '" + memberName + "'.")
+            return new BoundValue("Error", this.addBound("Call", "Error", memberName, calleeNode, emptyInts()))
+          end
+          if !method.isStatic
+            this.report("NR180", calleeNode, "Instance method '" + memberName + "' must be called through an instance.")
+          end
+          if !this.memberAccessible(method.className, method.access)
+            this.report("NR153", calleeNode, "Cannot access " + method.access + " member '" + memberName + "' of type '" + method.className + "'.")
+          end
+          if method.isUnsafe && this.unsafeDepth == 0
+            this.report("NR189", calleeNode, "Unsafe method requires an unsafe declaration or block.")
+          end
+          this.validateCallCount(classSymbol.fullName + "." + memberName, calleeNode, actual, method)
+          this.owner.recordOccurrence(this.owner.callableSourceIdentity(method), calleeNode)
+          let arguments = this.bindArguments(node, 1, method.parameterCount, "", classSymbol.fullName + "." + memberName, method)
+
+          return new BoundValue(method.returnType, this.addBound("Call", method.returnType, method.fullName, calleeNode, arguments))
+        end
+      end
+    end
     let instance = this.bindExpression(objectNode, "")
-    this.recordCompletionSite(calleeNode, "instance", instance.typeName)
+
+    this.recordCompletionSite(calleeNode, "instance", instance.typeName, expectedType)
     if semanticIsOptional(instance.typeName)
       this.report("NR169", objectNode, "Optional value of type '" + instance.typeName + "' must be narrowed before access.")
       return new BoundValue("Error", this.addBound("Call", "Error", memberName, calleeNode, appendChild(emptyInts(), instance.boundNode)))
     end
     let classSymbol = this.model().findClass(semanticMutableType(instance.typeName))
+
     if classSymbol == null
+      let requirement = semanticTypeParameterMethod(this.model(), instance.typeName, memberName)
+
+      if requirement != null
+        let contract = semanticTypeParameterContract(this.model(), instance.typeName)
+
+        if contract != null
+          this.owner.recordOccurrence("contract-member:" + contract.fullName + "." + memberName, calleeNode)
+        end
+        this.validateCallCount(memberName, calleeNode, actual, requirement)
+        let arguments = this.bindArguments(node, 1, requirement.parameterCount, "", memberName, requirement)
+        var children = [instance.boundNode]
+
+        for argument in arguments
+          children = host.appendInt(children, argument)
+        end
+        return new BoundValue(requirement.returnType, this.addBound("InstanceCall", requirement.returnType, requirement.fullName, calleeNode, children))
+      end
       this.report("NR104", calleeNode, "Unsupported call target.")
       return new BoundValue("Error", this.addBound("Call", "Error", memberName, calleeNode, appendChild(emptyInts(), instance.boundNode)))
     end
     let method = this.findMethod(classSymbol, memberName)
+
     if method == null
       let field = this.findField(classSymbol, memberName)
+
       if field != null && this.memberAccessible(field.owner, field.access)
         let typeName = semanticViewMember(instance.typeName, field.typeName)
-        this.owner.recordOccurrence("field:" + field.owner + "." + field.name, calleeNode, field.owner + "." + field.name + ": " + typeName)
+
+        this.owner.recordOccurrence(this.owner.fieldSourceIdentity(field), calleeNode, field.owner + "." + field.name + ": " + typeName)
         let value = new BoundValue(typeName, this.addBound("Member", typeName, field.owner + "." + field.name, calleeNode, [instance.boundNode]))
+
         return bindFunctionCall(this, node, value)
       end
       this.report("NR131", calleeNode, "Type '" + classSymbol.fullName + "' does not have a member '" + memberName + "'.")
@@ -1665,17 +2396,30 @@ class BootstrapBodyBinder
       this.report("NR189", calleeNode, "Unsafe function or method '" + classSymbol.name + "." + memberName + "' can be called only from an unsafe declaration or block.")
     end
     this.validateCallCount(classSymbol.name + "." + memberName, calleeNode, actual, method)
-    this.owner.recordOccurrence("callable:" + method.fullName, calleeNode)
+    this.owner.recordOccurrence(this.owner.callableSourceIdentity(method), calleeNode)
     var children = appendChild(emptyInts(), instance.boundNode)
     let arguments = this.bindArguments(node, 1, method.parameterCount, "", classSymbol.name + "." + memberName, method)
+
     for argument in arguments
       children = host.appendInt(children, argument)
     end
     return new BoundValue(method.returnType, this.addBound("InstanceCall", method.returnType, method.fullName, calleeNode, children))
   end
 
-  def resolveClassForCall(name: String): SemanticClass?
+  def resolveClassForCall(name: String, node: Int): SemanticClass?
+    if this.syntax().nodeAt(node).typeArguments.Length > 0
+      let typeNode = this.syntax().add("Type", name, emptyInts())
+      let typeSyntax = this.syntax().nodeAt(typeNode)
+
+      typeSyntax.typeArguments = this.syntax().nodeAt(node).typeArguments
+      typeSyntax.start = this.syntax().nodeAt(node).start
+      typeSyntax.length = this.syntax().nodeAt(node).length
+      let typeName = this.owner.resolveTypeNode(typeNode, this.owner.currentNamespace, "")
+
+      return this.model().findClass(typeName)
+    end
     let resolved = semanticResolveType(this.model(), name, this.owner.currentNamespace)
+
     if resolved == "Unknown" || resolved == "Ambiguous"
       return null
     end
@@ -1684,25 +2428,59 @@ class BootstrapBodyBinder
 
   def bindNew(node: Int): BoundValue
     let typeNode = this.syntax().childAt(node, 0)
+
     this.recordCompletionSite(typeNode, "type", "")
     let typeName = this.owner.resolveTypeNode(typeNode, this.owner.currentNamespace, "")
     let classSymbol = this.model().findClass(typeName)
+
     if classSymbol == null
       this.report("NR126B", node, "Cannot create instance of non-class type '" + this.syntax().dataAt(typeNode) + "'.")
       return new BoundValue("Error", this.addBound("New", "Error", typeName, node, emptyInts()))
     end
+    if classSymbol.isAbstract
+      this.owner.recordTypeOccurrence(classSymbol.fullName, typeNode)
+      this.report("NR256", typeNode, "Abstract class '" + classSymbol.fullName + "' cannot be instantiated.")
+      return new BoundValue("Error", this.addBound("New", "Error", classSymbol.fullName, node, emptyInts()))
+    end
+    if classSymbol.isAlternative
+      this.report("NR260", node, "Closed alternative type '" + classSymbol.fullName + "' can only be constructed through one of its cases.")
+      return new BoundValue("Error", this.addBound("New", "Error", classSymbol.fullName, node, emptyInts()))
+    end
+    if classSymbol.representation != ""
+      this.report("NR154A", node, "Represented type '" + classSymbol.fullName + "' is created only by literals and its library factories.")
+      return new BoundValue("Error", this.addBound("New", "Error", classSymbol.fullName, node, emptyInts()))
+    end
     let constructor = this.owner.findDeclaredMethod(classSymbol, "init")
-    this.owner.recordOccurrence("type:" + classSymbol.fullName, typeNode)
+
+    this.owner.recordTypeOccurrence(classSymbol.fullName, typeNode)
     let actual = this.syntax().childCountAt(node) - 1
+
     if constructor == null
+      let baseConstructor = this.inheritedConstructor(classSymbol)
+
+      if baseConstructor != null
+        if !this.inheritedConstructorAccessible(classSymbol, baseConstructor)
+          this.report("NR153", node, "Cannot access " + baseConstructor.access + " constructor of type '" + baseConstructor.className + "'.")
+        end
+        this.validateCallCount(baseConstructor.className + ".init", node, 0, baseConstructor)
+      end
       if actual > 0
-        this.report("NR154A", node, "Constructor 'init' was not found for class '" + classSymbol.name + "'.")
+        if baseConstructor != null
+          this.reportLength("NR111", node, 1, "Function '" + classSymbol.name + ".init' expects 0 arguments, but got " + (actual as String) + ".")
+        else
+          this.report("NR154A", node, "Constructor 'init' was not found for class '" + classSymbol.name + "'.")
+        end
       end
       let arguments = this.bindArguments(node, 1, actual, "", classSymbol.name + ".init", null)
+
       return new BoundValue(typeName, this.addBound("New", typeName, classSymbol.fullName, node, arguments))
     end
     this.validateCallCount(classSymbol.name + ".init", node, actual, constructor)
+    if !this.memberAccessible(constructor.className, constructor.access)
+      this.report("NR153", node, "Cannot access " + constructor.access + " constructor of type '" + classSymbol.fullName + "'.")
+    end
     let arguments = this.bindArguments(node, 1, constructor.parameterCount, "", classSymbol.name + ".init", constructor)
+
     return new BoundValue(typeName, this.addBound("New", typeName, classSymbol.fullName, node, arguments))
   end
 
@@ -1715,6 +2493,7 @@ class BootstrapBodyBinder
     let typeName = this.owner.resolveTypeNode(typeNode, this.owner.currentNamespace, "")
     let countNode = this.syntax().childAt(node, 1)
     let count = this.bindExpression(countNode, "Int")
+
     if this.unsafeDepth == 0
       this.report("NR192", node, "Unsafe operation 'stackalloc' requires an unsafe declaration or block.")
     end
@@ -1725,6 +2504,7 @@ class BootstrapBodyBinder
       this.report("NR112", countNode, "Argument 1 of 'stackalloc' expects type 'Int', but got '" + count.typeName + "'.")
     end
     let resultType = typeName + "*"
+
     return new BoundValue(resultType, this.addBound("StackAlloc", resultType, typeName, node, appendChild(emptyInts(), count.boundNode)))
   end
 
@@ -1732,6 +2512,7 @@ class BootstrapBodyBinder
     let operation = semanticField(this.syntax().dataAt(node), 0)
     var offset = 0
     var elementType = ""
+
     if this.syntax().childCountAt(node) > 0 && this.syntax().kindAt(this.syntax().childAt(node, 0)) == "Type"
       elementType = this.owner.resolveTypeNode(this.syntax().childAt(node, 0), this.owner.currentNamespace, "")
       offset = 1
@@ -1743,6 +2524,7 @@ class BootstrapBodyBinder
       this.report("NR192", node, "Unsafe operation 'native." + operation + "' requires an unsafe declaration or block.")
     end
     var resultType = "Error"
+
     if operation == "alloc" || operation == "allocZeroed"
       if elementType == ""
         this.report("NR200", node, "Intrinsic 'native." + operation + "' requires one element type argument.")
@@ -1755,6 +2537,7 @@ class BootstrapBodyBinder
       end
       if this.syntax().childCountAt(node) > offset
         let pointer = this.bindExpression(this.syntax().childAt(node, offset), "")
+
         resultType = pointer.typeName
       end
     else if operation == "free"
@@ -1767,12 +2550,15 @@ class BootstrapBodyBinder
     end
     var children: Int[] = []
     var index = offset
+
     while index < this.syntax().childCountAt(node)
       let argument = this.bindExpression(this.syntax().childAt(node, index), "")
+
       children = host.appendInt(children, argument.boundNode)
       index = index + 1
     end
     var boundOperation = operation
+
     if operation == "allocZeroed"
       boundOperation = "calloc"
     end

@@ -480,7 +480,9 @@ void require_operand_type(const function_context &context,
                           const type &expected) {
   if (index >= value.operands.size() ||
       !same_type(definition_type(context, value.operands[index]), expected)) {
-    fail(invalid_type, "Instruction operand has the wrong semantic type.");
+    fail(invalid_type, "Instruction operand has the wrong semantic type in " +
+         context.value.id.semantic_name + " (opcode " +
+         std::to_string(value.opcode) + ", operand " + std::to_string(index) + ").");
   }
 }
 
@@ -515,7 +517,8 @@ void require_binary(const function_context &context, const instruction &value,
                                         const instruction &value,
                                         bool imported,
                                         bool require_method = false,
-                                        bool c_abi = false) {
+                                        bool c_abi = false,
+                                        bool unsafe_call = false) {
   if (!value.symbol.has_value()) {
     fail(invalid_reference, "Call instruction has no target symbol.");
   }
@@ -536,27 +539,32 @@ void require_binary(const function_context &context, const instruction &value,
   } else {
     const auto *target = find_function(context.module, *value.symbol);
     const auto valid_kind = target != nullptr &&
-                            (require_method
+                            (unsafe_call
+                                 ? target->kind == NERI_IR_FUNCTION_V1 ||
+                                       target->kind == NERI_IR_STATIC_METHOD_V1 ||
+                                       target->kind == NERI_IR_INSTANCE_METHOD_V1
+                                 : require_method
                                  ? target->kind == NERI_IR_INSTANCE_METHOD_V1 ||
                                        target->kind == NERI_IR_CONSTRUCTOR_V1
                                  : target->kind == NERI_IR_FUNCTION_V1 ||
                                        target->kind == NERI_IR_STATIC_METHOD_V1 ||
                                        target->kind == NERI_IR_DEFAULT_ADAPTER_V1);
-    if (!valid_kind || target->unsafe_call) {
+    if (!valid_kind || target->unsafe_call != unsafe_call) {
       fail(invalid_reference,
-           "Direct call references a missing or unsupported function.");
+           "Direct call references a missing or unsupported function: " +
+               value.symbol->semantic_name + ".");
     }
     parameters = &target->parameter_types;
     result = &target->result_type;
     effects = target->effects;
   }
 
-  const auto operand_offset = c_abi ? 1U : 0U;
+  const auto operand_offset = c_abi || unsafe_call ? 1U : 0U;
   const auto result_count = is_void(*result) ? 0U : 1U;
   verify_instruction_shape(value, result_count,
                            parameters->size() + operand_offset, 0U, true,
                            false, false);
-  if (c_abi) {
+  if (c_abi || unsafe_call) {
     const type capability{NERI_IR_TYPE_UNSAFE_CAPABILITY_V1, std::nullopt,
                           {}};
     require_operand_type(context, value, 0U, capability);
@@ -568,7 +576,8 @@ void require_binary(const function_context &context, const instruction &value,
   if (result_count == 1U) {
     require_result_type(value, 0U, *result);
   }
-  return effects & ~NERI_IR_EFFECT_NO_RETURN_V1;
+  return (effects & ~NERI_IR_EFFECT_NO_RETURN_V1) |
+         (unsafe_call ? NERI_IR_EFFECT_UNSAFE_V1 : 0U);
 }
 
 [[nodiscard]] std::uint32_t verify_virtual_call(function_context &context,
@@ -848,6 +857,8 @@ void require_binary(const function_context &context, const instruction &value,
     return verify_call(context, value, true);
   case NERI_IR_OPCODE_CALL_C_ABI_V1:
     return verify_call(context, value, true, false, true);
+  case NERI_IR_OPCODE_CALL_UNSAFE_V1:
+    return verify_call(context, value, false, false, false, true);
   case NERI_IR_OPCODE_ARRAY_NEW_V1: {
     if (value.type_arguments.size() != 1U) {
       fail(invalid_type, "array.new requires one element type argument.");
@@ -1412,9 +1423,9 @@ void verify_function(const ir_module &module, const function &value) {
       value.kind > NERI_IR_DEFAULT_ADAPTER_V1) {
     fail(malformed_module, "Function has an invalid function kind.");
   }
-  if (value.unsafe_call) {
-    fail(unsupported_feature,
-         "Unsafe-call function lowering belongs to a later native card.");
+  if (!value.retained && value.unsafe_call != value.unsafe_root.has_value()) {
+    fail(invalid_safety,
+         "Unsafe function call contract disagrees with its capability root.");
   }
   if (is_method != value.declaring_class.has_value()) {
     fail(malformed_module,
@@ -1449,21 +1460,75 @@ void verify_function(const ir_module &module, const function &value) {
     require_declared_type(module, value.result_type, "Function result");
   }
 
+  if (value.retained) {
+    if (!value.blocks.empty() || value.unsafe_root.has_value() ||
+        !value.debug_scopes.empty() || !value.debug_locals.empty()) {
+      fail(malformed_module,
+           "Retained function declarations cannot contain a body or debug state.");
+    }
+    return;
+  }
+
   function_context context{module, value};
   verify_blocks_and_uses(context);
-  std::set<std::pair<std::uint32_t, std::string>> debug_values;
-  std::optional<std::pair<std::uint32_t, std::string_view>> previous_debug;
+  std::map<std::uint32_t, const debug_scope *> debug_scopes;
+  std::uint32_t previous_scope_id = 0U;
+  for (const auto &scope : value.debug_scopes) {
+    verify_location(scope.location, module);
+    if (scope.id == 0U || scope.id <= previous_scope_id ||
+        !debug_scopes.emplace(scope.id, &scope).second ||
+        (scope.parent_id != 0U &&
+         !debug_scopes.contains(scope.parent_id))) {
+      fail(malformed_module,
+           "Debug scopes must have unique canonical IDs and known parents.");
+    }
+    previous_scope_id = scope.id;
+  }
+  if (!value.debug_scopes.empty() &&
+      std::ranges::find(module.required_features, "debug-scopes-v1") ==
+          module.required_features.end()) {
+    fail(unsupported_feature,
+         "Debug scopes require the debug-scopes-v1 feature.");
+  }
+  for (const auto &block : value.blocks) {
+    for (const auto &instruction : block.instructions) {
+      if (instruction.debug_scope_id != 0U &&
+          !debug_scopes.contains(instruction.debug_scope_id)) {
+        fail(malformed_module,
+             "Instruction references an unknown debug scope.");
+      }
+    }
+    if (block.ending.debug_scope_id != 0U &&
+        !debug_scopes.contains(block.ending.debug_scope_id)) {
+      fail(malformed_module,
+           "Terminator references an unknown debug scope.");
+    }
+  }
+  std::set<std::tuple<std::uint32_t, std::string, std::uint32_t, std::string,
+                      std::uint32_t, std::uint32_t>>
+      debug_values;
+  std::optional<std::tuple<std::uint32_t, std::string_view, std::uint32_t,
+                           std::string_view, std::uint32_t, std::uint32_t>>
+      previous_debug;
   for (const auto &local : value.debug_locals) {
     verify_location(local.location, module);
     const auto definition = context.definitions.find(local.value);
     if (local.name.empty() || definition == context.definitions.end() ||
+        (local.scope_id != 0U && !debug_scopes.contains(local.scope_id)) ||
         is_unsafe_capability(*definition->second.value_type) ||
         is_borrow_capability(*definition->second.value_type) ||
-        !debug_values.emplace(local.value, local.name).second) {
+        !debug_values
+             .emplace(local.value, local.name, local.scope_id,
+                      local.location.source, local.location.utf8_start,
+                      local.location.utf8_length)
+             .second) {
       fail(invalid_safety,
            "Debug local has an invalid name, value, type, or duplicate value.");
     }
-    const auto key = std::pair(local.value, std::string_view(local.name));
+    const auto key =
+        std::tuple(local.value, std::string_view(local.name), local.scope_id,
+                   std::string_view(local.location.source),
+                   local.location.utf8_start, local.location.utf8_length);
     if (previous_debug.has_value() && !(previous_debug.value() < key)) {
       fail(malformed_module,
            "Debug locals are not in canonical value/name order.");
@@ -1523,10 +1588,35 @@ void verify_supported_module(const ir_module &value) {
            "Required feature '" + feature +
                "' is not a canonical feature identifier.");
     }
-    if (feature != "string-data-v1" && feature != "native-strings-v1" && feature != "native-libraries-v1" && feature != "extended-scalars-v1" && feature != "native-records-v1" && feature != "scoped-tasks-v1") {
+    if (feature != "string-data-v1" && feature != "native-strings-v1" && feature != "native-libraries-v1" && feature != "extended-scalars-v1" && feature != "native-records-v1" && feature != "scoped-tasks-v1" && feature != "session-module-v1" && feature != "debug-scopes-v1" && feature != "retained-modules-v1") {
       fail(unsupported_feature,
            "Unknown required semantic feature '" + feature + "'.");
     }
+  }
+
+  if (value.session.has_value()) {
+    const auto &session = *value.session;
+    const auto retained = std::ranges::find(value.required_features,
+                              "retained-modules-v1") != value.required_features.end();
+    if (retained != !session.artifact_identity.empty())
+      fail(invalid_reference,
+           "Retained session module requires one artifact identity.");
+    const auto found = std::ranges::find_if(value.functions, [&](const function &item) {
+      return item.id.module == session.entry.module && item.id.kind == session.entry.kind &&
+             item.id.semantic_name == session.entry.semantic_name;
+    });
+    if (found == value.functions.end() || found->id.semantic_name != "__neri_session_entry" ||
+        found->parameter_types.size() > 1U ||
+        (found->parameter_types.empty() ? session.source_type.tag != NERI_IR_TYPE_VOID_V1
+                                        : !same_type(found->parameter_types.front(), session.source_type)) ||
+        !same_type(found->result_type, session.target_type) ||
+        session.target_type.tag != NERI_IR_TYPE_CLASS_V1 ||
+        (!found->parameter_types.empty() && session.source_type.tag != NERI_IR_TYPE_CLASS_V1)) {
+      fail(invalid_reference, "Session export does not match the generated entry signature.");
+    }
+    require_declared_type(value, session.target_type, "Session target frame");
+    if (session.source_type.tag != NERI_IR_TYPE_VOID_V1)
+      require_declared_type(value, session.source_type, "Session source frame");
   }
 
   if (!value.native_records.empty() && std::ranges::find(value.required_features, "native-records-v1") == value.required_features.end())

@@ -4,7 +4,7 @@ use test
 use console
 
 @cabi("neri_rt_v1_net_connect")
-def unsafe connectLocal(fd: Int, port: Int): Int
+unsafe def connectLocal(fd: Int, port: Int): Int
 end
 
 def port(): Int
@@ -18,9 +18,9 @@ def port(): Int
   return 8080
 end
 
-def connect(): Int
+def connect(timeoutMilliseconds: Int = 5000): Int
   unsafe
-    let deadline = http.netMilliseconds() + 5000
+    let deadline = http.netMilliseconds() + timeoutMilliseconds
     while http.netMilliseconds() < deadline
       let fd = http.netOpen()
       if fd >= 0
@@ -143,7 +143,97 @@ def disconnectResponse(): Void
   end
 end
 
+def binaryResponse(): Void
+  let fd = connect()
+  var header = ""
+  var received = 0
+  var valid = true
+  var readingHeader = true
+  unsafe
+    let bytes = stackalloc Byte[4096]
+    let deadline = http.netMilliseconds() + 5000
+    test.assertTrue(http.writeText(fd, "GET /binary HTTP/1.1\r\nHost: a\r\n\r\n"))
+    var done = false
+    while !done
+      test.assertTrue(http.waitSocket(fd, 0, deadline) > 0)
+      let count = http.netRead(fd, bytes, 4096)
+      test.assertTrue(count != -1)
+      done = count == 0
+      var index = 0
+      while index < count
+        if readingHeader
+          let character = host.stringFromBytes([bytes[index]])
+          header = header + character if character != null
+          test.assertTrue(host.stringByteLength(header) < 1024)
+          readingHeader = http.find(header, "\r\n\r\n", 0) < 0
+        else
+          valid = valid && (bytes[index] as Int) == received - (received / 256) * 256
+          received = received + 1
+        end
+        index = index + 1
+      end
+    end
+    http.netClose(fd)
+  end
+  test.assertTrue(valid)
+  test.assertEqual(received, 1027)
+  test.assertTrue(http.find(header, "Content-Type: application/octet-stream\r\n", 0) > 0)
+  test.assertTrue(http.find(header, "Content-Length: 1027\r\n", 0) > 0)
+  test.assertEqual(exchange("HEAD /binary HTTP/1.1\r\nHost: a\r\n\r\n"), header)
+end
+
 def main(): Void
+  let requests = [
+    "GET / HTTP/1.1\r\nHost: a\r\n",
+    "GET / HTTP/1.1\r\n\r\n",
+    "GET /%xx HTTP/1.1\r\nHost: a\r\n\r\n",
+    "GET / HTTP/1.1\r\nHost: a\r\nContent-Length: x\r\n\r\n",
+    "GET / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n",
+    "POST / HTTP/1.1\r\nHost: a\r\n\r\n"]
+  let codes = ["malformed_request", "invalid_host", "invalid_target", "invalid_content_length", "unsupported_framing", "unsupported_method"]
+  var caseIndex = 0
+  while caseIndex < requests.Length
+    let failure = http.parse(requests[caseIndex]).failure
+    test.assertTrue(failure != null)
+    if failure != null
+      test.assertEqual(failure.code, codes[caseIndex])
+    end
+    caseIndex = caseIndex + 1
+  end
+  let socketFailure = http.readHead(-1).failure
+  test.assertTrue(socketFailure != null)
+  if socketFailure != null
+    test.assertEqual(socketFailure.code, "socket_error")
+    test.assertEqual(socketFailure.operation, "read.wait")
+  end
+  let timed = http.writeTextResult(-1, "x", 0)
+  test.assertEqual(timed.bytesWritten, 0)
+  let timeout = timed.failure
+  test.assertTrue(timeout != null)
+  if timeout != null
+    test.assertEqual(timeout.code, "timeout")
+  end
+  # The first connection also waits for a cold compiler-run server to start.
+  let closed = connect(30000)
+
+  test.assertTrue(http.writeText(closed, "GET / HTTP/1.1\r\nHost: a\r\n\r\n"))
+  test.assertEqual(http.readHead(closed).status, 200)
+  let eof = http.readHead(closed).failure
+  unsafe
+    http.netClose(closed)
+  end
+  test.assertTrue(eof != null)
+  if eof != null
+    test.assertEqual(eof.code, "peer_closed")
+  end
+  let fields = new http.Headers()
+  test.assertTrue(!fields.add("X-Invalid", "value\r\nInjected: yes"))
+  test.assertTrue(!fields.add("é", "value"))
+  test.assertEqual(fields.count(), 0)
+  test.assertTrue(http.parse("GET /水 HTTP/1.1\r\nHost: a\r\n\r\n").request == null)
+  let headRequest = "HEAD / HTTP/1.1\r\nHost: local\r\n\r\n"
+  test.assertEqual(http.parse(headRequest).status, 405)
+  test.assertTrue(http.parse(headRequest, true).request != null)
   let valid = "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n"
   let response = exchange(valid)
   test.assertTrue(http.find(response, "Content-Type: text/plain; charset=utf-8\r\n", 0) > 0)
@@ -151,6 +241,8 @@ def main(): Void
   test.assertTrue(http.find(response, "\r\n\r\nHello, world!", 0) > 0)
   let fragmented = exchange(valid, true)
   test.assertEqual(fragmented, response)
+  let headResponse = exchange("HEAD / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+  test.assertEqual(headResponse, host.stringSlice(response, 0, http.find(response, "\r\n\r\n", 0) + 4))
   let options = new http.Options()
   options.onListening = fn(address)
     test.assertTrue(false)
@@ -167,6 +259,22 @@ def main(): Void
   end
   var descriptors = ""
   if fixture
+    binaryResponse()
+    let headers = exchange("GET /headers HTTP/1.1\r\nHost: a\r\nx-tag: first\r\nX-TAG: second\r\n\r\n")
+    test.assertTrue(http.find(headers, "\r\n\r\nfirst/second", 0) > 0)
+    test.assertTrue(http.find(headers, "Content-Type: text/html; charset=utf-8\r\n", 0) > 0)
+    test.assertTrue(http.find(headers, "ETag: \"asset-v1\"\r\nSet-Cookie: a=1\r\nset-cookie: b=2\r\n", 0) > 0)
+    expect("GET /framing HTTP/1.1\r\nHost: a\r\n\r\n", 500)
+    expect("GET /duplicate HTTP/1.1\r\nHost: a\r\n\r\n", 500)
+    for path in ["/missing", "/empty", "/reset", "/cached", "/invalid"]
+      let get = exchange("GET " + path + " HTTP/1.1\r\nHost: a\r\n\r\n")
+      let head = exchange("HEAD " + path + " HTTP/1.1\r\nHost: a\r\n\r\n")
+      test.assertEqual(head, host.stringSlice(get, 0, http.find(get, "\r\n\r\n", 0) + 4))
+    end
+    let method = exchange("HEAD /a%2Fb?q=x HTTP/1.1\r\nHost: a\r\n\r\n")
+    test.assertTrue(http.find(method, "Content-Length: 15\r\n", 0) > 0)
+    let unsupported = exchange("POST / HTTP/1.1\r\nHost: a\r\n\r\n")
+    test.assertTrue(http.find(unsupported, "Allow: GET, HEAD\r\n", 0) > 0)
     descriptors = exchange("GET /fds HTTP/1.1\r\nHost: a\r\n\r\n")
     let encoded = exchange("GET /a%2Fb?q=%E2%82%AC HTTP/1.1\r\nHost: a\r\n\r\n", true)
     test.assertTrue(http.find(encoded, "\r\n\r\nGET /a%2Fb?q=%E2%82%AC", 0) > 0)
@@ -176,6 +284,9 @@ def main(): Void
     test.assertTrue(http.find(empty, "discarded", 0) < 0)
   end
   for malformed in [
+    "GET / HTTP/1.x\r\nHost: a\r\n\r\n",
+    "GET / HTTP/1.1\rX\r\nHost: a\r\n\r\n",
+    "GET / HTTP/1.1\r\nHost: a\r\n folded: x\r\n\r\n",
     "GET / HTTP/1.1\r\n\r\n",
     "GET / HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n",
     "GET / HTTP/1.1\r\nHost : a\r\n\r\n",

@@ -177,6 +177,7 @@ static void probe_abi_negotiation(void) {
       (info->features & (NERI_RT_FEATURE_INLINE_AGGREGATES |
                          NERI_RT_FEATURE_MULTIPLE_MUTATORS)) == 0);
   NERI_ABI_CHECK((info->features & NERI_RT_FEATURE_EXTENDED_SCALARS) != 0);
+  NERI_ABI_CHECK((info->features & NERI_RT_FEATURE_OPTIONAL_CONSOLE_READ) != 0);
 
   const uint64_t required_features =
       NERI_RT_FEATURE_PRECISE_GC | NERI_RT_FEATURE_NONMOVING_GC |

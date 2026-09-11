@@ -57,13 +57,14 @@ neri build main.hk
 ```
 
 Use `neri build main.hk --release` for optimized output. The default is Debug.
+Use [LLDB or an IDE with DAP support](docs/DEBUGGING.md) to debug an executable.
 
 ## Documentation
 
 - [Examples](examples/README.md) — output, functions, arrays and program arguments.
 - [Language reference](docs/LANGUAGE.md) — syntax, types and command-line behavior.
 - [Documentation index](docs/README.md) — installation, development and internals.
-- [Supported platforms](docs/PLATFORMS.md) — native targets and platform limits.
+- [Supported platforms](docs/BUILDING.md#supported-platforms) — native targets and platform limits.
 
 ## Development
 

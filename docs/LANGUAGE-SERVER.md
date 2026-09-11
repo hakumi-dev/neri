@@ -22,7 +22,17 @@ project owns the JetBrains client, grammar, configuration UI and Run/Build/Check
   and `BootstrapBinder`. No CLI-output parsing or TextMate-based type inference.
 - UTF-16 ranges, including non-BMP characters, tabs and CRLF line endings.
 - Versioned `publishDiagnostics`; old/duplicate change versions are ignored.
-  Successful analysis and document close publish an empty diagnostic list.
+  Each publication replaces the previous diagnostics. Analysis with no findings
+  and document close publish an empty diagnostic list.
+- [Neri CodeStyle](CODESTYLE.md) diagnostics share the CLI rule engine and
+  `.editorconfig` policy. Document formatting returns minimal edits; versioned
+  quick fixes and `source.fixAll.neri` apply safe style corrections.
+- Unused `use` directives produce an `NR_UNUSED_USE` hint after successful
+  semantic analysis. Clients that advertise support receive
+  `DiagnosticTag.Unnecessary`, allowing the editor to fade the directive.
+  References are resolved by the compiler across the compilation unit and its
+  loaded sources; an import needed by that analysis remains active. Syntax or
+  semantic errors suppress unused-import hints until analysis succeeds.
 - The same `http`, `terminal`, `clock` standard-library sources as the CLI,
   located using the launcher's `NERI_STDLIB` environment.
 - Hover for resolved variable/parameter declarations and reads, `this` and literals, using the
@@ -32,12 +42,43 @@ project owns the JetBrains client, grammar, configuration UI and Run/Build/Check
   document, including reads and assignments. Declaration locations identify the
   name, not the declaration keyword. Queries use binding identity, distinguish
   same-spelling symbols and honor `includeDeclaration` for references.
+  Navigation indexes are built on demand and retained for the current analysis
+  generation. Hash tables deduplicate locations and resolve canonical identities;
+  sorted source boundaries support binary search. Document changes discard both
+  the index and its snapshot. Completion and diagnostics do not build this index.
 - Document highlights use the same binding identities and remain within the
   queried document. Highlights use the text kind; read/write classification
   is not provided.
+- On-type formatting on newline uses the parser's block metadata to indent the
+  new body line and insert a missing `end`. Existing closures are retained;
+  abstract method signatures have no body. Branches share their enclosing
+  terminator. The query parses only the current document and returns UTF-16 edits
+  for its blank current line, preserving line endings and the client's indentation
+  options (`tabSize` from 1 to 32). Clients retain the caret on the body line and
+  discard edits if the document or caret changed while waiting.
 - Document symbols return flat `SymbolInformation` entries ordered by source
   position, using compiler declarations and identifier ranges. Generated
   specializations are excluded. Hierarchical declaration ranges are not provided.
+- `workspace/symbol` searches declared units of the workspace manifest, including
+  closed files and non-default units, and projects containing open documents.
+  Closed units are analyzed sequentially. The search cache retains names, kinds
+  and locations; source and manifest changes invalidate it. Initial indexing is
+  synchronous and its latency depends on the number and size of units.
+- `textDocument/typeDefinition` navigates from an expression's compiler-inferred
+  type to its source declaration, including generic templates. Builtin and
+  structural types without a source declaration return no location.
+- Clients supporting versioned workspace edits can request `prepareRename` and
+  `rename`. Proposed edits are rebound with the compiler before returning them;
+  edited references must resolve to the renamed declaration and other bindings
+  must remain unchanged. Local symbols are scoped to their analysis. Public
+  declarations require a complete executable unit and editable owned sources;
+  library APIs with unknown consumers are rejected. Inheritance method renames
+  and matching identifiers that remain unresolved in lazy generic bodies are
+  rejected until their complete binding relationships can be established.
+- Clients supporting code-action literals and versioned workspace edits receive
+  unused-import quick fixes and `source.organizeImports`. Edits remove proven
+  unused directives, preserve trailing comments, and are checked by reanalysis.
+  The server returns edits for the client to apply to the specified versions.
 - Completion resolves active locals, parameters, receiver members, inherited
   members, static methods, classes and intrinsic library functions through the
   compiler. Visibility and lexical scopes filter candidates. Replacement edits
@@ -46,9 +87,37 @@ project owns the JetBrains client, grammar, configuration UI and Run/Build/Check
   unsupported repairs and ambiguous specializations produce no candidates.
   Function and method details contain signatures without the `def` keyword;
   completion kinds identify functions, methods, classes, fields and variables.
+  Functions and methods insert `()` in call contexts, preserving existing call
+  or generic suffixes. Variables, types, and functions expected as values insert
+  names. Clients advertising `completionItem.snippetSupport` receive a cursor
+  stop inside the parentheses when arguments are present and after them otherwise;
+  other clients receive plain text.
+  Generic templates are available before instantiation. The candidate engine is
+  shared with [persistent session completion](SESSIONS.md#completion); the LSP
+  adapter supplies protocol positions and edits. Results are bounded to 128
+  candidates and use `CompletionList.isIncomplete` when truncated. Import
+  targets include known namespaces and the installed standard-library inventory.
 - `completionItem/resolve` supplies documentation on demand. Items identify the
   document version and analysis revision; changes invalidate earlier requests
   for enrichment. Types and insertion edits do not depend on documentation.
+- Declaration completion offers `class` and `def` templates at the end of a
+  single-line header. Written names, parameters and generic headers are retained.
+  Snippet-capable clients expose editable name, parameter and return-type fields,
+  then place the caret in the body. Body insertion shares the parser-backed
+  newline formatter, preserves existing `end` tokens and follows `.editorconfig`
+  indentation, defaulting to two spaces. Abstract methods remain bodyless.
+  After a parameter or return-type colon, candidates include visible named types,
+  scalar types and in-scope type parameters; `Void` is offered for returns.
+  Inside a class, `override` or `override def` offers unimplemented inherited
+  methods with resolved parameter and return types, visibility and required
+  modifiers. Private methods, constructors, static methods and unresolved bases
+  are excluded. Generated bodies are empty and parameters have no copied default
+  expressions. The developer supplies the implementation.
+  Declaration templates run before project analysis; type and override queries
+  use the existing compiler query path. Space, colon and closing parenthesis
+  trigger contextual completion. Dynamic templates use `isIncomplete` so clients
+  refresh edits as the header changes. Multiline and nested type-annotation
+  completion are outside this declaration-assistance contract.
 - Signature help uses resolved calls, constructors and intrinsic contracts,
   with parameter labels and the active argument. Nested calls and commas inside
   literals are distinguished. A limited delimiter repair supports incomplete
@@ -60,8 +129,12 @@ project owns the JetBrains client, grammar, configuration UI and Run/Build/Check
 - Class construction and direct function calls support definition and references
   across unit members, including closed files. Hover displays the resolved
   class name or callable signature. Source-map locations preserve each file's
-  URI and local UTF-16 ranges. Generic instantiations are not covered by this
-  contract.
+  URI and local UTF-16 ranges.
+- Definition navigation resolves class and native-record type annotations,
+  nested generic arguments, optional and callback types, and inheritance.
+  Generic constructors, methods and fields navigate to their original source
+  declarations. Enum cases navigate from construction and `match` patterns to
+  the case name. Generated specializations remain excluded from document symbols.
 - Fields and resolved method calls use the declaring owner's identity, including
   inherited members, static calls and explicit base calls. Field hover reflects
   the compiler's receiver-adjusted type. Callback parameters, callback-local
@@ -81,22 +154,28 @@ without an owning unit is analyzed independently. Libraries reject `main`, and
 executable units require exactly one entry point for language-server analysis.
 See [project sources and references](PROJECTS.md).
 
-Analysis is synchronous and ordered. The selected unit's source graph is
-flattened for analysis; units are not packages and no dependency artifacts are
-produced. Diagnostic versions let clients discard
-obsolete results, but there is no background cancellation, debounce,
-incremental semantic cache or incremental analysis yet. The bound model for
-each analyzed document is retained for semantic queries. A large analysis can
-delay later messages.
+Text changes apply immediately in protocol order and invalidate affected models.
+Consecutive changes coalesce into one pending analysis per document. Semantic
+queries analyze their current document on demand; newline formatting uses only
+its current syntax. After 150 ms without pending input, the server analyzes one
+dirty document for diagnostics, then checks input again. The last edited document
+has priority. Source membership is retained across text edits and rediscovered
+after open, close and watched-file notifications.
+
+The selected unit's source graph is flattened for synchronous analysis, and its
+bound model is retained for queries. A single large analysis can still delay
+later messages; background cancellation and incremental semantic analysis remain
+unsupported. Diagnostic versions let clients discard obsolete results.
 Transport limits are 2 MiB per message, 8 KiB of headers and 64 nested JSON
 containers. Malformed framing terminates the session; malformed JSON gets a
 parse-error reply. Protocol notices use `window/logMessage`.
 
-Rename and semantic tokens are not advertised or implemented. Type-annotation
-navigation and general generic navigation are unsupported. Completion and signature repairs do not
+Semantic tokens are not advertised or implemented. Built-in types
+and intrinsic operations without source declarations have no definition location.
+Completion and signature repairs do not
 provide general error-tolerant analysis. Background cancellation is unsupported.
-See [acceptance criteria](LSP-ACCEPTANCE.md)
-for language-service quality requirements.
+Language-service improvements and acceptance requirements are tracked in the
+[Kanban](https://github.com/hakumi-dev/neri/issues/55).
 
 ## Optional symbol documentation
 
@@ -138,6 +217,14 @@ toolchain. Transport and semantic analysis have no editor-specific dependencies.
 Semantic features use compiler symbol identity, types and source ranges rather
 than inferring meaning from syntax coloring or CLI output.
 
+Declaration providers live in `compiler/lsp/declarations.hk`,
+`declaration-types.hk` and `declaration-members.hk`. They share current syntax
+context in `declaration-context.hk`, protocol snippet encoding in `snippets.hk`,
+and semantic candidate rules in `compiler/semantic/`. Extensions add contextual
+providers and insertion contracts in `tests/lsp-declaration-contract.hk`.
+Editable fields and refresh behavior follow the
+[LSP completion contract](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#textDocument_completion).
+
 Streaming input uses bounded byte-array chunks, decoded at UTF-8 boundaries,
 and a balanced string join. Repeated `host.appendByte` on an ever-growing array
 copies the previous contents on each append and causes quadratic copying.
@@ -145,11 +232,26 @@ copies the previous contents on each append and causes quadratic copying.
 ## Validate
 
 `scripts/build.sh test` runs the protocol suite against the freshly bootstrapped
-compiler, alongside existing compiler and native tests. To run it separately:
+compiler, alongside existing compiler and native tests. To run the adapter
+separately, prepare an isolated standard-library directory and index every
+source it contains:
 
 ```sh
-build/native/native-release/neri-lsp-test "$HOME/.neri/bin/neri" "$PWD"
+fixture="$(mktemp -d)"
+cp "$PWD"/stdlib/*.hk "$fixture"/
+"$HOME/.neri/bin/neri" documentation-index \
+  --toolchain-version "$(cat VERSION)" \
+  --output "$fixture/documentation.json" "$fixture"/*.hk
+NERI_LSP_TEST_STDLIB="$fixture" \
+  build/native/native-release/neri-lsp-test "$HOME/.neri/bin/neri" "$PWD"
 ```
+
+The full test command prepares an isolated standard-library directory and its
+documentation index with Neri tooling, then passes its path to the adapter in
+`NERI_LSP_TEST_STDLIB`. The prepared directory contains every installed `.hk`
+standard-library source and a matching `documentation.json`. The adapter
+requires this variable; its no-sidecar contract temporarily uses the repository
+standard library without the sidecar.
 
 The tests exercise framing/lifecycle, recovery, real type errors, incomplete
 blocks, the existing callback fixture, standard-library loading, Unicode ranges,
@@ -166,7 +268,8 @@ not an empty document). Each edit must produce empty diagnostics with its exact
 version. The current server still reparses and binds the whole document.
 
 ```sh
-build/native/native-release/neri-lsp-test /path/to/current/compiler "$PWD" --benchmark
+NERI_LSP_TEST_STDLIB="$fixture" \
+  build/native/native-release/neri-lsp-test /path/to/current/compiler "$PWD" --benchmark
 ```
 
 Output reports nearest-rank p50/p95/p99 and maximum milliseconds from sending
@@ -187,4 +290,39 @@ replacements remain valid change events. File membership and process lifecycle
 are client responsibilities. Consult the client integration's documentation for
 editor-specific settings and execution actions.
 
+For local compiler development, configure the editor with the repository's
+absolute `scripts/neri.sh` path and the `lsp` argument. The launcher selects the
+validated `build/current` toolchain and its matching runtime and standard library.
+Run `scripts/build.sh bootstrap` to publish a new local toolchain, then restart
+the editor's language server. An already running server continues using the
+executable it started with. Installed-toolchain users likewise restart the
+language server after updating their installation.
+
 Protocol reference: [LSP specification](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/).
+
+The canonical test command discovers `tests/lsp-*-contract.hk` sources and builds
+their corresponding `lsp-*-contracts` manifest units. The original server
+manifest suite uses its established `lsp-contracts` unit name. Each executable
+receives the repository root as its first argument. New suites register their
+unit in `manifest.json` and follow this source naming convention.
+
+## Semantic query boundary
+
+Navigation and workspace search consume a typed index of compiler declarations
+and occurrences. Each analysis snapshot identifies its project unit, revision,
+source texts and versions. Canonical declaration locations distinguish symbols
+when source order changes. The protocol adapter owns file access and JSON;
+semantic queries operate on captured compiler results.
+
+This separation follows the compiler/IDE boundary described by
+[rust-analyzer's architecture](https://rust-analyzer.github.io/book/contributing/architecture.html).
+[Scope graphs](https://pl.ewi.tudelft.nl/research/projects/scope-graphs/) provide
+the reference model for connecting references to declarations through scopes.
+Neri queries consume its binder's resolved identities; the index itself does
+not implement a separate scope-graph resolver.
+
+Type-driven editor features consume the compiler's inferred types and expected
+callback types. [Dunfield and Krishnaswami's bidirectional typing paper](https://arxiv.org/abs/1306.6032)
+distinguishes synthesizing a type from checking against an expected type. That
+distinction guides contextual inference; it does not imply that Neri implements
+the paper's higher-rank calculus or inherits its soundness proof.

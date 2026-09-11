@@ -1,0 +1,136 @@
+use test
+use console
+use host
+
+def executionContracts(): Void
+  let compiler = host.argumentAt(0)
+  let linker = host.argumentAt(1)
+  let target = host.argumentAt(2)
+  let work = host.argumentAt(3)
+  let root = host.argumentAt(4)
+
+  test.assertTrue(compiler != null && linker != null && target != null && work != null && root != null)
+  if compiler == null || linker == null || target == null || work == null || root == null
+    return
+  end
+  let first = work + "/probe.module"
+  let next = work + "/probe-next.module"
+  let mismatch = work + "/probe-mismatch.module"
+  let layoutMismatch = work + "/probe-layout-mismatch.module"
+
+  unsafe
+    let one = sessionBridgeCreate()
+    let two = sessionBridgeCreate()
+
+    test.assertTrue(sessionBridgeOwner(one) != sessionBridgeOwner(two))
+    test.assertEqual(sessionBridgeLoadExecute(one, first), 0)
+    test.assertEqual(sessionBridgeLoadExecute(one, layoutMismatch), 4)
+    # The mismatched module must be rejected while the generation-zero state is intact.
+    test.assertEqual(sessionBridgeLoadExecute(one, mismatch), 5)
+    test.assertEqual(sessionBridgeLoadExecute(one, next), 0)
+    test.assertEqual(sessionBridgeReset(one), 0)
+    test.assertEqual(sessionBridgeLoadExecute(one, first), 0)
+    test.assertEqual(sessionBridgeReset(one), 0)
+    test.assertEqual(sessionBridgeDestroy(one), 0)
+    test.assertEqual(sessionBridgeDestroy(two), 0)
+  end
+  console.println("bridge direct passed")
+
+  let toolchain = new SessionToolchain(compiler, linker, target, work)
+
+  sessionCompletionExecutionContracts(toolchain, root)
+  executionResultContracts(toolchain)
+  abstractExecutionContracts(toolchain)
+  sessionSymbolIsolationContracts(toolchain)
+  retainedPruningContracts(toolchain)
+  sessionCacheContracts(toolchain, root)
+  initializerContracts(toolchain, root)
+  let fixtureLibraries = work + "/stdlib"
+  let configuredLibraries = host.environment("NERI_STDLIB")
+
+  test.assertTrue(configuredLibraries != null && configuredLibraries == fixtureLibraries)
+  let capturedLibrary = fixtureLibraries + "/snapshotfixture.hk"
+
+  test.assertTrue(host.writeText(capturedLibrary, "namespace snapshotfixture\ndef value(): Int\n  return 41\nend\n"))
+  let frozenSession = new ExecutableSession(toolchain)
+  let frozenCandidate = frozenSession.prepare("use snapshotfixture\nuse test\nlet captured = snapshotfixture.value()\ntest.assertEqual(captured, 41)\n")
+
+  test.assertEqual(frozenCandidate.status, "complete")
+  test.assertTrue(host.writeText(capturedLibrary, "namespace snapshotfixture\ndef value(): Int\n  return 99\nend\n"))
+  test.assertTrue(frozenSession.execute(frozenCandidate).succeeded)
+  test.assertTrue(frozenSession.submit("test.assertEqual(snapshotfixture.value(), 41)\n").execution.succeeded)
+  test.assertTrue(frozenSession.dispose().succeeded)
+
+  let refreshedSession = new ExecutableSession(toolchain)
+  let refreshed = refreshedSession.prepare("use snapshotfixture\nuse test\nlet captured = snapshotfixture.value()\ntest.assertEqual(captured, 99)\n")
+  let refreshedResult = refreshedSession.execute(refreshed)
+
+  test.assertTrue(refreshedResult.succeeded)
+  test.assertTrue(!refreshedResult.cacheHit)
+  test.assertTrue(refreshedSession.dispose().succeeded)
+  test.assertTrue(host.removeFile(capturedLibrary))
+  let session = new ExecutableSession(toolchain)
+  let initializerProject = root + "/tests/session-initializer/manifest.json"
+
+  test.assertTrue(!session.initializeProject(initializerProject, "service", "services.invalidSessionService").succeeded)
+  console.println("invalid initializer passed")
+  let initialized = session.initializeProject(initializerProject, "service", "services.createSessionService")
+
+  console.println("initializer result: " + initialized.message)
+
+  test.assertTrue(initialized.succeeded)
+  console.println("initializer passed")
+
+  test.assertTrue(session.submit("let observed = service.value\n").execution.succeeded)
+  test.assertTrue(session.submit("use crypto\nuse test\nlet digest = crypto.sha256([1 as Byte, 2 as Byte, 3 as Byte])\ntest.assertTrue(digest.failure() == null)\n").execution.succeeded)
+  console.println("service submit passed")
+  let objects = session.prepare("class Counter\n  public value: Int\n  def init(value: Int): Void\n    this.value = value\n  end\nend\ndef requireSession(value: Bool): Int\n  if value\n    return 1\n  end\n  return 1 / 0\nend\nlet counter = new Counter(3)\nlet alias = counter\nlet boxed = [counter]\nlet callback = fn(): Int\n  return counter.value\nend\nvar changing = 4\n")
+
+  objects.executionSource = "fail(\"forged public execution view\")\n"
+  objects.status = "invalid"
+  objects.generation = 999
+  let objectsResult = session.execute(objects)
+
+  console.println("objects result: " + objectsResult.message)
+
+  test.assertTrue(objectsResult.succeeded)
+  console.println("forged view passed")
+  let valuesResult = session.submit("counter.value = 9\nchanging = changing + 1\nlet checked = requireSession(alias.value == 9 && boxed[0].value == 9 && callback() == 9 && changing == 5)\n")
+
+  console.println("values result: " + valuesResult.format())
+
+  test.assertTrue(valuesResult.execution.succeeded)
+  console.println("debug values passed")
+
+  test.assertTrue(!session.initializeProject(initializerProject, "service", "services.createSessionService").succeeded)
+  test.assertTrue(session.reset().succeeded)
+  test.assertTrue(session.initializeProject(initializerProject, "service", "services.createSessionService").succeeded)
+  let disposedCandidate = session.prepare("let neverCompiled = 1\n")
+
+  test.assertTrue(session.dispose().succeeded)
+  test.assertTrue(!session.execute(disposedCandidate).succeeded)
+  test.assertTrue(!session.initializeProject(initializerProject, "service", "services.createSessionService").succeeded)
+
+  let debugSession = new ExecutableSession(toolchain)
+  let foreignSession = new ExecutableSession(toolchain)
+  let foreignCandidate = debugSession.prepare("let untouched = 1\n")
+
+  test.assertTrue(!foreignSession.execute(foreignCandidate).succeeded)
+  let winner = debugSession.prepare("let winner = 1\n")
+  let stale = debugSession.prepare("let stale = 2\n")
+
+  test.assertTrue(debugSession.execute(winner).succeeded)
+  test.assertTrue(!debugSession.execute(stale).succeeded)
+  test.assertTrue(debugSession.submit("let stillUsable = winner + 1\n").execution.succeeded)
+  test.assertTrue(debugSession.dispose().succeeded)
+  test.assertTrue(foreignSession.dispose().succeeded)
+
+  let releaseToolchain = new SessionToolchain(toolchain.compiler, toolchain.linker,
+    toolchain.target, toolchain.workRoot, true)
+  let releaseSession = new ExecutableSession(releaseToolchain)
+
+  test.assertTrue(releaseSession.submit("use crypto\nuse test\nlet digest = crypto.sha256([1 as Byte, 2 as Byte, 3 as Byte])\ntest.assertTrue(digest.failure() == null)\n").execution.succeeded)
+  test.assertTrue(releaseSession.submit("class Boxed\n  public value: Int\n  def init(value: Int): Void\n    this.value = value\n  end\nend\nlet box = new Boxed(8)\nlet aliases = [box]\nlet closure = fn(): Int\n  return box.value\nend\n").execution.succeeded)
+  test.assertTrue(releaseSession.submit("box.value = 12\nlet checked = 1 / ((aliases[0].value + closure() == 24) ? 1 : 0)\n").execution.succeeded)
+  test.assertTrue(releaseSession.dispose().succeeded)
+end

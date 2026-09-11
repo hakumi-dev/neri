@@ -22,7 +22,7 @@ static void completion_contract(void) {
     "  public def read(): Int\n"
     "    return this.value\n"
     "  end\n"
-    "  public def static create(): Widget\n"
+    "  public static def create(): Widget\n"
     "    return new Widget()\n"
     "  end\n"
     "end\n"
@@ -173,6 +173,6 @@ static void completion_contract(void) {
   item = completion_item(items, "read");
   require(completion_item(items, "print") != NULL && completion_item(items, "println") != NULL &&
           item != NULL && string_is(field(item, "detail"), "console.read(): String"),
-          "builtin completion is validated and rendered from compiler intrinsic signatures");
+          "library completion is rendered from source callable signatures");
   free(reply);
 }

@@ -18,6 +18,7 @@ static struct sigaction previous[5];
 static volatile sig_atomic_t interrupted;
 static int active, registered;
 static int64_t generation;
+int neri_terminal_active(void) { return active; }
 
 void neri_terminal_restore(void) {
   if (!active) return;
@@ -31,7 +32,7 @@ void neri_terminal_restore(void) {
 static void interrupt_session(int number) { (void)number; interrupted = 1; }
 
 int64_t neri_rt_v1_terminal_open(void) {
-  if (active || generation == INT64_MAX || !isatty(0) || !isatty(1) ||
+  if (active || neri_interrupt_active() || generation == INT64_MAX || !isatty(0) || !isatty(1) ||
       tcgetpgrp(0) != getpgrp() || tcgetattr(0, &saved) != 0) return 0;
   if (!registered) {
     if (atexit(neri_terminal_restore) != 0) return 0;
@@ -91,4 +92,18 @@ int64_t neri_rt_v1_clock_milliseconds(void) {
   struct timespec now;
   if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return -1;
   return (int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
+}
+
+int64_t neri_rt_v1_clock_wall_milliseconds(int64_t *value) {
+  struct timespec now;
+  if (value == NULL || clock_gettime(CLOCK_REALTIME, &now) != 0) return -1;
+  if (now.tv_sec > INT64_MAX / 1000 || now.tv_sec < INT64_MIN / 1000) return -1;
+  const int64_t seconds = (int64_t)now.tv_sec;
+  const int64_t milliseconds = (int64_t)(now.tv_nsec / 1000000);
+  if (seconds == INT64_MAX / 1000 &&
+      milliseconds > INT64_MAX - seconds * 1000) return -1;
+  if (seconds == INT64_MIN / 1000 &&
+      milliseconds < INT64_MIN - seconds * 1000) return -1;
+  *value = seconds * 1000 + milliseconds;
+  return 0;
 }

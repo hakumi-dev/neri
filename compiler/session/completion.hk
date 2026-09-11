@@ -1,0 +1,297 @@
+use host
+
+class SessionCompletionItem
+  public name: String = ""
+  public insertText: String = ""
+  public category: String = ""
+  public detail: String = ""
+  public replacementStart: Int = 0
+  public replacementEnd: Int = 0
+  public cursorByteOffset: Int = 0
+  public next: SessionCompletionItem?
+end
+
+class SessionCompletionFilter: SemanticCompletionFilter
+  public generation: Int = 0
+
+  def excludes(name: String, identity: String): Bool
+    if super.excludes(name, identity) || identity == "callable:__neri_session_entry" || textStartsWith(identity, "__neri_session_entry/parameter[")
+      return true
+    end
+    let prefix = "type:__NeriSessionState"
+
+    if textStartsWith(identity, prefix)
+      let suffix = host.stringSlice(identity, host.stringByteLength(prefix), host.stringByteLength(identity) - host.stringByteLength(prefix))
+      let frame = host.parseInt(suffix)
+
+      return frame != null && frame >= 0 && frame < this.generation && suffix == (frame as String)
+    end
+    return false
+  end
+end
+
+class SessionCompletionResult
+  public status: String = "complete"
+  public generation: Int = 0
+  public truncated: Bool = false
+  public count: Int = 0
+  public first: SessionCompletionItem?
+end
+
+# Public session offsets address the caller's UTF-8 bytes. The parser uses
+# UTF-16 internally; this boundary validates before converting either way.
+def sessionCompletionPosition(source: String, cursorByteOffset: Int): Int
+  let size = host.stringByteLength(source)
+
+  if cursorByteOffset < 0 || cursorByteOffset > size
+    return -1
+  end
+  if cursorByteOffset < size
+    let byte = host.stringByteAt(source, cursorByteOffset) as Int
+
+    if byte >= 128 && byte < 192
+      return -1
+    end
+  end
+  var byteOffset = 0
+  var position = 0
+
+  while byteOffset < cursorByteOffset
+    let width = utf8Width(host.stringByteAt(source, byteOffset) as Int)
+
+    byteOffset = byteOffset + width
+    position = position + (width == 4 ? 2 : 1)
+  end
+  return position
+end
+
+def sessionCompletionCategory(kind: Int): String
+  if kind == 2
+    return "method"
+  else if kind == 3
+    return "function"
+  else if kind == 5
+    return "field"
+  else if kind == 6
+    return "variable"
+  else if kind == 7
+    return "type"
+  else if kind == 8
+    return "contract"
+  else if kind == 9
+    return "namespace"
+  else if kind == 14
+    return "keyword"
+  end
+  return "symbol"
+end
+
+def sessionCompletionMappedPosition(source: String, starts: IntBuffer, lengths: IntBuffer, position: Int): Int
+  var offset = 0
+  var index = 0
+
+  while index < starts.size
+    let start = starts.get(index)
+    let length = lengths.get(index)
+
+    if position >= start && position < start + length
+      return offset + position - start
+    end
+    offset = offset + utf16Length(submissionPart(source, start, length))
+    index = index + 1
+  end
+  return -1
+end
+
+# Completion needs binding types, not the runtime frame-access expressions.
+# Typed temporary parameters keep analysis independent of retained frame depth.
+def sessionCompletionEntry(bindings: SessionBinding?): String
+  var parameters = ""
+  var locals = ""
+  var binding = bindings
+  var index = 0
+
+  while binding != null
+    let parameter = "__neri_completion_binding" + (index as String)
+    let separator = index == 0 ? "" : ", "
+
+    parameters = parameters + separator + parameter + ": " + binding.typeName
+    locals = locals + (binding.mutable ? "var " : "let ") + binding.name + ": " + binding.typeName + " = " + parameter + "\n"
+    index = index + 1
+    binding = binding.next
+  end
+  return "def __neri_session_entry(" + parameters + "): Void\n" + locals
+end
+
+def sessionCompletionBindings(site: SemanticCompletionSite, bindings: SessionBinding?): SemanticCompletionSite
+  if site.receiverKind != ""
+    return site
+  end
+  let merged = new SemanticCompletionSite()
+
+  merged.start = site.start
+  merged.length = site.length
+  merged.namespaceName = site.namespaceName
+  merged.className = site.className
+  merged.callable = site.callable
+  merged.expectsFunction = site.expectsFunction
+  var binding = bindings
+
+  while binding != null
+    let symbol = new SemanticCompletionSymbol()
+    let tail = merged.lastSymbol
+
+    symbol.identity = "session-binding:" + binding.name
+    symbol.name = binding.name
+    symbol.typeName = binding.typeName
+    symbol.mutable = binding.mutable
+    if tail == null
+      merged.firstSymbol = symbol
+    else
+      tail.next = symbol
+    end
+    merged.lastSymbol = symbol
+    binding = binding.next
+  end
+  var symbol = site.firstSymbol
+
+  while symbol != null
+    merged.addSymbol(symbol.identity, symbol.name, symbol.typeName, symbol.mutable)
+    symbol = symbol.next
+  end
+  return merged
+end
+
+def sessionCompleteSource(source: String, cursorByteOffset: Int, generation: Int, bindings: SessionBinding?, retained: SessionCompilation?, snapshot: SessionSourceSnapshot?, baseSource: String, availableImports: StringBuffer): SessionCompletionResult
+  let result = new SessionCompletionResult()
+  let position = sessionCompletionPosition(source, cursorByteOffset)
+
+  result.generation = generation
+  if position < 0
+    result.status = "invalid-position"
+    return result
+  end
+  if host.stringByteLength(source) > 1048576
+    result.status = "limit"
+    return result
+  end
+  let target = semanticCompletionTarget(source, position)
+
+  if !target.valid
+    return result
+  end
+  let map = new IrSourceMap(source)
+  let first = map.offsetAt(target.start)
+  let last = map.offsetAt(target.start + target.length)
+  let suffix = target.addCall ? "()" : ""
+  let repaired = host.stringSlice(source, 0, first) + "__neri_completion_site_7f31__" + suffix + host.stringSlice(source, last, host.stringByteLength(source) - last)
+  let parser = new BootstrapParser(new BootstrapLexer(repaired).lex())
+  let submission = parser.parseSubmission()
+  let declarations = submissionParts(repaired, submission.declarationStarts, submission.declarationLengths)
+  let statements = submissionParts(repaired, submission.statementStarts, submission.statementLengths)
+  var retainedModel: SemanticModel? = null
+  var retainedSyntax: SyntaxArena? = null
+  var sourceOffset = 0
+  var context = baseSource
+  var firstLibrary = 0
+
+  if retained != null
+    retainedModel = retained.model
+    retainedSyntax = retained.syntax
+    sourceOffset = retained.sourceEnd
+    context = ""
+    if snapshot != null
+      firstLibrary = snapshot.libraryCount()
+    end
+  end
+  let referenced = sessionReferencedBindings(bindings, new BootstrapLexer(source).lex())
+  let prefix = context + declarations + sessionCompletionEntry(referenced)
+  let program = prefix + statements + "end\n"
+  var candidateSnapshot = new SessionSourceSnapshot()
+
+  if snapshot != null
+    candidateSnapshot = snapshot.frozenCopy()
+  end
+  candidateSnapshot.captureLibraries(context + declarations + statements)
+  if candidateSnapshot.error != ""
+    result.status = "unavailable"
+    return result
+  end
+  let lexer = new BootstrapLexer(program + candidateSnapshot.librarySuffix(firstLibrary))
+
+  lexer.utf16Position = sourceOffset
+  let tokens = lexer.lex()
+  let analysisParser = new BootstrapParser(tokens, retainedSyntax)
+
+  analysisParser.sessionExpressions = true
+  if retained == null
+    candidateSnapshot.applyBoundaries(analysisParser, utf16Length(program) - utf16Length(baseSource))
+  else
+    candidateSnapshot.applyLibraryBoundaries(analysisParser, sourceOffset + utf16Length(program), firstLibrary)
+  end
+  let root = analysisParser.parseProgram()
+  let binder = new BootstrapBinder(analysisParser.arena, root, tokens.startAt(tokens.count() - 1), retainedModel)
+
+  binder.requireEntryPoint = false
+  binder.allowSessionEntryReplacement = true
+  binder.recordCompletionSites = true
+  candidateSnapshot.applyLibrarySources(binder, sourceOffset + utf16Length(program), firstLibrary)
+  let model = binder.bind()
+  let mapped = new SemanticCompletionTarget()
+  let declarationPosition = sessionCompletionMappedPosition(repaired, submission.declarationStarts, submission.declarationLengths, target.start)
+
+  mapped.kind = target.kind
+  mapped.receiverType = target.receiverType
+  if declarationPosition >= 0
+    mapped.start = sourceOffset + utf16Length(context) + declarationPosition
+  else
+    let statementPosition = sessionCompletionMappedPosition(repaired, submission.statementStarts, submission.statementLengths, target.start)
+
+    if statementPosition < 0
+      return result
+    end
+    mapped.start = sourceOffset + utf16Length(prefix) + statementPosition
+  end
+  var site = semanticCompletionSite(model, mapped)
+
+  if target.kind == "import"
+    let importSite = new SemanticCompletionSite()
+
+    importSite.receiverKind = "import"
+    importSite.receiverType = target.receiverType
+    site = importSite
+  end
+  if site == null
+    return result
+  end
+  let filter = new SessionCompletionFilter()
+
+  filter.marker = "__neri_completion_site_7f31__"
+  filter.generation = generation
+  let candidates = semanticCompletionCandidates(model, sessionCompletionBindings(site, bindings), target.prefix, 128, availableImports, filter)
+  var candidate = candidates.first
+  var tail: SessionCompletionItem? = null
+
+  result.truncated = candidates.truncated
+  while candidate != null
+    let item = new SessionCompletionItem()
+    let insertion = semanticCompletionInsertion(candidate, target, site)
+
+    item.name = candidate.name
+    item.insertText = insertion.text
+    item.category = sessionCompletionCategory(candidate.kind)
+    item.detail = candidate.detail
+    item.replacementStart = first
+    item.replacementEnd = last
+    item.cursorByteOffset = insertion.cursorByteOffset
+    if tail == null
+      result.first = item
+    else
+      tail.next = item
+    end
+    tail = item
+    result.count = result.count + 1
+    candidate = candidate.next
+  end
+  return result
+end

@@ -1,9 +1,300 @@
 use host
+use result
+use resources
 namespace http
+
+# Socket owns one native descriptor. Its handle remains available only to
+# unsafe implementation code; callers use the typed HTTP APIs.
+resource class Socket
+  private fd: Int
+  private closed: Bool = false
+
+  private def init(fd: Int): Void
+    this.fd = fd
+  end
+
+  public static unsafe def own(fd: Int): result.Result<Socket, ExchangeFailure>
+    if fd < 0
+      return result.Result<Socket, ExchangeFailure>.Error(new ExchangeFailure(new result.Failure("socket_error", "socket.own", socketError()), new Exchange()))
+    end
+    let owned = new Socket(fd)
+    return result.Result<Socket, ExchangeFailure>.Ok(transfer owned)
+  end
+
+  public static unsafe def ownListener(fd: Int): result.Result<Socket, Failure>
+    if fd < 0
+      return result.Result<Socket, Failure>.Error(new Failure("socket_error", "listen.open", socketError()))
+    end
+    let owned = new Socket(fd)
+    return result.Result<Socket, Failure>.Ok(transfer owned)
+  end
+
+  public def close(): result.Failure?
+    if this.closed
+      return null
+    end
+    this.closed = true
+    unsafe
+      if netCloseResult(this.fd) < 0
+        return new result.Failure("close_failed", "socket.close", socketError())
+      end
+    end
+    return null
+  end
+
+  public unsafe def nativeHandle(): Int
+    return this.fd
+  end
+end
+
+class Failure
+  public code: String
+  public operation: String
+  public detail: String
+  public closeFailures: resources.CloseFailures = new resources.CloseFailures()
+
+  def init(code: String, operation: String, detail: String = ""): Void
+    this.code = code
+    this.operation = operation
+    this.detail = detail
+  end
+end
 
 class Options
   public onListening: (fn(String): Void)?
   public log: (fn(String): Void)?
+  public stop: Stop?
+  public handleInterrupts: Bool = false
+  # Opt-in fatal boundary: after stop is requested, allow the active request to
+  # finish for this duration, then terminate the process with status 124.
+  public forceExitAfterStopMilliseconds: Int?
+  public onConnection: (fn(result.Result<Exchange, ExchangeFailure>): Void)?
+end
+
+class Exchange
+  public bytesRead: Int = 0
+  public bytesWritten: Int = 0
+  public status: Int = 0
+end
+
+class ExchangeFailure
+  public cause: result.Failure
+  public exchange: Exchange
+  public responseFailure: result.Failure?
+  public closeFailures: resources.CloseFailures = new resources.CloseFailures()
+
+  def init(cause: result.Failure, exchange: Exchange): Void
+    this.cause = cause
+    this.exchange = exchange
+  end
+end
+
+def transportFailure(failure: Failure, transferred: Int): result.Failure
+  let converted = new result.Failure(failure.code, failure.operation, failure.detail, transferred)
+  let chain = new CleanupFailureChain(converted)
+  failure.closeFailures.each() do |closed|
+    chain.append(closed)
+  end
+  return converted
+end
+
+class CleanupFailureChain
+  private tail: result.Failure
+
+  def init(primary: result.Failure): Void
+    this.tail = primary
+  end
+
+  def append(failure: result.Failure): Void
+    var source: result.Failure? = failure
+    while source != null
+      let copied = new result.Failure(source.code, source.operation, source.detail, source.transferred, source.osCode, source.cause)
+      this.tail.closeFailure = copied
+      this.tail = copied
+      source = source.closeFailure
+    end
+  end
+end
+
+def reportConnection(options: Options?, outcome: result.Result<Exchange, ExchangeFailure>): Void
+  if options != null
+    let observer = options.onConnection
+    observer(outcome) if observer != null
+  end
+  match outcome
+    case result.Result.Ok(exchange)
+      report(options, "Response " + (exchange.status as String))
+    case result.Result.Error(failure)
+      report(options, failure.cause.operation + ": " + failure.cause.code)
+  end
+end
+
+def sendResponseOutcome(fd: Int, response: Response, head: Bool): result.Result<Exchange, ExchangeFailure>
+  let output = wire(response, head)
+  let exchange = new Exchange()
+  let status = host.parseInt(host.stringSlice(output.headers, 9, 3))
+  exchange.status = status if status != null
+  unsafe
+    let started = netMilliseconds()
+    if started < 0
+      return result.Result<Exchange, ExchangeFailure>.Error(new ExchangeFailure(new result.Failure("clock_error", "response.clock", socketError()), exchange))
+    end
+    let deadline = started + 2000
+    let headers = writePayloadResult(fd, output.headers, null, deadline)
+    exchange.bytesWritten = headers.bytesWritten
+    let headerFailure = headers.failure
+    if headerFailure != null
+      return result.Result<Exchange, ExchangeFailure>.Error(new ExchangeFailure(transportFailure(headerFailure, exchange.bytesWritten), exchange))
+    end
+    let body = writePayloadResult(fd, output.text, output.bytes, deadline)
+    exchange.bytesWritten = exchange.bytesWritten + body.bytesWritten
+    let bodyFailure = body.failure
+    if bodyFailure != null
+      return result.Result<Exchange, ExchangeFailure>.Error(new ExchangeFailure(transportFailure(bodyFailure, exchange.bytesWritten), exchange))
+    end
+  end
+  return result.Result<Exchange, ExchangeFailure>.Ok(exchange)
+end
+
+def connectionOutcome(fd: Int, handler: fn(Request): Response): result.Result<Exchange, ExchangeFailure>
+  let head = readHead(fd)
+  let exchange = new Exchange()
+  exchange.bytesRead = head.bytesRead
+  let readFailure = head.failure
+  var primary: result.Failure? = null
+  if readFailure != null
+    primary = transportFailure(readFailure, head.bytesRead)
+  end
+  if head.status == 0
+    let cause = primary
+    if cause != null
+      return result.Result<Exchange, ExchangeFailure>.Error(new ExchangeFailure(cause, exchange))
+    end
+    return result.Result<Exchange, ExchangeFailure>.Error(new ExchangeFailure(new result.Failure("peer_closed", "read", "", head.bytesRead), exchange))
+  end
+  var response = text(head.status, "Request rejected")
+  var isHead = false
+  if head.status == 200
+    let parsed = parse(head.text, true)
+    isHead = parsed.head
+    let request = parsed.request
+    if request != null
+      response = handler(request)
+    else
+      response = text(parsed.status, "Request rejected")
+      let rejected = parsed.failure
+      if rejected != null
+        primary = transportFailure(rejected, head.bytesRead)
+      end
+    end
+  end
+  match sendResponseOutcome(fd, response, isHead)
+    case result.Result.Ok(sent)
+      sent.bytesRead = head.bytesRead
+      let cause = primary
+      if cause != null
+        return result.Result<Exchange, ExchangeFailure>.Error(new ExchangeFailure(cause, sent))
+      end
+      return result.Result<Exchange, ExchangeFailure>.Ok(sent)
+    case result.Result.Error(failed)
+      failed.exchange.bytesRead = head.bytesRead
+      let cause = primary
+      if cause != null
+        let combined = new ExchangeFailure(cause, failed.exchange)
+        combined.responseFailure = failed.cause
+        return result.Result<Exchange, ExchangeFailure>.Error(combined)
+      end
+      return result.Result<Exchange, ExchangeFailure>.Error(failed)
+  end
+end
+
+unsafe def scopedConnection(fd: Int, handler: fn(Request): Response): resources.Outcome<Exchange, ExchangeFailure>
+  using socket <- Socket.own(fd)
+    unsafe
+      let descriptor = socket.nativeHandle()
+      if netConfigure(descriptor) < 0
+        return new ExchangeFailure(new result.Failure("socket_error", "connection.configure", socketError()), new Exchange())
+      end
+      match connectionOutcome(descriptor, handler)
+        case result.Result.Ok(exchange)
+          return exchange
+        case result.Result.Error(failure)
+          return failure
+      end
+    end
+  end
+  return new ExchangeFailure(new result.Failure("connection_unavailable", "connection"), new Exchange())
+end
+
+def reportScopedConnection(options: Options?, outcome: resources.Outcome<Exchange, ExchangeFailure>): Void
+  match outcome.completion
+    case resources.Completion.Value(exchange)
+      if outcome.closeFailures.count() == 0
+        reportConnection(options, result.Result<Exchange, ExchangeFailure>.Ok(exchange))
+      else
+        let failure = new ExchangeFailure(new result.Failure("close_failed", "connection.close"), exchange)
+        failure.closeFailures = outcome.closeFailures
+        reportConnection(options, result.Result<Exchange, ExchangeFailure>.Error(failure))
+      end
+    case resources.Completion.Failure(primary)
+      if primary != null
+        primary.closeFailures = outcome.closeFailures
+        reportConnection(options, result.Result<Exchange, ExchangeFailure>.Error(primary))
+      else
+        let failure = new ExchangeFailure(new result.Failure("connection_failed", "connection"), new Exchange())
+        failure.closeFailures = outcome.closeFailures
+        reportConnection(options, result.Result<Exchange, ExchangeFailure>.Error(failure))
+      end
+  end
+end
+
+# Requested synchronously from callbacks on the serving thread.
+class Stop
+  private requested: Bool = false
+  private drainToken: Int = 0
+
+  def request(): Void
+    this.requested = true
+    if this.drainToken > 0
+      unsafe
+        drainRequest(this.drainToken)
+      end
+    end
+  end
+
+  def isRequested(): Bool
+    return this.requested
+  end
+
+  def attachDrain(token: Int): Void
+    this.drainToken = token
+    if this.requested && token > 0
+      unsafe
+        drainRequest(token)
+      end
+    end
+  end
+
+  def detachDrain(token: Int): Void
+    this.drainToken = 0 if this.drainToken == token
+  end
+end
+
+def stopRequested(options: Options?, interruptToken: Int = 0): Bool
+  if interruptToken > 0
+    unsafe
+      if interruptPending(interruptToken) != 0
+        return true
+      end
+    end
+  end
+  if options != null
+    let stop = options.stop
+    if stop != null
+      return stop.isRequested()
+    end
+  end
+  return false
 end
 
 def report(options: Options?, message: String): Void
@@ -13,15 +304,63 @@ def report(options: Options?, message: String): Void
   end
 end
 
+# Field lines retain their order and are never implicitly comma-combined.
+class Headers
+  private names: String[] = []
+  private contents: String[] = []
+  private bytes: Int = 0
+
+  def add(name: String, value: String): Bool
+    if !token(name) || !fieldValue(value)
+      return false
+    end
+    let size = host.stringByteLength(name) + host.stringByteLength(value) + 4
+    if this.names.Length >= 64 || size > 7168 - this.bytes
+      return false
+    end
+    this.names = host.appendString(this.names, name)
+    this.contents = host.appendString(this.contents, value)
+    this.bytes = this.bytes + size
+    return true
+  end
+
+  def values(name: String): String[]
+    var result: String[] = []
+    var index = 0
+    while index < this.names.Length
+      if lower(this.names[index]) == lower(name)
+        result = host.appendString(result, this.contents[index])
+      end
+      index = index + 1
+    end
+    return result
+  end
+
+  def count(): Int
+    return this.names.Length
+  end
+
+  def nameAt(index: Int): String
+    return this.names[index]
+  end
+
+  def valueAt(index: Int): String
+    return this.contents[index]
+  end
+end
+
 class Request
   public method: String = "GET"
   public path: String = "/"
   public query: String = ""
+  public headers: Headers = new Headers()
 end
 
 class Response
   public status: Int = 200
   public body: String = ""
+  public bodyBytes: Byte[]?
+  public headers: Headers = new Headers()
 
   def init(status: Int, body: String): Void
     this.status = status
@@ -33,17 +372,28 @@ def text(status: Int, body: String): Response
   return new Response(status, body)
 end
 
+def binary(status: Int, body: Byte[]): Response
+  let response = new Response(status, "")
+  response.bodyBytes = body
+  return response
+end
+
 class Parsed
   public request: Request?
   public status: Int = 400
   public head: Bool = false
+  public failure: Failure? = new Failure("malformed_request", "parse")
 end
 
 def find(text: String, part: String, start: Int): Int
   var index = start
   let limit = host.stringByteLength(text) - host.stringByteLength(part)
   while index <= limit
-    if host.stringSlice(text, index, host.stringByteLength(part)) == part
+    var offset = 0
+    while offset < host.stringByteLength(part) && host.stringByteAt(text, index + offset) == host.stringByteAt(part, offset)
+      offset = offset + 1
+    end
+    if offset == host.stringByteLength(part)
       return index
     end
     index = index + 1
@@ -85,10 +435,25 @@ def token(text: String): Bool
   var index = 0
   while index < host.stringByteLength(text)
     let byte = host.stringByteAt(text, index) as Int
+    if byte > 127
+      return false
+    end
     if !((byte >= 48 && byte <= 57) || (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122))
       if find("!#$%&'*+-.^_`|~", host.stringSlice(text, index, 1), 0) < 0
         return false
       end
+    end
+    index = index + 1
+  end
+  return true
+end
+
+def fieldValue(value: String): Bool
+  var index = 0
+  while index < host.stringByteLength(value)
+    let byte = host.stringByteAt(value, index) as Int
+    if (byte < 32 && byte != 9) || byte > 126
+      return false
     end
     index = index + 1
   end
@@ -118,8 +483,17 @@ def targetValid(target: String): Bool
   return true
 end
 
-def parse(head: String): Parsed
+def parse(head: String, allowHead: Bool = false): Parsed
   let result = new Parsed()
+  let headLength = host.stringByteLength(head)
+  if headLength > 8192 || headLength < 4 || !fieldValueLines(head)
+    return result
+  end
+  if host.stringSlice(head, headLength - 4, 4) != "\r\n\r\n"
+    return result
+  end
+  let fields = new Headers()
+  result.failure = new Failure("invalid_request_line", "parse")
   let lineEnd = find(head, "\r\n", 0)
   if lineEnd < 0
     return result
@@ -133,11 +507,28 @@ def parse(head: String): Parsed
   let method = host.stringSlice(line, 0, firstSpace)
   result.head = method == "HEAD"
   let target = host.stringSlice(line, firstSpace + 1, secondSpace - firstSpace - 1)
-  if !token(method) || !targetValid(target)
+  if !token(method)
     return result
   end
-  if host.stringSlice(line, secondSpace + 1, host.stringByteLength(line) - secondSpace - 1) != "HTTP/1.1"
+  if !targetValid(target)
+    result.failure = new Failure("invalid_target", "parse")
+    return result
+  end
+  let version = host.stringSlice(line, secondSpace + 1, host.stringByteLength(line) - secondSpace - 1)
+  if host.stringByteLength(version) != 8
+    return result
+  end
+  if host.stringSlice(version, 0, 5) != "HTTP/" || host.stringByteAt(version, 6) != (46 as Byte)
+    return result
+  end
+  let major = host.stringByteAt(version, 5) as Int
+  let minor = host.stringByteAt(version, 7) as Int
+  if major < 48 || major > 57 || minor < 48 || minor > 57
+    return result
+  end
+  if version != "HTTP/1.1"
     result.status = 505
+    result.failure = new Failure("unsupported_version", "parse")
     return result
   end
   var start = lineEnd + 2
@@ -146,6 +537,7 @@ def parse(head: String): Parsed
   var unsupportedBody = false
   var expect = false
   while start < host.stringByteLength(head) - 2
+    result.failure = new Failure("invalid_header", "parse")
     let endAt = find(head, "\r\n", start)
     if endAt < start
       return result
@@ -160,16 +552,18 @@ def parse(head: String): Parsed
       return result
     end
     let value = trim(host.stringSlice(field, colon + 1, host.stringByteLength(field) - colon - 1))
-    if find(value, "\r", 0) >= 0 || find(value, "\n", 0) >= 0
+    if !fields.add(name, value)
       return result
     end
     let normalized = lower(name)
     if normalized == "host"
       hosts = hosts + 1
       if value == "" || find(value, " ", 0) >= 0 || find(value, "\t", 0) >= 0 || find(value, ",", 0) >= 0
+        result.failure = new Failure("invalid_host", "parse")
         return result
       end
     else if normalized == "content-length"
+      result.failure = new Failure("invalid_content_length", "parse")
       lengths = lengths + 1
       if value == ""
         return result
@@ -186,24 +580,34 @@ def parse(head: String): Parsed
         index = index + 1
       end
     else if normalized == "transfer-encoding"
+      result.failure = new Failure("unsupported_framing", "parse")
       return result
     else if normalized == "expect"
       expect = true
     end
     start = endAt + 2
   end
-  if hosts != 1 || lengths > 1 || unsupportedBody
+  if hosts != 1
+    result.failure = new Failure("invalid_host", "parse")
+    return result
+  end
+  if lengths > 1 || unsupportedBody
+    result.failure = new Failure("unsupported_framing", "parse")
     return result
   end
   if expect
     result.status = 417
+    result.failure = new Failure("unsupported_expectation", "parse")
     return result
   end
-  if method != "GET"
+  if method != "GET" && !(allowHead && method == "HEAD")
     result.status = 405
+    result.failure = new Failure("unsupported_method", "parse")
     return result
   end
   let request = new Request()
+  request.method = method
+  request.headers = fields
   let queryAt = find(target, "?", 0)
   if queryAt < 0
     request.path = target
@@ -213,146 +617,284 @@ def parse(head: String): Parsed
   end
   result.request = request
   result.status = 200
+  result.failure = null
   return result
 end
 
-def wire(response: Response, head: Bool): String
+def fieldValueLines(value: String): Bool
+  var index = 0
+  while index < host.stringByteLength(value)
+    let byte = host.stringByteAt(value, index) as Int
+    if byte > 126 || (byte < 32 && byte != 9 && byte != 10 && byte != 13)
+      return false
+    end
+    index = index + 1
+  end
+  return true
+end
+
+def responseFieldsValid(fields: Headers): Bool
+  var index = 0
+  while index < fields.count()
+    let name = lower(fields.nameAt(index))
+    if name == "content-length" || name == "transfer-encoding" || name == "connection" || name == "trailer" || name == "upgrade" || name == "keep-alive" || name == "proxy-connection"
+      return false
+    end
+    if name != "set-cookie" && fields.values(name).Length > 1
+      return false
+    end
+    index = index + 1
+  end
+  return true
+end
+
+class EncodedResponse
+  public headers: String = ""
+  public text: String = ""
+  public bytes: Byte[]?
+end
+
+def wire(response: Response, head: Bool): EncodedResponse
+  let encoded = new EncodedResponse()
   var status = response.status
   var body = response.body
-  if status < 200 || status > 599 || host.stringByteLength(body) > 1048576
+  var binaryBody = response.bodyBytes
+  var length = host.stringByteLength(body)
+  if binaryBody != null
+    length = binaryBody.Length
+  end
+  var fields = response.headers
+  if status < 200 || status > 599 || length > 1048576 || !responseFieldsValid(fields)
     status = 500
     body = "Invalid response"
+    binaryBody = null
+    length = host.stringByteLength(body)
+    fields = new Headers()
   end
-  var headers = "HTTP/1.1 " + (status as String) + " Response\r\nConnection: close\r\nContent-Type: text/plain; charset=utf-8\r\n"
-  if status == 405
-    headers = headers + "Allow: GET\r\n"
+  var headers = "HTTP/1.1 " + (status as String) + " Response\r\nConnection: close\r\n"
+  if fields.values("content-type").Length == 0
+    headers = headers + "Content-Type: " + (binaryBody == null ? "text/plain; charset=utf-8" : "application/octet-stream") + "\r\n"
+  end
+  var index = 0
+  while index < fields.count()
+    headers = headers + fields.nameAt(index) + ": " + fields.valueAt(index) + "\r\n"
+    index = index + 1
+  end
+  if status == 405 && fields.values("allow").Length == 0
+    headers = headers + "Allow: GET, HEAD\r\n"
   end
   if status == 204 || status == 304
-    return headers + "\r\n"
+    encoded.headers = headers + "\r\n"
+    return encoded
   end
   if status == 205
     body = ""
+    binaryBody = null
+    length = 0
   end
-  headers = headers + "Content-Length: " + (host.stringByteLength(body) as String) + "\r\n\r\n"
-  return headers + (head ? "" : body)
+  encoded.headers = headers + "Content-Length: " + (length as String) + "\r\n\r\n"
+  if !head
+    encoded.text = body
+    encoded.bytes = binaryBody
+  end
+  return encoded
 end
 
 def sendResponse(fd: Int, response: Response, head: Bool, options: Options?): Void
-  let output = wire(response, head)
-  if writeText(fd, output)
-    report(options, "Response " + host.stringSlice(output, 9, 3))
-  else
-    report(options, "Response write failed or timed out")
+  match sendResponseOutcome(fd, response, head)
+    case result.Result.Ok(exchange)
+      report(options, "Response " + (exchange.status as String))
+    case result.Result.Error(failure)
+      report(options, failure.cause.operation + ": " + failure.cause.code)
   end
 end
 
 def connection(fd: Int, handler: fn(Request): Response, options: Options?): Void
-  unsafe
-    let head = readHead(fd)
-    if head.status == 0
-      report(options, "Connection closed before request headers completed")
-      return
-    end
-    if head.status != 200
-      sendResponse(fd, text(head.status, "Request rejected"), false, options)
-      return
-    end
-    let parsed = parse(head.text)
-    let request = parsed.request
-    var response = text(parsed.status, "Request rejected")
-    if request != null
-      response = handler(request)
-    end
-    sendResponse(fd, response, parsed.head, options)
+  match connectionOutcome(fd, handler)
+    case result.Result.Ok(exchange)
+      report(options, "Response " + (exchange.status as String))
+    case result.Result.Error(failure)
+      report(options, failure.cause.operation + ": " + failure.cause.code)
   end
 end
 
-# Returns an owned error string on startup/listener failure; otherwise serves until
-# process termination. Per-connection failures are isolated from the accept loop.
+# Formats listener failures or normal stop for callers of the text API.
 def serve(address: String, handler: fn(Request): Response, options: Options? = null): String
-  if host.stringByteLength(address) < 11 || host.stringSlice(address, 0, 10) != "127.0.0.1:"
-    return "Address must be 127.0.0.1:<port>"
-  end
-  let portText = host.stringSlice(address, 10, host.stringByteLength(address) - 10)
-  let port = host.parseInt(portText)
-  if port == null || port < 1 || port > 65535
-    return "Port must be an integer from 1 to 65535"
-  end
-  unsafe
-    let listener = netOpen()
-    if listener < 0
-      return "Open listener: " + socketError()
-    end
-    if netConfigure(listener) < 0 || netBind(listener, port) < 0 || netListen(listener) < 0
-      let detail = socketError()
-      let error = "Listen on " + address + ": " + detail
-      netClose(listener)
-      return error
-    end
-    if options != null
-      let onListening = options.onListening
-      onListening(address) if onListening != null
-    end
-    while true
-      let ready = netPoll(listener, 0, -1)
-      if ready == -1
-        let error = "Wait for connection: " + socketError()
-        netClose(listener)
-        return error
-      end
-      if ready > 0
-        let fd = netAccept(listener)
-        if fd == -1
-          let error = "Accept connection: " + socketError()
-          netClose(listener)
-          return error
-        end
-        if fd >= 0
-          if netConfigure(fd) == 0
-            connection(fd, handler, options)
-          else
-            report(options, "Configure connection: " + socketError())
-          end
-          netClose(fd)
-        end
-      end
-    end
+  let failure = serveResult(address, handler, options)
+  if failure != null
+    return failure.operation + ": " + failure.detail
   end
   return "Listener stopped"
 end
 
+def serveResult(address: String, handler: fn(Request): Response, options: Options? = null): Failure?
+  var token = 0
+  var drainToken = 0
+  var forceAfter: Int? = null
+  if options != null
+    forceAfter = options.forceExitAfterStopMilliseconds
+    if forceAfter != null && (forceAfter < 1 || forceAfter > 60000)
+      return new Failure("invalid_timeout", "listen.drain", "forceExitAfterStopMilliseconds must be 1..60000")
+    end
+  end
+  if options != null && options.handleInterrupts
+    unsafe
+      token = interruptOpen()
+    end
+    if token == 0
+      return new Failure("interrupt_unavailable", "listen.interrupt", "Process interrupt handling is already owned or unavailable")
+    end
+  end
+  if forceAfter != null
+    unsafe
+      drainToken = drainOpen(forceAfter, token > 0 ? 1 : 0)
+    end
+    if drainToken == 0
+      unsafe
+        interruptClose(token) if token > 0
+      end
+      return new Failure("drain_unavailable", "listen.drain", "Could not start the forced-exit deadline watcher")
+    end
+    if options != null
+      let stop = options.stop
+      stop.attachDrain(drainToken) if stop != null
+    end
+  end
+  let outcome = serveLoop(address, handler, options, token)
+  if drainToken > 0
+    if options != null
+      let stop = options.stop
+      stop.detachDrain(drainToken) if stop != null
+    end
+    unsafe
+      drainClose(drainToken)
+    end
+  end
+  if token > 0
+    unsafe
+      interruptClose(token)
+    end
+  end
+  match outcome.completion
+    case resources.Completion.Value(stopped)
+      if outcome.closeFailures.count() == 0
+        return null
+      end
+      let failure = new Failure("close_failed", "listen.close")
+      failure.closeFailures = outcome.closeFailures
+      return failure
+    case resources.Completion.Failure(primary)
+      if primary != null
+        primary.closeFailures = outcome.closeFailures
+        return primary
+      end
+      let failure = new Failure("listen_failed", "listen")
+      failure.closeFailures = outcome.closeFailures
+      return failure
+  end
+end
+
+def serveLoop(address: String, handler: fn(Request): Response, options: Options?, interruptToken: Int): resources.Outcome<Bool, Failure>
+  if host.stringByteLength(address) < 11 || find(address, "127.0.0.1:", 0) != 0
+    return new Failure("invalid_address", "listen", "Address must be 127.0.0.1:<port>")
+  end
+  let portText = host.stringSlice(address, 10, host.stringByteLength(address) - 10)
+  let port = host.parseInt(portText)
+  if port == null || port < 1 || port > 65535
+    return new Failure("invalid_port", "listen", "Port must be an integer from 1 to 65535")
+  end
+  if stopRequested(options, interruptToken)
+    return true
+  end
+  unsafe
+    using listener <- Socket.ownListener(netOpen())
+      let descriptor = listener.nativeHandle()
+      if netConfigure(descriptor) < 0
+        return new Failure("socket_error", "listen.configure", socketError())
+      else if netBind(descriptor, port) < 0
+        return new Failure("socket_error", "listen.bind", socketError())
+      else if netListen(descriptor) < 0
+        return new Failure("socket_error", "listen.start", socketError())
+      end
+      if options != null
+        let onListening = options.onListening
+        onListening(address) if onListening != null
+      end
+      while !stopRequested(options, interruptToken)
+        let ready = netPoll(descriptor, 0, interruptToken > 0 ? 50 : -1)
+        if ready == -1
+          return new Failure("socket_error", "listen.wait", socketError())
+        end
+        if ready > 0 && !stopRequested(options, interruptToken)
+          let fd = netAccept(descriptor)
+          if fd == -1
+            return new Failure("socket_error", "listen.accept", socketError())
+          end
+          if fd >= 0
+            reportScopedConnection(options, scopedConnection(fd, handler))
+          end
+        end
+      end
+      return true
+    end
+  end
+  return true
+end
+
+@cabi("neri_rt_v1_interrupt_open")
+unsafe def interruptOpen(): Int
+end
+@cabi("neri_rt_v1_interrupt_pending")
+unsafe def interruptPending(token: Int): Int
+end
+@cabi("neri_rt_v1_interrupt_close")
+unsafe def interruptClose(token: Int): Void
+end
+@cabi("neri_rt_v1_drain_open")
+unsafe def drainOpen(timeoutMilliseconds: Int, watchInterrupt: Int): Int
+end
+@cabi("neri_rt_v1_drain_request")
+unsafe def drainRequest(token: Int): Int
+end
+@cabi("neri_rt_v1_drain_close")
+unsafe def drainClose(token: Int): Int
+end
+
 @cabi("neri_rt_v1_net_open")
-def unsafe netOpen(): Int
+unsafe def netOpen(): Int
 end
 @cabi("neri_rt_v1_net_configure")
-def unsafe netConfigure(fd: Int): Int
+unsafe def netConfigure(fd: Int): Int
 end
 @cabi("neri_rt_v1_net_bind")
-def unsafe netBind(fd: Int, port: Int): Int
+unsafe def netBind(fd: Int, port: Int): Int
 end
 @cabi("neri_rt_v1_net_listen")
-def unsafe netListen(fd: Int): Int
+unsafe def netListen(fd: Int): Int
 end
 @cabi("neri_rt_v1_net_accept")
-def unsafe netAccept(fd: Int): Int
+unsafe def netAccept(fd: Int): Int
 end
 @cabi("neri_rt_v1_net_poll")
-def unsafe netPoll(fd: Int, writing: Int, milliseconds: Int): Int
+unsafe def netPoll(fd: Int, writing: Int, milliseconds: Int): Int
 end
 @cabi("neri_rt_v1_net_read")
-def unsafe netRead(fd: Int, bytes: Byte*, length: Int): Int
+unsafe def netRead(fd: Int, bytes: Byte*, length: Int): Int
 end
 @cabi("neri_rt_v1_net_write")
-def unsafe netWrite(fd: Int, bytes: Byte*, length: Int): Int
+unsafe def netWrite(fd: Int, bytes: Byte*, length: Int): Int
 end
 @cabi("neri_rt_v1_net_close")
-def unsafe netClose(fd: Int): Void
+unsafe def netClose(fd: Int): Void
+end
+@cabi("neri_rt_v1_net_close_result")
+unsafe def netCloseResult(fd: Int): Int
 end
 @cabi("neri_rt_v1_net_milliseconds")
-def unsafe netMilliseconds(): Int
+unsafe def netMilliseconds(): Int
 end
 @cabi("neri_rt_v1_net_error")
-def unsafe netError(bytes: Byte*, capacity: Int): Int
+unsafe def netError(bytes: Byte*, capacity: Int): Int
 end
 
 def socketError(): String
@@ -372,59 +914,88 @@ end
 
 # Each operation keeps one absolute deadline across interruptions and partial I/O.
 def waitSocket(fd: Int, writing: Int, deadline: Int): Int
+  let failure = waitReady(fd, writing, deadline)
+  if failure == null
+    return 1
+  end
+  return failure.code == "timeout" ? 0 : -1
+end
+
+def waitReady(fd: Int, writing: Int, deadline: Int): Failure?
   unsafe
     while true
       let now = netMilliseconds()
       if now < 0
-        return -1
+        return new Failure("clock_error", "clock", socketError())
       end
       let remaining = deadline - now
       if remaining <= 0
-        return 0
+        return new Failure("timeout", writing == 0 ? "read.wait" : "write.wait")
       end
       let result = netPoll(fd, writing, remaining)
-      if result != -2
-        return result
+      if result == -1
+        return new Failure("socket_error", writing == 0 ? "read.wait" : "write.wait", socketError())
+      end
+      if result == 0
+        return new Failure("timeout", writing == 0 ? "read.wait" : "write.wait")
+      end
+      if result > 0
+        return null
       end
     end
-    return -1
+    return new Failure("socket_error", "wait")
   end
 end
 
 class Head
   public text: String = ""
   public status: Int = 0
+  public failure: Failure?
+  public bytesRead: Int = 0
 end
 
-def readHead(fd: Int): Head
+def readHead(fd: Int, timeoutMilliseconds: Int = 2000): Head
   unsafe
     let result = new Head()
     let bytes = stackalloc Byte[8192]
-    let started = netMilliseconds()
-    if started < 0
+    if timeoutMilliseconds < 0 || timeoutMilliseconds > 2147483647
+      result.failure = new Failure("invalid_timeout", "read")
       return result
     end
-    let deadline = started + 2000
+    let started = netMilliseconds()
+    if started < 0
+      result.failure = new Failure("clock_error", "clock", socketError())
+      return result
+    end
+    let deadline = started + timeoutMilliseconds
     var length = 0
     var scanned = 0
     while length < 8192
-      let ready = waitSocket(fd, 0, deadline)
-      if ready <= 0
-        if ready == 0
+      let failure = waitReady(fd, 0, deadline)
+      if failure != null
+        result.failure = failure
+        if failure.code == "timeout"
           result.status = 408
         end
         return result
       end
       let count = netRead(fd, bytes + length, 8192 - length)
-      if count == 0 || count == -1
+      if count == 0
+        result.failure = new Failure("peer_closed", "read")
+        return result
+      end
+      if count == -1
+        result.failure = new Failure("socket_error", "read", socketError())
         return result
       end
       if count > 0
         length = length + count
+        result.bytesRead = length
         while scanned < length
           let byte = bytes[scanned] as Int
           if byte > 126 || (byte < 32 && byte != 9 && byte != 10 && byte != 13)
             result.status = 400
+            result.failure = new Failure("invalid_header_bytes", "read")
             return result
           end
           scanned = scanned + 1
@@ -442,20 +1013,61 @@ def readHead(fd: Int): Head
       end
     end
     result.status = 431
+    result.failure = new Failure("header_limit", "read")
     return result
   end
 end
 
 def writeText(fd: Int, text: String): Bool
+  return writeTextResult(fd, text).failure == null
+end
+
+def writeBytes(fd: Int, bytes: Byte[]): Bool
+  return writeBytesResult(fd, bytes).failure == null
+end
+
+class WriteResult
+  public bytesWritten: Int = 0
+  public failure: Failure?
+end
+
+def writeTextResult(fd: Int, text: String, timeoutMilliseconds: Int = 2000): WriteResult
+  return writeResult(fd, text, null, timeoutMilliseconds)
+end
+
+def writeBytesResult(fd: Int, bytes: Byte[], timeoutMilliseconds: Int = 2000): WriteResult
+  return writeResult(fd, "", bytes, timeoutMilliseconds)
+end
+
+def writeResult(fd: Int, text: String, bytes: Byte[]?, timeoutMilliseconds: Int): WriteResult
+  let result = new WriteResult()
+  if timeoutMilliseconds < 0 || timeoutMilliseconds > 2147483647
+    result.failure = new Failure("invalid_timeout", "write")
+    return result
+  end
   unsafe
-    let bytes = stackalloc Byte[1024]
     let started = netMilliseconds()
     if started < 0
-      return false
+      result.failure = new Failure("clock_error", "clock", socketError())
+      return result
     end
-    let deadline = started + 2000
+    return writePayloadResult(fd, text, bytes, started + timeoutMilliseconds)
+  end
+end
+
+def writePayload(fd: Int, text: String, binaryBody: Byte[]?, deadline: Int): Bool
+  return writePayloadResult(fd, text, binaryBody, deadline).failure == null
+end
+
+def writePayloadResult(fd: Int, text: String, binaryBody: Byte[]?, deadline: Int): WriteResult
+  let result = new WriteResult()
+  unsafe
+    let bytes = stackalloc Byte[1024]
     var offset = 0
-    let length = host.stringByteLength(text)
+    var length = host.stringByteLength(text)
+    if binaryBody != null
+      length = binaryBody.Length
+    end
     while offset < length
       var size = length - offset
       if size > 1024
@@ -463,24 +1075,111 @@ def writeText(fd: Int, text: String): Bool
       end
       var index = 0
       while index < size
-        bytes[index] = host.stringByteAt(text, offset + index)
+        if binaryBody != null
+          bytes[index] = binaryBody[offset + index]
+        else
+          bytes[index] = host.stringByteAt(text, offset + index)
+        end
         index = index + 1
       end
       var sent = 0
       while sent < size
-        if waitSocket(fd, 1, deadline) <= 0
-          return false
+        let failure = waitReady(fd, 1, deadline)
+        if failure != null
+          result.failure = failure
+          return result
         end
         let count = netWrite(fd, bytes + sent, size - sent)
-        if count == 0 || count == -1
-          return false
+        if count == -1
+          result.failure = new Failure("socket_error", "write", socketError())
+          return result
+        end
+        if count == 0
+          result.failure = new Failure("write_stalled", "write")
+          return result
         end
         if count > 0
           sent = sent + count
+          result.bytesWritten = result.bytesWritten + count
         end
       end
       offset = offset + size
     end
-    return true
+    return result
   end
+end
+
+class ParseFailure
+  public cause: result.Failure
+  public status: Int
+  public head: Bool
+
+  def init(cause: result.Failure, status: Int, head: Bool): Void
+    this.cause = cause
+    this.status = status
+    this.head = head
+  end
+end
+
+class HeaderFailure
+  public cause: result.Failure
+  public status: Int
+  public bytesRead: Int
+
+  def init(cause: result.Failure, status: Int, bytesRead: Int): Void
+    this.cause = cause
+    this.status = status
+    this.bytesRead = bytesRead
+  end
+end
+
+def parseOutcome(head: String, allowHead: Bool = false): result.Result<Request, ParseFailure>
+  let parsed = http.parse(head, allowHead)
+  let request = parsed.request
+  if request != null
+    return result.Result<Request, ParseFailure>.Ok(request)
+  end
+  let failure = parsed.failure
+  if failure != null
+    let cause = new result.Failure(failure.code, failure.operation, failure.detail)
+    return result.Result<Request, ParseFailure>.Error(new ParseFailure(cause, parsed.status, parsed.head))
+  end
+  let cause = new result.Failure("parse_failed", "http.parse")
+  return result.Result<Request, ParseFailure>.Error(new ParseFailure(cause, parsed.status, parsed.head))
+end
+
+def readHeadOutcome(fd: Int, timeoutMilliseconds: Int = 2000): result.Result<String, HeaderFailure>
+  let head = http.readHead(fd, timeoutMilliseconds)
+  let failure = head.failure
+  if failure != null
+    let cause = new result.Failure(failure.code, failure.operation, failure.detail, head.bytesRead)
+    return result.Result<String, HeaderFailure>.Error(new HeaderFailure(cause, head.status, head.bytesRead))
+  end
+  return result.Result<String, HeaderFailure>.Ok(head.text)
+end
+
+def writeBytesOutcome(fd: Int, bytes: Byte[], timeoutMilliseconds: Int = 2000): result.Result<Int, result.Failure>
+  let written = http.writeBytesResult(fd, bytes, timeoutMilliseconds)
+  let failure = written.failure
+  if failure != null
+    return result.Result<Int, result.Failure>.Error(new result.Failure(failure.code, failure.operation, failure.detail, written.bytesWritten))
+  end
+  return result.Result<Int, result.Failure>.Ok(written.bytesWritten)
+end
+
+def writeTextOutcome(fd: Int, text: String, timeoutMilliseconds: Int = 2000): result.Result<Int, result.Failure>
+  let written = http.writeTextResult(fd, text, timeoutMilliseconds)
+  let failure = written.failure
+  if failure != null
+    return result.Result<Int, result.Failure>.Error(new result.Failure(failure.code, failure.operation, failure.detail, written.bytesWritten))
+  end
+  return result.Result<Int, result.Failure>.Ok(written.bytesWritten)
+end
+
+def serveOutcome(address: String, handler: fn(Request): Response, options: Options? = null): result.Result<Bool, result.Failure>
+  let failure = http.serveResult(address, handler, options)
+  if failure != null
+    return result.Result<Bool, result.Failure>.Error(transportFailure(failure, 0))
+  end
+  return result.Result<Bool, result.Failure>.Ok(true)
 end

@@ -32,10 +32,16 @@ operators and conditional expressions evaluate only the required branch.
 
 ## Console
 
+Standard-library namespaces are source declarations loaded by `use`.
 `use console` provides terminal input and output: `console.print(value)` writes
 without a newline, `console.println(value)` appends a newline, and
-`console.read()` reads a line as a string. Output accepts strings and numeric
-values. End of input produces an empty string. Output is flushed after each call.
+`console.read()` reads a line as a string. Both output functions require a
+`String`; convert numeric values explicitly with `as String`. End of input
+produces an empty string. Output is flushed after each call.
+
+`use test` provides assertions. `test.assert`, `test.assertTrue`, and
+`test.assertFalse` require a `Bool`. `test.assertEqual` requires two arguments
+of the same type, with equality supported by the language's `==` operator.
 
 ## Values and variables
 
@@ -46,18 +52,65 @@ values. End of input produces an empty string. Output is flushed after each call
 | `Float` | IEEE-754 binary64, including infinities, NaN and signed zero. |
 | `Byte` | Unsigned 8-bit integer. |
 | `Bool` | Boolean logic and equality. |
-| `String` | Immutable UTF-8, concatenation and ordinal value equality. |
+| `String` | Sealed core class with specialized immutable UTF-8 storage, concatenation, and ordinal value equality. |
 | `Void` | No returned value. |
 | `T[]` | Homogeneous fixed-length array, checked indexing, `Length`, and `for` iteration. |
 | `T?` | Explicit optional value. |
 | Class | Managed reference to an instance. |
+
+Neri has no built-in `Any` type or dynamic escape hatch. A user-defined class
+named `Any` is an ordinary class. Generic type parameters preserve the type
+relationships established by their arguments.
+Built-in type names and the compiler's `Error` and `Null` type markers are
+reserved in type declarations and generic parameter lists.
 
 Integer division truncates toward zero; division by zero and minimum Int divided
 by -1 panic. Float arithmetic follows IEEE-754 without fast-math.
 Float equality considers two NaNs equal; ordered comparisons with NaN are false.
 Numeric casts are explicit: `Int`/`Float`, checked `Int` to `Byte`, and lossless `Byte` to `Int`.
 Float-to-Int truncates and panics for unrepresentable values. Numeric `as String`
-conversions are locale-independent. Arrays and objects have no equality operator.
+conversions are locale-independent. Arrays have no equality operator. Classes
+can define equality through an annotated instance method.
+
+`String` is loaded from the core library without a `use` directive. It is a
+source-declared, sealed class whose storage remains the runtime UTF-8 string;
+it is not a wrapper around another text value. String literals and
+`String.fromBytes(bytes)` create values. `fromBytes` returns `null` for invalid
+UTF-8. `new String()` and inheritance from `String` are unavailable.
+
+Readonly instance methods expose byte length, nullable byte access, checked
+byte slices, scalar boundaries, scalar count, scalar access, concatenation, and
+equality. A scalar is a Unicode scalar value rather than a grapheme cluster.
+The `text` library retains matching namespace functions and `text.Scalar` for
+explicit scalar construction and UTF-8 encoding.
+
+`sealed` closes an ordinary class to inheritance. `@representation("utf8")`
+selects the registered storage for the canonical public `String` declaration in
+`@stdlib/core.hk`. That declaration has methods and no fields, base, type
+parameters or constructor. Literal and factory construction maintain its storage
+invariants. `@intrinsic` module functions have registered exact signatures and
+empty bodies; the compiler supplies their runtime calls. An intrinsic identifier
+selects a closed compiler registry entry containing its native symbol, effects,
+runtime version and feature requirements. A source declaration cannot introduce
+an arbitrary native symbol through `@intrinsic`.
+
+`@exact` marks a generic or non-generic module function whose arguments must
+have exactly the instantiated parameter types. Ordinary functions continue to
+accept assignable subtype arguments. The standard-library `test.assertEqual<T>`
+uses this rule, evaluates its arguments once from left to right, and applies the
+ordinary `==` operation for `T`.
+
+This split follows the established compiler-library boundary in Rust: language
+items let source libraries provide compiler-known operations, while compiler
+intrinsics are registered implementation details normally exposed through
+library wrappers ([Rust compiler language items](https://rustc-dev-guide.rust-lang.org/lang-items.html),
+[Rust core intrinsics](https://doc.rust-lang.org/core/intrinsics/)).
+
+The dedicated immutable representation follows the public string contracts in
+[.NET String.cs](https://github.com/dotnet/runtime/blob/main/src/libraries/System.Private.CoreLib/src/System/String.cs)
+and [OpenJDK 25 String.java](https://github.com/openjdk/jdk/blob/jdk-25-ga/src/java.base/share/classes/java/lang/String.java).
+Keeping the representation behind a source-level class applies the abstraction
+boundary described by [Liskov and Zilles, Programming with Abstract Data Types (1974)](https://gleitzman.com/media/docs/adt-liskov.pdf).
 
 `let` and parameters are immutable bindings; `var` permits reassignment. Binding
 immutability does not freeze the fields of an object. An explicit annotation
@@ -78,8 +131,7 @@ object. Other mutable aliases still observe and can modify that storage.
 class Counter
   public value: Int = 0
 
-  @readonly
-  public def read(): Int
+  public readonly def read(): Int
     return this.value
   end
 end
@@ -104,7 +156,7 @@ retain their element-type identity rather than providing array covariance.
 elements. `(readonly T)[]` is a mutable array of readonly references: slots can
 be replaced, while objects accessed through those slots remain readonly.
 
-`@readonly` applies to an instance method and makes its `this` reference readonly.
+`readonly` applies to an instance method and makes its `this` reference readonly.
 Overrides preserve that receiver contract. Such a method may return a fresh
 mutable object, but an object reached through `this` requires a readonly return
 type. Calls through readonly receivers require readonly methods; ordinary
@@ -135,24 +187,109 @@ multiline actions use a block instead. Block `if` bodies begin on the next line;
 
 All supplied source files contribute to one compilation module. `namespace`
 applies to subsequent declarations; `use` exposes a namespace throughout the
-module. `use http`, `use terminal`, and `use clock` load their bundled libraries;
-other namespaces do not load files. Duplicate or ambiguous declarations are errors.
+module. A `use` matching a bundled standard-library source loads that library and
+its transitive imports. Other namespaces do not load files. Duplicate or ambiguous
+declarations are errors.
+An unqualified function name resolves in the current namespace before imported
+namespaces, including when an imported function is generic. Explicit type
+arguments apply to the selected declaration; a selected ordinary function reports
+`NR220` when given type arguments. Qualified names select their stated namespace.
+See [binary file reads](FILES.md) for the bounded file API.
+
 Module scope contains only namespace/use directives and function/class declarations;
 other tokens produce a parse diagnostic.
+
+Declaration modifiers are keywords before `class` or `def`. When combined, they
+use this order: access (`public`, `internal`, `protected`, or `private`),
+`abstract` or `sealed`, `override`, `static`, `readonly`, `unsafe`, `resource`,
+then `class` or `def`. Only modifiers supported by that declaration kind may
+appear. Compiler annotations such as `@cabi`, `@intrinsic`, `@operator`,
+`@conversion`, `@exact`, `@operation`, and `@representation` remain annotations.
 
 Classes have single inheritance. Classes default to `internal`, fields to
 `private`, and methods to `public`. `internal` is module visibility, `private`
 is declaring-class visibility, and `protected` includes derived classes.
 Instance methods dispatch virtually; exact name and signature override a base
-method. `@override` asserts that relationship. `def static` declares a method
+method. `override` asserts that relationship. `static def` declares a method
 without a receiver. `super.method()` dispatches directly to the base method.
 Omitted arguments use defaults from the statically resolved declaration; supplying
 those defaults preserves virtual dispatch to the receiver's implementation.
+
+`abstract` marks an ordinary class as incomplete, so the class cannot be
+constructed directly. An abstract class may declare abstract instance methods.
+Each abstract method is a signature without a body or its own `end`; it is safe
+and cannot be `init`, static, or private. Abstract classes cannot also be sealed,
+resources, represented classes, or enums.
+
+A concrete subclass implements every inherited method whose nearest declaration
+is abstract. An implementation follows the ordinary override rules: its name,
+parameter and result types, visibility, and readonly receiver contract match the
+abstract declaration exactly. An abstract subclass may leave an obligation
+unimplemented or replace it with another abstract declaration.
+`super.method()` requires a concrete implementation in the resolved base method.
+
+```neri
+abstract class Shape
+  abstract def area(): Int
+end
+
+class Square: Shape
+  override def area(): Int
+    return 4
+  end
+end
+```
+
+This completeness model follows the established rules for abstract
+[types and methods in Crystal](https://crystal-lang.org/reference/1.20/syntax_and_semantics/virtual_and_abstract_types.html),
+[classes](https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/language-specification/classes#15222-abstract-classes)
+and [methods](https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/language-specification/classes#1567-abstract-methods)
+in the C# language specification and the Java Language Specification rules for
+abstract [classes](https://docs.oracle.com/javase/specs/jls/se8/html/jls-8.html#jls-8.1.1.1)
+and [methods](https://docs.oracle.com/javase/specs/jls/se8/html/jls-8.html#jls-8.4.3.1).
 
 Construction initializes base classes before derived classes. `init` is not
 inherited. An explicit `super(args)` starts a derived initializer when the base
 requires arguments. A valid zero-argument base call is implicit. Inherited fields
 cannot be redeclared.
+An explicit `super(args)` occurs once, as the first statement of a derived
+`init`; it is invalid inside another control-flow body or an ordinary method.
+
+A class without `init` has an implicit zero-argument constructor. Construction
+initializes its ancestors first, invoking the nearest declared initializer with
+its default arguments, then initializes the remaining fields in inheritance
+order. That initializer must be accessible from the derived class and accept
+zero supplied arguments. Intermediate classes cannot skip initialization or
+constructor visibility.
+
+### Library operators and explicit conversions
+
+Public, safe instance methods on ordinary classes can expose operators using
+`@operator("+")`. The annotation belongs to the class that implements the
+operation. Binary operators take one parameter of exactly that class type;
+unary operators take none. Arithmetic operators return that class type;
+comparison operators and unary `!` return `Bool`.
+
+Supported binary tokens are `+`, `-`, `*`, `/`, `==`, `!=`, `<`, `<=`, `>`, and
+`>=`; unary tokens are `+`, `-`, and `!`. Each token and arity has one declaration
+per class. `==` and `!=` are independent operations. Logical `&&` and `||` retain
+their language-defined short-circuit behavior.
+
+`@conversion` marks a public, safe instance method with no parameters and a
+non-`Void` return type. The return annotation supplies the target of `value as T`.
+There is one conversion per target type in a class. Identity conversions and
+conversions that remove a readonly view retain the ordinary type rules.
+Assignments, arguments and returns require their declared types; the compiler
+does not insert calls to conversion methods.
+
+These annotations use ordinary instance dispatch, source methods and generic
+specialization. Operands are evaluated once, in order. Readonly receivers require
+`readonly` methods. Resource classes use their ownership operations and cannot
+declare these annotations. Operator and conversion methods remain callable by
+name. Adding a library type requires no new compiler case for its name.
+
+See [text](TEXT.md) for `text.Scalar`, a library class with validated construction,
+explicit conversion to `Int` and Unicode encoding implemented in Neri.
 
 ## Generics
 
@@ -191,16 +328,69 @@ produce a type error; inference introduces no numeric or unchecked conversions.
 
 Signatures name every parameter and return type. Each used specialization is
 type-checked with concrete arguments, including its body and initializers, and
-compiled once per compilation module. Unused generic bodies are checked when
+compiled once per compilation module. Unconstrained generic bodies are checked when
 specialized. Type parameters accept safe value types; `Void`, raw pointers and
 unresolved types cannot be type arguments. The entry point and C ABI imports have
 concrete signatures.
 
+### Generic contracts
+
+A source-declared contract names the operations a type parameter may use:
+
+```neri
+contract Named
+  readonly def label(): String
+  end
+end
+
+def read<T: Named>(value: T): String
+  return value.label()
+end
+```
+
+Each requirement is a unique public, safe instance signature with no body,
+defaults, abstract or static modifier, or type parameters. A requirement can use
+`Self`, `Self?`, or `Self[]`; a nested generic use such as `Box<Self>` is not supported.
+A contract itself has no type parameters. A generic module function may put one
+source-declared contract after each type parameter's colon. Class bounds and
+generic compiler operations do not accept contracts.
+
+Requirements match structurally. An implementing class supplies an accessible
+public instance method with the exact parameter and result types after replacing
+`Self`; matching does not insert conversions. A `readonly` requirement requires
+a readonly implementation. Contract requirements have no runtime value and do
+not introduce dynamic dispatch. Rename does not support contract requirements,
+because structural implementations do not declare their relation to a contract.
+
+`@operator` labels a requirement for an operator expression. For example,
+`@operator("==") def equals(other: Self): Bool` permits `left == right` for a
+constrained `T`; it does not add an `equals` method alias to `T`. Supported labels
+and their return and operand shapes are the ordinary operator rules described
+above.
+
+The core library declares `Equality` as an ordinary contract with a `==`
+requirement. Its spelling has no separate generic rule. Built-in operator
+implementations and source classes are checked against the same requirement.
+`test.assertEqual<T: Equality>` therefore uses the declared contract. A contract
+states callable shape only; it does not promise algebraic laws such as
+reflexivity, symmetry, or transitivity.
+
+Constrained templates are checked at their declaration with their type parameters
+opaque. Unconstrained generic functions retain specialization-time body checking.
+This is Neri's current design, not a claim of formal proof or a full trait system.
+It follows the general idea of stated generic requirements in
+[Siek and Lumsdaine](https://arxiv.org/pdf/0708.2255),
+[Go interface method sets](https://go.dev/ref/spec#Interface_types), and
+[Rust trait bounds](https://doc.rust-lang.org/reference/trait-bounds.html).
+
 The current generic surface consists of module functions and classes with their
-own fields and methods. Method-level type parameters, generic class inheritance,
-interface constraints and higher-kinded types are outside this surface. Templates
-are supplied as source files in the same compilation invocation, including across
-namespaces. A compiled specialization is concrete; it is not a separately
+own fields and methods. Static methods accept an explicitly specialized class
+receiver, such as `Container<Int>.create(42)` or
+`library.Container<String>.create("value")`; constructor and method visibility
+still apply. Method-level type parameters, generic class inheritance,
+class bounds, multiple bounds, generic contracts, and higher-kinded types are
+outside this surface. Templates are supplied as source files in the same
+compilation invocation, including across namespaces. A compiled specialization is concrete; it is not a separately
 importable generic template or a package ABI promise.
 
 Compilation permits 128 distinct generic specializations, 32 nested class
@@ -209,6 +399,43 @@ of at most 1024 UTF-8 bytes. Ordinary recursion reuses the same specialization;
 recursion that creates an unbounded sequence of new types reports `NR222`.
 `NR220` reports invalid generic declarations or type-argument counts; `NR221`
 reports arguments that cannot be inferred or used as safe value types.
+
+## Closed alternatives
+
+An `enum` declares a closed set of one or more named alternatives. Each `case` has zero or
+more typed payloads. Payloads do not have default values. A generic enum specializes its payload types with the same
+rules as a generic class.
+
+```neri
+enum Result<T>
+  case Ok(value: T)
+  case Error(message: String)
+end
+
+def describe(result: Result<Int>): String
+  match result
+    case Result.Ok(value)
+      return value as String
+    case Result.Error(message)
+      return message
+  end
+end
+```
+
+Construct a value only through an explicit case constructor, such as
+`Result<Int>.Ok(42)`. `new Result<Int>()`, inheritance, casts to a different
+alternative type, and access to the compiler-generated tag and payload storage
+are unavailable. Each match case names the enum that owns it and binds exactly
+the payloads declared by that case. Bindings exist only inside their case body.
+
+`match` is a reserved statement keyword. Its scrutinee evaluates once, every declared case must
+appear exactly once, and every case body participates in ordinary return and
+control-flow analysis. Missing, repeated, foreign, and wrong-arity cases are
+diagnostics. The current pattern surface is deliberately flat: cases select one
+closed constructor and bind its whole payload, with no wildcards, nested
+patterns, ranges, or or-patterns. Managed payloads, including generic objects
+captured by closures, retain the normal managed-field lifetime and survive
+collection.
 
 ## Function values and closures
 
@@ -323,8 +550,8 @@ task lifetime or authorize concurrent native-service access.
 call effects. Managed allocation, local mutation, checked arithmetic and calls
 to other verified functions are permitted. I/O, host services, C ABI calls,
 native allocation and `unsafe` operations are rejected, including through
-transitive calls. Callback invocations require a `parallel fn` type. The `math`
-builtins and `test` assertions satisfy the runtime-call contract.
+transitive calls. Callback invocations require a `parallel fn` type. Verified
+`math` declarations and `test` assertions satisfy the runtime-call contract.
 
 ```neri
 def apply(value: Int, callback: parallel fn(Int): Int): Int
@@ -346,6 +573,11 @@ exclusive ownership of explicit mutable arguments.
 `use tasks` provides `tasks.generate(count, callback)` and
 `tasks.generate(count, parallelism, callback)`. The callback has type
 `parallel fn(Int): R`; the result is a new `R[]` in index order.
+The generic source declaration carries `@operation("tasks.generate")`; this
+closed operation identifier selects task-generation binding while source
+navigation and completion use the declaration's namespace and function name.
+Its required shape is `(Int, Int = 0, parallel fn(Int): R): R[]` with an empty,
+safe body.
 
 ```neri
 use tasks
@@ -478,7 +710,7 @@ exchange records through typed pointers.
 
 ### Raw memory operations
 
-Raw pointer operations require `def unsafe` or an `unsafe ... end` block. `T*`
+Raw pointer operations require `unsafe def` or an `unsafe ... end` block. `T*`
 is non-null; `T*?` requires a null check before access. Raw pointers do not retain
 managed allocations. Address-of applies to mutable unmanaged locals.
 
@@ -508,7 +740,7 @@ available to the operating system's loader when running the program.
 ```ruby
 @library("m")
 @cabi("cos")
-def unsafe cosine(value: Float): Float
+unsafe def cosine(value: Float): Float
 end
 ```
 
@@ -518,6 +750,35 @@ feature in transport 1.2. Modules without this feature retain transport 1.1.
 The runtime [ABI and collection contract](ABI.md) defines roots and allocation
 boundaries. Bounds and arithmetic failures panic with exit status 70. Compile
 errors produce diagnostics and prevent artifact emission.
+
+## Resources
+
+A `resource class` owns a value that is acquired with `using` and released when
+its scope ends. A resource defines `close(): result.Failure?`. Nested resources
+close in reverse acquisition order, including after `return`, `break`, or
+`continue`.
+
+`transfer name` moves a local resource when it is the returned value of a
+callable with the same resource return type. Resource values cannot be copied,
+stored, captured, passed to ordinary calls, or cast.
+
+A callable containing `using` returns `resources.Outcome<T, E>`. Its
+`completion` contains the value or body failure, and `closeFailures` contains
+each cleanup failure in close order. A `using` acquisition may return a resource
+or `result.Result<Resource, E>`; the result error type matches the enclosing
+outcome error type.
+
+Factories may return `Result<R, E>.Ok(transfer owned)` from a fresh local `R`.
+The move invalidates the local binding. Static factories have no owned receiver.
+When `T` and `E` are the same type, return an explicit `Outcome` to distinguish
+a value from a failure. The compiler requires every cleanup failure to remain
+observable in the returned outcome.
+
+Resource implementations make `close` idempotent and reject operations after
+closure. The standard-library scoped handles report `closed` or `disposed` for
+such operations. Recoverable returns and cooperative cancellation run cleanup;
+fatal panic and forced process termination reclaim descriptors through the OS
+without executing language cleanup.
 
 ## Tooling
 

@@ -1,15 +1,89 @@
 # Runtime and IR boundary
 
 The canonical exported declarations and layouts are in
-[`runtime_abi.h`](../native/include/neri/runtime_abi.h). Runtime ABI 1.10 uses a
+[`runtime_abi.h`](../native/include/neri/runtime_abi.h). Runtime ABI 1.25 uses a
 C calling convention on macOS ARM64 and Linux x86-64. Generated programs negotiate
 major version, minimum minor version and required feature bits before execution.
 The package manifest also identifies the toolchain version and native target.
+
+`neri_rt_v1_file_wait_readable(fd, milliseconds)` waits without consuming input.
+It returns `1` for readable input or EOF, `0` for timeout, `-2` for interruption
+and `-1` for failure. The timeout is a nonnegative millisecond count. POSIX uses
+[`poll`](https://pubs.opengroup.org/onlinepubs/9799919799/functions/poll.html);
+Windows supports file and pipe descriptors with
+[`PeekNamedPipe`](https://learn.microsoft.com/en-us/windows/win32/api/namedpipeapi/nf-namedpipeapi-peeknamedpipe).
+
+`String` is declared in `stdlib/core.hk` with the registered `utf8` representation.
+Its semantic methods lower to direct functions with an explicit IR `string`
+receiver. The runtime string header, UTF-8 payload, tracing and literal allocation
+retain their existing ABI. Represented classes use their registered storage;
+ordinary classes use class descriptors and method dispatch slots.
+
+The compiler's typed intrinsic registry maps empty-body module declarations to
+reviewed runtime exports, with exact parameter/result types, effects and ABI
+requirements. String primitives use this mechanism. Native managed-reference
+calls use runtime imports; the unmanaged C ABI import contract remains separate.
 
 The `INTERACTIVE_IO` feature (8192) provides generation-scoped terminal
 leases, byte input with bounded waiting, terminal dimensions, and monotonic
 milliseconds. Platform terminal layouts remain inside the runtime. Key decoding
 and the public session API are implemented in Neri.
+
+The `WALL_CLOCK` feature (131072) provides signed Unix epoch milliseconds through
+a status and output pointer. It is separate from monotonic elapsed time and
+requires ABI 1.13. UTC formatting and injectable clocks are implemented in Neri.
+
+The `CRYPTO` feature (262144) requires ABI 1.14 and provides SHA-256 through
+maintained platform libraries and bounded operating-system entropy. Linux
+programs that use this feature link to OpenSSL's `libcrypto`.
+
+The `ROOTED_FILES` feature (524288) requires ABI 1.15 and provides descriptor-relative
+opens with symlink rejection. Neri validates complete relative paths, bounds reads,
+and preserves primary and close failures.
+
+The `PROCESS` feature (1048576), introduced in ABI 1.16, owns child execution
+domains and bounded binary output capture behind generation tokens. The
+`DIRECTORY` feature (2097152), introduced in ABI 1.17, enumerates entries relative
+to an open directory and preserves operating-system and close errors.
+
+The `SOCKET_CLOSE_RESULT` feature (4194304), introduced in ABI 1.18, reports socket
+close failure. The `DRAIN` feature (16777216), introduced in ABI 1.20, provides a
+native watchdog for explicitly configured whole-process termination after stop.
+The `SESSION_MODULES` feature (8388608), introduced in ABI 1.19, provides the
+versioned session metadata and coordinator bridge. The
+`OPTIONAL_CONSOLE_READ` feature (33554432), introduced in ABI 1.21, adds
+`console.readLine(): String?`: EOF before any byte returns none, while a blank
+line returns an empty string. The existing `console.read()` contract is unchanged.
+
+ABI 1.22 adds `PROCESS_IO` (67108864) for initial child stdin, terminal capture
+and controlled interruption, and `FILESYSTEM_MUTATION` (134217728) for temporary
+directories, filesystem mutations and metadata. Consumers negotiate these bits
+when importing the corresponding services. Platform-specific availability is
+reported by each operation.
+`SOCKET_ENDPOINTS` (268435456) adds a bounded loopback TCP connection
+operation for clients sharing one deadline across connect, write and read,
+and bound-port discovery for listeners allocated with port zero.
+
+ABI 1.23 extends session modules with exact artifact-specific entry lookup and
+the retained frame's display value. The coordinator resolves the named artifact
+export directly, keeps its dependency modules loaded, and copies the display
+string into runtime-owned storage while the frame remains rooted. The returned
+string remains valid after module unloading.
+
+ABI 1.23 also provides `neri_rt_v1_host_canonical_path` under `BOOTSTRAP_HOST`.
+It accepts a NUL-terminated UTF-8 path, an output byte pointer and its capacity.
+It returns the UTF-8 byte length of the weakly canonical path, or `-1` on failure.
+A capacity greater than that length receives the bytes and a terminating NUL;
+a smaller capacity, including zero, queries the length and leaves the output
+untouched. The project loader uses this filesystem boundary directly.
+
+ABI 1.24 provides `neri_rt_v1_session_load_execute_object(handle, object_path,
+artifact_identity, linker_path)` under `SESSION_MODULES`. The three path and
+identity arguments are managed strings; the result is a session status code.
+The coordinator loads the native object-linker bridge lazily, resolves the
+artifact-specific exports, and validates the existing frame and layout contract
+before invocation. Each coordinator owns its linked generations and releases
+them after clearing its state root and collecting during reset.
 
 ## Representation
 
@@ -110,13 +184,32 @@ Runtime contract failures panic; no exception unwinds into Neri code.
 
 The compiler emits canonical Neri IR with transport 1.1, 1.2 for extended
 scalars or external library metadata, 1.3 for native records and fixed arrays,
-and 1.4 for `scoped-tasks-v1`.
+1.4 for `scoped-tasks-v1`, 1.5 for `session-module-v1`, 1.6 for
+`debug-scopes-v1`, and 1.7 for `retained-modules-v1`.
 The `native-libraries-v1` feature carries a library
 name after each import's source location; empty names retain platform-default
 symbol resolution. Only C ABI imports may declare a library. The transport header
 includes versions, flags, payload size and a SHA-256 digest. The native reader
 validates the envelope and the typed program before constructing LLVM objects.
 Malformed, unsupported and incompatible inputs produce stable NIR diagnostics.
+
+`retained-modules-v1` marks class shapes and function signatures whose storage
+and bodies are owned by an earlier immutable session module. Retained functions
+carry no blocks, values, or debug state. Native lowering emits external typed
+declarations for retained functions and class descriptors and emits definitions
+only for the current module.
+
+`debug-scopes-v1` records an ordered scope vector after each function's blocks.
+Each scope contains a positive ID, its parent ID (zero denotes the function),
+and a source location. Parent scopes precede their children.
+Each debug local then carries its name, SSA value, scope ID and declaration
+location. Successive values of one variable retain its declaration identity;
+variables with the same name in nested scopes have separate identities.
+Instructions and terminators carry the scope ID active when they are lowered.
+The native backend maps these IDs directly to DWARF lexical blocks and updates
+debug values at definitions and control-flow joins. Source spans provide
+diagnostic locations; scope IDs determine lexical membership. This metadata
+does not change the executable runtime ABI.
 
 `task.generate<R>` (61) returns `R[]` and carries a virtual invoke-slot symbol,
 an unsafe capability, count, parallelism, and callback. The capability makes the

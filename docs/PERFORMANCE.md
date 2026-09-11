@@ -1,5 +1,35 @@
 # Memory and performance checks
 
+## UTF-8 construction
+
+`benchmarks/text.hk` compares the `String` concatenation operator, the `text.concat` library
+wrapper and `buffers.TextBuffer` with a reserved final capacity. Each appends
+`abcdé😀` (10 bytes, six scalars) and checks the resulting byte/scalar lengths.
+Build with `neri build benchmarks/text.hk --release --output build/text-benchmark`;
+run `/usr/bin/time -l build/text-benchmark <concat|library|builder> <count>` on macOS.
+
+A local ARM64 Release run on 2026-09-09 (Apple M4 Pro, LLVM 22) produced:
+
+| Appends | Operator ms / RSS bytes | Library ms / RSS bytes | Buffer ms / RSS bytes |
+|---:|---:|---:|---:|
+| 10,000 | 16 / 41,615,360 | 16 / 43,892,736 | 2 / 2,162,688 |
+| 50,000 | 270 / 50,053,120 | 278 / 50,266,112 | 8 / 3,784,704 |
+
+These are individual observations, not statistical estimates or regression
+thresholds. Milliseconds measure the construction region inside the executable;
+RSS covers the entire process, including runtime and final validation.
+The class uses the native string allocation directly. Its methods add no wrapper
+object or separate backing array. The buffer path reuses
+capacity and copies bytes directly into its array through Neri code.
+
+For `N` appends of `k` bytes to a flat immutable string, the total output bytes
+copied are `k Σ(i=1..N) i = kN(N+1)/2`, hence quadratic in `N`. Reserved buffer
+construction plus the final snapshot costs `O(kN)` with `O(kN)` storage.
+This arithmetic describes copy work; GC thresholds, allocator behavior and
+cache effects determine observed RSS and time. The representation tradeoffs are
+discussed in [Boehm, Atkinson and Plass, Ropes (1995)](https://www.cs.tufts.edu/comp/150FP/archive/hans-boehm/ropes.pdf).
+Neri retains flat immutable strings and supplies a separate mutable builder.
+
 ## Run latency
 
 `neri source.hk --timings` separates frontend, cache lookup, code generation,
@@ -7,14 +37,45 @@ linking and program execution. `--no-cache` provides an uncached comparison with
 the same compiler, runtime and safety checks. A cache hit still parses, type-checks,
 lowers and verifies the program; it skips native code generation and linking.
 
+Deterministic IR lowering and transport use one stable, typed merge sort to order
+compiler collections. Ordering takes `O(N log N)` comparisons and preserves
+insertion order for equal keys, following the standard
+[merge sort](https://www.nist.gov/dads/HTML/mergesort.html) and
+[merge](https://www.nist.gov/dads/HTML/merge.html) definitions.
+
+Syntax and bound arenas retain original node objects in linked lists. A binary
+index stores a checkpoint for every 128 nodes. Adjacent accesses use the cached
+cursor in `O(1)` time; other accesses take `O(log(1 + N / 128) + 128)` steps for
+`N` local nodes. Index storage is `O(1 + N / 128)`, and parent arenas retain their
+own indexes. Appending a checkpoint grows the binary index by doubling its
+capacity when full, following the standard
+[doubling and amortized-analysis technique](https://ocw.mit.edu/courses/6-046j-introduction-to-algorithms-sma-5503-fall-2005/resources/lecture-13-amortized-algorithms-table-doubling-potential-method/).
+
+The isolated [macOS ARM64 measurement](../benchmarks/arena-index-macos-arm64.json)
+reduced the Sumi console frontend from 15.049 s to 3.632 s and the complete build
+from 26.07 s to 14.69 s, with the same native backend. Native generation remained
+about 10.7 s. This is a sequential local comparison, not a latency percentile or
+a general memory-reduction claim.
+
+Transport bytes occupy linked 256-byte arrays, with `ceil(N / 256)` chunks
+and less than 256 bytes of unused tail capacity for `N` bytes. Each buffer
+constructs one zero template; copying that template creates independent chunks.
+Sequential writes and checksum input traverse the chunks in `O(N)` time;
+reads before the current chunk restart from the first chunk. Hexadecimal
+encoding writes two ASCII digits per byte into packed chunks, converts each
+chunk to a string, then joins pairs in balanced rounds. This uses `O(N)` storage
+and `O(N log(1 + N / 256))` character-copy work, without allocating a string for
+each digit. These bounds describe transport storage and encoding, not the
+complete compiler heap or compilation time; the IR remains live during encoding.
+
 The key hashes the canonical IR transport and a length-delimited build context
 with SHA-256. The context includes target, optimization mode, runtime manifest,
 working directory, selected SDK/developer tools, deployment target and PATH.
 File identities include device/inode, permissions, size and nanosecond mtime/ctime
 for codegen, the linker, runtime archive and selected platform link inputs.
 Access time is excluded. This cache assumes installed LLVM and SDK distributions
-are immutable; use `--no-cache` when developing or modifying their internal
-dependencies. External `@library` dependencies and custom search/injection
+and their transitive native dependencies are immutable; use `--no-cache` when
+developing or modifying these dependencies. External `@library` dependencies and custom search/injection
 environments are uncached. Other host ABIs use the uncached path.
 
 Each entry contains the executable and its file-identity receipt, under a
@@ -50,6 +111,149 @@ A hit removes codegen and link and reuses an already-created executable. For a
 fraction `p` accelerated by a factor `s`, overall speedup is
 `1 / ((1 - p) + p / s)`; optimize measured dominant phases first.
 This is the application of [Amdahl's law](https://www.cs.cmu.edu/~18742/papers/Amdahl1967.pdf).
+
+## Project object builds
+
+Executable projects partition verified IR by manifest unit. Automatically loaded
+standard-library sources form another unit. The compiler gives each class and
+its methods one owner; generic specializations and synthetic classes belong to
+the executable consumer. Other units carry the external declarations and layouts
+needed to call them. Each object uses the same logical module identity, with
+strong, executable-local function and class-descriptor symbols.
+
+An object contains its owned function bodies, referenced private string literals,
+native imports, and required external declarations. Partition views share immutable
+instruction graphs and previously built source maps. The unit containing `main(): Void` supplies
+the whole program's runtime import and feature requirements. Other units derive
+their feature requirements from their own code and required declarations. This AOT mode has
+a conservative minimum runtime ABI of 1.4 for native arrays and classes; imported
+capabilities can raise that minimum. Session modules retain their own ABI contract.
+
+On macOS ARM64, object reuse uses the private cache and dependency receipts
+described above, with a separate object-cache key domain. The key includes the
+unit's canonical transport, manifest contents, owner, target, optimization mode,
+runtime manifest, and native tool identities. Native library binaries are resolved
+at the final link, which runs on every project build. `--no-cache` compiles every
+object. Other supported targets use the same partitioned link without this cache.
+Cache lookup hashes the packed canonical payload. A hit skips hexadecimal
+transport encoding; a miss reuses that payload and digest to construct the
+unchanged transport envelope for the native backend.
+
+The frontend still reads, checks, and lowers the complete project before selecting
+objects. This is native-object reuse, not persisted semantic-analysis reuse.
+Source tables are tracked per file: a consumer specializing a generic template
+depends on that template's source file as well as its generated IR. Splitting
+stable definitions from consumer specializations follows the
+[Rust compiler's code-generation-unit design](https://rustc-dev-guide.rust-lang.org/backend/monomorph.html).
+The correctness of reuse depends on recording all inputs to each compilation
+task, as formalized in
+[Build Systems à la Carte](https://simon.peytonjones.org/assets/pdfs/build-systems-original.pdf).
+
+For units `U`, misses `M`, and frontend cost `F`, the build cost is
+`F + partition + sum(hash(U)) + sum(codegen(M)) + link`. A cache hit removes native
+generation for that unit while retaining partition and validation costs. The
+granularity tradeoff between reusable results and dependency-tracking overhead
+is described in
+[Constructing Hybrid Incremental Compilers](https://arxiv.org/pdf/2002.06183),
+section 4.1. End-to-end measurements include these costs; cache-hit counts alone
+do not establish a latency improvement.
+
+The [macOS ARM64 project measurement](../benchmarks/aot-project-macos-arm64.json)
+recorded 15.67 s with an empty object cache and 5.21 s with all five objects
+reused. Maximum resident memory was 830 MB and 472 MB respectively. Frontend
+work remained about 3.7 s in both builds. These are single sequential build
+observations, not complete `sumi c` startup measurements or latency percentiles.
+
+With the validated toolchain installed, Sumi's separate `prepare-console` command
+took 17.90 s. Two subsequent `sumi c` invocations reached `app ready` and exited
+on EOF in 2.35 s and 0.84 s. These include application initialization and shutdown.
+Object keys include owner and configuration paths; Sumi's fresh preparation
+directory can therefore cause conservative misses between preparations. The
+stable-project cache measurement above isolates Neri's object reuse.
+
+## Session completion
+
+The public completion API analyzes a temporary child of the committed semantic
+model. It parses the query and types of referenced bindings; names of other
+bindings come from metadata. The shared LSP candidate engine performs symbol
+lookup and caps results at 128. Query cost still depends on metadata lookup and
+input size; it does not reparse retained application bodies or generate native
+objects.
+
+On macOS ARM64, Release measurements over 100 queries per cell gave these mean
+latencies. Each cell used a fresh process with one untimed query warmup.
+
+| Retained functions | Prior submissions | Name query | Member query | Process max RSS |
+| --- | --- | --- | --- | --- |
+| 10 | 0 | 0.06 ms | 0.07 ms | 9.1 MiB |
+| 100 | 25 | 0.27 ms | 0.08 ms | 13.0 MiB |
+| 500 | 100 | 0.68 ms | 0.16 ms | 49.7 MiB |
+
+The [complete nine-cell records](../benchmarks/session-completion-macos-arm64.json)
+include binary hashes and a control that expanded retained frame accesses. At
+500 functions and 100 submissions that control averaged 367.4/368.5 ms over
+ten name/member queries and reached 123.3 MiB process RSS. The current query
+source contains typed parameters for referenced bindings instead of access
+paths through prior frames. If binding `b` has frame depth `d(b)`, expanding all
+access paths contributes `sum(d(b))` path segments; one binding per frame can
+therefore contribute `H(H-1)/2` segments after `H` submissions. Typed query
+parameters remove that source expansion, while retained symbol lookup remains.
+
+These are synthetic semantic-query measurements, not console startup times or
+latency percentiles. RSS includes context preparation, retained analysis and
+the runtime. Reproduction commands and workload parameters are in the
+[benchmark instructions](../benchmarks/session/README.md#semantic-completion).
+
+## Executable sessions
+
+The Neri-owned session benchmark measures an application initializer and typed
+incremental submissions through `ExecutableSession`. On an Apple M4 Pro running
+macOS 26.6.2, a three-repetition Sumi application fixture produced these final
+local observations with the object backend. The benchmark executable is built
+in Release mode; submitted modules use `SessionToolchain`'s default Debug mode:
+
+| Operation | First cache miss | Two cache hits |
+|---|---:|---:|
+| Initializer, complete operation | 1,260 ms | 600 ms, 596 ms |
+| New-variable execute | 36 ms | 15 ms, 17 ms |
+
+The initializer measurement includes preparation, compilation, linking or object
+loading, and execution. Submission execution rows exclude their separately
+recorded preparation, which was 32–36 ms for these operations. Uncached execution
+for the other four submissions was 38–42 ms. At retained-history positions 1,
+10 and 25, uncached execution was 39, 40 and 51 ms; preparation was 37, 41 and
+56 ms. Cache-hit execution at those positions was 15–17, 18–22 and 25 ms.
+
+A generated project matrix, measured before packed transport storage, separated
+application size from the new-variable submission. For 10, 100, 500 and 900 ordinary functions, initializer misses were
+60, 165, 781 and 1,467 ms, while new-variable misses were 23, 25, 39 and 52 ms.
+Their actual cache hits were 4, 5, 7 and 10 ms. This local matrix shows that the
+remaining initializer work grows with the application while incremental work
+grows much more slowly over the measured range.
+
+Each backend used a separate new private code-cache directory. The first artifact
+is therefore a Neri code-cache miss, but neither run clears operating-system file,
+loader or disk caches. This benchmark invokes the Sumi initializer through the
+Neri session API; it does not measure startup of an installed Sumi command-line
+program. Raw records (`build/wire-final-session.csv` and `.jsonl`) and exact reproduction
+metadata are described in
+[`benchmarks/session/README.md`](../benchmarks/session/README.md).
+
+An installed Sumi command may also build its console executable after a toolchain
+update. A separate Release build of the same Sumi console sources with the same
+native backend measured 40.83 s and 7,881,021,320 bytes of peak memory footprint
+with the previous transport encoder, versus 30.12 s and 789,480,432 bytes with
+packed storage and direct hexadecimal encoding. The 38,349,058-byte hexadecimal
+transport matched byte for byte. These are single sequential build observations,
+not latency percentiles. Footprint is process memory reported by macOS
+`/usr/bin/time -lp`, not disk-cache size. Sumi controls when this build runs;
+these changes reduce Neri's compilation cost.
+
+An earlier `e720a92` record measured complete initializer operations at 2,164,
+2,224 and 2,335 ms and new-variable preparation plus execution at 1,951, 1,875
+and 2,200 ms. That record predates cache-hit telemetry and uses a different
+compiler, runtime and session implementation, so it is historical context rather
+than a matched before-and-after attribution.
 
 Dependency-keyed reuse follows the task/rebuild distinction in
 [Build Systems à la Carte](https://simon.peytonjones.org/assets/pdfs/build-systems-original.pdf).

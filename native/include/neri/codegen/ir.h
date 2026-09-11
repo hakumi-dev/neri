@@ -64,6 +64,7 @@ struct class_declaration final {
   symbol_id id;
   std::optional<symbol_id> base;
   std::uint8_t access{};
+  bool retained{};
   std::vector<field> fields;
   std::vector<method> methods;
   std::optional<source_location> location;
@@ -127,6 +128,7 @@ struct instruction final {
   std::optional<std::uint8_t> predicate;
   bool flag{};
   std::optional<source_location> location;
+  std::uint32_t debug_scope_id{};
 };
 
 struct terminator final {
@@ -137,6 +139,7 @@ struct terminator final {
   std::string panic_code;
   std::string panic_message;
   std::optional<source_location> location;
+  std::uint32_t debug_scope_id{};
 };
 
 struct block final {
@@ -149,6 +152,13 @@ struct block final {
 struct debug_local final {
   std::string name;
   std::uint32_t value{};
+  std::uint32_t scope_id{};
+  source_location location;
+};
+
+struct debug_scope final {
+  std::uint32_t id{};
+  std::uint32_t parent_id{};
   source_location location;
 };
 
@@ -159,13 +169,22 @@ struct function final {
   std::uint8_t kind{};
   std::uint32_t effects{};
   bool unsafe_call{};
+  bool retained{};
   std::uint32_t entry_block{};
   std::optional<value_definition> unsafe_root;
   std::optional<symbol_id> declaring_class;
   std::optional<symbol_id> dispatch_slot;
   std::optional<source_location> location;
   std::vector<block> blocks;
+  std::vector<debug_scope> debug_scopes;
   std::vector<debug_local> debug_locals;
+};
+
+struct session_export final {
+  symbol_id entry;
+  type source_type;
+  type target_type;
+  std::string artifact_identity;
 };
 
 struct ir_module final {
@@ -178,6 +197,7 @@ struct ir_module final {
   std::vector<import_declaration> imports;
   std::vector<function> functions;
   std::vector<native_record> native_records;
+  std::optional<session_export> session;
 };
 
 } // namespace neri::codegen

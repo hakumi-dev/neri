@@ -74,6 +74,53 @@ required by the native verifier. The callback analysis graph is discarded after
 checking. Capture access remains a semantic type rule; mutable argument ownership
 and task lifetime are separate contracts.
 
+## Data abstraction and library types
+
+Classes provide nominal identity, private representation, checked construction,
+generic parameters and ordinary virtual methods. Operator and explicit conversion
+annotations attach metadata to those methods. The semantic binder resolves them
+to the same instance calls used by named methods; lowering, effect analysis,
+debug information and code generation share the existing call infrastructure.
+The mechanism is owned by the declaring class and has no global registry of
+user type names.
+Builtin operand types retain their existing operations without traversing the
+class registry for every arithmetic expression.
+
+Abstractness is semantic state on class and method symbols. Binding rejects
+abstract construction and requires a concrete class to close each nearest
+inherited abstract method slot. Abstract source methods contribute no body;
+lowering fills their virtual entries with typed panic stubs, while concrete
+implementations use the existing virtual slots, object layout, and dispatch path.
+The semantic rules keep those stubs unreachable in valid programs. This keeps
+class completeness separate from runtime representation.
+The terminating entry follows the precedent of the
+[Itanium ABI pure-virtual function API (§3.2.6)](https://itanium-cxx-abi.github.io/cxx-abi/abi.html#vcall).
+For valid overrides, the pending virtual slots satisfy
+`O(C) = (O(base(C)) − I(C)) ∪ A(C)`, where `I` contains concrete implementations
+declared in `C` and `A` its abstract declarations. A concrete class requires
+`O(C) = ∅`; binding retains that result on the class symbol.
+
+This separates the operations of a type from its representation, following the
+data abstraction model in [Liskov and Zilles (1974)](https://gleitzman.com/media/docs/adt-liskov.pdf).
+Neri's annotations are a concrete design choice, not an implementation of that
+paper's CLU operation clusters or a proof of representation independence.
+
+`core.hk` declares `String` as an immutable UTF-8 managed class. Its storage
+contains a byte length and encoded bytes; it is distinct from mutable `Byte[]`,
+and is not a subclass of a byte or Unicode scalar. Its source methods provide
+concatenation and equality through checked intrinsic declarations. The compiler
+and runtime own literals, object layout, allocation, tracing and those intrinsic
+operations. The [text library](TEXT.md) supplies checked slicing, copied byte
+access, scalar traversal and a validated ordinary `Scalar` class in Neri. This
+boundary preserves the existing String ABI and avoids a second wrapper allocation
+for every literal. General user classes still have their ordinary managed class
+representation, not the String storage layout.
+
+The runtime ABI is the boundary for managed values and garbage collection.
+Ordinary C ABI imports accept native scalar/pointer signatures; a managed String
+or array is not a portable C argument. Text operations reuse the reviewed runtime
+entry points through the existing host services.
+
 ## Native boundary
 
 `native/codegen/` is a narrow C++ LLVM consumer. It accepts only verified Neri IR and emits LLVM IR, assembly, or native objects.
@@ -83,6 +130,41 @@ C++. Generated programs link to its static archive through the versioned
 [runtime ABI](ABI.md).
 
 Language syntax, binding, type rules, diagnostics, and Neri IR lowering are owned by `compiler/`.
+
+### Source and intrinsic boundary
+
+Ordinary APIs come from source declarations. A standard-library declaration
+defines its namespace, name, parameters, result type, documentation, navigation,
+completion and import requirement; runtime symbol names do not define that
+surface.
+
+| Belongs to | Current rule | Reason |
+| --- | --- | --- |
+| Source library | Namespaces and callable signatures such as `console`, `math`, `host`, `test`, and `tasks`, plus contracts such as `Equality` | Source controls the user-facing API and editor information. |
+| Intrinsic registry | Intrinsic ID, native symbol, exact signature, effects, ABI minor, runtime features, and parallel safety | Lowering emits only verified ABI imports. |
+| Compiler and runtime | Primitive and structural types, managed String and Array layouts, GC roots, pointers, native records, and serialized IR types | These determine memory layout and transport. |
+| Compiler | Literal types, explicit numeric casts, primitive operators, indexing, and the built-in array `Length` member | These operations belong to the primitive and structural type surface. |
+| Core library loader | Automatic `core.hk` loading and the registered `String` declaration | Every compilation and session starts with the same literal representation. |
+| Compiler and runtime | Scoped task operation, callback proof, and disjoint result slots | The runtime relies on the compiler's parallel-safety proof. |
+| Source contract checker | Contract signatures and structural implementation matching | Generic source code receives a static callable surface. |
+
+`@intrinsic("id")` identifies a compiler-recognized operation. Its registry is
+authoritative for the native link symbol, exact signature, effects, minimum runtime
+ABI minor version, required features and parallel-safety property. The binder
+requires an exact matching declaration before lowering emits an import. This
+prevents source from claiming an arbitrary native symbol or weaker effects; it
+does not define public library names. Standard-library declarations select their
+intrinsic IDs in source.
+
+The compiler and runtime jointly verify managed representations across the ABI.
+Source declarations provide the scoped-task operation and user-facing signature;
+the compiler proves callback and capture requirements, emits its IR operation,
+and the runtime writes verified disjoint output slots.
+
+This follows the normal intrinsic boundary: LLVM defines intrinsic semantics and
+restrictions in its [Language Reference](https://llvm.org/docs/LangRef.html#intrinsic-functions)
+and recommends intrinsics for extensions expressible as calls in its [extension guide](https://llvm.org/docs/ExtendingLLVM.html).
+Rust provides a related model with compiler-recognized marked [library items](https://rustc-dev-guide.rust-lang.org/lang-items.html).
 
 ## Build driver
 
@@ -96,6 +178,12 @@ compiler source list, build graph or language expectations.
 ## Trusted seed
 
 The bootstrap release contains a Neri compiler plus its matching codegen and runtime. It compiles the current sources, and the resulting compiler performs the next verified generation.
+Only the pinned seed stage substitutes compiler paths that have mirrored
+`bootstrap/compiler/*` declarations. The mirrors express declaration modifiers
+and native imports in syntax accepted by the pinned seed; they do not enumerate
+compiler sources. Stage 1 and later compile the canonical sources from the
+current manifest, and bootstrap verification compares canonical IR, objects,
+and binaries to a fixed point.
 
 ## Execution and optimization boundaries
 

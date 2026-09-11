@@ -1,0 +1,148 @@
+use console
+use host
+
+def probeWrite(path: String, text: String): Void
+  if !host.writeText(path, text)
+    fail("cannot write " + path)
+  end
+end
+
+class InteractiveProbe
+  public root: String
+  public work: String
+  public linker: String
+  public compiler: String
+  public mac: Bool
+  public sanitize: Bool
+
+  def init(root: String, work: String): Void
+    this.root = root
+    this.work = work
+    this.mac = contains(requiredText(root + "/build/current/lib/neri-runtime.json"), "macos-arm64")
+    this.linker = envOr("NERI_LINKER", this.mac ? "/opt/homebrew/opt/llvm@22/bin/clang++" : "clang++-22")
+    this.compiler = envOr("NERI_PROBE_COMPILER", root + "/build/current/bin/neri")
+    this.sanitize = envOr("NERI_PROBE_SANITIZE", "0") == "1"
+  end
+
+  def capture(arguments: String[], name: String): Int
+    var command = ["run", "30", this.work + "/" + name + ".stdout",
+      this.work + "/" + name + ".stderr", this.work + "/" + name + ".status", "/usr/bin/env"]
+    for argument in arguments command = host.appendString(command, argument) end
+    execute(envOr("NERI_HOST", this.root + "/build/native/native-release/neri-host"), command)
+    let status = host.parseInt(lines(requiredText(this.work + "/" + name + ".status"))[0])
+    if status == null
+      fail("missing process status")
+      return 1
+    end
+    return status
+  end
+
+  def entrySymbol(): String
+    # Read the emitted symbol instead of duplicating parameter/type mangling.
+    let prefix = "@hk1_f_q1_n10_7375626d697373696f6e__"
+    for line in lines(requiredText(this.work + "/first.ll"))
+      if bytesEqualAt(line, "define ", 0)
+        var index = 0
+        while index < host.stringByteLength(line)
+          if bytesEqualAt(line, prefix, index)
+            let start = index + 1
+            var finish = start
+            while finish < host.stringByteLength(line) && host.stringByteAt(line, finish) != (40 as Byte)
+              finish = finish + 1
+            end
+            return host.stringSlice(line, start, finish - start)
+          end
+          index = index + 1
+        end
+      end
+    end
+    fail("submission entry missing from compiler LLVM output")
+    return ""
+  end
+
+  def buildModule(name: String, optimization: String): Void
+    let directory = this.work + "/" + name
+    execute("mkdir", ["-p", directory])
+    let kind = name == "first" ? "executable" : "library"
+    probeWrite(directory + "/neri.json", "{\"version\":2,\"defaultUnit\":\"submission\",\"units\":{\"submission\":{\"kind\":\"" + kind + "\",\"sources\":[\"submission.hk\"],\"references\":[{\"project\":\"../library/neri.json\",\"unit\":\"state\"}]}}}\n")
+    probeWrite(directory + "/submission.hk", requiredText(this.root + "/experiments/interactive/" + name + ".hk"))
+    for emission in ["obj", "llvm-ir"]
+      let suffix = emission == "obj" ? ".o" : ".ll"
+      var compile = ["build", "--project", directory + "/neri.json", "--source-root", this.work,
+        "--emit=" + emission, "--output", this.work + "/" + name + suffix]
+      if optimization == "Release"
+        compile = host.appendString(compile, "--release")
+      end
+      execute(this.compiler, compile)
+    end
+    var arguments = [this.work + "/" + name + ".o", "-o", this.work + "/" + name + ".module"]
+    if this.mac
+      arguments = host.appendString(arguments, "-dynamiclib")
+      arguments = host.appendString(arguments, "-Wl,-undefined,dynamic_lookup")
+    else
+      arguments = host.appendString(arguments, "-shared")
+      arguments = host.appendString(arguments, "-Wl,-Bsymbolic")
+    end
+    execute(this.linker, arguments)
+  end
+
+  def run(): Void
+    execute("mkdir", ["-p", this.work + "/library"])
+    probeWrite(this.work + "/library/neri.json", "{\"version\":2,\"defaultUnit\":\"state\",\"units\":{\"state\":{\"kind\":\"library\",\"sources\":[\"state.hk\"]}}}\n")
+    probeWrite(this.work + "/library/state.hk", requiredText(this.root + "/experiments/interactive/state.hk"))
+    # A private archive copy excludes the ordinary program main. The native
+    # host owns one runtime and exports its symbols to both submission modules.
+    let archive = this.work + "/runtime.a"
+    execute("cp", [envOr("NERI_PROBE_RUNTIME", this.root + "/build/current/lib/libneri-runtime.a"), archive])
+    execute(envOr("NERI_AR", this.mac ? "/opt/homebrew/opt/llvm@22/bin/llvm-ar" : "llvm-ar-22"),
+      ["d", archive, "entry.cpp.o"])
+    var compileLoader = ["-x", "c", "-std=c17", "-Wall", "-Wextra", "-Wpedantic", "-Werror",
+      "-I" + this.root + "/native/include", "-c", this.root + "/experiments/interactive/loader.c",
+      "-o", this.work + "/loader.o"]
+    if this.sanitize
+      compileLoader = host.appendString(compileLoader, "-fsanitize=address,undefined")
+      compileLoader = host.appendString(compileLoader, "-fno-omit-frame-pointer")
+    end
+    execute(this.linker, compileLoader)
+    var arguments = [this.work + "/loader.o", "-o", this.work + "/loader", "-Wl,-export_dynamic"]
+    if this.sanitize
+      arguments = host.appendString(arguments, "-fsanitize=address,undefined")
+    end
+    if this.mac
+      arguments = host.appendString(arguments, "-Wl,-force_load," + archive)
+    else
+      for option in ["-Wl,--whole-archive", archive, "-Wl,--no-whole-archive", "-pthread", "-ldl"]
+        arguments = host.appendString(arguments, option)
+      end
+    end
+    execute(this.linker, arguments)
+    for optimization in ["Debug", "Release"]
+      this.buildModule("first", optimization)
+      this.buildModule("second", optimization)
+      let status = this.capture([this.work + "/loader", this.work + "/first.module",
+        this.work + "/second.module", this.entrySymbol()], optimization)
+      let output = requiredText(this.work + "/" + optimization + ".stdout")
+      let errors = requiredText(this.work + "/" + optimization + ".stderr")
+      if status != 0 || errors != "" || output != "first: 1\nsecond: same object, generic and closure survived collection\nreset: 0 managed objects\n"
+        fail("native session " + optimization + ":\n" + output + errors)
+      end
+      console.println("Native persistence " + optimization + ": passed")
+    end
+    console.println("Evidence: " + this.work)
+  end
+end
+
+def main(): Void
+  let root = envOr("NERI_ROOT", "")
+  if root == ""
+    fail("set NERI_ROOT to the absolute checkout path")
+    return
+  end
+  let work = bootstrapTemporaryDirectory(root + "/build", "interactive-probe")
+  if work == null
+    fail("cannot create probe directory")
+    return
+  end
+  let probe = new InteractiveProbe(root, work)
+  probe.run()
+end

@@ -53,8 +53,10 @@ left in a noncanonical mode. Garbage collection is not a session-close mechanism
 
 `terminal.escape(): String` supplies the ASCII Escape character for applications
 that render ANSI control sequences through `console.print`.
-`clock.milliseconds(): Int?` returns milliseconds from an arbitrary monotonic epoch,
-or `null` if unavailable. It measures elapsed time, not civil time or timestamps.
+
+The [`clock` standard-library contract](CLOCK.md) documents monotonic durations
+and deadlines, explicit wall-clock timestamps, deterministic UTC formatting, and
+injectable system and fake clocks.
 
 Compiled executables statically include the Neri runtime. They need the target
 operating system's libraries, but neither Neri nor LLVM at execution time.

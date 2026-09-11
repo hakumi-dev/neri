@@ -3,9 +3,25 @@
 Use this guide to build the compiler from a source checkout. To write programs
 with an installed toolchain, start with the [installation instructions](../README.md#install).
 
+## Supported platforms
+
+| Target | Native ABI and development path |
+| --- | --- |
+| `macos-arm64` | Apple silicon macOS; bootstrap and package workflow below |
+| `linux-x86_64` | Native Linux with Clang/LLVM 22.1.8; [Linux setup](LINUX.md) |
+| `windows-x86_64` | Native Windows x64 with Win32 APIs and the MSVC ABI; [Windows setup](WINDOWS.md) |
+
+Windows support targets native execution. WSL and MinGW are outside the supported
+setup. POSIX worker and PTY helpers require platform-specific replacements;
+Windows-specific coverage remains in progress.
+
+CI runs macOS and Linux jobs and Windows Debug and Release jobs. The required
+`Required / supported platforms` check combines all three platform results;
+branch protection for `main` enforces it on remote pull requests.
+
 ## Requirements
 
-The bootstrap host is macOS on Apple silicon. Install the Xcode Command Line
+On macOS Apple silicon, install the Xcode Command Line
 Tools and these dependencies:
 
 - LLVM 22.1.8 and zstd.
@@ -33,14 +49,14 @@ For Linux dependencies and full source installation, follow
 
 ## Build and test
 
-The root `neri.json` defines the compiler and tooling units. The `build` and
+The root `manifest.json` defines the compiler and tooling units. The `build` and
 `install` executables reference the shared `tooling` library, which references
 process support. Library directories discover new `.hk` files automatically;
 entry-point files belong to explicit executable units. To check tooling:
 
 ```sh
-neri check --project neri.json --unit build
-neri check --project neri.json --unit install
+neri check --project manifest.json --unit build
+neri check --project manifest.json --unit install
 ```
 
 The trusted bootstrap seed predates manifests. `scripts/build.sh` enumerates
@@ -52,11 +68,12 @@ scripts/build.sh doctor
 scripts/build.sh test
 ```
 
-The launcher verifies a prebuilt seed compiler and uses it to compile the Neri
-build driver. The driver builds the native components, compiles three generations
-of the compiler and requires matching output. It then runs the language and
-native tests before selecting the verified toolchain at `build/current`.
-See [bootstrapping](BOOTSTRAP.md) and [testing](../tests/README.md) for details.
+`scripts/build.sh test` builds and validates the current checkout, then selects
+its verified toolchain at `build/current`. See [bootstrapping](BOOTSTRAP.md) for
+generation checks and [testing](../tests/README.md) for suite composition.
+
+The opt-in `scripts/build.sh debugger-test` command verifies real LLDB debugging
+on macOS; see [debugging](DEBUGGING.md) for setup and the supported contract.
 
 Use that toolchain without changing your installed `neri` command:
 
@@ -112,10 +129,5 @@ scripts/build.sh package
 scripts/build.sh install
 ```
 
-Packaging runs the full validation suite and produces two byte-identical archives.
-Verified packages are stored in `build/packages/` with their SHA-256 in the filename.
-Installation builds and validates a package, then installs it under `~/.neri` by
-default. `scripts/build.sh install --prefix /your/directory` selects another prefix.
-The standalone installer accepts `--no-doc` together with `--prefix` in either
-order when the packaged documentation and documentation sidecar are not needed.
-See [packaging and installation](PACKAGING.md) for integrity checks and PATH setup.
+See [packaging and installation](PACKAGING.md) for verified archives, installer
+options, integrity checks and PATH setup.

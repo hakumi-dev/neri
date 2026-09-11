@@ -44,8 +44,23 @@ static void signature_help_contract(void) {
   reply = receive();
   result = field(reply, "result");
   signature = spaces(field(result, "signatures") + 1);
-  require(string_is(field(signature, "label"), "console.println(Any): Void"),
-          "signature help uses the compiler intrinsic contract");
+  require(string_is(field(signature, "label"), "def console.println(value: String): Void"),
+          "signature help uses the declared library callable");
+  free(reply);
+
+  open_document("file:///signature-equality.hk",
+    "use test\n"
+    "def main(): Void\n"
+    "  test.assertEqual(1, 1)\n"
+    "end\n", 0);
+  empty_diagnostics(1);
+  send_message("{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/signatureHelp\",\"id\":\"signature-equality\","
+    "\"params\":{\"textDocument\":{\"uri\":\"file:///signature-equality.hk\"},\"position\":{\"line\":2,\"character\":22}}}", 0);
+  reply = receive();
+  result = field(reply, "result");
+  signature = spaces(field(result, "signatures") + 1);
+  require(string_is(field(signature, "label"), "def test.assertEqual<Int>(left: Int, right: Int): Void"),
+          "signature help resolves the generic library callable");
   free(reply);
 
   open_document("file:///signature-nested.hk",

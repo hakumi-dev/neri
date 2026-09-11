@@ -6,6 +6,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <string>
 #include <string_view>
 
 namespace {
@@ -88,6 +90,30 @@ int main() {
   check_text(roots[0], "12.5");
   roots[0] = neri_rt_v1_string_from_float(10000000000.0);
   check_text(roots[0], "1e10");
+
+  std::array<neri_byte_v1, 4096> canonical{};
+  const auto expected = std::filesystem::weakly_canonical("missing/../future").string();
+  const auto required = neri_rt_v1_host_canonical_path(
+      reinterpret_cast<const neri_byte_v1 *>("missing/../future"), nullptr, 0);
+  NERI_STRING_CHECK(required == static_cast<neri_int_v1>(expected.size()));
+  NERI_STRING_CHECK(neri_rt_v1_host_canonical_path(
+                        reinterpret_cast<const neri_byte_v1 *>("missing/../future"),
+                        canonical.data(), canonical.size()) == required);
+  NERI_STRING_CHECK(std::string_view(
+                        reinterpret_cast<const char *>(canonical.data()),
+                        static_cast<std::size_t>(required)) == expected);
+  NERI_STRING_CHECK(canonical[static_cast<std::size_t>(required)] == 0);
+  constexpr auto unicode_path = "unicode-\xC3\xA9/../\xCE\xB4";
+  const auto unicode_expected = std::filesystem::weakly_canonical(unicode_path).string();
+  const auto unicode_length = neri_rt_v1_host_canonical_path(
+      reinterpret_cast<const neri_byte_v1 *>(unicode_path), canonical.data(),
+      canonical.size());
+  NERI_STRING_CHECK(unicode_length ==
+                    static_cast<neri_int_v1>(unicode_expected.size()));
+  NERI_STRING_CHECK(std::string_view(
+                        reinterpret_cast<const char *>(canonical.data()),
+                        static_cast<std::size_t>(unicode_length)) == unicode_expected);
+  NERI_STRING_CHECK(canonical[static_cast<std::size_t>(unicode_length)] == 0);
 
   roots[0] = nullptr;
   neri_rt_v1_gc_collect();
