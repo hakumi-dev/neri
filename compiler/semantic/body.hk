@@ -411,12 +411,21 @@ class BootstrapBodyBinder
     while index < callable.bodyCount
       let statement = this.syntax().childAt(callable.syntaxNode, callable.bodyStart + index)
       if this.syntax().kindAt(statement) == "SuperConstructorCall"
-        this.bindBaseConstructorCall(callable, statement)
+        let owner = this.owner.currentClass
+
+        if callable.name != "init" || owner == null || owner.baseName == "" || index != 0 || callable.hasBaseConstructorCall
+          this.rejectBaseConstructorCall(statement)
+        else
+          this.bindBaseConstructorCall(callable, statement)
+        end
       else
         let boundStatement = this.bindStatement(statement, callable.returnType)
         bodyChildren = appendChild(bodyChildren, boundStatement)
       end
       index = index + 1
+    end
+    if callable.name == "init" && !callable.hasBaseConstructorCall
+      this.validateImplicitBaseConstructor(callable)
     end
     if callable.cAbiSymbol == "" && callable.returnType != "Void" && !this.statementsReturn(callable)
       this.report("NR108", callable.syntaxNode, "Not all code paths return a value in function '" + this.callableDisplayName(callable) + "'.")
@@ -493,7 +502,28 @@ class BootstrapBodyBinder
     end
     let constructor = this.owner.findDeclaredMethod(baseClass, "init")
     if constructor == null
+      let actual = this.syntax().childCountAt(node)
+      let inherited = this.inheritedConstructor(owner)
+
+      if inherited != null
+        if !this.memberAccessible(inherited.className, inherited.access)
+          this.report("NR153", node, "Cannot access " + inherited.access + " constructor of type '" + inherited.className + "'.")
+        end
+        this.validateCallCount(inherited.className + ".init", node, 0, inherited)
+      end
+      if actual > 0
+        this.reportLength("NR111", node, 1, "Function '" + baseClass.name + ".init' expects 0 arguments, but got " + (actual as String) + ".")
+      end
+      var index = 0
+
+      while index < actual
+        this.bindExpression(this.syntax().childAt(node, index), "")
+        index = index + 1
+      end
       return
+    end
+    if !this.memberAccessible(constructor.className, constructor.access)
+      this.report("NR153", node, "Cannot access " + constructor.access + " constructor of type '" + baseClass.fullName + "'.")
     end
     callable.baseConstructorName = constructor.fullName
     let actual = this.syntax().childCountAt(node)
@@ -509,6 +539,64 @@ class BootstrapBodyBinder
       callable.baseArguments.add(argument.boundNode)
       index = index + 1
     end
+  end
+
+  def rejectBaseConstructorCall(node: Int): Void
+    this.report("NR182", node, "Base constructor call 'super(...)' must be the first statement of a derived constructor and cannot be repeated.")
+    var index = 0
+
+    while index < this.syntax().childCountAt(node)
+      this.bindExpression(this.syntax().childAt(node, index), "")
+      index = index + 1
+    end
+  end
+
+  def validateImplicitBaseConstructor(callable: SemanticCallable): Void
+    let owner = this.owner.currentClass
+
+    if owner == null
+      return
+    end
+    let baseClass = this.model().findClass(owner.baseName)
+
+    if baseClass == null
+      return
+    end
+    let constructor = this.inheritedConstructor(owner)
+
+    if constructor == null
+      return
+    end
+    if !this.memberAccessible(constructor.className, constructor.access)
+      this.report("NR153", callable.syntaxNode, "Cannot access " + constructor.access + " constructor of type '" + constructor.className + "'.")
+    end
+    this.validateCallCount(constructor.className + ".init", callable.syntaxNode, 0, constructor)
+  end
+
+  def inheritedConstructor(classSymbol: SemanticClass): SemanticCallable?
+    var baseClass = this.model().findClass(classSymbol.baseName)
+    var steps = 0
+
+    while baseClass != null && steps < 256
+      let constructor = this.owner.findDeclaredMethod(baseClass, "init")
+
+      if constructor != null
+        return constructor
+      end
+      baseClass = this.model().findClass(baseClass.baseName)
+      steps = steps + 1
+    end
+    return null
+  end
+
+  def inheritedConstructorAccessible(classSymbol: SemanticClass, constructor: SemanticCallable): Bool
+    if constructor.access == "public" || constructor.access == "internal"
+      return true
+    end
+    if constructor.access == "protected"
+      return semanticClassAssignable(this.model(), constructor.className, classSymbol.fullName)
+    end
+    return false
   end
 
   def callableDisplayName(callable: SemanticCallable): String
@@ -656,6 +744,7 @@ class BootstrapBodyBinder
     else if kind == "UsingBlock"
       return this.bindUsing(node, returnType)
     else if kind == "SuperConstructorCall"
+      this.rejectBaseConstructorCall(node)
       return this.addBound("SuperConstructorCall", "Void", "", node, emptyInts())
     end
     this.report("NR134", node, "Unsupported statement '" + kind + "'.")
@@ -1343,6 +1432,11 @@ class BootstrapBodyBinder
     let operandNode = this.syntax().childAt(node, 0)
     let operand = this.bindExpression(operandNode, "")
     var resultType = operand.typeName
+    let annotated = semanticOperatorMethod(this.model(), operand.typeName, this.operationText(operation), 0)
+
+    if annotated != null
+      return new BoundValue(annotated.returnType, this.addBound("InstanceCall", annotated.returnType, annotated.fullName, node, [operand.boundNode]))
+    end
     if operation == "Bang"
       resultType = "Bool"
       if operand.typeName != "Bool" && operand.typeName != "Error"
@@ -1455,6 +1549,19 @@ class BootstrapBodyBinder
     else
       right = this.bindExpression(rightNode, "")
     end
+    var annotated: SemanticCallable? = null
+
+    if operation != "&&" && operation != "||"
+      annotated = semanticOperatorMethod(this.model(), left.typeName, operation, 1)
+    end
+
+    if annotated != null
+      let parameter = annotated.firstParameter
+
+      if parameter != null && right.typeName == parameter.typeName
+        return new BoundValue(annotated.returnType, this.addBound("InstanceCall", annotated.returnType, annotated.fullName, node, [left.boundNode, right.boundNode]))
+      end
+    end
     var resultType = "Int"
     let arithmetic = operation == "+" || operation == "-" || operation == "*" || operation == "/"
     let equality = operation == "==" || operation == "!="
@@ -1559,9 +1666,19 @@ class BootstrapBodyBinder
       this.report("NR262", node, "Resource ownership cannot be cast.")
     end
     this.owner.validatePointerType(typeNode, this.unsafeDepth > 0)
+    var conversion: SemanticCallable? = null
+    let dropsReadView = semanticIsReadonly(value.typeName) && !semanticIsReadonly(target) && semanticMutableType(value.typeName) == semanticMutableType(target)
+
+    if value.typeName != target && !dropsReadView
+      conversion = semanticConversionMethod(this.model(), value.typeName, target)
+    end
+
+    if conversion != null
+      return new BoundValue(target, this.addBound("InstanceCall", target, conversion.fullName, node, [value.boundNode]))
+    end
     let numeric = (semanticIsNumeric(value.typeName) && semanticIsNumeric(target)) || ((value.typeName == "Int" || value.typeName == "Byte" || value.typeName == "Float") && target == "String")
     let pointer = semanticIsPointer(value.typeName) && semanticIsPointer(target)
-    if (semanticIsReadonly(value.typeName) && !semanticIsReadonly(target)) || (value.typeName != target && !numeric && !pointer)
+    if dropsReadView || (value.typeName != target && !numeric && !pointer)
       this.report("NR125", typeNode, "Invalid cast from '" + value.typeName + "' to '" + target + "'.")
     end
     return new BoundValue(target, this.addBound("Cast", target, "", node, appendChild(emptyInts(), value.boundNode)))
@@ -1947,14 +2064,22 @@ class BootstrapBodyBinder
       end
       if library == "test" && name == "assertEqual" && index == 0
         firstType = argument.typeName
-        if !semanticEqualityComparable(firstType) && firstType != "Error"
-          this.report("NR119", argumentNode, "Type '" + firstType + "' does not support equality comparison.")
-        end
       end
       children = host.appendInt(children, argument.boundNode)
       if library == "test" && name == "assertEqual" && index == 1
         if firstType != argument.typeName && firstType != "Error" && argument.typeName != "Error"
           this.report("NR112", argumentNode, "Arguments to 'test.assertEqual' must have the same type, but got '" + firstType + "' and '" + argument.typeName + "'.")
+        else if !semanticEqualityComparable(firstType) && firstType != "Error"
+          let equality = semanticOperatorMethod(this.model(), firstType, "==", 1)
+          var parameter: SemanticParameter? = null
+
+          if equality != null
+            parameter = equality.firstParameter
+          end
+
+          if parameter == null || argument.typeName != parameter.typeName
+            this.report("NR119", argumentNode, "Type '" + firstType + "' does not support equality comparison.")
+          end
         end
       else if expected != "" && !semanticAssignable(this.model(), expected, argument.typeName)
         this.report("NR112", argumentNode, "Argument " + ((index + 1) as String) + " of '" + semanticQualifiedName(library, name) + "' expects type '" + expected + "', but got '" + argument.typeName + "'.")
@@ -2113,6 +2238,21 @@ class BootstrapBodyBinder
             this.reportLength("NR111", calleeNode, 1, "Function '" + objectName + "." + memberName + "' expects " + (expectedCount as String) + " arguments, but got " + (actual as String) + ".")
           end
           let arguments = this.bindArguments(node, 1, expectedCount, objectName, memberName, null)
+
+          if objectName == "test" && memberName == "assertEqual" && arguments.Length == 2
+            let firstType = this.model().bound.typeAt(arguments[0])
+            let equality = semanticOperatorMethod(this.model(), firstType, "==", 1)
+
+            if equality != null
+              let parameter = equality.firstParameter
+
+              if parameter != null && this.model().bound.typeAt(arguments[1]) == parameter.typeName
+                let comparison = this.addBound("InstanceCall", "Bool", equality.fullName, calleeNode, arguments)
+
+                return new BoundValue("Void", this.addBound("Call", "Void", "test.assert", calleeNode, [comparison]))
+              end
+            end
+          end
           return new BoundValue(libraryType, this.addBound("Call", libraryType, objectName + "." + memberName, calleeNode, arguments))
         end
         let classSymbol = this.resolveClassForCall(objectName, objectNode)
@@ -2265,8 +2405,20 @@ class BootstrapBodyBinder
     this.owner.recordTypeOccurrence(classSymbol.fullName, typeNode)
     let actual = this.syntax().childCountAt(node) - 1
     if constructor == null
+      let baseConstructor = this.inheritedConstructor(classSymbol)
+
+      if baseConstructor != null
+        if !this.inheritedConstructorAccessible(classSymbol, baseConstructor)
+          this.report("NR153", node, "Cannot access " + baseConstructor.access + " constructor of type '" + baseConstructor.className + "'.")
+        end
+        this.validateCallCount(baseConstructor.className + ".init", node, 0, baseConstructor)
+      end
       if actual > 0
-        this.report("NR154A", node, "Constructor 'init' was not found for class '" + classSymbol.name + "'.")
+        if baseConstructor != null
+          this.reportLength("NR111", node, 1, "Function '" + classSymbol.name + ".init' expects 0 arguments, but got " + (actual as String) + ".")
+        else
+          this.report("NR154A", node, "Constructor 'init' was not found for class '" + classSymbol.name + "'.")
+        end
       end
       let arguments = this.bindArguments(node, 1, actual, "", classSymbol.name + ".init", null)
       return new BoundValue(typeName, this.addBound("New", typeName, classSymbol.fullName, node, arguments))

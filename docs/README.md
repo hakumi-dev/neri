@@ -14,6 +14,7 @@ packages include the language reference for the packaged compiler.
 - [Read files and manage temporary filesystem state](FILES.md).
 - [Use elapsed time and UTC timestamps](CLOCK.md).
 - [Build bounded byte, text and ordered-value buffers](BUFFERS.md).
+- [Use UTF-8 text and validated Unicode scalars](TEXT.md).
 - [Hash bytes and obtain operating-system entropy](CRYPTO.md).
 - [Handle typed results and owned failures](RESULT.md).
 - [Build interactive terminal applications](TERMINAL.md).
