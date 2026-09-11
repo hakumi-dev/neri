@@ -1,5 +1,10 @@
 # Toolchain packages
 
+The package includes the public language, ABI, library and session references.
+The package driver owns that explicit document selection and verifies each
+selected source plus inline links to relative `.md` targets in that selection
+before it builds the archive.
+
 `scripts/build.sh package` produces a Release toolchain archive for the bootstrap
 host. The command builds the current native components, reaches the compiler
 fixed point, and passes the native and language contracts before packaging.
