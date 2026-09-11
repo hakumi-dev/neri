@@ -116,7 +116,7 @@ neri_int_v1 open_category(int error) {
   return root_other;
 }
 
-neri_int_v1 rooted_failure(int error, neri_int_v1 *os_code,
+[[maybe_unused]] neri_int_v1 rooted_failure(int error, neri_int_v1 *os_code,
                            neri_int_v1 *category) {
   *os_code = error;
   *category = open_category(error);
@@ -191,7 +191,7 @@ constexpr neri_int_v1 status_missing = 0;
 constexpr neri_int_v1 status_file = 1;
 constexpr neri_int_v1 status_directory = 2;
 constexpr neri_int_v1 status_symlink = 3;
-constexpr neri_int_v1 status_other = 4;
+[[maybe_unused]] constexpr neri_int_v1 status_other = 4;
 
 bool valid_path(const uint8_t *path, neri_int_v1 length) {
   return path && length > 0 && length <= 1048576 &&
