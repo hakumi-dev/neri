@@ -3,6 +3,7 @@ use test
 
 def sourceText(path: String): String
   let text = host.readText(path)
+
   test.assertTrue(text != null)
   if text != null
     return text
@@ -27,8 +28,86 @@ def analyzed(document: LspDocument): Bool
   return semantic.diagnostics.count() == 0
 end
 
+def containsText(text: String, part: String): Bool
+  var offset = 0
+  while offset + host.stringByteLength(part) <= host.stringByteLength(text)
+    var equal = true
+    var index = 0
+    while index < host.stringByteLength(part)
+      if host.stringByteAt(text, offset + index) != host.stringByteAt(part, index)
+        equal = false
+      end
+      index = index + 1
+    end
+    if equal
+      return true
+    end
+    offset = offset + 1
+  end
+  return false
+end
+
+def textOffset(text: String, part: String): Int
+  var offset = 0
+  while offset + host.stringByteLength(part) <= host.stringByteLength(text)
+    var equal = true
+    var index = 0
+    while index < host.stringByteLength(part)
+      if host.stringByteAt(text, offset + index) != host.stringByteAt(part, index)
+        equal = false
+      end
+      index = index + 1
+    end
+    if equal
+      return offset
+    end
+    offset = offset + 1
+  end
+  return -1
+end
+
+def definitionAt(document: LspDocument, text: String, part: String, offset: Int = 0): String
+  let start = textOffset(text, part)
+
+  test.assertTrue(start >= 0)
+  if start < 0
+    return "null"
+  end
+  return lspDefinition(document, start + offset)
+end
+
+def snapshot(document: LspDocument, projectKey: String, projectRevision: Int): LspSemanticSnapshot
+  let value = new LspSemanticSnapshot()
+  value.projectKey = projectKey
+  value.projectRevision = projectRevision
+  value.semantic = document.semantic
+  value.sourceUris = document.sourceUris
+  value.sourceTexts = document.sourceTexts
+  value.sourceStarts = document.sourceStarts
+  var index = 0
+  while index < document.sourceUris.size
+    value.sourceVersions.add(index == 0 ? document.version : -1)
+    index = index + 1
+  end
+  value.requireEntryPoint = document.requireEntryPoint
+  value.forbiddenEntryPointSources = document.forbiddenEntryPointSources
+  return value
+end
+
+def sourceSnapshot(projectKey: String, uri: String, start: Int): LspSemanticSnapshot
+  let value = new LspSemanticSnapshot()
+  value.projectKey = projectKey
+  value.projectRevision = 1
+  value.sourceUris.add(uri)
+  value.sourceTexts.add("local")
+  value.sourceStarts.add(start)
+  value.sourceVersions.add(-1)
+  return value
+end
+
 def main(): Void
   let root = host.argumentAt(0)
+
   test.assertTrue(root != null)
   if root == null
     return
@@ -41,9 +120,26 @@ def main(): Void
   let canonicalDocument = document(canonicalMain, sourceText(canonicalMain))
   canonical.documents = canonicalDocument
   canonical.analyze(canonicalDocument)
+
   test.assertEqual(canonical.nearestProjectRoot(canonicalMain), canonicalRoot)
   test.assertTrue(analyzed(canonicalDocument))
   test.assertEqual(canonicalDocument.sourceUris.size, 2)
+
+  # workspace/symbol discovers a non-default closed unit without retaining its
+  # semantic model. Reanalyzing an overlay invalidates that compact cache.
+  let closedWorkspace = new LspServer()
+  closedWorkspace.rootPath = canonicalRoot
+  let closedSymbols = lspWorkspaceSymbols(closedWorkspace, "secondaryOnly")
+
+  test.assertTrue(containsText(closedSymbols, "secondaryOnly"))
+  let secondaryPath = canonicalRoot + "/secondary.hk"
+  let secondary = document(secondaryPath, "def changedOnly(): Int\n  return 3\nend\n\ndef main(): Void\nend\n")
+  closedWorkspace.documents = secondary
+  closedWorkspace.analyze(secondary)
+  let overlaySymbols = lspWorkspaceSymbols(closedWorkspace, "")
+
+  test.assertTrue(containsText(overlaySymbols, "changedOnly"))
+  test.assertTrue(!containsText(overlaySymbols, "secondaryOnly"))
 
   let implicitRoot = root + "/tests/lsp/implicit-workspace"
   let implicitMain = implicitRoot + "/main.hk"
@@ -53,6 +149,7 @@ def main(): Void
   let main = document(implicitMain, sourceText(implicitMain))
   implicit.documents = main
   implicit.analyze(main)
+
   test.assertEqual(implicit.nearestProjectRoot(implicitMain), implicitRoot)
   test.assertTrue(analyzed(main))
   test.assertEqual(main.sourceUris.size, 2)
@@ -62,8 +159,106 @@ def main(): Void
   implicit.documents = overlay
   implicit.analyze(main)
   let overlaySemantic = main.semantic
+
   test.assertTrue(overlaySemantic != null)
   if overlaySemantic != null
     test.assertTrue(overlaySemantic.diagnostics.count() > 0)
   end
+
+  let navigationSource = "class Counter\n  def init(): Void\n  end\n\n  def increment(): Int\n    return 1\n  end\nend\n\nclass Box<T>\n  public value: T\n\n  def item(): T\n    return this.value\n  end\nend\n\nclass Derived: Counter\nend\n\nstruct Packet\n  bytes: Int\nend\n\nenum Signal\n  case Ready(value: Int)\n  case Stop()\nend\n\nclass Crate<T>\n  public item: T\nend\n\ndef accept(packet: Packet): Void\nend\n\ndef main(): Void\n  let typed: Counter? = new Counter()\n  let boxed: Box<fn(): Int> = new Box<fn(): Int>()\n  let nested: Crate<Box<fn(): Int>> = new Crate<Box<fn(): Int>>()\n  if typed != null\n    typed.increment()\n  end\n  boxed.item()\n  let value = boxed.value\n  let signal = Signal.Ready(7)\n  match signal\n    case Signal.Ready(number)\n      let copy = number\n    case Signal.Stop()\n  end\n  let inherited: Derived = new Derived()\nend\n"
+  let navigationDocument = new LspDocument()
+  navigationDocument.uri = "untitled:navigation"
+  navigationDocument.text = navigationSource
+  navigationDocument.version = 1
+  let navigation = new LspServer()
+  navigation.documents = navigationDocument
+  navigation.analyze(navigationDocument)
+
+  test.assertTrue(analyzed(navigationDocument))
+  let counterType = definitionAt(navigationDocument, navigationSource, ": Counter?", 2)
+  let counterConstructor = definitionAt(navigationDocument, navigationSource, "new Counter()", 4)
+  let counterConstructorEnd = definitionAt(navigationDocument, navigationSource, "new Counter()", 10)
+  let boxType = definitionAt(navigationDocument, navigationSource, ": Box<fn(): Int>", 2)
+  let boxConstructor = definitionAt(navigationDocument, navigationSource, "new Box<fn(): Int>()", 4)
+  let nestedOuter = definitionAt(navigationDocument, navigationSource, ": Crate<Box<fn(): Int>>", 2)
+  let nestedInner = definitionAt(navigationDocument, navigationSource, ": Crate<Box<fn(): Int>>", 8)
+  let inheritedType = definitionAt(navigationDocument, navigationSource, "class Derived: Counter", 15)
+  let nativeType = definitionAt(navigationDocument, navigationSource, "packet: Packet", 8)
+  let incrementCall = definitionAt(navigationDocument, navigationSource, "typed.increment()", 6)
+  let incrementCallEnd = definitionAt(navigationDocument, navigationSource, "typed.increment()", 14)
+  let genericMethod = definitionAt(navigationDocument, navigationSource, "boxed.item()", 6)
+  let genericField = definitionAt(navigationDocument, navigationSource, "boxed.value", 6)
+  let genericType = lspTypeDefinition(navigationDocument, textOffset(navigationSource, "boxed.item()") + 1)
+  let enumConstruct = definitionAt(navigationDocument, navigationSource, "Signal.Ready(7)", 7)
+  let enumMatch = definitionAt(navigationDocument, navigationSource, "Signal.Ready(number)", 7)
+  let enumStop = definitionAt(navigationDocument, navigationSource, "Signal.Stop()", 7)
+
+  test.assertTrue(containsText(counterType, "\"line\":0,\"character\":6"))
+  test.assertTrue(containsText(counterConstructor, "\"line\":0,\"character\":6"))
+  test.assertTrue(containsText(counterConstructorEnd, "\"line\":0,\"character\":6"))
+  test.assertTrue(containsText(boxType, "\"line\":9,\"character\":6"))
+  test.assertTrue(containsText(boxConstructor, "\"line\":9,\"character\":6"))
+  test.assertTrue(containsText(nestedOuter, "\"line\":29,\"character\":6"))
+  test.assertTrue(containsText(nestedInner, "\"line\":9,\"character\":6"))
+  test.assertTrue(containsText(inheritedType, "\"line\":0,\"character\":6"))
+  test.assertTrue(containsText(nativeType, "\"line\":20,\"character\":7"))
+  test.assertTrue(containsText(incrementCall, "\"line\":4,\"character\":6"))
+  test.assertTrue(containsText(incrementCallEnd, "\"line\":4,\"character\":6"))
+  test.assertTrue(containsText(genericMethod, "\"line\":12,\"character\":6"))
+  test.assertTrue(containsText(genericField, "\"line\":10,\"character\":9"))
+  test.assertTrue(containsText(genericType, "\"line\":9,\"character\":6"))
+  test.assertTrue(containsText(enumConstruct, "\"line\":25,\"character\":7"))
+  test.assertTrue(containsText(enumMatch, "\"line\":25,\"character\":7"))
+  test.assertTrue(containsText(enumStop, "\"line\":26,\"character\":7"))
+
+  let querySnapshot = snapshot(navigationDocument, "navigation", 1)
+  let duplicateSnapshot = snapshot(navigationDocument, "navigation", 1)
+  let rejectedSnapshot = snapshot(navigationDocument, "other-project", 1)
+  let staleSnapshot = snapshot(navigationDocument, "navigation", 0)
+  let queryIndex = new LspSemanticIndex()
+  queryIndex.begin("navigation", 1)
+  queryIndex.addSnapshot(querySnapshot)
+  queryIndex.addSnapshot(querySnapshot)
+  queryIndex.addSnapshot(duplicateSnapshot)
+  queryIndex.addSnapshot(rejectedSnapshot)
+  queryIndex.addSnapshot(staleSnapshot)
+  let boxIdentity = lspQueryCanonicalIdentity(querySnapshot, lspSnapshotIdentityAt(querySnapshot, textOffset(navigationSource, ": Box<fn(): Int>") + 2))
+  let boxDefinition = lspIndexDefinition(queryIndex, boxIdentity)
+  let boxReferences = lspIndexReferences(queryIndex, boxIdentity, true)
+  let boxSymbols = lspIndexWorkspaceSymbols(queryIndex, "bOx")
+
+  test.assertTrue(containsText(boxIdentity, "type:Box|untitled:navigation|"))
+  test.assertTrue(boxDefinition != null && boxDefinition.snapshotKey == lspSnapshotKey(querySnapshot))
+  test.assertTrue(boxReferences != null)
+  var boxCount = 0
+  var symbol = boxSymbols
+  while symbol != null
+    if symbol.name == "Box"
+      boxCount = boxCount + 1
+
+      test.assertEqual(symbol.kind, 5)
+    end
+    symbol = symbol.next
+  end
+
+  test.assertEqual(boxCount, 1)
+
+  # Source starts are snapshot-local. The same closed file must deduplicate
+  # when an analyzer orders it at a different absolute offset, while locals
+  # at the same offset in separate files remain distinct declarations.
+  let orderedFirst = sourceSnapshot("unit", "file:///one.hk", 0)
+  let orderedSecond = sourceSnapshot("unit", "file:///one.hk", 40)
+  let otherLocal = sourceSnapshot("unit", "file:///two.hk", 0)
+  let isolation = new LspSemanticIndex()
+  isolation.begin("unit", 1)
+  isolation.add("local:0|file:///one.hk|0", "first", 13, orderedFirst, 0, 5, true)
+  isolation.add("local:0|file:///one.hk|0", "first", 13, orderedSecond, 40, 5, true)
+  isolation.add("local:0|file:///two.hk|0", "second", 13, otherLocal, 0, 5, true)
+  let firstLocal = lspIndexDefinition(isolation, "local:0|file:///one.hk|0")
+  let secondLocal = lspIndexDefinition(isolation, "local:0|file:///two.hk|0")
+  let firstReferences = lspIndexReferences(isolation, "local:0|file:///one.hk|0", true)
+
+  test.assertTrue(firstLocal != null && firstLocal.sourceKey == "file:///one.hk" && firstLocal.sourceOffset == 0)
+  test.assertTrue(secondLocal != null && secondLocal.sourceKey == "file:///two.hk" && secondLocal.sourceOffset == 0)
+  test.assertTrue(firstReferences != null && firstReferences.next == null)
 end
