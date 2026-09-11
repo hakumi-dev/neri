@@ -1,10 +1,9 @@
 # Testing Neri
 
-`scripts/build.sh test` builds the current native codegen/runtime, reaches the
-compiler fixed point with those artifacts, runs native ABI/IR tests and executes
-language fixtures through the resulting compiler. `--debug` selects Debug native
-components and Debug compilation of language fixtures. The compiler bootstrap
-itself uses Release output for canonical generation comparisons.
+`scripts/build.sh test` runs the full suite against a freshly bootstrapped compiler.
+`--debug` selects Debug native components and language fixtures; compiler
+generations use Release for fixed-point comparisons. See [Building](../docs/BUILDING.md)
+for requirements and setup.
 
 The full suite also uses a native C stdio client to exercise
 `neri lsp` against the freshly built compiler. See the
@@ -12,9 +11,9 @@ The full suite also uses a native C stdio client to exercise
 
 The build discovers top-level `lsp-*-contract.hk` and `codestyle-*-contract.hk`
 sources and runs their registered executable units. Contract arguments are the
-repository root, compiler executable and work directory. CodeStyle contracts
-exercise rule behavior, EditorConfig inheritance, actual CLI writes and LSP
-responses. The native protocol fixture requests language diagnostics only;
+repository root, compiler executable and work directory. Rule and correction
+requirements live in [CodeStyle](../docs/CODESTYLE.md#extending-the-engine).
+The native protocol fixture requests language diagnostics only;
 Neri LSP contracts verify style diagnostics and corrections with the default
 client settings.
 

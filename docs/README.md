@@ -12,6 +12,7 @@ packages include the language reference for the packaged compiler.
 - [Debug with LLDB and IDEs](DEBUGGING.md).
 - [Serve HTTP requests](HTTP.md).
 - [Read files and manage temporary filesystem state](FILES.md).
+- [Track rooted filesystem changes](CHANGES.md).
 - [Use elapsed time and UTC timestamps](CLOCK.md).
 - [Build bounded byte, text and ordered-value buffers](BUFFERS.md).
 - [Use UTF-8 text and validated Unicode scalars](TEXT.md).
