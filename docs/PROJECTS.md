@@ -1,6 +1,11 @@
 # Compilation projects
 
-A version-2 `neri.json` contains named compilation units. A unit owns its
+`neri run --project .` discovers the directory's `.hk` sources as one executable
+unit named `main` when the directory has no project manifest. The same source
+exclusions and nested-project boundaries apply to inferred and explicit units.
+Simple executable projects need only their source files.
+
+A version-2 `manifest.json` contains named compilation units. A unit owns its
 sources and can depend on library units without making namespaces depend on the
 directory layout:
 
@@ -25,13 +30,19 @@ directory layout:
 }
 ```
 
+The manifest uses strict JSON. Unknown keys, duplicate keys, trailing content,
+and values with incorrect types are configuration errors, including in units
+other than the selected unit. `exclude` and `references` are optional.
+Existing `neri.json` manifests remain supported; a project directory must
+contain at most one of the two filenames.
+
 `defaultUnit` selects the unit used when the command does not pass `--unit`.
 Every unit declares `kind` as `library` or `executable`. A local reference is
 the name of another unit in the same manifest. An external reference names both
 the other manifest and one of its units:
 
 ```json
-{ "project": "../shared/neri.json", "unit": "core" }
+{ "project": "../shared/manifest.json", "unit": "core" }
 ```
 
 References may target only library units. The complete reference closure is
@@ -46,7 +57,7 @@ recursively. `exclude` entries are literal relative files or directory
 subtrees. Version 2 does not support globs.
 
 Discovery skips symlinks, generated-output directories, and descendant
-directories containing their own `neri.json`. The generated directories are
+directories containing their own `manifest.json` or legacy `neri.json`. The generated directories are
 `.git`, `.neri`, `.cache`, `.idea`, `.bootstrap`, `build`, `out`, `dist`,
 `target`, and `bin`. Manifest aliases resolve to canonical paths, but discovery
 does not follow symlinks. `.hk` basenames must not contain whitespace, including
@@ -63,14 +74,19 @@ Libraries must not declare `main`. Executable units must declare exactly one
 ## Command line
 
 ```sh
-neri check --project neri.json --unit core
-neri build --project neri.json --unit web --output build/web
-neri run --project neri.json --unit web
+neri check --project manifest.json --unit core
+neri build --project manifest.json --unit web --output build/web
+neri run --project manifest.json --unit web
 ```
 
 `--unit` requires `--project` and overrides `defaultUnit`. Explicit source
 arguments cannot be combined with `--project`. Compiler flags such as
 `--release`, `--target`, and `--output` remain independent of source membership.
+
+An inferred project accepts `--unit main`. Selecting another unit reports that
+`manifest.json` is needed to declare additional units. Entry-point diagnostics
+offer a manifest suggestion when inferred sources may describe a library or
+several programs. The original semantic error remains the primary diagnostic.
 
 ## Standard-library sources
 
@@ -83,7 +99,7 @@ to its own library directory.
 
 ## Language server
 
-For each document, the server selects the nearest ancestor `neri.json`, stopping
+For each document, the server selects the nearest ancestor `manifest.json` or legacy `neri.json`, stopping
 at the workspace root for documents inside it. Nested manifests are independent
 project boundaries. Within a v2 manifest, a source is analyzed in the unit that
 owns it. This is important for shared code: opening a library source selects the
@@ -98,7 +114,7 @@ contents for subsequent analysis.
 
 A `workspace/didChangeWatchedFiles` notification reloads manifests and automatic
 directory membership. Clients must report create, change and delete events for
-closed `.hk` files, source directories, and relevant `neri.json` files. This
+closed `.hk` files, source directories, and relevant `manifest.json` or legacy `neri.json` files. This
 makes newly created or removed sources, exclusions, references, and nested
 project boundaries take effect without restarting the server.
 
@@ -107,3 +123,13 @@ general editor indexing root. The compiler currently flattens the selected
 unit's reference closure into one analysis. It does not provide dependency
 artifacts, version resolution, fetching, incremental graph caching, or
 background cancellation.
+
+## Contract project discovery
+
+The build tooling discovers and sorts `main.hk` files under
+`tests/value-contracts` and `manifest.json` files under `tests/runtime-contracts` on each run. An empty
+inventory fails validation. Value contracts infer one executable from each source directory and run it in
+Debug and Release. Runtime contracts declare `fixture` and `driver` executable
+units. The driver receives a fresh data directory, the fixture executable path,
+and the native target; it owns the scenario's setup and assertions in Neri.
+Adding a project under either directory includes it in the corresponding suite.

@@ -23,7 +23,7 @@ extern "C" {
 #endif
 
 #define NERI_RUNTIME_ABI_MAJOR UINT16_C(1)
-#define NERI_RUNTIME_ABI_MINOR UINT16_C(15)
+#define NERI_RUNTIME_ABI_MINOR UINT16_C(20)
 
 #define NERI_RT_FEATURE_PRECISE_GC UINT64_C(1)
 #define NERI_RT_FEATURE_NONMOVING_GC (UINT64_C(1) << 1)
@@ -47,6 +47,11 @@ extern "C" {
 #define NERI_RT_FEATURE_WALL_CLOCK (UINT64_C(1) << 17)
 #define NERI_RT_FEATURE_CRYPTO (UINT64_C(1) << 18)
 #define NERI_RT_FEATURE_ROOTED_FILES (UINT64_C(1) << 19)
+#define NERI_RT_FEATURE_PROCESS (UINT64_C(1) << 20)
+#define NERI_RT_FEATURE_DIRECTORY (UINT64_C(1) << 21)
+#define NERI_RT_FEATURE_SOCKET_CLOSE_RESULT (UINT64_C(1) << 22)
+/* Bit 23 is reserved for ABI 1.19 session support. */
+#define NERI_RT_FEATURE_DRAIN (UINT64_C(1) << 24)
 
 #define NERI_TYPE_KIND_CLASS_V1 UINT32_C(1)
 #define NERI_TYPE_KIND_STRING_V1 UINT32_C(2)
@@ -335,11 +340,25 @@ NERI_RT_API neri_int_v1 neri_rt_v1_file_error(void);
  * other=5, unavailable=6. kind=1 requires a directory, kind=2 opens a file. */
 NERI_RT_API neri_int_v1 neri_rt_v1_file_root_open(const uint8_t *path, neri_int_v1 length, neri_int_v1 *os_code, neri_int_v1 *category);
 NERI_RT_API neri_int_v1 neri_rt_v1_file_root_open_at(neri_int_v1 parent, const uint8_t *name, neri_int_v1 length, neri_int_v1 kind, neri_int_v1 *os_code, neri_int_v1 *category);
+/* ABI 1.17: descriptor-owned, no-follow directory iteration. */
+NERI_RT_API neri_int_v1 neri_rt_v1_file_directory_open(neri_int_v1 parent, neri_int_v1 *token, neri_int_v1 *os_code, neri_int_v1 *close_code);
+NERI_RT_API neri_int_v1 neri_rt_v1_file_directory_next(neri_int_v1 token, uint8_t *name, neri_int_v1 capacity, neri_int_v1 *length, neri_int_v1 *kind, neri_int_v1 *os_code);
+NERI_RT_API neri_int_v1 neri_rt_v1_file_directory_close(neri_int_v1 token, neri_int_v1 *os_code);
+/* ABI 1.16: supervised child processes with owned output snapshots. */
+NERI_RT_API neri_int_v1 neri_rt_v1_process_spawn(const uint8_t *config, neri_int_v1 length, neri_int_v1 *token, neri_int_v1 *os_code);
+NERI_RT_API neri_int_v1 neri_rt_v1_process_poll(neri_int_v1 token, neri_int_v1 wait_ms, neri_int_v1 *state, neri_int_v1 *os_code);
+NERI_RT_API neri_int_v1 neri_rt_v1_process_read(neri_int_v1 token, neri_int_v1 channel, neri_int_v1 offset, uint8_t *output, neri_int_v1 capacity, neri_int_v1 *count);
+NERI_RT_API neri_int_v1 neri_rt_v1_process_cancel(neri_int_v1 token, neri_int_v1 *os_code);
+NERI_RT_API neri_int_v1 neri_rt_v1_process_dispose(neri_int_v1 token, neri_int_v1 *os_code);
 /* ABI 1.12: one serving-thread-owned interrupt lease; 0 means unavailable.
  * Positive generation tokens prevent stale closes affecting a later lease. */
 NERI_RT_API neri_int_v1 neri_rt_v1_interrupt_open(void);
 NERI_RT_API neri_int_v1 neri_rt_v1_interrupt_pending(neri_int_v1 token);
 NERI_RT_API void neri_rt_v1_interrupt_close(neri_int_v1 token);
+/* ABI 1.20: native fatal drain deadline; token ownership remains native. */
+NERI_RT_API neri_int_v1 neri_rt_v1_drain_open(neri_int_v1 timeout_milliseconds, neri_int_v1 watch_interrupt);
+NERI_RT_API neri_int_v1 neri_rt_v1_drain_request(neri_int_v1 token);
+NERI_RT_API neri_int_v1 neri_rt_v1_drain_close(neri_int_v1 token);
 /* ABI 1.8: one foreground terminal lease, positive generation token.
  * Read: byte 0..255, -1 timeout, -2 closed/interrupted/error. Timeout 0..60000ms.
  * Close is idempotent; stale tokens cannot affect a subsequent lease.
@@ -364,6 +383,8 @@ NERI_RT_API neri_int_v1 neri_rt_v1_net_poll(neri_int_v1 fd, neri_int_v1 writing,
 NERI_RT_API neri_int_v1 neri_rt_v1_net_read(neri_int_v1 fd, uint8_t *bytes, neri_int_v1 length);
 NERI_RT_API neri_int_v1 neri_rt_v1_net_write(neri_int_v1 fd, uint8_t *bytes, neri_int_v1 length);
 NERI_RT_API void neri_rt_v1_net_close(neri_int_v1 fd);
+/* ABI 1.18: closes once and reports the platform close result. */
+NERI_RT_API neri_int_v1 neri_rt_v1_net_close_result(neri_int_v1 fd);
 NERI_RT_API neri_int_v1 neri_rt_v1_net_milliseconds(void);
 NERI_RT_API neri_int_v1 neri_rt_v1_net_error(uint8_t *bytes, neri_int_v1 capacity);
 

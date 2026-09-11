@@ -1,5 +1,13 @@
 # Binary file reads
 
+`files.ScopedRoot.open(absolutePath)` acquires a root through
+`result.Result<ScopedRoot, result.Failure>`. Use it with `using` inside a callable
+returning `resources.Outcome<T, result.Failure>` to release the root on scope
+exit, early return, or failure acquiring a later resource. The scoped root exposes
+bounded reads and directory enumeration while retaining its private handle.
+Its `close` is idempotent; reads and enumeration after closure report `closed`.
+
+
 `use files` loads bounded binary file reads. `files.readBytes(path, limit)`
 returns a result with optional `bytes`, `failure` and `closeFailure`. Success
 contains the exact bytes of a regular file, including invalid UTF-8, and closes

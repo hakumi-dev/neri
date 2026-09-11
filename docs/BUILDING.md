@@ -33,14 +33,14 @@ For Linux dependencies and full source installation, follow
 
 ## Build and test
 
-The root `neri.json` defines the compiler and tooling units. The `build` and
+The root `manifest.json` defines the compiler and tooling units. The `build` and
 `install` executables reference the shared `tooling` library, which references
 process support. Library directories discover new `.hk` files automatically;
 entry-point files belong to explicit executable units. To check tooling:
 
 ```sh
-neri check --project neri.json --unit build
-neri check --project neri.json --unit install
+neri check --project manifest.json --unit build
+neri check --project manifest.json --unit install
 ```
 
 The trusted bootstrap seed predates manifests. `scripts/build.sh` enumerates

@@ -29,6 +29,9 @@ static void interrupted(int signal) {
 #endif
 
 extern "C" int neri_interrupt_active(void) { return active; }
+extern "C" int neri_interrupt_pending_any(void) {
+  return pending.load(std::memory_order_relaxed) ? 1 : 0;
+}
 extern "C" void neri_interrupt_restore(void) {
   if (!active) return;
 #if defined(_WIN32)

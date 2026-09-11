@@ -515,7 +515,8 @@ void require_binary(const function_context &context, const instruction &value,
                                         const instruction &value,
                                         bool imported,
                                         bool require_method = false,
-                                        bool c_abi = false) {
+                                        bool c_abi = false,
+                                        bool unsafe_call = false) {
   if (!value.symbol.has_value()) {
     fail(invalid_reference, "Call instruction has no target symbol.");
   }
@@ -536,13 +537,17 @@ void require_binary(const function_context &context, const instruction &value,
   } else {
     const auto *target = find_function(context.module, *value.symbol);
     const auto valid_kind = target != nullptr &&
-                            (require_method
+                            (unsafe_call
+                                 ? target->kind == NERI_IR_FUNCTION_V1 ||
+                                       target->kind == NERI_IR_STATIC_METHOD_V1 ||
+                                       target->kind == NERI_IR_INSTANCE_METHOD_V1
+                                 : require_method
                                  ? target->kind == NERI_IR_INSTANCE_METHOD_V1 ||
                                        target->kind == NERI_IR_CONSTRUCTOR_V1
                                  : target->kind == NERI_IR_FUNCTION_V1 ||
                                        target->kind == NERI_IR_STATIC_METHOD_V1 ||
                                        target->kind == NERI_IR_DEFAULT_ADAPTER_V1);
-    if (!valid_kind || target->unsafe_call) {
+    if (!valid_kind || target->unsafe_call != unsafe_call) {
       fail(invalid_reference,
            "Direct call references a missing or unsupported function.");
     }
@@ -551,12 +556,12 @@ void require_binary(const function_context &context, const instruction &value,
     effects = target->effects;
   }
 
-  const auto operand_offset = c_abi ? 1U : 0U;
+  const auto operand_offset = c_abi || unsafe_call ? 1U : 0U;
   const auto result_count = is_void(*result) ? 0U : 1U;
   verify_instruction_shape(value, result_count,
                            parameters->size() + operand_offset, 0U, true,
                            false, false);
-  if (c_abi) {
+  if (c_abi || unsafe_call) {
     const type capability{NERI_IR_TYPE_UNSAFE_CAPABILITY_V1, std::nullopt,
                           {}};
     require_operand_type(context, value, 0U, capability);
@@ -568,7 +573,8 @@ void require_binary(const function_context &context, const instruction &value,
   if (result_count == 1U) {
     require_result_type(value, 0U, *result);
   }
-  return effects & ~NERI_IR_EFFECT_NO_RETURN_V1;
+  return (effects & ~NERI_IR_EFFECT_NO_RETURN_V1) |
+         (unsafe_call ? NERI_IR_EFFECT_UNSAFE_V1 : 0U);
 }
 
 [[nodiscard]] std::uint32_t verify_virtual_call(function_context &context,
@@ -848,6 +854,8 @@ void require_binary(const function_context &context, const instruction &value,
     return verify_call(context, value, true);
   case NERI_IR_OPCODE_CALL_C_ABI_V1:
     return verify_call(context, value, true, false, true);
+  case NERI_IR_OPCODE_CALL_UNSAFE_V1:
+    return verify_call(context, value, false, false, false, true);
   case NERI_IR_OPCODE_ARRAY_NEW_V1: {
     if (value.type_arguments.size() != 1U) {
       fail(invalid_type, "array.new requires one element type argument.");
@@ -1412,9 +1420,9 @@ void verify_function(const ir_module &module, const function &value) {
       value.kind > NERI_IR_DEFAULT_ADAPTER_V1) {
     fail(malformed_module, "Function has an invalid function kind.");
   }
-  if (value.unsafe_call) {
-    fail(unsupported_feature,
-         "Unsafe-call function lowering belongs to a later native card.");
+  if (value.unsafe_call != value.unsafe_root.has_value()) {
+    fail(invalid_safety,
+         "Unsafe function call contract disagrees with its capability root.");
   }
   if (is_method != value.declaring_class.has_value()) {
     fail(malformed_module,

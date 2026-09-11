@@ -156,6 +156,13 @@ def lspPosition(text: String, offset: Int): String
   return "{\"line\":" + (line as String) + ",\"character\":" + (column as String) + "}"
 end
 
+def lspPathOrEmpty(path: String?): String
+  if path == null
+    return ""
+  end
+  return path
+end
+
 class LspDocument
   public uri: String = ""
   public sourcePath: String = ""
@@ -233,7 +240,12 @@ class LspServer
     return document.sourcePath
   end
 
-  def nearestProjectManifest(path: String): String
+  # Return a project directory rather than a manifest filename.  The shared
+  # loader then applies the canonical `manifest.json` preference, accepts the
+  # legacy name, and can report two competing files as configuration error.
+  # A workspace without either file is still a project: it is inferred from
+  # the .hk files below its root.
+  def nearestProjectRoot(path: String): String
     let absolute = host.pathAbsolute(path)
     if absolute == null
       return ""
@@ -247,12 +259,12 @@ class LspServer
     end
     var directory = bootstrapDirectory(absolute)
     while true
-      let manifest = directory + (directory == "/" ? "neri.json" : "/neri.json")
-      if host.readText(manifest) != null
-        return manifest
+      let separator = directory == "/" ? "" : "/"
+      if host.readText(directory + separator + "manifest.json") != null || host.readText(directory + separator + "neri.json") != null
+        return directory
       end
       if boundary != "" && directory == boundary
-        return ""
+        return directory
       end
       let parent = bootstrapDirectory(directory)
       if parent == directory
@@ -263,12 +275,19 @@ class LspServer
     return ""
   end
 
-  def selectedUnit(manifest: String): String
+  def selectedUnit(projectPath: String): String
     if this.unit == "" || this.rootPath == ""
       return ""
     end
-    let workspaceManifest = host.pathAbsolute(this.rootPath + "/neri.json")
-    return workspaceManifest != null && workspaceManifest == manifest ? this.unit : ""
+    let workspacePath = lspPathOrEmpty(host.pathAbsolute(this.rootPath))
+    var project = lspPathOrEmpty(host.pathAbsolute(projectPath))
+    if neriProjectManifestName(project)
+      project = bootstrapDirectory(project)
+    end
+    if workspacePath == project
+      return this.unit
+    end
+    return ""
   end
 
   def reanalyze(): Void
@@ -294,11 +313,11 @@ class LspServer
     if sourcePath == ""
       return false
     end
-    let manifest = this.nearestProjectManifest(lexical)
-    if manifest == ""
+    let projectPath = this.nearestProjectRoot(lexical)
+    if projectPath == ""
       return false
     end
-    let project = neriProjectForSource(manifest, sourcePath, this.selectedUnit(manifest))
+    let project = neriProjectForSource(projectPath, sourcePath, this.selectedUnit(projectPath))
     return project.error == "" && neriProjectContains(project, sourcePath) && neriProjectContains(project, path)
   end
 
@@ -324,6 +343,7 @@ class LspServer
     document.stdlibDocumentation = this.stdlibDocumentation
     document.requireEntryPoint = true
     document.forbiddenEntryPointSources = new StringBuffer()
+    var implicitProject = false
     let filePath = lspPath(document.uri)
     if filePath != null && !neriSourceNameValid(filePath)
       this.publish(document, "[{\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":0,\"character\":0}},\"severity\":1,\"code\":\"NR_FILE_NAME\",\"source\":\"neri\",\"message\":\".hk file names must not contain whitespace.\"}]")
@@ -344,15 +364,19 @@ class LspServer
       let lexical = host.pathAbsolute(filePath)
       if lexical != null
         let path = this.resolveDocumentPath(document)
-        let manifest = this.nearestProjectManifest(lexical)
-        if manifest != ""
-          let project = neriProjectForSource(manifest, path, this.selectedUnit(manifest))
-          if project.error != ""
+        let projectPath = this.nearestProjectRoot(lexical)
+        if projectPath != ""
+          let project = neriProjectForSource(projectPath, path, this.selectedUnit(projectPath))
+          # An empty inferred workspace can still analyze its first unsaved
+          # document. Once it is saved, discovery includes it on the next
+          # analysis. Other implicit-project configuration errors stay visible.
+          if project.error != "" && project.error != "An implicit project must contain at least one .hk source."
             this.publish(document, "[{\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":0,\"character\":0}},\"severity\":1,\"code\":\"NR_PROJECT\",\"source\":\"neri\",\"message\":" + lspQuote(project.error) + "}]")
             lspLog(project.error)
             return
           end
           if neriProjectContains(project, path)
+            implicitProject = project.implicit
             document.requireEntryPoint = project.kind == "executable"
             if project.kind == "library"
               # Preserve the editor URI for the primary file, including aliases.
@@ -452,7 +476,9 @@ class LspServer
     while index < diagnostics.count()
       let start = diagnostics.starts.get(index)
       if starts.size == 1 || start < starts.get(1)
-        result = result + separator + "{\"range\":{\"start\":" + lspPosition(document.text, start) + ",\"end\":" + lspPosition(document.text, start + diagnostics.lengths.get(index)) + "},\"severity\":1,\"code\":" + lspQuote(diagnostics.codes.get(index)) + ",\"source\":\"neri\",\"message\":" + lspQuote(diagnostics.messages.get(index)) + "}"
+        let code = diagnostics.codes.get(index)
+        let message = diagnostics.messages.get(index) + (implicitProject ? neriImplicitProjectHint(code) : "")
+        result = result + separator + "{\"range\":{\"start\":" + lspPosition(document.text, start) + ",\"end\":" + lspPosition(document.text, start + diagnostics.lengths.get(index)) + "},\"severity\":1,\"code\":" + lspQuote(code) + ",\"source\":\"neri\",\"message\":" + lspQuote(message) + "}"
         separator = ","
       else
         var sourceIndex = 0

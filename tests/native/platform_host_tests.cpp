@@ -131,6 +131,9 @@ void test_process(const std::filesystem::path &self, const std::filesystem::path
   arguments.insert(arguments.end(), child_arguments.begin(), child_arguments.end());
   std::string error = "stale error";
   require(neri::platform::run(arguments, error) == 7 && error.empty(), "process arguments or exit code changed");
+  arguments = {neri::path_text(child), "--exit-127"};
+  require(neri::platform::run(arguments, error) == 127 && error.empty(),
+          "real exit status 127 was treated as an exec failure");
   arguments = {neri::path_text(directory / "missing-program")};
   require(!neri::platform::run(arguments, error) && !error.empty(), "missing executable reported success");
 }
@@ -154,6 +157,7 @@ int main(int argc, char **argv) {
         require(argv[i + 2] == child_arguments[i], "child argument bytes changed");
       return 7;
     }
+    if (argc == 2 && std::string(argv[1]) == "--exit-127") return 127;
     temporary_directory directory;
     test_files(directory.path);
     test_environment();

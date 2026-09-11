@@ -131,9 +131,13 @@ else()
 endif()
 add_library(neri_runtime STATIC
   native/platform/interrupts.cpp
+  native/platform/drain.cpp
+  native/platform/directory.cpp
   native/platform/files.cpp
   native/platform/crypto.c
   native/platform/host.cpp
+  native/platform/posix_launch.cpp
+  native/platform/process.cpp
   native/runtime/entry.cpp
   native/runtime/math.cpp
   native/runtime/runtime.cpp
@@ -178,6 +182,10 @@ if(WIN32)
   target_link_libraries(neri_launcher PRIVATE neri_build_options shell32)
 endif()
 if(BUILD_TESTING)
+  add_library(neri_process_test STATIC tests/native/process_escape.c)
+  set_target_properties(neri_process_test PROPERTIES OUTPUT_NAME "neri-process-test")
+  target_link_libraries(neri_process_test PRIVATE neri_build_options)
+
   add_executable(neri_platform_host_tests tests/native/platform_host_tests.cpp)
   target_link_libraries(neri_platform_host_tests PRIVATE neri_build_options neri_runtime)
   add_test(NAME native_platform_host COMMAND neri_platform_host_tests)
@@ -242,7 +250,7 @@ set(NERI_MANIFEST_VERSION "${NERI_VERSION}")
 set(NERI_MANIFEST_NAME "neri-runtime-${NERI_TARGET}.json")
   file(GENERATE
     OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/${NERI_MANIFEST_NAME}"
-    CONTENT "{\n  \"schemaVersion\": 2,\n  \"toolchainVersion\": \"${NERI_MANIFEST_VERSION}\",\n  \"irTransportMajor\": 1,\n  \"irTransportMinor\": 1,\n  \"target\": \"${NERI_TARGET}\",\n  \"abiMajor\": 1,\n  \"abiMinor\": 15,\n  \"features\": 1047295,\n  \"artifact\": \"$<TARGET_FILE_NAME:neri_runtime>\"\n}\n"
+    CONTENT "{\n  \"schemaVersion\": 2,\n  \"toolchainVersion\": \"${NERI_MANIFEST_VERSION}\",\n  \"irTransportMajor\": 1,\n  \"irTransportMinor\": 1,\n  \"target\": \"${NERI_TARGET}\",\n  \"abiMajor\": 1,\n  \"abiMinor\": 20,\n  \"features\": 25164543,\n  \"artifact\": \"$<TARGET_FILE_NAME:neri_runtime>\"\n}\n"
   )
 install(TARGETS neri_codegen_cli neri_runtime RUNTIME DESTINATION bin ARCHIVE DESTINATION lib)
 install(FILES "${CMAKE_CURRENT_BINARY_DIR}/neri-runtime-${NERI_TARGET}.json" DESTINATION lib)
