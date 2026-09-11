@@ -13,6 +13,17 @@ insertion order for equal keys, following the standard
 [merge sort](https://www.nist.gov/dads/HTML/mergesort.html) and
 [merge](https://www.nist.gov/dads/HTML/merge.html) definitions.
 
+Transport bytes occupy linked 256-byte arrays, with `ceil(N / 256)` chunks
+and less than 256 bytes of unused tail capacity for `N` bytes. Each buffer
+constructs one zero template; copying that template creates independent chunks.
+Sequential writes and checksum input traverse the chunks in `O(N)` time;
+reads before the current chunk restart from the first chunk. Hexadecimal
+encoding writes two ASCII digits per byte into packed chunks, converts each
+chunk to a string, then joins pairs in balanced rounds. This uses `O(N)` storage
+and `O(N log(1 + N / 256))` character-copy work, without allocating a string for
+each digit. These bounds describe transport storage and encoding, not the
+complete compiler heap or compilation time; the IR remains live during encoding.
+
 The key hashes the canonical IR transport and a length-delimited build context
 with SHA-256. The context includes target, optimization mode, runtime manifest,
 working directory, selected SDK/developer tools, deployment target and PATH.
@@ -67,18 +78,18 @@ in Release mode; submitted modules use `SessionToolchain`'s default Debug mode:
 
 | Operation | First cache miss | Two cache hits |
 |---|---:|---:|
-| Initializer, complete operation | 3,275 ms | 1,406 ms, 1,342 ms |
-| New-variable execute | 86 ms | 20 ms, 21 ms |
+| Initializer, complete operation | 1,260 ms | 600 ms, 596 ms |
+| New-variable execute | 36 ms | 15 ms, 17 ms |
 
 The initializer measurement includes preparation, compilation, linking or object
 loading, and execution. Submission execution rows exclude their separately
 recorded preparation, which was 32–36 ms for these operations. Uncached execution
-for the other four submissions was 76–82 ms. At retained-history positions 1,
-10 and 25, uncached execution was 94, 82 and 100 ms; preparation was 37, 42 and
-54 ms. Cache-hit execution at those positions was 21–24, 35–39 and 48 ms.
+for the other four submissions was 38–42 ms. At retained-history positions 1,
+10 and 25, uncached execution was 39, 40 and 51 ms; preparation was 37, 41 and
+56 ms. Cache-hit execution at those positions was 15–17, 18–22 and 25 ms.
 
-A generated project matrix separated application size from the new-variable
-submission. For 10, 100, 500 and 900 ordinary functions, initializer misses were
+A generated project matrix, measured before packed transport storage, separated
+application size from the new-variable submission. For 10, 100, 500 and 900 ordinary functions, initializer misses were
 60, 165, 781 and 1,467 ms, while new-variable misses were 23, 25, 39 and 52 ms.
 Their actual cache hits were 4, 5, 7 and 10 ms. This local matrix shows that the
 remaining initializer work grows with the application while incremental work
@@ -88,8 +99,19 @@ Each backend used a separate new private code-cache directory. The first artifac
 is therefore a Neri code-cache miss, but neither run clears operating-system file,
 loader or disk caches. This benchmark invokes the Sumi initializer through the
 Neri session API; it does not measure startup of an installed Sumi command-line
-program. Raw records and exact reproduction metadata are described in
+program. Raw records (`build/wire-final-session.csv` and `.jsonl`) and exact reproduction
+metadata are described in
 [`benchmarks/session/README.md`](../benchmarks/session/README.md).
+
+An installed Sumi command may also build its console executable after a toolchain
+update. A separate Release build of the same Sumi console sources with the same
+native backend measured 40.83 s and 7,881,021,320 bytes of peak memory footprint
+with the previous transport encoder, versus 30.12 s and 789,480,432 bytes with
+packed storage and direct hexadecimal encoding. The 38,349,058-byte hexadecimal
+transport matched byte for byte. These are single sequential build observations,
+not latency percentiles. Footprint is process memory reported by macOS
+`/usr/bin/time -lp`, not disk-cache size. Sumi controls when this build runs;
+these changes reduce Neri's compilation cost.
 
 An earlier `e720a92` record measured complete initializer operations at 2,164,
 2,224 and 2,335 ms and new-variable preparation plus execution at 1,951, 1,875

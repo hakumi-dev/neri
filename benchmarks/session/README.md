@@ -69,7 +69,32 @@ using those metrics to attribute latency.
 
 ## Final session measurements
 
-The final 2026-09-09 macOS ARM64 observation used fixed-point compiler
+The packed-transport follow-up uses `build/wire-final-session.csv` and `.jsonl`.
+Its compiler `build/neri-wire-final-compact` has SHA-256
+`74c301fee75ac66d8c80eedf24f649c0027bc93bee5fc2ce324f262b25e92f18`;
+the Release driver `build/session-benchmark-wire-final` has SHA-256
+`a121380b252eeb937b72674bef53560255f1b2df8b247a6ab74e9061a26a8b89`.
+The reports have hashes
+`6319e5d9f2d655cc69333171f057472c594c0ac012c76c6f25eaacc13256b80d`
+and `077e83c8ad9ee3ac1745405d7505d720df53e7de4a8a9d2c0cf3b453785ccada`.
+The same three-repetition Sumi command below applies, with these compiler,
+driver and output paths, a new private cache, repository stdlib/native runtime,
+and `SUMI_PUBLIC` pointing at the demo's public directory. Initializer times were
+1,260 ms on a code-cache miss and 600/596 ms on hits. Modules remain Debug builds.
+
+The separate full-console build comparison is recorded in
+`build/wire-sumi-before.log` and `build/wire-sumi-final.log`. Both compile
+`/Users/kb714/Projects/sumi/console/neri.json` in Release mode using the same
+installed library sources and native toolchain, with `/usr/bin/time -lp`.
+The compiler changes; the baseline also includes the installed launcher's setup.
+The baseline compiler hash is
+`bdd82ed4b44244ca47b8f0d5b7e199727ec81d9d7df1d4250080cf52aa30e652`.
+The canonical hexadecimal output is 38,349,058 bytes with SHA-256
+`cb35dc810715f4bb5ca23340c507239a662988a630f55a699340ed910a3755bf`
+for both compilers. These runs measure rebuilding the console, separately from
+the session initializer and incremental submissions. No Sumi sources change.
+
+The preceding object-backend measurement on 2026-09-09 used fixed-point compiler
 `build/current/bin/neri` (SHA-256
 `bdd82ed4b44244ca47b8f0d5b7e199727ec81d9d7df1d4250080cf52aa30e652`)
 and benchmark driver `build/session-benchmark-final-abi24` (SHA-256
