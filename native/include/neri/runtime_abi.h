@@ -23,7 +23,7 @@ extern "C" {
 #endif
 
 #define NERI_RUNTIME_ABI_MAJOR UINT16_C(1)
-#define NERI_RUNTIME_ABI_MINOR UINT16_C(10)
+#define NERI_RUNTIME_ABI_MINOR UINT16_C(12)
 
 #define NERI_RT_FEATURE_PRECISE_GC UINT64_C(1)
 #define NERI_RT_FEATURE_NONMOVING_GC (UINT64_C(1) << 1)
@@ -42,6 +42,8 @@ extern "C" {
 #define NERI_RT_FEATURE_SOCKETS (UINT64_C(1) << 12)
 #define NERI_RT_FEATURE_INTERACTIVE_IO (UINT64_C(1) << 13)
 #define NERI_RT_FEATURE_SCOPED_TASKS (UINT64_C(1) << 14)
+#define NERI_RT_FEATURE_FILES (UINT64_C(1) << 15)
+#define NERI_RT_FEATURE_INTERRUPTS (UINT64_C(1) << 16)
 
 #define NERI_TYPE_KIND_CLASS_V1 UINT32_C(1)
 #define NERI_TYPE_KIND_STRING_V1 UINT32_C(2)
@@ -317,6 +319,19 @@ NERI_RT_API neri_ref_v1 neri_rt_v1_host_error_message(void);
  * configure enables nonblocking I/O, close-on-exec and SIGPIPE suppression.
  */
 NERI_RT_API neri_int_v1 neri_rt_v1_net_open(void);
+/* ABI 1.11: caller-owned regular-file descriptors; size -2 means nonregular,
+ * read -2 means interrupted. Other failures return -1. Capture file_error
+ * immediately after failure. Paths are UTF-8 bytes without embedded NUL. */
+NERI_RT_API neri_int_v1 neri_rt_v1_file_open(const uint8_t *path, neri_int_v1 length);
+NERI_RT_API neri_int_v1 neri_rt_v1_file_size(neri_int_v1 fd);
+NERI_RT_API neri_int_v1 neri_rt_v1_file_read(neri_int_v1 fd, uint8_t *bytes, neri_int_v1 length);
+NERI_RT_API neri_int_v1 neri_rt_v1_file_close(neri_int_v1 fd);
+NERI_RT_API neri_int_v1 neri_rt_v1_file_error(void);
+/* ABI 1.12: one serving-thread-owned interrupt lease; 0 means unavailable.
+ * Positive generation tokens prevent stale closes affecting a later lease. */
+NERI_RT_API neri_int_v1 neri_rt_v1_interrupt_open(void);
+NERI_RT_API neri_int_v1 neri_rt_v1_interrupt_pending(neri_int_v1 token);
+NERI_RT_API void neri_rt_v1_interrupt_close(neri_int_v1 token);
 /* ABI 1.8: one foreground terminal lease, positive generation token.
  * Read: byte 0..255, -1 timeout, -2 closed/interrupted/error. Timeout 0..60000ms.
  * Close is idempotent; stale tokens cannot affect a subsequent lease.

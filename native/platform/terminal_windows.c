@@ -10,6 +10,7 @@ static DWORD saved_input, saved_output;
 static int active, registered;
 static volatile LONG interrupted;
 static int64_t generation;
+int neri_terminal_active(void) { return active; }
 static unsigned char pending[16];
 static size_t pending_count;
 static BOOL WINAPI interrupt_session(DWORD event) {
@@ -29,7 +30,7 @@ void neri_terminal_restore(void) {
   active = 0;
 }
 int64_t neri_rt_v1_terminal_open(void) {
-  if (active || generation == INT64_MAX) return 0;
+  if (active || neri_interrupt_active() || generation == INT64_MAX) return 0;
   input = GetStdHandle(STD_INPUT_HANDLE);
   output = GetStdHandle(STD_OUTPUT_HANDLE);
   if (!GetConsoleMode(input, &saved_input) || !GetConsoleMode(output, &saved_output)) return 0;

@@ -130,6 +130,8 @@ else()
   set(NERI_PLATFORM_SOURCES native/platform/socket_posix.c native/platform/terminal_posix.c)
 endif()
 add_library(neri_runtime STATIC
+  native/platform/interrupts.cpp
+  native/platform/files.cpp
   native/platform/host.cpp
   native/runtime/entry.cpp
   native/runtime/math.cpp
@@ -236,7 +238,7 @@ set(NERI_MANIFEST_VERSION "${NERI_VERSION}")
 set(NERI_MANIFEST_NAME "neri-runtime-${NERI_TARGET}.json")
   file(GENERATE
     OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/${NERI_MANIFEST_NAME}"
-    CONTENT "{\n  \"schemaVersion\": 2,\n  \"toolchainVersion\": \"${NERI_MANIFEST_VERSION}\",\n  \"irTransportMajor\": 1,\n  \"irTransportMinor\": 1,\n  \"target\": \"${NERI_TARGET}\",\n  \"abiMajor\": 1,\n  \"abiMinor\": 10,\n  \"features\": 31487,\n  \"artifact\": \"$<TARGET_FILE_NAME:neri_runtime>\"\n}\n"
+    CONTENT "{\n  \"schemaVersion\": 2,\n  \"toolchainVersion\": \"${NERI_MANIFEST_VERSION}\",\n  \"irTransportMajor\": 1,\n  \"irTransportMinor\": 1,\n  \"target\": \"${NERI_TARGET}\",\n  \"abiMajor\": 1,\n  \"abiMinor\": 12,\n  \"features\": 129791,\n  \"artifact\": \"$<TARGET_FILE_NAME:neri_runtime>\"\n}\n"
   )
 install(TARGETS neri_codegen_cli neri_runtime RUNTIME DESTINATION bin ARCHIVE DESTINATION lib)
 install(FILES "${CMAKE_CURRENT_BINARY_DIR}/neri-runtime-${NERI_TARGET}.json" DESTINATION lib)

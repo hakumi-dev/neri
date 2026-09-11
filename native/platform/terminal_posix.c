@@ -18,6 +18,7 @@ static struct sigaction previous[5];
 static volatile sig_atomic_t interrupted;
 static int active, registered;
 static int64_t generation;
+int neri_terminal_active(void) { return active; }
 
 void neri_terminal_restore(void) {
   if (!active) return;
@@ -31,7 +32,7 @@ void neri_terminal_restore(void) {
 static void interrupt_session(int number) { (void)number; interrupted = 1; }
 
 int64_t neri_rt_v1_terminal_open(void) {
-  if (active || generation == INT64_MAX || !isatty(0) || !isatty(1) ||
+  if (active || neri_interrupt_active() || generation == INT64_MAX || !isatty(0) || !isatty(1) ||
       tcgetpgrp(0) != getpgrp() || tcgetattr(0, &saved) != 0) return 0;
   if (!registered) {
     if (atexit(neri_terminal_restore) != 0) return 0;
