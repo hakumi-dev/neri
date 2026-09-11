@@ -10,7 +10,7 @@ packages include the language reference for the packaged compiler.
 - [Look up syntax, types and commands](LANGUAGE.md).
 - [Configure code style and automatic corrections](CODESTYLE.md).
 - [Serve HTTP requests](HTTP.md).
-- [Read bounded binary files](FILES.md).
+- [Read files and manage temporary filesystem state](FILES.md).
 - [Use elapsed time and UTC timestamps](CLOCK.md).
 - [Build bounded byte, text and ordered-value buffers](BUFFERS.md).
 - [Hash bytes and obtain operating-system entropy](CRYPTO.md).

@@ -251,3 +251,39 @@ constants, monotonic time, and individual system calls. These unsafe imports
 require runtime ABI 1.20 with sockets, interrupts, socket-close-result, and drain
 features. The toolchain includes and
 checksums the standard-library source alongside its native artifacts.
+
+## Loopback client
+
+The `httpclient` module provides a bounded plain HTTP/1.1 client for local
+integration tests. `get`, `head`, and `request` connect only to `127.0.0.1` at
+the supplied port. The request target is an origin-form string beginning with
+`/` with an optional query and no fragment; the client sends its bytes unchanged, including encoded path separators,
+dot segments, and the query. This preserves the target syntax whose semantics
+belong to the server under
+[RFC 9112 section 3.2.1](https://www.rfc-editor.org/rfc/rfc9112.html#section-3.2.1).
+
+Each exchange uses one connection and sends `Connection: close`. Responses
+retain their body as bytes and retain repeated field lines in order. The first
+matching field is available through `Response.header`; all matching fields are
+available through `Response.headerValues`. `Options` bounds the absolute I/O
+deadline, response header, and response body. The client accepts
+`Content-Length` framing and close-delimited responses, rejects transfer coding
+and repeated length fields, and applies the response-body rules from
+[RFC 9112 section 6.3](https://www.rfc-editor.org/rfc/rfc9112.html#section-6.3).
+
+Defaults are 4 seconds, 16 KiB of response headers and 8 MiB of body. Response
+headers contain at most 128 field lines. Configurable limits are at most 1 MiB
+for response headers and 128 MiB for the body; the complete encoded request is
+bounded to 1 MiB. Status and length fields use strict decimal syntax. Interim
+1xx responses report `unsupported_interim_response`; extra bytes beyond a
+declared body report `extra_body`. Both connection and response deadlines
+report `timeout`. Cleanup preserves a socket-close failure alongside an
+existing exchange failure.
+
+The client requires runtime ABI 1.22 and `SOCKET_ENDPOINTS`. The runtime also
+exposes bound-port discovery for test listeners that bind port zero, so a
+fixture can retain its listener while reporting the assigned port.
+
+The module intentionally covers loopback plain HTTP. It does not resolve host
+names, negotiate TLS, follow redirects, pool connections, or decode transfer
+and content codings.
