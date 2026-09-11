@@ -9,67 +9,169 @@ class SemanticTypeParameter
   end
 end
 
-def semanticGenericConstraint(syntax: SyntaxArena, template: Int, index: Int): String
-  let constraints = syntax.nodeAt(template).typeParameterConstraints
+def semanticFindContract(model: SemanticModel, written: String, namespaceName: String): SemanticContract?
+  let qualified = semanticFindByte(written, 46) >= 0
+  var result = model.findContract(qualified ? written : semanticQualifiedName(namespaceName, written))
 
-  if index < 0 || index >= constraints.Length || constraints[index] < 0
-    return ""
+  if result == null && !qualified
+    result = model.findContract(written)
   end
-  return syntax.dataAt(constraints[index])
+  if result != null || qualified
+    return result
+  end
+  var index = 0
+
+  while index < model.usedNames.size
+    let candidate = model.findContract(semanticQualifiedName(model.usedNames.get(index), written))
+
+    if candidate != null
+      return null if result != null
+      result = candidate
+    end
+    index = index + 1
+  end
+  return result
+end
+
+def semanticResolveContract(owner: BootstrapBinder, written: String, namespaceName: String, node: Int): SemanticContract?
+  let result = semanticFindContract(owner.model, written, namespaceName)
+
+  if result == null
+    owner.report("NR250", node, "Unknown or ambiguous generic contract '" + written + "'.")
+    return null
+  end
+  owner.model.referenceQualifiedUse(result.fullName)
+  owner.recordOccurrence("contract:" + result.fullName, node)
+  return result
+end
+
+def semanticGenericContract(owner: BootstrapBinder, template: Int, index: Int, report: Bool): SemanticContract?
+  let constraints = owner.syntax.nodeAt(template).typeParameterConstraints
+
+  return null if index < 0 || index >= constraints.Length || constraints[index] < 0
+  let node = constraints[index]
+  let bound = owner.syntax.nodeAt(node)
+  let namespaceName = semanticField(owner.syntax.dataAt(template), 0)
+
+  if report && owner.recordCompletionSites
+    let site = new SemanticCompletionSite()
+
+    site.start = owner.syntax.startAt(node)
+    site.length = owner.syntax.lengthAt(node)
+    site.namespaceName = namespaceName
+    site.receiverKind = "constraint"
+    site.next = owner.model.completionSites
+    owner.model.completionSites = site
+  end
+
+  if bound.kind != "Type" || bound.typeArguments.Length != 0 || bound.children.Length != 1 || owner.syntax.kindAt(bound.children[0]) != "QualifiedName"
+    if report
+      owner.report("NR250", node, "A generic module function constraint names one source-declared contract without type arguments.")
+    end
+    return null
+  end
+  return report ? semanticResolveContract(owner, bound.data, namespaceName, node) : semanticFindContract(owner.model, bound.data, namespaceName)
 end
 
 def semanticGenericConstraintsValid(owner: BootstrapBinder, template: Int, report: Bool = true): Bool
   let source = owner.syntax.nodeAt(template)
   var valid = true
+  var constrained = false
+  var index = 0
 
-  for constraint in source.typeParameterConstraints
-    if constraint >= 0
-      let bound = owner.syntax.nodeAt(constraint)
-      let supported = source.kind == "Function" && source.typeParameters.Length > 0 && genericOperationName(owner.syntax, template) == "" && bound.kind == "Type" && bound.data == "Equality" && bound.typeArguments.Length == 0 && bound.children.Length == 1 && owner.syntax.kindAt(bound.children[0]) == "QualifiedName"
-
-      if !supported
+  while index < source.typeParameterConstraints.Length
+    if source.typeParameterConstraints[index] >= 0
+      constrained = true
+      if source.kind != "Function" || source.typeParameters.Length == 0 || genericOperationName(owner.syntax, template) != "" || semanticGenericContract(owner, template, index, report) == null
         valid = false
-        if report
-          owner.report("NR250", constraint, "A generic module function may require 'Equality' on a type parameter; this constraint has no type arguments and does not apply to classes, enums, or compiler operations.")
-        end
       end
     end
+    index = index + 1
+  end
+  if constrained && !valid && report && (source.kind != "Function" || genericOperationName(owner.syntax, template) != "")
+    owner.report("NR250", template, "Only generic module functions may declare contracts; compiler operations cannot be constrained.")
   end
   return valid
 end
 
-def semanticSupportsEquality(model: SemanticModel, typeName: String): Bool
-  let parameter = model.findTypeParameter(typeName)
+def semanticFindContractMethod(model: SemanticModel, typeName: String, name: String, arity: Int): SemanticCallable?
+  let abstract = semanticTypeParameterMethod(model, typeName, name)
 
-  if parameter != null
-    return parameter.capability == "Equality"
+  if abstract != null && abstract.parameterCount == arity
+    return abstract
   end
-  if semanticEqualityComparable(typeName)
-    return true
-  end
-  let method = semanticOperatorMethod(model, typeName, "==", 1)
+  var owner = model.findClass(semanticMutableType(typeName))
+  var steps = 0
 
-  if method == null || method.returnType != "Bool"
-    return false
-  end
-  let operand = method.firstParameter
+  while owner != null && steps < 256
+    var method = owner.firstMethod
 
-  return operand != null && operand.typeName == typeName
+    while method != null
+      if method.name == name
+        return method
+      end
+      method = method.nextCallable
+    end
+    owner = model.findClass(owner.baseName)
+    steps = steps + 1
+  end
+  return null
+end
+
+def semanticRequirementMatches(requirement: SemanticCallable, implementation: SemanticCallable, typeName: String): Bool
+  return false if implementation.access != "public" || implementation.isStatic || implementation.isUnsafe || implementation.parameterCount != requirement.parameterCount
+  return false if implementation.returnType != semanticContractSubstitute(requirement.returnType, typeName) || (requirement.isReadonly && !implementation.isReadonly) || (semanticIsReadonly(typeName) && !implementation.isReadonly)
+  var expected = requirement.firstParameter
+  var actual = implementation.firstParameter
+
+  while expected != null && actual != null
+    return false if actual.typeName != semanticContractSubstitute(expected.typeName, typeName)
+    expected = expected.nextParameter
+    actual = actual.nextParameter
+  end
+  return expected == null && actual == null
+end
+
+def semanticTypeSatisfiesContract(model: SemanticModel, typeName: String, contract: SemanticContract): Bool
+  var requirement = contract.firstRequirement
+
+  while requirement != null
+    if requirement.operatorName != ""
+      let builtin = semanticBuiltinOperatorResult(typeName, requirement.operatorName, requirement.parameterCount)
+
+      if builtin != ""
+        return false if builtin != semanticContractSubstitute(requirement.returnType, typeName)
+      else
+        let implementation = semanticOperatorMethod(model, typeName, requirement.operatorName, requirement.parameterCount)
+
+        return false if implementation == null || !semanticRequirementMatches(requirement, implementation, typeName)
+      end
+    else
+      let implementation = semanticFindContractMethod(model, typeName, requirement.name, requirement.parameterCount)
+
+      return false if implementation == null || !semanticRequirementMatches(requirement, implementation, typeName)
+    end
+    requirement = requirement.nextCallable
+  end
+  return contract.firstRequirement != null
 end
 
 def semanticCheckGenericConstraints(owner: BootstrapBinder, template: Int, arguments: StringBuffer, node: Int): Bool
+  return false if !semanticGenericConstraintsValid(owner, template, false)
   let source = owner.syntax.nodeAt(template)
-
-  if !semanticGenericConstraintsValid(owner, template, false)
-    return false
-  end
   var valid = true
   var index = 0
 
   while index < source.typeParameters.Length && index < arguments.size
-    if semanticGenericConstraint(owner.syntax, template, index) == "Equality" && !semanticSupportsEquality(owner.model, arguments.get(index))
-      owner.report("NR251", node, "Type '" + arguments.get(index) + "' does not satisfy 'Equality' required by type parameter '" + source.typeParameters[index] + "' of '" + genericName(owner, template) + "'.")
-      valid = false
+    let contract = semanticGenericContract(owner, template, index, false)
+
+    if contract != null
+      let satisfied = semanticTypeSatisfiesContract(owner.model, arguments.get(index), contract)
+
+      if !satisfied
+        owner.report("NR251", node, "Type '" + arguments.get(index) + "' does not satisfy '" + contract.fullName + "' required by type parameter '" + source.typeParameters[index] + "' of '" + genericName(owner, template) + "'.")
+        valid = false
+      end
     end
     index = index + 1
   end

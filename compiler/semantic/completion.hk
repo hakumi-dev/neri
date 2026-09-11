@@ -38,6 +38,26 @@ def semanticCompletionUtf16Slice(text: String, start: Int, length: Int): String
   return host.stringSlice(text, first, last - first)
 end
 
+def semanticCompletionConstraintColon(tokens: TokenBuffer, position: Int): Bool
+  if position < 2 || tokens.kindAt(position) != "Colon"
+    return false
+  end
+  var index = position - 2
+
+  while index >= 0
+    let kind = tokens.kindAt(index)
+
+    if kind == "Less"
+      return true
+    end
+    if kind == "NewLine" || kind == "Greater" || kind == "Equal" || kind == "LParen" || kind == "Def"
+      return false
+    end
+    index = index - 1
+  end
+  return false
+end
+
 def semanticCompletionTarget(text: String, position: Int): SemanticCompletionTarget
   let result = new SemanticCompletionTarget()
   let tokens = (new BootstrapLexer(text)).lex()
@@ -98,6 +118,11 @@ def semanticCompletionTarget(text: String, position: Int): SemanticCompletionTar
     result.kind = "import"
     result.receiverType = importPrefix
   end
+  if semanticCompletionConstraintColon(tokens, importIndex)
+    result.kind = "constraint"
+    result.receiverType = importPrefix
+    result.addCall = false
+  end
   result.addCall = false if result.kind == "import"
   result.addCall = false if following >= 0 && tokens.kindAt(following) == "LParen"
   result.valid = true
@@ -113,6 +138,9 @@ def semanticCompletionSite(model: SemanticModel, target: SemanticCompletionTarge
     let kindMatches = target.kind == "member" ? site.receiverKind != "" && site.receiverKind != "type" : site.receiverKind == target.kind || (target.kind == "name" && site.receiverKind == "")
 
     if kindMatches && site.start == target.start
+      if target.kind == "member" && site.receiverKind == "contract"
+        return site
+      end
       if selected == null
         selected = site
       else
@@ -129,6 +157,9 @@ def semanticCompletionSite(model: SemanticModel, target: SemanticCompletionTarge
   end
   if ambiguous
     return null
+  end
+  if selected != null && target.kind == "constraint"
+    selected.receiverType = target.receiverType
   end
   return selected
 end
@@ -258,33 +289,6 @@ def semanticCompletionAddClassMembers(values: SemanticCompletionList, model: Sem
   end
 end
 
-def semanticCompletionLibraryDetail(intrinsic: SemanticNativeIntrinsic): String
-  var result = intrinsic.legacyName + "("
-  var index = 0
-  var separator = ""
-
-  while index < intrinsic.parameterTypes.Length
-    result = result + separator + intrinsic.parameterTypes[index]
-    separator = ", "
-    index = index + 1
-  end
-  return result + "): " + intrinsic.resultType
-end
-
-def semanticCompletionAddLibrary(values: SemanticCompletionList, model: SemanticModel, site: SemanticCompletionSite, prefix: String): Void
-  let library = site.receiverType
-
-  semanticCompletionFunctions(values, model, site, prefix, true)
-  semanticCompletionGenerics(values, model, site, prefix, "Function", true)
-  for name in semanticLibraryNames(model, library)
-    let intrinsic = semanticLegacyIntrinsic(model, library + "." + name)
-
-    if intrinsic != null
-      semanticCompletionAdd(values, prefix, name, name, 3, semanticCompletionLibraryDetail(intrinsic))
-    end
-  end
-end
-
 def semanticCompletionFunctions(values: SemanticCompletionList, model: SemanticModel, site: SemanticCompletionSite, prefix: String, namespaceOnly: Bool): Void
   var current: SemanticModel? = model
 
@@ -292,7 +296,7 @@ def semanticCompletionFunctions(values: SemanticCompletionList, model: SemanticM
     var function = current.firstFunction
 
     while function != null && !values.truncated
-      if bootstrapStartsWith(function.name, prefix) && !semanticCompletionHas(values, function.name)
+      if function.genericOrigin < 0 && bootstrapStartsWith(function.name, prefix) && !semanticCompletionHas(values, function.name)
         let visible = namespaceOnly ? function.namespaceName == site.receiverType : semanticCompletionResolveFunction(model, site.namespaceName, function.name) == function.fullName
 
         if visible
@@ -375,12 +379,26 @@ def semanticCompletionClasses(values: SemanticCompletionList, model: SemanticMod
   end
 end
 
-def semanticCompletionImportCandidates(values: SemanticCompletionList, model: SemanticModel, prefix: String, namespacePrefix: String): Void
-  if namespacePrefix == ""
-    for library in semanticBuiltinLibraries(model)
-      semanticCompletionAdd(values, prefix, library, library, 9, "library " + library, "namespace:" + library)
+def semanticCompletionContracts(values: SemanticCompletionList, model: SemanticModel, site: SemanticCompletionSite, prefix: String, namespaceOnly: Bool = false): Void
+  var current: SemanticModel? = model
+
+  while current != null && !values.truncated
+    var contract = current.firstContract
+
+    while contract != null && !values.truncated
+      let resolved = semanticFindContract(model, contract.name, site.namespaceName)
+      let visible = namespaceOnly ? contract.namespaceName == site.receiverType : resolved != null && resolved.fullName == contract.fullName
+
+      if visible
+        semanticCompletionAdd(values, prefix, contract.name, contract.name, 8, "contract " + contract.fullName, "contract:" + contract.fullName)
+      end
+      contract = contract.nextContract
     end
+    current = current.parent
   end
+end
+
+def semanticCompletionImportCandidates(values: SemanticCompletionList, model: SemanticModel, prefix: String, namespacePrefix: String): Void
   var current: SemanticModel? = model
 
   while current != null
@@ -424,19 +442,31 @@ def semanticCompletionCandidates(model: SemanticModel, site: SemanticCompletionS
       semanticCompletionAdd(values, prefix, member.name, member.name, 5, member.family + "." + member.name + ": " + member.resultType)
     end
     semanticCompletionAddClassMembers(values, model, site, prefix, semanticMutableType(site.receiverType), false)
+  else if site.receiverKind == "contract"
+    let contract = model.findContract(site.receiverType)
+
+    if contract != null
+      var requirement = contract.firstRequirement
+
+      while requirement != null
+        if requirement.operatorName == ""
+          semanticCompletionAdd(values, prefix, requirement.name, requirement.name, 2, semanticCompletionCallableDetail(requirement), "contract-member:" + contract.fullName + "." + requirement.name)
+        end
+        requirement = requirement.nextCallable
+      end
+    end
+  else if site.receiverKind == "constraint"
+    semanticCompletionContracts(values, model, site, prefix, site.receiverType != "")
   else if site.receiverKind == "class"
     semanticCompletionAddClassMembers(values, model, site, prefix, site.receiverType, true)
   else if site.receiverKind == "super"
     semanticCompletionAddClassMembers(values, model, site, prefix, site.receiverType, false)
   else if site.receiverKind == "namespace"
+    semanticCompletionContracts(values, model, site, prefix, true)
     semanticCompletionFunctions(values, model, site, prefix, true)
     semanticCompletionGenerics(values, model, site, prefix, "Function", true)
     semanticCompletionClasses(values, model, site, prefix, true)
     semanticCompletionGenerics(values, model, site, prefix, "Class", true)
-  else if site.receiverKind == "library"
-    if site.receiverType == "Array" || model.hasUse(site.receiverType)
-      semanticCompletionAddLibrary(values, model, site, prefix)
-    end
   else if site.receiverKind == "type"
     semanticCompletionClasses(values, model, site, prefix)
     semanticCompletionGenerics(values, model, site, prefix, "Class", false)
@@ -461,6 +491,7 @@ def semanticCompletionCandidates(model: SemanticModel, site: SemanticCompletionS
       semanticCompletionAdd(values, prefix, "this", "this", 14, "this: " + site.className)
     end
     semanticCompletionFunctions(values, model, site, prefix, false)
+    semanticCompletionContracts(values, model, site, prefix)
     semanticCompletionGenerics(values, model, site, prefix, "Function", false)
     semanticCompletionClasses(values, model, site, prefix)
     semanticCompletionGenerics(values, model, site, prefix, "Class", false)

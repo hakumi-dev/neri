@@ -30,6 +30,7 @@ packages include the language reference for the packaged compiler.
   local compiler installation.
 - [Testing](../tests/README.md) — language contracts and native validation.
 - [Architecture](ARCHITECTURE.md) — compiler, native components and build driver.
+- [Compiler boundaries](COMPILER-BOUNDARIES.md) — source APIs, contracts and native operations.
 - [Language server](LANGUAGE-SERVER.md) — editor-independent live diagnostics and current limits.
 - [Compilation projects](PROJECTS.md) — compilation units, automatic source discovery and explicit library references.
 - [Bootstrapping](BOOTSTRAP.md) — trusted seed and reproducible compiler generations.

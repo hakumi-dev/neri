@@ -18,23 +18,14 @@ static pid_t server = -1;
 static int input = -1, output = -1;
 static char dynamic_project_source[4096];
 static char symlink_project_source[4096];
-static char documented_stdlib[4096];
 static char isolated_compiler[4096];
 static int installed_launcher = 0;
 static int use_documented_stdlib = 1;
+static const char *documented_stdlib = NULL;
 
 static void cleanup(void) {
   if (dynamic_project_source[0]) unlink(dynamic_project_source);
   if (symlink_project_source[0]) unlink(symlink_project_source);
-  if (documented_stdlib[0]) {
-    char path[8192];
-    const char *files[] = {"core.hk", "http.hk", "terminal.hk", "clock.hk", "result.hk", "documentation.json"};
-    for (size_t index = 0; index < sizeof(files) / sizeof(files[0]); ++index) {
-      snprintf(path, sizeof(path), "%s/%s", documented_stdlib, files[index]);
-      unlink(path);
-    }
-    rmdir(documented_stdlib);
-  }
   if (server > 0) {
     kill(server, SIGKILL);
     while (waitpid(server, NULL, 0) < 0 && errno == EINTR) {}
@@ -291,11 +282,12 @@ static void start_server(const char *compiler, const char *root) {
     if (dup2(to_server[0], STDIN_FILENO) < 0 || dup2(from_server[1], STDOUT_FILENO) < 0) _exit(2);
     close(to_server[0]); close(to_server[1]); close(from_server[0]); close(from_server[1]);
     char library[4096];
-    if (use_documented_stdlib && documented_stdlib[0])
-      snprintf(library, sizeof(library), "%s", documented_stdlib);
-    else
+    if (use_documented_stdlib && documented_stdlib != NULL && documented_stdlib[0] != '\0') {
+      if (setenv("NERI_STDLIB", documented_stdlib, 1) != 0) _exit(2);
+    } else {
       snprintf(library, sizeof(library), "%s/stdlib", root);
-    if (setenv("NERI_STDLIB", library, 1) != 0) _exit(2);
+      if (setenv("NERI_STDLIB", library, 1) != 0) _exit(2);
+    }
     const char *executable = !use_documented_stdlib && installed_launcher ? isolated_compiler : compiler;
     execl(executable, executable, "lsp", (char *)NULL);
     _exit(2);
@@ -323,34 +315,6 @@ static void identify_isolated_compiler(const char *compiler) {
   if (access(candidate, X_OK) != 0 || access(manifest, R_OK) != 0 || realpath(candidate, raw) == NULL) return;
   snprintf(isolated_compiler, sizeof(isolated_compiler), "%s", raw);
   installed_launcher = 1;
-}
-
-static void prepare_documented_stdlib(const char *root) {
-  snprintf(documented_stdlib, sizeof(documented_stdlib), "%s/build/lsp-documentation-XXXXXX", root);
-  require(mkdtemp(documented_stdlib) != NULL, "create isolated documented stdlib");
-  char source[8192], destination[8192], output_path[8192];
-  const char *files[] = {"core.hk", "http.hk", "terminal.hk", "clock.hk", "result.hk"};
-  for (size_t index = 0; index < sizeof(files) / sizeof(files[0]); ++index) {
-    snprintf(source, sizeof(source), "%s/stdlib/%s", root, files[index]);
-    snprintf(destination, sizeof(destination), "%s/%s", documented_stdlib, files[index]);
-    require(symlink(source, destination) == 0, "link documented standard-library source");
-  }
-  snprintf(output_path, sizeof(output_path), "%s/documentation.json", documented_stdlib);
-  char http_path[8192], terminal_path[8192], clock_path[8192], result_path[8192];
-  snprintf(http_path, sizeof(http_path), "%s/http.hk", documented_stdlib);
-  snprintf(terminal_path, sizeof(terminal_path), "%s/terminal.hk", documented_stdlib);
-  snprintf(clock_path, sizeof(clock_path), "%s/clock.hk", documented_stdlib);
-  snprintf(result_path, sizeof(result_path), "%s/result.hk", documented_stdlib);
-  pid_t child = fork();
-  require(child >= 0, "start documentation index generator");
-  if (child == 0) {
-    execl(isolated_compiler, isolated_compiler, "documentation-index", "--output", output_path,
-          http_path, terminal_path, clock_path, result_path, (char *)NULL);
-    _exit(2);
-  }
-  int status = 0;
-  require(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0,
-          "generate documented standard-library sidecar");
 }
 
 static void finish_server(void) {
@@ -566,7 +530,9 @@ int main(int argc, char **argv) {
   atexit(cleanup);
   signal(SIGPIPE, SIG_IGN);
   identify_isolated_compiler(argv[1]);
-  prepare_documented_stdlib(argv[2]);
+  documented_stdlib = getenv("NERI_LSP_TEST_STDLIB");
+  require(documented_stdlib != NULL && documented_stdlib[0] != '\0',
+          "NERI_LSP_TEST_STDLIB must name a prepared standard-library fixture");
   source_name_cli_contract(argv[1], argv[2]);
   automatic_project_cli_contract(argv[1], argv[2]);
   unit_cli_contract(argv[1], argv[2]);
