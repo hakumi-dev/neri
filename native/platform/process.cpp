@@ -265,6 +265,7 @@ bool spawn_child(const configuration &config, const std::shared_ptr<child> &resu
   SECURITY_ATTRIBUTES inherited{sizeof(inherited), nullptr, TRUE};
   HANDLE input_read = NULL, input_write = NULL, output_read = NULL, output_write = NULL, error_read = NULL, error_write = NULL;
   PROCESS_INFORMATION process{};
+  JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
   HANDLE inherited_handles[3] = {NULL, NULL, NULL};
   SIZE_T attribute_size = 0;
   std::vector<uint8_t> attribute_storage;
@@ -286,7 +287,6 @@ bool spawn_child(const configuration &config, const std::shared_ptr<child> &resu
       !SetHandleInformation(error_read, HANDLE_FLAG_INHERIT, 0)) { remember_error(); goto failure; }
   result->job = CreateJobObjectW(nullptr, nullptr);
   if (!result->job) { remember_error(); goto failure; }
-  JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
   limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
   if (!SetInformationJobObject(result->job, JobObjectExtendedLimitInformation,
                                &limits, sizeof(limits))) { remember_error(); goto failure; }
