@@ -1,5 +1,34 @@
 # Memory and performance checks
 
+## UTF-8 construction
+
+`benchmarks/text.hk` compares builtin concatenation, the `text.concat` library
+wrapper and `buffers.TextBuffer` with a reserved final capacity. Each appends
+`abcdé😀` (10 bytes, six scalars) and checks the resulting byte/scalar lengths.
+Build with `neri build benchmarks/text.hk --release --output build/text-benchmark`;
+run `/usr/bin/time -l build/text-benchmark <concat|library|builder> <count>` on macOS.
+
+A local ARM64 Release run on 2026-09-09 (Apple M4 Pro, LLVM 22) produced:
+
+| Appends | Builtin ms / RSS bytes | Library ms / RSS bytes | Buffer ms / RSS bytes |
+|---:|---:|---:|---:|
+| 10,000 | 17 / 49,922,048 | 16 / 49,807,360 | 1 / 2,146,304 |
+| 50,000 | 264 / 49,889,280 | 254 / 49,922,048 | 5 / 3,768,320 |
+
+These are individual observations, not statistical estimates or regression
+thresholds. Milliseconds measure the construction region inside the executable;
+RSS covers the entire process, including runtime and final validation.
+The library wrapper preserves the builtin storage cost. The buffer path reuses
+capacity and copies bytes directly into its array through Neri code.
+
+For `N` appends of `k` bytes to a flat immutable string, the total output bytes
+copied are `k Σ(i=1..N) i = kN(N+1)/2`, hence quadratic in `N`. Reserved buffer
+construction plus the final snapshot costs `O(kN)` with `O(kN)` storage.
+This arithmetic describes copy work; GC thresholds, allocator behavior and
+cache effects determine observed RSS and time. The representation tradeoffs are
+discussed in [Boehm, Atkinson and Plass, Ropes (1995)](https://www.cs.tufts.edu/comp/150FP/archive/hans-boehm/ropes.pdf).
+Neri retains flat immutable strings and supplies a separate mutable builder.
+
 ## Run latency
 
 `neri source.hk --timings` separates frontend, cache lookup, code generation,
