@@ -7,6 +7,12 @@ linking and program execution. `--no-cache` provides an uncached comparison with
 the same compiler, runtime and safety checks. A cache hit still parses, type-checks,
 lowers and verifies the program; it skips native code generation and linking.
 
+Deterministic IR lowering and transport use one stable, typed merge sort to order
+compiler collections. Ordering takes `O(N log N)` comparisons and preserves
+insertion order for equal keys, following the standard
+[merge sort](https://www.nist.gov/dads/HTML/mergesort.html) and
+[merge](https://www.nist.gov/dads/HTML/merge.html) definitions.
+
 The key hashes the canonical IR transport and a length-delimited build context
 with SHA-256. The context includes target, optimization mode, runtime manifest,
 working directory, selected SDK/developer tools, deployment target and PATH.
@@ -50,6 +56,46 @@ A hit removes codegen and link and reuses an already-created executable. For a
 fraction `p` accelerated by a factor `s`, overall speedup is
 `1 / ((1 - p) + p / s)`; optimize measured dominant phases first.
 This is the application of [Amdahl's law](https://www.cs.cmu.edu/~18742/papers/Amdahl1967.pdf).
+
+## Executable sessions
+
+The Neri-owned session benchmark measures an application initializer and typed
+incremental submissions through `ExecutableSession`. On an Apple M4 Pro running
+macOS 26.6.2, a three-repetition Sumi application fixture produced these final
+local observations with the object backend. The benchmark executable is built
+in Release mode; submitted modules use `SessionToolchain`'s default Debug mode:
+
+| Operation | First cache miss | Two cache hits |
+|---|---:|---:|
+| Initializer, complete operation | 3,275 ms | 1,406 ms, 1,342 ms |
+| New-variable execute | 86 ms | 20 ms, 21 ms |
+
+The initializer measurement includes preparation, compilation, linking or object
+loading, and execution. Submission execution rows exclude their separately
+recorded preparation, which was 32–36 ms for these operations. Uncached execution
+for the other four submissions was 76–82 ms. At retained-history positions 1,
+10 and 25, uncached execution was 94, 82 and 100 ms; preparation was 37, 42 and
+54 ms. Cache-hit execution at those positions was 21–24, 35–39 and 48 ms.
+
+A generated project matrix separated application size from the new-variable
+submission. For 10, 100, 500 and 900 ordinary functions, initializer misses were
+60, 165, 781 and 1,467 ms, while new-variable misses were 23, 25, 39 and 52 ms.
+Their actual cache hits were 4, 5, 7 and 10 ms. This local matrix shows that the
+remaining initializer work grows with the application while incremental work
+grows much more slowly over the measured range.
+
+Each backend used a separate new private code-cache directory. The first artifact
+is therefore a Neri code-cache miss, but neither run clears operating-system file,
+loader or disk caches. This benchmark invokes the Sumi initializer through the
+Neri session API; it does not measure startup of an installed Sumi command-line
+program. Raw records and exact reproduction metadata are described in
+[`benchmarks/session/README.md`](../benchmarks/session/README.md).
+
+An earlier `e720a92` record measured complete initializer operations at 2,164,
+2,224 and 2,335 ms and new-variable preparation plus execution at 1,951, 1,875
+and 2,200 ms. That record predates cache-hit telemetry and uses a different
+compiler, runtime and session implementation, so it is historical context rather
+than a matched before-and-after attribution.
 
 Dependency-keyed reuse follows the task/rebuild distinction in
 [Build Systems à la Carte](https://simon.peytonjones.org/assets/pdfs/build-systems-original.pdf).
