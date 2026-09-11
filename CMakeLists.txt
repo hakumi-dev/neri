@@ -132,6 +132,7 @@ endif()
 add_library(neri_runtime STATIC
   native/platform/interrupts.cpp
   native/platform/files.cpp
+  native/platform/crypto.c
   native/platform/host.cpp
   native/runtime/entry.cpp
   native/runtime/math.cpp
@@ -145,6 +146,9 @@ target_compile_definitions(neri_runtime PRIVATE NERI_RUNTIME_BUILD=1)
 target_compile_definitions(neri_runtime PUBLIC NERI_RUNTIME_STATIC=1)
 if(WIN32)
   target_link_libraries(neri_runtime PUBLIC ws2_32 bcrypt shell32)
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  find_package(OpenSSL REQUIRED COMPONENTS Crypto)
+  target_link_libraries(neri_runtime PUBLIC OpenSSL::Crypto)
 endif()
 target_link_libraries(neri_runtime PRIVATE neri_build_options Threads::Threads)
 target_include_directories(neri_runtime PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/native/include")
@@ -238,7 +242,7 @@ set(NERI_MANIFEST_VERSION "${NERI_VERSION}")
 set(NERI_MANIFEST_NAME "neri-runtime-${NERI_TARGET}.json")
   file(GENERATE
     OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/${NERI_MANIFEST_NAME}"
-    CONTENT "{\n  \"schemaVersion\": 2,\n  \"toolchainVersion\": \"${NERI_MANIFEST_VERSION}\",\n  \"irTransportMajor\": 1,\n  \"irTransportMinor\": 1,\n  \"target\": \"${NERI_TARGET}\",\n  \"abiMajor\": 1,\n  \"abiMinor\": 12,\n  \"features\": 129791,\n  \"artifact\": \"$<TARGET_FILE_NAME:neri_runtime>\"\n}\n"
+    CONTENT "{\n  \"schemaVersion\": 2,\n  \"toolchainVersion\": \"${NERI_MANIFEST_VERSION}\",\n  \"irTransportMajor\": 1,\n  \"irTransportMinor\": 1,\n  \"target\": \"${NERI_TARGET}\",\n  \"abiMajor\": 1,\n  \"abiMinor\": 15,\n  \"features\": 1047295,\n  \"artifact\": \"$<TARGET_FILE_NAME:neri_runtime>\"\n}\n"
   )
 install(TARGETS neri_codegen_cli neri_runtime RUNTIME DESTINATION bin ARCHIVE DESTINATION lib)
 install(FILES "${CMAKE_CURRENT_BINARY_DIR}/neri-runtime-${NERI_TARGET}.json" DESTINATION lib)

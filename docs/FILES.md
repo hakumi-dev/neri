@@ -21,3 +21,63 @@ read counts and EOF follow the [Darwin read contract](https://developer.apple.co
 and [Windows CRT read contract](https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/read).
 Windows opens with `_O_BINARY` to preserve bytes. Cleanup attempts one close
 and reports its failure; it does not retry a potentially reused descriptor.
+
+## Rooted reads
+
+`files.Root.open(absolutePath)` pins an existing directory and returns a root or
+an owned failure. The configured root path is UTF-8, NUL-free, at most 1 MiB and
+absolute, with no trailing separator except for `/` itself. Its final component must not be a symbolic link. Parent components may
+resolve symbolic links intentionally as part of choosing the configured root;
+the opened directory object, rather than its original spelling, becomes the
+authorization anchor.
+
+`root.readBytes(relativePath, limit)` reads a regular file through that pinned
+directory. Paths use `/` separators and reject absolute paths, empty components,
+`.` and `..`, `\`, `:`, NUL and trailing separators. The complete lexical path
+is validated before any filesystem operation, so an invalid suffix is never
+masked by an earlier missing component. Neri does not percent-decode the
+path. Every component is opened relative to the preceding directory descriptor
+without following symbolic links. This follows the descriptor-relative and
+no-follow behavior of [POSIX `openat`](https://pubs.opengroup.org/onlinepubs/9799919799/functions/openat.html),
+then checks the opened object with
+[POSIX `fstat`](https://pubs.opengroup.org/onlinepubs/9799919799/functions/fstat.html).
+
+An opened directory object stays authorized if it is subsequently renamed.
+Rooted reads do not provide a global filesystem snapshot or current-path
+confinement against hostile renames of already opened ancestor directories.
+Opening each later name remains relative to the retained authorized object, and
+no-link traversal plus rejection of `..` prevents that name traversal from
+escaping it. Hard links are allowed; this is a namespace containment contract,
+not a file-origin contract.
+
+The final size is checked before whole-file allocation. A concurrent size change
+returns `changed_size`; concurrent same-size writes do not have snapshot
+semantics. The byte and path limits match `readBytes`.
+
+Root opening reports `invalid_root`, `root_open_failed`, `root_not_directory`,
+`symlink_disallowed` or `unavailable`. POSIX may report `wrong_type` for a
+no-follow directory open of a symbolic link; callers must treat both outcomes as
+denial and neither outcome exposes target bytes. Reads additionally report `closed`,
+`invalid_path`, `component_missing`, `component_denied`, `wrong_type` and the
+existing metadata, limit, read and changed-size failures. Failures retain the OS
+code, operation and zero-based component index when available. Temporary child
+descriptors close on every supported return. The primary operation failure and
+a secondary `closeFailure` remain separate. Additional cleanup failures form a
+`closeFailure` chain in the order the closes were attempted.
+
+Directory opens require directory descriptors at the operating-system boundary.
+Neri checks the final descriptor's regular-file metadata before reading and owns
+its close, preserving a secondary `closeFailure` on metadata and read failures.
+`bytesRead` records consumed bytes, including the extra size-change probe byte.
+
+`root.close()` is idempotent. A failed close reports `close_failed`; the root is
+still considered closed because retrying could close a reused descriptor. This
+ownership contract releases the descriptor on an explicit close.
+
+Rooted access is currently available on POSIX targets. Windows returns
+`unavailable`; matching the race contract requires verified component-relative
+handle traversal rather than string-prefix canonicalization. Windows
+[`CreateFileW`](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilew)
+and [`GetFinalPathNameByHandleW`](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getfinalpathnamebyhandlew)
+document the relevant handle and resolved-path behavior, but resolved-path checks
+alone are not the containment primitive promised here.

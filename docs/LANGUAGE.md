@@ -215,6 +215,43 @@ recursion that creates an unbounded sequence of new types reports `NR222`.
 `NR220` reports invalid generic declarations or type-argument counts; `NR221`
 reports arguments that cannot be inferred or used as safe value types.
 
+## Closed alternatives
+
+An `enum` declares a closed set of one or more named alternatives. Each `case` has zero or
+more typed payloads. Payloads do not have default values. A generic enum specializes its payload types with the same
+rules as a generic class.
+
+```neri
+enum Result<T>
+  case Ok(value: T)
+  case Error(message: String)
+end
+
+def describe(result: Result<Int>): String
+  match result
+    case Result.Ok(value)
+      return value as String
+    case Result.Error(message)
+      return message
+  end
+end
+```
+
+Construct a value only through an explicit case constructor, such as
+`Result<Int>.Ok(42)`. `new Result<Int>()`, inheritance, casts to a different
+alternative type, and access to the compiler-generated tag and payload storage
+are unavailable. Each match case names the enum that owns it and binds exactly
+the payloads declared by that case. Bindings exist only inside their case body.
+
+`match` is a reserved statement keyword. Its scrutinee evaluates once, every declared case must
+appear exactly once, and every case body participates in ordinary return and
+control-flow analysis. Missing, repeated, foreign, and wrong-arity cases are
+diagnostics. The current pattern surface is deliberately flat: cases select one
+closed constructor and bind its whole payload, with no wildcards, nested
+patterns, ranges, or or-patterns. Managed payloads, including generic objects
+captured by closures, retain the normal managed-field lifetime and survive
+collection.
+
 ## Function values and closures
 
 `fn(Int): String` is a function type. Function types are invariant: parameter

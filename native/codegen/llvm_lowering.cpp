@@ -2309,6 +2309,18 @@ private:
         minimum_minor = std::max(minimum_minor, uint16_t{12});
         required_features |= NERI_RT_FEATURE_INTERRUPTS;
       }
+      if (import.link_name.starts_with("neri_rt_v1_clock_wall_")) {
+        minimum_minor = std::max(minimum_minor, uint16_t{13});
+        required_features |= NERI_RT_FEATURE_WALL_CLOCK;
+      }
+      if (import.link_name.starts_with("neri_rt_v1_crypto_")) {
+        minimum_minor = std::max(minimum_minor, uint16_t{14});
+        required_features |= NERI_RT_FEATURE_CRYPTO;
+      }
+      if (import.link_name.starts_with("neri_rt_v1_file_root_")) {
+        minimum_minor = std::max(minimum_minor, uint16_t{15});
+        required_features |= NERI_RT_FEATURE_ROOTED_FILES;
+      }
       if (import.link_name.starts_with("neri_rt_v1_terminal_") ||
           import.link_name.starts_with("neri_rt_v1_clock_")) {
         minimum_minor = std::max(minimum_minor, uint16_t{8});

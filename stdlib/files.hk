@@ -1,21 +1,33 @@
 use host
 use tasks
+use result
 namespace files
 
 class Failure
   public code: String
   public osCode: Int
+  public operation: String
+  public component: Int
+  public closeFailure: Failure?
 
-  def init(code: String, osCode: Int = 0): Void
+  def init(code: String, osCode: Int = 0, operation: String = "", component: Int = -1): Void
     this.code = code
     this.osCode = osCode
+    this.operation = operation
+    this.component = component
   end
+end
+
+class RootOpenResult
+  public root: Root?
+  public failure: Failure?
 end
 
 class ReadResult
   public bytes: Byte[]?
   public failure: Failure?
   public closeFailure: Failure?
+  public bytesRead: Int = 0
 end
 
 @cabi("neri_rt_v1_file_open")
@@ -33,22 +45,233 @@ end
 @cabi("neri_rt_v1_file_error")
 def unsafe fileError(): Int
 end
+@cabi("neri_rt_v1_file_root_open")
+def unsafe rootOpen(path: Byte*, length: Int, osCode: Int*, category: Int*): Int
+end
+@cabi("neri_rt_v1_file_root_open_at")
+def unsafe rootOpenAt(parent: Int, name: Byte*, length: Int, kind: Int, osCode: Int*, category: Int*): Int
+end
+
+def rootedFailure(category: Int, osCode: Int, operation: String, component: Int): Failure
+  var code = "open_failed"
+  code = "component_missing" if category == 1
+  code = "component_denied" if category == 2
+  code = "symlink_disallowed" if category == 3
+  code = "wrong_type" if category == 4
+  code = "unavailable" if category == 6
+  return new Failure(code, osCode, operation, component)
+end
+
+class Root
+  private fd: Int
+  private closed: Bool = false
+
+  private def init(fd: Int): Void
+    this.fd = fd
+  end
+
+  def static open(path: String): RootOpenResult
+    let result = new RootOpenResult()
+    let length = host.stringByteLength(path)
+    if length == 0 || length > 1048576 || host.stringByteAt(path, 0) != (47 as Byte) || (length > 1 && host.stringByteAt(path, length - 1) == (47 as Byte))
+      result.failure = new Failure("invalid_root", 0, "root.open")
+      return result
+    end
+    var index = 0
+    while index < length
+      if host.stringByteAt(path, index) == (0 as Byte)
+        result.failure = new Failure("invalid_root", 0, "root.open")
+        return result
+      end
+      index = index + 1
+    end
+    unsafe
+      let osCode = stackalloc Int[1]
+      let category = stackalloc Int[1]
+      let bytes = native.alloc<Byte>(length)
+      index = 0
+      while index < length
+        bytes[index] = host.stringByteAt(path, index)
+        index = index + 1
+      end
+      let fd = rootOpen(bytes, length, osCode, category)
+      native.free(bytes)
+      if fd < 0
+        let failure = rootedFailure(category[0], osCode[0], "root.open", -1)
+        failure.code = "root_not_directory" if category[0] == 4
+        failure.code = "root_open_failed" if category[0] == 1 || category[0] == 2 || category[0] == 5
+        result.failure = failure
+      else
+        result.root = new Root(fd)
+      end
+    end
+    return result
+  end
+
+  def isClosed(): Bool
+    return this.closed
+  end
+
+  def close(): Failure?
+    if this.closed
+      return null
+    end
+    this.closed = true
+    unsafe
+      if closeFile(this.fd) < 0
+        return new Failure("close_failed", fileError(), "root.close")
+      end
+    end
+    return null
+  end
+
+  def readBytes(path: String, limit: Int): ReadResult
+    let result = new ReadResult()
+    if this.closed
+      result.failure = new Failure("closed", 0, "root.read")
+      return result
+    end
+    if limit < 0 || limit > 134217728
+      result.failure = new Failure("invalid_limit", 0, "root.read")
+      return result
+    end
+    let length = host.stringByteLength(path)
+    if !validRelativePath(path)
+      result.failure = new Failure("invalid_path", 0, "root.read")
+      return result
+    end
+    var start = 0
+    var component = 0
+    var parent = this.fd
+    var ownsParent = false
+    while start < length
+      var endAt = start
+      while endAt < length && host.stringByteAt(path, endAt) != (47 as Byte)
+        let byte = host.stringByteAt(path, endAt)
+        if byte == (0 as Byte) || byte == (92 as Byte)
+          result.failure = new Failure("invalid_path", 0, "root.read", component)
+          closeIntermediate(parent, ownsParent, result)
+          return result
+        end
+        endAt = endAt + 1
+      end
+      let name = host.stringSlice(path, start, endAt - start)
+      if name == "" || name == "." || name == ".."
+        result.failure = new Failure("invalid_path", 0, "root.read", component)
+        closeIntermediate(parent, ownsParent, result)
+        return result
+      end
+      let final = endAt == length
+      unsafe
+        let osCode = stackalloc Int[1]
+        let category = stackalloc Int[1]
+        let nameLength = host.stringByteLength(name)
+        let bytes = native.alloc<Byte>(nameLength)
+        var nameIndex = 0
+        while nameIndex < nameLength
+          bytes[nameIndex] = host.stringByteAt(name, nameIndex)
+          nameIndex = nameIndex + 1
+        end
+        let opened = rootOpenAt(parent, bytes, host.stringByteLength(name), final ? 2 : 1, osCode, category)
+        native.free(bytes)
+        if opened < 0
+          result.failure = rootedFailure(category[0], osCode[0], final ? "root.open_file" : "root.open_directory", component)
+          closeIntermediate(parent, ownsParent, result)
+          return result
+        end
+        if !closeIntermediate(parent, ownsParent, result)
+          closeIntermediate(opened, true, result)
+          return result
+        end
+        parent = opened
+        ownsParent = true
+      end
+      start = endAt + 1
+      component = component + 1
+    end
+    readOpened(parent, limit, result)
+    let failure = result.failure
+    if failure != null
+      failure.component = component - 1
+      failure.operation = "root." + failure.operation
+    end
+    closeIntermediate(parent, true, result)
+    return result
+  end
+
+  def readBytesOutcome(path: String, limit: Int): result.Result<Byte[], ReadFailure>
+    return readOutcome(this.readBytes(path, limit))
+  end
+end
+
+def validRelativePath(path: String): Bool
+  let length = host.stringByteLength(path)
+  if length == 0 || length > 1048576 || host.stringByteAt(path, 0) == (47 as Byte) || host.stringByteAt(path, length - 1) == (47 as Byte)
+    return false
+  end
+  var start = 0
+  var index = 0
+  while index <= length
+    if index == length || host.stringByteAt(path, index) == (47 as Byte)
+      let component = host.stringSlice(path, start, index - start)
+      if component == "" || component == "." || component == ".."
+        return false
+      end
+      start = index + 1
+    else
+      let byte = host.stringByteAt(path, index)
+      if byte == (0 as Byte) || byte == (92 as Byte) || byte == (58 as Byte)
+        return false
+      end
+    end
+    index = index + 1
+  end
+  return true
+end
+
+def closeIntermediate(fd: Int, owned: Bool, result: ReadResult): Bool
+  if !owned
+    return true
+  end
+  unsafe
+    if closeFile(fd) < 0
+      let failure = new Failure("close_failed", fileError(), "root.close_component")
+      let previous = result.closeFailure
+      if previous == null
+        result.closeFailure = failure
+      else
+        var cursor: Failure = previous
+        while true
+          let next = cursor.closeFailure
+          if next == null
+            cursor.closeFailure = failure
+            break
+          end
+          cursor = next
+        end
+      end
+      result.bytes = null
+      return false
+    end
+  end
+  return true
+end
 
 def readBytes(path: String, limit: Int): ReadResult
   let result = new ReadResult()
   if limit < 0 || limit > 134217728
-    result.failure = new Failure("invalid_limit")
+    result.failure = new Failure("invalid_limit", 0, "files.read")
     return result
   end
   let pathLength = host.stringByteLength(path)
   if pathLength == 0 || pathLength > 1048576
-    result.failure = new Failure("invalid_path")
+    result.failure = new Failure("invalid_path", 0, "files.read")
     return result
   end
   var index = 0
   while index < pathLength
     if host.stringByteAt(path, index) == (0 as Byte)
-      result.failure = new Failure("invalid_path")
+      result.failure = new Failure("invalid_path", 0, "files.read")
       return result
     end
     index = index + 1
@@ -64,12 +287,12 @@ def readBytes(path: String, limit: Int): ReadResult
     let openError = fileError()
     native.free(pathBytes)
     if fd < 0
-      result.failure = new Failure("open_failed", openError)
+      result.failure = new Failure("open_failed", openError, "open")
       return result
     end
     readOpened(fd, limit, result)
     if closeFile(fd) < 0
-      result.closeFailure = new Failure("close_failed", fileError())
+      result.closeFailure = new Failure("close_failed", fileError(), "close")
       result.bytes = null
     end
   end
@@ -80,15 +303,15 @@ def readOpened(fd: Int, limit: Int, result: ReadResult): Void
   unsafe
   let size = fileSize(fd)
   if size == -2
-    result.failure = new Failure("not_regular")
+    result.failure = new Failure("not_regular", 0, "metadata")
     return
   end
   if size < 0
-    result.failure = new Failure("metadata_failed", fileError())
+    result.failure = new Failure("metadata_failed", fileError(), "metadata")
     return
   end
   if size > limit
-    result.failure = new Failure("limit_exceeded")
+    result.failure = new Failure("limit_exceeded", 0, "metadata")
     return
   end
   # Indexed generation allocates one managed array in linear time.
@@ -100,15 +323,16 @@ def readOpened(fd: Int, limit: Int, result: ReadResult): Void
     while offset < size
       let count = readFile(fd, pointer + offset, size - offset)
       if count == -1
-        result.failure = new Failure("read_failed", fileError())
+        result.failure = new Failure("read_failed", fileError(), "read")
         return
       end
       if count == 0
-        result.failure = new Failure("changed_size")
+        result.failure = new Failure("changed_size", 0, "read")
         return
       end
       if count > 0
         offset = offset + count
+        result.bytesRead = offset
       end
     end
   end
@@ -118,11 +342,62 @@ def readOpened(fd: Int, limit: Int, result: ReadResult): Void
     count = readFile(fd, extra, 1)
   end
   if count < 0
-    result.failure = new Failure("read_failed", fileError())
+    result.failure = new Failure("read_failed", fileError(), "read")
   else if count > 0
-    result.failure = new Failure("changed_size")
+    result.bytesRead = result.bytesRead + count
+    result.failure = new Failure("changed_size", 0, "read")
   else
     result.bytes = bytes
   end
   end
+end
+
+class ReadFailure
+  public cause: result.Failure
+  public component: Int
+  public closeFailure: result.Failure?
+
+  def init(cause: result.Failure, component: Int = -1, closeFailure: result.Failure? = null): Void
+    this.cause = cause
+    this.component = component
+    this.closeFailure = closeFailure
+  end
+end
+
+def asReadFailure(source: Failure, bytesRead: Int, fallbackOperation: String): result.Failure
+  var operation = source.operation
+  operation = fallbackOperation if operation == ""
+  let failure = new result.Failure(source.code, operation, "", bytesRead, source.osCode)
+  let closed = source.closeFailure
+  if closed != null
+    failure.closeFailure = asReadFailure(closed, bytesRead, "files.close")
+  end
+  return failure
+end
+
+def readOutcome(read: ReadResult): result.Result<Byte[], ReadFailure>
+  let primary = read.failure
+  let closed = read.closeFailure
+  let bytes = read.bytes
+  if primary != null
+    var closeCause: result.Failure? = null
+    if closed != null
+      closeCause = asReadFailure(closed, read.bytesRead, "files.close")
+    end
+    let cause = asReadFailure(primary, read.bytesRead, "files.read")
+    return result.Result<Byte[], ReadFailure>.Error(new ReadFailure(cause, primary.component, closeCause))
+  end
+  if closed != null
+    let cause = asReadFailure(closed, read.bytesRead, "files.close")
+    return result.Result<Byte[], ReadFailure>.Error(new ReadFailure(cause, closed.component))
+  end
+  if bytes == null
+    let cause = new result.Failure("missing_bytes", "files.read", "", read.bytesRead)
+    return result.Result<Byte[], ReadFailure>.Error(new ReadFailure(cause))
+  end
+  return result.Result<Byte[], ReadFailure>.Ok(bytes)
+end
+
+def readBytesOutcome(path: String, limit: Int): result.Result<Byte[], ReadFailure>
+  return readOutcome(files.readBytes(path, limit))
 end
