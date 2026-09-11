@@ -141,6 +141,39 @@ Object keys include owner and configuration paths; Sumi's fresh preparation
 directory can therefore cause conservative misses between preparations. The
 stable-project cache measurement above isolates Neri's object reuse.
 
+## Session completion
+
+The public completion API analyzes a temporary child of the committed semantic
+model. It parses the query and types of referenced bindings; names of other
+bindings come from metadata. The shared LSP candidate engine performs symbol
+lookup and caps results at 128. Query cost still depends on metadata lookup and
+input size; it does not reparse retained application bodies or generate native
+objects.
+
+On macOS ARM64, Release measurements over 100 queries per cell gave these mean
+latencies. Each cell used a fresh process with one untimed query warmup.
+
+| Retained functions | Prior submissions | Name query | Member query | Process max RSS |
+| --- | --- | --- | --- | --- |
+| 10 | 0 | 0.06 ms | 0.07 ms | 9.1 MiB |
+| 100 | 25 | 0.27 ms | 0.08 ms | 13.0 MiB |
+| 500 | 100 | 0.68 ms | 0.16 ms | 49.7 MiB |
+
+The [complete nine-cell records](../benchmarks/session-completion-macos-arm64.json)
+include binary hashes and a control that expanded retained frame accesses. At
+500 functions and 100 submissions that control averaged 367.4/368.5 ms over
+ten name/member queries and reached 123.3 MiB process RSS. The current query
+source contains typed parameters for referenced bindings instead of access
+paths through prior frames. If binding `b` has frame depth `d(b)`, expanding all
+access paths contributes `sum(d(b))` path segments; one binding per frame can
+therefore contribute `H(H-1)/2` segments after `H` submissions. Typed query
+parameters remove that source expansion, while retained symbol lookup remains.
+
+These are synthetic semantic-query measurements, not console startup times or
+latency percentiles. RSS includes context preparation, retained analysis and
+the runtime. Reproduction commands and workload parameters are in the
+[benchmark instructions](../benchmarks/session/README.md#semantic-completion).
+
 ## Executable sessions
 
 The Neri-owned session benchmark measures an application initializer and typed

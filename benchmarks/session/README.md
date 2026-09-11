@@ -1,5 +1,28 @@
 # Executable session benchmark
 
+## Semantic completion
+
+The `completion` unit measures the shared session completion engine against
+10, 100 or 500 retained functions and 0, 25 or 100 committed submissions.
+It performs one untimed query before timing repeated name and member queries.
+Every run checks candidate counts and truncation. Preparation builds the typed
+context without executing native code; these timings exclude application
+startup, compilation, terminal rendering and process startup.
+
+```sh
+neri build --project benchmarks/session/manifest.json --unit completion --release --output build/session-completion-benchmark
+/usr/bin/time -lp ./build/session-completion-benchmark 500 100 100
+```
+
+Run with the matching installed `NERI_STDLIB` environment described in
+[the session API](../../docs/SESSIONS.md#installed-session-api).
+The JSON lines report aggregate milliseconds and iteration count. Divide the
+aggregate by that count for mean query latency. Process maximum RSS includes
+the retained context, preparation, runtime and both query loops. Run each
+size/history combination sequentially without compiler builds in parallel.
+
+## Executable submissions
+
 This benchmark measures `ExecutableSession` initialization and four sequential
 submissions, then a dedicated sequence of 25 submissions that grows retained
 context one binding at a time. It records preparation separately from the
