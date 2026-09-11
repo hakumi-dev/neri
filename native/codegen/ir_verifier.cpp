@@ -551,7 +551,8 @@ void require_binary(const function_context &context, const instruction &value,
                                        target->kind == NERI_IR_DEFAULT_ADAPTER_V1);
     if (!valid_kind || target->unsafe_call != unsafe_call) {
       fail(invalid_reference,
-           "Direct call references a missing or unsupported function.");
+           "Direct call references a missing or unsupported function: " +
+               value.symbol->semantic_name + ".");
     }
     parameters = &target->parameter_types;
     result = &target->result_type;
