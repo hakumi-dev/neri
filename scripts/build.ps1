@@ -67,7 +67,7 @@ try {
   $env:NERI_LINKER = Forward-Path "$env:LLVM_PREFIX/bin/clang++.exe"
   $env:TMPDIR = Forward-Path $work
   $sources = @(Get-ChildItem -LiteralPath "$root/compiler" -Recurse -Filter '*.hk' -File |
-    Where-Object { (Forward-Path $_.FullName) -notmatch '/(frontend|semantic)/main\.hk$' } |
+    Where-Object { (Forward-Path $_.FullName) -notmatch '/(frontend|semantic)/main\.hk$|/compiler/session/' } |
     ForEach-Object { Forward-Path $_.FullName } | Sort-Object)
   [IO.File]::WriteAllLines("$work/compiler-sources.txt", $sources)
   $inventory = @($sources | ForEach-Object { (Get-FileHash -LiteralPath $_).Hash + '  ' + $_ })
@@ -84,7 +84,19 @@ try {
     New-Item -ItemType Directory -Force $stage | Out-Null
     $previous = "$work/stage$($generation - 1)/neri.exe"
     Write-Host "Compiling generation $generation on Windows..."
-    Invoke-Checked $previous (@('build') + $sources + @('--module','neri-compiler','--source-root',"$root/compiler",'--emit=neri-ir-hex','--output',"$stage/compiler.nir.hex"))
+    if ($generation -eq 1) {
+      $stageSources = @($sources | ForEach-Object {
+        $relative = $_.Substring((Forward-Path $root).Length + 1)
+        $compatible = "$root/bootstrap/$relative"
+        if (Test-Path -LiteralPath $compatible) { Forward-Path $compatible } else { $_ }
+      })
+      $env:NERI_STDLIB = ''
+      $buildArguments = @('build') + $stageSources + @('--source-root', $root)
+    } else {
+      $env:NERI_STDLIB = Forward-Path "$root/stdlib"
+      $buildArguments = @('build','--project',"$root/manifest.json",'--unit','compiler','--source-root',"$root/compiler")
+    }
+    Invoke-Checked $previous ($buildArguments + @('--module','neri-compiler','--emit=neri-ir-hex','--output',"$stage/compiler.nir.hex"))
     Materialize "$stage/compiler.nir.hex" $stage
   }
   foreach ($artifact in @('compiler.nir.hex','compiler.obj','neri.exe')) {
