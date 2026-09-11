@@ -127,6 +127,7 @@ struct instruction final {
   std::optional<std::uint8_t> predicate;
   bool flag{};
   std::optional<source_location> location;
+  std::uint32_t debug_scope_id{};
 };
 
 struct terminator final {
@@ -137,6 +138,7 @@ struct terminator final {
   std::string panic_code;
   std::string panic_message;
   std::optional<source_location> location;
+  std::uint32_t debug_scope_id{};
 };
 
 struct block final {
@@ -149,6 +151,13 @@ struct block final {
 struct debug_local final {
   std::string name;
   std::uint32_t value{};
+  std::uint32_t scope_id{};
+  source_location location;
+};
+
+struct debug_scope final {
+  std::uint32_t id{};
+  std::uint32_t parent_id{};
   source_location location;
 };
 
@@ -165,6 +174,7 @@ struct function final {
   std::optional<symbol_id> dispatch_slot;
   std::optional<source_location> location;
   std::vector<block> blocks;
+  std::vector<debug_scope> debug_scopes;
   std::vector<debug_local> debug_locals;
 };
 

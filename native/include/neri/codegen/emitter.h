@@ -9,6 +9,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace neri::codegen {
@@ -41,6 +42,8 @@ struct emission_metrics final {
   std::uint64_t target_codegen_ns{};
 };
 
+using debug_source_paths = std::vector<std::pair<std::string, std::string>>;
+
 class codegen_error final : public std::runtime_error {
 public:
   codegen_error(std::string code, std::string message);
@@ -64,7 +67,8 @@ optimization_name(optimization_mode mode) noexcept;
                                    target_platform target,
                                    optimization_mode optimization,
                                    output_kind kind,
-                                   emission_metrics *metrics = nullptr);
+                                   emission_metrics *metrics = nullptr,
+                                   const debug_source_paths &debug_sources = {});
 
 void write_artifact_atomically(const std::filesystem::path &path,
                                std::span<const std::uint8_t> bytes);

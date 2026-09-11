@@ -120,6 +120,54 @@ void test_unsafe_call_boundary() {
   rejected(malformed);
 }
 
+void test_debug_scope_validation() {
+  using namespace neri::codegen;
+  ir_module module;
+  module.semantic_version = {1, 0};
+  module.id = "debug-scope-contract";
+  module.required_features = {"debug-scopes-v1"};
+  module.sources.push_back({"scope.hk", {'d', 'e', 'f', ' ', 'm', 'a', 'i',
+                                          'n', '\n', ' ', ' ', 'l', 'e', 't',
+                                          ' ', 'v', '\n'}});
+  const source_location function_location{"scope.hk", 0U, 17U};
+  const source_location scope_location{"scope.hk", 9U, 8U};
+  const source_location local_location{"scope.hk", 11U, 5U};
+  const type integer{NERI_IR_TYPE_INT_V1, std::nullopt, {}};
+  function body;
+  body.id = {module.id, NERI_IR_SYMBOL_FUNCTION_V1, "main"};
+  body.result_type.tag = NERI_IR_TYPE_VOID_V1;
+  body.kind = NERI_IR_FUNCTION_V1;
+  body.location = function_location;
+  block entry;
+  entry.parameters.push_back({0U, integer, function_location});
+  entry.ending.tag = NERI_IR_TERMINATOR_RETURN_V1;
+  body.parameter_types.push_back(integer);
+  body.blocks.push_back(entry);
+  body.debug_scopes.push_back({1U, 0U, scope_location});
+  body.debug_locals.push_back({"value", 0U, 1U, local_location});
+  module.functions.push_back(body);
+
+  verify_supported_module(module);
+
+  const auto rejected = [](const ir_module &candidate) {
+    try {
+      verify_supported_module(candidate);
+    } catch (const reader_error &) {
+      return;
+    }
+    throw std::runtime_error("invalid debug scope escaped verification");
+  };
+  auto malformed = module;
+  malformed.functions[0].debug_scopes[0].parent_id = 2U;
+  rejected(malformed);
+  malformed = module;
+  malformed.functions[0].blocks[0].ending.debug_scope_id = 2U;
+  rejected(malformed);
+  malformed = module;
+  malformed.functions[0].debug_locals[0].scope_id = 2U;
+  rejected(malformed);
+}
+
 void write_u16(std::vector<std::uint8_t> &bytes, std::size_t offset,
                std::uint16_t value) {
   bytes.at(offset) = static_cast<std::uint8_t>(value);
@@ -157,6 +205,17 @@ void expect_error(std::span<const std::uint8_t> bytes,
 
 void test_primitive_codegen(const std::vector<std::uint8_t> &bytes) {
   const auto input = neri::codegen::read_verified_module(bytes);
+  const auto debug_ir = neri::codegen::emit_module(
+      input, neri::codegen::target_platform::macos_arm64,
+      neri::codegen::optimization_mode::debug,
+      neri::codegen::output_kind::llvm_ir);
+  const std::string debug_text(debug_ir.bytes.begin(), debug_ir.bytes.end());
+
+  require(debug_ir.text &&
+              debug_text.find("DILocalVariable(name: \"left\", arg: 1") !=
+                  std::string::npos,
+          "entry parameters must be emitted as formal debug parameters");
+
   const auto windows_target = neri::codegen::parse_target("windows-x86_64");
   const auto windows_object = neri::codegen::emit_module(input, windows_target,
       neri::codegen::optimization_mode::release, neri::codegen::output_kind::object);
@@ -285,10 +344,13 @@ int main(int argc, char **argv) {
       throw std::runtime_error("expected minimal and primitive IR vector paths");
     }
     const auto bytes = read_hex(argv[1]);
-    static_cast<void>(neri::codegen::read_verified_module(bytes));
+    const auto legacy = neri::codegen::read_verified_module(bytes);
+    require(legacy.value().functions.front().debug_scopes.empty(),
+            "pre-1.6 transport must not synthesize debug scopes");
     test_envelope_rejections(bytes);
     test_payload_rejections(bytes);
     test_unsafe_call_boundary();
+    test_debug_scope_validation();
     test_primitive_codegen(read_hex(argv[2]));
     return 0;
   } catch (const std::exception &error) {

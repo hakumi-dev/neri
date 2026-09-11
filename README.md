@@ -57,6 +57,7 @@ neri build main.hk
 ```
 
 Use `neri build main.hk --release` for optimized output. The default is Debug.
+Use [LLDB or an IDE with DAP support](docs/DEBUGGING.md) to debug an executable.
 
 ## Documentation
 

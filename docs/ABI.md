@@ -145,13 +145,26 @@ Runtime contract failures panic; no exception unwinds into Neri code.
 
 The compiler emits canonical Neri IR with transport 1.1, 1.2 for extended
 scalars or external library metadata, 1.3 for native records and fixed arrays,
-and 1.4 for `scoped-tasks-v1`.
+1.4 for `scoped-tasks-v1`, 1.5 for `session-module-v1`, and 1.6 for
+`debug-scopes-v1`.
 The `native-libraries-v1` feature carries a library
 name after each import's source location; empty names retain platform-default
 symbol resolution. Only C ABI imports may declare a library. The transport header
 includes versions, flags, payload size and a SHA-256 digest. The native reader
 validates the envelope and the typed program before constructing LLVM objects.
 Malformed, unsupported and incompatible inputs produce stable NIR diagnostics.
+
+`debug-scopes-v1` records an ordered scope vector after each function's blocks.
+Each scope contains a positive ID, its parent ID (zero denotes the function),
+and a source location. Parent scopes precede their children.
+Each debug local then carries its name, SSA value, scope ID and declaration
+location. Successive values of one variable retain its declaration identity;
+variables with the same name in nested scopes have separate identities.
+Instructions and terminators carry the scope ID active when they are lowered.
+The native backend maps these IDs directly to DWARF lexical blocks and updates
+debug values at definitions and control-flow joins. Source spans provide
+diagnostic locations; scope IDs determine lexical membership. This metadata
+does not change the executable runtime ABI.
 
 `task.generate<R>` (61) returns `R[]` and carries a virtual invoke-slot symbol,
 an unsafe capability, count, parallelism, and callback. The capability makes the

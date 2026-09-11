@@ -316,6 +316,8 @@ public:
       if (feature == "session-module-v1") session_module_ = true;
       if (feature == "scoped-tasks-v1" && transport_minor_ < 4U)
         fail(unsupported_feature, "Scoped tasks require IR transport 1.4.", input_.offset());
+      if (feature == "debug-scopes-v1" && transport_minor_ < 6U)
+        fail(unsupported_feature, "Debug scopes require IR transport 1.6.", input_.offset());
     }
     if (native_libraries_ && transport_minor_ < 2U) {
       fail(unsupported_feature, "Native libraries require IR transport 1.2.", input_.offset());
@@ -615,6 +617,9 @@ private:
     });
     result.flag = input_.boolean();
     result.location = read_location();
+    if (transport_minor_ >= 6U) {
+      result.debug_scope_id = input_.model_id("instruction debug scope");
+    }
     return result;
   }
 
@@ -645,6 +650,9 @@ private:
            tag_offset);
     }
     result.location = read_location();
+    if (transport_minor_ >= 6U) {
+      result.debug_scope_id = input_.model_id("terminator debug scope");
+    }
     return result;
   }
 
@@ -681,11 +689,29 @@ private:
     result.location = read_location();
     result.blocks = read_vector<block>(input_, "function blocks",
                                        [this] { return read_block(); });
+    if (transport_minor_ >= 6U) {
+      result.debug_scopes = read_vector<debug_scope>(
+          input_, "debug scopes", [this] {
+            debug_scope value{input_.model_id("debug scope ID"),
+                              input_.model_id("debug scope parent"), {}};
+            const auto location = read_location();
+            if (!location.has_value()) {
+              fail(malformed_module, "Debug scope requires a source location.",
+                   input_.offset());
+            }
+            value.location = *location;
+            return value;
+          });
+    }
     if (transport_minor_ >= 1U) {
       result.debug_locals = read_vector<debug_local>(
           input_, "debug locals", [this] {
             debug_local value{input_.utf8(),
-                              input_.model_id("debug local value"), {}};
+                              input_.model_id("debug local value"),
+                              transport_minor_ >= 6U
+                                  ? input_.model_id("debug local scope")
+                                  : 0U,
+                              {}};
             const auto location = read_location();
             if (!location.has_value()) {
               fail(malformed_module, "Debug local requires a source location.",
