@@ -26,7 +26,9 @@ class SessionSourceSnapshot
   private sources: StringBuffer = new StringBuffer()
   private libraryNames: StringBuffer = new StringBuffer()
   private librarySources: StringBuffer = new StringBuffer()
+  private libraryBytes: Int = 0
   public error: String = ""
+  public configuration: String = ""
 
   def add(path: String, source: String): Void
     if this.error != ""
@@ -58,49 +60,75 @@ class SessionSourceSnapshot
     let result = new SessionSourceSnapshot()
     var path = this.paths.first.nextNode
     var source = this.sources.first.nextNode
+
     while path != null && source != null
-      result.add(path.value, source.value)
+      result.paths.add(path.value)
+      result.sources.add(source.value)
       path = path.nextNode
       source = source.nextNode
     end
+    result.text = this.text
+    var finish = this.finishes.first.nextNode
+
+    while finish != null
+      result.finishes.add(finish.value)
+      finish = finish.nextNode
+    end
     var name = this.libraryNames.first.nextNode
     var library = this.librarySources.first.nextNode
+
     while name != null && library != null
       result.addLibrary(name.value, library.value)
       name = name.nextNode
       library = library.nextNode
     end
     result.error = this.error
+    result.configuration = this.configuration
+    return result
+  end
+
+  def cacheInputs(): String
+    var result = runCacheFrame(this.configuration)
+    var path = this.paths.first.nextNode
+
+    while path != null
+      result = result + runCacheFrame(path.value)
+      path = path.nextNode
+    end
     return result
   end
 
   def captureLibraries(source: String): Void
     let directory = host.environment("NERI_STDLIB")
+
     if directory == null
       return
     end
-    var scanned = source + this.librarySource()
-    var pending = true
-    while pending
+    let pending = new StringBuffer()
+    var index = 0
+
+    pending.add(source)
+    while index < pending.size
       if this.error != ""
         return
       end
-      pending = false
-      for name in bootstrapLibraryImports(scanned)
+      for name in bootstrapLibraryImports(pending.get(index))
         if !this.hasLibrary(name)
           let text = host.readText(directory + "/" + name + ".hk")
+
           if text != null
             this.addLibrary(name, text)
-            scanned = scanned + text + "\n"
-            pending = true
+            pending.add(text)
           end
         end
       end
+      index = index + 1
     end
   end
 
   private def hasLibrary(name: String): Bool
     var item = this.libraryNames.first.nextNode
+
     while item != null
       if item.value == name
         return true
@@ -111,12 +139,13 @@ class SessionSourceSnapshot
   end
 
   private def addLibrary(name: String, source: String): Void
-    if host.stringByteLength(this.text) + host.stringByteLength(this.librarySource()) > 1048576 - host.stringByteLength(source) - 1
+    if host.stringByteLength(this.text) + this.libraryBytes > 1048576 - host.stringByteLength(source) - 1
       this.error = "Project and standard-library snapshot exceeds 1048576 bytes."
       return
     end
     this.libraryNames.add(name)
     this.librarySources.add(source)
+    this.libraryBytes = this.libraryBytes + host.stringByteLength(source) + 1
   end
 
   def libraryCount(): Int
@@ -134,6 +163,7 @@ class SessionSourceSnapshot
   def librarySource(): String
     var result = ""
     var source = this.librarySources.first.nextNode
+
     while source != null
       result = result + source.value + "\n"
       source = source.nextNode
@@ -141,14 +171,39 @@ class SessionSourceSnapshot
     return result
   end
 
+  def librarySuffix(first: Int): String
+    var result = ""
+    var index = first
+
+    while index < this.libraryCount()
+      result = result + this.librarySourceAt(index) + "\n"
+      index = index + 1
+    end
+    return result
+  end
+
+  def applyLibraryBoundaries(parser: BootstrapParser, start: Int, first: Int): Void
+    var offset = start
+    var index = first
+
+    while index < this.libraryCount()
+      parser.addSourceBoundary(offset)
+      offset = offset + utf16Length(this.librarySourceAt(index) + "\n")
+      index = index + 1
+    end
+    parser.addSourceBoundary(offset)
+  end
+
   def applyBoundaries(parser: BootstrapParser, insertedBeforeLibraries: Int = 0): Void
     var index = 0
+
     while index < this.finishes.size
       parser.addSourceBoundary(this.finishes.get(index))
       index = index + 1
     end
     var finish = utf16Length(this.text) + insertedBeforeLibraries
     var library = this.librarySources.first.nextNode
+
     if library != null
       parser.addSourceBoundary(finish)
     end
@@ -162,6 +217,7 @@ class SessionSourceSnapshot
   def sourceIdentityAt(position: Int): String
     var index = 0
     var path = this.paths.first.nextNode
+
     while index < this.finishes.size && path != null
       if position < this.finishes.get(index)
         return path.value
@@ -175,13 +231,54 @@ end
 
 def sessionSnapshotFromProject(project: NeriProject): SessionSourceSnapshot
   let snapshot = new SessionSourceSnapshot()
+
   if project.error != ""
     snapshot.error = project.error
     return snapshot
   end
+  let manifests = new StringBuffer()
+  var owner = project.sourceOwners.first.nextNode
+
+  while owner != null
+    var separator = -1
+    var index = 0
+
+    while index < host.stringByteLength(owner.value)
+      if host.stringByteAt(owner.value, index) == (35 as Byte)
+        separator = index
+      end
+      index = index + 1
+    end
+    if separator >= 0
+      let manifestPath = host.stringSlice(owner.value, 0, separator)
+      var found = false
+      var known = manifests.first.nextNode
+
+      while known != null
+        if known.value == manifestPath
+          found = true
+        end
+        known = known.nextNode
+      end
+      if !found
+        let content = host.readText(manifestPath)
+
+        if content == null
+          snapshot.error = "Cannot read project configuration: " + manifestPath
+          return snapshot
+        end
+        manifests.add(manifestPath)
+        snapshot.configuration = snapshot.configuration + runCacheFrame(manifestPath) + runCacheFrame(content)
+      end
+    end
+    snapshot.configuration = snapshot.configuration + runCacheFrame(owner.value)
+    owner = owner.nextNode
+  end
   var entry = project.sources.first.nextNode
+
   while entry != null
     let source = host.readText(entry.value)
+
     if source == null
       snapshot.error = "Cannot read project source: " + entry.value
       return snapshot
@@ -238,6 +335,7 @@ class PreparedSubmission
   public firstType: SessionTypeMetadata?
   public bindingCount: Int = 0
   public declarationCount: Int = 0
+  public resultType: String = "Void"
   public consumed: Bool = false
 
   def init(generation: Int, owner: String, ownerEnvironment: Int, candidateId: Int): Void
@@ -257,6 +355,7 @@ class PreparedSubmission
 
   def addDiagnostic(code: String, start: Int, length: Int, message: String): Void
     let diagnostic = new SessionDiagnostic(code, start, length, message)
+
     diagnostic.next = this.diagnostics
     this.diagnostics = diagnostic
   end
@@ -273,31 +372,112 @@ class PreparedSubmission
   end
 end
 
+class SessionCompilation
+  public error: String = ""
+  public model: SemanticModel
+  public syntax: SyntaxArena
+  public source: String
+  public parent: SessionCompilation?
+  public sourceStart: Int = 0
+  public sourceEnd: Int
+  public identity: String
+  private lowered: IrModule?
+
+  def init(model: SemanticModel, syntax: SyntaxArena, source: String, parent: SessionCompilation? = null): Void
+    this.model = model
+    this.syntax = syntax
+    this.source = source
+    this.parent = parent
+    var predecessor = ""
+
+    if parent != null
+      this.sourceStart = parent.sourceEnd
+      predecessor = parent.identity
+    end
+    this.sourceEnd = this.sourceStart + utf16Length(source)
+    this.identity = sessionCodeDigest(runCacheFrame(predecessor) + runCacheFrame(source))
+  end
+
+  def lower(): IrModule?
+    let lowered = this.lowered
+
+    if lowered != null
+      return lowered
+    end
+    let lowerer = new IrLowerer(this.model, this.syntax, this.source, "neri-session")
+    let sourceIds = new StringBuffer()
+    let sourceTexts = new StringBuffer()
+    let sourceStarts = new IntBuffer()
+
+    sourceIds.add("session/" + this.identity)
+    sourceTexts.add(this.source)
+    sourceStarts.add(this.sourceStart)
+    lowerer.setSources(sourceIds, sourceTexts, sourceStarts)
+    let parent = this.parent
+
+    if parent != null
+      let previous = parent.lower()
+
+      if previous == null
+        return null
+      end
+      lowerer.retain(previous)
+    end
+    let module = lowerer.lower()
+
+    if this.model.diagnostics.count() != 0
+      this.error = this.model.diagnostics.codes.get(0) + ": " + this.model.diagnostics.messages.get(0)
+      return null
+    end
+    var entry = module.firstFunction
+
+    while entry != null
+      if entry.symbol.name == "__neri_session_entry"
+        module.exportSession(entry, this.identity)
+        let verification = irVerify(module)
+
+        if verification.succeeded()
+          this.lowered = module
+          return module
+        end
+        this.error = verification.errors.get(0)
+        return null
+      end
+      entry = entry.nextFunction
+    end
+    return null
+  end
+end
+
 class PendingSubmission
   public candidateId: Int
   public generation: Int
   public declarations: String
   public statements: String
-  public frameSource: String
   public firstBinding: SessionBinding?
   public bindingCount: Int
   public declarationCount: Int
   public executionSource: String
   public snapshot: SessionSourceSnapshot?
+  public compilation: SessionCompilation?
+  public resultType: String
+  public establishesProject: Bool
   public claimed: Bool = false
   public next: PendingSubmission?
 
-  def init(prepared: PreparedSubmission, candidateId: Int, snapshot: SessionSourceSnapshot?): Void
+  def init(prepared: PreparedSubmission, candidateId: Int, snapshot: SessionSourceSnapshot?, compilation: SessionCompilation?, establishesProject: Bool): Void
     this.candidateId = candidateId
     this.generation = prepared.generation
     this.declarations = prepared.declarations
     this.statements = prepared.statements
-    this.frameSource = prepared.frameSource
     this.firstBinding = copyBindings(prepared.firstBinding)
     this.bindingCount = prepared.bindingCount
     this.declarationCount = prepared.declarationCount
     this.executionSource = prepared.executionSource
     this.snapshot = snapshot
+    this.compilation = compilation
+    this.resultType = prepared.resultType
+    this.establishesProject = establishesProject
   end
 end
 
@@ -308,8 +488,6 @@ class SessionEnvironment
   private snapshot: SessionSourceSnapshot?
   private initializationError: String = ""
   private nextCandidateId: Int = 1
-  private declarations: String = ""
-  private frames: String = ""
   private firstBinding: SessionBinding?
   private generation: Int = 0
   private declarationsUsed: Int = 0
@@ -318,6 +496,7 @@ class SessionEnvironment
   private disposed: Bool = false
   private pending: PendingSubmission?
   private pendingCount: Int = 0
+  private compilation: SessionCompilation?
 
   def init(identity: String, snapshot: SessionSourceSnapshot? = null): Void
     this.identity = identity
@@ -326,6 +505,7 @@ class SessionEnvironment
     end
     if snapshot != null
       let frozen = snapshot.frozenCopy()
+
       this.snapshot = frozen
       this.baseSource = frozen.source()
       this.initializationError = frozen.error
@@ -334,6 +514,7 @@ class SessionEnvironment
 
   def prepare(source: String): PreparedSubmission
     let prepared = new PreparedSubmission(this.generation, this.identity, this.environmentIdentity, this.nextCandidateId)
+
     this.nextCandidateId = this.nextCandidateId + 1
     if this.disposed
       prepared.addDiagnostic("NR_SESSION_DISPOSED", 0, 1, "The session has been disposed.")
@@ -344,20 +525,25 @@ class SessionEnvironment
       return prepared
     end
     let size = host.stringByteLength(source)
+
     if size > 1048576 || this.sourceBytes > 1048576 - size
       prepared.addDiagnostic("NR_SESSION_LIMIT", 0, 1, "Session source exceeds the 1048576-byte limit.")
       return prepared
     end
     let lexer = new BootstrapLexer(source)
     let tokens = lexer.lex()
+
     if rejectReservedSessionNames(tokens, prepared)
       return prepared
     end
+    let referencedBindings = sessionReferencedBindings(this.firstBinding, tokens)
     let parser = new BootstrapParser(tokens)
     let submission = parser.parseSubmission()
+
     prepared.status = submission.status
     if tokens.count() > 1
       let finalToken = tokens.count() - 2
+
       if tokens.kindAt(finalToken) == "BadToken" && startsWithQuote(tokens.textAt(finalToken))
         prepared.status = "incomplete"
       end
@@ -374,56 +560,112 @@ class SessionEnvironment
       prepared.addDiagnostic("NR_SESSION_LIMIT", 0, 1, "Session declaration count exceeds 1024.")
       return prepared
     end
-    let prefix = this.baseSource + this.declarations + prepared.declarations + this.frames + entryPrefix(this.generation, this.firstBinding)
+    let retained = this.compilation
+    var sourceOffset = 0
+    var retainedModel: SemanticModel? = null
+    var retainedSyntax: SyntaxArena? = null
+    var contextSource = this.baseSource
+    var firstLibrary = 0
+
+    if retained != null
+      sourceOffset = retained.sourceEnd
+      retainedModel = retained.model
+      retainedSyntax = retained.syntax
+      contextSource = ""
+      let snapshot = this.snapshot
+
+      if snapshot != null
+        firstLibrary = snapshot.libraryCount()
+      end
+    end
+    let declarationOffset = sourceOffset + utf16Length(contextSource)
+    let prefix = contextSource + prepared.declarations + entryPrefix(this.generation, referencedBindings)
     let analysisProgram = prefix + indentSubmission(prepared.statements) + "end\n"
     var candidateSnapshot = new SessionSourceSnapshot()
     let currentSnapshot = this.snapshot
+
     if currentSnapshot != null
       candidateSnapshot = currentSnapshot.frozenCopy()
     end
-    candidateSnapshot.captureLibraries(analysisProgram)
+    candidateSnapshot.captureLibraries(contextSource + prepared.declarations + prepared.statements)
     if candidateSnapshot.error != ""
       prepared.status = "invalid"
       prepared.addDiagnostic("NR_SESSION_PROJECT", 0, 1, candidateSnapshot.error)
       return prepared
     end
-    prepared.analysisSource = analysisProgram + candidateSnapshot.librarySource()
-    let analysisLexer = new BootstrapLexer(prepared.analysisSource)
+    let librarySource = candidateSnapshot.librarySuffix(firstLibrary)
+
+    prepared.analysisSource = analysisProgram + librarySource
+    let analysisLexer = new BootstrapLexer(analysisProgram + librarySource)
+
+    analysisLexer.utf16Position = sourceOffset
     let analysisTokens = analysisLexer.lex()
-    let analysisParser = new BootstrapParser(analysisTokens)
-    candidateSnapshot.applyBoundaries(analysisParser, utf16Length(analysisProgram) - utf16Length(this.baseSource))
+    let analysisParser = new BootstrapParser(analysisTokens, retainedSyntax)
+
+    analysisParser.sessionExpressions = true
+    if retained == null
+      candidateSnapshot.applyBoundaries(analysisParser, utf16Length(analysisProgram) - utf16Length(this.baseSource))
+    else
+      candidateSnapshot.applyLibraryBoundaries(analysisParser, sourceOffset + utf16Length(analysisProgram), firstLibrary)
+    end
     let root = analysisParser.parseProgram()
+
     if analysisParser.diagnostics.count() > 0
       prepared.status = "invalid"
       copyMappedDiagnostics(analysisParser.diagnostics, prepared, source, submission,
-        utf16Length(this.baseSource + this.declarations), utf16Length(prefix))
+        declarationOffset, sourceOffset + utf16Length(prefix))
       return prepared
     end
-    let binder = new BootstrapBinder(analysisParser.arena, root, analysisTokens.startAt(analysisTokens.count() - 1))
+    let binder = new BootstrapBinder(analysisParser.arena, root, analysisTokens.startAt(analysisTokens.count() - 1), retainedModel)
+
     binder.requireEntryPoint = false
+    binder.allowSessionEntryReplacement = true
     let model = binder.bind()
+
     if model.diagnostics.count() > 0
       prepared.status = "invalid"
       copyMappedDiagnostics(model.diagnostics, prepared, source, submission,
-        utf16Length(this.baseSource + this.declarations), utf16Length(prefix))
+        declarationOffset, sourceOffset + utf16Length(prefix))
       return prepared
     end
     let entry = model.findFunction(prepared.entryName)
+
     if entry == null
       prepared.status = "invalid"
       prepared.addDiagnostic("NR_SESSION_INTERNAL", 0, 1, "Generated session entry is missing.")
       return prepared
     end
+    var executionStatements = prepared.statements
+    let bodyCount = model.bound.childCountAt(entry.boundNode)
+
+    if submission.statementCount > 0 && bodyCount > 0
+      let finalStatement = model.bound.childAt(entry.boundNode, bodyCount - 1)
+
+      if model.bound.kindAt(finalStatement) == "ExpressionStatement"
+        let expression = model.bound.childAt(finalStatement, 0)
+
+        prepared.resultType = model.bound.typeAt(expression)
+        if prepared.resultType != "Void"
+          let last = submission.statementStarts.size - 1
+          let tail = submissionPart(source, submission.statementStarts.get(last), submission.statementLengths.get(last))
+          let byteStart = host.stringByteLength(prepared.statements) - host.stringByteLength(tail)
+
+          executionStatements = host.stringSlice(prepared.statements, 0, byteStart) + "let __neri_session_result = " + tail
+        end
+      end
+    end
     var local = entry.firstSessionLocal
+
     while local != null
       if !this.hasBinding(local.name)
         let binding = new SessionBinding(local.name, local.typeName, local.mutable, local.name)
+
         binding.identity = "session/" + (this.generation as String) + "/" + local.identity
         prepared.addBinding(binding)
       end
       local = local.nextLocal
     end
-    collectSubmittedTypes(model, analysisParser.arena, prepared, utf16Length(this.baseSource + this.declarations), utf16Length(prepared.declarations))
+    collectSubmittedTypes(model, analysisParser.arena, prepared, declarationOffset, utf16Length(prepared.declarations))
     if this.bindingsUsed + prepared.bindingCount > 1024
       prepared.status = "invalid"
       prepared.addDiagnostic("NR_SESSION_LIMIT", 0, 1, "Session binding count exceeds 1024.")
@@ -432,31 +674,42 @@ class SessionEnvironment
       return prepared
     end
     prepared.frameSource = sessionFrameSource(this.generation, prepared.firstBinding)
-    prepared.executionSource = this.declarations + prepared.declarations + this.frames + prepared.frameSource + executionEntrySource(this.generation, this.firstBinding, prepared.firstBinding, prepared.statements)
-    let executionProgram = this.baseSource + prepared.executionSource
-    let executionAnalysisSource = executionProgram + candidateSnapshot.librarySource()
-    let executionLexer = new BootstrapLexer(executionAnalysisSource)
+    prepared.executionSource = contextSource + prepared.declarations + prepared.frameSource + executionEntrySource(this.generation, referencedBindings, prepared.firstBinding, executionStatements, prepared.resultType)
+    let executionProgram = prepared.executionSource
+    let executionAnalysisSource = executionProgram + librarySource
+    let executionLexer = new BootstrapLexer(executionProgram + librarySource)
+
+    executionLexer.utf16Position = sourceOffset
     let executionTokens = executionLexer.lex()
-    let executionParser = new BootstrapParser(executionTokens)
-    candidateSnapshot.applyBoundaries(executionParser, utf16Length(prepared.executionSource))
+    let executionParser = new BootstrapParser(executionTokens, retainedSyntax)
+
+    if retained == null
+      candidateSnapshot.applyBoundaries(executionParser, utf16Length(prepared.executionSource))
+    else
+      candidateSnapshot.applyLibraryBoundaries(executionParser, sourceOffset + utf16Length(executionProgram), firstLibrary)
+    end
     let executionRoot = executionParser.parseProgram()
+
     if executionParser.diagnostics.count() > 0
       prepared.status = "invalid"
       copyMappedDiagnostics(executionParser.diagnostics, prepared, source, submission,
-        utf16Length(this.baseSource + this.declarations), utf16Length(this.baseSource + this.declarations + prepared.declarations + this.frames + prepared.frameSource + executionEntryPrefix(this.generation, this.firstBinding)))
+        declarationOffset, sourceOffset + utf16Length(contextSource + prepared.declarations + prepared.frameSource + executionEntryPrefix(this.generation, referencedBindings)))
       return prepared
     end
-    let executionBinder = new BootstrapBinder(executionParser.arena, executionRoot, executionTokens.startAt(executionTokens.count() - 1))
+    let executionBinder = new BootstrapBinder(executionParser.arena, executionRoot, executionTokens.startAt(executionTokens.count() - 1), retainedModel)
+
     executionBinder.requireEntryPoint = false
+    executionBinder.allowSessionEntryReplacement = true
     let executionModel = executionBinder.bind()
+
     if executionModel.diagnostics.count() > 0
       prepared.status = "invalid"
       copyMappedDiagnostics(executionModel.diagnostics, prepared, source, submission,
-        utf16Length(this.baseSource + this.declarations), utf16Length(this.baseSource + this.declarations + prepared.declarations + this.frames + prepared.frameSource + executionEntryPrefix(this.generation, this.firstBinding)))
+        declarationOffset, sourceOffset + utf16Length(contextSource + prepared.declarations + prepared.frameSource + executionEntryPrefix(this.generation, referencedBindings)))
       return prepared
     end
     prepared.status = "complete"
-    if !this.register(prepared, candidateSnapshot)
+    if !this.register(prepared, candidateSnapshot, new SessionCompilation(executionModel, executionParser.arena, executionAnalysisSource, retained))
       prepared.status = "invalid"
       prepared.addDiagnostic("NR_SESSION_LIMIT", 0, 1, "Session has 1024 active prepared submissions.")
     end
@@ -468,6 +721,7 @@ class SessionEnvironment
       return false
     end
     var claimed = this.pending
+
     while claimed != null
       if claimed.claimed && !prepared.matches(this.identity, this.environmentIdentity, claimed.candidateId)
         return false
@@ -478,20 +732,23 @@ class SessionEnvironment
       claimed = claimed.next
     end
     let pending = this.removePending(prepared)
+
     if pending == null || pending.generation != this.generation
       return false
     end
     prepared.consumed = true
-    this.declarations = this.declarations + pending.declarations
-    this.frames = this.frames + pending.frameSource
+    this.compilation = pending.compilation
     var existing = this.firstBinding
+
     while existing != null
       existing.access = "__neri_session_previous." + existing.access
       existing = existing.next
     end
     var binding = pending.firstBinding
+
     while binding != null
       let next = binding.next
+
       binding.next = this.firstBinding
       this.firstBinding = binding
       binding = next
@@ -500,8 +757,12 @@ class SessionEnvironment
     this.bindingsUsed = this.bindingsUsed + pending.bindingCount
     this.sourceBytes = this.sourceBytes + host.stringByteLength(pending.declarations) + host.stringByteLength(pending.statements)
     let committedSnapshot = pending.snapshot
+
     if committedSnapshot != null
       this.snapshot = committedSnapshot.frozenCopy()
+      if pending.establishesProject
+        this.baseSource = committedSnapshot.source()
+      end
     end
     this.generation = this.generation + 1
     this.pending = null
@@ -515,6 +776,7 @@ class SessionEnvironment
     end
     var item = this.pending
     var selected: PendingSubmission? = null
+
     while item != null
       if item.claimed
         return null
@@ -533,6 +795,7 @@ class SessionEnvironment
 
   def releaseExecution(prepared: PreparedSubmission): Bool
     var item = this.pending
+
     while item != null
       if prepared.matches(this.identity, this.environmentIdentity, item.candidateId) && item.claimed
         item.claimed = false
@@ -545,9 +808,11 @@ class SessionEnvironment
 
   def claimedSnapshot(prepared: PreparedSubmission): SessionSourceSnapshot?
     var item = this.pending
+
     while item != null
       if item.claimed && prepared.matches(this.identity, this.environmentIdentity, item.candidateId)
         let snapshot = item.snapshot
+
         if snapshot != null
           return snapshot.frozenCopy()
         end
@@ -558,8 +823,54 @@ class SessionEnvironment
     return null
   end
 
+  def claimedModule(prepared: PreparedSubmission): IrModule?
+    var item = this.pending
+
+    while item != null
+      if item.claimed && prepared.matches(this.identity, this.environmentIdentity, item.candidateId)
+        let compilation = item.compilation
+
+        if compilation != null
+          return compilation.lower()
+        end
+        return null
+      end
+      item = item.next
+    end
+    return null
+  end
+
+  def claimedResultType(prepared: PreparedSubmission): String
+    var item = this.pending
+
+    while item != null
+      if item.claimed && prepared.matches(this.identity, this.environmentIdentity, item.candidateId)
+        return item.resultType
+      end
+      item = item.next
+    end
+    return "Void"
+  end
+
+  def claimedCompilationError(prepared: PreparedSubmission): String
+    var item = this.pending
+
+    while item != null
+      if item.claimed && prepared.matches(this.identity, this.environmentIdentity, item.candidateId)
+        let compilation = item.compilation
+
+        if compilation != null
+          return compilation.error
+        end
+      end
+      item = item.next
+    end
+    return ""
+  end
+
   def discard(prepared: PreparedSubmission): Bool
     var claimed = this.pending
+
     while claimed != null
       if claimed.claimed && prepared.matches(this.identity, this.environmentIdentity, claimed.candidateId)
         return false
@@ -567,6 +878,7 @@ class SessionEnvironment
       claimed = claimed.next
     end
     let pending = this.removePending(prepared)
+
     if pending == null
       if prepared.consumed || prepared.generation != this.generation || !prepared.belongsTo(this.identity, this.environmentIdentity)
         return false
@@ -586,18 +898,20 @@ class SessionEnvironment
 
   def dispose(): Void
     this.disposed = true
-    this.declarations = ""
-    this.frames = ""
     this.firstBinding = null
     this.declarationsUsed = 0
     this.bindingsUsed = 0
     this.sourceBytes = 0
     this.pending = null
     this.pendingCount = 0
+    this.compilation = null
+    this.snapshot = null
+    this.baseSource = ""
   end
 
   def validateInitializer(snapshot: SessionSourceSnapshot, name: String, bindingName: String = "service", imports: String = ""): PreparedSubmission
     let prepared = new PreparedSubmission(this.generation, this.identity, this.environmentIdentity, this.nextCandidateId)
+
     this.nextCandidateId = this.nextCandidateId + 1
     if this.disposed
       prepared.addDiagnostic("NR_SESSION_DISPOSED", 0, 1, "The session has been disposed.")
@@ -608,6 +922,7 @@ class SessionEnvironment
       return prepared
     end
     let bindingTokens = new BootstrapLexer(bindingName).lex()
+
     if bindingTokens.count() != 2 || bindingTokens.kindAt(0) != "Identifier" || bindingTokens.textAt(0) != bindingName
       prepared.addDiagnostic("NR_SESSION_INITIALIZER", 0, 1, "Initializer binding must be one identifier.")
       return prepared
@@ -616,6 +931,7 @@ class SessionEnvironment
       return prepared
     end
     let importParser = new BootstrapParser(new BootstrapLexer(imports).lex())
+
     importParser.skipNewLines()
     while importParser.currentKind() == "Use"
       importParser.parseUse()
@@ -629,6 +945,7 @@ class SessionEnvironment
     let candidateSnapshot = snapshot.frozenCopy()
     let source = candidateSnapshot.source()
     let size = host.stringByteLength(source)
+
     if size > 1048576 || host.stringByteLength(contextImports) > 1048576 - size || this.sourceBytes > 1048576 - size - host.stringByteLength(contextImports)
       prepared.addDiagnostic("NR_SESSION_LIMIT", 0, 1, "Session source exceeds the 1048576-byte limit.")
       return prepared
@@ -641,36 +958,41 @@ class SessionEnvironment
     let analysisSource = source + contextImports + candidateSnapshot.librarySource()
     let lexer = new BootstrapLexer(analysisSource)
     let tokens = lexer.lex()
+
     if rejectReservedSessionNames(tokens, prepared)
       return prepared
     end
     let parser = new BootstrapParser(tokens)
+
     candidateSnapshot.applyBoundaries(parser, utf16Length(contextImports))
     let root = parser.parseProgram()
+
     if parser.diagnostics.count() > 0
       copySessionDiagnostics(parser.diagnostics, prepared, 0, 0, false)
       return prepared
     end
     let binder = new BootstrapBinder(parser.arena, root, tokens.startAt(tokens.count() - 1))
+
     binder.requireEntryPoint = false
     let model = binder.bind()
+
     if model.diagnostics.count() > 0
       copySessionDiagnostics(model.diagnostics, prepared, 0, 0, false)
       return prepared
     end
     let programData = parser.arena.dataAt(root)
+
     prepared.declarationCount = semanticIntField(programData, 1) + semanticIntField(programData, 2) + semanticIntField(programData, 3)
     if this.declarationsUsed + prepared.declarationCount > 1024
       prepared.addDiagnostic("NR_SESSION_LIMIT", 0, 1, "Session declaration count exceeds 1024.")
       return prepared
     end
     let initializer = model.findFunction(name)
+
     if initializer == null || initializer.parameterCount != 0 || initializer.returnType == "Void" || initializer.isUnsafe
       prepared.addDiagnostic("NR_SESSION_INITIALIZER", 0, 1, "Initializer must name a safe zero-argument function with a value result.")
       return prepared
     end
-    this.snapshot = candidateSnapshot.frozenCopy()
-    this.baseSource = source
     prepared.declarations = contextImports
     prepared.addBinding(new SessionBinding(bindingName, initializer.returnType, false, bindingName))
     if this.bindingsUsed + prepared.bindingCount > 1024
@@ -680,20 +1002,44 @@ class SessionEnvironment
       return prepared
     end
     prepared.frameSource = sessionFrameSource(this.generation, prepared.firstBinding)
-    prepared.executionSource = contextImports + this.frames + prepared.frameSource + initializerEntrySource(this.generation, name, initializer.returnType, bindingName)
+    prepared.executionSource = contextImports + prepared.frameSource + initializerEntrySource(this.generation, name, initializer.returnType, bindingName)
+    let executionFragment = prepared.frameSource + initializerEntrySource(this.generation, name, initializer.returnType, bindingName)
+    let executionSource = analysisSource + executionFragment
+    let executionLexer = new BootstrapLexer(executionFragment)
+
+    executionLexer.utf16Position = utf16Length(analysisSource)
+    let executionTokens = executionLexer.lex()
+    let executionParser = new BootstrapParser(executionTokens, parser.arena)
+    let executionRoot = executionParser.parseProgram()
+
+    if executionParser.diagnostics.count() != 0
+      copySessionDiagnostics(executionParser.diagnostics, prepared, 0, 0, false)
+      return prepared
+    end
+    let executionBinder = new BootstrapBinder(executionParser.arena, executionRoot, executionTokens.startAt(executionTokens.count() - 1), model)
+
+    executionBinder.requireEntryPoint = false
+    let executionModel = executionBinder.bindChild()
+
+    if executionModel.diagnostics.count() != 0
+      copySessionDiagnostics(executionModel.diagnostics, prepared, 0, 0, false)
+      return prepared
+    end
+    sessionOwnInitializerDeclarations(executionModel, model)
     prepared.status = "complete"
-    if !this.register(prepared, candidateSnapshot)
+    if !this.register(prepared, candidateSnapshot, new SessionCompilation(executionModel, executionParser.arena, executionSource), true)
       prepared.status = "invalid"
       prepared.addDiagnostic("NR_SESSION_LIMIT", 0, 1, "Session has 1024 active prepared submissions.")
     end
     return prepared
   end
 
-  private def register(prepared: PreparedSubmission, snapshot: SessionSourceSnapshot): Bool
+  private def register(prepared: PreparedSubmission, snapshot: SessionSourceSnapshot, compilation: SessionCompilation?, establishesProject: Bool = false): Bool
     if this.pendingCount >= 1024
       return false
     end
-    let item = new PendingSubmission(prepared, this.nextCandidateId - 1, snapshot.frozenCopy())
+    let item = new PendingSubmission(prepared, this.nextCandidateId - 1, snapshot.frozenCopy(), compilation, establishesProject)
+
     item.next = this.pending
     this.pending = item
     this.pendingCount = this.pendingCount + 1
@@ -703,6 +1049,7 @@ class SessionEnvironment
   private def removePending(prepared: PreparedSubmission): PendingSubmission?
     var previous: PendingSubmission? = null
     var item = this.pending
+
     while item != null
       if prepared.matches(this.identity, this.environmentIdentity, item.candidateId)
         if previous == null
@@ -722,6 +1069,7 @@ class SessionEnvironment
 
   private def hasBinding(name: String): Bool
     var binding = this.firstBinding
+
     while binding != null
       if binding.name == name
         return true
@@ -732,11 +1080,47 @@ class SessionEnvironment
   end
 end
 
+# The initializer's project model is private to this candidate. Both declaration
+# sets are emitted in its first native module; subsequent submissions retain it.
+def sessionOwnInitializerDeclarations(child: SemanticModel, project: SemanticModel): Void
+  let lastClass = child.lastClass
+  let lastFunction = child.lastFunction
+  let lastRecord = child.lastRecord
+
+  if lastClass == null
+    child.firstClass = project.firstClass
+  else
+    lastClass.nextClass = project.firstClass
+  end
+  if project.lastClass != null
+    child.lastClass = project.lastClass
+  end
+  if lastFunction == null
+    child.firstFunction = project.firstFunction
+  else
+    lastFunction.nextCallable = project.firstFunction
+  end
+  if project.lastFunction != null
+    child.lastFunction = project.lastFunction
+  end
+  if lastRecord == null
+    child.firstRecord = project.firstRecord
+  else
+    lastRecord.nextRecord = project.firstRecord
+  end
+  if project.lastRecord != null
+    child.lastRecord = project.lastRecord
+  end
+  child.parent = null
+end
+
 def rejectReservedSessionNames(tokens: TokenBuffer, prepared: PreparedSubmission): Bool
   var index = 0
+
   while index < tokens.count()
     if tokens.kindAt(index) == "Identifier"
       let name = tokens.textAt(index)
+
       if textStartsWith(name, "__neri_session_") || textStartsWith(name, "__NeriSessionState")
         prepared.addDiagnostic("NR_SESSION_RESERVED", tokens.startAt(index), tokens.lengthAt(index), "Identifier uses the reserved session namespace.")
         return true
@@ -750,10 +1134,12 @@ end
 def textStartsWith(text: String, prefix: String): Bool
   let textSize = host.stringByteLength(text)
   let prefixSize = host.stringByteLength(prefix)
+
   if textSize < prefixSize
     return false
   end
   var index = 0
+
   while index < prefixSize
     if host.stringByteAt(text, index) != host.stringByteAt(prefix, index)
       return false
@@ -763,20 +1149,48 @@ def textStartsWith(text: String, prefix: String): Bool
   return true
 end
 
+def sessionReferencedBindings(source: SessionBinding?, tokens: TokenBuffer): SessionBinding?
+  var result: SessionBinding? = null
+  var binding = source
+
+  while binding != null
+    var index = 0
+    var referenced = false
+
+    while index < tokens.count() && !referenced
+      referenced = tokens.kindAt(index) == "Identifier" && tokens.textAt(index) == binding.name
+      index = index + 1
+    end
+    if referenced
+      let copy = new SessionBinding(binding.name, binding.typeName, binding.mutable, binding.access)
+
+      copy.identity = binding.identity
+      copy.next = result
+      result = copy
+    end
+    binding = binding.next
+  end
+  return result
+end
+
 def copyBindings(source: SessionBinding?): SessionBinding?
   var first: SessionBinding? = null
   var item = source
+
   while item != null
     let copied = new SessionBinding(item.name, item.typeName, item.mutable, item.access)
+
     copied.identity = item.identity
     copied.next = first
     first = copied
     item = item.next
   end
   var reversed: SessionBinding? = null
+
   item = first
   while item != null
     let next = item.next
+
     item.next = reversed
     reversed = item
     item = next
@@ -786,12 +1200,15 @@ end
 
 def collectSubmittedTypes(model: SemanticModel, syntax: SyntaxArena, prepared: PreparedSubmission, start: Int, length: Int): Void
   var symbol = model.firstClass
+
   while symbol != null
     if symbol.genericOrigin < 0 && symbol.syntaxNode >= 0
       let position = syntax.startAt(symbol.syntaxNode)
+
       if position >= start && position < start + length
         var layout = "class|" + symbol.fullName + "|base=" + symbol.baseName
         var field = symbol.firstField
+
         while field != null
           layout = layout + "|field=" + field.name + ":" + field.typeName
           field = field.nextField
@@ -806,6 +1223,7 @@ end
 def initializerEntrySource(generation: Int, name: String, returnType: String, bindingName: String = "service"): String
   let state = "__NeriSessionState" + (generation as String)
   var result = "def __neri_session_entry("
+
   if generation > 0
     result = result + "__neri_session_previous: __NeriSessionState" + ((generation - 1) as String)
   end
@@ -825,8 +1243,10 @@ end
 def utf16Length(text: String): Int
   var bytes = 0
   var units = 0
+
   while bytes < host.stringByteLength(text)
     let width = utf8Width(host.stringByteAt(text, bytes) as Int)
+
     units = units + (width == 4 ? 2 : 1)
     bytes = bytes + width
   end
@@ -836,24 +1256,33 @@ end
 def byteAtUtf16(text: String, target: Int): Int
   var bytes = 0
   var units = 0
+
   while bytes < host.stringByteLength(text) && units < target
     let width = utf8Width(host.stringByteAt(text, bytes) as Int)
+
     units = units + (width == 4 ? 2 : 1)
     bytes = bytes + width
   end
   return bytes
 end
 
+def submissionPart(source: String, start: Int, length: Int): String
+  let first = byteAtUtf16(source, start)
+  let finish = byteAtUtf16(source, start + length)
+  let text = host.stringSlice(source, first, finish - first)
+
+  if text != "" && host.stringByteAt(text, host.stringByteLength(text) - 1) != (10 as Byte)
+    return text + "\n"
+  end
+  return text
+end
+
 def submissionParts(source: String, starts: IntBuffer, lengths: IntBuffer): String
   var result = ""
   var index = 0
+
   while index < starts.size
-    let start = byteAtUtf16(source, starts.get(index))
-    let finish = byteAtUtf16(source, starts.get(index) + lengths.get(index))
-    result = result + host.stringSlice(source, start, finish - start)
-    if result != "" && host.stringByteAt(result, host.stringByteLength(result) - 1) != (10 as Byte)
-      result = result + "\n"
-    end
+    result = result + submissionPart(source, starts.get(index), lengths.get(index))
     index = index + 1
   end
   return result
@@ -865,11 +1294,13 @@ end
 
 def entryPrefix(generation: Int, bindings: SessionBinding?): String
   var result = "def __neri_session_entry("
+
   if generation > 0
     result = result + "__neri_session_previous: __NeriSessionState" + ((generation - 1) as String)
   end
   result = result + "): Void\n"
   var binding = bindings
+
   while binding != null
     result = result + "  " + (binding.mutable ? "var " : "let ") + binding.name + ": " + binding.typeName + " = __neri_session_previous." + binding.access + "\n"
     binding = binding.next
@@ -883,19 +1314,40 @@ def sessionFrameSource(generation: Int, bindings: SessionBinding?): String
   var parameters = generation > 0 ? "__neri_session_previous: __NeriSessionState" + ((generation - 1) as String) : ""
   var assignments = generation > 0 ? "    this.__neri_session_previous = __neri_session_previous\n" : ""
   var binding = bindings
+
   while binding != null
     fields = fields + "  public " + binding.name + ": " + binding.typeName + "\n"
     parameters = parameters + (parameters == "" ? "" : ", ") + binding.name + ": " + binding.typeName
     assignments = assignments + "    this." + binding.name + " = " + binding.name + "\n"
     binding = binding.next
   end
+  fields = fields + "  public __neri_session_display: String\n"
+  parameters = parameters + (parameters == "" ? "" : ", ") + "__neri_session_display: String = \"\""
+  assignments = assignments + "    this.__neri_session_display = __neri_session_display\n"
   return "class " + name + "\n" + fields + "\n  def init(" + parameters + "): Void\n" + assignments + "  end\nend\n"
 end
 
-def executionEntrySource(generation: Int, previousBindings: SessionBinding?, newBindings: SessionBinding?, statements: String): String
+def sessionDisplayExpression(typeName: String): String
+  if typeName == "Void"
+    return "\"\""
+  else if typeName == "String"
+    return "__neri_session_result"
+  else if typeName == "Int" || typeName == "Byte" || typeName == "Float"
+    return "(__neri_session_result as String)"
+  else if typeName == "Bool"
+    return "(__neri_session_result ? \"true\" : \"false\")"
+  else if semanticEndsWith(typeName, "?")
+    return "(__neri_session_result == null ? \"null\" : " + irQuote(typeName) + ")"
+  end
+  return irQuote(typeName)
+end
+
+def executionEntrySource(generation: Int, previousBindings: SessionBinding?, newBindings: SessionBinding?, statements: String, resultType: String = "Void"): String
   var result = executionEntryPrefix(generation, previousBindings)
+
   result = result + statements
   var writeback = previousBindings
+
   while writeback != null
     if writeback.mutable
       result = result + "__neri_session_previous." + writeback.access + " = " + writeback.name + "\n"
@@ -904,27 +1356,31 @@ def executionEntrySource(generation: Int, previousBindings: SessionBinding?, new
   end
   result = result + "return new __NeriSessionState" + (generation as String) + "("
   var separator = ""
+
   if generation > 0
     result = result + "__neri_session_previous"
     separator = ", "
   end
   var argument = newBindings
+
   while argument != null
     result = result + separator + argument.name
     separator = ", "
     argument = argument.next
   end
-  return result + ")\nend\n"
+  return result + separator + sessionDisplayExpression(resultType) + ")\nend\n"
 end
 
 def executionEntryPrefix(generation: Int, previousBindings: SessionBinding?): String
   let state = "__NeriSessionState" + (generation as String)
   var result = "def __neri_session_entry("
+
   if generation > 0
     result = result + "__neri_session_previous: __NeriSessionState" + ((generation - 1) as String)
   end
   result = result + "): " + state + "\n"
   var materialized = previousBindings
+
   while materialized != null
     result = result + (materialized.mutable ? "var " : "let ") + materialized.name + ": " + materialized.typeName + " = __neri_session_previous." + materialized.access + "\n"
     materialized = materialized.next
@@ -934,8 +1390,10 @@ end
 
 def copySessionDiagnostics(source: DiagnosticBuffer, target: PreparedSubmission, prefix: Int, submittedLength: Int, mapped: Bool): Void
   var index = 0
+
   while index < source.count()
     var start = source.starts.get(index)
+
     if mapped
       if start >= prefix && start <= prefix + submittedLength
         start = start - prefix
@@ -952,9 +1410,11 @@ def copyMappedDiagnostics(source: DiagnosticBuffer, target: PreparedSubmission, 
   let declarationLength = utf16Length(submissionParts(submitted, syntax.declarationStarts, syntax.declarationLengths))
   let statementLength = utf16Length(submissionParts(submitted, syntax.statementStarts, syntax.statementLengths))
   var index = 0
+
   while index < source.count()
     let generated = source.starts.get(index)
     var start = 0
+
     if generated >= declarationStart && generated < declarationStart + declarationLength
       start = submissionPartPosition(submitted, generated - declarationStart, syntax.declarationStarts, syntax.declarationLengths)
     else if generated >= statementStart && generated <= statementStart + statementLength
@@ -968,16 +1428,19 @@ end
 def submissionPartPosition(source: String, generated: Int, starts: IntBuffer, lengths: IntBuffer): Int
   var offset = 0
   var index = 0
+
   while index < starts.size
     let startByte = byteAtUtf16(source, starts.get(index))
     let finishByte = byteAtUtf16(source, starts.get(index) + lengths.get(index))
     let part = host.stringSlice(source, startByte, finishByte - startByte)
     var emitted = lengths.get(index)
+
     if part != "" && host.stringByteAt(part, host.stringByteLength(part) - 1) != (10 as Byte)
       emitted = emitted + 1
     end
     if generated < offset + emitted
       let within = generated - offset
+
       return starts.get(index) + (within < lengths.get(index) ? within : lengths.get(index))
     end
     offset = offset + emitted
