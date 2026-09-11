@@ -1,0 +1,165 @@
+# Current-document declaration context from compiler tokens and block ownership.
+class LspDeclarationSite
+  public start: Int = 0
+  public finish: Int = 0
+  public byteStart: Int = 0
+  public byteFinish: Int = 0
+  public header: String = ""
+  public lineEnding: String = "\n"
+  public className: String = ""
+  public namespaceName: String = ""
+  public abstractClass: Bool = false
+  public contextText: String = ""
+  public parser: BootstrapParser = new BootstrapParser(new TokenBuffer())
+  public modifiers: Int[] = []
+end
+
+def lspDeclarationSite(document: LspDocument, position: Int, allowSuffix: Bool = false): LspDeclarationSite?
+  let map = new IrSourceMap(document.text)
+  let cursor = map.offsetAt(position)
+  let lineStart = lspEnterLineStart(document.text, cursor)
+  var start = lineStart
+  var finish = cursor
+
+  while start < cursor && ((host.stringByteAt(document.text, start) as Int) == 32 || (host.stringByteAt(document.text, start) as Int) == 9)
+    start = start + 1
+  end
+  while finish < host.stringByteLength(document.text)
+    let byte = host.stringByteAt(document.text, finish) as Int
+
+    if byte == 10 || byte == 13
+      break
+    end
+    # Preserve code after the caret; ordinary identifier/type completion handles it.
+    if !allowSuffix && byte != 32 && byte != 9
+      return null
+    end
+    finish = finish + 1
+  end
+  let header = host.stringSlice(document.text, start, cursor - start)
+  let lexer = new BootstrapLexer(header)
+  let tokens = lexer.lex()
+
+  if tokens.count() < 2
+    return null
+  end
+  let last = tokens.count() - 2
+  let tokenEnd = tokens.startAt(last) + tokens.lengthAt(last)
+  let trailing = semanticCompletionUtf16Slice(header, tokenEnd, position - (new IrSourceMap(host.stringSlice(document.text, 0, start))).utf16Length() - tokenEnd)
+
+  # Comments and literal contents are not declaration sites.
+  if codeStyleTrim(trailing) != "" || tokens.kindAt(last) == "StringLiteral"
+    return null
+  end
+  let site = new LspDeclarationSite()
+
+  site.start = (new IrSourceMap(host.stringSlice(document.text, 0, start))).utf16Length()
+  site.finish = site.start + (new IrSourceMap(host.stringSlice(document.text, start, finish - start))).utf16Length()
+  site.byteStart = start
+  site.byteFinish = finish
+  site.header = header
+  site.parser = new BootstrapParser(tokens)
+  site.modifiers = site.parser.parseDeclarationModifiers()
+  if site.parser.diagnostics.count() != 0
+    return null
+  end
+  let keyword = tokens.textAt(site.parser.currentIndex())
+  let overriding = syntaxModifierIn(site.parser.arena, site.modifiers, "override") >= 0
+
+  if !overriding && (keyword == "" || (!bootstrapStartsWith("class", keyword) && !bootstrapStartsWith("def", keyword)))
+    return null
+  end
+  var blank = ""
+  var index = site.start
+
+  while index < site.finish
+    blank = blank + " "
+    index = index + 1
+  end
+  site.contextText = host.stringSlice(document.text, 0, start) + blank + host.stringSlice(document.text, finish, host.stringByteLength(document.text) - finish)
+  if allowSuffix
+    # When editing a syntactically complete signature, omit its existing body
+    # and owned terminator from the semantic query copy as well as its header.
+    let original = new BootstrapParser((new BootstrapLexer(document.text)).lex())
+
+    original.recordBlocks = true
+    original.parseProgram()
+    var owned = original.blocks
+
+    while owned != null
+      if owned.kind == "Def" && owned.start >= site.start && owned.start < position && owned.headerEnd == site.finish && owned.closing >= site.finish
+        let closing = map.offsetAt(owned.closing)
+
+        if lspEnterIndent(document.text, closing) == lspEnterIndent(document.text, start)
+          site.contextText = host.stringSlice(document.text, 0, start) + blank + host.stringSlice(document.text, closing + 3, host.stringByteLength(document.text) - closing - 3)
+        end
+        break
+      end
+      owned = owned.next
+    end
+  end
+  let context = new BootstrapParser((new BootstrapLexer(site.contextText)).lex())
+
+  context.recordBlocks = true
+  context.parseProgram()
+  var parent: SyntaxBlock? = null
+  var block = context.blocks
+
+  while block != null
+    if block.headerEnd >= 0 && block.headerEnd < site.start && (block.closing < 0 || block.closing >= site.finish) && (parent == null || block.start > parent.start)
+      parent = block
+    end
+    block = block.next
+  end
+  if parent != null
+    if parent.kind != "Class" || parent.syntaxNode < 0
+      return null
+    end
+    let data = context.arena.dataAt(parent.syntaxNode)
+
+    site.namespaceName = semanticField(data, 0)
+    site.className = semanticQualifiedName(site.namespaceName, semanticField(data, 2))
+    site.abstractClass = semanticAbstractClass(context.arena, parent.syntaxNode)
+  else
+    # Namespaces are declarations rather than blocks.
+    let contextTokens = context.tokens
+
+    index = 0
+    while index + 1 < contextTokens.count() && contextTokens.startAt(index) < site.start
+      if contextTokens.kindAt(index) == "Namespace"
+        var namespaceName = ""
+
+        index = index + 1
+        while contextTokens.kindAt(index) == "Identifier" || contextTokens.kindAt(index) == "Dot"
+          namespaceName = namespaceName + contextTokens.textAt(index)
+          index = index + 1
+        end
+        site.namespaceName = namespaceName
+      end
+      index = index + 1
+    end
+  end
+  if finish < host.stringByteLength(document.text) && (host.stringByteAt(document.text, finish) as Int) == 13
+    site.lineEnding = "\r\n"
+  else if bootstrapFindText(document.text, "\r\n") >= 0
+    site.lineEnding = "\r\n"
+  end
+  return site
+end
+
+def lspDeclarationContextText(site: LspDeclarationSite): String
+  var text = site.contextText
+  let parser = new BootstrapParser((new BootstrapLexer(text)).lex())
+
+  parser.recordBlocks = true
+  parser.parseProgram()
+  var block = parser.blocks
+
+  while block != null
+    if block.ownsEnd && block.closing < 0
+      text = text + site.lineEnding + "end"
+    end
+    block = block.next
+  end
+  return text
+end
