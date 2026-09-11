@@ -2,11 +2,13 @@
 #include "posix_launch.h"
 #include <cerrno>
 #include <cstdint>
+#include <cstdlib>
 #include <fcntl.h>
 #include <string>
 #include <mutex>
 #include <signal.h>
 #include <sys/wait.h>
+#include <sys/ioctl.h>
 #include <unistd.h>
 
 namespace neri::platform {
@@ -71,6 +73,26 @@ bool posix_pipe_cloexec(int descriptors[2], int &error) {
   return true;
 }
 
+bool posix_terminal_pair(int &master, int &slave, int &error) {
+  std::lock_guard guard(launch_lock);
+  master = posix_openpt(O_RDWR | O_NOCTTY | O_CLOEXEC);
+  slave = -1;
+  if (master >= 0 && grantpt(master) == 0 && unlockpt(master) == 0) {
+    // ptsname storage is copied while holding the launch lock.
+    const char *name = ptsname(master);
+    if (name) slave = open(name, O_RDWR | O_NOCTTY | O_CLOEXEC);
+    if (slave >= 0 && move_above_standard(master) && move_above_standard(slave)) {
+      const winsize size{24, 80, 0, 0};
+      if (ioctl(slave, TIOCSWINSZ, &size) == 0) { error = 0; return true; }
+    }
+  }
+  error = errno;
+  if (master >= 0) close(master);
+  if (slave >= 0) close(slave);
+  master = slave = -1;
+  return false;
+}
+
 bool posix_launch(const posix_launch_options &options, pid_t &process, int &error) {
   process = 0;
   error = 0;
@@ -124,7 +146,16 @@ bool posix_launch(const posix_launch_options &options, pid_t &process, int &erro
   if (process == 0) {
     close(startup[0]);
     int failure = 0;
-    if ((options.process_group && setpgid(0, 0) != 0) ||
+    struct sigaction default_interrupt{};
+    default_interrupt.sa_handler = SIG_DFL;
+    sigemptyset(&default_interrupt.sa_mask);
+    sigset_t unblocked;
+    sigemptyset(&unblocked);
+    sigaddset(&unblocked, SIGINT);
+    if (sigaction(SIGINT, &default_interrupt, nullptr) != 0 ||
+        sigprocmask(SIG_UNBLOCK, &unblocked, nullptr) != 0 ||
+        (options.controlling_terminal && (setsid() < 0 || ioctl(redirects[0], TIOCSCTTY, 0) < 0)) ||
+        (!options.controlling_terminal && options.process_group && setpgid(0, 0) != 0) ||
         (!options.working_directory.empty() && chdir(options.working_directory.c_str()) != 0) ||
         (redirects[0] >= 0 && dup2(redirects[0], STDIN_FILENO) < 0) ||
         (redirects[1] >= 0 && dup2(redirects[1], STDOUT_FILENO) < 0) ||
@@ -160,7 +191,7 @@ bool posix_launch(const posix_launch_options &options, pid_t &process, int &erro
   const int read_error = count < 0 ? errno : 0;
   close(startup[0]);
   if (count == 0) return true;
-  if (options.process_group) kill(-process, SIGKILL);
+  if (options.process_group || options.controlling_terminal) kill(-process, SIGKILL);
   else kill(process, SIGKILL);
   int ignored = 0;
   while (waitpid(process, &ignored, 0) < 0 && errno == EINTR) {}

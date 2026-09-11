@@ -1,7 +1,7 @@
 # Runtime and IR boundary
 
 The canonical exported declarations and layouts are in
-[`runtime_abi.h`](../native/include/neri/runtime_abi.h). Runtime ABI 1.21 uses a
+[`runtime_abi.h`](../native/include/neri/runtime_abi.h). Runtime ABI 1.22 uses a
 C calling convention on macOS ARM64 and Linux x86-64. Generated programs negotiate
 major version, minimum minor version and required feature bits before execution.
 The package manifest also identifies the toolchain version and native target.
@@ -36,6 +36,15 @@ versioned session metadata and coordinator bridge. The
 `OPTIONAL_CONSOLE_READ` feature (33554432), introduced in ABI 1.21, adds
 `console.readLine(): String?`: EOF before any byte returns none, while a blank
 line returns an empty string. The existing `console.read()` contract is unchanged.
+
+ABI 1.22 adds `PROCESS_IO` (67108864) for initial child stdin, terminal capture
+and controlled interruption, and `FILESYSTEM_MUTATION` (134217728) for temporary
+directories, filesystem mutations and metadata. Consumers negotiate these bits
+when importing the corresponding services. Platform-specific availability is
+reported by each operation.
+`SOCKET_ENDPOINTS` (268435456) adds a bounded loopback TCP connection
+operation for clients sharing one deadline across connect, write and read,
+and bound-port discovery for listeners allocated with port zero.
 
 ## Representation
 

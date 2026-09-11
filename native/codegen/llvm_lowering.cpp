@@ -2478,6 +2478,20 @@ private:
         minimum_minor = std::max(minimum_minor, uint16_t{16});
         required_features |= NERI_RT_FEATURE_PROCESS;
       }
+      if (import.link_name == "neri_rt_v1_process_spawn_input" ||
+          import.link_name == "neri_rt_v1_process_interrupt") {
+        minimum_minor = std::max(minimum_minor, uint16_t{22});
+        required_features |= NERI_RT_FEATURE_PROCESS_IO;
+      }
+      if (import.link_name.starts_with("neri_rt_v1_file_mutation_")) {
+        minimum_minor = std::max(minimum_minor, uint16_t{22});
+        required_features |= NERI_RT_FEATURE_FILESYSTEM_MUTATION;
+      }
+      if (import.link_name == "neri_rt_v1_net_connect_timeout" ||
+          import.link_name == "neri_rt_v1_net_local_port") {
+        minimum_minor = std::max(minimum_minor, uint16_t{22});
+        required_features |= NERI_RT_FEATURE_SOCKET_ENDPOINTS;
+      }
       if (import.link_name.starts_with("neri_rt_v1_file_directory_")) {
         minimum_minor = std::max(minimum_minor, uint16_t{17});
         required_features |= NERI_RT_FEATURE_DIRECTORY;

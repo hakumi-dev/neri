@@ -29,12 +29,20 @@ int64_t neri_rt_v1_net_configure(int64_t fd) {
   return setsockopt((int)fd, SOL_SOCKET, SO_REUSEADDR, &enabled, sizeof(enabled));
 }
 int64_t neri_rt_v1_net_bind(int64_t fd, int64_t port) {
-  if (port < 1 || port > 65535) { errno = EINVAL; return -1; }
+  if (port < 0 || port > 65535) { errno = EINVAL; return -1; }
   struct sockaddr_in address = {0};
   address.sin_family = AF_INET;
   address.sin_port = htons((uint16_t)port);
   address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
   return bind((int)fd, (struct sockaddr *)&address, sizeof(address));
+}
+int64_t neri_rt_v1_net_local_port(int64_t fd) {
+  if (fd < 0 || fd > INT_MAX) { errno = EINVAL; return -1; }
+  struct sockaddr_in address = {0};
+  socklen_t length = sizeof(address);
+  if (getsockname((int)fd, (struct sockaddr *)&address, &length) < 0 ||
+      length < sizeof(address) || address.sin_family != AF_INET) return -1;
+  return ntohs(address.sin_port);
 }
 int64_t neri_rt_v1_net_listen(int64_t fd) { return listen((int)fd, 16); }
 int64_t neri_rt_v1_net_connect(int64_t fd, int64_t port) {
@@ -44,6 +52,36 @@ int64_t neri_rt_v1_net_connect(int64_t fd, int64_t port) {
   address.sin_port = htons((uint16_t)port);
   address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
   return connect((int)fd, (struct sockaddr *)&address, sizeof(address));
+}
+int64_t neri_rt_v1_net_connect_timeout(int64_t fd, int64_t port, int64_t milliseconds) {
+  if (fd < 0 || fd > INT_MAX || port < 1 || port > 65535 ||
+      milliseconds < 0 || milliseconds > INT_MAX) { errno = EINVAL; return -1; }
+  if (fcntl((int)fd, F_SETFD, FD_CLOEXEC) < 0 ||
+      fcntl((int)fd, F_SETFL, O_NONBLOCK) < 0) return -1;
+  struct sockaddr_in address = {0};
+  address.sin_family = AF_INET;
+  address.sin_port = htons((uint16_t)port);
+  address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  if (connect((int)fd, (struct sockaddr *)&address, sizeof(address)) == 0) return 0;
+  if (errno != EINPROGRESS && errno != EALREADY && errno != EINTR) return -1;
+  struct pollfd item = {(int)fd, POLLOUT, 0};
+  struct timespec started = {0};
+  if (clock_gettime(CLOCK_MONOTONIC, &started) < 0) return -1;
+  const int64_t deadline = started.tv_sec * INT64_C(1000) + started.tv_nsec / 1000000 + milliseconds;
+  int ready;
+  do {
+    struct timespec now = {0};
+    if (clock_gettime(CLOCK_MONOTONIC, &now) < 0) return -1;
+    const int64_t remaining = deadline - (now.tv_sec * INT64_C(1000) + now.tv_nsec / 1000000);
+    if (remaining <= 0) { errno = ETIMEDOUT; return -2; }
+    ready = poll(&item, 1, (int)remaining);
+  } while (ready < 0 && errno == EINTR);
+  if (ready <= 0) { if (ready == 0) { errno = ETIMEDOUT; return -2; } return -1; }
+  int error = 0;
+  socklen_t length = sizeof(error);
+  if (getsockopt((int)fd, SOL_SOCKET, SO_ERROR, &error, &length) < 0) return -1;
+  if (error != 0) { errno = error; return -1; }
+  return 0;
 }
 int64_t neri_rt_v1_net_accept(int64_t fd) {
   return io_result(accept((int)fd, NULL, NULL));

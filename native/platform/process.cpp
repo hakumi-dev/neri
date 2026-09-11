@@ -25,6 +25,7 @@
 #include <csignal>
 #include <fcntl.h>
 #include <poll.h>
+#include <pthread.h>
 #include <sys/wait.h>
 #include <unistd.h>
 extern char **environ;
@@ -67,12 +68,14 @@ struct configuration {
   std::string directory;
   std::vector<std::string> arguments;
   std::vector<std::pair<std::string, std::string>> environment;
+  std::vector<uint8_t> input;
+  bool terminal = false;
 };
 
-bool decode(const uint8_t *data, int64_t length, configuration &value) {
+bool decode(const uint8_t *data, int64_t length, configuration &value, const char *magic) {
   if (!data || length < 0 || length > 1048576) return false;
   parser input{data, static_cast<size_t>(length)};
-  if (input.size < 4 || std::memcmp(input.data, "NPR1", 4) != 0) return false;
+  if (input.size < 4 || std::memcmp(input.data, magic, 4) != 0) return false;
   input.offset = 4;
   uint8_t inherit = 0;
   uint32_t argc = 0, envc = 0;
@@ -93,6 +96,15 @@ bool decode(const uint8_t *data, int64_t length, configuration &value) {
         name.find('=') != std::string::npos) return false;
     value.environment.emplace_back(std::move(name), std::move(item));
   }
+  if (std::memcmp(magic, "NPR2", 4) == 0) {
+    uint32_t input_length = 0;
+    uint8_t terminal = 0;
+    if (!input.u32(input_length) || input_length > input.size - input.offset) return false;
+    value.input.assign(input.data + input.offset, input.data + input.offset + input_length);
+    input.offset += input_length;
+    if (!input.byte(terminal) || terminal > 1 || (terminal != 0 && input_length != 0)) return false;
+    value.terminal = terminal != 0;
+  }
   return input.offset == input.size;
 }
 
@@ -107,19 +119,26 @@ struct child {
   bool running = true;
   bool cancelled = false;
   std::atomic<bool> stop_readers{false};
+  std::atomic<bool> stop_writer{false};
+  std::atomic<bool> writer_done{false};
   int64_t exit_kind = 0;
   int64_t exit_value = 0;
   std::thread output_reader;
   std::thread error_reader;
+  std::thread input_writer;
+  std::vector<uint8_t> input;
 #if defined(_WIN32)
   HANDLE process = NULL;
   HANDLE job = NULL;
   HANDLE output_pipe = NULL;
   HANDLE error_pipe = NULL;
+  HANDLE input_pipe = NULL;
+  DWORD process_group = 0;
 #else
   pid_t process = 0;
   int output_pipe = -1;
   int error_pipe = -1;
+  int input_pipe = -1;
 #endif
 };
 
@@ -159,6 +178,18 @@ void drain(const std::shared_ptr<child> &process, bool error, HANDLE pipe) {
   }
   CloseHandle(pipe);
 }
+
+void write_input(const std::shared_ptr<child> &process, HANDLE pipe) {
+  size_t offset = 0;
+  while (offset < process->input.size() && !process->stop_writer.load()) {
+    DWORD count = 0;
+    const DWORD requested = static_cast<DWORD>(std::min<size_t>(8192, process->input.size() - offset));
+    if (!WriteFile(pipe, process->input.data() + offset, requested, &count, nullptr) || count == 0) break;
+    offset += count;
+  }
+  CloseHandle(pipe);
+  process->writer_done.store(true);
+}
 #else
 void drain(const std::shared_ptr<child> &process, bool error, int descriptor) {
   uint8_t bytes[8192];
@@ -179,6 +210,26 @@ void drain(const std::shared_ptr<child> &process, bool error, int descriptor) {
     } else break;
   }
   close(descriptor);
+}
+
+void write_input(const std::shared_ptr<child> &process, int descriptor) {
+  sigset_t blocked;
+  sigemptyset(&blocked);
+  sigaddset(&blocked, SIGPIPE);
+  pthread_sigmask(SIG_BLOCK, &blocked, nullptr);
+  size_t offset = 0;
+  while (offset < process->input.size() && !process->stop_writer.load()) {
+    const ssize_t count = write(descriptor, process->input.data() + offset,
+                                process->input.size() - offset);
+    if (count > 0) offset += static_cast<size_t>(count);
+    else if (count < 0 && errno == EINTR) continue;
+    else if (count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+      pollfd waiting{descriptor, POLLOUT | POLLHUP, 0};
+      poll(&waiting, 1, 10);
+    } else break;
+  }
+  close(descriptor);
+  process->writer_done.store(true);
 }
 #endif
 
@@ -212,7 +263,7 @@ std::wstring quote(const std::wstring &argument) {
 bool spawn_child(const configuration &config, const std::shared_ptr<child> &result, int64_t &os_code) {
   os_code = 0;
   SECURITY_ATTRIBUTES inherited{sizeof(inherited), nullptr, TRUE};
-  HANDLE output_read = NULL, output_write = NULL, error_read = NULL, error_write = NULL;
+  HANDLE input_read = NULL, input_write = NULL, output_read = NULL, output_write = NULL, error_read = NULL, error_write = NULL;
   PROCESS_INFORMATION process{};
   HANDLE inherited_handles[3] = {NULL, NULL, NULL};
   SIZE_T attribute_size = 0;
@@ -226,11 +277,11 @@ bool spawn_child(const configuration &config, const std::shared_ptr<child> &resu
     }
   };
   std::map<std::wstring, std::wstring, insensitive> environment;
-  HANDLE input = CreateFileW(L"NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
-                             &inherited, OPEN_EXISTING, 0, nullptr);
-  if (input == INVALID_HANDLE_VALUE ||
+  if (config.terminal) { os_code = ERROR_NOT_SUPPORTED; goto failure; }
+  if (!CreatePipe(&input_read, &input_write, &inherited, 0) ||
       !CreatePipe(&output_read, &output_write, &inherited, 0) ||
       !CreatePipe(&error_read, &error_write, &inherited, 0) ||
+      !SetHandleInformation(input_write, HANDLE_FLAG_INHERIT, 0) ||
       !SetHandleInformation(output_read, HANDLE_FLAG_INHERIT, 0) ||
       !SetHandleInformation(error_read, HANDLE_FLAG_INHERIT, 0)) { remember_error(); goto failure; }
   result->job = CreateJobObjectW(nullptr, nullptr);
@@ -265,14 +316,14 @@ bool spawn_child(const configuration &config, const std::shared_ptr<child> &resu
   }
   startup.StartupInfo.cb = sizeof(startup);
   startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
-  startup.StartupInfo.hStdInput = input;
+  startup.StartupInfo.hStdInput = input_read;
   startup.StartupInfo.hStdOutput = output_write;
   startup.StartupInfo.hStdError = error_write;
   InitializeProcThreadAttributeList(nullptr, 1, 0, &attribute_size);
   attribute_storage.resize(attribute_size);
   startup.lpAttributeList = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attribute_storage.data());
   if (!InitializeProcThreadAttributeList(startup.lpAttributeList, 1, 0, &attribute_size)) { remember_error(); goto failure; }
-  inherited_handles[0] = input;
+  inherited_handles[0] = input_read;
   inherited_handles[1] = output_write;
   inherited_handles[2] = error_write;
   if (!UpdateProcThreadAttribute(startup.lpAttributeList, 0,
@@ -281,11 +332,12 @@ bool spawn_child(const configuration &config, const std::shared_ptr<child> &resu
   executable = neri::windows::wide(config.arguments.front());
   directory = config.directory.empty() ? std::wstring() : neri::windows::wide(config.directory);
   if (!CreateProcessW(executable.c_str(), command.data(), nullptr, nullptr, TRUE,
-                      CREATE_SUSPENDED | CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT |
+                      CREATE_SUSPENDED | CREATE_NEW_PROCESS_GROUP | EXTENDED_STARTUPINFO_PRESENT |
                           CREATE_UNICODE_ENVIRONMENT,
                       environment_block.data(), directory.empty() ? nullptr : directory.c_str(),
                       &startup.StartupInfo, &process)) { remember_error(); goto failure; }
   result->process = process.hProcess;
+  result->process_group = process.dwProcessId;
   if (!AssignProcessToJobObject(result->job, result->process)) {
     remember_error();
     TerminateProcess(result->process, 1);
@@ -301,12 +353,12 @@ bool spawn_child(const configuration &config, const std::shared_ptr<child> &resu
   CloseHandle(process.hThread);
   DeleteProcThreadAttributeList(startup.lpAttributeList);
   startup.lpAttributeList = nullptr;
-  CloseHandle(input); CloseHandle(output_write); CloseHandle(error_write);
-  result->output_pipe = output_read; result->error_pipe = error_read;
+  CloseHandle(input_read); CloseHandle(output_write); CloseHandle(error_write);
+  result->input_pipe = input_write; result->output_pipe = output_read; result->error_pipe = error_read;
   return true;
 failure:
   if (startup.lpAttributeList) DeleteProcThreadAttributeList(startup.lpAttributeList);
-  if (input && input != INVALID_HANDLE_VALUE) CloseHandle(input);
+  if (input_read) CloseHandle(input_read); if (input_write) CloseHandle(input_write);
   if (output_read) CloseHandle(output_read); if (output_write) CloseHandle(output_write);
   if (error_read) CloseHandle(error_read); if (error_write) CloseHandle(error_write);
   if (result->process) CloseHandle(result->process);
@@ -316,7 +368,7 @@ failure:
 }
 #else
 bool spawn_child(const configuration &config, const std::shared_ptr<child> &result, int64_t &os_code) {
-  int output[2] = {-1, -1}, errors[2] = {-1, -1};
+  int input[2] = {-1, -1}, output[2] = {-1, -1}, errors[2] = {-1, -1};
   std::map<std::string, std::string> environment_values;
   std::vector<std::string> environment_storage;
   int launch_error = 0;
@@ -342,28 +394,60 @@ bool spawn_child(const configuration &config, const std::shared_ptr<child> &resu
   options.process_group = true;
   for (const auto &[name, value] : environment_values) environment_storage.push_back(name + "=" + value);
   options.environment = std::move(environment_storage);
-  if (!neri::platform::posix_pipe_cloexec(output, launch_error) ||
-      !neri::platform::posix_pipe_cloexec(errors, launch_error) ||
-      (options.standard_input = open("/dev/null", O_RDONLY | O_CLOEXEC)) < 0) goto failure;
+  if (config.terminal) {
+    int master = -1, slave = -1;
+    if (!neri::platform::posix_terminal_pair(master, slave, launch_error)) {
+      os_code = launch_error;
+      return false;
+    }
+    options.standard_input = options.standard_output = options.standard_error = slave;
+    options.controlling_terminal = true;
+    if (!make_nonblocking(master, launch_error) ||
+        !neri::platform::posix_launch(options, result->process, launch_error)) {
+      close(master);
+      close(slave);
+      os_code = launch_error;
+      return false;
+    }
+    close(slave);
+    result->output_pipe = master;
+    return true;
+  }
+  if (!neri::platform::posix_pipe_cloexec(input, launch_error) ||
+      !neri::platform::posix_pipe_cloexec(output, launch_error) ||
+      !neri::platform::posix_pipe_cloexec(errors, launch_error)) goto failure;
+  options.standard_input = input[0];
   options.standard_output = output[1];
   options.standard_error = errors[1];
   if (!neri::platform::posix_launch(options, result->process, launch_error)) goto failure;
-  close(options.standard_input); options.standard_input = -1;
+  close(input[0]); input[0] = -1; options.standard_input = -1;
   close(output[1]); output[1] = -1; close(errors[1]); errors[1] = -1;
-  result->output_pipe = output[0]; result->error_pipe = errors[0];
-  if (!make_nonblocking(result->output_pipe, nonblocking_error) ||
-      !make_nonblocking(result->error_pipe, nonblocking_error)) {
-    close(result->output_pipe); close(result->error_pipe);
+  result->input_pipe = input[1]; result->output_pipe = output[0]; result->error_pipe = errors[0];
+#if defined(__APPLE__)
+  if (fcntl(result->input_pipe, F_SETNOSIGPIPE, 1) < 0) {
+    nonblocking_error = errno;
+    close(result->input_pipe); close(result->output_pipe); close(result->error_pipe);
     kill(-result->process, SIGKILL);
     while (waitpid(result->process, nullptr, 0) < 0 && errno == EINTR) {}
-    result->process = 0; result->output_pipe = result->error_pipe = -1;
+    result->process = 0; result->input_pipe = result->output_pipe = result->error_pipe = -1;
+    os_code = nonblocking_error;
+    return false;
+  }
+#endif
+  if (!make_nonblocking(result->input_pipe, nonblocking_error) ||
+      !make_nonblocking(result->output_pipe, nonblocking_error) ||
+      !make_nonblocking(result->error_pipe, nonblocking_error)) {
+    close(result->input_pipe); close(result->output_pipe); close(result->error_pipe);
+    kill(-result->process, SIGKILL);
+    while (waitpid(result->process, nullptr, 0) < 0 && errno == EINTR) {}
+    result->process = 0; result->input_pipe = result->output_pipe = result->error_pipe = -1;
     os_code = nonblocking_error;
     return false;
   }
   return true;
 failure:
   os_code = launch_error != 0 ? launch_error : errno;
-  if (options.standard_input >= 0) close(options.standard_input);
+  for (int descriptor : input) if (descriptor >= 0) close(descriptor);
   for (int descriptor : output) if (descriptor >= 0) close(descriptor);
   for (int descriptor : errors) if (descriptor >= 0) close(descriptor);
   return false;
@@ -371,6 +455,15 @@ failure:
 #endif
 
 void join_readers(child &process) {
+  if (process.input_writer.joinable()) {
+#if defined(_WIN32)
+    while (process.stop_writer.load() && !process.writer_done.load()) {
+      CancelSynchronousIo(process.input_writer.native_handle());
+      Sleep(1);
+    }
+#endif
+    process.input_writer.join();
+  }
   if (process.output_reader.joinable()) process.output_reader.join();
   if (process.error_reader.joinable()) process.error_reader.join();
 }
@@ -397,19 +490,21 @@ bool refresh(const std::shared_ptr<child> &process, int64_t &os_code) {
   process->exit_value = WIFEXITED(status) ? WEXITSTATUS(status) : WTERMSIG(status);
 #endif
   process->running = false;
+  process->stop_writer.store(true);
   process->stop_readers.store(true);
   return true;
 }
 }
 
-extern "C" int64_t neri_rt_v1_process_spawn(const uint8_t *config, int64_t length,
-                                               int64_t *token, int64_t *os_code) {
+int64_t spawn_process(const uint8_t *config, int64_t length, int64_t *token,
+                      int64_t *os_code, const char *magic) {
   try {
   configuration decoded;
   if (!token || !os_code) return -1;
   *os_code = 0;
-  if (!decode(config, length, decoded)) return -1;
+  if (!decode(config, length, decoded, magic)) return -1;
   auto process = std::make_shared<child>();
+  process->input = std::move(decoded.input);
   process->output_limit = decoded.stdout_limit;
   process->error_limit = decoded.stderr_limit;
   process->output.reserve(decoded.stdout_limit);
@@ -420,25 +515,33 @@ extern "C" int64_t neri_rt_v1_process_spawn(const uint8_t *config, int64_t lengt
   if (!spawn_child(decoded, process, *os_code)) return -1;
   bool output_started = false;
   bool error_started = false;
+  bool input_started = false;
   try {
     process->output_reader = std::thread(drain, process, false, process->output_pipe);
     output_started = true;
-    process->error_reader = std::thread(drain, process, true, process->error_pipe);
-    error_started = true;
+    if (!decoded.terminal) {
+      process->error_reader = std::thread(drain, process, true, process->error_pipe);
+      error_started = true;
+      process->input_writer = std::thread(write_input, process, process->input_pipe);
+      input_started = true;
+    }
     std::lock_guard guard(registry_lock);
     registry.emplace(id, process);
   } catch (...) {
     process->stop_readers.store(true);
+    process->stop_writer.store(true);
 #if defined(_WIN32)
     if (process->job) TerminateJobObject(process->job, 1);
     if (process->process) WaitForSingleObject(process->process, 5000);
     if (!output_started && process->output_pipe) CloseHandle(process->output_pipe);
     if (!error_started && process->error_pipe) CloseHandle(process->error_pipe);
+    if (!input_started && process->input_pipe) CloseHandle(process->input_pipe);
 #else
     if (process->process) kill(-process->process, SIGKILL);
     if (process->process) while (waitpid(process->process, nullptr, 0) < 0 && errno == EINTR) {}
     if (!output_started && process->output_pipe >= 0) close(process->output_pipe);
     if (!error_started && process->error_pipe >= 0) close(process->error_pipe);
+    if (!input_started && process->input_pipe >= 0) close(process->input_pipe);
 #endif
     join_readers(*process);
 #if defined(_WIN32)
@@ -450,6 +553,16 @@ extern "C" int64_t neri_rt_v1_process_spawn(const uint8_t *config, int64_t lengt
   *token = id;
   return 0;
   } catch (...) { return -1; }
+}
+
+extern "C" int64_t neri_rt_v1_process_spawn(const uint8_t *config, int64_t length,
+                                               int64_t *token, int64_t *os_code) {
+  return spawn_process(config, length, token, os_code, "NPR1");
+}
+
+extern "C" int64_t neri_rt_v1_process_spawn_input(const uint8_t *config, int64_t length,
+                                                     int64_t *token, int64_t *os_code) {
+  return spawn_process(config, length, token, os_code, "NPR2");
 }
 
 extern "C" int64_t neri_rt_v1_process_poll(int64_t token, int64_t wait_ms,
@@ -496,6 +609,27 @@ extern "C" int64_t neri_rt_v1_process_read(int64_t token, int64_t channel,
   return 0;
 }
 
+extern "C" int64_t neri_rt_v1_process_interrupt(int64_t token, int64_t *os_code) {
+  if (!os_code) return -1;
+  *os_code = 0;
+  auto process = find_child(token);
+  if (!process) return -1;
+  if (!refresh(process, *os_code)) return -1;
+  { std::lock_guard guard(process->lock); if (!process->running) return 0; }
+#if defined(_WIN32)
+  if (!GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, process->process_group)) {
+    *os_code = GetLastError();
+    return -1;
+  }
+#else
+  if (kill(-process->process, SIGINT) != 0 && errno != ESRCH) {
+    *os_code = errno;
+    return -1;
+  }
+#endif
+  return 0;
+}
+
 extern "C" int64_t neri_rt_v1_process_cancel(int64_t token, int64_t *os_code) {
   if (!os_code) return -1;
   *os_code = 0;
@@ -511,6 +645,7 @@ extern "C" int64_t neri_rt_v1_process_cancel(int64_t token, int64_t *os_code) {
   while (waitpid(process->process, &status, 0) < 0) if (errno != EINTR) { *os_code = errno; return -1; }
 #endif
   { std::lock_guard guard(process->lock); process->running = false; process->exit_kind = 3; process->exit_value = 1; }
+  process->stop_writer.store(true);
   process->stop_readers.store(true);
   join_readers(*process);
   return 0;
@@ -522,6 +657,9 @@ extern "C" int64_t neri_rt_v1_process_dispose(int64_t token, int64_t *os_code) {
   auto process = find_child(token);
   if (!process) return 0;
   if (neri_rt_v1_process_cancel(token, os_code) != 0) return -1;
+  // interrupt() can observe completion through refresh() before any poll joins
+  // the I/O threads. Disposal owns those threads even for an exited child.
+  join_readers(*process);
   { std::lock_guard guard(registry_lock); registry.erase(token); }
 #if defined(_WIN32)
   if (process->process && !CloseHandle(process->process)) {
