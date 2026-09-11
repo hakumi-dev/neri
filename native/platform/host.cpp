@@ -19,6 +19,7 @@
 #define getpid _getpid
 #else
 #include "posix_launch.h"
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 extern char **environ;
@@ -78,6 +79,14 @@ void deallocate(void *pointer) {
 
 [[nodiscard]] bool write_atomic(std::string_view path, const uint8_t *bytes,
                                 size_t size, std::string &error) {
+#if !defined(_WIN32)
+  struct stat previous{};
+  const bool replacing = ::stat(std::string(path).c_str(), &previous) == 0;
+  if (!replacing && errno != ENOENT) {
+    error = "cannot read existing file permissions: " + std::string(std::strerror(errno));
+    return false;
+  }
+#endif
   std::string temporary;
   int descriptor = -1;
   for (unsigned int attempt = 0; attempt < 100U; ++attempt) {
@@ -101,6 +110,12 @@ void deallocate(void *pointer) {
 
   bool succeeded = write_all(descriptor, bytes, size);
   int failure = succeeded ? 0 : errno;
+#if !defined(_WIN32)
+  if (succeeded && replacing && ::fchmod(descriptor, previous.st_mode & 07777) != 0) {
+    succeeded = false;
+    failure = errno;
+  }
+#endif
   if (succeeded && ::fsync(descriptor) != 0) {
     succeeded = false;
     failure = errno;
@@ -110,7 +125,12 @@ void deallocate(void *pointer) {
     failure = errno;
   }
 #if defined(_WIN32)
-  if (succeeded && !MoveFileExW(neri::windows::wide(temporary).c_str(), neri::windows::wide(path).c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+  const auto target = neri::windows::wide(path);
+  const auto replacement = neri::windows::wide(temporary);
+  const bool replacing = GetFileAttributesW(target.c_str()) != INVALID_FILE_ATTRIBUTES;
+  if (succeeded && !(replacing
+      ? ReplaceFileW(target.c_str(), replacement.c_str(), nullptr, 0, nullptr, nullptr)
+      : MoveFileExW(replacement.c_str(), target.c_str(), MOVEFILE_WRITE_THROUGH))) {
     errno = EIO;
 #else
   if (succeeded && ::rename(temporary.c_str(), std::string(path).c_str()) != 0) {

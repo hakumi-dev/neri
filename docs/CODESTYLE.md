@@ -1,0 +1,122 @@
+# Neri CodeStyle
+
+Neri CodeStyle shares one syntax-based rule engine between the compiler CLI and
+the language server. Rules inspect sibling statements in the compiler's syntax
+tree and propose edits against the original source text.
+
+## Commands
+
+```sh
+neri format source.hk
+neri format --check --project manifest.json
+neri lint --project manifest.json --unit compiler-core
+neri lint --fix source.hk
+```
+
+With no source arguments, commands discover the project in the current
+directory. Project commands visit the sources owned by its declared units;
+`--unit` selects one unit. Canonical paths are deduplicated. Referenced external
+projects retain their own formatting policy and are processed separately.
+
+Exit status `0` means success, `1` means `format --check` found changes or
+`lint` has remaining diagnostics, and `2` means a usage, configuration, syntax,
+project-loading or I/O failure.
+
+`format` applies enabled spacing rules. `format --check` reports whether those
+rules require changes. `lint` reports rule diagnostics, and `lint --fix` applies
+safe corrections before reporting remaining diagnostics. All input files are
+read, parsed and checked before writing begins. Each changed file is written
+atomically after checking that its content still matches the analyzed snapshot.
+Writes form a sequence of per-file replacements. A later I/O failure reports
+failure and leaves earlier successful replacements in place. POSIX replacements
+preserve existing permission bits; ownership, ACLs and extended attributes are
+outside that guarantee.
+
+## Rules and configuration
+
+| Rule | Behavior | Default |
+| --- | --- | --- |
+| `NRSTYLE001` | Separate a group of sibling `let`/`var` declarations from the following statement with a blank line. | Enabled, warning |
+| `NRSTYLE002` | Separate an assertion group from a preceding non-assertion statement with a blank line. | Enabled, warning |
+
+Consecutive declarations and consecutive assertions stay together. An assertion
+at the start of a body needs no leading blank line. Closing delimiters end a
+body; they do not begin another statement. Comments attached to the following
+statement stay with it.
+
+Configuration lives in `.editorconfig` and follows its directory hierarchy,
+`root = true`, section matching, property precedence and `unset` behavior.
+
+```ini
+root = true
+
+[*.hk]
+neri_blank_line_after_declarations = true
+neri_blank_line_before_assertions = true
+neri_diagnostic.NRSTYLE001.severity = warning
+neri_diagnostic.NRSTYLE002.severity = warning
+neri_assertion_helpers = test.assert*, assert
+```
+
+Severity values are `none`, `suggestion`, `warning` and `error`. Assertion helper
+names are case-sensitive qualified names; a final `*` matches a name prefix.
+Severity `none` suppresses reporting while keeping the formatting preference.
+Set a rule's boolean option to `false` to disable its analysis and correction.
+
+## Editor integration
+
+The LSP publishes rule identifiers and source ranges as diagnostics.
+`textDocument/formatting` returns minimal text edits. Clients supporting
+code-action literals and versioned workspace edits receive individual quick
+fixes and `source.fixAll.neri` for the current document. The client applies these
+edits against the advertised document version.
+The Rider client watches project `.editorconfig` files and asks the server to
+refresh diagnostics after changes. Its SDK provides the LSP formatting and
+intention-action UI.
+The plugin's optional EditorConfig integration registers Neri property
+descriptors for key completion and value validation. A client version without
+those descriptors reports “The property is not supported” for Neri keys.
+
+`initializationOptions.codeStyleDiagnostics = false` disables automatic style
+diagnostic publication for that client. Explicit formatting and correction
+requests remain available. The default is `true`.
+
+## Extending the engine
+
+Implement a `NeriCodeStyleRule` in Neri and register it in
+`neriCodeStyleRules()`. A rule supplies an identifier, option key, category,
+default severity and an evaluator that produces typed findings and edits.
+`validateOption` defines the accepted values for its configuration key.
+The CLI and LSP consume those descriptors and results through the shared
+engine. Add a behavior contract for the rule's intended change and important
+false-positive boundary.
+
+Edits retain the original source outside their ranges. The spacing engine
+accepts non-overlapping newline insertions at physical line boundaries and
+checks token preservation and syntactic validity before adapters offer or
+apply corrections. The initial rules insert blank lines and preserve existing
+indentation and line endings. Their contracts include idempotence, overlapping
+rule requests, multiline expressions, comments and UTF-16 editor coordinates.
+
+## Verified references
+
+- [Roslyn analyzer and code-fix tutorial](https://learn.microsoft.com/en-us/dotnet/csharp/roslyn-sdk/tutorials/how-to-write-csharp-analyzer-code-fix)
+  grounds the separation between rule diagnostics and proposed corrections.
+- [Roslyn syntax model](https://learn.microsoft.com/en-us/dotnet/csharp/roslyn-sdk/work-with-syntax)
+  explains why tokens and trivia matter for source-preserving transformations.
+  Neri retains its original source alongside the compiler's syntax and tokens.
+- [EditorConfig specification](https://spec.editorconfig.org/)
+  defines configuration discovery, matching and precedence.
+- [LSP formatting contract](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#textDocument_formatting)
+  defines the editor request and returned text edits;
+  [code actions](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#textDocument_codeAction)
+  define quick fixes, source actions and capability negotiation.
+- Philip Wadler, [A prettier printer](https://homepages.inf.ed.ac.uk/wadler/papers/prettier/prettier.pdf),
+  develops compositional formatting and the separation of document structure
+  from layout. It provides a foundation for future layout rules; the current
+  spacing engine does not implement its width-dependent pretty-printing algorithm.
+- [JetBrains LSP integration](https://plugins.jetbrains.com/docs/intellij/language-server-protocol.html)
+  documents the client's formatting, intention actions and watched-file support.
+
+References motivate the design. Executable Neri contracts verify this
+implementation's behavior.

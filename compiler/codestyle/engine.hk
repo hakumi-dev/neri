@@ -1,0 +1,608 @@
+use host
+
+# The code-style engine operates only on a lossless source string plus the
+# parser's syntax and token tables. Adapters own files, configuration loading,
+# and LSP/CLI serialization.
+
+class NeriCodeStyleEdit
+  public start: Int = 0
+  public length: Int = 0
+  public replacement: String = ""
+  public next: NeriCodeStyleEdit?
+end
+
+class NeriCodeStyleFinding
+  public ruleId: String = ""
+  public category: String = "style"
+  public severity: String = "warning"
+  public message: String = ""
+  public start: Int = 0
+  public length: Int = 0
+  public safeFix: Bool = true
+  public edit: NeriCodeStyleEdit?
+  public next: NeriCodeStyleFinding?
+end
+
+class NeriCodeStyleContext
+  public text: String = ""
+  public tokens: TokenBuffer?
+  public syntax: SyntaxArena?
+  public root: Int = -1
+  public valid: Bool = false
+  public error: String = ""
+end
+
+class NeriCodeStyleResult
+  public valid: Bool = false
+  public error: String = ""
+  public findings: NeriCodeStyleFinding?
+  public edits: NeriCodeStyleEdit?
+end
+
+class NeriCodeStyleApplyResult
+  public valid: Bool = false
+  public error: String = ""
+  public text: String = ""
+end
+
+class NeriCodeStyleRule
+  public ruleId: String = ""
+  public optionKey: String = ""
+  public defaultSeverity: String = "warning"
+  public category: String = "style"
+  public safeFix: Bool = true
+  public next: NeriCodeStyleRule?
+
+  def enabled(options: NeriCodeStyleOptions): Bool
+    return options.value(this.optionKey, "true") == "true"
+  end
+
+  def validateOption(value: String): Bool
+    return value == "true" || value == "false" || value == "unset"
+  end
+
+  def evaluate(context: NeriCodeStyleContext, options: NeriCodeStyleOptions, result: NeriCodeStyleResult): Void
+    return
+  end
+end
+
+def neriCodeStyleStatement(arena: SyntaxArena, node: Int): Bool
+  let kind = arena.kindAt(node)
+
+  return kind == "Let" || kind == "Var" || kind == "Return" || kind == "If" || kind == "While" || kind == "For" || kind == "Match" || kind == "Break" || kind == "Continue" || kind == "UnsafeBlock" || kind == "BorrowBlock" || kind == "UsingBlock" || kind == "Assignment" || kind == "ExpressionStatement" || kind == "SuperConstructorCall"
+end
+
+def neriCodeStyleNodeName(arena: SyntaxArena, node: Int): String
+  let kind = arena.kindAt(node)
+
+  if kind == "Name"
+    return arena.dataAt(node)
+  end
+  if kind == "Member" && arena.childCountAt(node) == 1
+    let base = neriCodeStyleNodeName(arena, arena.childAt(node, 0))
+
+    return base == "" ? "" : base + "." + arena.dataAt(node)
+  end
+  return ""
+end
+
+def neriCodeStyleStartsWith(value: String, prefix: String): Bool
+  if host.stringByteLength(prefix) > host.stringByteLength(value)
+    return false
+  end
+  return host.stringSlice(value, 0, host.stringByteLength(prefix)) == prefix
+end
+
+def neriCodeStyleIsAssertion(arena: SyntaxArena, node: Int, options: NeriCodeStyleOptions): Bool
+  if arena.kindAt(node) != "ExpressionStatement" || arena.childCountAt(node) != 1
+    return false
+  end
+  let call = arena.childAt(node, 0)
+
+  if arena.kindAt(call) != "Call" || arena.childCountAt(call) < 1
+    return false
+  end
+  let name = neriCodeStyleNodeName(arena, arena.childAt(call, 0))
+  var helper = options.assertionHelpers.first.nextNode
+
+  while helper != null
+    let pattern = helper.value
+
+    if host.stringByteLength(pattern) > 0 && (host.stringByteAt(pattern, host.stringByteLength(pattern) - 1) as Int) == 42
+      let prefix = host.stringSlice(pattern, 0, host.stringByteLength(pattern) - 1)
+
+      if neriCodeStyleStartsWith(name, prefix)
+        return true
+      end
+    else if name == pattern
+      return true
+    end
+    helper = helper.nextNode
+  end
+  return false
+end
+
+def neriCodeStyleNewline(context: NeriCodeStyleContext): String
+  let map = new IrSourceMap(context.text)
+  var index = 0
+
+  while index < map.utf16Length()
+    let byte = map.offsetAt(index)
+
+    if (host.stringByteAt(context.text, byte) as Int) == 13
+      return "\r\n"
+    end
+    index = index + 1
+  end
+  return "\n"
+end
+
+def neriCodeStyleGap(context: NeriCodeStyleContext, previousStart: Int, nextStart: Int): Int
+  let tokens = context.tokens
+
+  if tokens == null || nextStart <= previousStart
+    return -1
+  end
+  var index = 0
+  var last = -1
+  var lastKind = ""
+  var newlines = 0
+
+  while index < tokens.count()
+    let start = tokens.startAt(index)
+
+    if start >= nextStart
+      break
+    end
+    if start >= previousStart
+      if tokens.kindAt(index) == "NewLine"
+        if last >= 0
+          newlines = newlines + 1
+        end
+      else
+        last = index
+        lastKind = tokens.kindAt(index)
+        newlines = 0
+      end
+    end
+    index = index + 1
+  end
+  if last < 0 || newlines < 1 || lastKind == "Else" || lastKind == "Case"
+    return -1
+  end
+  return tokens.startAt(last) + tokens.lengthAt(last)
+end
+
+def neriCodeStyleGapNeedsBlank(context: NeriCodeStyleContext, gap: Int, nextStart: Int): Bool
+  let map = new IrSourceMap(context.text)
+  let first = map.offsetAt(gap)
+  let last = map.offsetAt(nextStart)
+  var index = first
+  var newlines = 0
+
+  while index < last
+    let value = host.stringByteAt(context.text, index) as Int
+
+    if value == 10
+      newlines = newlines + 1
+    end
+    if value == 35
+      var lineStart = index
+
+      while lineStart > 0
+        let previous = host.stringByteAt(context.text, lineStart - 1) as Int
+
+        if previous == 10 || previous == 13
+          break
+        end
+        lineStart = lineStart - 1
+      end
+      # A full-line comment travels with the following statement. An inline
+      # comment belongs to the preceding statement and does not consume the
+      # required line break before the next statement.
+      if lineStart >= first
+        return newlines == 1
+      end
+    end
+    index = index + 1
+  end
+  return newlines == 1
+end
+
+def neriCodeStyleGapSafe(context: NeriCodeStyleContext, start: Int, finish: Int): Bool
+  let map = new IrSourceMap(context.text)
+  let first = map.offsetAt(start)
+  let last = map.offsetAt(finish)
+  var index = first
+  var comment = false
+
+  while index < last
+    let value = host.stringByteAt(context.text, index) as Int
+
+    if value == 35
+      comment = true
+    else if value == 10 || value == 13
+      comment = false
+    else if !comment && value != 32 && value != 9
+      return false
+    end
+    index = index + 1
+  end
+  return true
+end
+
+def neriCodeStyleLineStart(context: NeriCodeStyleContext, position: Int): Int
+  let map = new IrSourceMap(context.text)
+  var byte = map.offsetAt(position)
+
+  while byte > 0
+    let previous = host.stringByteAt(context.text, byte - 1) as Int
+
+    if previous == 10 || previous == 13
+      break
+    end
+    byte = byte - 1
+  end
+  return (new IrSourceMap(host.stringSlice(context.text, 0, byte))).utf16Length()
+end
+
+def neriCodeStyleInsertionStart(context: NeriCodeStyleContext, gap: Int, nextStart: Int): Int
+  let map = new IrSourceMap(context.text)
+  let first = map.offsetAt(gap)
+  let last = map.offsetAt(nextStart)
+  var byte = first
+
+  while byte < last
+    if (host.stringByteAt(context.text, byte) as Int) == 35
+      var lineStart = byte
+
+      while lineStart > 0
+        let previous = host.stringByteAt(context.text, lineStart - 1) as Int
+
+        if previous == 10 || previous == 13
+          break
+        end
+        lineStart = lineStart - 1
+      end
+      if lineStart >= first
+        return (new IrSourceMap(host.stringSlice(context.text, 0, lineStart))).utf16Length()
+      end
+    end
+    byte = byte + 1
+  end
+  return neriCodeStyleLineStart(context, nextStart)
+end
+
+def neriCodeStyleAddEdit(result: NeriCodeStyleResult, start: Int, replacement: String): NeriCodeStyleEdit
+  var previous: NeriCodeStyleEdit? = null
+  var current = result.edits
+
+  while current != null && current.start > start
+    previous = current
+    current = current.next
+  end
+  if current != null && current.start == start && current.length == 0 && current.replacement == replacement
+    return current
+  end
+  let edit = new NeriCodeStyleEdit()
+
+  edit.start = start
+  edit.replacement = replacement
+  edit.next = current
+  if previous == null
+    result.edits = edit
+  else
+    previous.next = edit
+  end
+  return edit
+end
+
+def neriCodeStyleAddFinding(rule: NeriCodeStyleRule, context: NeriCodeStyleContext, options: NeriCodeStyleOptions, result: NeriCodeStyleResult, previousStart: Int, start: Int, message: String): Void
+  let gap = neriCodeStyleGap(context, previousStart, start)
+
+  if gap < 0 || !neriCodeStyleGapNeedsBlank(context, gap, start) || !neriCodeStyleGapSafe(context, gap, start)
+    return
+  end
+  var edit: NeriCodeStyleEdit? = null
+
+  if rule.safeFix
+    edit = neriCodeStyleAddEdit(result, neriCodeStyleInsertionStart(context, gap, start), neriCodeStyleNewline(context))
+  end
+  let finding = new NeriCodeStyleFinding()
+
+  finding.ruleId = rule.ruleId
+  finding.category = rule.category
+  finding.severity = options.severity(rule)
+  finding.message = message
+  finding.start = start
+  finding.length = neriCodeStyleFindingLength(context, start)
+  finding.safeFix = rule.safeFix
+  finding.edit = edit
+  neriCodeStyleInsertFinding(result, finding)
+end
+
+def neriCodeStyleFindingLength(context: NeriCodeStyleContext, start: Int): Int
+  let tokens = context.tokens
+
+  if tokens == null
+    return 1
+  end
+  var index = 0
+
+  while index < tokens.count()
+    let tokenStart = tokens.startAt(index)
+
+    if tokenStart >= start && tokens.kindAt(index) != "NewLine" && tokens.kindAt(index) != "EndOfFile"
+      let length = tokens.lengthAt(index)
+
+      return length > 0 ? length : 1
+    end
+    index = index + 1
+  end
+  return 1
+end
+
+def neriCodeStyleFindingBefore(left: NeriCodeStyleFinding, right: NeriCodeStyleFinding): Bool
+  if left.start != right.start
+    return left.start < right.start
+  end
+  let leftLength = host.stringByteLength(left.ruleId)
+  let rightLength = host.stringByteLength(right.ruleId)
+  var index = 0
+
+  while index < leftLength && index < rightLength
+    let leftByte = host.stringByteAt(left.ruleId, index) as Int
+    let rightByte = host.stringByteAt(right.ruleId, index) as Int
+
+    if leftByte != rightByte
+      return leftByte < rightByte
+    end
+    index = index + 1
+  end
+  return leftLength < rightLength
+end
+
+def neriCodeStyleInsertFinding(result: NeriCodeStyleResult, finding: NeriCodeStyleFinding): Void
+  var previous: NeriCodeStyleFinding? = null
+  var current = result.findings
+
+  while current != null && neriCodeStyleFindingBefore(current, finding)
+    previous = current
+    current = current.next
+  end
+  finding.next = current
+  if previous == null
+    result.findings = finding
+  else
+    previous.next = finding
+  end
+end
+
+class NeriCodeStyleDeclarationSpacingRule: NeriCodeStyleRule
+  def init(): Void
+    this.ruleId = "NRSTYLE001"
+    this.optionKey = "neri_blank_line_after_declarations"
+    this.category = "style.spacing"
+  end
+
+  def evaluate(context: NeriCodeStyleContext, options: NeriCodeStyleOptions, result: NeriCodeStyleResult): Void
+    neriCodeStyleEvaluateDeclarationSiblings(this, context, options, result, context.root)
+  end
+end
+
+class NeriCodeStyleAssertionSpacingRule: NeriCodeStyleRule
+  def init(): Void
+    this.ruleId = "NRSTYLE002"
+    this.optionKey = "neri_blank_line_before_assertions"
+    this.category = "style.spacing"
+  end
+
+  def evaluate(context: NeriCodeStyleContext, options: NeriCodeStyleOptions, result: NeriCodeStyleResult): Void
+    neriCodeStyleEvaluateAssertionSiblings(this, context, options, result, context.root)
+  end
+end
+
+def neriCodeStyleRules(): NeriCodeStyleRule
+  let declarations: NeriCodeStyleRule = new NeriCodeStyleDeclarationSpacingRule()
+  let assertions: NeriCodeStyleRule = new NeriCodeStyleAssertionSpacingRule()
+
+  declarations.next = assertions
+  return declarations
+end
+
+def neriCodeStyleStatementStart(context: NeriCodeStyleContext, arena: SyntaxArena, node: Int): Int
+  let statement = arena.statementStartAt(node)
+
+  return statement >= 0 ? statement : arena.startAt(node)
+end
+
+def neriCodeStyleEvaluateDeclarationSiblings(rule: NeriCodeStyleRule, context: NeriCodeStyleContext, options: NeriCodeStyleOptions, result: NeriCodeStyleResult, parent: Int): Void
+  let arena = context.syntax
+
+  if arena == null
+    return
+  end
+  var previous = -1
+  var index = 0
+
+  while index < arena.childCountAt(parent)
+    let child = arena.childAt(parent, index)
+
+    if neriCodeStyleStatement(arena, child)
+      if previous >= 0
+        let previousKind = arena.kindAt(previous)
+        let childStart = neriCodeStyleStatementStart(context, arena, child)
+        let previousStart = neriCodeStyleStatementStart(context, arena, previous)
+
+        if (previousKind == "Let" || previousKind == "Var") && arena.kindAt(child) != "Let" && arena.kindAt(child) != "Var"
+          neriCodeStyleAddFinding(rule, context, options, result, previousStart, childStart, "Insert a blank line after the declaration group.")
+        end
+      end
+      previous = child
+    end
+    index = index + 1
+  end
+  index = 0
+  while index < arena.childCountAt(parent)
+    neriCodeStyleEvaluateDeclarationSiblings(rule, context, options, result, arena.childAt(parent, index))
+    index = index + 1
+  end
+end
+
+def neriCodeStyleEvaluateAssertionSiblings(rule: NeriCodeStyleRule, context: NeriCodeStyleContext, options: NeriCodeStyleOptions, result: NeriCodeStyleResult, parent: Int): Void
+  let arena = context.syntax
+
+  if arena == null
+    return
+  end
+  var previous = -1
+  var index = 0
+
+  while index < arena.childCountAt(parent)
+    let child = arena.childAt(parent, index)
+
+    if neriCodeStyleStatement(arena, child)
+      if previous >= 0 && !neriCodeStyleIsAssertion(arena, previous, options) && neriCodeStyleIsAssertion(arena, child, options)
+        neriCodeStyleAddFinding(rule, context, options, result, neriCodeStyleStatementStart(context, arena, previous), neriCodeStyleStatementStart(context, arena, child), "Insert a blank line before the assertion group.")
+      end
+      previous = child
+    end
+    index = index + 1
+  end
+  index = 0
+  while index < arena.childCountAt(parent)
+    neriCodeStyleEvaluateAssertionSiblings(rule, context, options, result, arena.childAt(parent, index))
+    index = index + 1
+  end
+end
+
+def neriCodeStyleContext(text: String): NeriCodeStyleContext
+  let context = new NeriCodeStyleContext()
+
+  context.text = text
+  let tokens = (new BootstrapLexer(text)).lex()
+  let parser = new BootstrapParser(tokens)
+  let root = parser.parseProgram()
+
+  context.tokens = tokens
+  context.syntax = parser.arena
+  context.root = root
+  if parser.diagnostics.count() != 0
+    context.error = "Code style requires syntactically valid Neri source."
+    return context
+  end
+  context.valid = true
+  return context
+end
+
+def neriCodeStyleAnalyzeWithRules(context: NeriCodeStyleContext, options: NeriCodeStyleOptions, rules: NeriCodeStyleRule?): NeriCodeStyleResult
+  let result = new NeriCodeStyleResult()
+
+  result.valid = context.valid
+  result.error = context.error
+  if !context.valid
+    return result
+  end
+  var rule = rules
+
+  while rule != null
+    if rule.enabled(options)
+      rule.evaluate(context, options, result)
+    end
+    rule = rule.next
+  end
+  return result
+end
+
+def neriCodeStyleAnalyze(context: NeriCodeStyleContext, options: NeriCodeStyleOptions): NeriCodeStyleResult
+  return neriCodeStyleAnalyzeWithRules(context, options, neriCodeStyleRules())
+end
+
+def neriCodeStyleAnalyzeText(text: String, options: NeriCodeStyleOptions): NeriCodeStyleResult
+  return neriCodeStyleAnalyze(neriCodeStyleContext(text), options)
+end
+
+def neriCodeStyleApplyChecked(text: String, edits: NeriCodeStyleEdit?): NeriCodeStyleApplyResult
+  let checked = new NeriCodeStyleApplyResult()
+  var result = text
+  var edit = edits
+  let originalMap = new IrSourceMap(text)
+  let context = new NeriCodeStyleContext()
+
+  context.text = text
+  let newline = neriCodeStyleNewline(context)
+  var previousStart = originalMap.utf16Length() + 1
+
+  while edit != null
+    if edit.start < 0 || edit.length != 0 || edit.start > originalMap.utf16Length() || edit.start >= previousStart || !neriCodeStyleUtf16Boundary(originalMap, edit.start) || !neriCodeStyleLineBoundary(text, originalMap, edit.start) || edit.replacement != newline
+      checked.error = "Code style edits require distinct descending UTF-16 line-boundary newline insertions."
+      return checked
+    end
+    let start = originalMap.offsetAt(edit.start)
+    let finish = originalMap.offsetAt(edit.start + edit.length)
+
+    result = host.stringSlice(result, 0, start) + edit.replacement + host.stringSlice(result, finish, host.stringByteLength(result) - finish)
+    previousStart = edit.start
+    edit = edit.next
+  end
+  if !neriCodeStyleTokensEquivalent(text, result)
+    checked.error = "Code style edit changed non-layout tokens."
+    return checked
+  end
+  let parsed = neriCodeStyleContext(result)
+
+  if !parsed.valid
+    checked.error = "Code style edit produced invalid Neri syntax."
+    return checked
+  end
+  checked.valid = true
+  checked.text = result
+  return checked
+end
+
+def neriCodeStyleUtf16Boundary(map: IrSourceMap, position: Int): Bool
+  if position < 0 || position > map.utf16Length()
+    return false
+  end
+  return position == 0 || map.offsetAt(position) != map.offsetAt(position - 1)
+end
+
+def neriCodeStyleLineBoundary(text: String, map: IrSourceMap, position: Int): Bool
+  let byte = map.offsetAt(position)
+
+  return byte == 0 || (host.stringByteAt(text, byte - 1) as Int) == 10
+end
+
+def neriCodeStyleApply(text: String, edits: NeriCodeStyleEdit?): String
+  let checked = neriCodeStyleApplyChecked(text, edits)
+
+  return checked.valid ? checked.text : text
+end
+
+# These spacing rules may only add line endings. A final token comparison makes
+# that promise executable: comments and strings remain untouched source text,
+# while all non-layout lexer tokens retain their kind, spelling, and value.
+def neriCodeStyleTokensEquivalent(before: String, after: String): Bool
+  let left = (new BootstrapLexer(before)).lex()
+  let right = (new BootstrapLexer(after)).lex()
+  var leftIndex = 0
+  var rightIndex = 0
+
+  while true
+    while leftIndex < left.count() && left.kindAt(leftIndex) == "NewLine"
+      leftIndex = leftIndex + 1
+    end
+    while rightIndex < right.count() && right.kindAt(rightIndex) == "NewLine"
+      rightIndex = rightIndex + 1
+    end
+    if leftIndex >= left.count() || rightIndex >= right.count()
+      return leftIndex >= left.count() && rightIndex >= right.count()
+    end
+    if left.kindAt(leftIndex) != right.kindAt(rightIndex) || left.textAt(leftIndex) != right.textAt(rightIndex) || left.valueAt(leftIndex) != right.valueAt(rightIndex)
+      return false
+    end
+    leftIndex = leftIndex + 1
+    rightIndex = rightIndex + 1
+  end
+  return false
+end

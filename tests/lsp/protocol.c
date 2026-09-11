@@ -389,7 +389,7 @@ static void project_contract(const char *compiler, const char *root) {
   snprintf(path, sizeof(path), "%s/tests/lsp/project", root);
   char *uri = file_uri(path);
   snprintf(message, sizeof(message), "{\"jsonrpc\":\"2.0\",\"method\":\"initialize\",\"id\":1,"
-    "\"params\":{\"rootUri\":\"%s\",\"capabilities\":{}}}", uri);
+    "\"params\":{\"rootUri\":\"%s\",\"initializationOptions\":{\"codeStyleDiagnostics\":false},\"capabilities\":{}}}", uri);
   free(uri);
   send_message(message, 0);
   free(receive());
@@ -576,7 +576,7 @@ int main(int argc, char **argv) {
   error_is(-32002);
   send_message("{\"jsonrpc\":\"2.0\",}", 0);
   error_is(-32700);
-  send_message("{\"jsonrpc\":\"2.0\",\"method\":\"initialize\",\"id\":\"init\",\"params\":{\"capabilities\":{}}}", 0);
+  send_message("{\"jsonrpc\":\"2.0\",\"method\":\"initialize\",\"id\":\"init\",\"params\":{\"initializationOptions\":{\"codeStyleDiagnostics\":false},\"capabilities\":{}}}", 0);
   char *reply = receive();
   const char *capabilities = field(field(reply, "result"), "capabilities");
   require(string_is(field(capabilities, "positionEncoding"), "utf-16"), "UTF-16 encoding");
