@@ -2,7 +2,7 @@
 
 ## UTF-8 construction
 
-`benchmarks/text.hk` compares builtin concatenation, the `text.concat` library
+`benchmarks/text.hk` compares the `String` concatenation operator, the `text.concat` library
 wrapper and `buffers.TextBuffer` with a reserved final capacity. Each appends
 `abcdé😀` (10 bytes, six scalars) and checks the resulting byte/scalar lengths.
 Build with `neri build benchmarks/text.hk --release --output build/text-benchmark`;
@@ -10,15 +10,16 @@ run `/usr/bin/time -l build/text-benchmark <concat|library|builder> <count>` on 
 
 A local ARM64 Release run on 2026-09-09 (Apple M4 Pro, LLVM 22) produced:
 
-| Appends | Builtin ms / RSS bytes | Library ms / RSS bytes | Buffer ms / RSS bytes |
+| Appends | Operator ms / RSS bytes | Library ms / RSS bytes | Buffer ms / RSS bytes |
 |---:|---:|---:|---:|
-| 10,000 | 17 / 49,922,048 | 16 / 49,807,360 | 1 / 2,146,304 |
-| 50,000 | 264 / 49,889,280 | 254 / 49,922,048 | 5 / 3,768,320 |
+| 10,000 | 16 / 41,615,360 | 16 / 43,892,736 | 2 / 2,162,688 |
+| 50,000 | 270 / 50,053,120 | 278 / 50,266,112 | 8 / 3,784,704 |
 
 These are individual observations, not statistical estimates or regression
 thresholds. Milliseconds measure the construction region inside the executable;
 RSS covers the entire process, including runtime and final validation.
-The library wrapper preserves the builtin storage cost. The buffer path reuses
+The class uses the native string allocation directly. Its methods add no wrapper
+object or separate backing array. The buffer path reuses
 capacity and copies bytes directly into its array through Neri code.
 
 For `N` appends of `k` bytes to a flat immutable string, the total output bytes
