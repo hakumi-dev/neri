@@ -51,7 +51,10 @@ class IrLowerer
   public adapterTargets: StringBuffer = new StringBuffer()
   public adapterArities: IntBuffer = new IntBuffer()
   public adapterVirtual: IntBuffer = new IntBuffer()
+  public adapterNodes: IntBuffer = new IntBuffer()
   public checkParallel: Bool = false
+  public retainedModule: IrModule?
+  private locationOverride: IrLocation?
 
   def init(semantic: SemanticModel, syntax: SyntaxArena, source: String, moduleName: String): Void
     this.semantic = semantic
@@ -71,7 +74,17 @@ class IrLowerer
     end
   end
 
+  def retain(parent: IrModule): Void
+    this.retainedModule = parent
+    this.module.retainedParent = parent
+  end
+
   def location(node: Int): IrLocation
+    let override = this.locationOverride
+
+    if override != null
+      return override
+    end
     return this.module.location(this.bound.startAt(node), this.bound.lengthAt(node))
   end
 
@@ -92,6 +105,11 @@ class IrLowerer
 
   def lower(): IrModule
     this.module.requireFeature("debug-scopes-v1")
+    let retained = this.retainedModule
+
+    if retained != null
+      this.module.requireFeature("retained-modules-v1")
+    end
     var signature = this.semantic.firstClass
 
     while signature != null
@@ -100,6 +118,11 @@ class IrLowerer
     end
     irLowerNativeRecords(this)
     var typeIndex = 0
+    let parentBound = this.bound.parent
+
+    if parentBound != null && retained != null
+      typeIndex = parentBound.count()
+    end
 
     while typeIndex < this.bound.count()
       this.requireType(irType(this.bound.typeAt(typeIndex)))
@@ -124,9 +147,12 @@ class IrLowerer
       let target = this.findCallable(this.adapterTargets.get(adapter))
 
       if target != null
-        this.lowerDefaultAdapter(target, this.adapterArities.get(adapter), this.adapterVirtual.get(adapter) == 1)
+        this.lowerDefaultAdapter(target, this.adapterArities.get(adapter), this.adapterVirtual.get(adapter) == 1, this.adapterNodes.get(adapter))
       end
       adapter = adapter + 1
+    end
+    if retained != null
+      this.lowerRetainedModule(retained)
     end
     if this.checkParallel
       irPropagateEffects(this.module, true)
@@ -134,6 +160,348 @@ class IrLowerer
     end
     irPropagateEffects(this.module)
     return this.module
+  end
+
+  private def lowerRetainedModule(parent: IrModule): Void
+    let functions = new StringBuffer()
+    let classes = new StringBuffer()
+    var localClass = this.module.firstClass
+
+    while localClass != null
+      let base = localClass.baseSymbol
+
+      this.addRetainedName(classes, base.name) if base != null
+      var field = localClass.firstField
+
+      while field != null
+        this.addRetainedType(classes, field.typeName)
+        field = field.nextField
+      end
+      var method = localClass.firstMethod
+
+      while method != null
+        this.addRetainedName(functions, method.functionSymbol.name)
+        let slot = method.dispatchSlot
+
+        this.addRetainedName(functions, slot.name) if slot != null
+        method = method.nextMethod
+      end
+      localClass = localClass.nextClass
+    end
+    var localRecord = this.module.firstRecord
+
+    while localRecord != null
+      var field = localRecord.firstField
+
+      while field != null
+        this.addRetainedType(classes, field.typeName)
+        field = field.nextField
+      end
+      localRecord = localRecord.nextRecord
+    end
+    var localImport = this.module.firstImport
+
+    while localImport != null
+      this.addRetainedType(classes, localImport.resultType)
+      var parameter = localImport.parameterTypes.first.nextNode
+
+      while parameter != null
+        this.addRetainedType(classes, parameter.value)
+        parameter = parameter.nextNode
+      end
+      localImport = localImport.nextImport
+    end
+    var local = this.module.firstFunction
+
+    while local != null
+      var callee = 0
+
+      while callee < local.callees.size
+        this.addRetainedName(functions, local.callees.get(callee))
+        callee = callee + 1
+      end
+      this.addRetainedType(classes, local.resultType)
+      var parameter = local.parameterTypes.first.nextNode
+
+      while parameter != null
+        this.addRetainedType(classes, parameter.value)
+        parameter = parameter.nextNode
+      end
+      let owner = local.declaringClass
+
+      this.addRetainedName(classes, owner.name) if owner != null
+      var block = local.firstBlock
+
+      while block != null
+        var blockParameter = block.firstParameter
+
+        while blockParameter != null
+          this.addRetainedType(classes, blockParameter.typeName)
+          blockParameter = blockParameter.nextParameter
+        end
+        var instruction = block.firstInstruction
+
+        while instruction != null
+          this.addRetainedType(classes, instruction.resultType)
+          this.addRetainedType(classes, instruction.secondResultType)
+          var typeIndex = 0
+
+          while typeIndex < instruction.typeArguments.Length
+            this.addRetainedType(classes, instruction.typeArguments[typeIndex])
+            typeIndex = typeIndex + 1
+          end
+          let symbol = instruction.symbol
+
+          if symbol != null
+            if symbol.kind == 1
+              this.addRetainedName(classes, symbol.name)
+            else if symbol.kind == 3 || symbol.kind == 4
+              this.addRetainedName(functions, symbol.name)
+            end
+          end
+          instruction = instruction.nextInstruction
+        end
+        block = block.nextBlock
+      end
+      local = local.nextFunction
+    end
+    this.addRetainedType(classes, this.module.sessionSourceType)
+    this.addRetainedType(classes, this.module.sessionTargetType)
+    var changed = true
+
+    while changed
+      let oldFunctionCount = functions.size
+      let oldClassCount = classes.size
+      var functionIndex = 0
+
+      while functionIndex < functions.size
+        let sourceFunction = this.findRetainedFunction(parent, functions.get(functionIndex))
+
+        if sourceFunction != null
+          this.addRetainedType(classes, sourceFunction.resultType)
+          let owner = sourceFunction.declaringClass
+
+          this.addRetainedName(classes, owner.name) if owner != null
+          var parameter = sourceFunction.parameterTypes.first.nextNode
+
+          while parameter != null
+            this.addRetainedType(classes, parameter.value)
+            parameter = parameter.nextNode
+          end
+        end
+        functionIndex = functionIndex + 1
+      end
+      var classIndex = 0
+
+      while classIndex < classes.size
+        let classValue = this.findRetainedClass(parent, classes.get(classIndex))
+
+        if classValue != null
+          let base = classValue.baseSymbol
+
+          this.addRetainedName(classes, base.name) if base != null
+          var field = classValue.firstField
+
+          while field != null
+            this.addRetainedType(classes, field.typeName)
+            field = field.nextField
+          end
+          var method = classValue.firstMethod
+
+          while method != null
+            this.addRetainedName(functions, method.functionSymbol.name)
+            method = method.nextMethod
+          end
+        else
+          let record = this.findRetainedRecord(parent, classes.get(classIndex))
+
+          if record != null
+            var field = record.firstField
+
+            while field != null
+              this.addRetainedType(classes, field.typeName)
+              field = field.nextField
+            end
+          end
+        end
+        classIndex = classIndex + 1
+      end
+      changed = functions.size != oldFunctionCount || classes.size != oldClassCount
+    end
+    var classIndex = 0
+
+    while classIndex < classes.size
+      let classValue = this.findRetainedClass(parent, classes.get(classIndex))
+
+      if classValue != null && !this.hasOwnedClass(classValue.symbol.name)
+        let declaration = new IrClass(classValue.symbol, classValue.baseSymbol, classValue.access, irNoLocation())
+
+        declaration.retained = true
+        var field = classValue.firstField
+
+        while field != null
+          declaration.addField(new IrField(field.symbol, field.typeName, field.access, irNoLocation()))
+          field = field.nextField
+        end
+        var method = classValue.firstMethod
+
+        while method != null
+          declaration.addMethod(new IrMethod(method.functionSymbol, method.dispatch, method.dispatchSlot, irNoLocation()))
+          method = method.nextMethod
+        end
+        this.module.addClass(declaration)
+      end
+      classIndex = classIndex + 1
+    end
+    var recordIndex = 0
+
+    while recordIndex < classes.size
+      let sourceRecord = this.findRetainedRecord(parent, classes.get(recordIndex))
+
+      if sourceRecord != null && !this.hasOwnedRecord(sourceRecord.symbol.name)
+        let declaration = new IrNativeRecord(sourceRecord.symbol, sourceRecord.unionType)
+        var field = sourceRecord.firstField
+
+        while field != null
+          declaration.addField(new IrField(field.symbol, field.typeName, field.access, irNoLocation()))
+          field = field.nextField
+        end
+        let last = this.module.lastRecord
+
+        if last == null
+          this.module.firstRecord = declaration
+        else
+          last.nextRecord = declaration
+        end
+        this.module.lastRecord = declaration
+        this.module.recordCount = this.module.recordCount + 1
+        this.module.requireFeature("native-records-v1")
+      end
+      recordIndex = recordIndex + 1
+    end
+    var functionIndex = 0
+
+    while functionIndex < functions.size
+      let sourceFunction = this.findRetainedFunction(parent, functions.get(functionIndex))
+
+      if sourceFunction != null && sourceFunction.symbol.name != "__neri_session_entry" && irEffectFunction(this.module, sourceFunction.symbol.name) == null
+        let function = new IrFunction(sourceFunction.symbol, sourceFunction.resultType, sourceFunction.kind, sourceFunction.unsafeCall, irNoLocation())
+
+        function.retained = true
+        function.effects = sourceFunction.effects
+        function.localEffects = sourceFunction.effects
+        function.declaringClass = sourceFunction.declaringClass
+        function.dispatchSlot = sourceFunction.dispatchSlot
+        var parameter = sourceFunction.parameterTypes.first.nextNode
+
+        while parameter != null
+          function.parameterTypes.add(parameter.value)
+          parameter = parameter.nextNode
+        end
+        this.module.addFunction(function)
+      end
+      functionIndex = functionIndex + 1
+    end
+  end
+
+  private def addRetainedName(names: StringBuffer, name: String): Void
+    var index = 0
+
+    while index < names.size
+      if names.get(index) == name
+        return
+      end
+      index = index + 1
+    end
+    names.add(name) if name != ""
+  end
+
+  private def addRetainedType(classes: StringBuffer, typeName: String): Void
+    this.requireType(typeName)
+    let kind = irTypeKind(typeName)
+
+    if kind == "class" || kind == "record"
+      this.addRetainedName(classes, irTypeInner(typeName))
+    else if kind == "fixed-array"
+      this.addRetainedType(classes, irFixedArrayInner(typeName))
+    else if kind == "array" || kind == "optional" || kind == "pointer"
+      this.addRetainedType(classes, irTypeInner(typeName))
+    end
+  end
+
+  private def hasOwnedClass(name: String): Bool
+    var value = this.module.firstClass
+
+    while value != null
+      if value.symbol.name == name && !value.retained
+        return true
+      end
+      value = value.nextClass
+    end
+    return false
+  end
+
+  private def hasOwnedRecord(name: String): Bool
+    var value = this.module.firstRecord
+
+    while value != null
+      if value.symbol.name == name
+        return true
+      end
+      value = value.nextRecord
+    end
+    return false
+  end
+
+  private def findRetainedFunction(parent: IrModule, name: String): IrFunction?
+    var module: IrModule? = parent
+
+    while module != null
+      var function = module.firstFunction
+
+      while function != null
+        if function.symbol.name == name && !function.retained
+          return function
+        end
+        function = function.nextFunction
+      end
+      module = module.retainedParent
+    end
+    return null
+  end
+
+  private def findRetainedClass(parent: IrModule, name: String): IrClass?
+    var module: IrModule? = parent
+
+    while module != null
+      var value = module.firstClass
+
+      while value != null
+        if value.symbol.name == name && !value.retained
+          return value
+        end
+        value = value.nextClass
+      end
+      module = module.retainedParent
+    end
+    return null
+  end
+
+  private def findRetainedRecord(parent: IrModule, name: String): IrNativeRecord?
+    var module: IrModule? = parent
+
+    while module != null
+      var value = module.firstRecord
+
+      while value != null
+        if value.symbol.name == name
+          return value
+        end
+        value = value.nextRecord
+      end
+      module = module.retainedParent
+    end
+    return null
   end
 
   def requireType(typeName: String): Void
@@ -160,33 +528,18 @@ class IrLowerer
   end
 
   def lowerFunctionsInSymbolOrder(): Void
-    var count = 0
+    let ordered = new IrOrderList<SemanticCallable>()
     var function = this.semantic.firstFunction
 
     while function != null
-      count = count + 1
+      ordered.add(function, 0, function.fullName)
       function = function.nextCallable
     end
-    var emitted = 0
-    var previous = ""
+    var current = ordered.sorted()
 
-    while emitted < count
-      var best: SemanticCallable? = null
-
-      function = this.semantic.firstFunction
-      while function != null
-        let afterPrevious = emitted == 0 || irCompareText(function.fullName, previous) > 0
-
-        if afterPrevious && (best == null || irCompareText(function.fullName, best.fullName) < 0)
-          best = function
-        end
-        function = function.nextCallable
-      end
-      if best != null
-        this.lowerCallable(best)
-        previous = best.fullName
-      end
-      emitted = emitted + 1
+    while current != null
+      this.lowerCallable(current.value)
+      current = current.next
     end
   end
 
@@ -200,6 +553,7 @@ class IrLowerer
         baseSymbol = irSymbol(this.module.id, 1, semanticClass.baseName)
       end
       let declaration = new IrClass(irSymbol(this.module.id, 1, semanticClass.fullName), baseSymbol, irAccessTag(semanticClass.access), irNoLocation())
+
       var field = semanticClass.firstField
 
       while field != null
@@ -452,7 +806,7 @@ class IrLowerer
 
           for argument in arguments operands = host.appendInt(operands, argument) end
           if callable.baseArguments.size < baseConstructor.parameterCount
-            let adapterName = this.requestDefaultAdapter(baseConstructor, callable.baseArguments.size, false)
+            let adapterName = this.requestDefaultAdapter(baseConstructor, callable.baseArguments.size, false, callable.boundNode)
 
             context.emitSymbol(28, "void", operands, irSymbol(this.module.id, 4, adapterName), location)
             context.function.addCallee(adapterName)
@@ -711,7 +1065,9 @@ class IrLowerer
           context.function.localEffects = irEffectUnion(context.function.localEffects, 66)
         else
           variable.value = value.id
-          context.function.addDebugLocal(new IrDebugLocal(variable.name, value.id, variable.declarationLocation, variable.debugScopeId))
+          if variable.declarationLocation.present
+            context.function.addDebugLocal(new IrDebugLocal(variable.name, value.id, variable.declarationLocation, variable.debugScopeId))
+          end
         end
       end
       return
@@ -1276,7 +1632,7 @@ class IrLowerer
     var callSymbolKind = symbolKind
 
     if callable != null && operands.Length < callable.parameterCount
-      callTarget = this.requestDefaultAdapter(callable, operands.Length, false)
+      callTarget = this.requestDefaultAdapter(callable, operands.Length, false, node)
       callSymbolKind = 4
     end
     context.function.addCallee(callTarget)
@@ -1307,7 +1663,7 @@ class IrLowerer
     if callable != null && receiver.typeName != "class|" + callable.className
       let upcastOperands: Int[] = [receiver.id]
 
-      receiver = context.emitValue(20, "class|" + callable.className, upcastOperands, isDirect ? irNoLocation() : this.location(receiverNode))
+      receiver = context.emitValue(20, "class|" + callable.className, upcastOperands, this.location(receiverNode))
     end
     operands = host.appendInt(operands, receiver.id)
     var index = 1
@@ -1342,7 +1698,7 @@ class IrLowerer
       opcode = 32
     end
     if callable != null && operands.Length - 1 < callable.parameterCount
-      let adapterName = this.requestDefaultAdapter(callable, operands.Length - 1, opcode == 30)
+      let adapterName = this.requestDefaultAdapter(callable, operands.Length - 1, opcode == 30, node)
 
       context.function.addCallee(adapterName)
       return context.emitSymbol(28, irType(this.bound.typeAt(node)), operands, irSymbol(this.module.id, 4, adapterName), this.location(node))
@@ -1431,7 +1787,7 @@ class IrLowerer
 
       for argument in arguments operands = host.appendInt(operands, argument) end
       if arguments.Length < constructor.parameterCount
-        let adapterName = this.requestDefaultAdapter(constructor, arguments.Length, false)
+        let adapterName = this.requestDefaultAdapter(constructor, arguments.Length, false, node)
 
         context.emitSymbol(28, "void", operands, irSymbol(this.module.id, 4, adapterName), this.location(node))
         context.function.addCallee(adapterName)
@@ -1959,7 +2315,9 @@ class IrLowerer
 
     while entry != null
       entry.variable.value = entry.value
-      context.function.addDebugLocal(new IrDebugLocal(entry.variable.name, entry.value, entry.variable.declarationLocation, entry.variable.debugScopeId))
+      if entry.variable.declarationLocation.present
+        context.function.addDebugLocal(new IrDebugLocal(entry.variable.name, entry.value, entry.variable.declarationLocation, entry.variable.debugScopeId))
+      end
       entry = entry.nextEntry
     end
   end
@@ -1999,7 +2357,9 @@ class IrLowerer
           variable.value = value.id
           variable.addressedPointer = -1
           variable.addressedDepth = -1
-          context.function.addDebugLocal(new IrDebugLocal(variable.name, value.id, variable.declarationLocation, variable.debugScopeId))
+          if variable.declarationLocation.present
+            context.function.addDebugLocal(new IrDebugLocal(variable.name, value.id, variable.declarationLocation, variable.debugScopeId))
+          end
           context.function.localEffects = irEffectUnion(context.function.localEffects, 65)
         end
         variable = variable.nextVariable
@@ -2188,7 +2548,16 @@ class IrLowerer
   end
 
   def addVirtualCallees(context: IrFunctionContext, slotName: String, receiverType: String): Void
-    var classSymbol = this.semantic.firstClass
+    this.addVirtualCalleesFrom(context, slotName, receiverType, this.semantic)
+  end
+
+  private def addVirtualCalleesFrom(context: IrFunctionContext, slotName: String, receiverType: String, model: SemanticModel): Void
+    let parent = model.parent
+
+    if parent != null
+      this.addVirtualCalleesFrom(context, slotName, receiverType, parent)
+    end
+    var classSymbol = model.firstClass
 
     while classSymbol != null
       var method = classSymbol.firstMethod
@@ -2225,7 +2594,7 @@ class IrLowerer
     return adjusted
   end
 
-  def requestDefaultAdapter(target: SemanticCallable, arity: Int, virtualDispatch: Bool): String
+  def requestDefaultAdapter(target: SemanticCallable, arity: Int, virtualDispatch: Bool, node: Int): String
     let name = target.fullName + "$default$arity" + (arity as String) + (virtualDispatch ? "$virtual" : "")
     let dispatch = virtualDispatch ? 1 : 0
     var index = 0
@@ -2239,12 +2608,23 @@ class IrLowerer
     this.adapterTargets.add(target.fullName)
     this.adapterArities.add(arity)
     this.adapterVirtual.add(dispatch)
+    this.adapterNodes.add(node)
     return name
   end
 
-  def lowerDefaultAdapter(target: SemanticCallable, arity: Int, virtualDispatch: Bool): Void
+  def lowerDefaultAdapter(target: SemanticCallable, arity: Int, virtualDispatch: Bool, node: Int): Void
     let name = target.fullName + "$default$arity" + (arity as String) + (virtualDispatch ? "$virtual" : "")
-    let function = new IrFunction(irSymbol(this.module.id, 4, name), irType(target.returnType), 5, false, this.location(target.boundNode))
+
+    let retained = this.retainedModule
+
+    if irEffectFunction(this.module, name) != null || (retained != null && this.findRetainedFunction(retained, name) != null)
+      return
+    end
+    let adapterLocation = this.location(node)
+    let previousLocationOverride = this.locationOverride
+
+    this.locationOverride = adapterLocation
+    let function = new IrFunction(irSymbol(this.module.id, 4, name), irType(target.returnType), 5, false, adapterLocation)
 
     function.parallelCallees = new StringBuffer() if this.checkParallel
     let entry = function.createBlock()
@@ -2303,6 +2683,7 @@ class IrLowerer
 
     context.returnValue(irType(target.returnType) == "void" ? -1 : result.id, this.location(target.boundNode))
     this.module.addFunction(function)
+    this.locationOverride = previousLocationOverride
   end
 
   def findCallable(name: String): SemanticCallable?
@@ -2311,7 +2692,11 @@ class IrLowerer
     if function != null
       return function
     end
-    var classSymbol = this.semantic.firstClass
+    return this.findMethod(this.semantic, name)
+  end
+
+  private def findMethod(model: SemanticModel, name: String): SemanticCallable?
+    var classSymbol = model.firstClass
 
     while classSymbol != null
       var method = classSymbol.firstMethod
@@ -2323,6 +2708,11 @@ class IrLowerer
         method = method.nextCallable
       end
       classSymbol = classSymbol.nextClass
+    end
+    let parent = model.parent
+
+    if parent != null
+      return this.findMethod(parent, name)
     end
     return null
   end
@@ -2340,6 +2730,12 @@ class IrLowerer
     if name == "sessionBridgeLoadExecute" || name == "neri_rt_v1_session_load_execute"
       return new IrRuntimeContract(name, "neri_rt_v1_session_load_execute", "int", 125, 19, 8388608, 6)
     end
+    if name == "sessionBridgeLoadExecuteRetained" || name == "neri_rt_v1_session_load_execute_retained"
+      return new IrRuntimeContract(name, "neri_rt_v1_session_load_execute_retained", "int", 125, 23, 8388608, 6)
+    end
+    if name == "sessionBridgeLoadExecuteObject" || name == "neri_rt_v1_session_load_execute_object"
+      return new IrRuntimeContract(name, "neri_rt_v1_session_load_execute_object", "int", 125, 24, 8388608, 6)
+    end
     if name == "sessionBridgeReset" || name == "neri_rt_v1_session_reset"
       return new IrRuntimeContract(name, "neri_rt_v1_session_reset", "int", 125, 19, 8388608, 6)
     end
@@ -2348,6 +2744,9 @@ class IrLowerer
     end
     if name == "sessionBridgeError" || name == "neri_rt_v1_session_error"
       return new IrRuntimeContract(name, "neri_rt_v1_session_error", "string", 93, 19, 8388608, 6)
+    end
+    if name == "sessionBridgeResult" || name == "neri_rt_v1_session_result"
+      return new IrRuntimeContract(name, "neri_rt_v1_session_result", "string", 93, 23, 8388608, 6)
     end
     if name == "console.print"
       return new IrRuntimeContract(name, "neri_rt_v1_stdout_write", "void", 6, 3, 128, 2)

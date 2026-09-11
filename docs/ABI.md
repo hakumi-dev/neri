@@ -1,7 +1,7 @@
 # Runtime and IR boundary
 
 The canonical exported declarations and layouts are in
-[`runtime_abi.h`](../native/include/neri/runtime_abi.h). Runtime ABI 1.22 uses a
+[`runtime_abi.h`](../native/include/neri/runtime_abi.h). Runtime ABI 1.24 uses a
 C calling convention on macOS ARM64 and Linux x86-64. Generated programs negotiate
 major version, minimum minor version and required feature bits before execution.
 The package manifest also identifies the toolchain version and native target.
@@ -45,6 +45,27 @@ reported by each operation.
 `SOCKET_ENDPOINTS` (268435456) adds a bounded loopback TCP connection
 operation for clients sharing one deadline across connect, write and read,
 and bound-port discovery for listeners allocated with port zero.
+
+ABI 1.23 extends session modules with exact artifact-specific entry lookup and
+the retained frame's display value. The coordinator resolves the named artifact
+export directly, keeps its dependency modules loaded, and copies the display
+string into runtime-owned storage while the frame remains rooted. The returned
+string remains valid after module unloading.
+
+ABI 1.23 also provides `neri_rt_v1_host_canonical_path` under `BOOTSTRAP_HOST`.
+It accepts a NUL-terminated UTF-8 path, an output byte pointer and its capacity.
+It returns the UTF-8 byte length of the weakly canonical path, or `-1` on failure.
+A capacity greater than that length receives the bytes and a terminating NUL;
+a smaller capacity, including zero, queries the length and leaves the output
+untouched. The project loader uses this filesystem boundary directly.
+
+ABI 1.24 provides `neri_rt_v1_session_load_execute_object(handle, object_path,
+artifact_identity, linker_path)` under `SESSION_MODULES`. The three path and
+identity arguments are managed strings; the result is a session status code.
+The coordinator loads the native object-linker bridge lazily, resolves the
+artifact-specific exports, and validates the existing frame and layout contract
+before invocation. Each coordinator owns its linked generations and releases
+them after clearing its state root and collecting during reset.
 
 ## Representation
 
@@ -145,14 +166,20 @@ Runtime contract failures panic; no exception unwinds into Neri code.
 
 The compiler emits canonical Neri IR with transport 1.1, 1.2 for extended
 scalars or external library metadata, 1.3 for native records and fixed arrays,
-1.4 for `scoped-tasks-v1`, 1.5 for `session-module-v1`, and 1.6 for
-`debug-scopes-v1`.
+1.4 for `scoped-tasks-v1`, 1.5 for `session-module-v1`, 1.6 for
+`debug-scopes-v1`, and 1.7 for `retained-modules-v1`.
 The `native-libraries-v1` feature carries a library
 name after each import's source location; empty names retain platform-default
 symbol resolution. Only C ABI imports may declare a library. The transport header
 includes versions, flags, payload size and a SHA-256 digest. The native reader
 validates the envelope and the typed program before constructing LLVM objects.
 Malformed, unsupported and incompatible inputs produce stable NIR diagnostics.
+
+`retained-modules-v1` marks class shapes and function signatures whose storage
+and bodies are owned by an earlier immutable session module. Retained functions
+carry no blocks, values, or debug state. Native lowering emits external typed
+declarations for retained functions and class descriptors and emits definitions
+only for the current module.
 
 `debug-scopes-v1` records an ordered scope vector after each function's blocks.
 Each scope contains a positive ID, its parent ID (zero denotes the function),
