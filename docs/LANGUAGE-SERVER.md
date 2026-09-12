@@ -100,6 +100,10 @@ project owns the JetBrains client, grammar, configuration UI and Run/Build/Check
   Opening parenthesis and comma trigger argument completion. Ordinary parameters
   supply their declared names and types; `labels` parameters derive candidates
   from the resolved entity's public fields. Supplied labels are excluded.
+  Positions that require a named argument offer the remaining labels. Expression
+  candidates are available for positional arguments and after a label's colon.
+  Semantic candidate order is carried in LSP `sortText`; clients can apply their
+  own ranking preferences.
   At an argument value, the compiler retains the expected type of the parameter
   selected by positional order or its named label, after generic instantiation.
   Assignable locals are offered first, followed by applicable Bool literals,
