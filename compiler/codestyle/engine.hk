@@ -30,6 +30,7 @@ class NeriCodeStyleContext
   public newline: String = ""
   public tokens: TokenBuffer?
   public syntax: SyntaxArena?
+  public blocks: SyntaxBlock?
   public root: Int = -1
   public valid: Bool = false
   public error: String = ""
@@ -311,7 +312,7 @@ def neriCodeStyleInsertionStart(context: NeriCodeStyleContext, gap: Int, nextSta
   return neriCodeStyleLineStart(context, nextStart)
 end
 
-def neriCodeStyleAddEdit(result: NeriCodeStyleResult, start: Int, replacement: String): NeriCodeStyleEdit
+def neriCodeStyleAddEdit(result: NeriCodeStyleResult, start: Int, replacement: String, length: Int = 0): NeriCodeStyleEdit
   var previous: NeriCodeStyleEdit? = null
   var current = result.edits
 
@@ -319,12 +320,29 @@ def neriCodeStyleAddEdit(result: NeriCodeStyleResult, start: Int, replacement: S
     previous = current
     current = current.next
   end
-  if current != null && current.start == start && current.length == 0 && current.replacement == replacement
-    return current
+  if current != null && current.start == start
+    if current.length == length && current.replacement == replacement
+      return current
+    end
+    if current.length == 0 && length == 0 && (current.replacement == "\n" || current.replacement == "\r\n" || current.replacement == "\r") && neriCodeStyleWhitespace(replacement) && bootstrapFindText(replacement, "\n") < 0 && bootstrapFindText(replacement, "\r") < 0
+      current.replacement = current.replacement + replacement
+      return current
+    end
+    # A blank-line insertion and a prefix replacement share one source boundary.
+    if current.length == 0 && length > 0
+      current.length = length
+      current.replacement = current.replacement + replacement
+      return current
+    end
+    if length == 0 && current.length > 0
+      current.replacement = replacement + current.replacement
+      return current
+    end
   end
   let edit = new NeriCodeStyleEdit()
 
   edit.start = start
+  edit.length = length
   edit.replacement = replacement
   edit.next = current
   if previous == null
@@ -454,6 +472,15 @@ def neriCodeStyleRules(): NeriCodeStyleRule
   let assertions: NeriCodeStyleRule = new NeriCodeStyleAssertionSpacingRule()
 
   declarations.next = assertions
+  let trailing: NeriCodeStyleRule = new NeriCodeStyleTrailingWhitespaceRule()
+  let finalNewline: NeriCodeStyleRule = new NeriCodeStyleFinalNewlineRule()
+  let indentation: NeriCodeStyleRule = new NeriCodeStyleIndentationRule()
+  let spacing: NeriCodeStyleRule = new NeriCodeStyleTokenSpacingRule()
+
+  assertions.next = trailing
+  trailing.next = finalNewline
+  finalNewline.next = indentation
+  indentation.next = spacing
   return declarations
 end
 
@@ -540,11 +567,14 @@ def neriCodeStyleContext(text: String): NeriCodeStyleContext
     tokenIndex = tokenIndex + 1
   end
   let parser = new BootstrapParser(tokens)
+
+  parser.recordBlocks = true
   let root = parser.parseProgram()
 
   context.tokens = tokens
   context.tokenStarts = tokenStarts
   context.syntax = parser.arena
+  context.blocks = parser.blocks
   context.root = root
   if parser.diagnostics.count() != 0
     context.error = "Code style requires syntactically valid Neri source."
@@ -587,22 +617,21 @@ def neriCodeStyleApplyChecked(text: String, edits: NeriCodeStyleEdit?): NeriCode
   var result = text
   var edit = edits
   let originalMap = new IrSourceMap(text)
-  let context = new NeriCodeStyleContext()
-
-  context.text = text
-  context.sourceMap = originalMap
-  context.newline = neriCodeStyleDetectNewline(text, originalMap)
-  let newline = context.newline
+  let original = neriCodeStyleContext(text)
   var previousStart = originalMap.utf16Length() + 1
 
   while edit != null
-    if edit.start < 0 || edit.length != 0 || edit.start > originalMap.utf16Length() || edit.start >= previousStart || !neriCodeStyleUtf16Boundary(originalMap, edit.start) || !neriCodeStyleLineBoundary(text, originalMap, edit.start) || edit.replacement != newline
-      checked.error = "Code style edits require distinct descending UTF-16 line-boundary newline insertions."
+    if edit.start < 0 || edit.length < 0 || edit.start + edit.length > originalMap.utf16Length() || edit.start >= previousStart || edit.start + edit.length > previousStart || !neriCodeStyleUtf16Boundary(originalMap, edit.start) || !neriCodeStyleUtf16Boundary(originalMap, edit.start + edit.length)
+      checked.error = "Code style edits require non-overlapping descending UTF-16 ranges."
       return checked
     end
     let start = originalMap.offsetAt(edit.start)
     let finish = originalMap.offsetAt(edit.start + edit.length)
 
+    if !neriCodeStyleWhitespace(host.stringSlice(text, start, finish - start)) || !neriCodeStyleWhitespace(edit.replacement)
+      checked.error = "Code style edits may replace layout whitespace only."
+      return checked
+    end
     result = host.stringSlice(result, 0, start) + edit.replacement + host.stringSlice(result, finish, host.stringByteLength(result) - finish)
     previousStart = edit.start
     edit = edit.next
@@ -615,6 +644,17 @@ def neriCodeStyleApplyChecked(text: String, edits: NeriCodeStyleEdit?): NeriCode
 
   if !parsed.valid
     checked.error = "Code style edit produced invalid Neri syntax."
+    return checked
+  end
+  let originalSyntax = original.syntax
+  let parsedSyntax = parsed.syntax
+
+  if !original.valid || originalSyntax == null || parsedSyntax == null
+    checked.error = "Code style requires syntactically valid source."
+    return checked
+  end
+  if !neriCodeStyleSyntaxEquivalent(originalSyntax, original.root, parsedSyntax, parsed.root) || neriCodeStyleComments(original) != neriCodeStyleComments(parsed)
+    checked.error = "Code style edit changed syntax structure or comment content."
     return checked
   end
   checked.valid = true
@@ -641,9 +681,8 @@ def neriCodeStyleApply(text: String, edits: NeriCodeStyleEdit?): String
   return checked.valid ? checked.text : text
 end
 
-# These spacing rules may only add line endings. A final token comparison makes
-# that promise executable: comments and strings remain untouched source text,
-# while all non-layout lexer tokens retain their kind, spelling, and value.
+# Non-layout tokens retain their kind, spelling and value. Structural and
+# comment checks separately validate newline placement and source trivia.
 def neriCodeStyleTokensEquivalent(before: String, after: String): Bool
   let left = (new BootstrapLexer(before)).lex()
   let right = (new BootstrapLexer(after)).lex()
