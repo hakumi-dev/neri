@@ -152,6 +152,9 @@ project owns the JetBrains client, grammar, configuration UI and Run/Build/Check
   Generic constructors, methods and fields navigate to their original source
   declarations. Enum cases navigate from construction and `match` patterns to
   the case name. Generated specializations remain excluded from document symbols.
+- Namespace qualifiers and resolved `use` declarations navigate to their actual
+  `namespace` declarations. A namespace declared in multiple source files
+  returns every declaration location.
 - Fields and resolved method calls use the declaring owner's identity, including
   inherited members, static calls and explicit base calls. Field hover reflects
   the compiler's receiver-adjusted type. Callback parameters, callback-local
