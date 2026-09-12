@@ -38,9 +38,10 @@ class GenericInference
 
   def inferClosure(pattern: Int, node: Int, namespaceName: String): Void
     let signature = this.owner.syntax.nodeAt(pattern)
-    let closure = this.owner.syntax.nodeAt(node)
+    let closureNode = this.owner.syntax.kindAt(node) == "QuoteExpression" ? this.owner.syntax.childAt(node, 0) : node
+    let closure = this.owner.syntax.nodeAt(closureNode)
 
-    if signature.data != "fn" && signature.data != "shared fn" && signature.data != "parallel fn"
+    if signature.data != "fn" && signature.data != "shared fn" && signature.data != "parallel fn" && signature.data != "quote fn"
       return
     end
     let count = semanticIntField(closure.data, 0)
@@ -110,13 +111,28 @@ class GenericInference
       this.infer(source.children[0], value)
       return
     end
-    let classSymbol = this.owner.model.findClass(value)
+    let classSymbol = this.owner.model.findClass(semanticMutableType(value))
 
     if classSymbol == null
       return
     end
-    if (written == "fn" || written == "shared fn" || written == "parallel fn") && classSymbol.isFunctionType
-      let signature = classSymbol.firstMethod
+    if written == "#fields" && classSymbol.fieldPackEntityType != ""
+      this.infer(source.children[0], classSymbol.fieldPackEntityType)
+      return
+    end
+    let quotation = written == "quote fn" && classSymbol.quotedFunctionType != ""
+
+    if ((written == "fn" || written == "shared fn" || written == "parallel fn") && classSymbol.isFunctionType) || quotation
+      var functionClass: SemanticClass? = classSymbol
+
+      if quotation
+        functionClass = this.owner.model.findClass(classSymbol.quotedFunctionType)
+      end
+      var signature: SemanticCallable? = null
+
+      if functionClass != null
+        signature = functionClass.firstMethod
+      end
 
       if signature != null && signature.parameterCount + 1 == source.children.Length
         index = 0
@@ -238,6 +254,7 @@ def bindGenericExpression(body: BootstrapBodyBinder, node: Int, expectedType: St
   let parameterNames = new StringBuffer()
   let defaultFlags = new IntBuffer()
   var mapping = new SemanticArgumentMap()
+  var packParameter = -1
 
   index = 0
   while index < count
@@ -245,12 +262,13 @@ def bindGenericExpression(body: BootstrapBodyBinder, node: Int, expectedType: St
 
     parameterNames.add(owner.syntax.dataAt(parameterNode))
     defaultFlags.add(owner.syntax.childCountAt(parameterNode) > 1 ? 1 : 0)
+    packParameter = index if owner.syntax.nodeAt(parameterNode).parameterMode == "labels"
     index = index + 1
   end
   if call
-    mapping = semanticMapArguments(owner, node, 1, parameterNames, defaultFlags, name, true, false)
-    if mapping.hasNamed
-      mapping = semanticMapArguments(owner, node, 1, parameterNames, defaultFlags, name)
+    mapping = semanticMapArguments(owner, node, 1, parameterNames, defaultFlags, name, true, false, packParameter)
+    if mapping.hasNamed || packParameter >= 0
+      mapping = semanticMapArguments(owner, node, 1, parameterNames, defaultFlags, name, true, true, packParameter)
     end
   end
   index = 0
@@ -268,7 +286,8 @@ def bindGenericExpression(body: BootstrapBodyBinder, node: Int, expectedType: St
       let parameterIndex = mapping.parameterAt(index)
       let kind = owner.syntax.kindAt(argumentNode)
       let genericValue = findGenericTemplate(owner, genericCalleeName(body, argumentNode), owner.currentNamespace, "Function") >= 0
-      let contextual = kind == "Closure" || kind == "ArrayLiteral" || genericValue
+      let packed = mapping.isPackEntry(index)
+      let contextual = kind == "Closure" || kind == "QuoteExpression" || kind == "ArrayLiteral" || genericValue || packed
 
       if values.get(index) < 0 && (pass == 1 || !contextual)
         var expected = ""
@@ -276,20 +295,29 @@ def bindGenericExpression(body: BootstrapBodyBinder, node: Int, expectedType: St
 
         if parameterIndex >= 0 && parameterIndex < count
           pattern = owner.syntax.childAt(source.children[start + parameterIndex], 0)
-          if kind == "Closure"
+          if !packed && (kind == "Closure" || kind == "QuoteExpression")
             inference.inferClosure(pattern, argumentNode, owner.currentNamespace)
           end
           if !inference.unresolved(pattern)
             let clone = genericClone(owner, pattern, names, arguments)
 
             expected = owner.resolveTypeNode(clone, semanticField(source.data, 0), "")
+            if packed
+              let sourceArgument = owner.syntax.childAt(node, index + 1)
+              let field = fieldPackField(body, expected, semanticArgumentLabel(owner.syntax, sourceArgument), sourceArgument, false)
+
+              expected = ""
+              if field != null
+                expected = field.typeName
+              end
+            end
           end
         end
         let value = body.bindExpression(argumentNode, expected)
 
         values.set(index, value.boundNode)
         types.set(index, value.typeName)
-        if pattern >= 0
+        if pattern >= 0 && !packed
           inference.infer(pattern, value.typeName)
         end
       end
@@ -307,7 +335,7 @@ def bindGenericExpression(body: BootstrapBodyBinder, node: Int, expectedType: St
   end
   semanticValidateNamedDefaults(owner, node, callable, mapping)
   owner.recordOccurrence(owner.callableSourceIdentity(callable), callee)
-  if !mapping.hasNamed
+  if !mapping.hasNamed && packParameter < 0
     body.validateCallCount(callable.fullName, callee, actual, callable)
   end
   if callable.isUnsafe && body.unsafeDepth == 0
@@ -320,21 +348,25 @@ def bindGenericExpression(body: BootstrapBodyBinder, node: Int, expectedType: St
     let argumentNode = owner.syntax.childAt(node, index + 1)
     let parameterIndex = mapping.parameterAt(index)
     var value = values.get(index)
+    let parameter = callable.parameterAt(parameterIndex)
 
-    if mapping.hasNamed
+    if mapping.isPackEntry(index) && parameter != null
+      let entry = fieldPackEntry(body, parameter, argumentNode, new BoundValue(types.get(index), value))
+
+      value = body.addBound("FieldPackArgument", "fields.Entry", parameterIndex as String, argumentNode, [entry])
+    else if mapping.hasNamed || packParameter >= 0
       value = body.addBound("Argument", types.get(index), parameterIndex as String, argumentNode, [value])
     end
     children = host.appendInt(children, value)
-    let parameter = callable.parameterAt(parameterIndex)
-
-    if parameter != null && semanticArgumentLabel(owner.syntax, argumentNode) != ""
+    if parameter != null && semanticArgumentLabel(owner.syntax, argumentNode) != "" && !mapping.isPackEntry(index)
       owner.recordOccurrence(parameter.identity, argumentNode, parameter.name + ": " + parameter.typeName)
     end
-    if parameter != null && ((callable.exactArguments && parameter.typeName != types.get(index)) || (!callable.exactArguments && !semanticAssignable(owner.model, parameter.typeName, types.get(index))))
+    if parameter != null && !mapping.isPackEntry(index) && ((callable.exactArguments && parameter.typeName != types.get(index)) || (!callable.exactArguments && !semanticAssignable(owner.model, parameter.typeName, types.get(index))))
       owner.report("NR112", owner.syntax.childAt(node, index + 1), "Generic argument expects '" + parameter.typeName + "', but got '" + types.get(index) + "'.")
     end
     index = index + 1
   end
   body.recordArgumentCompletion(node, 1, callable, mapping)
+  children = appendFieldPack(body, callable, node, children)
   return new BoundValue(callable.returnType, body.addBound("Call", callable.returnType, callable.fullName, callee, children))
 end

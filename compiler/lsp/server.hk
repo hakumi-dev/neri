@@ -209,6 +209,7 @@ class LspDocument
   public sourceUris: StringBuffer = new StringBuffer()
   public sourceTexts: StringBuffer = new StringBuffer()
   public sourceStarts: IntBuffer = new IntBuffer()
+  public generatedOrigins: NeriGeneratedOrigin?
   public next: LspDocument?
 end
 
@@ -483,6 +484,7 @@ class LspServer
     let filePath = lspPath(document.uri)
 
     document.dependencyPaths = null
+    document.generatedOrigins = null
 
     if filePath != null && !neriSourceNameValid(filePath)
       this.publish(document, "[{\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":0,\"character\":0}},\"severity\":1,\"code\":\"NR_FILE_NAME\",\"source\":\"neri\",\"message\":\".hk file names must not contain whitespace.\"}]")
@@ -493,6 +495,7 @@ class LspServer
     let starts = new IntBuffer()
     let ids = new StringBuffer()
     let texts = new StringBuffer()
+    var loadedProject: NeriProject? = null
 
     document.sourceUris = ids
     document.sourceTexts = texts
@@ -521,6 +524,8 @@ class LspServer
         if projectPath != ""
           let project = neriProjectForSource(projectPath, path, this.selectedUnit(projectPath))
 
+          loadedProject = project
+
           # An empty inferred workspace can still analyze its first unsaved
           # document. Once it is saved, discovery includes it on the next
           # analysis. Other implicit-project configuration errors stay visible.
@@ -531,6 +536,41 @@ class LspServer
           end
           if neriProjectContains(project, path)
             document.dependencyPaths = project.sources
+            document.generatedOrigins = project.generatedOrigins
+            var outputIndex = 0
+
+            while outputIndex < project.generatedOutputs.size
+              let outputPath = project.generatedOutputs.get(outputIndex)
+              var outputOverlay = this.documents
+
+              while outputOverlay != null
+                if this.resolveDocumentPath(outputOverlay) == outputPath
+                  let verified = neriProjectVerifiedText(project, outputPath)
+
+                  if verified == null || outputOverlay.text != verified
+                    this.publish(document, "[{\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":0,\"character\":0}},\"severity\":1,\"code\":\"NR_GENERATED\",\"source\":\"neri\",\"message\":\"A generated output has unsaved changes. Regenerate its artifacts before using the generated API.\"}]")
+                    return
+                  end
+                end
+                outputOverlay = outputOverlay.next
+              end
+              outputIndex = outputIndex + 1
+            end
+            var generationIndex = 0
+
+            while generationIndex < project.generatedInputs.size
+              let inputPath = project.generatedInputs.get(generationIndex)
+              var overlay = this.documents
+
+              while overlay != null
+                if this.resolveDocumentPath(overlay) == inputPath && sha256FastText(overlay.text) != project.generatedDigests.get(generationIndex)
+                  this.publish(document, "[{\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":0,\"character\":0}},\"severity\":1,\"code\":\"NR_GENERATED\",\"source\":\"neri\",\"message\":\"A generation input has unsaved changes. Save and regenerate its artifacts before using the generated API.\"}]")
+                  return
+                end
+                overlay = overlay.next
+              end
+              generationIndex = generationIndex + 1
+            end
             document.renameClosedWorld = project.kind == "executable"
             var ownIndex = 0
 
@@ -575,10 +615,12 @@ class LspServer
                 let opened = this.findPath(entry.value)
                 var text: String? = null
 
-                if opened != null
+                if neriProjectListed(project.generatedOutputs, entry.value)
+                  text = neriProjectVerifiedText(project, entry.value)
+                else if opened != null
                   text = opened.text
                 else
-                  text = host.readText(entry.value)
+                  text = neriProjectVerifiedText(project, entry.value)
                 end
                 if text == null
                   this.publish(document, "[]")
@@ -619,7 +661,15 @@ class LspServer
           sourceIndex = sourceIndex + 1
         end
         if directory != null && !supplied
-          let text = host.readText(directory + "/" + library + ".hk")
+          let libraryPath = directory + "/" + library + ".hk"
+          let project = loadedProject
+          var text: String? = null
+
+          if project == null
+            text = host.readText(libraryPath)
+          else
+            text = neriProjectVerifiedText(project, libraryPath)
+          end
 
           if text != null
             starts.add((new IrSourceMap(source)).utf16Length())
@@ -783,7 +833,7 @@ class LspServer
       this.stdlibDocumentation = lspLoadStdlibDocumentation()
       let actions = (this.codeActionLiterals ? ",\"codeActionProvider\":{\"codeActionKinds\":[\"quickfix\",\"source.organizeImports\",\"source.fixAll.neri\"]}" : "") + ",\"workspaceSymbolProvider\":true,\"typeDefinitionProvider\":true,\"documentFormattingProvider\":true"
       let rename = this.versionedWorkspaceEdits ? ",\"renameProvider\":{\"prepareProvider\":true}" : ""
-      let onType = ",\"documentOnTypeFormattingProvider\":{\"firstTriggerCharacter\":\"\\n\"}"
+      let onType = ",\"documentOnTypeFormattingProvider\":{\"firstTriggerCharacter\":\"\\n\"},\"experimental\":{\"sourceOriginProvider\":true}"
 
       lspResult(id, "{\"capabilities\":{\"positionEncoding\":\"utf-16\",\"hoverProvider\":true,\"definitionProvider\":true,\"referencesProvider\":true,\"documentHighlightProvider\":true,\"documentSymbolProvider\":true,\"completionProvider\":{\"triggerCharacters\":[\".\",\" \",\":\",\")\"],\"resolveProvider\":true},\"signatureHelpProvider\":{\"triggerCharacters\":[\"(\",\",\"]},\"textDocumentSync\":{\"openClose\":true,\"change\":2}" + actions + rename + onType + "},\"serverInfo\":{\"name\":\"neri\",\"version\":" + lspQuote(neriVersion()) + "}}")
       if this.declarationCatalog.error != ""
@@ -929,7 +979,7 @@ class LspServer
       lspResult(id, lspResolveCompletion(document, item, this.documentationEnabled, this.completionMarkdown))
       return true
     end
-    if (method.value == "textDocument/hover" || method.value == "textDocument/definition" || method.value == "textDocument/typeDefinition" || method.value == "textDocument/references" || method.value == "textDocument/documentHighlight" || method.value == "textDocument/completion" || method.value == "textDocument/signatureHelp") && request
+    if (method.value == "textDocument/hover" || method.value == "textDocument/definition" || method.value == "neri/sourceOrigin" || method.value == "textDocument/typeDefinition" || method.value == "textDocument/references" || method.value == "textDocument/documentHighlight" || method.value == "textDocument/completion" || method.value == "textDocument/signatureHelp") && request
       let params = message.get("params")
       let document = this.find(params.get("textDocument").get("uri").value)
 
@@ -958,6 +1008,8 @@ class LspServer
           this.ensureAnalyzed(document)
           if method.value == "textDocument/references"
             lspResult(id, lspReferences(document, position, params.get("context").get("includeDeclaration").value == "true"))
+          else if method.value == "neri/sourceOrigin"
+            lspResult(id, lspSourceOrigin(document, position))
           else if method.value == "textDocument/typeDefinition"
             lspResult(id, lspTypeDefinition(document, position))
           else if method.value == "textDocument/documentHighlight"

@@ -547,6 +547,27 @@ capture. Callback signatures contain safe value types, and an unsafe enclosing
 block does not grant unsafe access inside a callback. Unsafe and C ABI functions
 require an explicitly written callback wrapper with its own unsafe block.
 
+### Typed quotations
+
+`quote fn(Parameters): Result` describes an inspectable expression. An explicit
+`quote do |parameter: Type|: Result ... end` expression constructs one. A
+quotation parameter also supplies the expected types for a trailing `do` block.
+The compiler preserves resolved field identities, parameter types and scalar
+captures in a readonly tree exposed through `tree()`.
+
+Quotations use `use quotation` and a body containing one supported return
+expression. Their signatures participate in ordinary generic inference. See
+[typed quotations](QUOTATIONS.md) for supported operations, capture rules and
+diagnostics.
+
+### Typed field arguments
+
+`fields of T` preserves a declared class's identity in a collection of supplied
+field values. A final `labels values: fields of T` parameter accepts named
+arguments checked against `T`'s public instance fields. Generic inference,
+completion and navigation use the entity declarations. See
+[typed field arguments](FIELDS.md) for presence, evaluation and inspection rules.
+
 ### Shared callbacks
 
 `shared fn(Parameters): Result` gives a callback read-only access through its

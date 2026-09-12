@@ -1,41 +1,134 @@
 # Verification record
 
-Local audit, 2026-09-12, macOS ARM64. Base source revision:
-`23fdfc7c733d6105cd1a6a7e6f47890b45573f6b`. The experiment is uncommitted.
-Compiler launcher: `scripts/neri.sh`; binary SHA-256:
-`08945cab0326d609c171e5290bd6f3d14f506606dcea92a55d67ed39f666aaa2`.
+Current local verification uses the Neri toolchain through `scripts/neri.sh`.
+The checks below describe the generic `Query<T>` API, the manual source
+generator and the generated Customer/Order fixture.
 
-## Passed checks
+## Generic data contracts
 
-- Library and sample compile. The sample executes successfully.
-- Behavior assertions cover omission, false, explicit NULL, quoted text as a
-  separate parameter, parameter order, query reuse, integer ordering, a typed
-  single-field projection and the relationship descriptor.
-- The verification executable passes against the actual `data.hk` source.
-  It exercises standalone LSP completion, project-aware unsaved completion through
-  the editor manifest, and retained-session completion with `use neri_data`.
-- Boolean completion exposes `eq(value: Bool)` and excludes `gt` and `isNull`.
-  Nullable text exposes `isNull`. Chained query completion retains the entity in
-  its predicate and return types.
-- The four semantic negatives below are rejected by CLI, LSP and session
-  preparation. Session preparation does not execute or persist these submissions.
-- Formatting checks pass for the implementation, sample and verification source.
+The executable `runtime-contract` covers the shared runtime surface:
 
-| Invalid expression | CLI / LSP first diagnostic | Session first diagnostic |
-| --- | --- | --- |
-| `customerActive().eq(1)` | NR112: expected Bool, got Int | NR112 |
-| `customers().where(orderId().eq(1))` | NR112: incompatible entity predicate | NR112 |
-| `customerActive().gt(1)` | NR131: missing member | NR131 |
-| `customerActve().eq(true)` | NR110: undefined function | NR104: unsupported call target |
+- `Query<T>.where(labels filters: fields of T)` resolves only declared labels
+  and preserves source order for predicates and parameters. Omitted filters,
+  `false`, non-null nullable text and explicit `NULL` are distinct cases.
+- `fields of T` exposes all public supported entity fields. Mapping membership
+  is validated by `translateFields` and `translateQuotation`; an unmapped but
+  statically valid field returns `QueryFailure.UnsupportedCapability` rather
+  than promising translation at compile time.
+- `matching(predicate: quote fn(T): Bool)` accepts the supported quotation
+  tree and captures values once. Cross-entity predicates and unsupported
+  quotation operations are rejected.
+- `orderBy`, `orderByString` and `orderByBool` accept typed field quotations;
+  `take` records the bound, which `compile()` validates.
+- `select(query, codec, selector)` is the shared generic projection entry
+  point. The query infers `T`; the scalar codec infers `R`. Scalar decoders
+  reject missing columns, wrong kinds and invalid NULL values.
+- `compile()` produces the explicit plan and validates its limit, selected
+  columns and scalar metadata. `all(provider)` checks provider capability and
+  executes the plan.
+- Plans expose placeholders and separately typed parameters. Values are never
+  interpolated into preview SQL.
 
-The typo's session diagnostic is less specific than CLI/LSP and remains an
-acceptance gap. The harness records this observed difference explicitly.
+The generated example runs with `model.Customer` and `model.Order`. Its
+generated context contains `Query<model.Customer>` and `Query<model.Order>`,
+mapping metadata, strict entity decoders, `snapshot_Entity` and `key_Entity`
+functions, and the mapped `Customer.id` to `Order.customerId` dependent query.
+It does not generate per-entity query, field or snapshot classes.
 
-With the named-argument implementation in the working tree,
-`customers().where(active: true)` parses and is rejected by semantic binding:
-`NR270` for the unknown `active` label and `NR273` for the missing `predicate`.
-The fixture declares `where(predicate: Predicate<T>)`; entity-specific equality
-labels belong to the generated API tracked in #63. Reproduce negatives with:
+## Generation and source contracts
+
+`data-generation-contracts` exercises the `tooling/data` project against the
+mapping and entity source fixture. It verifies mapped member and scalar checks,
+inherited fields with origins on their declaring class,
+deterministic source output, input and output digests, content-addressed
+publication, manifest replacement, output repair, selected-unit isolation,
+foreign-file protection and UTF-16 semantic origin spans. Generated sources
+are loaded as ordinary project sources; definitions and `neri/sourceOrigin`
+resolve through the recorded manifest.
+
+The generated project has `entities`, `data` and `sample` units. The `data`
+unit owns the generated manifest and `database.hk`; the default sample is
+`generated-example/sample.hk`. These are manual source fixtures for the
+current generator workflow, not a claim of an automatic generator pipeline for
+arbitrary projects.
+
+## Scale boundary
+
+`/tmp/neri-data-delivery-scale.log` measures generated entities and generic
+instances. Successful cases have no diagnostics:
+
+| entities | generic instances | generated bytes | diagnostics |
+| ---: | ---: | ---: | ---: |
+| 2 | 42 | 5,899 | 0 |
+| 3 | 54 | 8,799 | 0 |
+| 4 | 66 | 11,699 | 0 |
+| 8 | 114 | 23,299 | 0 |
+
+At 16 and 32 entities, specialization reaches the 128-instance cap and
+reports `NR222`. Native object emission passes at two entities and fails at
+the cap at 32; the intermediate cases measure semantic binding only.
+These measurements describe this four-field workload.
+
+`scripts/build.sh test` passed the fixed-point bootstrap and complete native
+and language suite on 2026-09-12 (`build/work.E2wjXS`). The inherited-mapping
+correction also passed the focused generation contract. Formatting checks pass
+for the new compiler spacing changes; the repository-wide check reports
+existing spacing violations in other files.
+
+## Editor checks
+
+The current directed language-service fixture checks generic member completion,
+label and value completion, resolved documentation, definitions and the
+corresponding negative diagnostics. The current real Rider checks passed for
+`customers`, `.where`, `active:` with `false`, and Cmd+B from `active` to the
+entity declaration. A real Rider quotation-body check also inserted
+`customer.active` after typing `.` then `ac` and accepting completion. The
+Rider quick documentation displays the specialized
+`Query<model.Customer>.where(labels filters: (fields of model.Customer))`
+signature and the source method documentation. The language-service trace
+`Neri-20260912-160304-587.log`, request 26, records the same hover response at
+line 6, character 28. Generic source bodies with ambiguous specializations
+retain an empty hover rather than selecting an arbitrary concrete type.
+
+CLI, LSP and retained sessions agree on these first diagnostics:
+
+| Invalid case | Diagnostic |
+| --- | --- |
+| Integer value for a Bool field | NR112 |
+| Unknown field label | NR278 |
+| Quotation from another entity | NR112 |
+| Invalid Bool operator | NR120 |
+| Misspelled factory | NR110 |
+
+## Current limits
+
+The repository has no database driver. The executable provider is in-memory and
+implements the bounded typed-read contract. The query vocabulary has no change
+tracking, insert, update, delete, transaction, migration, join or schema
+discovery API. Generated relationships produce filtered dependent queries.
+
+Quotation calls, overloaded operators represented as calls, indexing, casts,
+arithmetic and control-flow statements remain rejected with `NR276`. Limits
+must be present and range from 1 through 1000. The manifest and origin schema
+are Neri-specific and are independent of ECMA-426 source maps.
+
+## Reproduce
+
+Run from the repository root:
+
+```sh
+scripts/neri.sh run --project tooling/data --unit generator -- \
+  "$PWD/experiments/neri-data/generated-example/mapping.json"
+scripts/neri.sh run --project experiments/neri-data/generated-example --unit sample
+scripts/neri.sh run --project experiments/neri-data --unit runtime-contract
+scripts/neri.sh run --project . --unit data-generation-contracts -- "$PWD"
+scripts/neri.sh run --project . --unit generated-source-contracts -- "$PWD"
+scripts/neri.sh run --project experiments/neri-data/verification --unit verification
+scripts/neri.sh run --project benchmarks/data --unit benchmark -- \
+  "$PWD" "$PWD/scripts/neri.sh"
+```
+
+The focused invalid fixtures should fail with diagnostics:
 
 ```sh
 scripts/neri.sh check --project experiments/neri-data/verification --unit invalid-wrong-bool
@@ -44,39 +137,3 @@ scripts/neri.sh check --project experiments/neri-data/verification --unit invali
 scripts/neri.sh check --project experiments/neri-data/verification --unit invalid-typo
 scripts/neri.sh check --project experiments/neri-data/verification --unit invalid-named-argument
 ```
-
-Each command is expected to exit 1.
-
-## Editor observations and acceptance gaps
-
-Rider 2026.2, Neri plugin `0.4.3-dev`, compiler setting
-`/Users/kb714/Projects/neri/scripts/neri.sh` was inspected in the UI.
-The separate `editor/probe.hk` consumer was opened and edited without saving:
-
-```neri
-use neri_data
-
-def main(): Void
-  let field = customerActive()
-  field.
-end
-```
-
-No completion popup appeared after Ctrl+Space, invoking the Basic completion
-action, or restarting the Neri language server and retrying. The editor showed
-the expected incomplete-source diagnostic. Its log also recorded two
-`Invalid document range` responses during these edits. That is an observation,
-not an established cause. The matching project-aware direct LSP probe passes;
-the real-editor acceptance gate remains open. The original valid file was
-restored and saved, and settings were closed without changes.
-
-The standalone incomplete generic-member completion returns an accurate method
-signature but lacks `data` for documentation resolution, despite the method's
-`##` documentation. The harness reports that gap; documentation and provenance
-are not claimed as passing.
-
-The fixture has no generator, stale-output invalidation, entity-specific named
-labels, database provider, row materializer or Ito integration. Result typing
-currently ends at the inspectable `QueryPlan`. These boundaries and the selected
-generation/provenance contract are tracked in [#61](https://github.com/hakumi-dev/neri/issues/61)
-and [#63](https://github.com/hakumi-dev/neri/issues/63).

@@ -212,13 +212,14 @@ class BootstrapBodyBinder
     site.callable = this.owner.currentCallable
     site.receiverKind = receiverKind
     site.receiverType = receiverType
+    site.expectedType = expectedType
     site.expectsFunction = semanticExpectedFunction(this, expectedType) != null
     this.addCompletionVariables(site)
     site.next = this.model().completionSites
     this.model().completionSites = site
   end
 
-  def addArgumentCompletionSite(node: Int, receiverKind: String, target: SemanticCallable, mapping: SemanticArgumentMap, sourceIndex: Int): Void
+  def addArgumentCompletionSite(callNode: Int, start: Int, node: Int, receiverKind: String, target: SemanticCallable, mapping: SemanticArgumentMap, sourceIndex: Int): Void
     let site = new SemanticCompletionSite()
 
     site.start = this.syntax().startAt(node)
@@ -228,12 +229,35 @@ class BootstrapBodyBinder
     site.callable = this.owner.currentCallable
     site.receiverKind = receiverKind
     site.receiverType = target.fullName
+    let mapped = mapping.parameterAt(sourceIndex)
+
+    if mapping.isPackEntry(sourceIndex)
+      let pack = target.parameterAt(mapping.packParameter)
+
+      if pack != null
+        let argument = this.syntax().childAt(callNode, start + sourceIndex)
+        let field = fieldPackField(this, pack.typeName, semanticArgumentLabel(this.syntax(), argument), argument, false)
+
+        if field != null
+          site.expectedType = field.typeName
+        end
+      end
+    else if mapped >= 0
+      let expected = target.parameterAt(mapped)
+
+      if expected != null
+        site.expectedType = expected.typeName
+      end
+    end
     if receiverKind == "argument-start"
       var scope = this.model().completionSites
 
       while scope != null
         if scope.start == site.start && scope.receiverKind == ""
           site.argumentScope = scope
+          if site.expectedType == ""
+            site.expectedType = scope.expectedType
+          end
           site.expectsFunction = scope.expectsFunction
           break
         end
@@ -253,11 +277,51 @@ class BootstrapBodyBinder
         end
         other = other + 1
       end
-      if !suppliedElsewhere
+      if !suppliedElsewhere && parameter.mode != "labels"
         site.addSymbol(parameter.identity, parameter.name, parameter.typeName, false)
       end
       parameter = parameter.nextParameter
       parameterIndex = parameterIndex + 1
+    end
+    let pack = target.parameterAt(mapping.packParameter)
+
+    if pack != null
+      let packClass = this.model().findClass(semanticMutableType(pack.typeName))
+      var owner: SemanticClass? = null
+
+      if packClass != null
+        owner = this.model().findClass(packClass.fieldPackEntityType)
+      end
+
+      while owner != null
+        var field = owner.firstField
+
+        while field != null
+          var supplied = false
+          var conflictsWithOrdinary = false
+          var argumentIndex = 0
+
+          while argumentIndex < this.syntax().childCountAt(callNode) - start
+            let argument = this.syntax().childAt(callNode, start + argumentIndex)
+
+            supplied = true if argumentIndex != sourceIndex && semanticArgumentLabel(this.syntax(), argument) == field.name
+            argumentIndex = argumentIndex + 1
+          end
+          var candidateParameter = target.firstParameter
+
+          while candidateParameter != null
+            if candidateParameter.mode != "labels" && candidateParameter.name == field.name
+              conflictsWithOrdinary = true
+            end
+            candidateParameter = candidateParameter.nextParameter
+          end
+          if field.access == "public" && !supplied && !conflictsWithOrdinary
+            site.addSymbol(this.owner.fieldSourceIdentity(field), field.name, field.typeName, false)
+          end
+          field = field.nextField
+        end
+        owner = this.model().findClass(owner.baseName)
+      end
     end
     site.next = this.model().completionSites
     this.model().completionSites = site
@@ -275,23 +339,22 @@ class BootstrapBodyBinder
       let label = semanticArgumentLabel(this.syntax(), argumentNode)
 
       if label != ""
-        this.addArgumentCompletionSite(argumentNode, "argument-label", callable, mapping, sourceIndex)
-      else
-        let expressionNode = semanticArgumentExpression(this.syntax(), argumentNode)
-        var nameNode = -1
+        this.addArgumentCompletionSite(node, start, argumentNode, "argument-label", callable, mapping, sourceIndex)
+      end
+      let expressionNode = semanticArgumentExpression(this.syntax(), argumentNode)
+      var nameNode = -1
 
-        if this.syntax().kindAt(expressionNode) == "Name"
-          nameNode = expressionNode
-        else if this.syntax().kindAt(expressionNode) == "Call" && this.syntax().childCountAt(expressionNode) > 0
-          let callee = this.syntax().childAt(expressionNode, 0)
+      if this.syntax().kindAt(expressionNode) == "Name"
+        nameNode = expressionNode
+      else if this.syntax().kindAt(expressionNode) == "Call" && this.syntax().childCountAt(expressionNode) > 0
+        let callee = this.syntax().childAt(expressionNode, 0)
 
-          if this.syntax().kindAt(callee) == "Name"
-            nameNode = callee
-          end
+        if this.syntax().kindAt(callee) == "Name"
+          nameNode = callee
         end
-        if nameNode >= 0
-          this.addArgumentCompletionSite(nameNode, "argument-start", callable, mapping, sourceIndex)
-        end
+      end
+      if nameNode >= 0
+        this.addArgumentCompletionSite(node, start, nameNode, "argument-start", callable, mapping, sourceIndex)
       end
       sourceIndex = sourceIndex + 1
     end
@@ -1556,7 +1619,15 @@ class BootstrapBodyBinder
         return generic
       end
     end
-    if kind == "Closure"
+    if kind == "QuoteExpression"
+      return bindQuotation(this, node, expectedType)
+    else if kind == "Closure"
+      let expectedValue = semanticIsOptional(expectedType) ? semanticInnerType(expectedType) : expectedType
+      let expectedClass = this.model().findClass(semanticMutableType(expectedValue))
+
+      if expectedClass != null && expectedClass.quotedFunctionType != ""
+        return bindQuotation(this, node, expectedType)
+      end
       return bindClosure(this, node, expectedType)
     else if kind == "IntLiteral"
       if host.parseInt(data) == null && data != "9223372036854775808"
@@ -2226,6 +2297,16 @@ class BootstrapBodyBinder
       end
       let argumentNode = this.syntax().childAt(node, start + index)
       let expressionNode = semanticArgumentExpression(this.syntax(), argumentNode)
+      let packed = argumentMap != null && argumentMap.isPackEntry(index)
+
+      if packed
+        let field = fieldPackField(this, expected, semanticArgumentLabel(this.syntax(), argumentNode), argumentNode, false)
+
+        expected = ""
+        if field != null
+          expected = field.typeName
+        end
+      end
       let argument = this.bindExpression(expressionNode, expected)
 
       if semanticContainsResource(this.model(), argument.typeName)
@@ -2233,26 +2314,37 @@ class BootstrapBodyBinder
       end
       var boundArgument = argument.boundNode
 
-      if hasNamed
+      if packed && callable != null
+        let parameter = callable.parameterAt(mapped)
+
+        if parameter != null
+          let entry = fieldPackEntry(this, parameter, argumentNode, argument)
+
+          boundArgument = this.addBound("FieldPackArgument", "fields.Entry", mapped as String, argumentNode, [entry])
+        end
+      else if hasNamed || (callable != null && semanticLabelParameter(callable) >= 0)
         boundArgument = this.addBound("Argument", argument.typeName, mapped as String, argumentNode, [argument.boundNode])
       end
       children = host.appendInt(children, boundArgument)
       if callable != null && semanticArgumentLabel(this.syntax(), argumentNode) != ""
         let parameter = callable.parameterAt(mapped)
 
-        if parameter != null && labelsSupported
+        if parameter != null && labelsSupported && !packed
           this.owner.recordOccurrence(parameter.identity, argumentNode, parameter.name + ": " + parameter.typeName)
         end
       else if callable == null && semanticArgumentLabel(this.syntax(), argumentNode) != ""
         this.report("NR275", argumentNode, "Named arguments require a call target with declared parameter labels.")
       end
-      if expected != "" && ((callable != null && callable.exactArguments && expected != argument.typeName) || ((callable == null || !callable.exactArguments) && !semanticAssignable(this.model(), expected, argument.typeName)))
+      if !packed && expected != "" && ((callable != null && callable.exactArguments && expected != argument.typeName) || ((callable == null || !callable.exactArguments) && !semanticAssignable(this.model(), expected, argument.typeName)))
         this.report("NR112", expressionNode, "Argument " + ((mapped + 1) as String) + " of '" + semanticQualifiedName(library, name) + "' expects type '" + expected + "', but got '" + argument.typeName + "'.")
       end
       index = index + 1
     end
     if callable != null && argumentMap != null && labelsSupported
       this.recordArgumentCompletion(node, start, callable, argumentMap)
+    end
+    if callable != null && labelsSupported
+      return appendFieldPack(this, callable, node, children)
     end
     return children
   end
@@ -2262,7 +2354,7 @@ class BootstrapBodyBinder
     var parameter = callable.firstParameter
 
     while parameter != null
-      if parameter.hasDefault
+      if parameter.hasDefault || parameter.mode == "labels"
         return count
       end
       count = count + 1
@@ -2272,6 +2364,10 @@ class BootstrapBodyBinder
   end
 
   def validateCallCount(displayName: String, node: Int, actual: Int, callable: SemanticCallable, callNode: Int = -1, argumentStart: Int = 1, labelsSupported: Bool = true): Void
+    if callNode >= 0 && labelsSupported && semanticLabelParameter(callable) >= 0
+      semanticCallableArgumentMap(this.owner, callNode, argumentStart, callable, displayName, labelsSupported)
+      return
+    end
     if callNode >= 0
       var hasNamed = false
       var sourceIndex = 0
@@ -2633,6 +2729,14 @@ class BootstrapBodyBinder
       let arguments = this.bindArguments(node, 1, actual, "", this.syntax().dataAt(typeNode) + ".init", null)
 
       return new BoundValue("Error", this.addBound("New", "Error", typeName, node, arguments))
+    end
+    if classSymbol.fieldPackEntityType != ""
+      this.report("NR277", node, "Typed field packs are constructed by labeled calls.")
+      return new BoundValue("Error", this.addBound("ErrorExpression", "Error", "", node, emptyInts()))
+    end
+    if classSymbol.quotedFunctionType != ""
+      this.report("NR276", node, "A typed quotation is constructed by a quote expression.")
+      return new BoundValue("Error", this.addBound("ErrorExpression", "Error", "", node, emptyInts()))
     end
     if classSymbol.isAbstract
       this.owner.recordTypeOccurrence(classSymbol.fullName, typeNode)

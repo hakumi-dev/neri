@@ -1,0 +1,231 @@
+# Generation manifests describe source artifacts and their semantic origins.
+# They are checked by shared project loading before downstream binding.
+class NeriGeneratedOrigin
+  public path: String = ""
+  public start: Int = 0
+  public length: Int = 0
+  public source: String = ""
+  public sourceStart: Int = 0
+  public sourceLength: Int = 0
+  public sourceText: String = ""
+  public identity: String = ""
+  public next: NeriGeneratedOrigin?
+end
+
+def neriGenerationError(project: NeriProject, path: String, message: String): Bool
+  project.error = "Generation manifest " + path + ": " + message + " Regenerate the declared artifacts before compilation."
+  return false
+end
+
+def neriGenerationDigest(value: LspJson): Bool
+  if value.kind != "string" || host.stringByteLength(value.value) != 64
+    return false
+  end
+  var index = 0
+
+  while index < 64
+    let byte = host.stringByteAt(value.value, index) as Int
+
+    if !(byte >= 48 && byte <= 57) && !(byte >= 97 && byte <= 102)
+      return false
+    end
+    index = index + 1
+  end
+  return true
+end
+
+def neriGenerationInputPath(root: String, path: String): String?
+  if bootstrapStartsWith(path, "@stdlib/")
+    let directory = host.environment("NERI_STDLIB")
+    let name = host.stringSlice(path, 8, host.stringByteLength(path) - 8)
+
+    if directory == null || !neriRelativeProjectPath(name) || bootstrapFindText(name, "/") >= 0 || !semanticEndsWith(name, ".hk")
+      return null
+    end
+    return neriCanonicalPath(directory + "/" + name)
+  end
+  return neriCanonicalPath(root + "/" + path)
+end
+
+def neriGenerationEntries(project: NeriProject, root: String, manifest: String, entries: LspJson, outputs: Bool, paths: StringBuffer): Bool
+  if entries.kind != "array" || entries.first == null
+    return neriGenerationError(project, manifest, "inputs and outputs must be nonempty arrays.")
+  end
+  var entry = entries.first
+
+  while entry != null
+    if entry.kind != "object" || !neriProjectObjectKeysValid(entry, ["path", "sha256"], "generation artifact", project)
+      return neriGenerationError(project, manifest, "Each artifact requires only path and sha256.")
+    end
+    let path = entry.get("path")
+    let digest = entry.get("sha256")
+
+    if path.kind != "string" || !neriProjectReferencePathValid(path.value) || !neriGenerationDigest(digest)
+      return neriGenerationError(project, manifest, "Invalid artifact path or SHA-256 digest.")
+    end
+    if outputs && (!neriRelativeProjectPath(path.value) || !semanticEndsWith(path.value, ".hk"))
+      return neriGenerationError(project, manifest, "Generated outputs must be project-relative .hk files.")
+    end
+    let absolute = outputs ? neriCanonicalPath(root + "/" + path.value) : neriGenerationInputPath(root, path.value)
+
+    if absolute == null
+      return neriGenerationError(project, manifest, "Artifact is unavailable: " + path.value)
+    end
+    if outputs && (absolute != root + "/" + path.value || !bootstrapPathWithin(bootstrapDirectory(manifest), absolute))
+      return neriGenerationError(project, manifest, "Outputs must reside in the manifest's owned directory without symlinks: " + path.value)
+    end
+    if neriProjectListed(paths, absolute)
+      return neriGenerationError(project, manifest, "Duplicate artifact: " + path.value)
+    end
+    let source = host.readText(absolute)
+
+    if source == null || sha256FastText(source) != digest.value
+      return neriGenerationError(project, manifest, "Artifact digest differs: " + path.value)
+    end
+    if !neriProjectStoreVerified(project, absolute, source, digest.value)
+      return neriGenerationError(project, manifest, "Artifact has conflicting verified content: " + path.value)
+    end
+    paths.add(absolute)
+    if outputs
+      project.generatedOutputs.add(absolute)
+    else
+      project.generatedInputs.add(absolute)
+      project.generatedDigests.add(digest.value)
+    end
+    entry = entry.next
+  end
+  return true
+end
+
+def neriGenerationOffset(node: LspJson): Int?
+  if node.kind != "number"
+    return null
+  end
+  let value = host.parseInt(node.value)
+
+  if value == null || value < 0 || (value as String) != node.value
+    return null
+  end
+  return value
+end
+
+def neriGenerationOrigins(project: NeriProject, root: String, manifest: String, entries: LspJson, inputs: StringBuffer, outputs: StringBuffer): Bool
+  if entries.kind != "array"
+    return neriGenerationError(project, manifest, "origins must be an array.")
+  end
+  var entry = entries.first
+
+  while entry != null
+    if entry.kind != "object" || !neriProjectObjectKeysValid(entry, ["path", "start", "length", "source", "sourceStart", "sourceLength", "identity"], "generated origin", project)
+      return neriGenerationError(project, manifest, "Invalid generated origin properties.")
+    end
+    let path = entry.get("path")
+    let source = entry.get("source")
+    let identity = entry.get("identity")
+    let start = neriGenerationOffset(entry.get("start"))
+    let length = neriGenerationOffset(entry.get("length"))
+    let sourceStart = neriGenerationOffset(entry.get("sourceStart"))
+    let sourceLength = neriGenerationOffset(entry.get("sourceLength"))
+
+    if path.kind != "string" || source.kind != "string" || identity.kind != "string" || identity.value == "" || start == null || length == null || length == 0 || sourceStart == null || sourceLength == null || sourceLength == 0
+      return neriGenerationError(project, manifest, "Origins require paths, identity and nonempty UTF-16 spans.")
+    end
+    if !neriRelativeProjectPath(path.value) || !neriProjectReferencePathValid(source.value)
+      return neriGenerationError(project, manifest, "Invalid origin path.")
+    end
+    let absolutePath = neriCanonicalPath(root + "/" + path.value)
+    let absoluteSource = neriGenerationInputPath(root, source.value)
+
+    if absolutePath == null || absoluteSource == null || !neriProjectListed(outputs, absolutePath) || !neriProjectListed(inputs, absoluteSource)
+      return neriGenerationError(project, manifest, "Origins must connect declared outputs to declared inputs.")
+    end
+    let outputText = neriProjectVerifiedText(project, absolutePath)
+    let inputText = neriProjectVerifiedText(project, absoluteSource)
+
+    if outputText == null || inputText == null
+      return neriGenerationError(project, manifest, "Origin source is unavailable.")
+    end
+    let outputSize = (new IrSourceMap(outputText)).utf16Length()
+    let inputSize = (new IrSourceMap(inputText)).utf16Length()
+
+    if start > outputSize || length > outputSize - start || sourceStart > inputSize || sourceLength > inputSize - sourceStart
+      return neriGenerationError(project, manifest, "Origin span exceeds its source.")
+    end
+    let origin = new NeriGeneratedOrigin()
+
+    origin.path = absolutePath
+    origin.start = start
+    origin.length = length
+    origin.source = absoluteSource
+    origin.sourceStart = sourceStart
+    origin.sourceLength = sourceLength
+    origin.sourceText = inputText
+    origin.identity = identity.value
+    origin.next = project.generatedOrigins
+    project.generatedOrigins = origin
+    entry = entry.next
+  end
+  return true
+end
+
+def neriGenerationSourceText(cache: StringTable<String>, path: String): String?
+  let known = cache.find(path)
+
+  if known != null
+    return known.value
+  end
+  let source = host.readText(path)
+
+  if source != null
+    cache.add(path, source)
+  end
+  return source
+end
+
+def neriLoadGeneratedSources(project: NeriProject, root: String, owner: String, own: Bool, manifests: LspJson): Bool
+  var manifest = manifests.first
+
+  while manifest != null
+    let path = root + "/" + manifest.value
+    let source = host.readText(path)
+
+    if source == null
+      return neriGenerationError(project, path, "Manifest is unavailable.")
+    end
+    let canonical = neriCanonicalPath(path)
+
+    if canonical == null || canonical != path
+      return neriGenerationError(project, path, "Manifest must not use a symlink.")
+    end
+    let parser = new LspJsonParser(source)
+    let config = parser.parse()
+
+    parser.spaces()
+    if parser.failed || parser.position != host.stringByteLength(source) || config.kind != "object" || !neriProjectObjectKeysValid(config, ["version", "generator", "generatorVersion", "inputs", "outputs", "origins"], "generation manifest", project)
+      return neriGenerationError(project, path, "Invalid manifest JSON or properties.")
+    end
+    if config.get("version").kind != "number" || config.get("version").value != "1" || config.get("generator").kind != "string" || config.get("generator").value == "" || config.get("generatorVersion").kind != "string" || config.get("generatorVersion").value == ""
+      return neriGenerationError(project, path, "Expected version 1 and nonempty generator/version strings.")
+    end
+    let inputs = new StringBuffer()
+    let outputs = new StringBuffer()
+
+    if !neriGenerationEntries(project, root, path, config.get("inputs"), false, inputs) || !neriGenerationEntries(project, root, path, config.get("outputs"), true, outputs) || !neriGenerationOrigins(project, root, path, config.get("origins"), inputs, outputs)
+      return false
+    end
+    var index = 0
+
+    while index < outputs.size
+      let output = outputs.get(index)
+
+      if !neriAddUnitSource(project, output, host.stringSlice(output, host.stringByteLength(root) + 1, host.stringByteLength(output) - host.stringByteLength(root) - 1), owner, own)
+        return false
+      end
+      index = index + 1
+    end
+    project.generationManifests.add(path)
+    project.generationManifestTexts.add(source)
+    manifest = manifest.next
+  end
+  return true
+end

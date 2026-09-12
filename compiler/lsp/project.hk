@@ -10,6 +10,35 @@ class NeriProject
   public error: String = ""
   public kind: String = ""
   public implicit: Bool = false
+  public generatedInputs: StringBuffer = new StringBuffer()
+  public generatedDigests: StringBuffer = new StringBuffer()
+  public generatedOutputs: StringBuffer = new StringBuffer()
+  public verifiedTextTable: StringTable<String> = new StringTable<String>()
+  public verifiedDigestTable: StringTable<String> = new StringTable<String>()
+  public generationManifests: StringBuffer = new StringBuffer()
+  public generationManifestTexts: StringBuffer = new StringBuffer()
+  public generatedOrigins: NeriGeneratedOrigin?
+end
+
+def neriProjectVerifiedText(project: NeriProject, path: String): String?
+  let verified = project.verifiedTextTable.find(path)
+
+  if verified != null
+    return verified.value
+  end
+  return host.readText(path)
+end
+
+def neriProjectStoreVerified(project: NeriProject, path: String, text: String, digest: String): Bool
+  let previousText = project.verifiedTextTable.find(path)
+  let previousDigest = project.verifiedDigestTable.find(path)
+
+  if previousText != null || previousDigest != null
+    return previousText != null && previousDigest != null && previousText.value == text && previousDigest.value == digest
+  end
+  project.verifiedTextTable.add(path, text)
+  project.verifiedDigestTable.add(path, digest)
+  return true
 end
 
 class NeriProjectReference
@@ -347,8 +376,12 @@ def neriLoadUnitSources(project: NeriProject, projectRoot: String, owner: String
   let sources = unit.get("sources")
   let exclusions = unit.get("exclude")
 
-  if sources.kind != "array" || sources.first == null
+  if sources.kind != "array"
     project.error = "Unit sources must be a nonempty array of relative directories or .hk files."
+    return false
+  end
+  if sources.first == null && unit.get("generated").first == null
+    project.error = "Unit must declare sources or generated manifests."
     return false
   end
   if !neriValidateUnitExclusions(project, exclusions)
@@ -473,7 +506,7 @@ def neriValidateProjectShape(config: LspJson, project: NeriProject): Bool
   var unit = units.first
 
   while unit != null
-    if unit.key == "" || unit.kind != "object" || !neriProjectObjectKeysValid(unit, ["kind", "sources", "exclude", "references"], "unit " + unit.key, project)
+    if unit.key == "" || unit.kind != "object" || !neriProjectObjectKeysValid(unit, ["kind", "sources", "exclude", "references", "generated"], "unit " + unit.key, project)
       if project.error == ""
         project.error = "Each unit must be a named object."
       end
@@ -483,13 +516,32 @@ def neriValidateProjectShape(config: LspJson, project: NeriProject): Bool
     let sources = unit.get("sources")
     let exclude = unit.get("exclude")
     let references = unit.get("references")
+    let generated = unit.get("generated")
+
+    if generated.kind != "missing" && generated.kind != "array"
+      project.error = "Unit generated must be an array of generation manifests: " + unit.key
+      return false
+    end
+    var generation = generated.first
+
+    while generation != null
+      if generation.kind != "string" || !neriRelativeProjectPath(generation.value) || !semanticEndsWith(generation.value, ".json")
+        project.error = "Unit generated must contain relative JSON manifest paths: " + unit.key
+        return false
+      end
+      generation = generation.next
+    end
 
     if kind.kind != "string" || (kind.value != "library" && kind.value != "executable")
       project.error = "Unit kind must be library or executable: " + unit.key
       return false
     end
-    if sources.kind != "array" || sources.first == null
+    if sources.kind != "array"
       project.error = "Unit sources must be a nonempty array: " + unit.key
+      return false
+    end
+    if sources.first == null && generated.first == null
+      project.error = "Unit must declare sources or generated manifests: " + unit.key
       return false
     end
     var source = sources.first
@@ -624,6 +676,9 @@ def neriLoadUnitManifest(project: NeriProject, path: String, selectedUnit: Strin
   if !neriLoadUnitSources(project, projectRoot, key, own, definition)
     return false
   end
+  if !neriLoadGeneratedSources(project, projectRoot, key, own, definition.get("generated"))
+    return false
+  end
   if project.sources.size == before
     project.error = "Unit must resolve at least one own .hk source: " + key
     return false
@@ -720,13 +775,49 @@ def neriValidateRootUnitOwnership(project: NeriProject, path: String): Bool
       project.error = scratch.error
       return false
     end
-    if scratch.sources.size == before
+    if scratch.sources.size == before && unit.get("generated").first == null
       project.error = "Unit must resolve at least one own .hk source: " + neriUnitKey(absolute, unit.key)
       return false
     end
     unit = unit.next
   end
   return true
+end
+
+def neriUnitGeneratedOwner(projectRoot: String, unit: LspJson, sourcePath: String): Bool
+  var generation = unit.get("generated").first
+
+  while generation != null
+    if generation.kind == "string" && neriRelativeProjectPath(generation.value)
+      let manifestPath = projectRoot + "/" + generation.value
+      let text = host.readText(manifestPath)
+
+      if text != null
+        let parser = new LspJsonParser(text)
+        let document = parser.parse()
+
+        parser.spaces()
+        if !parser.failed && parser.position == host.stringByteLength(text)
+          var output = document.get("outputs").first
+
+          while output != null
+            let declared = output.get("path")
+
+            if declared.kind == "string" && neriRelativeProjectPath(declared.value)
+              let absolute = neriCanonicalPath(projectRoot + "/" + declared.value)
+
+              if absolute != null && absolute == sourcePath
+                return true
+              end
+            end
+            output = output.next
+          end
+        end
+      end
+    end
+    generation = generation.next
+  end
+  return false
 end
 
 def neriRootOwnerUnit(project: NeriProject, path: String, sourcePath: String): String?
@@ -752,6 +843,7 @@ def neriRootOwnerUnit(project: NeriProject, path: String, sourcePath: String): S
   end
   let scratch = new NeriProject()
   let projectRoot = bootstrapDirectory(absolute)
+  var generatedOwner = ""
   var unit = units.first
 
   while unit != null
@@ -759,16 +851,30 @@ def neriRootOwnerUnit(project: NeriProject, path: String, sourcePath: String): S
       project.error = unit.kind != "object" ? "Each unit must be an object: " + unit.key : scratch.error
       return null
     end
+    if neriUnitGeneratedOwner(projectRoot, unit, sourcePath)
+      if generatedOwner != ""
+        project.error = "Generated source belongs to multiple units: " + sourcePath
+        return null
+      end
+      generatedOwner = unit.key
+    end
     unit = unit.next
   end
   let owner = neriUnitSourceOwner(scratch, sourcePath)
 
   if owner == null
-    return null
+    if generatedOwner == ""
+      return null
+    end
+    return generatedOwner
   end
   unit = units.first
   while unit != null
     if owner == neriUnitKey(absolute, unit.key)
+      if generatedOwner != "" && generatedOwner != unit.key
+        project.error = "Source belongs to multiple units: " + sourcePath
+        return null
+      end
       return unit.key
     end
     unit = unit.next

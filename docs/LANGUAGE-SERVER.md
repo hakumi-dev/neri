@@ -97,6 +97,13 @@ project owns the JetBrains client, grammar, configuration UI and Run/Build/Check
   adapter supplies protocol positions and edits. Results are bounded to 128
   candidates and use `CompletionList.isIncomplete` when truncated. Import
   targets include known namespaces and the installed standard-library inventory.
+  At an argument value, the compiler retains the expected type of the parameter
+  selected by positional order or its named label, after generic instantiation.
+  Assignable locals are offered first, followed by applicable Bool literals,
+  `null` for optional types, and constructors for the expected enum. Enum
+  constructors use the short type name when its namespace is current or imported
+  and a qualified type name otherwise. The remaining Basic completion candidates
+  stay available after these expected-type candidates, subject to the same bound.
 - `completionItem/resolve` supplies documentation on demand. Items identify the
   document version and analysis revision; changes invalidate earlier requests
   for enrichment. Types and insertion edits do not depend on documentation.
@@ -149,6 +156,12 @@ the standard library. Opening a library source selects the library's own context
 not an arbitrary executable consumer. Source folders and namespaces are
 independent: references are explicit, and `use` or `namespace` never infer one.
 Open dependencies use their unsaved contents and invalidate open consumers.
+
+Units can declare [generated sources](GENERATED-SOURCES.md). Their verified
+content snapshots participate in ordinary semantic analysis. Changed open
+generation inputs or outputs suppress the consumer API with `NR_GENERATED`.
+Definitions target emitted declarations; `neri/sourceOrigin` returns the mapped
+original location using the retained source text.
 
 Directory sources are rediscovered after `workspace/didChangeWatchedFiles`, so
 reported file creation and deletion updates membership while exclusions,

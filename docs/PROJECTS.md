@@ -37,7 +37,7 @@ directory layout:
 
 The manifest uses strict JSON. Unknown keys, duplicate keys, trailing content,
 and values with incorrect types are configuration errors, including in units
-other than the selected unit. `exclude` and `references` are optional.
+other than the selected unit. `exclude`, `references` and `generated` are optional.
 Existing `neri.json` manifests remain supported; a project directory must
 contain at most one of the two filenames.
 
@@ -72,6 +72,13 @@ Source paths define compilation membership, not namespaces. Files in unrelated
 folders may declare the same namespace, and folder names never create or infer
 namespaces. `namespace` and `use` resolve names inside the selected unit and its
 explicit reference closure; they do not add dependencies.
+
+`generated` lists relative JSON generation manifests. The selected reference
+closure validates their input/output digests and loads their emitted `.hk`
+declarations from retained content snapshots. Project formatting discovers
+hand-written sources and skips these owned outputs. See
+[generated source contracts](GENERATED-SOURCES.md) for publication, regeneration
+and original-source navigation.
 
 Libraries must not declare `main`. Executable units must declare exactly one
 `main`; additional entry points are rejected by the binder.
