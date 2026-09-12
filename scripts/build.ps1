@@ -70,7 +70,8 @@ try {
     Where-Object { (Forward-Path $_.FullName) -notmatch '/(frontend|semantic)/main\.hk$|/compiler/session/' } |
     ForEach-Object { Forward-Path $_.FullName } | Sort-Object)
   [IO.File]::WriteAllLines("$work/compiler-sources.txt", $sources)
-  $inventory = @($sources | ForEach-Object { (Get-FileHash -LiteralPath $_).Hash + '  ' + $_ })
+  $templateAssets = @("$root/share/neri/templates/declarations.json", "$root/share/neri/templates/declarations.schema.json")
+  $inventory = @(($sources + $templateAssets) | ForEach-Object { (Get-FileHash -LiteralPath $_).Hash + '  ' + $_ })
   [IO.File]::WriteAllLines("$work/SOURCE-MANIFEST.sha256", $inventory)
 
   function Materialize([string]$IR, [string]$Stage) {
@@ -102,7 +103,7 @@ try {
   foreach ($artifact in @('compiler.nir.hex','compiler.obj','neri.exe')) {
     Assert-Hash "$work/stage3/$artifact" (Get-FileHash "$work/stage2/$artifact").Hash
   }
-  $after = @($sources | ForEach-Object { (Get-FileHash -LiteralPath $_).Hash + '  ' + $_ })
+  $after = @(($sources + $templateAssets) | ForEach-Object { (Get-FileHash -LiteralPath $_).Hash + '  ' + $_ })
   if (Compare-Object $inventory $after) { throw 'Compiler sources changed during bootstrap' }
   Write-Host 'Verified native Windows compiler fixed point (IR, COFF and PE).'
 
@@ -113,6 +114,8 @@ try {
   Copy-Item "$native/neri-codegen.exe","$native/neri-host.exe" "$tree/libexec"
   Copy-Item "$native/neri-runtime.lib","$native/neri-runtime-windows-x86_64.json" "$tree/lib"
   Copy-Item "$root/stdlib" "$tree/stdlib" -Recurse
+  New-Item -ItemType Directory -Force "$tree/share/neri/templates" | Out-Null
+  Copy-Item $templateAssets "$tree/share/neri/templates"
   $runtimeLLVM = $env:LLVM_PREFIX
   $prefixPath = [IO.Path]::GetFullPath($Prefix)
   if ($Action -eq 'install') {

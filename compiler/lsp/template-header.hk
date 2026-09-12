@@ -1,0 +1,249 @@
+# Parser-derived declaration header slots. Catalog text is parsed once when it
+# is loaded; completion renders ranges from the compiled template parts.
+class LspTemplateHeader
+  public keywordStart: Int = 0
+  public nameStart: Int = 0
+  public nameFinish: Int = 0
+  public typeParametersFinish: Int = 0
+  public parametersStart: Int = -1
+  public parametersContentStart: Int = -1
+  public annotationStart: Int = 0
+  public finish: Int = 0
+end
+
+def lspTemplateTokenStart(map: IrSourceMap, tokens: TokenBuffer, index: Int): Int
+  return map.offsetAt(tokens.startAt(index))
+end
+
+def lspTemplateTokenFinish(map: IrSourceMap, tokens: TokenBuffer, index: Int): Int
+  return map.offsetAt(tokens.startAt(index) + tokens.lengthAt(index))
+end
+
+def lspTemplateHeaderNameField(template: LspDeclarationTemplate, layout: LspTemplateHeader): Bool
+  var offset = 0
+  var part = template.headerText.first
+
+  while part != null
+    let finish = offset + host.stringByteLength(part.value)
+
+    if offset == layout.nameStart && finish == layout.nameFinish
+      return part.kind == "field"
+    end
+    offset = finish
+    part = part.nextPart
+  end
+  return false
+end
+
+def lspTemplateHeaderFieldsRespectCuts(template: LspDeclarationTemplate, layout: LspTemplateHeader): Bool
+  var cuts = [layout.nameFinish, layout.typeParametersFinish, layout.annotationStart]
+
+  if layout.parametersStart >= 0
+    cuts = host.appendInt(cuts, layout.parametersStart)
+    cuts = host.appendInt(cuts, layout.parametersContentStart)
+  end
+  var offset = 0
+  var part = template.headerText.first
+
+  while part != null
+    let finish = offset + host.stringByteLength(part.value)
+
+    if part.kind == "field"
+      for cut in cuts
+        if offset < cut && cut < finish
+          return false
+        end
+      end
+    end
+    offset = finish
+    part = part.nextPart
+  end
+  return true
+end
+
+def lspCompileTemplateHeader(template: LspDeclarationTemplate, catalog: LspDeclarationCatalog, text: String, node: LspJson): Bool
+  if template.provider == "staticDeclaration"
+    return true
+  end
+  let tokens = (new BootstrapLexer(template.headerText.rendered)).lex()
+  let parser = new BootstrapParser(tokens)
+  let layout = new LspTemplateHeader()
+  let map = new IrSourceMap(template.headerText.rendered)
+
+  parser.parseDeclarationModifiers()
+  let keyword = parser.currentIndex()
+  let expectedKeyword = template.provider == "classDeclaration" ? "class" : "def"
+
+  layout.keywordStart = lspTemplateTokenStart(map, tokens, keyword)
+  if tokens.textAt(keyword) != expectedKeyword
+    return lspCatalogFail(catalog, text, node.start, "Template header must begin with declaration keyword '" + expectedKeyword + "'.")
+  end
+  if layout.keywordStart != 0
+    return lspCatalogFail(catalog, text, node.start, "Template provider headers cannot contain modifiers or leading whitespace.")
+  end
+  parser.next()
+  let name = parser.currentIndex()
+
+  parser.expect("Identifier")
+  layout.nameStart = lspTemplateTokenStart(map, tokens, name)
+  layout.nameFinish = lspTemplateTokenFinish(map, tokens, name)
+  parser.parseTypeParameters()
+  layout.typeParametersFinish = lspTemplateTokenFinish(map, tokens, parser.currentIndex() - 1)
+  if template.provider == "functionDeclaration"
+    layout.parametersStart = layout.typeParametersFinish
+    let open = parser.currentIndex()
+
+    parser.expect("LParen")
+    layout.parametersContentStart = lspTemplateTokenFinish(map, tokens, open)
+    parser.parseParameters()
+    let close = parser.currentIndex()
+
+    parser.expect("RParen")
+    layout.annotationStart = lspTemplateTokenFinish(map, tokens, close)
+    parser.expect("Colon")
+    parser.parseTypeName()
+  else
+    layout.annotationStart = layout.typeParametersFinish
+    if parser.accept("Colon")
+      parser.parseTypeName()
+    end
+  end
+  layout.finish = lspTemplateTokenStart(map, tokens, parser.currentIndex())
+  if parser.diagnostics.count() != 0 || parser.currentKind() != "EndOfFile"
+    return lspCatalogFail(catalog, text, node.start, "Template header must be one complete declaration header.")
+  end
+  if !lspTemplateHeaderNameField(template, layout)
+    return lspCatalogFail(catalog, text, node.start, "Template declaration name must be one editable field.")
+  end
+  if !lspTemplateHeaderFieldsRespectCuts(template, layout)
+    return lspCatalogFail(catalog, text, node.start, "Editable fields cannot cross declaration header continuation boundaries.")
+  end
+  template.headerLayout = layout
+  return true
+end
+
+def lspTemplateAppendRange(snippet: LspSnippet, source: LspTemplateText, start: Int, finish: Int): Void
+  var offset = 0
+  var part = source.first
+  let sourceFinish = host.stringByteLength(source.rendered)
+
+  while part != null
+    let partFinish = offset + host.stringByteLength(part.value)
+
+    if part.kind == "literal"
+      let selectedStart = start > offset ? start : offset
+      let selectedFinish = finish < partFinish ? finish : partFinish
+
+      if selectedStart < selectedFinish
+        snippet.literal(host.stringSlice(part.value, selectedStart - offset, selectedFinish - selectedStart))
+      end
+    else if part.kind == "field" && offset >= start && partFinish <= finish && (offset < finish || finish == sourceFinish)
+      snippet.field(part.value)
+    else if part.kind == "final" && offset >= start && (offset < finish || finish == sourceFinish)
+      snippet.finalStop()
+    end
+    offset = partFinish
+    part = part.nextPart
+  end
+end
+
+def lspTemplatePreserveHeader(site: LspDeclarationSite, snippet: LspSnippet, finish: Int): Void
+  snippet.text = ""
+  snippet.plain = ""
+  snippet.nextField = 1
+  snippet.hasFinalStop = false
+  snippet.literal(semanticCompletionUtf16Slice(site.header, 0, finish))
+end
+
+# Returns applied when the header is ready for body insertion, reject when the
+# partial text is not this declaration form, and defer for semantic completion.
+def lspRenderTemplateHeader(template: LspDeclarationTemplate, site: LspDeclarationSite, snippet: LspSnippet): String
+  let layout = template.headerLayout
+
+  if layout == null
+    return "reject"
+  end
+  let parser = site.parser
+  let tokens = parser.tokens
+  let modifiersFinish = tokens.startAt(parser.currentIndex())
+  let writtenKeyword = tokens.textAt(parser.currentIndex())
+
+  parser.next()
+  if parser.currentKind() == "EndOfFile"
+    snippet.literal(semanticCompletionUtf16Slice(site.header, 0, modifiersFinish))
+    lspTemplateAppendRange(snippet, template.headerText, 0, layout.finish)
+    return "applied"
+  end
+  if parser.currentKind() != "Identifier"
+    return "reject"
+  end
+  if writtenKeyword != template.declarationKeyword
+    return "reject"
+  end
+  parser.next()
+  let writtenNameFinish = tokens.startAt(parser.currentIndex())
+
+  lspTemplatePreserveHeader(site, snippet, writtenNameFinish)
+  if parser.currentKind() == "EndOfFile"
+    lspTemplateAppendRange(snippet, template.headerText, layout.nameFinish, layout.finish)
+    return "applied"
+  end
+  let hasTypeParameters = parser.currentKind() == "Less"
+
+  parser.parseTypeParameters()
+  if parser.diagnostics.count() != 0
+    return "defer"
+  end
+  if template.provider == "classDeclaration"
+    if parser.currentKind() == "Colon"
+      parser.next()
+      parser.parseTypeName()
+      if parser.diagnostics.count() != 0 || parser.currentKind() != "EndOfFile"
+        return "defer"
+      end
+      lspTemplatePreserveHeader(site, snippet, tokens.startAt(parser.currentIndex()))
+      return "applied"
+    end
+    if parser.currentKind() != "EndOfFile"
+      return "defer"
+    end
+    if hasTypeParameters
+      lspTemplatePreserveHeader(site, snippet, tokens.startAt(parser.currentIndex()))
+      lspTemplateAppendRange(snippet, template.headerText, layout.annotationStart, layout.finish)
+    else
+      lspTemplateAppendRange(snippet, template.headerText, layout.nameFinish, layout.finish)
+    end
+    return "applied"
+  end
+  if parser.currentKind() == "EndOfFile"
+    if hasTypeParameters
+      lspTemplatePreserveHeader(site, snippet, tokens.startAt(parser.currentIndex()))
+      lspTemplateAppendRange(snippet, template.headerText, layout.parametersStart, layout.finish)
+    else
+      lspTemplateAppendRange(snippet, template.headerText, layout.nameFinish, layout.finish)
+    end
+    return "applied"
+  end
+  if parser.currentKind() != "LParen"
+    return "defer"
+  end
+  parser.next()
+  if parser.currentKind() == "EndOfFile"
+    lspTemplatePreserveHeader(site, snippet, tokens.startAt(parser.currentIndex()))
+    lspTemplateAppendRange(snippet, template.headerText, layout.parametersContentStart, layout.finish)
+    return "applied"
+  end
+  parser.parseParameters()
+  if parser.diagnostics.count() != 0 || parser.currentKind() != "RParen"
+    return "defer"
+  end
+  parser.next()
+  if parser.currentKind() == "EndOfFile"
+    lspTemplatePreserveHeader(site, snippet, tokens.startAt(parser.currentIndex()))
+    lspTemplateAppendRange(snippet, template.headerText, layout.annotationStart, layout.finish)
+    return "applied"
+  end
+  # A written return annotation belongs to semantic type completion, even when
+  # it is already syntactically complete.
+  return "defer"
+end

@@ -101,7 +101,10 @@ project owns the JetBrains client, grammar, configuration UI and Run/Build/Check
   document version and analysis revision; changes invalidate earlier requests
   for enrichment. Types and insertion edits do not depend on documentation.
 - Declaration completion offers `class` and `def` templates at the end of a
-  single-line header. Written names, parameters and generic headers are retained.
+  single-line header through the validated [declaration catalog](TEMPLATES.md).
+  Catalog text is compiled once when the server starts; contextual providers
+  share parser-backed insertion and protocol encoding. Written names,
+  parameters and generic headers are retained.
   Snippet-capable clients expose editable name, parameter and return-type fields,
   then place the caret in the body. Body insertion shares the parser-backed
   newline formatter, preserves existing `end` tokens and follows `.editorconfig`

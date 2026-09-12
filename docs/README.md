@@ -28,6 +28,7 @@ See [packaging](PACKAGING.md) for distribution and standalone installation.
 - [Architecture](ARCHITECTURE.md): compiler, libraries and native boundaries.
 - [Runtime and IR](ABI.md): layouts, memory management and ABI contracts.
 - [Language server](LANGUAGE-SERVER.md): editor protocol and semantic services.
+- [Declaration templates](TEMPLATES.md): catalog format, contextual providers and editor insertion.
 - [Bootstrapping](BOOTSTRAP.md): trusted seed and reproducible generations.
 - [Performance](PERFORMANCE.md): workloads, measurements and budgets.
 
