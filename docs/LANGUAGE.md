@@ -175,6 +175,43 @@ recursion and forward calls are supported. A program defines exactly one
 non-namespaced top-level `main(): Void` with no parameters. Non-Void functions
 return on every statically recognized path. Overloading is outside this surface.
 
+Calls to declared functions, methods and constructors accept named arguments:
+
+```neri
+def rangeLength(start: Int, finish: Int = start + 1): Int
+  return finish - start
+end
+
+def main(): Void
+  let length = rangeLength(finish: 10, start: 3)
+end
+```
+
+Each label binds to a parameter in the resolved declaration. Positional arguments
+precede named arguments. Named arguments may appear in any order; each parameter
+is supplied at most once. Required parameters must be supplied, and omitted
+defaulted parameters use their declared expressions. Labels are case-sensitive.
+Renaming a public parameter changes the named-call source API.
+
+The receiver of an instance call is evaluated first. Supplied argument expressions
+are evaluated exactly once in source order, followed by omitted defaults in
+declaration order. Defaults can use earlier parameter values. Parameter placement
+does not reorder evaluation. Virtual calls use the compile-time receiver's
+declaration for labels and defaults and preserve runtime method dispatch.
+
+Generic inference matches each argument to its labeled parameter before using
+its type. Contextual expressions, including empty arrays, receive the resolved
+parameter type through the ordinary inference and checking rules. For example,
+`headOr(values: [], fallback: 7)` can infer `T = Int` when `headOr<T>` declares
+`values: T[]` and `fallback: T`.
+
+Function values retain their positional function-type contract; parameter labels
+are available on declared callables. Alternative-case payload construction and
+`native.*` intrinsic syntax use positional arguments. Declared `@intrinsic` and
+`@cabi` functions expose the labels in their Neri signatures. Arrays contain
+expressions rather than labeled arguments. Named calls to unsafe and C ABI
+declarations require every parameter explicitly (`NR275` for omitted defaults).
+
 `if`, `while`, and `for` have lexical scopes. A `for` element binding is immutable.
 `break` and `continue` require an enclosing loop.
 

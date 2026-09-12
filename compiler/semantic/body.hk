@@ -218,6 +218,85 @@ class BootstrapBodyBinder
     this.model().completionSites = site
   end
 
+  def addArgumentCompletionSite(node: Int, receiverKind: String, target: SemanticCallable, mapping: SemanticArgumentMap, sourceIndex: Int): Void
+    let site = new SemanticCompletionSite()
+
+    site.start = this.syntax().startAt(node)
+    site.length = this.syntax().lengthAt(node)
+    site.namespaceName = this.owner.currentNamespace
+    site.className = this.completionClassName()
+    site.callable = this.owner.currentCallable
+    site.receiverKind = receiverKind
+    site.receiverType = target.fullName
+    if receiverKind == "argument-start"
+      var scope = this.model().completionSites
+
+      while scope != null
+        if scope.start == site.start && scope.receiverKind == ""
+          site.argumentScope = scope
+          site.expectsFunction = scope.expectsFunction
+          break
+        end
+        scope = scope.next
+      end
+    end
+    var parameter = target.firstParameter
+    var parameterIndex = 0
+
+    while parameter != null
+      var suppliedElsewhere = false
+      var other = 0
+
+      while other < mapping.sourceToParameter.size
+        if other != sourceIndex && mapping.parameterAt(other) == parameterIndex
+          suppliedElsewhere = true
+        end
+        other = other + 1
+      end
+      if !suppliedElsewhere
+        site.addSymbol(parameter.identity, parameter.name, parameter.typeName, false)
+      end
+      parameter = parameter.nextParameter
+      parameterIndex = parameterIndex + 1
+    end
+    site.next = this.model().completionSites
+    this.model().completionSites = site
+  end
+
+  def recordArgumentCompletion(node: Int, start: Int, callable: SemanticCallable, mapping: SemanticArgumentMap): Void
+    if !this.owner.recordCompletionSites
+      return
+    end
+    let actual = this.syntax().childCountAt(node) - start
+    var sourceIndex = 0
+
+    while sourceIndex < actual
+      let argumentNode = this.syntax().childAt(node, start + sourceIndex)
+      let label = semanticArgumentLabel(this.syntax(), argumentNode)
+
+      if label != ""
+        this.addArgumentCompletionSite(argumentNode, "argument-label", callable, mapping, sourceIndex)
+      else
+        let expressionNode = semanticArgumentExpression(this.syntax(), argumentNode)
+        var nameNode = -1
+
+        if this.syntax().kindAt(expressionNode) == "Name"
+          nameNode = expressionNode
+        else if this.syntax().kindAt(expressionNode) == "Call" && this.syntax().childCountAt(expressionNode) > 0
+          let callee = this.syntax().childAt(expressionNode, 0)
+
+          if this.syntax().kindAt(callee) == "Name"
+            nameNode = callee
+          end
+        end
+        if nameNode >= 0
+          this.addArgumentCompletionSite(nameNode, "argument-start", callable, mapping, sourceIndex)
+        end
+      end
+      sourceIndex = sourceIndex + 1
+    end
+  end
+
   def currentCallable(): SemanticCallable
     let callable = this.owner.currentCallable
 
@@ -551,9 +630,29 @@ class BootstrapBodyBinder
         this.reportLength("NR111", node, 1, "Function '" + baseClass.name + ".init' expects 0 arguments, but got " + (actual as String) + ".")
       end
       var index = 0
+      var hasNamed = false
 
       while index < actual
-        this.bindExpression(this.syntax().childAt(node, index), "")
+        if semanticArgumentLabel(this.syntax(), this.syntax().childAt(node, index)) != ""
+          hasNamed = true
+        end
+        index = index + 1
+      end
+      index = 0
+
+      while index < actual
+        let argumentNode = this.syntax().childAt(node, index)
+        let expressionNode = semanticArgumentExpression(this.syntax(), argumentNode)
+        let argument = this.bindExpression(expressionNode, "")
+
+        if semanticArgumentLabel(this.syntax(), argumentNode) != ""
+          this.report("NR275", argumentNode, "Named arguments require a constructor with declared parameter labels.")
+        end
+        if hasNamed
+          callable.baseArguments.add(this.addBound("Argument", argument.typeName, index as String, argumentNode, [argument.boundNode]))
+        else
+          callable.baseArguments.add(argument.boundNode)
+        end
         index = index + 1
       end
       return
@@ -564,21 +663,44 @@ class BootstrapBodyBinder
     callable.baseConstructorName = constructor.fullName
     let actual = this.syntax().childCountAt(node)
 
-    this.validateCallCount(baseClass.name + ".init", node, actual, constructor)
+    this.validateCallCount(baseClass.name + ".init", node, actual, constructor, node, 0)
     var index = 0
+    let argumentMap = semanticCallableArgumentMap(this.owner, node, 0, constructor, baseClass.name + ".init", true, false)
+    var boundArguments: Int[] = []
 
     while index < actual
       var expected = ""
-      let parameter = constructor.parameterAt(index)
+      let argumentNode = this.syntax().childAt(node, index)
+      let expressionNode = semanticArgumentExpression(this.syntax(), argumentNode)
+      let mapped = argumentMap.parameterAt(index)
+      let parameter = constructor.parameterAt(mapped)
 
       if parameter != null
         expected = parameter.typeName
       end
-      let argument = this.bindExpression(this.syntax().childAt(node, index), expected)
+      let argument = this.bindExpression(expressionNode, expected)
 
-      callable.baseArguments.add(argument.boundNode)
+      if semanticContainsResource(this.model(), argument.typeName)
+        this.report("NR262", expressionNode, "Resource ownership cannot be passed to an ordinary call.")
+      end
+      if expected != "" && ((constructor.exactArguments && expected != argument.typeName) || (!constructor.exactArguments && !semanticAssignable(this.model(), expected, argument.typeName)))
+        this.report("NR112", expressionNode, "Argument " + ((mapped + 1) as String) + " of '" + baseClass.name + ".init' expects type '" + expected + "', but got '" + argument.typeName + "'.")
+      end
+      var boundArgument = argument.boundNode
+
+      if argumentMap.hasNamed
+        boundArgument = this.addBound("Argument", argument.typeName, mapped as String, argumentNode, [argument.boundNode])
+      end
+      if semanticArgumentLabel(this.syntax(), argumentNode) != "" && parameter != null
+        this.owner.recordOccurrence(parameter.identity, argumentNode, parameter.name + ": " + parameter.typeName)
+      end
+
+      callable.baseArguments.add(boundArgument)
+      boundArguments = host.appendInt(boundArguments, boundArgument)
       index = index + 1
     end
+    callable.baseCallNode = this.addBound("BaseCall", "Void", constructor.fullName, node, boundArguments)
+    this.recordArgumentCompletion(node, 0, constructor, argumentMap)
   end
 
   def rejectBaseConstructorCall(node: Int): Void
@@ -2066,32 +2188,71 @@ class BootstrapBodyBinder
     return this.model().findFunction(name)
   end
 
-  def bindArguments(node: Int, start: Int, expectedCount: Int, library: String, name: String, callable: SemanticCallable?): Int[]
+  def bindArguments(node: Int, start: Int, expectedCount: Int, library: String, name: String, callable: SemanticCallable?, labelsSupported: Bool = true): Int[]
     var children: Int[] = []
     let actual = this.syntax().childCountAt(node) - start
+    var argumentMap: SemanticArgumentMap? = null
+
+    if callable != null
+      argumentMap = semanticCallableArgumentMap(this.owner, node, start, callable, semanticQualifiedName(library, name), labelsSupported, false)
+    end
+    var hasNamed = argumentMap != null && argumentMap.hasNamed
+
+    if argumentMap == null
+      var namedIndex = 0
+
+      while namedIndex < actual
+        if semanticArgumentLabel(this.syntax(), this.syntax().childAt(node, start + namedIndex)) != ""
+          hasNamed = true
+        end
+        namedIndex = namedIndex + 1
+      end
+    end
     var index = 0
 
     while index < actual
       var expected = ""
+      var mapped = index
 
+      if argumentMap != null
+        mapped = argumentMap.parameterAt(index)
+      end
       if callable != null
-        let parameter = callable.parameterAt(index)
+        let parameter = callable.parameterAt(mapped)
 
         if parameter != null
           expected = parameter.typeName
         end
       end
       let argumentNode = this.syntax().childAt(node, start + index)
-      let argument = this.bindExpression(argumentNode, expected)
+      let expressionNode = semanticArgumentExpression(this.syntax(), argumentNode)
+      let argument = this.bindExpression(expressionNode, expected)
 
       if semanticContainsResource(this.model(), argument.typeName)
-        this.report("NR262", argumentNode, "Resource ownership cannot be passed to an ordinary call.")
+        this.report("NR262", expressionNode, "Resource ownership cannot be passed to an ordinary call.")
       end
-      children = host.appendInt(children, argument.boundNode)
+      var boundArgument = argument.boundNode
+
+      if hasNamed
+        boundArgument = this.addBound("Argument", argument.typeName, mapped as String, argumentNode, [argument.boundNode])
+      end
+      children = host.appendInt(children, boundArgument)
+      if callable != null && semanticArgumentLabel(this.syntax(), argumentNode) != ""
+        let parameter = callable.parameterAt(mapped)
+
+        if parameter != null && labelsSupported
+          this.owner.recordOccurrence(parameter.identity, argumentNode, parameter.name + ": " + parameter.typeName)
+        end
+      else if callable == null && semanticArgumentLabel(this.syntax(), argumentNode) != ""
+        this.report("NR275", argumentNode, "Named arguments require a call target with declared parameter labels.")
+      end
       if expected != "" && ((callable != null && callable.exactArguments && expected != argument.typeName) || ((callable == null || !callable.exactArguments) && !semanticAssignable(this.model(), expected, argument.typeName)))
-        this.report("NR112", argumentNode, "Argument " + ((index + 1) as String) + " of '" + semanticQualifiedName(library, name) + "' expects type '" + expected + "', but got '" + argument.typeName + "'.")
+        this.report("NR112", expressionNode, "Argument " + ((mapped + 1) as String) + " of '" + semanticQualifiedName(library, name) + "' expects type '" + expected + "', but got '" + argument.typeName + "'.")
       end
       index = index + 1
+    end
+    if callable != null && argumentMap != null && labelsSupported
+      this.recordArgumentCompletion(node, start, callable, argumentMap)
     end
     return children
   end
@@ -2110,7 +2271,22 @@ class BootstrapBodyBinder
     return count
   end
 
-  def validateCallCount(displayName: String, node: Int, actual: Int, callable: SemanticCallable): Void
+  def validateCallCount(displayName: String, node: Int, actual: Int, callable: SemanticCallable, callNode: Int = -1, argumentStart: Int = 1, labelsSupported: Bool = true): Void
+    if callNode >= 0
+      var hasNamed = false
+      var sourceIndex = 0
+
+      while sourceIndex < actual
+        if semanticArgumentLabel(this.syntax(), this.syntax().childAt(callNode, argumentStart + sourceIndex)) != ""
+          hasNamed = true
+        end
+        sourceIndex = sourceIndex + 1
+      end
+      if hasNamed
+        semanticCallableArgumentMap(this.owner, callNode, argumentStart, callable, displayName, labelsSupported)
+        return
+      end
+    end
     let required = this.requiredParameterCount(callable)
 
     if actual < required
@@ -2151,7 +2327,7 @@ class BootstrapBodyBinder
 
         return new BoundValue("Error", this.addBound("Call", "Error", name, calleeNode, arguments))
       end
-      this.validateCallCount(callable.fullName, calleeNode, actual, callable)
+      this.validateCallCount(callable.fullName, calleeNode, actual, callable, node)
       this.owner.recordOccurrence(this.owner.callableSourceIdentity(callable), calleeNode)
       let arguments = this.bindArguments(node, 1, callable.parameterCount, "", callable.fullName, callable)
 
@@ -2177,7 +2353,9 @@ class BootstrapBodyBinder
 
     if caseIndex < 0
       this.report("NR260", calleeNode, "Type '" + symbol.fullName + "' has no alternative case '" + caseName + "'.")
-      return new BoundValue("Error", this.addBound("AlternativeConstruct", "Error", symbol.fullName + "|-1", calleeNode, emptyInts()))
+      let arguments = this.bindArguments(node, 1, actual, "", symbol.fullName + "." + caseName, null)
+
+      return new BoundValue("Error", this.addBound("AlternativeConstruct", "Error", symbol.fullName + "|-1", calleeNode, arguments))
     end
     let expected = this.syntax().childCountAt(alternativeCaseNode(this.owner, symbol, caseIndex))
 
@@ -2186,21 +2364,37 @@ class BootstrapBodyBinder
       this.reportLength("NR261", calleeNode, 1, "Alternative case '" + caseName + "' expects " + (expected as String) + " arguments, but got " + (actual as String) + ".")
     end
     var children: Int[] = []
+    var hasNamed = false
+    var namedIndex = 0
+
+    while namedIndex < actual
+      if semanticArgumentLabel(this.syntax(), this.syntax().childAt(node, namedIndex + 1)) != ""
+        hasNamed = true
+      end
+      namedIndex = namedIndex + 1
+    end
     var index = 0
 
     while index < actual
       let typeName = index < expected ? this.alternativePayloadType(symbol, caseIndex, index) : ""
       let argumentNode = this.syntax().childAt(node, index + 1)
-      let isTransfer = this.syntax().kindAt(argumentNode) == "Transfer"
-      let value = isTransfer && this.returnTransferDepth > 0 ? this.bindTransfer(argumentNode, typeName, true) : this.bindExpression(argumentNode, typeName)
+      let expressionNode = semanticArgumentExpression(this.syntax(), argumentNode)
+      let isTransfer = this.syntax().kindAt(expressionNode) == "Transfer"
+      let value = isTransfer && this.returnTransferDepth > 0 ? this.bindTransfer(expressionNode, typeName, true) : this.bindExpression(expressionNode, typeName)
+
+      if semanticArgumentLabel(this.syntax(), argumentNode) != ""
+        this.report("NR275", argumentNode, "Named arguments are not supported for alternative cases because payload labels are not part of the case signature.")
+      end
 
       if semanticContainsResource(this.model(), value.typeName) && value.resourceIdentity != "" && !isTransfer
-        this.report("NR262", this.syntax().childAt(node, index + 1), "Resource ownership cannot be copied into an alternative payload.")
+        this.report("NR262", expressionNode, "Resource ownership cannot be copied into an alternative payload.")
       end
       if index < expected && !semanticAssignable(this.model(), typeName, value.typeName)
-        this.report("NR261", this.syntax().childAt(node, index + 1), "Alternative payload " + ((index + 1) as String) + " for '" + caseName + "' must be '" + typeName + "', but got '" + value.typeName + "'.")
+        this.report("NR261", expressionNode, "Alternative payload " + ((index + 1) as String) + " for '" + caseName + "' must be '" + typeName + "', but got '" + value.typeName + "'.")
       end
-      children = host.appendInt(children, value.boundNode)
+      let boundValue = hasNamed ? this.addBound("Argument", value.typeName, index as String, argumentNode, [value.boundNode]) : value.boundNode
+
+      children = host.appendInt(children, boundValue)
       index = index + 1
     end
     return new BoundValue(symbol.fullName, this.addBound("AlternativeConstruct", symbol.fullName, symbol.fullName + "|" + (caseIndex as String), calleeNode, children))
@@ -2231,7 +2425,7 @@ class BootstrapBodyBinder
         this.report("NR186", calleeNode, "Base type '" + baseClass.fullName + "' does not define an accessible instance method '" + memberName + "'.")
         return new BoundValue("Error", this.addBound("Call", "Error", memberName, calleeNode, emptyInts()))
       end
-      this.validateCallCount(baseClass.name + "." + memberName, calleeNode, actual, method)
+      this.validateCallCount(baseClass.name + "." + memberName, calleeNode, actual, method, node)
       this.owner.recordOccurrence(this.owner.callableSourceIdentity(method), calleeNode)
       if method.isAbstract
         this.report("NR256", calleeNode, "Abstract method '" + method.fullName + "' has no implementation to call through 'super'.")
@@ -2257,7 +2451,7 @@ class BootstrapBodyBinder
 
         if namespaced != null
           this.recordCompletionSite(calleeNode, "namespace", objectName, expectedType)
-          this.validateCallCount(namespaced.fullName, calleeNode, actual, namespaced)
+          this.validateCallCount(namespaced.fullName, calleeNode, actual, namespaced, node)
           this.owner.recordOccurrence(this.owner.callableSourceIdentity(namespaced), calleeNode)
           let arguments = this.bindArguments(node, 1, namespaced.parameterCount, "", namespaced.fullName, namespaced)
 
@@ -2288,7 +2482,7 @@ class BootstrapBodyBinder
           if method.isUnsafe && this.unsafeDepth == 0
             this.report("NR189", calleeNode, "Unsafe method requires an unsafe declaration or block.")
           end
-          this.validateCallCount(classSymbol.name + "." + memberName, calleeNode, actual, method)
+          this.validateCallCount(classSymbol.name + "." + memberName, calleeNode, actual, method, node)
           this.owner.recordOccurrence(this.owner.callableSourceIdentity(method), calleeNode)
           let arguments = this.bindArguments(node, 1, method.parameterCount, "", classSymbol.name + "." + memberName, method)
 
@@ -2329,7 +2523,7 @@ class BootstrapBodyBinder
           if method.isUnsafe && this.unsafeDepth == 0
             this.report("NR189", calleeNode, "Unsafe method requires an unsafe declaration or block.")
           end
-          this.validateCallCount(classSymbol.fullName + "." + memberName, calleeNode, actual, method)
+          this.validateCallCount(classSymbol.fullName + "." + memberName, calleeNode, actual, method, node)
           this.owner.recordOccurrence(this.owner.callableSourceIdentity(method), calleeNode)
           let arguments = this.bindArguments(node, 1, method.parameterCount, "", classSymbol.fullName + "." + memberName, method)
 
@@ -2355,7 +2549,7 @@ class BootstrapBodyBinder
         if contract != null
           this.owner.recordOccurrence("contract-member:" + contract.fullName + "." + memberName, calleeNode)
         end
-        this.validateCallCount(memberName, calleeNode, actual, requirement)
+        this.validateCallCount(memberName, calleeNode, actual, requirement, node)
         let arguments = this.bindArguments(node, 1, requirement.parameterCount, "", memberName, requirement)
         var children = [instance.boundNode]
 
@@ -2395,7 +2589,7 @@ class BootstrapBodyBinder
     if method.isUnsafe && this.unsafeDepth == 0
       this.report("NR189", calleeNode, "Unsafe function or method '" + classSymbol.name + "." + memberName + "' can be called only from an unsafe declaration or block.")
     end
-    this.validateCallCount(classSymbol.name + "." + memberName, calleeNode, actual, method)
+    this.validateCallCount(classSymbol.name + "." + memberName, calleeNode, actual, method, node)
     this.owner.recordOccurrence(this.owner.callableSourceIdentity(method), calleeNode)
     var children = appendChild(emptyInts(), instance.boundNode)
     let arguments = this.bindArguments(node, 1, method.parameterCount, "", classSymbol.name + "." + memberName, method)
@@ -2428,6 +2622,7 @@ class BootstrapBodyBinder
 
   def bindNew(node: Int): BoundValue
     let typeNode = this.syntax().childAt(node, 0)
+    let actual = this.syntax().childCountAt(node) - 1
 
     this.recordCompletionSite(typeNode, "type", "")
     let typeName = this.owner.resolveTypeNode(typeNode, this.owner.currentNamespace, "")
@@ -2435,26 +2630,32 @@ class BootstrapBodyBinder
 
     if classSymbol == null
       this.report("NR126B", node, "Cannot create instance of non-class type '" + this.syntax().dataAt(typeNode) + "'.")
-      return new BoundValue("Error", this.addBound("New", "Error", typeName, node, emptyInts()))
+      let arguments = this.bindArguments(node, 1, actual, "", this.syntax().dataAt(typeNode) + ".init", null)
+
+      return new BoundValue("Error", this.addBound("New", "Error", typeName, node, arguments))
     end
     if classSymbol.isAbstract
       this.owner.recordTypeOccurrence(classSymbol.fullName, typeNode)
       this.report("NR256", typeNode, "Abstract class '" + classSymbol.fullName + "' cannot be instantiated.")
-      return new BoundValue("Error", this.addBound("New", "Error", classSymbol.fullName, node, emptyInts()))
+      let arguments = this.bindArguments(node, 1, actual, "", classSymbol.name + ".init", null)
+
+      return new BoundValue("Error", this.addBound("New", "Error", classSymbol.fullName, node, arguments))
     end
     if classSymbol.isAlternative
       this.report("NR260", node, "Closed alternative type '" + classSymbol.fullName + "' can only be constructed through one of its cases.")
-      return new BoundValue("Error", this.addBound("New", "Error", classSymbol.fullName, node, emptyInts()))
+      let arguments = this.bindArguments(node, 1, actual, "", classSymbol.name + ".init", null)
+
+      return new BoundValue("Error", this.addBound("New", "Error", classSymbol.fullName, node, arguments))
     end
     if classSymbol.representation != ""
       this.report("NR154A", node, "Represented type '" + classSymbol.fullName + "' is created only by literals and its library factories.")
-      return new BoundValue("Error", this.addBound("New", "Error", classSymbol.fullName, node, emptyInts()))
+      let arguments = this.bindArguments(node, 1, actual, "", classSymbol.name + ".init", null)
+
+      return new BoundValue("Error", this.addBound("New", "Error", classSymbol.fullName, node, arguments))
     end
     let constructor = this.owner.findDeclaredMethod(classSymbol, "init")
 
     this.owner.recordTypeOccurrence(classSymbol.fullName, typeNode)
-    let actual = this.syntax().childCountAt(node) - 1
-
     if constructor == null
       let baseConstructor = this.inheritedConstructor(classSymbol)
 
@@ -2475,7 +2676,7 @@ class BootstrapBodyBinder
 
       return new BoundValue(typeName, this.addBound("New", typeName, classSymbol.fullName, node, arguments))
     end
-    this.validateCallCount(classSymbol.name + ".init", node, actual, constructor)
+    this.validateCallCount(classSymbol.name + ".init", node, actual, constructor, node)
     if !this.memberAccessible(constructor.className, constructor.access)
       this.report("NR153", node, "Cannot access " + constructor.access + " constructor of type '" + classSymbol.fullName + "'.")
     end
