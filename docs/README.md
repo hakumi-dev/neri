@@ -13,6 +13,7 @@ packages include the language reference for the packaged compiler.
 | Work with text and collections | [Text](TEXT.md), [buffers](BUFFERS.md), [results](RESULT.md) |
 | Inspect typed expressions | [Quotations](QUOTATIONS.md) |
 | Accept typed field arguments | [Fields](FIELDS.md) |
+| Connect an agent to compiler feedback | [Agent feedback](AGENT-FEEDBACK.md) |
 | Access files and watch changes | [Files](FILES.md), [change scanner](CHANGES.md) |
 | Run processes and build consoles | [Processes](PROCESS.md), [terminal](TERMINAL.md), [compiled sessions](SESSIONS.md) |
 | Serve HTTP and make local requests | [HTTP](HTTP.md) |

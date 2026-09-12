@@ -97,6 +97,9 @@ project owns the JetBrains client, grammar, configuration UI and Run/Build/Check
   adapter supplies protocol positions and edits. Results are bounded to 128
   candidates and use `CompletionList.isIncomplete` when truncated. Import
   targets include known namespaces and the installed standard-library inventory.
+  Opening parenthesis and comma trigger argument completion. Ordinary parameters
+  supply their declared names and types; `labels` parameters derive candidates
+  from the resolved entity's public fields. Supplied labels are excluded.
   At an argument value, the compiler retains the expected type of the parameter
   selected by positional order or its named label, after generic instantiation.
   Assignable locals are offered first, followed by applicable Bool literals,

@@ -1,13 +1,16 @@
 use host
 use test
 
-def fieldPackDocument(source: String): LspDocument
+def fieldPackDocument(source: String, allowSyntaxErrors: Bool = false): LspDocument
   let marker = bootstrapFindText(source, "|")
   let document = new LspDocument()
 
   test.assertTrue(marker >= 0)
   document.uri = "untitled:field-pack"
   document.text = host.stringSlice(source, 0, marker) + host.stringSlice(source, marker + 1, host.stringByteLength(source) - marker - 1)
+  document.sourceUris.add(document.uri)
+  document.sourceTexts.add(document.text)
+  document.sourceStarts.add(0)
   let directory = host.environment("NERI_STDLIB")
 
   test.assertTrue(directory != null)
@@ -18,34 +21,73 @@ def fieldPackDocument(source: String): LspDocument
     test.assertTrue(fields != null)
     test.assertTrue(quotation != null)
     if fields != null && quotation != null
-      document.text = document.text + fields + "\n" + quotation
+      let fieldsStart = (new IrSourceMap(document.text + "\n")).utf16Length()
+      let quotationStart = (new IrSourceMap(document.text + "\n" + fields + "\n")).utf16Length()
+
+      document.sourceUris.add("@stdlib/fields.hk")
+      document.sourceUris.add("@stdlib/quotation.hk")
+      document.sourceTexts.add(fields)
+      document.sourceTexts.add(quotation)
+      document.sourceStarts.add(fieldsStart)
+      document.sourceStarts.add(quotationStart)
     end
   end
-  let tokens = (new BootstrapLexer(document.text)).lex()
+  var combined = ""
+  var sourceIndex = 0
+
+  while sourceIndex < document.sourceTexts.size
+    combined = combined + document.sourceTexts.get(sourceIndex) + "\n"
+    sourceIndex = sourceIndex + 1
+  end
+  let tokens = (new BootstrapLexer(combined)).lex()
   let parser = new BootstrapParser(tokens)
+
+  sourceIndex = 0
+  while sourceIndex < document.sourceStarts.size
+    parser.addSourceBoundary(document.sourceStarts.get(sourceIndex))
+    sourceIndex = sourceIndex + 1
+  end
   let root = parser.parseProgram()
 
-  test.assertEqual(parser.diagnostics.count(), 0)
-  let binder = new BootstrapBinder(parser.arena, root, tokens.startAt(tokens.count() - 1))
+  if !allowSyntaxErrors
+    test.assertEqual(parser.diagnostics.count(), 0)
+  end
 
-  binder.recordCompletionSites = true
   document.tokens = tokens
   document.syntax = parser.arena
   document.syntaxRoot = root
-  let semantic = binder.bind()
+  if parser.diagnostics.count() == 0
+    let binder = new BootstrapBinder(parser.arena, root, tokens.startAt(tokens.count() - 1))
 
-  test.assertEqual(semantic.diagnostics.count(), 0)
-  document.semantic = semantic
-  document.sourceUris.add(document.uri)
-  document.sourceTexts.add(document.text)
-  document.sourceStarts.add(0)
+    binder.recordCompletionSites = true
+    binder.clearSources()
+    sourceIndex = 0
+    while sourceIndex < document.sourceStarts.size
+      binder.addSource(document.sourceUris.get(sourceIndex), document.sourceStarts.get(sourceIndex))
+      sourceIndex = sourceIndex + 1
+    end
+    let semantic = binder.bind()
+
+    test.assertEqual(semantic.diagnostics.count(), 0)
+    document.semantic = semantic
+  end
   return document
 end
 
-def fieldPackCompletion(source: String): String
-  let document = fieldPackDocument(source)
+def fieldPackCompletion(source: String, allowSyntaxErrors: Bool = false): String
+  let document = fieldPackDocument(source, allowSyntaxErrors)
 
   return lspCompletion(document, bootstrapFindText(source, "|"))
+end
+
+def assertFieldTextEdit(source: String, result: String, label: String, insertion: String, relativeStart: Int = 0, length: Int = 0): Void
+  let position = bootstrapFindText(source, "|")
+  let documentText = host.stringSlice(source, 0, position) + host.stringSlice(source, position + 1, host.stringByteLength(source) - position - 1)
+  let start = position + relativeStart
+  let range = "{\"start\":" + lspPosition(documentText, start) + ",\"end\":" + lspPosition(documentText, start + length) + "}"
+
+  test.assertTrue(bootstrapFindText(result, "\"label\":" + lspQuote(label)) >= 0)
+  test.assertTrue(bootstrapFindText(result, "\"textEdit\":{\"range\":" + range + ",\"newText\":" + lspQuote(insertion) + "}") >= 0)
 end
 
 def fieldPackDeclarations(): String
@@ -53,19 +95,37 @@ def fieldPackDeclarations(): String
 end
 
 def main(): Void
-  let incomplete = fieldPackDeclarations() + "\ndef main(): Void\n  let result = new Query().where(|active: true)\nend\n"
-  let incompleteResult = fieldPackCompletion(incomplete)
+  let first = fieldPackDeclarations() + "\ndef main(): Void\n  let result = new Query().where(|)\nend\n"
+  let firstResult = fieldPackCompletion(first)
 
-  test.assertTrue(bootstrapFindText(incompleteResult, "\"label\":\"active\"") >= 0)
-  test.assertTrue(bootstrapFindText(incompleteResult, "\"label\":\"filters\"") < 0)
-  test.assertTrue(bootstrapFindText(incompleteResult, "\"label\":\"enabled\"") >= 0)
-  test.assertTrue(bootstrapFindText(incompleteResult, "\"label\":\"secret\"") < 0)
+  assertFieldTextEdit(first, firstResult, "active", "active: ")
+
+  test.assertTrue(bootstrapFindText(firstResult, "\"label\":\"filters\"") < 0)
+  test.assertTrue(bootstrapFindText(firstResult, "\"label\":\"enabled\"") >= 0)
+  test.assertTrue(bootstrapFindText(firstResult, "\"label\":\"secret\"") < 0)
+
+  let afterSupplied = fieldPackDeclarations() + "\ndef main(): Void\n  let result = new Query().where(active: true,|)\nend\n"
+  let afterSuppliedResult = fieldPackCompletion(afterSupplied, true)
+
+  assertFieldTextEdit(afterSupplied, afterSuppliedResult, "name", "name: ")
+
+  test.assertTrue(bootstrapFindText(afterSuppliedResult, "\"label\":\"active\"") < 0)
+
+  let open = fieldPackDeclarations() + "\ndef main(): Void\n  let result = new Query().where(|\nend\n"
+  let openResult = fieldPackCompletion(open, true)
+
+  assertFieldTextEdit(open, openResult, "active", "active: ")
+
+  let malformed = fieldPackDeclarations() + "\ndef main(): Void\n  let result = new Query().where([)|\nend\n"
+
+  test.assertEqual(fieldPackCompletion(malformed, true), "[]")
 
   let supplied = fieldPackDeclarations() + "\ndef main(): Void\n  let result = new Query().where(active: true, na|me: null)\nend\n"
   let suppliedResult = fieldPackCompletion(supplied)
 
+  assertFieldTextEdit(supplied, suppliedResult, "name", "name", -2, 4)
+
   test.assertTrue(bootstrapFindText(suppliedResult, "\"label\":\"active\"") < 0)
-  test.assertTrue(bootstrapFindText(suppliedResult, "\"label\":\"name\"") >= 0)
 
   let value = fieldPackDeclarations() + "\ndef main(): Void\n  let fallback: Bool = false\n  let result = new Query().where(active: fa|llback)\nend\n"
   let valueResult = fieldPackCompletion(value)
