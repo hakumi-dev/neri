@@ -1,0 +1,342 @@
+use host
+
+class NeriAgentWorkspace
+  public root: String = ""
+  public unit: String = ""
+  public revision: Int = 0
+  public server: LspServer = new LspServer("")
+  public fingerprint: String = ""
+  public project: NeriProject = new NeriProject()
+  public inputLimit: Bool = false
+
+  def init(root: String, unit: String): Void
+    this.root = root
+    this.unit = unit
+    this.server.rootPath = neriProjectManifestName(root) ? bootstrapDirectory(root) : root
+    this.server.unit = unit
+    this.server.documentationEnabled = false
+    this.server.codeStyleDiagnostics = false
+    this.fingerprint = this.inputFingerprint()
+  end
+
+  def addInput(paths: StringBuffer, path: String): Void
+    if path != "" && !neriProjectListed(paths, path)
+      paths.add(path)
+    end
+  end
+
+  # Closed dependencies and manifests are observed before each operation.
+  # Open buffers remain the source authority until this workspace is disposed.
+  def inputFingerprint(): String
+    let limits = new AgentLimits()
+    let project = neriLoadProject(this.root, this.unit)
+    let paths = new StringBuffer()
+    let parts = new StringBuffer()
+
+    this.project = project
+    this.inputLimit = false
+    this.addInput(paths, project.manifest)
+    parts.add(runCacheFrame(project.error()) + runCacheFrame(project.kind))
+    var index = 0
+
+    while index < project.sources.size
+      this.addInput(paths, project.sources.get(index))
+      if index < project.sourceOwners.size
+        let owner = project.sourceOwners.get(index)
+        var split = host.stringByteLength(owner)
+        var scan = 0
+
+        while scan < host.stringByteLength(owner)
+          if (host.stringByteAt(owner, scan) as Int) == 35
+            split = scan
+          end
+          scan = scan + 1
+        end
+        this.addInput(paths, host.stringSlice(owner, 0, split))
+        parts.add(runCacheFrame(owner))
+      end
+      index = index + 1
+    end
+    index = 0
+    while index < project.generationManifests.size
+      this.addInput(paths, project.generationManifests.get(index))
+      index = index + 1
+    end
+    index = 0
+    while index < project.generatedInputs.size
+      this.addInput(paths, project.generatedInputs.get(index))
+      index = index + 1
+    end
+    let core = bootstrapCoreLibraryPath()
+
+    if core != null
+      this.addInput(paths, core)
+    end
+    let stdlib = host.environment("NERI_STDLIB")
+    var totalBytes = 0
+
+    index = 0
+    while index < paths.size
+      if paths.size > limits.analysisPaths()
+        this.inputLimit = true
+        break
+      end
+      let path = paths.get(index)
+      let disk = host.readText(path)
+      let opened = this.server.findPath(path)
+      var text = disk
+
+      if opened != null
+        text = opened.text
+      end
+      var digest = "missing"
+
+      if disk != null
+        digest = sha256FastText(disk)
+      end
+      parts.add(runCacheFrame(path) + runCacheFrame(digest))
+      if text != null
+        totalBytes = totalBytes + host.stringByteLength(text)
+        if totalBytes > limits.analysisBytes()
+          this.inputLimit = true
+          break
+        end
+        if stdlib != null && semanticEndsWith(path, ".hk")
+          for library in bootstrapLibraryImports(text)
+            this.addInput(paths, stdlib + "/" + library + ".hk")
+          end
+        end
+      end
+      index = index + 1
+    end
+    return sha256FastText(lspJoin(parts, 0, parts.size))
+  end
+
+  def refresh(): Void
+    let fingerprint = this.inputFingerprint()
+
+    if fingerprint != this.fingerprint
+      this.fingerprint = fingerprint
+      this.revision = this.revision + 1
+      this.server.reanalyze()
+    end
+  end
+
+  def response(operation: String, uri: String, status: String, message: String, document: LspDocument?, applied: Bool = false, analyzed: Bool = false, context: String = "", position: Int = 0): String
+    var version = 0
+    var analysisStatus = "unavailable"
+    var analysisRevision = 0
+    var diagnostics = "[]"
+    var diagnosticCount = 0
+    var emittedDiagnostics = 0
+    var snapshot = ""
+    var projectKey = ""
+    var excerpt = ""
+
+    if document != null
+      version = document.version
+      if analyzed
+        projectKey = document.projectKey
+        analysisStatus = document.analysisStatus
+        analysisRevision = document.analysisRevision
+        diagnostics = agentDocumentDiagnostics(document)
+        var emitted = (new LspJsonParser(diagnostics)).parse().first
+
+        while emitted != null
+          emittedDiagnostics = emittedDiagnostics + 1
+          emitted = emitted.next
+        end
+        let raw = document.lastDiagnostics
+
+        if raw != null
+          diagnosticCount = raw.count()
+        else
+          var item = (new LspJsonParser(document.lastPublishedDiagnostics)).parse().first
+
+          while item != null
+            diagnosticCount = diagnosticCount + 1
+            item = item.next
+          end
+        end
+        let parts = new StringBuffer()
+        var index = 0
+
+        parts.add(runCacheFrame(document.projectKey))
+        while index < document.sourceTexts.size
+          parts.add(runCacheFrame(document.sourceUris.get(index)) + runCacheFrame(document.sourceTexts.get(index)))
+          index = index + 1
+        end
+        snapshot = sha256FastText(lspJoin(parts, 0, parts.size))
+        excerpt = ",\"sourceExcerpt\":" + agentSourceExcerpt(document.text, position)
+      end
+    end
+    let extra = ",\"projectKey\":" + lspQuote(projectKey) + excerpt + (context == "" ? "" : ",\"context\":" + context)
+
+    return "{\"schemaVersion\":1,\"operationId\":" + lspQuote(operation) + ",\"uri\":" + lspQuote(uri) + ",\"revision\":" + (this.revision as String) + ",\"documentVersion\":" + (version as String) + ",\"status\":" + lspQuote(status) + ",\"message\":" + lspQuote(message) + ",\"analysisStatus\":" + lspQuote(analysisStatus) + ",\"analysisRevision\":" + (analysisRevision as String) + ",\"snapshot\":" + lspQuote(snapshot) + ",\"diagnostics\":" + diagnostics + ",\"diagnosticCount\":" + (diagnosticCount as String) + ",\"diagnosticsTruncated\":" + (diagnosticCount > emittedDiagnostics ? "true" : "false") + ",\"effects\":{\"applied\":" + (applied ? "true" : "false") + ",\"analyzed\":" + (analyzed ? "true" : "false") + ",\"persisted\":false,\"executed\":false}" + extra + "}"
+  end
+
+  def handleTool(request: AgentToolRequest): String
+    let operation = request.operationId()
+    let uri = request.uri()
+
+    this.refresh()
+    if this.inputLimit
+      return this.response(operation, uri, "limit", "Workspace analysis inputs exceed 1024 paths or 16 MiB.", null)
+    end
+    if this.project.error() != ""
+      return this.response(operation, uri, "unavailable", this.project.error(), null)
+    end
+    let rawPath = lspPath(uri)
+    var path: String? = null
+
+    if rawPath != null
+      path = neriCanonicalPath(rawPath)
+    end
+    if path == null || !neriProjectListed(this.project.sources, path)
+      return this.response(operation, uri, "invalid_request", "URI must identify an existing source in the selected project unit or its references.", null)
+    end
+    let canonicalUri = lspUri(path)
+    let target = new AgentWorkspaceTarget(operation, canonicalUri, path, this.server.find(canonicalUri))
+    let document = target.document()
+
+    if request.requiresOpenBuffer() && document == null
+      return this.response(operation, canonicalUri, "not_found", "Open the buffer before inspecting or editing it.", null)
+    end
+    let expected = request.expectedRevision()
+
+    if expected != null && expected != this.revision
+      return this.response(operation, canonicalUri, "conflict", "Workspace revision changed; inspect the current revision before retrying.", document)
+    end
+    let execution = request.apply(this, target)
+    let failedExecution = execution.failure()
+
+    if failedExecution != null
+      return failedExecution
+    end
+    let current = target.document()
+
+    if current == null
+      return this.response(operation, canonicalUri, "unavailable", "Buffer is unavailable.", null)
+    end
+    if execution.wasApplied()
+      this.revision = this.revision + 1
+      this.server.reanalyze()
+      this.fingerprint = execution.fingerprint()
+    end
+    this.server.ensureAnalyzed(current)
+    let context = request.context(this, current)
+    let failedContext = context.failure()
+
+    if failedContext != null
+      return failedContext
+    end
+    let before = this.revision
+
+    this.refresh()
+    if this.revision != before
+      return this.response(operation, canonicalUri, "conflict", "Files changed during analysis; inspect the current revision. Applied buffer edits are retained.", current, execution.wasApplied())
+    end
+    return this.response(operation, canonicalUri, current.analysisStatus, "", current, execution.wasApplied(), true, context.json(), context.position())
+  end
+
+  def applyOpen(request: AgentOpenRequest, target: AgentWorkspaceTarget): AgentToolExecution
+    let result = new AgentToolExecution()
+    let existing = target.document()
+
+    if existing != null
+      return result.fail(this.response(request.operationId(), target.uri(), "conflict", "Buffer is already open; inspect its current revision or edit it.", existing))
+    end
+    let proposed = request.text()
+    var source = host.readText(target.path())
+
+    if proposed != null
+      source = proposed
+    end
+    if source == null
+      return result.fail(this.response(request.operationId(), target.uri(), "not_found", "Source is unavailable.", null))
+    end
+    let limits = new AgentLimits()
+    var count = 0
+    var bytes = host.stringByteLength(source)
+    var other = this.server.documents
+
+    while other != null
+      count = count + 1
+      bytes = bytes + host.stringByteLength(other.text)
+      other = other.next
+    end
+    if count >= limits.bufferDocuments() || bytes > limits.bufferBytes() || host.stringByteLength(source) > limits.documentBytes()
+      return result.fail(this.response(request.operationId(), target.uri(), "limit", "Buffers are limited to 64 documents, 1 MiB per document and 8 MiB total.", null))
+    end
+    let opened = new LspDocument()
+
+    opened.uri = target.uri()
+    opened.sourcePath = target.path()
+    opened.text = source
+    opened.version = 1
+    opened.publishDiagnostics = false
+    opened.next = this.server.documents
+    this.server.documents = opened
+    let acceptedFingerprint = this.inputFingerprint()
+
+    if this.inputLimit
+      this.server.documents = opened.next
+      return result.fail(this.response(request.operationId(), target.uri(), "limit", "Opening this overlay exceeds the workspace analysis input limit.", null))
+    end
+    target.setDocument(opened)
+    return result.applied(acceptedFingerprint)
+  end
+
+  def applyEdit(request: AgentEditRequest, target: AgentWorkspaceTarget): AgentToolExecution
+    let result = new AgentToolExecution()
+    let document = target.document()
+
+    if document == null
+      return result.fail(this.response(request.operationId(), target.uri(), "unavailable", "Buffer is unavailable.", null))
+    end
+    let range = request.range()
+    let first = agentBytePosition(document.text, range.start())
+    let last = agentBytePosition(document.text, range.finish())
+
+    if first < 0 || last < first
+      return result.fail(this.response(request.operationId(), target.uri(), "invalid_request", "Edit range must lie on UTF-16 scalar boundaries inside the buffer.", document))
+    end
+    let source = host.stringSlice(document.text, 0, first) + request.text() + host.stringSlice(document.text, last, host.stringByteLength(document.text) - last)
+    let limits = new AgentLimits()
+    var bytes = host.stringByteLength(source)
+    var other = this.server.documents
+
+    while other != null
+      if other.uri != target.uri()
+        bytes = bytes + host.stringByteLength(other.text)
+      end
+      other = other.next
+    end
+    if host.stringByteLength(source) > limits.documentBytes() || bytes > limits.bufferBytes()
+      return result.fail(this.response(request.operationId(), target.uri(), "limit", "Edit exceeds the document or workspace buffer limit.", document))
+    end
+    let previous = document.text
+
+    document.text = source
+    let acceptedFingerprint = this.inputFingerprint()
+
+    if this.inputLimit
+      document.text = previous
+      return result.fail(this.response(request.operationId(), target.uri(), "limit", "Edit exceeds the workspace analysis input limit.", document))
+    end
+    document.version = document.version + 1
+    return result.applied(acceptedFingerprint)
+  end
+
+  def inspectContext(request: AgentInspectRequest, document: LspDocument): AgentToolContext
+    let result = new AgentToolContext()
+    let position = agentBytePosition(document.text, request.position())
+
+    if position < 0
+      return result.fail(this.response(request.operationId(), document.uri, "invalid_request", "Position is outside the buffer or splits a UTF-16 scalar.", document))
+    end
+    let offset = (new IrSourceMap(host.stringSlice(document.text, 0, position))).utf16Length()
+
+    return result.complete(lspAgentContext(document, offset), offset)
+  end
+end

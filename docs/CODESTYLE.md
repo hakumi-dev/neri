@@ -2,7 +2,8 @@
 
 Neri CodeStyle shares one syntax-based rule engine between the compiler CLI and
 the language server. Rules inspect the compiler's syntax, block metadata and
-tokens and propose layout edits against the original source text.
+tokens, report diagnostics and propose safe layout edits against the original
+source text.
 
 ## Commands
 
@@ -42,6 +43,7 @@ outside that guarantee.
 | `NRSTYLE004` | Add a final newline to a nonempty file that lacks one. | Enabled, warning |
 | `NRSTYLE005` | Indent parser-defined block bodies and parenthesized/bracketed continuations. | Enabled, warning |
 | `NRSTYLE006` | Normalize horizontal spacing around commas, colons, dots, delimiter interiors, assignments, casts and syntax-resolved unary/binary operators. | Enabled, warning |
+| `NRSTYLE007` | Report each class or enum declaration after the first top-level class or enum in a file. | Disabled, warning; enabled for `compiler/` and `tooling/` |
 
 Consecutive declarations and consecutive assertions stay together. An assertion
 at the start of a body needs no leading blank line. Closing delimiters end a
@@ -77,9 +79,16 @@ neri_blank_line_after_declarations = true
 neri_blank_line_before_assertions = true
 neri_indentation = true
 neri_token_spacing = true
+neri_one_class_per_file = false
 neri_diagnostic.NRSTYLE001.severity = warning
 neri_diagnostic.NRSTYLE002.severity = warning
 neri_assertion_helpers = test/assert*, assert
+
+[compiler/**/*.hk]
+neri_one_class_per_file = true
+
+[tooling/**/*.hk]
+neri_one_class_per_file = true
 ```
 
 Severity values are `none`, `suggestion`, `warning` and `error`. Assertion helper
@@ -91,6 +100,21 @@ Neri also accepts dot-qualified values. Slash qualification keeps each helper
 as one value identifier in Rider's EditorConfig parser.
 Severity `none` suppresses reporting while keeping the formatting preference.
 Set a rule's boolean option to `false` to disable its analysis and correction.
+NRSTYLE007 has no automatic correction because moving declarations can change
+source ownership and project structure.
+
+## Source organization
+
+Compiler and tooling sources keep one top-level class or enum per file, grouped
+in directories by responsibility. Extracted types use their full name in
+snake_case, for example `IrFunction` in `compiler/ir/ir_function.hk`. Related
+top-level functions can share a file. The project manifest determines source
+ownership and references across units.
+
+The repository enables NRSTYLE007 for `compiler/` and `tooling/`. Tests can keep
+multiple types together to express a language contract. Standard library modules
+retain their single-file packaging. Bootstrap compatibility sources mirror the
+canonical compiler paths for the types that need a seed-compatible definition.
 
 ## Editor integration
 
@@ -131,16 +155,21 @@ overlapping rule requests, multiline expressions, comments and UTF-16 coordinate
 
 ## Repository checks
 
-`scripts/build.sh test` checks formatting with the freshly bootstrapped compiler
-before running the language contracts. The CI jobs that run this entry point,
-including packaging, enforce the same check. Its scope covers the root manifest,
-Neri Data generation/runtime/verification/example manifests and the standard
-library. Manifest-owned sources are deduplicated and declared generated outputs
+`scripts/build.sh test` checks formatting and lints owned project sources with
+the freshly bootstrapped compiler before running the language contracts.
+The CI jobs that run this entry point,
+including packaging, enforce the same checks. Its scope covers the root manifest,
+ABI tooling and Neri Data generation/runtime/verification/example manifests.
+The standard library also receives a formatting check.
+Manifest-owned sources are deduplicated and declared generated outputs
 are excluded. Parser fixtures outside these units retain their purpose-specific
 layout; source snippets inside test literals remain unchanged.
 
 ## Verified references
 
+- [.NET runtime source-file guidelines](https://github.com/dotnet/runtime/blob/main/docs/coding-guidelines/project-guidelines.md)
+  provide a precedent for one class per file, type-based filenames and directory
+  organization. Neri applies its own configurable scope and snake_case naming.
 - [Effective Go: formatting](https://go.dev/doc/effective_go#formatting)
   supports a shared automated formatter as the project's layout convention.
 - [Microsoft coding conventions](https://learn.microsoft.com/en-us/dotnet/csharp/fundamentals/coding-style/coding-conventions)
