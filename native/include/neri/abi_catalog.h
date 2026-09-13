@@ -6,7 +6,7 @@
 #include <string.h>
 
 #define NERI_RUNTIME_ABI_MAJOR UINT16_C(1)
-#define NERI_RUNTIME_ABI_MINOR UINT16_C(25)
+#define NERI_RUNTIME_ABI_MINOR UINT16_C(26)
 
 enum neri_ir_effect_v1 {
   NERI_IR_EFFECT_READ_V1 = UINT32_C(1),
@@ -71,6 +71,7 @@ static inline uint16_t neri_abi_symbol_minimum_minor(const char *link_name) {
   if (strncmp(link_name, "neri_rt_v1_session_", sizeof("neri_rt_v1_session_") - 1U) == 0 && result < UINT16_C(19)) result = UINT16_C(19);
   if (strcmp(link_name, "neri_rt_v1_stdin_read_line_optional") == 0 && result < UINT16_C(21)) result = UINT16_C(21);
   if (strcmp(link_name, "neri_rt_v1_host_canonical_path") == 0 && result < UINT16_C(23)) result = UINT16_C(23);
+  if (strcmp(link_name, "neri_rt_v1_host_executable_path") == 0 && result < UINT16_C(26)) result = UINT16_C(26);
   if (strncmp(link_name, "neri_rt_v1_terminal_", sizeof("neri_rt_v1_terminal_") - 1U) == 0 && result < UINT16_C(8)) result = UINT16_C(8);
   if (strncmp(link_name, "neri_rt_v1_clock_", sizeof("neri_rt_v1_clock_") - 1U) == 0 && result < UINT16_C(8)) result = UINT16_C(8);
   if (strncmp(link_name, "neri_rt_v1_net_", sizeof("neri_rt_v1_net_") - 1U) == 0 && result < UINT16_C(7)) result = UINT16_C(7);
@@ -97,6 +98,7 @@ static inline uint64_t neri_abi_symbol_features(const char *link_name) {
   if (strncmp(link_name, "neri_rt_v1_session_", sizeof("neri_rt_v1_session_") - 1U) == 0) result |= NERI_RT_FEATURE_SESSION_MODULES;
   if (strcmp(link_name, "neri_rt_v1_stdin_read_line_optional") == 0) result |= NERI_RT_FEATURE_OPTIONAL_CONSOLE_READ;
   if (strcmp(link_name, "neri_rt_v1_host_canonical_path") == 0) result |= NERI_RT_FEATURE_BOOTSTRAP_HOST;
+  if (strcmp(link_name, "neri_rt_v1_host_executable_path") == 0) result |= NERI_RT_FEATURE_BOOTSTRAP_HOST;
   if (strncmp(link_name, "neri_rt_v1_terminal_", sizeof("neri_rt_v1_terminal_") - 1U) == 0) result |= NERI_RT_FEATURE_INTERACTIVE_IO;
   if (strncmp(link_name, "neri_rt_v1_clock_", sizeof("neri_rt_v1_clock_") - 1U) == 0) result |= NERI_RT_FEATURE_INTERACTIVE_IO;
   if (strncmp(link_name, "neri_rt_v1_net_", sizeof("neri_rt_v1_net_") - 1U) == 0) result |= NERI_RT_FEATURE_SOCKETS;

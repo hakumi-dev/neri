@@ -1,6 +1,59 @@
 use console
 use host
 
+# State is an integrity-checked optimization. It does not authenticate the file's
+# author or replace analysis of inputs that no longer match.
+def agentFeedbackStateDigest(scope: String, inputs: String, report: String): String
+  return sha256FastText(runCacheFrame("2") + runCacheFrame(scope) + runCacheFrame(inputs) + runCacheFrame(report))
+end
+
+def agentFeedbackCachedState(record: LspJson, scope: String, projectScope: Bool): String?
+  if record.kind != "object"
+    return null
+  end
+  var version = false
+  var storedScope = false
+  var inputs = false
+  var report = false
+  var digest = false
+  var field = record.first
+
+  while field != null
+    if field.key == "version" && !version
+      version = true
+    else if field.key == "scope" && !storedScope
+      storedScope = true
+    else if field.key == "inputs" && !inputs
+      inputs = true
+    else if field.key == "report" && !report
+      report = true
+    else if field.key == "digest" && !digest
+      digest = true
+    else
+      return null
+    end
+    field = field.next
+  end
+  let cachedReport = record.get("report")
+
+  if !version || !storedScope || !inputs || !report || !digest || record.get("version").kind != "number" || record.get("version").value != "2" || record.get("scope").kind != "string" || record.get("scope").value != scope || record.get("inputs").kind != "string" || record.get("inputs").value == "" || record.get("digest").kind != "string"
+    return null
+  end
+  if projectScope
+    if !agentCachedProjectReport(cachedReport)
+      return null
+    end
+  else if cachedReport.kind != "literal" || cachedReport.value != "null"
+    return null
+  end
+  let rendered = lspJsonStringify(cachedReport)
+
+  if record.get("digest").value != agentFeedbackStateDigest(scope, record.get("inputs").value, rendered)
+    return null
+  end
+  return rendered
+end
+
 # The CLI selects transport and cache policy. Analysis stays in the shared session.
 def agentFeedbackMain(): Void
   var root = "."
@@ -54,33 +107,66 @@ def agentFeedbackMain(): Void
     end
     operation = adapter.operationId
   end
-  let session = new AgentFeedbackSession(absolute, unit)
   var previous = ""
+  var previousReport = ""
   let scope = adapter.scope(absolute, unit)
 
   if hook && state != "" && scope != ""
     let stored = host.readText(state)
 
-    if stored != null && host.stringByteLength(stored) <= 1024
+    if stored != null && host.stringByteLength(stored) <= (new AgentLimits()).messageBytes()
       let parser = new LspJsonParser(stored)
       let record = parser.parse()
 
       parser.spaces()
-      if !parser.failed && parser.position == host.stringByteLength(stored) && record.get("scope").value == scope && record.get("inputs").kind == "string"
+      let cached = agentFeedbackCachedState(record, scope, unit == "")
+
+      if !parser.failed && parser.position == host.stringByteLength(stored) && cached != null
         previous = record.get("inputs").value
+        if unit == ""
+          previousReport = cached
+        end
       end
     end
   end
-  let feedback = session.collect(operation, previous)
+  var feedback = ""
+  var inputs = ""
+  var report = "null"
+
+  if unit == ""
+    let project = new AgentProjectFeedback(absolute)
+
+    feedback = project.collect(operation, previous, previousReport)
+    inputs = project.inputs
+    if project.report != ""
+      report = project.report
+    end
+  else
+    let compilerBefore = agentCompilerIdentity()
+    let session = new AgentFeedbackSession(absolute, unit)
+
+    feedback = session.collect(operation, previous, compilerBefore)
+    inputs = session.inputs
+    let compilerAfter = agentCompilerIdentity()
+
+    if compilerBefore == null || compilerAfter == null || compilerBefore != compilerAfter
+      inputs = ""
+      if feedback == ""
+        feedback = (new AgentFeedbackSession(absolute, unit)).collect(operation, "", null)
+      end
+    end
+  end
 
   if feedback == ""
     console.println("{}")
     return
   end
   console.println(hook ? adapter.output(feedback) : feedback)
-  if hook && state != "" && scope != "" && session.inputs != ""
+  if hook && state != "" && scope != "" && inputs != ""
     # A lost or partial cache write causes another report, never stale analysis.
-    host.writeText(state, "{\"scope\":" + lspQuote(scope) + ",\"inputs\":" + lspQuote(session.inputs) + "}")
+    let digest = agentFeedbackStateDigest(scope, inputs, report)
+
+    host.writeText(state, "{\"version\":2,\"scope\":" + lspQuote(scope) + ",\"inputs\":" + lspQuote(inputs) + ",\"report\":" + report + ",\"digest\":" + lspQuote(digest) + "}")
   end
 end
 

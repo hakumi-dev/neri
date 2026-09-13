@@ -1,0 +1,150 @@
+use host
+
+def agentDescribeQueryMatches(declaration: SemanticDeclaration, query: String): Bool
+  return lspIndexNameMatches(declaration.name, query) || lspIndexNameMatches(declaration.identity, query) || lspIndexNameMatches(declaration.display, query) || lspIndexNameMatches(declaration.typeName, query)
+end
+
+def agentDescribeResponse(operationId: String, query: String, status: String, message: String, snapshot: String, complete: Bool, resultsTruncated: Bool, unitsTotal: Int, unitsAnalyzed: Int, omittedUnits: String, results: String): String
+  return "{\"schemaVersion\":1,\"operationId\":" + lspQuote(operationId) + ",\"query\":" + lspQuote(query) + ",\"status\":" + lspQuote(status) + ",\"message\":" + lspQuote(message) + ",\"snapshot\":" + lspQuote(snapshot) + ",\"complete\":" + (complete ? "true" : "false") + ",\"resultsTruncated\":" + (resultsTruncated ? "true" : "false") + ",\"unitsTotal\":" + (unitsTotal as String) + ",\"unitsAnalyzed\":" + (unitsAnalyzed as String) + ",\"omittedUnits\":[" + omittedUnits + "],\"results\":[" + results + "]}"
+end
+
+def agentDescribeOutputSchema(): String
+  let point = "{\"type\":\"object\",\"properties\":{\"line\":{\"type\":\"integer\",\"minimum\":0},\"character\":{\"type\":\"integer\",\"minimum\":0}},\"required\":[\"line\",\"character\"],\"additionalProperties\":false}"
+  let range = "{\"type\":\"object\",\"properties\":{\"start\":{\"$ref\":\"#/$defs/point\"},\"end\":{\"$ref\":\"#/$defs/point\"}},\"required\":[\"start\",\"end\"],\"additionalProperties\":false}"
+  let result = "{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"},\"symbolKind\":{\"type\":\"integer\",\"minimum\":1},\"signature\":{\"type\":\"string\"},\"type\":{\"type\":\"string\"},\"documentation\":{\"type\":\"string\"},\"identity\":{\"type\":\"string\"},\"uri\":{\"type\":\"string\"},\"range\":{\"$ref\":\"#/$defs/range\"},\"projectKey\":{\"type\":\"string\"}},\"required\":[\"name\",\"symbolKind\",\"signature\",\"type\",\"documentation\",\"identity\",\"uri\",\"range\",\"projectKey\"],\"additionalProperties\":false}"
+
+  return "{\"$schema\":\"https://json-schema.org/draft/2020-12/schema\",\"type\":\"object\",\"properties\":{\"schemaVersion\":{\"type\":\"integer\",\"minimum\":0},\"operationId\":{\"type\":\"string\"},\"query\":{\"type\":\"string\"},\"status\":{\"type\":\"string\"},\"message\":{\"type\":\"string\"},\"snapshot\":{\"type\":\"string\"},\"complete\":{\"type\":\"boolean\"},\"resultsTruncated\":{\"type\":\"boolean\"},\"unitsTotal\":{\"type\":\"integer\",\"minimum\":0},\"unitsAnalyzed\":{\"type\":\"integer\",\"minimum\":0},\"omittedUnits\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"results\":{\"type\":\"array\",\"items\":{\"$ref\":\"#/$defs/result\"}}},\"required\":[\"schemaVersion\",\"operationId\",\"query\",\"status\",\"message\",\"snapshot\",\"complete\",\"resultsTruncated\",\"unitsTotal\",\"unitsAnalyzed\",\"omittedUnits\",\"results\"],\"additionalProperties\":false,\"$defs\":{\"point\":" + point + ",\"range\":" + range + ",\"result\":" + result + "}}"
+end
+
+class AgentDescribeService
+  private graph: AgentProjectGraph
+
+  def init(root: String): Void
+    this.graph = new AgentProjectGraph(root)
+  end
+
+  def describe(operationId: String, query: String): String
+    if query == "" || host.stringByteLength(query) > 1024
+      return agentDescribeResponse(operationId, query, "invalid_request", "Query must contain between 1 and 1024 bytes.", this.graph.snapshot, false, false, this.graph.count, 0, "", "")
+    end
+    this.graph.refresh()
+    if this.graph.error != ""
+      let status = bootstrapFindText(this.graph.error, "limit") >= 0 ? "limit" : "unavailable"
+
+      return agentDescribeResponse(operationId, query, status, this.graph.error, this.graph.snapshot, false, false, this.graph.count, 0, "", "")
+    end
+    let before = this.graph.snapshot
+    let results = new StringBuffer()
+    let omitted = new StringBuffer()
+    let seen = new StringBuffer()
+    var resultsBytes = 0
+    var resultCount = 0
+    var resultsTruncated = false
+    var unitsTotal = 0
+    var unitsAnalyzed = 0
+    let stdlibDocumentation = lspLoadStdlibDocumentation()
+    var unit = this.graph.first
+
+    while unit != null
+      unitsTotal = unitsTotal + 1
+      let workspace = unit.workspace
+
+      workspace.server.documents = null
+      workspace.server.priorityDocument = null
+      workspace.server.stdlibDocumentation = stdlibDocumentation
+      let first = workspace.project.ownSources.first.nextNode
+      var analyzed = false
+      var covered = true
+
+      if first != null
+        let path = first.value
+        let text = neriProjectVerifiedText(workspace.project, path)
+
+        if text != null
+          let document = new LspDocument()
+
+          document.uri = lspUri(path)
+          document.sourcePath = path
+          document.text = text
+          document.version = 0
+          document.publishDiagnostics = false
+          workspace.server.documents = document
+          workspace.server.invalidate(document)
+          workspace.server.ensureAnalyzed(document)
+          let semantic = document.semantic
+
+          if document.analysisStatus == "valid" && semantic != null
+            analyzed = true
+            unitsAnalyzed = unitsAnalyzed + 1
+            let snapshot = lspNavigationSnapshot(document)
+            var declaration = semantic.declarations
+
+            while declaration != null
+              let kind = lspSourceSymbolKind(semantic, declaration)
+              let canonical = lspQueryCanonicalIdentity(snapshot, declaration.identity)
+              let key = runCacheFrame(unit.key) + runCacheFrame(canonical)
+
+              if kind != 0 && kind != 13 && declaration.identity != "" && declaration.name != "" && declaration.length > 0 && !lspSourceSymbolIsGenerated(declaration.identity) && !neriProjectListed(seen, key) && agentDescribeQueryMatches(declaration, query)
+                let locationText = lspLocation(document, declaration.start, declaration.length)
+
+                if locationText != "null"
+                  let location = (new LspJsonParser(locationText)).parse()
+
+                  if location.kind == "object" && location.get("uri").kind == "string" && location.get("range").kind == "object"
+                    seen.add(key)
+                    let item = "{\"name\":" + lspQuote(declaration.name) + ",\"symbolKind\":" + (kind as String) + ",\"signature\":" + lspQuote(declaration.display) + ",\"type\":" + lspQuote(declaration.typeName) + ",\"documentation\":" + lspQuote(lspDocumentationForDeclaration(document, declaration)) + ",\"identity\":" + lspQuote(declaration.identity) + ",\"uri\":" + lspQuote(location.get("uri").value) + ",\"range\":" + lspJsonStringify(location.get("range")) + ",\"projectKey\":" + lspQuote(unit.key) + "}"
+                    let separatorBytes = resultCount > 0 ? 1 : 0
+
+                    if resultCount < 128 && resultsBytes + separatorBytes + host.stringByteLength(item) <= 65534
+                      if resultCount > 0
+                        results.add(",")
+                      end
+                      results.add(item)
+                      resultsBytes = resultsBytes + separatorBytes + host.stringByteLength(item)
+                      resultCount = resultCount + 1
+                    else
+                      resultsTruncated = true
+                    end
+                  else
+                    covered = false
+                  end
+                else
+                  covered = false
+                end
+              end
+              declaration = declaration.next
+            end
+          end
+        end
+      end
+      if !analyzed || !covered
+        if omitted.size > 0
+          omitted.add(",")
+        end
+        omitted.add(lspQuote(unit.key))
+      end
+      unit = unit.next
+    end
+    let resultText = lspJoin(results, 0, results.size)
+    let omittedText = lspJoin(omitted, 0, omitted.size)
+
+    this.graph.refresh()
+    if this.graph.snapshot != before
+      return agentDescribeResponse(operationId, query, "conflict", "Project inputs changed during analysis; retry the query.", this.graph.snapshot, false, false, this.graph.count, 0, "", "")
+    end
+    if this.graph.error != ""
+      let status = bootstrapFindText(this.graph.error, "limit") >= 0 ? "limit" : "unavailable"
+
+      return agentDescribeResponse(operationId, query, status, this.graph.error, this.graph.snapshot, false, false, this.graph.count, 0, "", "")
+    end
+    var message = ""
+
+    if omitted.size > 0
+      message = "Some project units could not be analyzed."
+    end
+    if resultsTruncated
+      message = message + (message == "" ? "" : " ") + "Matching declarations exceed the result limit."
+    end
+    return agentDescribeResponse(operationId, query, "valid", message, before, omitted.size == 0 && !resultsTruncated, resultsTruncated, unitsTotal, unitsAnalyzed, omittedText, resultText)
+  end
+end

@@ -1,0 +1,195 @@
+use files
+use host
+use process
+
+class AgentTestService
+  private root: String
+
+  def init(root: String): Void
+    this.root = root
+  end
+
+  def run(operationId: String): String
+    let graph = new AgentProjectGraph(this.root)
+    let before = graph.snapshot
+    let projectKey = graph.manifest
+    var unitsTotal = 0
+    var testsTotal = 0
+    var candidate = graph.first
+
+    while candidate != null
+      if neriProjectListed(graph.projects, candidate.manifest)
+        unitsTotal = unitsTotal + 1
+        if candidate.project.testDeclared
+          testsTotal = testsTotal + 1
+        end
+      end
+      candidate = candidate.next
+    end
+    if graph.error != ""
+      return agentTestResponse(operationId, projectKey, before, "unavailable", "unavailable", graph.error, false, false, unitsTotal, testsTotal, "", false)
+    end
+    if testsTotal == 0
+      return agentTestResponse(operationId, projectKey, before, "noTests", "unavailable", "No project test units are registered.", false, true, unitsTotal, 0, "", false)
+    end
+    let compiler = graph.compilerPath
+    let compilerDigest = graph.compilerDigest
+    let directory = bootstrapRunDirectory()
+
+    if directory == null
+      return agentTestResponse(operationId, projectKey, before, "unavailable", "unavailable", "Cannot create the test work directory.", false, false, unitsTotal, testsTotal, "", false)
+    end
+    var results = ""
+    var separator = ""
+    var status = "valid"
+    var complete = true
+    var executed = false
+    var cleanupFailed = false
+    var capturedBytes = 0
+    var unit = graph.first
+
+    while unit != null
+      if neriProjectListed(graph.projects, unit.manifest) && unit.project.testDeclared
+        let work = bootstrapTemporaryDirectory(directory, "test")
+        let buildSnapshot = agentTestBuildSnapshot(before, compiler, compilerDigest, unit)
+        var testStatus = "unavailable"
+        var phase = "build"
+        var message = ""
+        var artifactDigest = ""
+        var exitKind = ""
+        var exitCode = 0
+        var stdout = ""
+        var stderr = ""
+        var stdoutTruncated = false
+        var stderrTruncated = false
+        var testExecuted = false
+
+        if work == null
+          message = "Cannot create the unit test work directory."
+          complete = false
+        else
+          let artifact = agentTestExecutable(work + "/program")
+          let buildOptions = new process.SpawnOptions(compiler)
+
+          buildOptions.arguments = ["build", "--project", unit.manifest, "--unit", unit.name, "--output", work + "/program", "--no-cache"]
+          buildOptions.workingDirectory = bootstrapDirectory(unit.manifest)
+          buildOptions.stdoutLimit = 65536
+          buildOptions.stderrLimit = 65536
+          let build = new AgentProcessResult()
+
+          build.run(buildOptions, 120000)
+          executed = executed || build.started
+          if build.status == "unavailable"
+            message = build.message
+            complete = false
+          else if build.status == "timeout"
+            testStatus = "invalid"
+            message = "Building the test unit exceeded 120000 milliseconds."
+          else if build.exitKind != "exit" || build.exitCode != 0
+            testStatus = "invalid"
+            message = "Building the test unit failed."
+          else
+            let digest = agentArtifactDigest(artifact)
+
+            if digest != null
+              artifactDigest = digest
+            end
+            if artifactDigest == ""
+              message = "The build completed without a readable executable artifact."
+              complete = false
+            else
+              phase = "run"
+              let runOptions = new process.SpawnOptions(artifact)
+
+              runOptions.arguments = agentTestArguments(bootstrapDirectory(unit.manifest), compiler, work, unit.project.testArguments)
+              runOptions.workingDirectory = bootstrapDirectory(unit.manifest)
+              runOptions.stdoutLimit = 65536
+              runOptions.stderrLimit = 65536
+              let run = new AgentProcessResult()
+
+              run.run(runOptions, unit.project.testTimeoutMs)
+              testExecuted = run.started
+              executed = executed || run.started
+              if run.status == "unavailable"
+                message = run.message
+                complete = false
+              else if run.status == "timeout"
+                testStatus = "invalid"
+                message = "Test exceeded " + (unit.project.testTimeoutMs as String) + " milliseconds."
+              else if run.exitKind != "exit" || run.exitCode != 0
+                testStatus = "invalid"
+                message = "Test exited unsuccessfully."
+              else
+                testStatus = "valid"
+                message = "Test completed successfully."
+              end
+              exitKind = run.exitKind
+              exitCode = run.exitCode
+              stdout = run.stdout
+              stderr = run.stderr
+              stdoutTruncated = run.stdoutTruncated
+              stderrTruncated = run.stderrTruncated
+            end
+          end
+          if phase == "build"
+            exitKind = build.exitKind
+            exitCode = build.exitCode
+            stdout = build.stdout
+            stderr = build.stderr
+            stdoutTruncated = build.stdoutTruncated
+            stderrTruncated = build.stderrTruncated
+          end
+          let cleaned = files.removeTree(work)
+
+          if cleaned.failure != null
+            testStatus = "unavailable"
+            message = "Cannot remove the unit test work directory."
+            complete = false
+            cleanupFailed = true
+          end
+        end
+        if testStatus == "unavailable"
+          status = "unavailable"
+        else if testStatus == "invalid" && status == "valid"
+          status = "invalid"
+        end
+        let outputBytes = host.stringByteLength(stdout) + host.stringByteLength(stderr)
+
+        if capturedBytes + outputBytes > 1048576
+          stdout = ""
+          stderr = ""
+          stdoutTruncated = true
+          stderrTruncated = true
+        else
+          capturedBytes = capturedBytes + outputBytes
+        end
+        results = results + separator + "{\"projectKey\":" + lspQuote(unit.key) + ",\"name\":" + lspQuote(unit.name) + ",\"status\":" + lspQuote(testStatus) + ",\"phase\":" + lspQuote(phase) + ",\"message\":" + lspQuote(message) + ",\"buildSnapshot\":" + lspQuote(buildSnapshot) + ",\"artifactDigest\":" + lspQuote(artifactDigest) + ",\"exitKind\":" + lspQuote(exitKind) + ",\"exitCode\":" + (exitCode as String) + ",\"stdout\":" + lspQuote(stdout) + ",\"stderr\":" + lspQuote(stderr) + ",\"stdoutTruncated\":" + (stdoutTruncated ? "true" : "false") + ",\"stderrTruncated\":" + (stderrTruncated ? "true" : "false") + ",\"executed\":" + (testExecuted ? "true" : "false") + "}"
+        separator = ","
+      end
+      unit = unit.next
+    end
+    let cleaned = files.removeTree(directory)
+
+    if cleaned.failure != null
+      status = "unavailable"
+      complete = false
+      cleanupFailed = true
+    end
+    graph.refresh()
+    if graph.snapshot != before
+      return agentTestResponse(operationId, projectKey, before, "conflict", "conflict", "Project inputs changed while tests ran; retry against the current graph.", false, false, unitsTotal, testsTotal, results, executed)
+    end
+    let state = complete ? "complete" : "unavailable"
+    var message = "All registered project tests completed successfully."
+
+    if status == "invalid"
+      message = "One or more registered project tests failed."
+    else if status == "unavailable"
+      message = "The registered project test run was incomplete."
+    end
+    if cleanupFailed
+      message = "The registered project test run could not remove its temporary work directory."
+    end
+    return agentTestResponse(operationId, projectKey, before, state, status, message, complete, false, unitsTotal, testsTotal, results, executed)
+  end
+end

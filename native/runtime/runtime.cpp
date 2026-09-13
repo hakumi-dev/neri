@@ -1916,6 +1916,19 @@ NERI_RT_API neri_int_v1 neri_rt_v1_host_argument_count(void) {
   return current_state().process_argument_count;
 }
 
+NERI_RT_API neri_int_v1 neri_rt_v1_host_executable_path(
+    neri_byte_v1 *output, neri_int_v1 capacity) {
+  require_initialized();
+  if (capacity < 0 || (capacity > 0 && output == nullptr)) return -1;
+  const auto path = neri::platform::executable_path();
+  if (!path || !is_strict_utf8(reinterpret_cast<const uint8_t *>(path->data()), path->size())) return -1;
+  const auto length = static_cast<neri_int_v1>(path->size());
+  if (capacity <= length) return length;
+  std::memcpy(output, path->data(), path->size());
+  output[path->size()] = 0;
+  return length;
+}
+
 NERI_RT_API neri_ref_v1
 neri_rt_v1_host_argument_at(neri_int_v1 index) {
   require_initialized();

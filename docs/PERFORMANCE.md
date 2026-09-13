@@ -32,6 +32,20 @@ Neri retains flat immutable strings and supplies a separate mutable builder.
 
 ## Run latency
 
+`neri profile --project ROOT` measures release builds of all declared project
+members and referenced libraries. Its structured output records per-phase
+duration totals and sample counts, binary artifact digests, input fingerprints
+and project snapshots before and after the run. Libraries are measured as object
+builds. The profiler builds executables without running them.
+
+`NERI_TIMING_OUTPUT` selects the JSONL timing sink when `--timings` is enabled.
+The terminal `build-complete` event establishes that all successful build phases
+were recorded; a write failure fails the profiling build. The sink is bounded
+to 8 MiB. Repeated phases, such as object code generation, are grouped in the
+project response. Nested durations overlap; `build-complete` supplies the total.
+Measurements are individual observations with the current cache state, not
+statistical regressions or application profiles.
+
 `neri source.hk --timings` separates frontend, cache lookup, code generation,
 linking and program execution. `--no-cache` provides an uncached comparison with
 the same compiler, runtime and safety checks. A cache hit still parses, type-checks,

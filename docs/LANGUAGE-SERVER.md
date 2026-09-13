@@ -175,10 +175,14 @@ original location using the retained source text.
 
 Directory sources are rediscovered after `workspace/didChangeWatchedFiles`, so
 reported file creation and deletion updates membership while exclusions,
-symlinks, generated directories, and nested manifests remain outside it. A file
-without an owning unit is analyzed independently. Libraries reject `main`, and
-executable units require exactly one entry point for language-server analysis.
-See [project sources and references](PROJECTS.md).
+symlinks, generated directories, and nested manifests remain outside it. Under
+an explicit manifest, each source requires an owning unit; the server reports
+the informational `NR_PROJECT_CONTEXT` diagnostic and leaves semantic analysis
+unavailable until the manifest supplies that context. A workspace without a
+manifest is an implicit project and analyzes its discovered sources together,
+including its first unsaved document. Libraries reject `main`, and executable
+units require exactly one entry point for language-server analysis. See
+[project sources and references](PROJECTS.md).
 
 Text changes apply immediately in protocol order and invalidate affected models.
 Consecutive changes coalesce into one pending analysis per document. Semantic
@@ -319,11 +323,11 @@ editor-specific settings and execution actions.
 
 For local compiler development, configure the editor with the repository's
 absolute `scripts/neri.sh` path and the `lsp` argument. The launcher selects the
-validated `build/current` toolchain and its matching runtime and standard library.
-Run `scripts/build.sh bootstrap` to publish a new local toolchain, then restart
-the editor's language server. An already running server continues using the
-executable it started with. Installed-toolchain users likewise restart the
-language server after updating their installation.
+validated `build/current` compiler and runtime together with the standard-library
+sources from the same checkout. Run `scripts/build.sh bootstrap` to publish a new
+local toolchain, then restart the editor's language server. An already running
+server continues using the executable it started with. Installed-toolchain users
+likewise restart the language server after updating their installation.
 
 Protocol reference: [LSP specification](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/).
 

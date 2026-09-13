@@ -10,6 +10,9 @@
 #include <fcntl.h>
 #include <locale.h>
 #include <system_error>
+#if defined(__APPLE__)
+#include <mach-o/dyld.h>
+#endif
 #if defined(_WIN32)
 #include "windows_support.h"
 #include <io.h>
@@ -27,6 +30,40 @@ extern char **environ;
 
 namespace neri::platform {
 namespace { std::atomic<uint64_t> temporary_file_counter{0}; }
+std::optional<std::string> executable_path() {
+  std::filesystem::path image;
+#if defined(_WIN32)
+  std::vector<wchar_t> buffer(256);
+  for (;;) {
+    const auto size = GetModuleFileNameW(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
+    if (size == 0) return std::nullopt;
+    if (size < buffer.size()) {
+      image = std::wstring(buffer.data(), size);
+      break;
+    }
+    if (buffer.size() >= 1048576) return std::nullopt;
+    buffer.resize(buffer.size() * 2);
+  }
+#elif defined(__APPLE__)
+  uint32_t size = 0;
+  _NSGetExecutablePath(nullptr, &size);
+  if (size == 0 || size > 1048576) return std::nullopt;
+  std::vector<char> buffer(size);
+  if (_NSGetExecutablePath(buffer.data(), &size) != 0) return std::nullopt;
+  image = buffer.data();
+#elif defined(__linux__)
+  std::error_code link_error;
+  image = std::filesystem::read_symlink("/proc/self/exe", link_error);
+  if (link_error) return std::nullopt;
+#else
+  return std::nullopt;
+#endif
+  std::error_code error;
+  const auto canonical = std::filesystem::canonical(image, error);
+  if (error || canonical.empty()) return std::nullopt;
+  return neri::path_text(canonical);
+}
+
 double parse_float(const char *text, char **end) {
 #if defined(_WIN32)
   static const auto locale = _create_locale(LC_NUMERIC, "C");

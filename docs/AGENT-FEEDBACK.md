@@ -3,7 +3,16 @@
 `neri agent` exposes compiler feedback to a local coding agent through MCP over
 standard input and output. It keeps project source buffers in memory, analyzes
 them with Neri's parser and binder, and returns diagnostics and semantic context.
-It does not write source files or execute submitted code.
+Project tools inspect saved sources across declared project members. The test
+tool builds and runs explicitly registered test units.
+
+The coding agent controls the improvement cycle: observe the project, edit its
+sources, run the relevant checks and decide whether to retain the change.
+Diagnostics establish syntax and type correctness; test results establish the
+registered behavioral contracts; timings report the measured build workload.
+Neri supplies these observations and their input identities. Scheduling work,
+choosing an improvement objective and applying or reverting disk edits belong
+to the agent host.
 
 Start one server for one project unit. MCP clients use their own configuration
 shape, but a generic server entry is:
@@ -44,16 +53,55 @@ limits validate. It advances the buffer version and workspace revision, then
 reanalyzes the source's owning compilation unit and its references. The result reports
 `persisted: false` and `executed: false`.
 
-`neri.feedback` takes an `operationId` and analyzes the selected unit's current
-files on disk, including its references. It uses a separate disk session and
-preserves all unsaved overlays. Its document version is zero; its workspace and
-analysis revisions belong to that disk session. Clients use `snapshot` to
-correlate disk results and obtain overlay concurrency tokens from the overlay
-tools. The selected unit is analyzed through one of its own sources, so changes
-in a referenced library also produce diagnostics in the consumer.
+`neri.feedback` takes an `operationId` and analyzes every unit in the root
+manifest, declared `projects` members and their referenced libraries. Each unit
+retains its own reference visibility and entry-point rules. A library change is
+checked in every consumer's context, including consumers in other members.
+Independent units remain separate. The result reports `scope: "project"`, a
+snapshot, unit diagnostics, `complete`, `unitsTotal`, `unitsAnalyzed` and
+`unitsReused`. `invalidatedUnits` identifies units whose input closure required
+analysis; `removedUnits` identifies previously reported units absent now.
+
+`neri.describe` takes `operationId` and a nonempty `query`. It searches bound
+declarations across the project graph and returns signatures, inferred types,
+documentation, identities, source URIs, UTF-16 ranges and the unit context.
+Local variables and parameters stay in point inspection. The query is a
+case-sensitive substring of declaration names, identities, signatures or types.
+`omittedUnits` and `resultsTruncated` make incomplete coverage explicit. Results
+are limited to 128 declarations and 64 KiB.
+
+`neri.test` builds and executes units carrying [test metadata](PROJECTS.md)
+in the root or declared member manifests. A referenced library alone does not
+enroll its project's executable tests. Results include the phase, exit kind and
+code, captured output, timeout failures, build snapshot and executable SHA-256.
+`noTests: true` has `status: "unavailable"`. Temporary artifacts are removed
+after execution. Output truncation is explicit. Test code has the host process's
+filesystem and process capabilities.
+
+`neri.profile` builds all graph units with release optimization and measures
+compiler phases. Libraries produce object files and executable units produce
+executables. Results contain the artifact digest, input fingerprint, normal or
+abnormal exit and measured durations grouped by phase with sample counts.
+Object-cache hit and miss events remain distinct phases. `build-complete`
+measures elapsed build time; nested phases overlap, so their durations must not
+be added to derive total time. Applications are not launched. A missing artifact
+or incomplete timing stream produces an unavailable result. Builds have a
+120-second limit per unit. This measures compiler work; application CPU, memory,
+SQL and distributed tracing require runtime instrumentation.
+
+The project tools use disk state independently of unsaved editor overlays. They
+check the complete graph again before returning and report `conflict` when its
+inputs changed. The CLI exposes the same services:
+
+```sh
+neri feedback --project .
+neri describe --project . --query Customer
+neri test --project .
+neri profile --project .
+```
 
 Every tool call requires an `operationId`, which is echoed in its result. Tool
-results include the canonical source URI, workspace revision, document version,
+overlay results include the canonical source URI, workspace revision, document version,
 analysis status, owning-unit `projectKey`, diagnostics, and effect flags. Invalid syntax and type errors
 are normal analyzed results; protocol, range, stale-revision, membership, and
 resource failures have distinct statuses. Rejected edits preserve the buffer.
@@ -61,11 +109,22 @@ If external files change during analysis, a conflict response explicitly states
 whether the in-memory edit was already applied; the client uses the returned
 revision to inspect again.
 
-Analyzed responses include a source excerpt of at most 4 KiB, its UTF-16 range,
+Analyzed overlay responses include a source excerpt of at most 4 KiB, its UTF-16 range,
 and an explicit truncation flag. Inspection places the excerpt around the
 requested position. Clients can inspect another position to obtain more text.
 
 ## Revisions and snapshots
+
+The dependency model follows the separation of task inputs, dependency graphs
+and rebuilding conditions studied in
+[Build Systems à la Carte (Mokhov, Mitchell and Peyton Jones, 2018)](https://simon.peytonjones.org/assets/pdfs/build-systems-original.pdf).
+Neri uses input digests and explicit member/reference edges; the integration
+contracts verify consumer invalidation and independent-unit reuse. This is a
+design application of that work, not a formal proof of the implementation.
+Each tool publishes its own output schema through the
+[MCP tools contract](https://modelcontextprotocol.io/specification/2025-11-25/server/tools).
+Malformed arguments produce an error content item without a fabricated domain
+result. Compiler syntax and type diagnostics remain normal analyzed results.
 
 The **workspace revision** is the concurrency token accepted as
 `expectedRevision`. It advances when an in-memory buffer changes and when the
@@ -85,12 +144,26 @@ The **analysis revision** identifies the internal LSP analysis generation.
 Invalidation and reanalysis can advance it independently of workspace revision,
 so clients use it to correlate feedback, not to authorize an edit.
 
-The **snapshot digest** is a SHA-256 digest of the analyzed project key and the
+The **overlay snapshot digest** is a SHA-256 digest of the analyzed project key and the
 ordered source URIs and texts used by that analysis. Equal digests identify
 equal values for those recorded fields; they do not compare every process or
 toolchain setting. The digest does not state that external files remained
 unchanged after the response. The server checks its workspace inputs again
 before returning and reports a conflict if it observes a concurrent change.
+
+The **project snapshot** hashes the complete unit inventory, canonical member
+identities, each unit's observed inputs and the running compiler's binary digest.
+It includes source ownership, generated-source contracts, project manifests and
+the imported standard-library closure. Compiler replacement invalidates cached
+results even when its version string stays the same. Profiling and test artifacts
+have separate binary digests. Snapshots describe observations before and after
+an operation; they are not filesystem transactions or locks.
+
+Coverage follows explicit manifest membership. Nested projects enter the graph
+through `projects`; directories of negative fixtures and bootstrap seed overlays
+retain their own validation workflows. Seed overlays target the pinned compiler
+syntax and are verified by the bootstrap build. The MCP feedback reports compiler
+diagnostics; it does not subscribe to Rider's inspection panel.
 
 The selected unit's reference closure defines which files can be opened. Each
 source is analyzed in its owning unit's closure, preserving the same dependency
@@ -133,9 +206,9 @@ and 2 MiB per MCP message.
 
 A completion candidate is a context-sensitive suggestion, not proof that the
 insertion produces a complete, valid program. The final edited unit is parsed
-and bound again, and its diagnostics are authoritative. The service does not
-perform token-level constrained decoding, introduce typed holes, run tests, or
-execute, save, or commit code.
+and bound again, and its diagnostics are authoritative. Point inspection and
+buffer edits operate on in-memory source snapshots. Test execution is an
+explicit `neri.test` operation; the agent host owns disk edits and commits.
 
 ## Input contracts
 
@@ -207,7 +280,9 @@ protocol conversation.
 
 `neri feedback --project ROOT [--unit UNIT] [--operation ID]` analyzes saved
 sources and writes one structured feedback result to standard output. It shares
-`AgentFeedbackSession` with the MCP tool and uses the current parser and binder.
+the project graph with the MCP tool and uses the current parser and binder.
+An explicit `--unit UNIT` selects the single-unit feedback contract; omitting it
+selects the complete graph independently of `defaultUnit`.
 The command exits successfully when it delivers feedback; consumers inspect
 `status` and `diagnosticCount` to distinguish valid code, invalid code and an
 unavailable analysis. Invalid CLI arguments exit with status 2.
@@ -229,7 +304,7 @@ Configure the project's `.codex/hooks.json`:
       "hooks": [{
         "type": "command",
         "command": "neri feedback --project . --codex-hook",
-        "timeout": 60,
+        "timeout": 300,
         "statusMessage": "Analyzing Neri project"
       }]
     }]
@@ -237,34 +312,43 @@ Configure the project's `.codex/hooks.json`:
 }
 ```
 
-Set an absolute project path when tools can run from another directory, and
-select `--unit` for the compilation unit to
-observe. The executable must be the built Neri version containing `feedback`.
+Set an absolute project path when tools can run from another directory. The
+executable must be the built Neri version containing `feedback`.
 Codex reviews and trusts hook definitions through `/hooks`; a configured hook
 becomes active after the host accepts it. Neri supplies the feedback and Codex
 incorporates it before the agent's next decision. The adapter responds at tool
 completion boundaries, including completed editing commands.
 Delivery follows the host's supported tool paths. Changes made by an external
 editor are observed at the next invocation.
+Codex's default hook context limit is approximately 2,500 tokens. Larger reports
+arrive as a preview and a path to the complete saved output; the agent reads that
+file for omitted unit diagnostics. The aggregate status, coverage and diagnostic
+count precede the unit list. Host preview limits and Neri's explicit diagnostic
+truncation are separate limits.
 
 Optional `--state FILE` enables deduplication for hook invocations. The parent
 directory must exist. State is a disposable cache: it records input identity and
 the host session, turn and transcript identity. An unchanged invocation in that
 scope emits `{}`. A new scope receives fresh feedback even for unchanged files.
 Missing turn identity disables deduplication. The input identity includes
-project and unit selection, compiler version, the canonical standard-library
+project and unit selection, compiler version and executable digest, the canonical standard-library
 location, its manifest and required sources, and observed project inputs.
-Replace the cache when using a rebuilt compiler with the same version and
-standard-library location. Installed immutable toolchain locations distinguish
-those toolchains automatically.
+Project scope also records per-unit results.
+When one input closure changes, unaffected units reuse their recorded results.
+The response identifies reused units and keeps their truncation flags. Version 2
+state records carry an integrity digest over scope, inputs and the report.
+Project reports must satisfy their schema and correlated totals before reuse.
+The digest detects accidental corruption; it does not authenticate a writer
+with access to the state file.
 
 State writes concern only this cache. `effects.persisted` describes source-file
 persistence and remains false. A missing, partial or unwritable cache causes
 repeat feedback. Only consistent `valid` or `invalid` analyses populate the
 cache. Analysis checks its inputs again before returning; concurrent changes
 produce `conflict`. Each result describes the observed snapshot, and subsequent
-edits require another analysis. This hook analyzes the selected compilation
-unit; tests, execution and other units have their own verification steps.
+edits require another analysis. The hook analyzes the complete project graph by
+default. Test execution and profiling are explicit tools; source analysis alone
+does not assert that tests passed or that application performance was measured.
 
 The adapter follows the official [Codex hook contract](https://learn.chatgpt.com/docs/hooks).
 The separation of analysis and host delivery also permits other clients to use

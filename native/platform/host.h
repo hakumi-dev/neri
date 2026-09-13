@@ -15,6 +15,7 @@ double parse_float(const char *text, char **end);
 bool write_atomic(std::string_view path, const uint8_t *bytes, size_t size, std::string &error);
 bool remove_file(std::string_view path, std::string &error);
 std::optional<std::string> environment(std::string_view name);
+std::optional<std::string> executable_path();
 std::optional<int64_t> run(std::vector<std::string> &arguments, std::string &error);
 }
 #endif

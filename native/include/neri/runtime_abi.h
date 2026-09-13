@@ -335,6 +335,11 @@ NERI_RT_API neri_int_v1 neri_rt_v1_host_canonical_path(
 NERI_RT_API neri_ref_v1
 neri_rt_v1_host_path_file_name(neri_ref_v1 path);
 NERI_RT_API neri_int_v1 neri_rt_v1_host_argument_count(void);
+/* ABI 1.26: canonical current executable path in UTF-8. Returns byte length,
+   excluding NUL, or -1 on failure. Writes only when capacity exceeds length;
+   output may be NULL when capacity is zero. */
+NERI_RT_API neri_int_v1 neri_rt_v1_host_executable_path(
+    neri_byte_v1 *output, neri_int_v1 capacity);
 NERI_RT_API neri_ref_v1
 neri_rt_v1_host_argument_at(neri_int_v1 index);
 NERI_RT_API neri_ref_v1
