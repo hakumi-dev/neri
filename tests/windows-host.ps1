@@ -27,7 +27,10 @@ function Run-Host([int]$Seconds, [string]$Name, [string]$Command, [int]$Expected
   [pscustomobject]@{Elapsed = $clock.Elapsed; Stdout = [IO.File]::ReadAllText($stdout); Stderr = [IO.File]::ReadAllText($stderr)}
 }
 
-$normal = Run-Host 5 'normal' "[Console]::WriteLine('child stdout'); [Console]::Error.WriteLine('child stderr'); exit 23" 23
+# Allow cold PowerShell startup on CI; this case checks capture and normal exit.
+$normalExitTimeoutSeconds = 30
+$normal = Run-Host $normalExitTimeoutSeconds 'normal' "[Console]::WriteLine('child stdout'); [Console]::Error.WriteLine('child stderr'); exit 23" 23
+
 Assert-Equal $normal.Stdout "child stdout`r`n" 'stdout was not captured separately'
 Assert-Equal $normal.Stderr "child stderr`r`n" 'stderr was not captured separately'
 
