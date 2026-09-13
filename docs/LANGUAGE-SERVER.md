@@ -264,12 +264,13 @@ source it contains:
 
 ```sh
 fixture="$(mktemp -d)"
-cp "$PWD"/stdlib/*.hk "$fixture"/
-"$HOME/.neri/bin/neri" documentation-index \
+cp -R "$PWD/stdlib/." "$fixture/"
+NERI_STDLIB="$fixture" NERI_HOST="$PWD/build/native/native-release/neri-host" \
+  find "$fixture" -name '*.hk' -exec "$PWD/build/current/bin/neri" documentation-index \
   --toolchain-version "$(cat VERSION)" \
-  --output "$fixture/documentation.json" "$fixture"/*.hk
+  --output "$fixture/documentation.json" {} +
 NERI_LSP_TEST_STDLIB="$fixture" \
-  build/native/native-release/neri-lsp-test "$HOME/.neri/bin/neri" "$PWD"
+  build/native/native-release/neri-lsp-test "$PWD/build/current/bin/neri" "$PWD"
 ```
 
 The full test command prepares an isolated standard-library directory and its

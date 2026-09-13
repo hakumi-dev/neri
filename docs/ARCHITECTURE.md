@@ -143,6 +143,15 @@ defines its namespace, name, parameters, result type, documentation, navigation,
 completion and import requirement; runtime symbol names do not define that
 surface.
 
+`StandardLibraryCatalog` resolves a `use` target through the library units in
+`NERI_STDLIB/manifest.json`. Each unit can own multiple source files, and imports
+in every file participate in dependency discovery. Compilation, LSP analysis,
+session snapshots and documentation indexing use this catalog. Source identities
+preserve relative paths as `@stdlib/<path>.hk`; namespaces remain source
+declarations. The `core` unit includes `core.hk`, which owns the intrinsic
+`String` declaration. A standard-library directory without a manifest uses the
+legacy `<module>.hk` lookup.
+
 | Belongs to | Current rule | Reason |
 | --- | --- | --- |
 | Source library | Namespaces and callable signatures such as `console`, `math`, `host`, `test`, and `tasks`, plus contracts such as `Equality` | Source controls the user-facing API and editor information. |

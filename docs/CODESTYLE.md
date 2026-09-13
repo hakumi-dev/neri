@@ -43,7 +43,7 @@ outside that guarantee.
 | `NRSTYLE004` | Add a final newline to a nonempty file that lacks one. | Enabled, warning |
 | `NRSTYLE005` | Indent parser-defined block bodies and parenthesized/bracketed continuations. | Enabled, warning |
 | `NRSTYLE006` | Normalize horizontal spacing around commas, colons, dots, delimiter interiors, assignments, casts and syntax-resolved unary/binary operators. | Enabled, warning |
-| `NRSTYLE007` | Report each class or enum declaration after the first top-level class or enum in a file. | Disabled, warning; enabled for `compiler/` and `tooling/` |
+| `NRSTYLE007` | Report each class or enum declaration after the first top-level class or enum in a file. | Disabled, warning; enabled for `compiler/`, `tooling/` and `stdlib/` |
 
 Consecutive declarations and consecutive assertions stay together. An assertion
 at the start of a body needs no leading blank line. Closing delimiters end a
@@ -89,6 +89,9 @@ neri_one_class_per_file = true
 
 [tooling/**/*.hk]
 neri_one_class_per_file = true
+
+[stdlib/**/*.hk]
+neri_one_class_per_file = true
 ```
 
 Severity values are `none`, `suggestion`, `warning` and `error`. Assertion helper
@@ -105,16 +108,17 @@ source ownership and project structure.
 
 ## Source organization
 
-Compiler and tooling sources keep one top-level class or enum per file, grouped
-in directories by responsibility. Extracted types use their full name in
+Compiler, tooling and standard-library sources keep one top-level class or enum
+per file, grouped in directories by responsibility. Extracted types use their full name in
 snake_case, for example `IrFunction` in `compiler/ir/ir_function.hk`. Related
 top-level functions can share a file. The project manifest determines source
 ownership and references across units.
 
-The repository enables NRSTYLE007 for `compiler/` and `tooling/`. Tests can keep
-multiple types together to express a language contract. Standard library modules
-retain their single-file packaging. Bootstrap compatibility sources mirror the
-canonical compiler paths for the types that need a seed-compatible definition.
+The repository enables NRSTYLE007 for `compiler/`, `tooling/` and `stdlib/`.
+Tests can keep multiple types together to express a language contract.
+Standard-library modules declare their source files in `stdlib/manifest.json`.
+Bootstrap compatibility sources mirror the canonical compiler paths for the
+types that need a seed-compatible definition.
 
 ## Editor integration
 
@@ -160,7 +164,7 @@ the freshly bootstrapped compiler before running the language contracts.
 The CI jobs that run this entry point,
 including packaging, enforce the same checks. Its scope covers the root manifest,
 ABI tooling and Neri Data generation/runtime/verification/example manifests.
-The standard library also receives a formatting check.
+The standard-library manifest receives the same formatting and lint checks.
 Manifest-owned sources are deduplicated and declared generated outputs
 are excluded. Parser fixtures outside these units retain their purpose-specific
 layout; source snippets inside test literals remain unchanged.
