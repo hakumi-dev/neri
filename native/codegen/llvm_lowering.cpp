@@ -2741,73 +2741,9 @@ private:
       minimum_minor = std::max(minimum_minor, native_class_runtime_minor);
     }
     for (const auto &import : input_.imports) {
-      if (import.link_name.starts_with("neri_rt_v1_net_")) {
-        minimum_minor = std::max(minimum_minor, uint16_t{7});
-        required_features |= NERI_RT_FEATURE_SOCKETS;
-      }
-      if (import.link_name.starts_with("neri_rt_v1_file_")) {
-        minimum_minor = std::max(minimum_minor, uint16_t{11});
-        required_features |= NERI_RT_FEATURE_FILES;
-      }
-      if (import.link_name.starts_with("neri_rt_v1_interrupt_")) {
-        minimum_minor = std::max(minimum_minor, uint16_t{12});
-        required_features |= NERI_RT_FEATURE_INTERRUPTS;
-      }
-      if (import.link_name.starts_with("neri_rt_v1_clock_wall_")) {
-        minimum_minor = std::max(minimum_minor, uint16_t{13});
-        required_features |= NERI_RT_FEATURE_WALL_CLOCK;
-      }
-      if (import.link_name.starts_with("neri_rt_v1_crypto_")) {
-        minimum_minor = std::max(minimum_minor, uint16_t{14});
-        required_features |= NERI_RT_FEATURE_CRYPTO;
-      }
-      if (import.link_name.starts_with("neri_rt_v1_file_root_")) {
-        minimum_minor = std::max(minimum_minor, uint16_t{15});
-        required_features |= NERI_RT_FEATURE_ROOTED_FILES;
-      }
-      if (import.link_name.starts_with("neri_rt_v1_process_")) {
-        minimum_minor = std::max(minimum_minor, uint16_t{16});
-        required_features |= NERI_RT_FEATURE_PROCESS;
-      }
-      if (import.link_name == "neri_rt_v1_process_spawn_input" ||
-          import.link_name == "neri_rt_v1_process_interrupt") {
-        minimum_minor = std::max(minimum_minor, uint16_t{22});
-        required_features |= NERI_RT_FEATURE_PROCESS_IO;
-      }
-      if (import.link_name.starts_with("neri_rt_v1_file_mutation_")) {
-        minimum_minor = std::max(minimum_minor, uint16_t{22});
-        required_features |= NERI_RT_FEATURE_FILESYSTEM_MUTATION;
-      }
-      if (import.link_name == "neri_rt_v1_net_connect_timeout" ||
-          import.link_name == "neri_rt_v1_net_local_port") {
-        minimum_minor = std::max(minimum_minor, uint16_t{22});
-        required_features |= NERI_RT_FEATURE_SOCKET_ENDPOINTS;
-      }
-      if (import.link_name.starts_with("neri_rt_v1_file_directory_")) {
-        minimum_minor = std::max(minimum_minor, uint16_t{17});
-        required_features |= NERI_RT_FEATURE_DIRECTORY;
-      }
-      if (import.link_name == "neri_rt_v1_net_close_result") {
-        minimum_minor = std::max(minimum_minor, uint16_t{18});
-        required_features |= NERI_RT_FEATURE_SOCKET_CLOSE_RESULT;
-      }
-      if (import.link_name.starts_with("neri_rt_v1_drain_")) {
-        minimum_minor = std::max(minimum_minor, uint16_t{20});
-        required_features |= NERI_RT_FEATURE_DRAIN;
-      }
-      if (import.link_name.starts_with("neri_rt_v1_session_")) {
-        minimum_minor = std::max(minimum_minor, uint16_t{19});
-        required_features |= NERI_RT_FEATURE_SESSION_MODULES;
-      }
-      if (import.link_name == "neri_rt_v1_stdin_read_line_optional") {
-        minimum_minor = std::max(minimum_minor, uint16_t{21});
-        required_features |= NERI_RT_FEATURE_OPTIONAL_CONSOLE_READ;
-      }
-      if (import.link_name.starts_with("neri_rt_v1_terminal_") ||
-          import.link_name.starts_with("neri_rt_v1_clock_")) {
-        minimum_minor = std::max(minimum_minor, uint16_t{8});
-        required_features |= NERI_RT_FEATURE_INTERACTIVE_IO;
-      }
+      minimum_minor = std::max(
+          minimum_minor, neri_abi_symbol_minimum_minor(import.link_name.c_str()));
+      required_features |= neri_abi_symbol_features(import.link_name.c_str());
       if (import.kind == NERI_IR_IMPORT_RUNTIME_V1 &&
           import.minimum_runtime.has_value()) {
         minimum_minor =

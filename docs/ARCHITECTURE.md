@@ -41,6 +41,11 @@ Neri implements readonly views, not that paper's full isolation type system.
 
 ### Effect summaries
 
+`EffectSet` represents function effects; `RuntimeFeatures` represents required
+runtime capabilities. Both expose immutable, named set operations, and their
+distinct types prevent mixing the two domains. Numeric masks cross the IR
+serialization and runtime-manifest boundaries through explicit methods.
+
 `compiler/ir/effects.hk` computes transitive summaries over the lowered call graph,
 including virtual-call targets. Each function starts with its local effects and
 the safepoint effect of known calls. A callee contributes all its effects except
@@ -52,7 +57,7 @@ grow at most eight times, so the queue terminates even for recursive cycles.
 At termination every caller contains its callees' propagated effects. Starting
 from local effects and adding only required bits yields the least fixed point.
 This is a finite monotone dataflow analysis; the general foundation is
-[Kildall's global analysis framework (1973)](https://calhoun.nps.edu/bitstream/10945/42162/1/Kildall_A_unified_approach_1973.pdf).
+[Kildall's global analysis framework (1973)](https://doi.org/10.1145/512927.512945).
 
 For `V` functions and `E` call edges, propagation takes `O(V + 8E)` work and
 scratch storage takes `O(V + E)`. Building the reverse graph still uses linear
@@ -155,6 +160,26 @@ requires an exact matching declaration before lowering emits an import. This
 prevents source from claiming an arbitrary native symbol or weaker effects; it
 does not define public library names. Standard-library declarations select their
 intrinsic IDs in source.
+
+`tooling/abi` defines the declarative catalog for effect bits, runtime capability
+bits, native intrinsics, and symbol-specific runtime requirements. Its Neri
+generator produces the typed compiler definitions and the shared native header.
+The compiler linker and native code generator combine all matching symbol rules;
+exact rules can raise the minimum version required by a broader prefix rule.
+The runtime and its package manifest obtain advertised capabilities from the
+same generated definition.
+
+Bootstrap checks generated artifacts against the catalog before publishing a
+toolchain. Regeneration uses `--write <repository-root>`; verification uses
+`--check <repository-root>` on the executable built from
+`tooling/abi/manifest.json`. The checked-in artifacts support compilation from
+the pinned seed.
+
+This use of one declarative description to produce several consumers follows
+the approach documented by [LLVM TableGen](https://llvm.org/docs/TableGen/).
+Effect summaries retain Neri's own semantics; LLVM's distinction between
+[memory effects and control-flow attributes](https://llvm.org/docs/LangRef.html#function-attributes)
+also motivates keeping `noreturn` separate during call-graph propagation.
 
 The compiler and runtime jointly verify managed representations across the ABI.
 Source declarations provide the scoped-task operation and user-facing signature;
