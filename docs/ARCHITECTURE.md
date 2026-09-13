@@ -166,6 +166,19 @@ restrictions in its [Language Reference](https://llvm.org/docs/LangRef.html#intr
 and recommends intrinsics for extensions expressible as calls in its [extension guide](https://llvm.org/docs/ExtendingLLVM.html).
 Rust provides a related model with compiler-recognized marked [library items](https://rustc-dev-guide.rust-lang.org/lang-items.html).
 
+## Project loading
+
+Project loading retains each failure's typed classification together with its
+display message. Callers use the classification when recovery depends on the
+failure's meaning. The language server can analyze the first unsaved source of
+an empty implicit project; other project-loading failures remain diagnostics.
+The diagnostic wording is presentation data.
+
+This boundary applies the information-hiding criterion in
+[Parnas (1972)](https://www.cs.lafayette.edu/~gexia/cs301/resources/parnas.html):
+the project loader owns failure classification, while its callers own their
+recovery policies.
+
 ## Build driver
 
 `tooling/build.hk` owns native build orchestration, compiler source discovery,
@@ -179,9 +192,10 @@ compiler source list, build graph or language expectations.
 
 The bootstrap release contains a Neri compiler plus its matching codegen and runtime. It compiles the current sources, and the resulting compiler performs the next verified generation.
 Only the pinned seed stage substitutes compiler paths that have mirrored
-`bootstrap/compiler/*` declarations. The mirrors express declaration modifiers
-and native imports in syntax accepted by the pinned seed; they do not enumerate
-compiler sources. Stage 1 and later compile the canonical sources from the
+`bootstrap/compiler/*` declarations. The mirrors express declaration modifiers,
+native imports and the isolated project-error classification in syntax accepted
+by the pinned seed. The build driver owns source discovery. Stage 1 and later
+compile the canonical sources from the
 current manifest, and bootstrap verification compares canonical IR, objects,
 and binaries to a fixed point.
 

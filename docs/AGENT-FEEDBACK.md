@@ -126,6 +126,22 @@ and bound again, and its diagnostics are authoritative. The service does not
 perform token-level constrained decoding, introduce typed holes, run tests, or
 execute, save, or commit code.
 
+## Input contracts
+
+Tool input contracts are declared in typed descriptors. Each descriptor supplies
+its public name, description, input fields and decoder. The same field structure
+produces the advertised JSON Schema and validates required fields, types,
+unknown properties and duplicate keys. Decoding produces a typed request whose
+payload contains the fields available to that operation. Workspace execution
+consumes those requests; JSON parsing and tool-name lookup belong to the protocol
+boundary. Shared input limits measure source text in UTF-8 bytes, while positions
+and ranges use UTF-16 code units.
+
+This applies the single-description approach used by
+[MLIR's Operation Definition Specification](https://mlir.llvm.org/docs/DefiningDialects/Operations/):
+declarative facts drive multiple consistent representations. Neri evaluates its
+descriptors directly in Neri; the descriptors describe the agent protocol.
+
 ## Research basis
 
 [SWE-agent: Agent-Computer Interfaces Enable Automated Software Engineering

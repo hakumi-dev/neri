@@ -1,16 +1,44 @@
 use host
 
 # Agent positions use LSP UTF-16 units, with strict bounds for proposed edits.
-def agentBytePosition(text: String, position: LspJson): Int
-  let offset = lspByteOffset(text, position)
+def agentBytePosition(text: String, position: AgentPosition): Int
+  var offset = 0
+  var currentLine = 0
+  let length = host.stringByteLength(text)
 
-  if offset < 0
+  while offset < length && currentLine < position.line()
+    let byte = host.stringByteAt(text, offset) as Int
+
+    offset = offset + 1
+    if byte == 13
+      if offset < length && (host.stringByteAt(text, offset) as Int) == 10
+        offset = offset + 1
+      end
+      currentLine = currentLine + 1
+    else if byte == 10
+      currentLine = currentLine + 1
+    end
+  end
+  if currentLine != position.line()
     return -1
   end
-  let prefix = host.stringSlice(text, 0, offset)
-  let actual = (new LspJsonParser(lspPosition(text, (new IrSourceMap(prefix)).utf16Length()))).parse()
+  var column = 0
 
-  if actual.get("line").value != position.get("line").value || actual.get("character").value != position.get("character").value
+  while offset < length && column < position.character()
+    let byte = host.stringByteAt(text, offset) as Int
+
+    if byte == 13 || byte == 10
+      return -1
+    end
+    let width = utf16Width(codePointAt(text, offset))
+
+    if column + width > position.character()
+      return -1
+    end
+    column = column + width
+    offset = offset + utf8Width(byte)
+  end
+  if column != position.character()
     return -1
   end
   return offset
@@ -23,9 +51,10 @@ def agentDiagnosticJson(document: LspDocument, start: Int, length: Int, code: St
 end
 
 def agentSourceExcerpt(text: String, position: Int): String
+  let limits = new AgentLimits()
   let map = new IrSourceMap(text)
   let center = map.offsetAt(position)
-  var first = center > 1024 ? center - 1024 : 0
+  var first = center > limits.excerptPrefixBytes() ? center - limits.excerptPrefixBytes() : 0
   let length = host.stringByteLength(text)
 
   while first > 0 && first < length && (host.stringByteAt(text, first) as Int) >= 128 && (host.stringByteAt(text, first) as Int) < 192
@@ -34,7 +63,7 @@ def agentSourceExcerpt(text: String, position: Int): String
   if first > 0 && first < length && (host.stringByteAt(text, first) as Int) == 10 && (host.stringByteAt(text, first - 1) as Int) == 13
     first = first - 1
   end
-  var last = first + 4096
+  var last = first + limits.excerptBytes()
 
   if last > length
     last = length
@@ -53,6 +82,7 @@ def agentSourceExcerpt(text: String, position: Int): String
 end
 
 def agentDocumentDiagnostics(document: LspDocument): String
+  let limits = new AgentLimits()
   let diagnostics = document.lastDiagnostics
   var result = "["
   var separator = ""
@@ -62,10 +92,10 @@ def agentDocumentDiagnostics(document: LspDocument): String
     let published = (new LspJsonParser(document.lastPublishedDiagnostics)).parse()
     var item = published.first
 
-    while item != null && index < 128
+    while item != null && index < limits.diagnosticCount()
       let entry = "{\"uri\":" + lspQuote(document.uri) + ",\"range\":" + lspJsonStringify(item.get("range")) + ",\"severity\":" + lspJsonStringify(item.get("severity")) + ",\"code\":" + lspJsonStringify(item.get("code")) + ",\"message\":" + lspJsonStringify(item.get("message")) + "}"
 
-      if host.stringByteLength(result) + host.stringByteLength(entry) > 65534
+      if host.stringByteLength(result) + host.stringByteLength(entry) > limits.diagnosticBytes()
         break
       end
       result = result + separator + entry
@@ -75,7 +105,7 @@ def agentDocumentDiagnostics(document: LspDocument): String
     end
     return result + "]"
   end
-  while index < diagnostics.count() && index < 128
+  while index < diagnostics.count() && index < limits.diagnosticCount()
     let start = diagnostics.starts.get(index)
     var source = 0
 
@@ -85,7 +115,7 @@ def agentDocumentDiagnostics(document: LspDocument): String
     if source < document.sourceTexts.size
       let entry = agentDiagnosticJson(document, start, diagnostics.lengths.get(index), diagnostics.codes.get(index), diagnostics.messages.get(index))
 
-      if host.stringByteLength(result) + host.stringByteLength(entry) > 65534
+      if host.stringByteLength(result) + host.stringByteLength(entry) > limits.diagnosticBytes()
         break
       end
       result = result + separator + entry
@@ -94,6 +124,98 @@ def agentDocumentDiagnostics(document: LspDocument): String
     index = index + 1
   end
   return result + "]"
+end
+
+class AgentWorkspaceTarget
+  private storedOperationId: String
+  private storedUri: String
+  private storedPath: String
+  private storedDocument: LspDocument?
+
+  def init(operationId: String, uri: String, path: String, document: LspDocument?): Void
+    this.storedOperationId = operationId
+    this.storedUri = uri
+    this.storedPath = path
+    this.storedDocument = document
+  end
+
+  def operationId(): String
+    return this.storedOperationId
+  end
+
+  def uri(): String
+    return this.storedUri
+  end
+
+  def path(): String
+    return this.storedPath
+  end
+
+  def document(): LspDocument?
+    return this.storedDocument
+  end
+
+  def setDocument(document: LspDocument): Void
+    this.storedDocument = document
+  end
+end
+
+class AgentToolExecution
+  private failureResponse: String?
+  private didApply: Bool = false
+  private acceptedFingerprint: String = ""
+
+  def fail(response: String): AgentToolExecution
+    this.failureResponse = response
+    return this
+  end
+
+  def applied(fingerprint: String): AgentToolExecution
+    this.didApply = true
+    this.acceptedFingerprint = fingerprint
+    return this
+  end
+
+  def failure(): String?
+    return this.failureResponse
+  end
+
+  def wasApplied(): Bool
+    return this.didApply
+  end
+
+  def fingerprint(): String
+    return this.acceptedFingerprint
+  end
+end
+
+class AgentToolContext
+  private failureResponse: String?
+  private content: String = ""
+  private sourcePosition: Int = 0
+
+  def fail(response: String): AgentToolContext
+    this.failureResponse = response
+    return this
+  end
+
+  def complete(content: String, position: Int): AgentToolContext
+    this.content = content
+    this.sourcePosition = position
+    return this
+  end
+
+  def failure(): String?
+    return this.failureResponse
+  end
+
+  def json(): String
+    return this.content
+  end
+
+  def position(): Int
+    return this.sourcePosition
+  end
 end
 
 class NeriAgentWorkspace
@@ -124,6 +246,7 @@ class NeriAgentWorkspace
   # Closed dependencies and manifests are observed before each operation.
   # Open buffers remain the source authority until this workspace is disposed.
   def inputFingerprint(): String
+    let limits = new AgentLimits()
     let project = neriLoadProject(this.root, this.unit)
     let paths = new StringBuffer()
     let parts = new StringBuffer()
@@ -131,7 +254,7 @@ class NeriAgentWorkspace
     this.project = project
     this.inputLimit = false
     this.addInput(paths, project.manifest)
-    parts.add(runCacheFrame(project.error) + runCacheFrame(project.kind))
+    parts.add(runCacheFrame(project.error()) + runCacheFrame(project.kind))
     var index = 0
 
     while index < project.sources.size
@@ -172,7 +295,7 @@ class NeriAgentWorkspace
 
     index = 0
     while index < paths.size
-      if paths.size > 1024
+      if paths.size > limits.analysisPaths()
         this.inputLimit = true
         break
       end
@@ -192,7 +315,7 @@ class NeriAgentWorkspace
       parts.add(runCacheFrame(path) + runCacheFrame(digest))
       if text != null
         totalBytes = totalBytes + host.stringByteLength(text)
-        if totalBytes > 16777216
+        if totalBytes > limits.analysisBytes()
           this.inputLimit = true
           break
         end
@@ -270,16 +393,16 @@ class NeriAgentWorkspace
     return "{\"schemaVersion\":1,\"operationId\":" + lspQuote(operation) + ",\"uri\":" + lspQuote(uri) + ",\"revision\":" + (this.revision as String) + ",\"documentVersion\":" + (version as String) + ",\"status\":" + lspQuote(status) + ",\"message\":" + lspQuote(message) + ",\"analysisStatus\":" + lspQuote(analysisStatus) + ",\"analysisRevision\":" + (analysisRevision as String) + ",\"snapshot\":" + lspQuote(snapshot) + ",\"diagnostics\":" + diagnostics + ",\"diagnosticCount\":" + (diagnosticCount as String) + ",\"diagnosticsTruncated\":" + (diagnosticCount > emittedDiagnostics ? "true" : "false") + ",\"effects\":{\"applied\":" + (applied ? "true" : "false") + ",\"analyzed\":" + (analyzed ? "true" : "false") + ",\"persisted\":false,\"executed\":false}" + extra + "}"
   end
 
-  def handleTool(name: String, arguments: LspJson): String
-    let operation = arguments.get("operationId").value
-    let uri = arguments.get("uri").value
+  def handleTool(request: AgentToolRequest): String
+    let operation = request.operationId()
+    let uri = request.uri()
 
     this.refresh()
     if this.inputLimit
       return this.response(operation, uri, "limit", "Workspace analysis inputs exceed 1024 paths or 16 MiB.", null)
     end
-    if this.project.error != ""
-      return this.response(operation, uri, "unavailable", this.project.error, null)
+    if this.project.error() != ""
+      return this.response(operation, uri, "unavailable", this.project.error(), null)
     end
     let rawPath = lspPath(uri)
     var path: String? = null
@@ -291,122 +414,147 @@ class NeriAgentWorkspace
       return this.response(operation, uri, "invalid_request", "URI must identify an existing source in the selected project unit or its references.", null)
     end
     let canonicalUri = lspUri(path)
-    var document = this.server.find(canonicalUri)
-    var applied = false
-    var acceptedFingerprint = this.fingerprint
+    let target = new AgentWorkspaceTarget(operation, canonicalUri, path, this.server.find(canonicalUri))
+    let document = target.document()
 
-    if name == "neri.open"
-      if document != null
-        return this.response(operation, canonicalUri, "conflict", "Buffer is already open; inspect its current revision or edit it.", document)
-      end
-      let proposed = arguments.get("text")
-      var source = host.readText(path)
-
-      if proposed.kind == "string"
-        source = proposed.value
-      end
-      if source == null
-        return this.response(operation, canonicalUri, "not_found", "Source is unavailable.", null)
-      end
-      var count = 0
-      var bytes = host.stringByteLength(source)
-      var other = this.server.documents
-
-      while other != null
-        count = count + 1
-        bytes = bytes + host.stringByteLength(other.text)
-        other = other.next
-      end
-      if count >= 64 || bytes > 8388608 || host.stringByteLength(source) > 1048576
-        return this.response(operation, canonicalUri, "limit", "Buffers are limited to 64 documents, 1 MiB per document and 8 MiB total.", null)
-      end
-      let opened = new LspDocument()
-
-      opened.uri = canonicalUri
-      opened.sourcePath = path
-      opened.text = source
-      opened.version = 1
-      opened.publishDiagnostics = false
-      opened.next = this.server.documents
-      this.server.documents = opened
-      acceptedFingerprint = this.inputFingerprint()
-      if this.inputLimit
-        this.server.documents = opened.next
-        return this.response(operation, canonicalUri, "limit", "Opening this overlay exceeds the workspace analysis input limit.", null)
-      end
-      document = opened
-      applied = true
-    else
-      if document == null
-        return this.response(operation, canonicalUri, "not_found", "Open the buffer before inspecting or editing it.", null)
-      end
-      let expected = agentInteger(arguments.get("expectedRevision"))
-
-      if expected == null || expected != this.revision
-        return this.response(operation, canonicalUri, "conflict", "Workspace revision changed; inspect the current revision before retrying.", document)
-      end
-      if name == "neri.edit"
-        let range = arguments.get("range")
-        let first = agentBytePosition(document.text, range.get("start"))
-        let last = agentBytePosition(document.text, range.get("end"))
-
-        if first < 0 || last < first
-          return this.response(operation, canonicalUri, "invalid_request", "Edit range must lie on UTF-16 scalar boundaries inside the buffer.", document)
-        end
-        let source = host.stringSlice(document.text, 0, first) + arguments.get("text").value + host.stringSlice(document.text, last, host.stringByteLength(document.text) - last)
-        var bytes = host.stringByteLength(source)
-        var other = this.server.documents
-
-        while other != null
-          if other.uri != canonicalUri
-            bytes = bytes + host.stringByteLength(other.text)
-          end
-          other = other.next
-        end
-        if host.stringByteLength(source) > 1048576 || bytes > 8388608
-          return this.response(operation, canonicalUri, "limit", "Edit exceeds the document or workspace buffer limit.", document)
-        end
-        let previous = document.text
-
-        document.text = source
-        acceptedFingerprint = this.inputFingerprint()
-        if this.inputLimit
-          document.text = previous
-          return this.response(operation, canonicalUri, "limit", "Edit exceeds the workspace analysis input limit.", document)
-        end
-        document.version = document.version + 1
-        applied = true
-      end
+    if request.requiresOpenBuffer() && document == null
+      return this.response(operation, canonicalUri, "not_found", "Open the buffer before inspecting or editing it.", null)
     end
-    if document == null
+    let expected = request.expectedRevision()
+
+    if expected != null && expected != this.revision
+      return this.response(operation, canonicalUri, "conflict", "Workspace revision changed; inspect the current revision before retrying.", document)
+    end
+    let execution = request.apply(this, target)
+    let failedExecution = execution.failure()
+
+    if failedExecution != null
+      return failedExecution
+    end
+    let current = target.document()
+
+    if current == null
       return this.response(operation, canonicalUri, "unavailable", "Buffer is unavailable.", null)
     end
-    if applied
+    if execution.wasApplied()
       this.revision = this.revision + 1
       this.server.reanalyze()
-      this.fingerprint = acceptedFingerprint
+      this.fingerprint = execution.fingerprint()
     end
-    this.server.ensureAnalyzed(document)
-    var context = ""
-    var inspectOffset = 0
+    this.server.ensureAnalyzed(current)
+    let context = request.context(this, current)
+    let failedContext = context.failure()
 
-    if name == "neri.inspect"
-      let position = agentBytePosition(document.text, arguments.get("position"))
-
-      if position < 0
-        return this.response(operation, canonicalUri, "invalid_request", "Position is outside the buffer or splits a UTF-16 scalar.", document)
-      end
-      let offset = (new IrSourceMap(host.stringSlice(document.text, 0, position))).utf16Length()
-
-      inspectOffset = offset
-      context = lspAgentContext(document, offset)
+    if failedContext != null
+      return failedContext
     end
     let before = this.revision
 
     this.refresh()
     if this.revision != before
-      return this.response(operation, canonicalUri, "conflict", "Files changed during analysis; inspect the current revision. Applied buffer edits are retained.", document, applied)
+      return this.response(operation, canonicalUri, "conflict", "Files changed during analysis; inspect the current revision. Applied buffer edits are retained.", current, execution.wasApplied())
     end
-    return this.response(operation, canonicalUri, document.analysisStatus, "", document, applied, true, context, inspectOffset)
+    return this.response(operation, canonicalUri, current.analysisStatus, "", current, execution.wasApplied(), true, context.json(), context.position())
+  end
+
+  def applyOpen(request: AgentOpenRequest, target: AgentWorkspaceTarget): AgentToolExecution
+    let result = new AgentToolExecution()
+    let existing = target.document()
+
+    if existing != null
+      return result.fail(this.response(request.operationId(), target.uri(), "conflict", "Buffer is already open; inspect its current revision or edit it.", existing))
+    end
+    let proposed = request.text()
+    var source = host.readText(target.path())
+
+    if proposed != null
+      source = proposed
+    end
+    if source == null
+      return result.fail(this.response(request.operationId(), target.uri(), "not_found", "Source is unavailable.", null))
+    end
+    let limits = new AgentLimits()
+    var count = 0
+    var bytes = host.stringByteLength(source)
+    var other = this.server.documents
+
+    while other != null
+      count = count + 1
+      bytes = bytes + host.stringByteLength(other.text)
+      other = other.next
+    end
+    if count >= limits.bufferDocuments() || bytes > limits.bufferBytes() || host.stringByteLength(source) > limits.documentBytes()
+      return result.fail(this.response(request.operationId(), target.uri(), "limit", "Buffers are limited to 64 documents, 1 MiB per document and 8 MiB total.", null))
+    end
+    let opened = new LspDocument()
+
+    opened.uri = target.uri()
+    opened.sourcePath = target.path()
+    opened.text = source
+    opened.version = 1
+    opened.publishDiagnostics = false
+    opened.next = this.server.documents
+    this.server.documents = opened
+    let acceptedFingerprint = this.inputFingerprint()
+
+    if this.inputLimit
+      this.server.documents = opened.next
+      return result.fail(this.response(request.operationId(), target.uri(), "limit", "Opening this overlay exceeds the workspace analysis input limit.", null))
+    end
+    target.setDocument(opened)
+    return result.applied(acceptedFingerprint)
+  end
+
+  def applyEdit(request: AgentEditRequest, target: AgentWorkspaceTarget): AgentToolExecution
+    let result = new AgentToolExecution()
+    let document = target.document()
+
+    if document == null
+      return result.fail(this.response(request.operationId(), target.uri(), "unavailable", "Buffer is unavailable.", null))
+    end
+    let range = request.range()
+    let first = agentBytePosition(document.text, range.start())
+    let last = agentBytePosition(document.text, range.finish())
+
+    if first < 0 || last < first
+      return result.fail(this.response(request.operationId(), target.uri(), "invalid_request", "Edit range must lie on UTF-16 scalar boundaries inside the buffer.", document))
+    end
+    let source = host.stringSlice(document.text, 0, first) + request.text() + host.stringSlice(document.text, last, host.stringByteLength(document.text) - last)
+    let limits = new AgentLimits()
+    var bytes = host.stringByteLength(source)
+    var other = this.server.documents
+
+    while other != null
+      if other.uri != target.uri()
+        bytes = bytes + host.stringByteLength(other.text)
+      end
+      other = other.next
+    end
+    if host.stringByteLength(source) > limits.documentBytes() || bytes > limits.bufferBytes()
+      return result.fail(this.response(request.operationId(), target.uri(), "limit", "Edit exceeds the document or workspace buffer limit.", document))
+    end
+    let previous = document.text
+
+    document.text = source
+    let acceptedFingerprint = this.inputFingerprint()
+
+    if this.inputLimit
+      document.text = previous
+      return result.fail(this.response(request.operationId(), target.uri(), "limit", "Edit exceeds the workspace analysis input limit.", document))
+    end
+    document.version = document.version + 1
+    return result.applied(acceptedFingerprint)
+  end
+
+  def inspectContext(request: AgentInspectRequest, document: LspDocument): AgentToolContext
+    let result = new AgentToolContext()
+    let position = agentBytePosition(document.text, request.position())
+
+    if position < 0
+      return result.fail(this.response(request.operationId(), document.uri, "invalid_request", "Position is outside the buffer or splits a UTF-16 scalar.", document))
+    end
+    let offset = (new IrSourceMap(host.stringSlice(document.text, 0, position))).utf16Length()
+
+    return result.complete(lspAgentContext(document, offset), offset)
   end
 end
