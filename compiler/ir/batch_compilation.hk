@@ -1,0 +1,113 @@
+use host
+
+class BatchCompilation
+  private dependency: BatchDependency?
+  public reused: Int = 0
+  public analyzed: Int = 0
+  public fallback: Int = 0
+
+  def prepare(combined: String, ids: StringBuffer, texts: StringBuffer, starts: IntBuffer, owners: StringBuffer, consumer: String, timings: Bool): BatchDependency?
+    var count = 0
+    var bytes = 0
+    var identity = ""
+
+    while count < ids.size && owners.get(count) != consumer
+      bytes = bytes + host.stringByteLength(texts.get(count)) + 1
+      identity = identity + runCacheFrame(ids.get(count))
+      count = count + 1
+    end
+    if count == 0 || count == ids.size
+      this.fallback = this.fallback + 1
+      return null
+    end
+    var index = count
+
+    while index < ids.size
+      if owners.get(index) != consumer
+        this.fallback = this.fallback + 1
+        return null
+      end
+      index = index + 1
+    end
+    let offset = starts.get(count)
+    let consumerLexer = new BootstrapLexer(host.stringSlice(combined, bytes, host.stringByteLength(combined) - bytes))
+    let consumerParser = new BootstrapParser(consumerLexer.lex())
+
+    index = count
+    while index < ids.size
+      consumerParser.addSourceBoundary(starts.get(index) - offset)
+      index = index + 1
+    end
+    let consumerRoot = consumerParser.parseProgram()
+
+    if consumerParser.diagnostics.count() != 0
+      this.fallback = this.fallback + 1
+      return null
+    end
+    var followingUses: String[] = []
+
+    index = 0
+    while index < consumerParser.arena.childCountAt(consumerRoot)
+      let node = consumerParser.arena.childAt(consumerRoot, index)
+
+      if consumerParser.arena.kindAt(node) == "Use"
+        let name = consumerParser.arena.dataAt(node)
+
+        followingUses = host.appendString(followingUses, name)
+      end
+      index = index + 1
+    end
+    let prefix = host.stringSlice(combined, 0, bytes)
+
+    identity = sha256FastText(runCacheFrame(identity) + runCacheFrame(prefix))
+    var dependency = this.dependency
+    let reused = dependency != null && dependency.identity == identity && dependency.importScope == dependency.scopeKey(followingUses)
+
+    if !reused
+      let parseStarted = runCacheTime()
+      let lexer = new BootstrapLexer(prefix)
+      let parser = new BootstrapParser(lexer.lex())
+
+      index = 0
+      while index < count
+        parser.addSourceBoundary(starts.get(index))
+        index = index + 1
+      end
+      let root = parser.parseProgram()
+
+      runCacheReport(timings, "dependency-parse", parseStarted)
+      if parser.diagnostics.count() != 0
+        this.fallback = this.fallback + 1
+        return null
+      end
+      let bindStarted = runCacheTime()
+      let binder = new BootstrapBinder(parser.arena, root, offset)
+
+      binder.requireEntryPoint = false
+      binder.followingUses = followingUses
+      binder.clearSources()
+      index = 0
+      while index < count
+        binder.addSource(ids.get(index), starts.get(index))
+        binder.forbiddenEntryPointSources.add(ids.get(index))
+        index = index + 1
+      end
+      let model = binder.bind()
+
+      runCacheReport(timings, "dependency-bind", bindStarted)
+      if model.diagnostics.count() != 0
+        this.fallback = this.fallback + 1
+        return null
+      end
+      dependency = new BatchDependency(identity, parser, root, model, bytes, offset, followingUses)
+      this.dependency = dependency
+      this.analyzed = this.analyzed + 1
+    end
+    if dependency == null || !dependency.accepts(consumerParser, consumerRoot)
+      this.fallback = this.fallback + 1
+      return null
+    end
+    this.reused = this.reused + 1 if reused
+    return dependency
+  end
+end

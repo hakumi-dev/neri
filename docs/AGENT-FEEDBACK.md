@@ -82,6 +82,8 @@ filesystem and process capabilities.
 compiler phases. Libraries produce object files and executable units produce
 executables. Results contain the artifact digest, input fingerprint, normal or
 abnormal exit and measured durations grouped by phase with sample counts.
+Frontend phases distinguish source loading, parsing, binding, IR lowering and
+IR verification (`source-load`, `parse`, `bind`, `lower`, `ir-verify`).
 Object-cache hit and miss events remain distinct phases. `build-complete`
 measures elapsed build time; nested phases overlap, so their durations must not
 be added to derive total time. Applications are not launched. A missing artifact

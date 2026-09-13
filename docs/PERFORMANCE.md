@@ -51,6 +51,56 @@ linking and program execution. `--no-cache` provides an uncached comparison with
 the same compiler, runtime and safety checks. A cache hit still parses, type-checks,
 lowers and verifies the program; it skips native code generation and linking.
 
+Frontend timings distinguish `source-load`, `parse`, `bind`, `lower` and
+`ir-verify`. They use the same JSONL sink consumed by project profiling. The
+`frontend` phase measures their enclosing compilation interval; phase durations
+overlap and must not be added to their enclosing total.
+
+## Batch builds
+
+`neri build-batch --project manifest.json --output-dir build/contracts
+--unit first --unit second --timings` builds the selected executable units in
+one process. The output directory exists before invocation. Each unit has its
+own executable, entry point, consumer declarations and generic specializations.
+All unit selections are validated before compilation starts. A failed build
+returns a nonzero status; artifacts from preceding successful units remain.
+
+The batch retains one dependency analysis in memory. Its identity includes exact
+source contents, ordered source identities and the effective import context.
+Each unit loads its current sources before reuse is considered. An eligible
+dependency prefix is parsed and bound once; child syntax and bound arenas retain
+that analysis while binding each consumer separately. IR lowering, verification,
+partitioning and native artifact checks run for every executable.
+
+Sharing applies when dependencies precede consumer sources in the compiler's
+source order and resolve independently. Consumer declarations that could change
+dependency name resolution, interleaved ownership and dependency diagnostics
+select ordinary whole-program analysis. Changes to dependency contents or import
+resolution establish a new retained analysis. `--no-cache` disables native object
+reuse; the batch still shares eligible in-memory semantic analysis.
+
+Timings report `dependency-parse` and `dependency-bind` when establishing an
+analysis. The final batch summary reports analyzed and reused dependency contexts
+and units that selected whole-program analysis. The compiler tooling contract
+stage uses batch builds and executes each resulting contract with its own process
+and deadline.
+
+Dependency-aware reuse follows the model described in the
+[Rust compiler's incremental compilation guide](https://rustc-dev-guide.rust-lang.org/queries/incremental-compilation.html).
+Neri's batch cache is process-local and retains a whole eligible dependency
+context; it does not persist a fine-grained semantic query graph.
+
+The [macOS ARM64 comparison](../benchmarks/compiler-batch-macos-arm64.json)
+builds `lsp-input-contracts`, `lsp-enter-contracts` and `lsp-rename-contracts`
+against the same source inputs. Both paths were warmed and every measured native
+object lookup was a hit. Three separate baseline invocations took 28.62 s in
+total; the optimized batch took 15.60 s, a 45.5% reduction. It established one
+dependency analysis and reused it twice. All three resulting contracts passed.
+This is one sequential local comparison, including source-loading and symbol
+lookup improvements as well as batching; it does not predict cold CI duration.
+
+## Compiler data structures and native caching
+
 Deterministic IR lowering and transport use one stable, typed merge sort to order
 compiler collections. Ordering takes `O(N log N)` comparisons and preserves
 insertion order for equal keys, following the standard
@@ -356,6 +406,28 @@ Repeat runs and stable target-specific histories are required before setting
 latency or RSS regression percentages.
 
 ## Collections and compiler workloads
+
+Semantic models index class and function names with the compiler's typed
+`StringTable`. Lookups index newly appended declarations and resolve local names
+before consulting the parent model. The first local declaration wins; session
+initializers can append inherited declaration lists before detaching the parent.
+The linked lists retain declaration order and the index retains the same symbol
+objects. This avoids rescanning every local declaration on each lookup.
+
+IR lowering indexes the bound callable and field names once per lowerer.
+Callable lookup preserves function-before-method and local-before-parent
+precedence. Field lookup preserves the first declared owner/name pair. Indexes
+retain live semantic symbols, and qualified field names are constructed when
+indexing rather than on each lookup. Source loading likewise indexes supplied
+canonical paths and source identities; each source's library imports are lexed
+once during that load.
+
+An individual macOS ARM64 comparison compiling `lsp-input-contracts` with
+`--timings` reduced the frontend phase from 8.651 s to 7.292 s. Running the
+baseline contract executable took 0.31 s. These are local observations, not a
+CI-duration prediction or a statistical regression threshold. The frontend
+measurement includes parsing, binding, lowering and IR verification; it is
+separate from native object generation and linking.
 
 `scripts/build.sh benchmark` compiles `benchmarks/collections.hk` with the current
 compiler and runtime. It compares flat-array append with the compiler's actual
