@@ -329,12 +329,20 @@ truncation are separate limits.
 Optional `--state FILE` enables deduplication for hook invocations. The parent
 directory must exist. State is a disposable cache: it records input identity and
 the host session, turn and transcript identity. An unchanged invocation in that
-scope emits `{}`. A new scope receives fresh feedback even for unchanged files.
-Missing turn identity disables deduplication. The input identity includes
+scope emits `{}`. A new scope receives feedback correlated with its current
+operation, reusing valid project analyses when their inputs match. Missing turn
+identity disables message deduplication while permitting project-analysis reuse.
+The input identity includes
 project and unit selection, compiler version and executable digest, the canonical standard-library
 location, its manifest and required sources, and observed project inputs.
 Project scope also records per-unit results.
 When one input closure changes, unaffected units reuse their recorded results.
+Each graph pass shares bounded file-content, digest and import observations
+across units. Verification creates a fresh pass and reads disk again. Project
+feedback brackets unit analysis with these graph checks; standalone unit feedback
+performs its own input checks. Diagnostics use the complete parser and binder
+without recording editor navigation symbols. Inspection and documentation retain
+their semantic symbol indexes.
 The response identifies reused units and keeps their truncation flags. Version 2
 state records carry an integrity digest over scope, inputs and the report.
 Project reports must satisfy their schema and correlated totals before reuse.
