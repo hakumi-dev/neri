@@ -3,6 +3,7 @@
 #include "native_layout.h"
 
 #include "neri/codegen/emitter.h"
+#include "neri/abi_runtime_imports.h"
 #include "neri/ir_transport.h"
 #include "neri/runtime_abi.h"
 
@@ -2840,7 +2841,12 @@ private:
             llvm::GlobalValue::ExternalLinkage, import.link_name, output_.get());
         created->setCallingConv(llvm::CallingConv::C);
         created->addFnAttr(llvm::Attribute::NoUnwind);
-        if ((import.effects & NERI_IR_EFFECT_NO_RETURN_V1) != 0U) {
+        const auto *contract = import.kind == NERI_IR_IMPORT_RUNTIME_V1
+                                   ? neri_abi_runtime_import(import.link_name.c_str())
+                                   : nullptr;
+        if ((import.effects & NERI_IR_EFFECT_NO_RETURN_V1) != 0U ||
+            (contract != nullptr &&
+             (contract->effects & NERI_IR_EFFECT_NO_RETURN_V1) != 0U)) {
           created->addFnAttr(llvm::Attribute::NoReturn);
         }
         declarations.emplace(import.link_name, created);

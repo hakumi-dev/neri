@@ -169,6 +169,18 @@ exact rules can raise the minimum version required by a broader prefix rule.
 The runtime and its package manifest obtain advertised capabilities from the
 same generated definition.
 
+The native verifier checks runtime imports against generated catalog entries.
+Parameter and result types match structurally, including array elements and
+optional values. The declared ABI minor, capabilities and may-effects include
+the catalog's requirements. Unknown runtime symbols and weaker contracts are
+rejected before LLVM generation.
+
+`noreturn` is a positive control-flow guarantee: an import may assert it only
+when the catalog guarantees it. Its omission remains valid for conservative
+producers. The backend obtains the guarantee from the catalog, including for
+`host.exit`; callers receive its may-effects separately from this guarantee.
+Unsafe C ABI imports retain their distinct calling-convention contract.
+
 Bootstrap checks generated artifacts against the catalog before publishing a
 toolchain. Regeneration uses `--write <repository-root>`; verification uses
 `--check <repository-root>` on the executable built from

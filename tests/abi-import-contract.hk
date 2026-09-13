@@ -1,0 +1,240 @@
+use host
+use process
+use test
+
+def abiImportContains(text: String, part: String): Bool
+  var offset = 0
+
+  while offset + host.stringByteLength(part) <= host.stringByteLength(text)
+    var equal = true
+    var index = 0
+
+    while index < host.stringByteLength(part)
+      if host.stringByteAt(text, offset + index) != host.stringByteAt(part, index)
+        equal = false
+      end
+      index = index + 1
+    end
+    if equal
+      return true
+    end
+    offset = offset + 1
+  end
+  return false
+end
+
+def abiImportModule(name: String, linkName: String, resultType: String, parameterTypes: String[], effects: EffectSet, minor: Int, features: RuntimeFeatures): IrModule
+  let module = new IrModule(name, "")
+  let declaration = new IrImport(irSymbol(name, 7, "runtime.import." + name), irType(resultType), 1, linkName, effects, irNoLocation())
+
+  module.requireFeature("native-strings-v1")
+  declaration.runtimeMajor = 1
+  declaration.runtimeMinor = minor
+  declaration.runtimeFeatures = features
+  for parameterType in parameterTypes
+    declaration.parameterTypes.add(irType(parameterType))
+  end
+  module.addImport(declaration)
+  return module
+end
+
+def abiImportTarget(): String
+  let manifest = host.environment("NERI_RUNTIME_MANIFEST")
+
+  if manifest != null && abiImportContains(manifest, "linux-x86_64")
+    return "linux-x86_64"
+  end
+  if manifest != null && abiImportContains(manifest, "windows-x86_64")
+    return "windows-x86_64"
+  end
+  return "macos-arm64"
+end
+
+def abiImportCodegen(module: IrModule, directory: String, name: String): process.PollResult
+  let codegen = host.environment("NERI_CODEGEN")
+
+  test.assertTrue(codegen != null && codegen != "")
+  if codegen == null || codegen == ""
+    return new process.PollResult()
+  end
+  let input = directory + "/" + name + ".nir.hex"
+  let output = directory + "/" + name + ".ll"
+
+  test.assertTrue(host.writeText(input, irSerializeEnvelopeHex(module)))
+  let options = new process.SpawnOptions(codegen)
+
+  options.arguments = [
+    "--input", input,
+    "--input-format", "hex",
+    "--target", abiImportTarget(),
+    "--optimization", "debug",
+    "--emit", "llvm-ir",
+    "--output", output
+  ]
+  let started = process.spawn(options)
+  let child = started.child()
+
+  test.assertTrue(started.failure() == null && child != null)
+  if child == null
+    return new process.PollResult()
+  end
+  let completed = child.wait(30000)
+
+  test.assertTrue(completed.failure == null && !completed.running && !completed.stdoutTruncated && !completed.stderrTruncated)
+  test.assertTrue(child.dispose())
+  return completed
+end
+
+def abiImportAccept(module: IrModule, directory: String, name: String): Void
+  let completed = abiImportCodegen(module, directory, name)
+  let status = completed.exit
+
+  test.assertTrue(status != null && status.kind == "exit" && status.value == 0)
+end
+
+def abiImportReject(module: IrModule, directory: String, name: String, code: String, message: String): Void
+  let completed = abiImportCodegen(module, directory, name)
+  let status = completed.exit
+  let errors = host.stringFromBytes(completed.stderr)
+
+  test.assertTrue(status != null && status.kind == "exit" && status.value == 2)
+  test.assertTrue(errors != null && abiImportContains(errors, code) && abiImportContains(errors, message))
+end
+
+def rejectsUnknownRuntimeSymbol(directory: String): Void
+  let module = abiImportModule("unknown-runtime", "neri_rt_v1_math_abs", "Int", ["Int"], new EffectSet().withMayPanic(), 4, new RuntimeFeatures())
+  let declaration = module.firstImport
+
+  test.assertTrue(declaration != null)
+  if declaration != null
+    declaration.linkName = "neri_rt_v1_not_catalogued"
+  end
+
+  abiImportReject(module, directory, "unknown-runtime", "NIR003", "absent from the ABI catalog")
+end
+
+def rejectsMismatchedSignatures(directory: String): Void
+  let scalar = abiImportModule("scalar-signature", "neri_rt_v1_math_abs", "Int", ["Int"], new EffectSet().withMayPanic(), 4, new RuntimeFeatures())
+  let scalarImport = scalar.firstImport
+
+  abiImportAccept(scalar, directory, "scalar-baseline")
+
+  test.assertTrue(scalarImport != null)
+  if scalarImport != null
+    scalarImport.resultType = irType("Bool")
+  end
+
+  abiImportReject(scalar, directory, "scalar-signature", "NIR006", "signature differs from the ABI catalog")
+
+  let optional = abiImportModule("optional-signature", "neri_rt_v1_host_parse_int", "Int?", ["String"], new EffectSet().withMayPanic(), 6, new RuntimeFeatures().withBootstrapHost())
+  let optionalImport = optional.firstImport
+
+  abiImportAccept(optional, directory, "optional-baseline")
+
+  test.assertTrue(optionalImport != null)
+  if optionalImport != null
+    optionalImport.resultType = irType("Float?")
+  end
+
+  abiImportReject(optional, directory, "optional-signature", "NIR006", "signature differs from the ABI catalog")
+
+  let array = abiImportModule("array-signature", "neri_rt_v1_host_append_byte", "Byte[]", ["Byte[]", "Byte"], new EffectSet().withMayPanic().withManagedAllocate().withSafepoint(), 6, new RuntimeFeatures().withBootstrapHost())
+  let arrayImport = array.firstImport
+
+  abiImportAccept(array, directory, "array-baseline")
+
+  test.assertTrue(arrayImport != null)
+  if arrayImport != null
+    arrayImport.parameterTypes.set(0, irType("Int[]"))
+  end
+
+  abiImportReject(array, directory, "array-signature", "NIR006", "parameter differs from the ABI catalog")
+end
+
+def rejectsWeakenedContract(directory: String): Void
+  let effects = abiImportModule("weaker-effects", "neri_rt_v1_string_concat", "String", ["String", "String"], new EffectSet().withMayPanic().withManagedAllocate().withSafepoint(), 2, new RuntimeFeatures())
+  let effectsImport = effects.firstImport
+
+  abiImportAccept(effects, directory, "effects-baseline")
+
+  test.assertTrue(effectsImport != null)
+  if effectsImport != null
+    effectsImport.effects = effectsImport.effects.withoutSafepoint()
+  end
+
+  abiImportReject(effects, directory, "weaker-effects", "NIR009", "effects contradict the ABI catalog")
+
+  let minor = abiImportModule("insufficient-minor", "neri_rt_v1_host_string_byte_length", "Int", ["String"], new EffectSet().withMayPanic(), 6, new RuntimeFeatures().withBootstrapHost())
+  let minorImport = minor.firstImport
+
+  abiImportAccept(minor, directory, "minor-baseline")
+
+  test.assertTrue(minorImport != null)
+  if minorImport != null
+    minorImport.runtimeMinor = 5
+  end
+
+  abiImportReject(minor, directory, "insufficient-minor", "NIR003", "weakens the catalog ABI requirements")
+
+  let features = abiImportModule("insufficient-features", "neri_rt_v1_host_string_byte_length", "Int", ["String"], new EffectSet().withMayPanic(), 6, new RuntimeFeatures())
+
+  abiImportReject(features, directory, "insufficient-features", "NIR003", "weakens the catalog ABI requirements")
+end
+
+def acceptsConservativeEffectsWithExactNoReturn(directory: String): Void
+  let stronger = abiImportModule("stronger-effects", "neri_rt_v1_math_abs", "Int", ["Int"], new EffectSet().withRead().withMayPanic(), 4, new RuntimeFeatures())
+
+  abiImportAccept(stronger, directory, "stronger-effects")
+
+  let exit = abiImportModule("exact-noreturn", "neri_rt_v1_host_exit", "Void", ["Int"], new EffectSet().withWrite().withMayPanic().withNoReturn(), 6, new RuntimeFeatures().withBootstrapHost())
+
+  abiImportAccept(exit, directory, "exact-noreturn")
+
+  let legacyExit = abiImportModule("legacy-noreturn", "neri_rt_v1_host_exit", "Void", ["Int"], new EffectSet().withWrite().withMayPanic(), 6, new RuntimeFeatures().withBootstrapHost())
+
+  abiImportAccept(legacyExit, directory, "legacy-noreturn")
+
+  let falseNoReturn = abiImportModule("false-noreturn", "neri_rt_v1_math_abs", "Int", ["Int"], new EffectSet().withMayPanic().withNoReturn(), 4, new RuntimeFeatures())
+
+  abiImportReject(falseNoReturn, directory, "false-noreturn", "NIR009", "effects contradict the ABI catalog")
+end
+
+def conditionalNoReturnCaller(compiler: String, directory: String): Void
+  let source = directory + "/conditional-noreturn.hk"
+  let rendered = directory + "/conditional-noreturn.nir"
+  let executable = directory + "/conditional-noreturn"
+  let program = "use console\nuse host\n\ndef conditionalExit(stop: Bool): Void\n  if stop\n    host.exit(9)\n  end\n  console.println(\"continued\")\nend\n\ndef main(): Void\n  conditionalExit(false)\nend\n"
+
+  test.assertTrue(host.writeText(source, program))
+  let renderStatus = host.run(compiler, ["build", source, "--emit=neri-ir", "--output", rendered])
+
+  test.assertTrue(renderStatus != null && renderStatus == 0)
+  let ir = host.readText(rendered)
+
+  test.assertTrue(ir != null)
+  if ir != null
+    test.assertTrue(abiImportContains(ir, "\"runtime.intrinsic.host.exit\"] : (int) -> void kind=runtime link=\"neri_rt_v1_host_exit\" effects=[write, may-panic, noreturn]"))
+    test.assertTrue(abiImportContains(ir, "\"conditionalExit\"] kind=function (bool) -> void effects=[write, may-panic]"))
+  end
+  let buildStatus = host.run(compiler, ["build", source, "--output", executable])
+
+  test.assertTrue(buildStatus != null && buildStatus == 0)
+  let runStatus = host.run(executable, [])
+
+  test.assertTrue(runStatus != null && runStatus == 0)
+end
+
+def main(): Void
+  let compiler = host.argumentAt(1)
+  let directory = host.argumentAt(2)
+
+  test.assertTrue(compiler != null && directory != null)
+  if compiler == null || directory == null
+    return
+  end
+  rejectsUnknownRuntimeSymbol(directory)
+  rejectsMismatchedSignatures(directory)
+  rejectsWeakenedContract(directory)
+  acceptsConservativeEffectsWithExactNoReturn(directory)
+  conditionalNoReturnCaller(compiler, directory)
+end
