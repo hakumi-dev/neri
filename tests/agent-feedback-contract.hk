@@ -1,0 +1,251 @@
+use host
+use process
+use test
+
+def feedbackWrite(path: String, text: String): Void
+  test.assertTrue(host.writeText(path, text))
+end
+
+def feedbackBytes(text: String): Byte[]
+  var result: Byte[] = []
+  var index = 0
+
+  while index < host.stringByteLength(text)
+    result = host.appendByte(result, host.stringByteAt(text, index))
+    index = index + 1
+  end
+  return result
+end
+
+def feedbackObject(text: String): LspJson
+  let parser = new LspJsonParser(text)
+  let value = parser.parse()
+
+  parser.spaces()
+
+  test.assertTrue(!parser.failed && parser.position == host.stringByteLength(text) && value.kind == "object")
+  return value
+end
+
+def feedbackHasDiagnostic(result: LspJson, code: String, uri: String): Bool
+  var diagnostic = result.get("diagnostics").first
+
+  while diagnostic != null
+    if diagnostic.get("code").value == code && diagnostic.get("uri").value == uri
+      return true
+    end
+    diagnostic = diagnostic.next
+  end
+  return false
+end
+
+def feedbackAssert(result: LspJson, operation: String, status: String): Void
+  test.assertEqual(result.get("schemaVersion").value, "1")
+  test.assertEqual(result.get("operationId").value, operation)
+  test.assertEqual(result.get("status").value, status)
+  test.assertTrue(result.get("projectKey").value != "")
+  test.assertTrue(result.get("snapshot").value != "")
+  let effects = result.get("effects")
+
+  test.assertEqual(effects.get("applied").value, "false")
+  test.assertEqual(effects.get("persisted").value, "false")
+  test.assertEqual(effects.get("executed").value, "false")
+end
+
+def feedbackHookInput(session: String, operation: String, workspace: String): String
+  return "{\"session_id\":" + lspQuote(session) + ",\"transcript_path\":null,\"cwd\":" + lspQuote(workspace) + ",\"hook_event_name\":\"PostToolUse\",\"model\":\"contract\",\"turn_id\":\"turn\",\"permission_mode\":\"dontAsk\",\"tool_name\":\"apply_patch\",\"tool_use_id\":" + lspQuote(operation) + ",\"tool_input\":{\"command\":\"edit\"},\"tool_response\":{}}\n"
+end
+
+def feedbackInvoke(compiler: String, workspace: String, state: String, session: String, operation: String, library: String = ""): String
+  let options = new process.SpawnOptions(compiler)
+
+  options.arguments = ["feedback", "--project", workspace, "--unit", "app", "--state", state, "--codex-hook"]
+  let input = feedbackHookInput(session, operation, workspace)
+
+  # Command-hook hosts can close stdin immediately after the JSON object.
+  options.input = feedbackBytes(host.stringSlice(input, 0, host.stringByteLength(input) - 1))
+  options.workingDirectory = workspace
+  if library != ""
+    options.environment = [new process.EnvironmentEntry("NERI_STDLIB", library)]
+  end
+  let started = process.spawn(options)
+  let child = started.child()
+
+  test.assertTrue(started.failure() == null && child != null)
+  if child == null
+    return ""
+  end
+  let completed = child.wait(30000)
+  let exit = completed.exit
+  let output = host.stringFromBytes(completed.stdout)
+
+  test.assertTrue(completed.failure == null && !completed.running && !completed.stdoutTruncated && !completed.stderrTruncated)
+  test.assertTrue(exit != null && exit.kind == "exit" && exit.value == 0)
+  test.assertTrue(output != null)
+  test.assertTrue(child.dispose())
+  if output != null
+    return output
+  end
+  return ""
+end
+
+def feedbackHookResult(output: String): LspJson
+  let hook = feedbackObject(output).get("hookSpecificOutput")
+
+  test.assertEqual(hook.get("hookEventName").value, "PostToolUse")
+  test.assertEqual(hook.get("additionalContext").kind, "string")
+  let context = hook.get("additionalContext").value
+  let newline = bootstrapFindText(context, "\n")
+
+  test.assertTrue(newline >= 0)
+  return feedbackObject(host.stringSlice(context, newline + 1, host.stringByteLength(context) - newline - 1))
+end
+
+def feedbackServiceContract(workspace: String, mainPath: String, mainUri: String, modelPath: String, invalidMain: String, validMain: String, model: String): Void
+  feedbackWrite(mainPath, invalidMain)
+  feedbackWrite(modelPath, model)
+  let session = new AgentFeedbackSession(workspace, "app")
+  let initial = feedbackObject(session.collect("service-error"))
+
+  feedbackAssert(initial, "service-error", "invalid")
+
+  test.assertTrue(feedbackHasDiagnostic(initial, "NR112", mainUri))
+  let initialInputs = session.inputs
+  let overlayWorkspace = new NeriAgentWorkspace(workspace, "app")
+  let overlay = new LspDocument()
+
+  overlay.uri = mainUri
+  overlay.sourcePath = mainPath
+  overlay.text = invalidMain
+  overlay.version = 1
+  overlayWorkspace.server.documents = overlay
+  feedbackWrite(mainPath, validMain)
+  let feedbackTool = agentFindTool("neri.feedback")
+
+  test.assertTrue(feedbackTool != null)
+  if feedbackTool != null
+    let request = feedbackTool.decode(feedbackObject("{\"operationId\":\"mcp-disk\"}"))
+
+    test.assertTrue(request != null)
+    if request != null
+      let mcp = feedbackObject(request.execute(overlayWorkspace))
+
+      feedbackAssert(mcp, "mcp-disk", "valid")
+
+      test.assertFalse(feedbackHasDiagnostic(mcp, "NR112", mainUri))
+      test.assertEqual(overlay.text, invalidMain)
+    end
+  end
+  let repaired = feedbackObject(session.collect("service-repair", initialInputs))
+
+  feedbackAssert(repaired, "service-repair", "valid")
+
+  test.assertFalse(feedbackHasDiagnostic(repaired, "NR112", mainUri))
+  test.assertEqual(session.collect("service-unchanged", session.inputs), "")
+  feedbackWrite(modelPath, "namespace model\n\ndef double(value: String): Int\n  return 0\nend\n")
+  let dependency = feedbackObject(session.collect("service-dependency", session.inputs))
+
+  feedbackAssert(dependency, "service-dependency", "invalid")
+
+  test.assertTrue(feedbackHasDiagnostic(dependency, "NR112", mainUri))
+  feedbackWrite(modelPath, model)
+end
+
+def feedbackCliContract(compiler: String, workspace: String, state: String, mainPath: String, mainUri: String, invalidMain: String, validMain: String): Void
+  feedbackWrite(mainPath, invalidMain)
+  let invalid = feedbackHookResult(feedbackInvoke(compiler, workspace, state, "session-a", "hook-error"))
+
+  feedbackAssert(invalid, "hook-error", "invalid")
+
+  test.assertTrue(feedbackHasDiagnostic(invalid, "NR112", mainUri))
+  feedbackWrite(mainPath, validMain)
+  let repaired = feedbackHookResult(feedbackInvoke(compiler, workspace, state, "session-a", "hook-repair"))
+
+  feedbackAssert(repaired, "hook-repair", "valid")
+
+  let unchanged = feedbackObject(feedbackInvoke(compiler, workspace, state, "session-a", "hook-unchanged"))
+
+  test.assertEqual(unchanged.get("hookSpecificOutput").kind, "missing")
+  let otherSession = feedbackHookResult(feedbackInvoke(compiler, workspace, state, "session-b", "hook-other-session"))
+
+  feedbackAssert(otherSession, "hook-other-session", "valid")
+end
+
+def feedbackStandardLibraryContract(root: String, compiler: String, work: String): Void
+  let workspace = work + "/agent-feedback-stdlib-project"
+  let library = work + "/agent-feedback-stdlib"
+  let state = work + "/agent-feedback-stdlib-state.json"
+  let cleared = host.run("rm", ["-rf", workspace, library, state])
+
+  test.assertTrue(cleared != null && cleared == 0)
+  let made = host.run("mkdir", ["-p", workspace, library + "/alpha"])
+  let core = host.readText(root + "/stdlib/core.hk")
+
+  test.assertTrue(made != null && made == 0 && core != null)
+  if core == null
+    return
+  end
+  feedbackWrite(library + "/core.hk", core)
+  feedbackWrite(library + "/alpha/api.hk", "namespace alpha\n\ndef marker(): Int\n  return 1\nend\n")
+  feedbackWrite(library + "/alpha/implementation.hk", "namespace alpha\n\ndef value(): Int\n  return 1\nend\n")
+  feedbackWrite(library + "/manifest.json", "{\"version\":2,\"defaultUnit\":\"core\",\"units\":{\"core\":{\"kind\":\"library\",\"sources\":[\"core.hk\"]},\"alpha\":{\"kind\":\"library\",\"sources\":[\"alpha/api.hk\",\"alpha/implementation.hk\"]}}}\n")
+  feedbackWrite(workspace + "/manifest.json", "{\"version\":2,\"defaultUnit\":\"app\",\"units\":{\"app\":{\"kind\":\"executable\",\"sources\":[\"main.hk\"]}}}\n")
+  feedbackWrite(workspace + "/main.hk", "use alpha\n\ndef main(): Void\n  let value: Int = alpha.value()\nend\n")
+  let canonicalMain = neriCanonicalPath(workspace + "/main.hk")
+
+  test.assertTrue(canonicalMain != null)
+  if canonicalMain == null
+    return
+  end
+  let mainUri = lspUri(canonicalMain)
+  let initial = feedbackHookResult(feedbackInvoke(compiler, workspace, state, "stdlib-session", "stdlib-valid", library))
+
+  feedbackAssert(initial, "stdlib-valid", "valid")
+  feedbackWrite(library + "/alpha/implementation.hk", "namespace alpha\n\ndef value(): String\n  return \"bad\"\nend\n")
+  let changed = feedbackHookResult(feedbackInvoke(compiler, workspace, state, "stdlib-session", "stdlib-changed", library))
+
+  feedbackAssert(changed, "stdlib-changed", "invalid")
+
+  test.assertTrue(feedbackHasDiagnostic(changed, "NR135", mainUri))
+end
+
+def main(): Void
+  let root = host.argumentAt(0)
+  let compiler = host.argumentAt(1)
+  let work = host.argumentAt(2)
+
+  test.assertTrue(root != null && compiler != null && work != null)
+  if root == null || compiler == null || work == null
+    return
+  end
+  let workspace = work + "/agent-feedback"
+  let state = work + "/agent-feedback-state.json"
+  let cleared = host.run("rm", ["-rf", workspace, state])
+
+  test.assertTrue(cleared != null && cleared == 0)
+  let made = host.run("mkdir", ["-p", workspace])
+
+  test.assertTrue(made != null && made == 0)
+  let manifest = "{\"version\":2,\"defaultUnit\":\"app\",\"units\":{\"app\":{\"kind\":\"executable\",\"sources\":[\"main.hk\"],\"references\":[\"model\"]},\"model\":{\"kind\":\"library\",\"sources\":[\"model.hk\"]}}}\n"
+  let model = "namespace model\n\ndef double(value: Int): Int\n  return value * 2\nend\n"
+  let declarations = "use fields\nuse model\n\nclass Customer\n  public active: Bool = false\nend\n\ndef collect(labels filters: fields of Customer): Void\nend\n\n"
+  let invalidMain = declarations + "def main(): Void\n  collect(active: true)\n  let value = model.double(\"bad\")\nend\n"
+  let validMain = declarations + "def main(): Void\n  collect(active: true)\n  let value = model.double(1)\nend\n"
+  let mainPath = workspace + "/main.hk"
+  let modelPath = workspace + "/model.hk"
+
+  feedbackWrite(workspace + "/manifest.json", manifest)
+  feedbackWrite(mainPath, invalidMain)
+  feedbackWrite(modelPath, model)
+  let canonicalMain = neriCanonicalPath(mainPath)
+
+  test.assertTrue(canonicalMain != null)
+  if canonicalMain == null
+    return
+  end
+  let mainUri = lspUri(canonicalMain)
+
+  feedbackServiceContract(workspace, mainPath, mainUri, modelPath, invalidMain, validMain, model)
+  feedbackCliContract(compiler, workspace, state, mainPath, mainUri, invalidMain, validMain)
+  feedbackStandardLibraryContract(root, compiler, work)
+end

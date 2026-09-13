@@ -44,6 +44,14 @@ limits validate. It advances the buffer version and workspace revision, then
 reanalyzes the source's owning compilation unit and its references. The result reports
 `persisted: false` and `executed: false`.
 
+`neri.feedback` takes an `operationId` and analyzes the selected unit's current
+files on disk, including its references. It uses a separate disk session and
+preserves all unsaved overlays. Its document version is zero; its workspace and
+analysis revisions belong to that disk session. Clients use `snapshot` to
+correlate disk results and obtain overlay concurrency tokens from the overlay
+tools. The selected unit is analyzed through one of its own sources, so changes
+in a referenced library also produce diagnostics in the consumer.
+
 Every tool call requires an `operationId`, which is echoed in its result. Tool
 results include the canonical source URI, workspace revision, document version,
 analysis status, owning-unit `projectKey`, diagnostics, and effect flags. Invalid syntax and type errors
@@ -65,6 +73,9 @@ server observes a change to project inputs, including manifests, closed source
 files, generated-source inputs, and required standard-library sources. An edit
 or inspection with a stale revision returns a conflict. Opening a buffer returns
 the new revision to use for the next operation.
+
+Standard-library observation follows its manifest and every source in imported
+modules, including transitive imports from additional module files.
 
 The **document version** counts accepted in-memory changes to one open buffer.
 It is descriptive; workspace revision is the mutation guard exposed by the
@@ -191,3 +202,91 @@ unfinished expression. It also checks revision conflicts after buffer and disk
 changes, UTF-16 edit boundaries, the published result schema, and MCP lifecycle
 and framing behavior. Source-buffer edits remain in memory throughout the
 protocol conversation.
+
+## Automatic feedback after agent tools
+
+`neri feedback --project ROOT [--unit UNIT] [--operation ID]` analyzes saved
+sources and writes one structured feedback result to standard output. It shares
+`AgentFeedbackSession` with the MCP tool and uses the current parser and binder.
+The command exits successfully when it delivers feedback; consumers inspect
+`status` and `diagnosticCount` to distinguish valid code, invalid code and an
+unavailable analysis. Invalid CLI arguments exit with status 2.
+
+`--codex-hook` reads a bounded JSON hook event from standard input and emits the
+Codex `PostToolUse` response envelope. It correlates feedback with `tool_use_id`
+and places the compiler result in `hookSpecificOutput.additionalContext`. The
+adapter accepts a final JSON value terminated by either a newline or EOF. A
+malformed event produces explicit unavailable feedback. Diagnostic messages and
+source excerpts are identified as program data in the enclosing context.
+
+Configure the project's `.codex/hooks.json`:
+
+```json
+{
+  "hooks": {
+    "PostToolUse": [{
+      "matcher": "*",
+      "hooks": [{
+        "type": "command",
+        "command": "neri feedback --project . --codex-hook",
+        "timeout": 60,
+        "statusMessage": "Analyzing Neri project"
+      }]
+    }]
+  }
+}
+```
+
+Set an absolute project path when tools can run from another directory, and
+select `--unit` for the compilation unit to
+observe. The executable must be the built Neri version containing `feedback`.
+Codex reviews and trusts hook definitions through `/hooks`; a configured hook
+becomes active after the host accepts it. Neri supplies the feedback and Codex
+incorporates it before the agent's next decision. The adapter responds at tool
+completion boundaries, including completed editing commands.
+Delivery follows the host's supported tool paths. Changes made by an external
+editor are observed at the next invocation.
+
+Optional `--state FILE` enables deduplication for hook invocations. The parent
+directory must exist. State is a disposable cache: it records input identity and
+the host session, turn and transcript identity. An unchanged invocation in that
+scope emits `{}`. A new scope receives fresh feedback even for unchanged files.
+Missing turn identity disables deduplication. The input identity includes
+project and unit selection, compiler version, the canonical standard-library
+location, its manifest and required sources, and observed project inputs.
+Replace the cache when using a rebuilt compiler with the same version and
+standard-library location. Installed immutable toolchain locations distinguish
+those toolchains automatically.
+
+State writes concern only this cache. `effects.persisted` describes source-file
+persistence and remains false. A missing, partial or unwritable cache causes
+repeat feedback. Only consistent `valid` or `invalid` analyses populate the
+cache. Analysis checks its inputs again before returning; concurrent changes
+produce `conflict`. Each result describes the observed snapshot, and subsequent
+edits require another analysis. This hook analyzes the selected compilation
+unit; tests, execution and other units have their own verification steps.
+
+The adapter follows the official [Codex hook contract](https://learn.chatgpt.com/docs/hooks).
+The separation of analysis and host delivery also permits other clients to use
+MCP or the plain JSON command. MCP resource subscriptions are an optional
+transport facility; [the MCP resource contract](https://modelcontextprotocol.io/specification/2025-11-25/server/resources)
+leaves context incorporation to the host application.
+
+[Reflexion (Shinn et al., 2023)](https://arxiv.org/abs/2303.11366) studies the use
+of task feedback across agent attempts. Together with SWE-agent's interface
+study, it motivates the edit/analyze/repair cycle. Protocol tests establish
+Neri's feedback delivery and revision behavior; agent task-success improvements
+require a separate evaluation.
+
+The integration contract can be reproduced with:
+
+```sh
+neri_feedback_work=$(mktemp -d)
+scripts/neri.sh run --project . --unit agent-feedback-contracts -- \
+  "$PWD" "$PWD/build/current/bin/neri" "$neri_feedback_work"
+```
+
+It exercises disk errors and repairs, consumer diagnostics after dependency
+changes, overlay isolation, hook delivery and deduplication, and changes in an
+additional source of a standard-library module. The MCP protocol contract also
+checks the published feedback schema and preservation of overlay revisions.
