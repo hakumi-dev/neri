@@ -114,10 +114,12 @@ child-model names take precedence over parent names with the same spelling.
 Generated session names are excluded. The service does not claim that its list
 is a proof of every syntactically or semantically valid insertion.
 
-Installed-toolchain `use` completion adds names read only from
-`ARTIFACTS.sha256` entries under `stdlib/`; it does not list the standard-library
-directory or parse unimported library sources. The normal source lookup still
-binds explicit imports independently of this completion catalog.
+Installed-toolchain `use` completion reads module names from
+`stdlib/manifest.json`, without parsing unimported library sources. Legacy
+toolchains without this manifest use `ARTIFACTS.sha256` entries under `stdlib/`.
+Explicit imports resolve all sources of the selected library unit, including
+transitive imports declared by any of its files. Captured source bytes retain
+their relative paths for diagnostics and frozen session submissions.
 
 The language server serializes the same typed candidates into LSP completion
 items. It returns a normal array when the list is complete and an LSP

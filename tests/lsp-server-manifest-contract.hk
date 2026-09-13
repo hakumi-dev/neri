@@ -205,6 +205,68 @@ def snapshotSourceContracts(): Void
   test.assertEqual(lspSnapshotSourceOffset(snapshot, 99), 59)
 end
 
+def namespaceSubmissionContract(): Void
+  let source = "namespace sample\n\ndef value(): Int\n  return 1\nend\n"
+  let parser = new BootstrapParser((new BootstrapLexer(source)).lex())
+  let submission = parser.parseSubmission()
+
+  test.assertEqual(parser.diagnostics.count(), 0)
+  test.assertEqual(semanticIntField(parser.arena.dataAt(submission.root), 5), 1)
+  test.assertEqual(submission.declarationCount, 1)
+  let namespaceNode = parser.arena.childAt(submission.root, 2)
+  let nameNode = parser.arena.childAt(namespaceNode, 0)
+
+  test.assertEqual(parser.arena.kindAt(namespaceNode), "Namespace")
+  test.assertEqual(parser.arena.dataAt(namespaceNode), "sample")
+  test.assertEqual(parser.arena.startAt(nameNode), bootstrapFindText(source, "sample"))
+  test.assertEqual(parser.arena.lengthAt(nameNode), 6)
+end
+
+def splitNamespaceDefinitionContract(): Void
+  let firstSource = "use split\nnamespace split\ndef first(): Int\n  return 1\nend\n"
+  let secondSource = "namespace split\ndef second(): Int\n  return 2\nend\n"
+  let secondStart = (new IrSourceMap(firstSource + "\n")).utf16Length()
+  let source = firstSource + "\n" + secondSource
+  let tokens = (new BootstrapLexer(source)).lex()
+  let parser = new BootstrapParser(tokens)
+
+  parser.addSourceBoundary(0)
+  parser.addSourceBoundary(secondStart)
+  let root = parser.parseProgram()
+  let binder = new BootstrapBinder(parser.arena, root, (new IrSourceMap(source)).utf16Length())
+
+  binder.recordSourceSymbols = true
+  binder.requireEntryPoint = false
+  binder.clearSources()
+  binder.addSource("file:///first-split.hk", 0)
+  binder.addSource("file:///second-split.hk", secondStart)
+  let document = new LspDocument()
+
+  document.uri = "file:///first-split.hk"
+  document.text = firstSource
+  document.semantic = binder.bind()
+  document.sourceUris.add(document.uri)
+  document.sourceUris.add("file:///second-split.hk")
+  document.sourceTexts.add(firstSource)
+  document.sourceTexts.add(secondSource)
+  document.sourceStarts.add(0)
+  document.sourceStarts.add(secondStart)
+  let definition = lspDefinition(document, bootstrapFindText(source, "use split") + 4)
+  let parsed = (new LspJsonParser(definition)).parse()
+  let first = parsed.first
+
+  test.assertTrue(parsed.kind == "array" && first != null)
+  if first != null
+    let second = first.next
+
+    test.assertTrue(second != null)
+    if second != null
+      test.assertTrue(second.next == null)
+      test.assertTrue((first.get("uri").value == "file:///first-split.hk" && second.get("uri").value == "file:///second-split.hk") || (first.get("uri").value == "file:///second-split.hk" && second.get("uri").value == "file:///first-split.hk"))
+    end
+  end
+end
+
 def main(): Void
   let root = host.argumentAt(0)
 
@@ -216,6 +278,28 @@ def main(): Void
   abstractLspContracts()
   queryTableContracts()
   snapshotSourceContracts()
+  namespaceSubmissionContract()
+  splitNamespaceDefinitionContract()
+
+  let emptyRoot = root + "/tests/lsp/empty-implicit"
+  let emptyProject = neriLoadProject(emptyRoot)
+
+  test.assertEqual(emptyProject.error(), "An implicit project must contain at least one .hk source.")
+  test.assertTrue(neriProjectErrorReasonIsEmptyImplicitProject(emptyProject.errorReason()))
+  let invalidProject = neriLoadProject(root + "/tests/lsp/project/invalid-name.json")
+
+  test.assertTrue(invalidProject.errorReason() != null)
+  test.assertFalse(neriProjectErrorReasonIsEmptyImplicitProject(invalidProject.errorReason()))
+  let unsavedPath = emptyRoot + "/unsaved.hk"
+  let unsaved = document(unsavedPath, "def main(): Void\nend\n")
+  let unsavedServer = new LspServer()
+
+  unsavedServer.rootPath = emptyRoot
+  unsavedServer.documents = unsaved
+  unsavedServer.analyze(unsaved)
+
+  test.assertTrue(analyzed(unsaved))
+  test.assertEqual(unsaved.lastPublishedDiagnostics, "[]")
 
   let canonicalRoot = root + "/tests/lsp/manifest-workspace"
   let canonicalMain = canonicalRoot + "/main.hk"
@@ -235,6 +319,15 @@ def main(): Void
   test.assertEqual(canonical.nearestProjectRoot(canonicalMain), canonicalRoot)
   test.assertTrue(analyzed(canonicalDocument))
   test.assertEqual(canonicalDocument.sourceUris.size, 3)
+  let unowned = document(canonicalRoot + "/unowned.hk", "def unowned(): Int\n  return 1\nend\n")
+
+  canonical.documents = unowned
+  canonical.analyze(unowned)
+
+  test.assertEqual(unowned.analysisStatus, "unavailable")
+  test.assertTrue(unowned.semantic == null)
+  test.assertTrue(containsText(unowned.lastPublishedDiagnostics, "\"severity\":3"))
+  test.assertTrue(containsText(unowned.lastPublishedDiagnostics, "\"code\":\"NR_PROJECT_CONTEXT\""))
   let corePath = root + "/stdlib/core.hk"
   let coreDocument = document(corePath, sourceText(corePath))
   let coreServer = new LspServer()
@@ -279,6 +372,29 @@ def main(): Void
   test.assertEqual(implicit.nearestProjectRoot(implicitMain), implicitRoot)
   test.assertTrue(analyzed(main))
   test.assertEqual(main.sourceUris.size, 3)
+  let symlinkFixture = bootstrapTemporaryDirectory(root + "/build", "lsp-symlink-boundary")
+
+  test.assertTrue(symlinkFixture != null)
+  if symlinkFixture != null
+    let actualRoot = symlinkFixture + "/actual"
+    let linkedRoot = symlinkFixture + "/linked"
+    let actualMade = host.run("mkdir", ["-p", actualRoot])
+    let actualMain = actualRoot + "/main.hk"
+
+    test.assertTrue(actualMade != null && actualMade == 0)
+    test.assertTrue(host.writeText(actualMain, "def local(): Int\n  return 1\nend\n"))
+    let linked = host.run("ln", ["-s", actualRoot, linkedRoot])
+
+    test.assertTrue(linked != null && linked == 0)
+    let symlinkServer = new LspServer()
+
+    symlinkServer.rootPath = linkedRoot
+
+    test.assertEqual(symlinkServer.nearestProjectRoot(linkedRoot + "/main.hk"), actualRoot)
+    let removed = host.run("rm", ["-rf", symlinkFixture])
+
+    test.assertTrue(removed != null && removed == 0)
+  end
 
   let overlay = document(implicitHelper, "namespace implicitdemo\n\ndef helper(): String\n  return \"changed\"\nend\n")
 
@@ -399,12 +515,22 @@ def main(): Void
   libraryServer.analyze(libraryDocument)
 
   test.assertTrue(analyzed(libraryDocument))
+  test.assertTrue(containsText(definitionAt(libraryDocument, librarySource, "use console", 4), "console.hk"))
+  test.assertTrue(containsText(definitionAt(libraryDocument, librarySource, "console.println", 2), "console.hk"))
   test.assertTrue(containsText(definitionAt(libraryDocument, librarySource, "console.println", 9), "console.hk"))
   test.assertTrue(containsText(definitionAt(libraryDocument, librarySource, "math.max", 6), "math.hk"))
   test.assertTrue(containsText(definitionAt(libraryDocument, librarySource, "test.assertEqual", 7), "test.hk"))
   test.assertTrue(containsText(definitionAt(libraryDocument, librarySource, "host.argumentCount", 7), "host.hk"))
   test.assertTrue(containsText(definitionAt(libraryDocument, librarySource, "tasks.generate", 7), "tasks.hk"))
   test.assertTrue(containsText(lspCompletion(libraryDocument, textOffset(librarySource, "console.println") + 8), "\"label\":\"println\""))
+  let librarySnapshot = snapshot(libraryDocument, "library-declarations", 1)
+  let importRename = lspPrepareRename(librarySnapshot, textOffset(librarySource, "use console") + 4)
+  let qualifierRename = lspPrepareRename(librarySnapshot, textOffset(librarySource, "console.println") + 2)
+  let directRename = lspRename(librarySnapshot, textOffset(librarySource, "use console") + 4, "terminal")
+
+  test.assertTrue(containsText(importRename.error, "Namespaces cannot be renamed safely"))
+  test.assertTrue(containsText(qualifierRename.error, "Namespaces cannot be renamed safely"))
+  test.assertTrue(containsText(directRename.error, "Namespaces cannot be renamed safely"))
   let equalitySource = "def same<T: Equality>(left: T, right: T): Bool\n  return left == right\nend\n\ndef main(): Void\n  let equal = same(1, 1)\nend\n"
   let equalityDocument = new LspDocument()
 

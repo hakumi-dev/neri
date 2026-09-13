@@ -1,0 +1,422 @@
+use host
+use process
+use test
+
+def agentWrite(path: String, text: String): Void
+  test.assertTrue(host.writeText(path, text))
+end
+
+def agentBytes(text: String): Byte[]
+  var result: Byte[] = []
+  var index = 0
+
+  while index < host.stringByteLength(text)
+    result = host.appendByte(result, host.stringByteAt(text, index))
+    index = index + 1
+  end
+  return result
+end
+
+def agentRequest(id: Int, method: String, parameters: String): String
+  return "{\"jsonrpc\":\"2.0\",\"id\":" + (id as String) + ",\"method\":" + lspQuote(method) + ",\"params\":" + parameters + "}\n"
+end
+
+def agentStringRequest(id: String, method: String, parameters: String): String
+  return "{\"jsonrpc\":\"2.0\",\"id\":" + lspQuote(id) + ",\"method\":" + lspQuote(method) + ",\"params\":" + parameters + "}\n"
+end
+
+def agentNotification(method: String, parameters: String): String
+  return "{\"jsonrpc\":\"2.0\",\"method\":" + lspQuote(method) + ",\"params\":" + parameters + "}\n"
+end
+
+def agentTool(id: Int, name: String, arguments: String): String
+  return agentRequest(id, "tools/call", "{\"name\":" + lspQuote(name) + ",\"arguments\":" + arguments + "}")
+end
+
+def agentPosition(line: Int, character: Int): String
+  return "{\"line\":" + (line as String) + ",\"character\":" + (character as String) + "}"
+end
+
+def agentRange(startLine: Int, startCharacter: Int, endLine: Int, endCharacter: Int): String
+  return "{\"start\":" + agentPosition(startLine, startCharacter) + ",\"end\":" + agentPosition(endLine, endCharacter) + "}"
+end
+
+def agentResponseForId(output: String, id: String): LspJson
+  var remaining = output
+
+  while host.stringByteLength(remaining) > 0
+    let newline = bootstrapFindText(remaining, "\n")
+    let length = newline < 0 ? host.stringByteLength(remaining) : newline
+    let line = host.stringSlice(remaining, 0, length)
+
+    if line != ""
+      let parser = new LspJsonParser(line)
+      let message = parser.parse()
+
+      parser.spaces()
+
+      test.assertTrue(!parser.failed && parser.position == host.stringByteLength(line))
+      test.assertEqual(message.get("jsonrpc").value, "2.0")
+      let responseId = message.get("id")
+
+      if responseId.value == id || (id == "" && responseId.kind == "literal" && responseId.value == "null")
+        return message
+      end
+    end
+    if newline < 0
+      break
+    end
+    remaining = host.stringSlice(remaining, newline + 1, host.stringByteLength(remaining) - newline - 1)
+  end
+
+  test.assertTrue(false)
+  return new LspJson()
+end
+
+def agentResponse(output: String, id: Int): LspJson
+  return agentResponseForId(output, id as String)
+end
+
+def agentSchemaTypeMatches(value: LspJson, typeName: String): Bool
+  if typeName == "integer"
+    return value.kind == "number" && host.parseInt(value.value) != null
+  end
+  if typeName == "boolean"
+    return value.kind == "literal" && (value.value == "true" || value.value == "false")
+  end
+  if typeName == "string" || typeName == "object" || typeName == "array"
+    return value.kind == typeName
+  end
+  return false
+end
+
+def agentAssertSchema(value: LspJson, schema: LspJson): Void
+  let properties = schema.get("properties")
+  let required = schema.get("required")
+
+  test.assertEqual(schema.get("additionalProperties").value, "false")
+  var field = value.first
+
+  while field != null
+    let property = properties.get(field.key)
+
+    test.assertTrue(property.kind == "object" && agentSchemaTypeMatches(field, property.get("type").value))
+    field = field.next
+  end
+  var name = required.first
+
+  while name != null
+    test.assertEqual(name.kind, "string")
+    test.assertTrue(value.get(name.value).kind != "missing")
+    name = name.next
+  end
+end
+
+def agentListedOutputSchema(tools: LspJson, name: String): LspJson
+  var tool = tools.get("tools").first
+
+  while tool != null
+    if tool.get("name").value == name
+      return tool.get("outputSchema")
+    end
+    tool = tool.next
+  end
+
+  test.assertTrue(false)
+  return new LspJson()
+end
+
+def agentStructured(output: String, id: Int, schema: LspJson): LspJson
+  let result = agentResponse(output, id).get("result")
+  let structured = result.get("structuredContent")
+
+  test.assertEqual(structured.kind, "object")
+  test.assertEqual(result.get("content").kind, "array")
+  agentAssertSchema(structured, schema)
+  return structured
+end
+
+def agentAssertResult(result: LspJson, operationId: String, uri: String, revision: Int, documentVersion: Int, status: String, analysisStatus: String, applied: Bool, analyzed: Bool): Void
+  test.assertEqual(result.get("schemaVersion").value, "1")
+  test.assertEqual(result.get("operationId").value, operationId)
+  test.assertEqual(result.get("uri").value, uri)
+  test.assertEqual(result.get("revision").value, revision as String)
+  test.assertEqual(result.get("documentVersion").value, documentVersion as String)
+  test.assertEqual(result.get("status").value, status)
+  test.assertEqual(result.get("analysisStatus").value, analysisStatus)
+  let effects = result.get("effects")
+
+  test.assertEqual(effects.get("applied").value, applied ? "true" : "false")
+  test.assertEqual(effects.get("analyzed").value, analyzed ? "true" : "false")
+  test.assertEqual(effects.get("persisted").value, "false")
+  test.assertEqual(effects.get("executed").value, "false")
+end
+
+def agentHasDiagnostic(result: LspJson, code: String, uri: String): Bool
+  var diagnostic = result.get("diagnostics").first
+
+  while diagnostic != null
+    if diagnostic.get("code").value == code && diagnostic.get("uri").value == uri
+      return true
+    end
+    diagnostic = diagnostic.next
+  end
+  return false
+end
+
+def agentInvoke(compiler: String, workspace: String, input: Byte[]): String
+  let options = new process.SpawnOptions(compiler)
+
+  options.arguments = ["agent", "--project", workspace, "--unit", "app"]
+  options.input = input
+  options.workingDirectory = workspace
+  let started = process.spawn(options)
+  let child = started.child()
+
+  test.assertTrue(started.failure() == null && child != null)
+  if child == null
+    return ""
+  end
+  let completed = child.wait(30000)
+  let exit = completed.exit
+  let output = host.stringFromBytes(completed.stdout)
+
+  test.assertTrue(completed.failure == null && !completed.running && !completed.stdoutTruncated && !completed.stderrTruncated)
+  test.assertTrue(exit != null && exit.kind == "exit" && exit.value == 0)
+  test.assertTrue(output != null)
+  test.assertTrue(child.dispose())
+  if output != null
+    return output
+  end
+  return ""
+end
+
+def agentObject(text: String): LspJson
+  let parser = new LspJsonParser(text)
+  let value = parser.parse()
+
+  parser.spaces()
+
+  test.assertTrue(!parser.failed && parser.position == host.stringByteLength(text) && value.kind == "object")
+  return value
+end
+
+def agentTypedCall(workspace: NeriAgentWorkspace, name: String, arguments: String): String
+  let tool = agentFindTool(name)
+
+  test.assertTrue(tool != null)
+  if tool == null
+    return ""
+  end
+  let request = tool.decode(agentObject(arguments))
+
+  test.assertTrue(request != null)
+  if request == null
+    return ""
+  end
+  return request.execute(workspace)
+end
+
+def agentDescriptorAccepts(name: String, arguments: String): Bool
+  let tool = agentFindTool(name)
+
+  test.assertTrue(tool != null)
+  return tool != null && tool.decode(agentObject(arguments)) != null
+end
+
+def agentRepeat(value: String, count: Int): String
+  var result = ""
+  var index = 0
+
+  while index < count
+    result = result + value
+    index = index + 1
+  end
+  return result
+end
+
+def agentDescriptorContract(): Void
+  test.assertTrue(agentDescriptorAccepts("neri.open", "{\"operationId\":\"open\",\"uri\":\"file:///source.hk\"}"))
+  test.assertTrue(agentDescriptorAccepts("neri.open", "{\"operationId\":" + lspQuote(agentRepeat("é", 128)) + ",\"uri\":\"file:///source.hk\"}"))
+  test.assertFalse(agentDescriptorAccepts("neri.open", "{\"operationId\":" + lspQuote(agentRepeat("é", 129)) + ",\"uri\":\"file:///source.hk\"}"))
+  test.assertFalse(agentDescriptorAccepts("neri.open", "{\"operationId\":\"open\",\"uri\":\"file:///source.hk\",\"text\":null}"))
+  test.assertFalse(agentDescriptorAccepts("neri.open", "{\"operationId\":\"open\",\"uri\":\"file:///source.hk\",\"extra\":true}"))
+  test.assertFalse(agentDescriptorAccepts("neri.open", "{\"operationId\":\"first\",\"operationId\":\"second\",\"uri\":\"file:///source.hk\"}"))
+  test.assertFalse(agentDescriptorAccepts("neri.inspect", "{\"operationId\":\"inspect\",\"uri\":\"file:///source.hk\",\"expectedRevision\":0,\"position\":{\"line\":0,\"character\":0,\"extra\":0}}"))
+  test.assertFalse(agentDescriptorAccepts("neri.inspect", "{\"operationId\":\"inspect\",\"uri\":\"file:///source.hk\",\"expectedRevision\":0,\"position\":{\"line\":0,\"line\":1,\"character\":0}}"))
+  test.assertFalse(agentDescriptorAccepts("neri.edit", "{\"operationId\":\"edit\",\"uri\":\"file:///source.hk\",\"expectedRevision\":0,\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":-1,\"character\":0}},\"text\":\"\"}"))
+end
+
+def agentPositionContract(): Void
+  let source = "a\r\n😀\rb\n"
+
+  test.assertEqual(agentBytePosition(source, new AgentPosition(1, 2)), 7)
+  test.assertEqual(agentBytePosition(source, new AgentPosition(2, 0)), 8)
+  test.assertEqual(agentBytePosition(source, new AgentPosition(3, 0)), 10)
+  test.assertEqual(agentBytePosition(source, new AgentPosition(1, 1)), -1)
+  test.assertEqual(agentBytePosition(source, new AgentPosition(0, 2)), -1)
+end
+
+def agentClosedDependencyContract(workspacePath: String, mainUri: String, modelPath: String, model: String): Void
+  let workspace = new NeriAgentWorkspace(workspacePath, "app")
+  let opened = agentObject(agentTypedCall(workspace, "neri.open", "{\"operationId\":\"dependency-open\",\"uri\":" + lspQuote(mainUri) + "}"))
+  let changedModel = "namespace model\n\ndef double(value: String): Int\n  return 0\nend\n"
+
+  agentWrite(modelPath, changedModel)
+  let stale = agentObject(agentTypedCall(workspace, "neri.inspect", "{\"operationId\":\"dependency-stale\",\"uri\":" + lspQuote(mainUri) + ",\"expectedRevision\":1,\"position\":" + agentPosition(4, 28) + "}"))
+  let refreshed = agentObject(agentTypedCall(workspace, "neri.inspect", "{\"operationId\":\"dependency-refresh\",\"uri\":" + lspQuote(mainUri) + ",\"expectedRevision\":2,\"position\":" + agentPosition(4, 28) + "}"))
+
+  agentWrite(modelPath, model)
+
+  agentAssertResult(opened, "dependency-open", mainUri, 1, 1, "valid", "valid", true, true)
+  agentAssertResult(stale, "dependency-stale", mainUri, 2, 1, "conflict", "unavailable", false, false)
+  agentAssertResult(refreshed, "dependency-refresh", mainUri, 2, 1, "invalid", "invalid", false, true)
+
+  test.assertTrue(agentHasDiagnostic(refreshed, "NR112", mainUri))
+end
+
+def main(): Void
+  let compiler = host.argumentAt(1)
+  let work = host.argumentAt(2)
+
+  test.assertTrue(compiler != null && work != null)
+  if compiler == null || work == null
+    return
+  end
+  agentDescriptorContract()
+  agentPositionContract()
+  let workspace = work + "/agent-protocol"
+  let made = host.run("mkdir", ["-p", workspace])
+
+  test.assertTrue(made != null && made == 0)
+  let manifest = "{\"version\":2,\"defaultUnit\":\"app\",\"units\":{\"app\":{\"kind\":\"executable\",\"sources\":[\"main.hk\",\"model.hk\"]}}}\n"
+  let model = "namespace model\n\ndef double(value: Int): Int\n  return value * 2\nend\n"
+  let diskMain = "use model\n\ndef main(): Void\n  let emoji = \"🙂\"\n  let result = model.double(1)\nend\n"
+  let invalidMain = "use model\n\ndef main(): Void\n  let emoji = \"🙂\"\n  let result = model.double(\"bad\")\nend\n"
+
+  agentWrite(workspace + "/manifest.json", manifest)
+  agentWrite(workspace + "/model.hk", model)
+  agentWrite(workspace + "/main.hk", diskMain)
+  let modelPath = neriCanonicalPath(workspace + "/model.hk")
+  let mainPath = neriCanonicalPath(workspace + "/main.hk")
+
+  test.assertTrue(modelPath != null && mainPath != null)
+  if modelPath == null || mainPath == null
+    return
+  end
+  let modelUri = lspUri(modelPath)
+  let mainUri = lspUri(mainPath)
+  let initialization = "{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{},\"clientInfo\":{\"name\":\"neri-agent-contract\",\"version\":\"1\"}}"
+  var input = agentStringRequest("initialized-request", "notifications/initialized", "{}")
+
+  input = input + agentStringRequest("locked", "tools/list", "{}")
+  input = input + agentRequest(1, "initialize", initialization)
+  input = input + agentNotification("notifications/initialized", "{}")
+  input = input + agentRequest(2, "tools/list", "{}")
+  input = input + agentStringRequest("unknown", "tools/call", "{\"name\":\"neri.unknown\",\"arguments\":{}}")
+  input = input + agentTool(12, "neri.inspect", "{\"operationId\":\"malformed\",\"uri\":" + lspQuote(modelUri) + "}")
+  input = input + agentTool(3, "neri.open", "{\"operationId\":\"open-model\",\"uri\":" + lspQuote(modelUri) + ",\"text\":" + lspQuote(model) + "}")
+  input = input + agentTool(4, "neri.open", "{\"operationId\":\"duplicate-model\",\"uri\":" + lspQuote(modelUri) + ",\"text\":" + lspQuote("namespace model\n\ndef double(value: String): Int\n  return 0\nend\n") + "}")
+  input = input + agentTool(5, "neri.open", "{\"operationId\":\"open-main\",\"uri\":" + lspQuote(mainUri) + ",\"text\":" + lspQuote(invalidMain) + "}")
+  input = input + agentTool(6, "neri.edit", "{\"operationId\":\"stale-repair\",\"uri\":" + lspQuote(mainUri) + ",\"expectedRevision\":1,\"range\":" + agentRange(4, 28, 4, 33) + ",\"text\":\"1\"}")
+  input = input + agentTool(7, "neri.edit", "{\"operationId\":\"repair\",\"uri\":" + lspQuote(mainUri) + ",\"expectedRevision\":2,\"range\":" + agentRange(4, 28, 4, 33) + ",\"text\":\"1\"}")
+  input = input + agentTool(8, "neri.edit", "{\"operationId\":\"remove-argument\",\"uri\":" + lspQuote(mainUri) + ",\"expectedRevision\":3,\"range\":" + agentRange(4, 28, 4, 29) + ",\"text\":\"\"}")
+  input = input + agentTool(9, "neri.edit", "{\"operationId\":\"outside-range\",\"uri\":" + lspQuote(mainUri) + ",\"expectedRevision\":4,\"range\":" + agentRange(99, 0, 99, 0) + ",\"text\":\"bad\"}")
+  input = input + agentTool(10, "neri.edit", "{\"operationId\":\"split-unicode\",\"uri\":" + lspQuote(mainUri) + ",\"expectedRevision\":4,\"range\":" + agentRange(3, 16, 3, 17) + ",\"text\":\"bad\"}")
+  input = input + agentTool(13, "neri.feedback", "{\"operationId\":\"disk-feedback\"}")
+  input = input + agentTool(11, "neri.inspect", "{\"operationId\":\"inspect-missing\",\"uri\":" + lspQuote(mainUri) + ",\"expectedRevision\":4,\"position\":" + agentPosition(4, 28) + "}")
+  let output = agentInvoke(compiler, workspace, agentBytes(input))
+  let initializedRequest = agentResponseForId(output, "initialized-request")
+  let locked = agentResponseForId(output, "locked")
+
+  test.assertEqual(initializedRequest.get("error").get("code").value, "-32600")
+  test.assertEqual(locked.get("error").get("code").value, "-32002")
+  let initialized = agentResponse(output, 1).get("result")
+
+  test.assertEqual(initialized.get("protocolVersion").value, "2025-11-25")
+  let unknown = agentResponseForId(output, "unknown")
+
+  test.assertEqual(unknown.get("id").value, "unknown")
+  test.assertEqual(unknown.get("error").get("code").value, "-32602")
+  let tools = agentResponse(output, 2).get("result")
+  let schema = agentListedOutputSchema(tools, "neri.open")
+
+  test.assertEqual(agentResponse(output, 12).get("result").get("isError").value, "true")
+  test.assertEqual(agentResponse(output, 12).get("result").get("structuredContent").kind, "missing")
+  let listed = lspJsonStringify(tools)
+
+  test.assertTrue(bootstrapFindText(listed, "\"name\":\"neri.open\"") >= 0)
+  test.assertTrue(bootstrapFindText(listed, "\"name\":\"neri.inspect\"") >= 0)
+  test.assertTrue(bootstrapFindText(listed, "\"name\":\"neri.edit\"") >= 0)
+  let disk = agentStructured(output, 13, agentListedOutputSchema(tools, "neri.feedback"))
+
+  test.assertEqual(disk.get("operationId").value, "disk-feedback")
+  test.assertEqual(disk.get("scope").value, "project")
+  test.assertEqual(disk.get("complete").value, "true")
+  test.assertEqual(disk.get("status").value, "valid")
+  test.assertEqual(disk.get("unitsTotal").value, "1")
+  test.assertEqual(disk.get("diagnosticCount").value, "0")
+  let openedModel = agentStructured(output, 3, schema)
+
+  agentAssertResult(openedModel, "open-model", modelUri, 1, 1, "valid", "valid", true, true)
+  let duplicate = agentStructured(output, 4, schema)
+
+  agentAssertResult(duplicate, "duplicate-model", modelUri, 1, 1, "conflict", "unavailable", false, false)
+
+  test.assertEqual(agentResponse(output, 4).get("result").get("isError").value, "true")
+  let openedMain = agentStructured(output, 5, schema)
+
+  agentAssertResult(openedMain, "open-main", mainUri, 2, 1, "invalid", "invalid", true, true)
+
+  test.assertTrue(agentHasDiagnostic(openedMain, "NR112", mainUri))
+  let stale = agentStructured(output, 6, schema)
+
+  agentAssertResult(stale, "stale-repair", mainUri, 2, 1, "conflict", "unavailable", false, false)
+
+  test.assertEqual(agentResponse(output, 6).get("result").get("isError").value, "true")
+  let repaired = agentStructured(output, 7, schema)
+
+  agentAssertResult(repaired, "repair", mainUri, 3, 2, "valid", "valid", true, true)
+
+  test.assertTrue(!agentHasDiagnostic(repaired, "NR112", mainUri))
+  let missing = agentStructured(output, 8, schema)
+
+  agentAssertResult(missing, "remove-argument", mainUri, 4, 3, "invalid", "invalid", true, true)
+  let outside = agentStructured(output, 9, schema)
+
+  agentAssertResult(outside, "outside-range", mainUri, 4, 3, "invalid_request", "unavailable", false, false)
+  let unicode = agentStructured(output, 10, schema)
+
+  agentAssertResult(unicode, "split-unicode", mainUri, 4, 3, "invalid_request", "unavailable", false, false)
+  let inspected = agentStructured(output, 11, schema)
+
+  agentAssertResult(inspected, "inspect-missing", mainUri, 4, 3, "invalid", "invalid", false, true)
+  let context = inspected.get("context")
+
+  test.assertEqual(context.get("status").value, "complete")
+  test.assertEqual(context.get("expectedType").get("kind").value, "scalar")
+  test.assertEqual(context.get("expectedType").get("name").value, "Int")
+  test.assertEqual(context.get("expectedType").get("identity").value, "")
+  let truncated = agentInvoke(compiler, workspace, agentBytes("{\"jsonrpc\":\"2.0\"}"))
+
+  test.assertEqual(agentResponseForId(truncated, "").get("error").get("code").value, "-32700")
+  var invalidBytes: Byte[] = []
+  var invalidIndex = 0
+
+  while invalidIndex < 260
+    invalidBytes = host.appendByte(invalidBytes, 194 as Byte)
+    invalidIndex = invalidIndex + 1
+  end
+  invalidBytes = host.appendByte(invalidBytes, 10 as Byte)
+  let ping = agentBytes(agentRequest(99, "ping", "{}"))
+
+  for byte in ping
+    invalidBytes = host.appendByte(invalidBytes, byte)
+  end
+  let invalid = agentInvoke(compiler, workspace, invalidBytes)
+
+  test.assertEqual(agentResponseForId(invalid, "").get("error").get("code").value, "-32700")
+  test.assertEqual(agentResponse(invalid, 99).get("result").kind, "object")
+
+  agentClosedDependencyContract(workspace, mainUri, modelPath, model)
+end

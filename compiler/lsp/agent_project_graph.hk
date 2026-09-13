@@ -1,0 +1,215 @@
+use host
+
+class AgentProjectGraph
+  public root: String
+  public manifest: String = ""
+  public error: String = ""
+  public first: AgentProjectUnit?
+  public snapshot: String = ""
+  public count: Int = 0
+  public compilerPath: String = ""
+  public compilerDigest: String = ""
+  public projects: StringBuffer = new StringBuffer()
+  private last: AgentProjectUnit?
+  private observations: AgentInputSnapshot = new AgentInputSnapshot()
+
+  def init(root: String): Void
+    this.root = root
+    this.refresh()
+  end
+
+  def find(key: String): AgentProjectUnit?
+    var unit = this.first
+
+    while unit != null
+      if unit.key == key
+        return unit
+      end
+      unit = unit.next
+    end
+    return null
+  end
+
+  def add(manifest: String, name: String): Void
+    let canonical = neriCanonicalPath(manifest)
+
+    if canonical == null
+      this.error = "Cannot resolve project manifest: " + manifest
+      return
+    end
+    let key = neriUnitKey(canonical, name)
+
+    if this.find(key) != null
+      return
+    end
+    if this.count >= (new AgentLimits()).projectUnits()
+      this.error = "Project graph exceeds the unit limit. Coverage is incomplete."
+      return
+    end
+    let unit = new AgentProjectUnit(canonical, name, this.observations)
+    let previous = this.last
+
+    if previous == null
+      this.first = unit
+    else
+      previous.next = unit
+    end
+    this.last = unit
+    this.count = this.count + 1
+    if unit.project.error() != ""
+      this.error = unit.project.error()
+      return
+    end
+    if unit.workspace.inputLimit
+      this.error = "Project unit exceeds analysis input limits: " + key
+      return
+    end
+    if unit.project.implicit
+      return
+    end
+    let text = host.readText(canonical)
+
+    if text == null
+      this.error = "Cannot read project manifest: " + canonical
+      return
+    end
+    let config = (new LspJsonParser(text)).parse()
+    var reference = config.get("units").get(name).get("references").first
+
+    while reference != null
+      var targetManifest = canonical
+      var targetName = reference.value
+
+      if reference.kind == "object"
+        targetManifest = bootstrapDirectory(canonical) + "/" + reference.get("project").value
+        targetName = reference.get("unit").value
+      end
+      let target = neriCanonicalPath(targetManifest)
+
+      if target == null
+        this.error = "Cannot resolve referenced project: " + targetManifest
+        return
+      end
+      unit.references.add(neriUnitKey(target, targetName))
+      this.add(target, targetName)
+      reference = reference.next
+    end
+  end
+
+  def addProject(path: String): Void
+    let canonical = neriCanonicalPath(path)
+
+    if canonical == null
+      this.error = "Cannot resolve project member: " + path
+      return
+    end
+    if neriProjectListed(this.projects, canonical)
+      return
+    end
+    this.projects.add(canonical)
+    let inventory = new NeriProject()
+
+    inventory.manifest = canonical
+    let names = neriProjectUnitNames(inventory)
+
+    if inventory.error() != ""
+      this.error = inventory.error()
+      return
+    end
+    var name = names.first.nextNode
+
+    while name != null
+      this.add(canonical, name.value)
+      name = name.nextNode
+    end
+    let text = host.readText(canonical)
+
+    if text == null
+      this.error = "Cannot read project member: " + canonical
+      return
+    end
+    let config = (new LspJsonParser(text)).parse()
+    var member = config.get("projects").first
+
+    while member != null
+      this.addProject(bootstrapDirectory(canonical) + "/" + member.value)
+      member = member.next
+    end
+  end
+
+  def refresh(): Void
+    this.first = null
+    this.last = null
+    this.count = 0
+    this.error = ""
+    this.manifest = ""
+    this.projects = new StringBuffer()
+    this.observations = new AgentInputSnapshot()
+    let canonical = neriCanonicalPath(this.root)
+
+    if canonical == null
+      this.error = "Cannot resolve project: " + this.root
+      this.snapshot = sha256FastText(runCacheFrame(this.root) + runCacheFrame(this.error))
+      return
+    end
+    this.manifest = canonical
+    if host.readText(canonical) == null
+      let modern = host.readText(canonical + "/manifest.json")
+      let legacy = host.readText(canonical + "/neri.json")
+
+      if modern != null && legacy != null
+        this.error = "Project directory contains both manifest.json and neri.json; keep exactly one project manifest."
+      else if modern != null
+        this.manifest = canonical + "/manifest.json"
+      else if legacy != null
+        this.manifest = canonical + "/neri.json"
+      else
+        this.projects.add(canonical)
+        this.add(canonical, "main")
+      end
+    end
+    if this.first == null && this.error == ""
+      this.addProject(this.manifest)
+    end
+    let parts = new StringBuffer()
+    let compiler = agentCompilerExecutable()
+
+    this.compilerPath = ""
+    this.compilerDigest = ""
+    if compiler != null
+      this.compilerPath = compiler
+      let digest = agentArtifactDigest(compiler)
+
+      if digest != null
+        this.compilerDigest = digest
+      end
+    end
+    if this.compilerDigest == ""
+      this.error = "Cannot fingerprint the running compiler."
+    end
+    parts.add(runCacheFrame(this.manifest) + runCacheFrame(this.error))
+    parts.add(runCacheFrame(this.compilerPath) + runCacheFrame(this.compilerDigest))
+    var unit = this.first
+
+    while unit != null
+      unit.fingerprint = sha256FastText(runCacheFrame(unit.fingerprint) + runCacheFrame(this.compilerDigest))
+      parts.add(runCacheFrame(unit.key) + runCacheFrame(unit.fingerprint))
+      unit = unit.next
+    end
+    this.snapshot = sha256FastText(lspJoin(parts, 0, parts.size))
+  end
+
+  # A consumer's source closure includes every transitive reference owner.
+  def consumers(key: String): StringBuffer
+    let result = new StringBuffer()
+    var unit = this.first
+
+    while unit != null
+      if unit.key == key || neriProjectListed(unit.project.sourceOwners, key)
+        result.add(unit.key)
+      end
+      unit = unit.next
+    end
+    return result
+  end
+end

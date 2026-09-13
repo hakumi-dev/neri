@@ -1,6 +1,7 @@
 #include "ir_verifier.h"
 
 #include "neri/codegen/reader.h"
+#include "neri/abi_runtime_imports.h"
 #include "neri/ir_transport.h"
 #include "numeric_types.h"
 #include "native_layout.h"
@@ -1557,6 +1558,60 @@ void verify_function(const ir_module &module, const function &value) {
 
 } // namespace
 
+namespace {
+
+[[nodiscard]] bool matches_runtime_type(const type &actual,
+                                       const neri_abi_type_v1 &expected) {
+  if (actual.tag != expected.tag || actual.symbol.has_value() ||
+      actual.element_count != 0U) {
+    return false;
+  }
+  if (expected.argument == nullptr) {
+    return actual.arguments.empty();
+  }
+  return actual.arguments.size() == 1U &&
+         matches_runtime_type(actual.arguments.front(), *expected.argument);
+}
+
+void verify_runtime_import(const import_declaration &value) {
+  const auto *contract = neri_abi_runtime_import(value.link_name.c_str());
+  if (contract == nullptr) {
+    fail(unsupported_feature, "Runtime import is absent from the ABI catalog: " +
+                                  value.link_name + ".");
+  }
+  if (!value.minimum_runtime.has_value() ||
+      value.minimum_runtime->abi_major != NERI_RUNTIME_ABI_MAJOR ||
+      value.minimum_runtime->abi_minor < contract->minimum_minor ||
+      (value.minimum_runtime->feature_bits & contract->feature_bits) !=
+          contract->feature_bits) {
+    fail(unsupported_feature, "Runtime import weakens the catalog ABI requirements: " +
+                                  value.link_name + ".");
+  }
+  if (value.parameter_types.size() != contract->parameter_count ||
+      !matches_runtime_type(value.result_type, contract->result_type)) {
+    fail(invalid_type, "Runtime import signature differs from the ABI catalog: " +
+                           value.link_name + ".");
+  }
+  for (std::size_t index = 0; index < value.parameter_types.size(); ++index) {
+    if (!matches_runtime_type(value.parameter_types[index],
+                              contract->parameter_types[index])) {
+      fail(invalid_type, "Runtime import parameter differs from the ABI catalog: " +
+                             value.link_name + ".");
+    }
+  }
+  // May-effects are conservative sets. Noreturn is a positive guarantee;
+  // omitting it is safe, asserting it on a returning import is not.
+  const auto required_effects = contract->effects & ~NERI_IR_EFFECT_NO_RETURN_V1;
+  if ((value.effects & required_effects) != required_effects ||
+      ((value.effects & NERI_IR_EFFECT_NO_RETURN_V1) != 0U &&
+       (contract->effects & NERI_IR_EFFECT_NO_RETURN_V1) == 0U)) {
+    fail(invalid_safety, "Runtime import effects contradict the ABI catalog: " +
+                             value.link_name + ".");
+  }
+}
+
+} // namespace
+
 void verify_supported_module(const ir_module &value) {
   if (value.semantic_version.major != 1U) {
     fail(incompatible_major,
@@ -1820,13 +1875,7 @@ void verify_supported_module(const ir_module &value) {
       fail(invalid_type, "Native library requires a C ABI import, a portable library name, and native-libraries-v1.");
     }
     if (import.kind == NERI_IR_IMPORT_RUNTIME_V1) {
-      if (!import.minimum_runtime.has_value() ||
-          import.minimum_runtime->abi_major != 1U ||
-          !import.link_name.starts_with("neri_rt_v1_") ||
-          import.link_name == "neri_rt_v1_panic") {
-        fail(unsupported_feature,
-             "Runtime import does not match the reviewed ABI v1 surface.");
-      }
+      verify_runtime_import(import);
     } else if (import.kind == NERI_IR_IMPORT_C_ABI_V1) {
       const auto required_effects = NERI_IR_EFFECT_READ_V1 |
                                     NERI_IR_EFFECT_WRITE_V1 |

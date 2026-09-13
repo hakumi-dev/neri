@@ -97,11 +97,28 @@ project owns the JetBrains client, grammar, configuration UI and Run/Build/Check
   adapter supplies protocol positions and edits. Results are bounded to 128
   candidates and use `CompletionList.isIncomplete` when truncated. Import
   targets include known namespaces and the installed standard-library inventory.
+  Opening parenthesis and comma trigger argument completion. Ordinary parameters
+  supply their declared names and types; `labels` parameters derive candidates
+  from the resolved entity's public fields. Supplied labels are excluded.
+  Positions that require a named argument offer the remaining labels. Expression
+  candidates are available for positional arguments and after a label's colon.
+  Semantic candidate order is carried in LSP `sortText`; clients can apply their
+  own ranking preferences.
+  At an argument value, the compiler retains the expected type of the parameter
+  selected by positional order or its named label, after generic instantiation.
+  Assignable locals are offered first, followed by applicable Bool literals,
+  `null` for optional types, and constructors for the expected enum. Enum
+  constructors use the short type name when its namespace is current or imported
+  and a qualified type name otherwise. The remaining Basic completion candidates
+  stay available after these expected-type candidates, subject to the same bound.
 - `completionItem/resolve` supplies documentation on demand. Items identify the
   document version and analysis revision; changes invalidate earlier requests
   for enrichment. Types and insertion edits do not depend on documentation.
 - Declaration completion offers `class` and `def` templates at the end of a
-  single-line header. Written names, parameters and generic headers are retained.
+  single-line header through the validated [declaration catalog](TEMPLATES.md).
+  Catalog text is compiled once when the server starts; contextual providers
+  share parser-backed insertion and protocol encoding. Written names,
+  parameters and generic headers are retained.
   Snippet-capable clients expose editable name, parameter and return-type fields,
   then place the caret in the body. Body insertion shares the parser-backed
   newline formatter, preserves existing `end` tokens and follows `.editorconfig`
@@ -135,6 +152,9 @@ project owns the JetBrains client, grammar, configuration UI and Run/Build/Check
   Generic constructors, methods and fields navigate to their original source
   declarations. Enum cases navigate from construction and `match` patterns to
   the case name. Generated specializations remain excluded from document symbols.
+- Namespace qualifiers and resolved `use` declarations navigate to their actual
+  `namespace` declarations. A namespace declared in multiple source files
+  returns every declaration location.
 - Fields and resolved method calls use the declaring owner's identity, including
   inherited members, static calls and explicit base calls. Field hover reflects
   the compiler's receiver-adjusted type. Callback parameters, callback-local
@@ -147,12 +167,22 @@ not an arbitrary executable consumer. Source folders and namespaces are
 independent: references are explicit, and `use` or `namespace` never infer one.
 Open dependencies use their unsaved contents and invalidate open consumers.
 
+Units can declare [generated sources](GENERATED-SOURCES.md). Their verified
+content snapshots participate in ordinary semantic analysis. Changed open
+generation inputs or outputs suppress the consumer API with `NR_GENERATED`.
+Definitions target emitted declarations; `neri/sourceOrigin` returns the mapped
+original location using the retained source text.
+
 Directory sources are rediscovered after `workspace/didChangeWatchedFiles`, so
 reported file creation and deletion updates membership while exclusions,
-symlinks, generated directories, and nested manifests remain outside it. A file
-without an owning unit is analyzed independently. Libraries reject `main`, and
-executable units require exactly one entry point for language-server analysis.
-See [project sources and references](PROJECTS.md).
+symlinks, generated directories, and nested manifests remain outside it. Under
+an explicit manifest, each source requires an owning unit; the server reports
+the informational `NR_PROJECT_CONTEXT` diagnostic and leaves semantic analysis
+unavailable until the manifest supplies that context. A workspace without a
+manifest is an implicit project and analyzes its discovered sources together,
+including its first unsaved document. Libraries reject `main`, and executable
+units require exactly one entry point for language-server analysis. See
+[project sources and references](PROJECTS.md).
 
 Text changes apply immediately in protocol order and invalidate affected models.
 Consecutive changes coalesce into one pending analysis per document. Semantic
@@ -238,12 +268,13 @@ source it contains:
 
 ```sh
 fixture="$(mktemp -d)"
-cp "$PWD"/stdlib/*.hk "$fixture"/
-"$HOME/.neri/bin/neri" documentation-index \
+cp -R "$PWD/stdlib/." "$fixture/"
+NERI_STDLIB="$fixture" NERI_HOST="$PWD/build/native/native-release/neri-host" \
+  find "$fixture" -name '*.hk' -exec "$PWD/build/current/bin/neri" documentation-index \
   --toolchain-version "$(cat VERSION)" \
-  --output "$fixture/documentation.json" "$fixture"/*.hk
+  --output "$fixture/documentation.json" {} +
 NERI_LSP_TEST_STDLIB="$fixture" \
-  build/native/native-release/neri-lsp-test "$HOME/.neri/bin/neri" "$PWD"
+  build/native/native-release/neri-lsp-test "$PWD/build/current/bin/neri" "$PWD"
 ```
 
 The full test command prepares an isolated standard-library directory and its
@@ -292,11 +323,11 @@ editor-specific settings and execution actions.
 
 For local compiler development, configure the editor with the repository's
 absolute `scripts/neri.sh` path and the `lsp` argument. The launcher selects the
-validated `build/current` toolchain and its matching runtime and standard library.
-Run `scripts/build.sh bootstrap` to publish a new local toolchain, then restart
-the editor's language server. An already running server continues using the
-executable it started with. Installed-toolchain users likewise restart the
-language server after updating their installation.
+validated `build/current` compiler and runtime together with the standard-library
+sources from the same checkout. Run `scripts/build.sh bootstrap` to publish a new
+local toolchain, then restart the editor's language server. An already running
+server continues using the executable it started with. Installed-toolchain users
+likewise restart the language server after updating their installation.
 
 Protocol reference: [LSP specification](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/).
 

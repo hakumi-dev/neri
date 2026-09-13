@@ -38,8 +38,17 @@ The seed establishes Stage1; it may use an older internal IR naming convention.
 Fixed-point checks compare generations running the current compiler sources,
 without normalizing or ignoring any output differences.
 
+The pinned seed stage has no current standard library. Its mirrored agent test
+and profile services report those execution capabilities as unavailable while
+preserving their protocol shapes. Stage2 and later compile the canonical
+services with the current `files`, `crypto`, and `process` libraries.
+
 Compiler, tooling and user sources use `console`. The pinned release already
 supports this spelling, so no legacy import alias or source rewriting is needed.
+
+The `scripts/neri.sh` development launcher runs the published compiler and
+runtime with the standard-library sources from the same checkout. Packaged
+launchers use the standard library shipped in their immutable toolchain.
 
 Every compiler process receives the current native artifact paths, the pinned LLVM linker, the macOS SDK path, a C locale, UTC, and the host `PATH`. Any unexplained difference fails the bootstrap. Native configuration independently checks Clang/LLVM and Ninja versions.
 

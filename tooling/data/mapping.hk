@@ -1,0 +1,700 @@
+use host
+
+def dataObject(mapping: DataMapping, node: LspJson, context: String, keys: String[]): Bool
+  if node.kind != "object"
+    return mapping.fail(context + " must be a JSON object.")
+  end
+  var child = node.first
+
+  while child != null
+    var allowed = false
+
+    for key in keys
+      allowed = true if child.key == key
+    end
+    if !allowed
+      return mapping.fail(context + " has unknown key '" + child.key + "'.")
+    end
+    var previous = node.first
+
+    while previous != null && previous.keyStart < child.keyStart
+      if previous.key == child.key
+        return mapping.fail(context + " has duplicate key '" + child.key + "'.")
+      end
+      previous = previous.next
+    end
+    child = child.next
+  end
+  return true
+end
+
+def dataRequired(mapping: DataMapping, object: LspJson, key: String, kind: String, context: String): LspJson?
+  let value = object.get(key)
+
+  if value.kind == "missing"
+    mapping.fail(context + " requires '" + key + "'.")
+    return null
+  end
+  if value.kind != kind
+    mapping.fail(context + "." + key + " must be a JSON " + kind + ".")
+    return null
+  end
+  return value
+end
+
+def dataString(mapping: DataMapping, object: LspJson, key: String, context: String): String
+  let node = dataRequired(mapping, object, key, "string", context)
+
+  if node == null
+    return ""
+  end
+  if node.value == ""
+    mapping.fail(context + "." + key + " must not be empty.")
+  end
+  return node.value
+end
+
+def dataIdentifier(value: String, qualified: Bool = false): Bool
+  let tokens = (new BootstrapLexer(value)).lex()
+  var index = 0
+  var expectIdentifier = true
+
+  while index + 1 < tokens.count()
+    if expectIdentifier
+      if tokens.kindAt(index) != "Identifier"
+        return false
+      end
+    else if !qualified || tokens.kindAt(index) != "Dot"
+      return false
+    end
+    expectIdentifier = !expectIdentifier
+    index = index + 1
+  end
+  return index > 0 && !expectIdentifier && tokens.kindAt(index) == "EndOfFile"
+end
+
+def dataSqlIdentifier(value: String): Bool
+  if value == ""
+    return false
+  end
+  var index = 0
+
+  while index < host.stringByteLength(value)
+    let byte = host.stringByteAt(value, index) as Int
+    let letter = (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) || byte == 95
+
+    if !letter && !(index > 0 && byte >= 48 && byte <= 57)
+      return false
+    end
+    index = index + 1
+  end
+  return true
+end
+
+def dataPathWithin(root: String, path: String): Bool
+  return path == root || bootstrapStartsWith(path, root + "/")
+end
+
+def dataOutputPath(mapping: DataMapping, relative: String): String?
+  let candidate = mapping.mappingRoot + "/" + relative
+  let resolved = neriCanonicalPath(candidate)
+
+  if resolved != null
+    return resolved if dataPathWithin(mapping.mappingRoot, resolved)
+    return null
+  end
+  var parent = bootstrapDirectory(candidate)
+  var resolvedParent = neriCanonicalPath(parent)
+
+  while resolvedParent == null && parent != mapping.mappingRoot
+    parent = bootstrapDirectory(parent)
+    resolvedParent = neriCanonicalPath(parent)
+  end
+  if resolvedParent == null || !dataPathWithin(mapping.mappingRoot, resolvedParent)
+    return null
+  end
+  return candidate
+end
+
+def dataDeclaration(model: SemanticModel, identity: String): SemanticDeclaration?
+  var declaration = model.declarations
+
+  while declaration != null
+    if declaration.identity == identity
+      return declaration
+    end
+    declaration = declaration.next
+  end
+  return null
+end
+
+def dataOrigin(mapping: DataMapping, declaration: SemanticDeclaration?): DataOrigin
+  let origin = new DataOrigin()
+
+  if declaration == null
+    return origin
+  end
+  origin.identity = declaration.identity
+  var source = mapping.firstSource
+
+  while source != null
+    let next = source.nextSource
+
+    if declaration.start >= source.start && (next == null || declaration.start < next.start)
+      origin.sourcePath = source.path
+      origin.start = declaration.start - source.start
+      origin.length = declaration.length
+      return origin
+    end
+    source = next
+  end
+  return origin
+end
+
+def dataTypeDomain(typeName: String): String
+  let concrete = semanticIsOptional(typeName) ? semanticInnerType(typeName) : typeName
+
+  if concrete == "Int"
+    return "Int"
+  else if concrete == "Bool"
+    return "Bool"
+  else if concrete == "String"
+    return "String"
+  end
+  return ""
+end
+
+def dataFindClass(model: SemanticModel, typeName: String): SemanticClass?
+  var symbol = model.firstClass
+
+  while symbol != null
+    if symbol.genericOrigin < 0 && symbol.fullName == typeName
+      return symbol
+    end
+    symbol = symbol.nextClass
+  end
+  return null
+end
+
+def dataFindField(model: SemanticModel?, symbol: SemanticClass, name: String): SemanticField?
+  var current: SemanticClass? = symbol
+  var depth = 0
+
+  while current != null && depth < 256
+    var field = current.firstField
+
+    while field != null
+      if field.name == name
+        return field
+      end
+      field = field.nextField
+    end
+    if model == null
+      return null
+    end
+    current = model.findClass(current.baseName)
+    depth = depth + 1
+  end
+  return null
+end
+
+def dataInitializer(entity: DataEntity): Bool
+  let symbol = entity.symbol
+
+  if symbol == null
+    return false
+  end
+  var method = symbol.firstMethod
+  var declaredInitializer = false
+
+  while method != null
+    if method.name == "init"
+      declaredInitializer = true
+    end
+    if method.name == "init" && (method.access == "public" || method.access == "internal")
+      var parameter = method.firstParameter
+      var field = entity.firstField
+      var compatible = true
+      var acceptsNoArguments = true
+
+      while parameter != null || field != null
+        if parameter == null || field == null || parameter.name != field.memberName || parameter.typeName != field.typeName
+          compatible = false
+        end
+        if parameter != null && !parameter.hasDefault
+          acceptsNoArguments = false
+        end
+        parameter = parameter.nextParameter if parameter != null
+        field = field.nextField if field != null
+      end
+      if compatible
+        entity.initializer = method
+        entity.construction = "init"
+        return true
+      end
+      if acceptsNoArguments
+        entity.initializer = method
+        entity.construction = "fields"
+        return true
+      end
+    end
+    method = method.nextCallable
+  end
+  if declaredInitializer
+    return false
+  end
+  # A class without an initializer has the language's implicit zero-argument
+  # construction surface. Public mapped fields can then be assigned directly.
+  var mapped = entity.firstField
+
+  while mapped != null
+    let fieldSymbol = mapped.symbol
+
+    if fieldSymbol == null || fieldSymbol.access != "public"
+      return false
+    end
+    mapped = mapped.nextField
+  end
+  entity.construction = "fields"
+  return true
+end
+
+def dataParseField(mapping: DataMapping, entity: DataEntity, node: LspJson, index: Int): Bool
+  let context = "entities[" + (index as String) + "].columns"
+
+  if !dataObject(mapping, node, context, ["member", "column"])
+    return false
+  end
+  let field = new DataField()
+
+  field.memberName = dataString(mapping, node, "member", context)
+  field.columnName = dataString(mapping, node, "column", context)
+  if mapping.error != ""
+    return false
+  end
+  if !dataIdentifier(field.memberName)
+    return mapping.fail(context + ".member must be a Neri identifier.")
+  end
+  if !dataSqlIdentifier(field.columnName)
+    return mapping.fail(context + ".column must be an unquoted SQL identifier.")
+  end
+  if entity.field(field.memberName) != null
+    return mapping.fail("Entity '" + entity.typeName + "' maps member '" + field.memberName + "' more than once.")
+  end
+  var existing = entity.firstField
+
+  while existing != null
+    if existing.columnName == field.columnName
+      return mapping.fail("Entity '" + entity.typeName + "' maps column '" + field.columnName + "' more than once.")
+    end
+    existing = existing.nextField
+  end
+  let classSymbol = entity.symbol
+
+  if classSymbol == null
+    return false
+  end
+  let symbol = dataFindField(mapping.semantic, classSymbol, field.memberName)
+
+  if symbol == null
+    return mapping.fail("Mapped member '" + entity.typeName + "." + field.memberName + "' does not exist; regenerate or update the mapping after a rename.")
+  end
+  if symbol.access != "public"
+    return mapping.fail("Mapped member '" + entity.typeName + "." + field.memberName + "' must be public.")
+  end
+  field.domain = dataTypeDomain(symbol.typeName)
+  if field.domain == ""
+    return mapping.fail("Mapped member '" + entity.typeName + "." + field.memberName + "' has unsupported type '" + symbol.typeName + "'; expected Int, Bool, String, or an optional of one of those types.")
+  end
+  field.typeName = symbol.typeName
+  field.optional = semanticIsOptional(symbol.typeName)
+  field.symbol = symbol
+  let semantic = mapping.semantic
+
+  field.declaration = dataDeclaration(semantic, "field:" + symbol.owner + "." + symbol.name) if semantic != null
+  field.origin = dataOrigin(mapping, field.declaration)
+  entity.addField(field)
+  return true
+end
+
+def dataParseEntity(mapping: DataMapping, node: LspJson, index: Int): Bool
+  let context = "entities[" + (index as String) + "]"
+
+  if !dataObject(mapping, node, context, ["type", "set", "table", "key", "columns"])
+    return false
+  end
+  let entity = new DataEntity()
+
+  entity.typeName = dataString(mapping, node, "type", context)
+  entity.setName = dataString(mapping, node, "set", context)
+  entity.tableName = dataString(mapping, node, "table", context)
+  entity.keyMember = dataString(mapping, node, "key", context)
+  let columns = dataRequired(mapping, node, "columns", "array", context)
+
+  if mapping.error != "" || columns == null
+    return false
+  end
+  if !dataIdentifier(entity.typeName, true)
+    return mapping.fail(context + ".type must be a qualified Neri type name.")
+  end
+  if !dataIdentifier(entity.setName)
+    return mapping.fail(context + ".set must be a Neri identifier.")
+  end
+  if !dataSqlIdentifier(entity.tableName)
+    return mapping.fail(context + ".table must be an unquoted SQL identifier.")
+  end
+  if !dataIdentifier(entity.keyMember)
+    return mapping.fail(context + ".key must be a Neri member identifier.")
+  end
+  if mapping.entity(entity.typeName) != null
+    return mapping.fail("Mapped entity type '" + entity.typeName + "' is duplicated.")
+  end
+  var existing = mapping.firstEntity
+
+  while existing != null
+    if existing.setName == entity.setName
+      return mapping.fail("Mapped set '" + entity.setName + "' is duplicated.")
+    end
+    if existing.tableName == entity.tableName
+      return mapping.fail("Mapped table '" + entity.tableName + "' is duplicated.")
+    end
+    existing = existing.nextEntity
+  end
+  let semantic = mapping.semantic
+
+  if semantic == null
+    return false
+  end
+  let symbol = dataFindClass(semantic, entity.typeName)
+
+  if symbol == null
+    return mapping.fail("Mapped entity type '" + entity.typeName + "' does not exist in unit '" + mapping.unit + "'.")
+  end
+  if symbol.access != "public" && symbol.access != "internal"
+    return mapping.fail("Mapped entity type '" + entity.typeName + "' must be public or internal.")
+  end
+  entity.symbol = symbol
+  entity.generatedName = symbol.name
+  entity.declaration = dataDeclaration(semantic, "type:" + entity.typeName)
+  entity.origin = dataOrigin(mapping, entity.declaration)
+  existing = mapping.firstEntity
+  while existing != null
+    if existing.generatedName == entity.generatedName
+      return mapping.fail("Mapped entity types '" + existing.typeName + "' and '" + entity.typeName + "' have the same generated name '" + entity.generatedName + "'.")
+    end
+    existing = existing.nextEntity
+  end
+  var column = columns.first
+  var columnIndex = 0
+
+  while column != null
+    if !dataParseField(mapping, entity, column, columnIndex)
+      return false
+    end
+    column = column.next
+    columnIndex = columnIndex + 1
+  end
+  if entity.firstField == null
+    return mapping.fail(context + ".columns must contain at least one mapping.")
+  end
+  let key = entity.field(entity.keyMember)
+
+  if key == null
+    return mapping.fail("Entity '" + entity.typeName + "' key '" + entity.keyMember + "' must be present in columns.")
+  end
+  if key.optional || (key.domain != "Int" && key.domain != "String")
+    return mapping.fail("Entity '" + entity.typeName + "' key must be a non-optional Int or String.")
+  end
+  if !dataInitializer(entity)
+    return mapping.fail("Entity '" + entity.typeName + "' needs an accessible initializer whose parameters match mapped columns in order, or zero-argument construction with public mapped fields.")
+  end
+  mapping.addEntity(entity)
+  return true
+end
+
+def dataParseRelation(mapping: DataMapping, node: LspJson, index: Int): Bool
+  let context = "relations[" + (index as String) + "]"
+
+  if !dataObject(mapping, node, context, ["principal", "dependent", "key", "foreignKey"])
+    return false
+  end
+  let relation = new DataRelation()
+
+  relation.principalType = dataString(mapping, node, "principal", context)
+  relation.dependentType = dataString(mapping, node, "dependent", context)
+  relation.keyMember = dataString(mapping, node, "key", context)
+  relation.foreignKeyMember = dataString(mapping, node, "foreignKey", context)
+  if mapping.error != ""
+    return false
+  end
+  let principal = mapping.entity(relation.principalType)
+  let dependent = mapping.entity(relation.dependentType)
+
+  if principal == null
+    return mapping.fail(context + ".principal must name a mapped entity.")
+  end
+  if dependent == null
+    return mapping.fail(context + ".dependent must name a mapped entity.")
+  end
+  let key = principal.field(relation.keyMember)
+  let foreignKey = dependent.field(relation.foreignKeyMember)
+
+  if key == null
+    return mapping.fail(context + ".key must name a mapped principal field.")
+  end
+  if foreignKey == null
+    return mapping.fail(context + ".foreignKey must name a mapped dependent field.")
+  end
+  if relation.keyMember != principal.keyMember
+    return mapping.fail(context + ".key must name the principal entity key '" + principal.keyMember + "'.")
+  end
+  if key.typeName != foreignKey.typeName
+    return mapping.fail(context + " fields must have the same type, got '" + key.typeName + "' and '" + foreignKey.typeName + "'.")
+  end
+  var existing = mapping.firstRelation
+
+  while existing != null
+    if existing.principalType == relation.principalType && existing.dependentType == relation.dependentType && existing.keyMember == relation.keyMember && existing.foreignKeyMember == relation.foreignKeyMember
+      return mapping.fail(context + " duplicates an existing relation.")
+    end
+    existing = existing.nextRelation
+  end
+  relation.principal = principal
+  relation.dependent = dependent
+  relation.key = key
+  relation.foreignKey = foreignKey
+  mapping.addRelation(relation)
+  return true
+end
+
+def dataBindProject(mapping: DataMapping): Bool
+  let project = neriLoadProject(mapping.projectPath, mapping.unit)
+
+  if project.error() != ""
+    return mapping.fail("Cannot load mapped project: " + project.error())
+  end
+  if project.kind != "library"
+    return mapping.fail("Mapped unit '" + mapping.unit + "' must be a library unit.")
+  end
+  mapping.projectRoot = project.root
+  let paths = new StringBuffer()
+  let ids = new StringBuffer()
+  let texts = new StringBuffer()
+  var entry = project.sources.first.nextNode
+
+  while entry != null
+    let source = neriProjectVerifiedText(project, entry.value)
+
+    if source == null
+      return mapping.fail("Cannot read mapped project source '" + entry.value + "': " + host.errorMessage())
+    end
+    paths.add(entry.value)
+    ids.add(entry.value)
+    texts.add(source)
+    entry = entry.nextNode
+  end
+  var pending = true
+
+  while pending
+    pending = false
+    var sourceIndex = 0
+
+    while sourceIndex < texts.size
+      for library in bootstrapLibraryImports(texts.get(sourceIndex))
+        let id = "@stdlib/" + library + ".hk"
+        var known = false
+        var knownIndex = 0
+
+        while knownIndex < ids.size
+          known = true if ids.get(knownIndex) == id
+          knownIndex = knownIndex + 1
+        end
+        if !known
+          let directory = host.environment("NERI_STDLIB")
+
+          if directory == null || directory == ""
+            return mapping.fail("NERI_STDLIB is required to resolve mapped project imports.")
+          end
+          let path = directory + "/" + library + ".hk"
+          let text = neriProjectVerifiedText(project, path)
+
+          if text == null
+            return mapping.fail("Cannot resolve imported standard library '" + library + "'.")
+          end
+          paths.add(path)
+          ids.add(id)
+          texts.add(text)
+          pending = true
+        end
+      end
+      sourceIndex = sourceIndex + 1
+    end
+  end
+  let starts = new IntBuffer()
+  var combined = ""
+  var combinedLength = 0
+  var index = 0
+
+  while index < texts.size
+    let source = new DataSource()
+
+    source.path = paths.get(index)
+    source.text = texts.get(index)
+    source.start = combinedLength
+    mapping.addSource(source)
+    starts.add(combinedLength)
+    combined = combined + source.text + "\n"
+    combinedLength = combinedLength + (new IrSourceMap(source.text)).utf16Length() + 1
+    index = index + 1
+  end
+  let tokens = (new BootstrapLexer(combined)).lex()
+  let parser = new BootstrapParser(tokens)
+
+  index = 0
+  while index < starts.size
+    parser.addSourceBoundary(starts.get(index))
+    index = index + 1
+  end
+  let root = parser.parseProgram()
+
+  if parser.diagnostics.count() > 0
+    return mapping.fail("Mapped project has parse diagnostic " + parser.diagnostics.codes.get(0) + ": " + parser.diagnostics.messages.get(0))
+  end
+  let binder = new BootstrapBinder(parser.arena, root, tokens.startAt(tokens.count() - 1))
+
+  binder.recordSourceSymbols = true
+  binder.requireEntryPoint = false
+  binder.clearSources()
+  index = 0
+  while index < ids.size
+    binder.addSource(ids.get(index), starts.get(index))
+    index = index + 1
+  end
+  let semantic = binder.bind()
+
+  if semantic.diagnostics.count() > 0
+    return mapping.fail("Mapped project has semantic diagnostic " + semantic.diagnostics.codes.get(0) + ": " + semantic.diagnostics.messages.get(0))
+  end
+  mapping.semantic = semantic
+  return true
+end
+
+def dataLoadMapping(path: String): DataMapping
+  let mapping = new DataMapping()
+  let absolute = neriCanonicalPath(path)
+
+  if absolute == null
+    mapping.fail("Mapping path is invalid or does not exist: " + path)
+    return mapping
+  end
+  let text = host.readText(absolute)
+
+  if text == null
+    mapping.fail("Cannot read mapping '" + absolute + "': " + host.errorMessage())
+    return mapping
+  end
+  let parser = new LspJsonParser(text)
+  let root = parser.parse()
+
+  parser.spaces()
+  if parser.failed || parser.position != host.stringByteLength(text)
+    mapping.fail("Mapping must contain exactly one valid JSON value.")
+    return mapping
+  end
+  if !dataObject(mapping, root, "mapping", ["version", "project", "unit", "namespace", "context", "output", "entities", "relations"])
+    return mapping
+  end
+  let version = dataRequired(mapping, root, "version", "number", "mapping")
+  let entities = dataRequired(mapping, root, "entities", "array", "mapping")
+  let relations = root.get("relations")
+
+  if version == null || entities == null
+    return mapping
+  end
+  if version.value != "1"
+    mapping.fail("mapping.version must be 1.")
+    return mapping
+  end
+  if relations.kind != "missing" && relations.kind != "array"
+    mapping.fail("mapping.relations must be a JSON array when present.")
+    return mapping
+  end
+  mapping.version = 1
+  mapping.mappingPath = absolute
+  mapping.mappingText = text
+  mapping.mappingRoot = bootstrapDirectory(absolute)
+  let project = dataString(mapping, root, "project", "mapping")
+
+  mapping.unit = dataString(mapping, root, "unit", "mapping")
+  mapping.namespaceName = dataString(mapping, root, "namespace", "mapping")
+  mapping.contextName = dataString(mapping, root, "context", "mapping")
+  let output = dataString(mapping, root, "output", "mapping")
+
+  if mapping.error != ""
+    return mapping
+  end
+  if !neriProjectReferencePathValid(project) || !neriProjectManifestName(project)
+    mapping.fail("mapping.project must be a relative manifest path.")
+    return mapping
+  end
+  if !dataIdentifier(mapping.namespaceName, true)
+    mapping.fail("mapping.namespace must be a qualified Neri namespace.")
+    return mapping
+  end
+  if !dataIdentifier(mapping.contextName)
+    mapping.fail("mapping.context must be a Neri identifier.")
+    return mapping
+  end
+  if !neriRelativeProjectPath(output)
+    mapping.fail("mapping.output must be a relative path without parent segments.")
+    return mapping
+  end
+  let projectPath = neriCanonicalPath(mapping.mappingRoot + "/" + project)
+  let outputPath = dataOutputPath(mapping, output)
+
+  if projectPath == null
+    mapping.fail("Mapped project does not exist: " + project)
+    return mapping
+  end
+  if outputPath == null
+    mapping.fail("mapping.output must remain within the mapping directory.")
+    return mapping
+  end
+  mapping.projectPath = projectPath
+  let projectText = host.readText(projectPath)
+
+  if projectText == null
+    mapping.fail("Cannot read mapped project manifest: " + project)
+    return mapping
+  end
+  mapping.projectText = projectText
+  mapping.outputPath = outputPath
+  if !dataBindProject(mapping)
+    return mapping
+  end
+  var entity = entities.first
+  var entityIndex = 0
+
+  while entity != null
+    if !dataParseEntity(mapping, entity, entityIndex)
+      return mapping
+    end
+    entity = entity.next
+    entityIndex = entityIndex + 1
+  end
+  if mapping.firstEntity == null
+    mapping.fail("mapping.entities must contain at least one entity.")
+    return mapping
+  end
+  var relation = relations.first
+  var relationIndex = 0
+
+  while relation != null
+    if !dataParseRelation(mapping, relation, relationIndex)
+      return mapping
+    end
+    relation = relation.next
+    relationIndex = relationIndex + 1
+  end
+  return mapping
+end

@@ -41,6 +41,11 @@ Neri implements readonly views, not that paper's full isolation type system.
 
 ### Effect summaries
 
+`EffectSet` represents function effects; `RuntimeFeatures` represents required
+runtime capabilities. Both expose immutable, named set operations, and their
+distinct types prevent mixing the two domains. Numeric masks cross the IR
+serialization and runtime-manifest boundaries through explicit methods.
+
 `compiler/ir/effects.hk` computes transitive summaries over the lowered call graph,
 including virtual-call targets. Each function starts with its local effects and
 the safepoint effect of known calls. A callee contributes all its effects except
@@ -52,7 +57,7 @@ grow at most eight times, so the queue terminates even for recursive cycles.
 At termination every caller contains its callees' propagated effects. Starting
 from local effects and adding only required bits yields the least fixed point.
 This is a finite monotone dataflow analysis; the general foundation is
-[Kildall's global analysis framework (1973)](https://calhoun.nps.edu/bitstream/10945/42162/1/Kildall_A_unified_approach_1973.pdf).
+[Kildall's global analysis framework (1973)](https://doi.org/10.1145/512927.512945).
 
 For `V` functions and `E` call edges, propagation takes `O(V + 8E)` work and
 scratch storage takes `O(V + E)`. Building the reverse graph still uses linear
@@ -138,6 +143,15 @@ defines its namespace, name, parameters, result type, documentation, navigation,
 completion and import requirement; runtime symbol names do not define that
 surface.
 
+`StandardLibraryCatalog` resolves a `use` target through the library units in
+`NERI_STDLIB/manifest.json`. Each unit can own multiple source files, and imports
+in every file participate in dependency discovery. Compilation, LSP analysis,
+session snapshots and documentation indexing use this catalog. Source identities
+preserve relative paths as `@stdlib/<path>.hk`; namespaces remain source
+declarations. The `core` unit includes `core.hk`, which owns the intrinsic
+`String` declaration. A standard-library directory without a manifest uses the
+legacy `<module>.hk` lookup.
+
 | Belongs to | Current rule | Reason |
 | --- | --- | --- |
 | Source library | Namespaces and callable signatures such as `console`, `math`, `host`, `test`, and `tasks`, plus contracts such as `Equality` | Source controls the user-facing API and editor information. |
@@ -156,6 +170,38 @@ prevents source from claiming an arbitrary native symbol or weaker effects; it
 does not define public library names. Standard-library declarations select their
 intrinsic IDs in source.
 
+`tooling/abi` defines the declarative catalog for effect bits, runtime capability
+bits, native intrinsics, and symbol-specific runtime requirements. Its Neri
+generator produces the typed compiler definitions and the shared native header.
+The compiler linker and native code generator combine all matching symbol rules;
+exact rules can raise the minimum version required by a broader prefix rule.
+The runtime and its package manifest obtain advertised capabilities from the
+same generated definition.
+
+The native verifier checks runtime imports against generated catalog entries.
+Parameter and result types match structurally, including array elements and
+optional values. The declared ABI minor, capabilities and may-effects include
+the catalog's requirements. Unknown runtime symbols and weaker contracts are
+rejected before LLVM generation.
+
+`noreturn` is a positive control-flow guarantee: an import may assert it only
+when the catalog guarantees it. Its omission remains valid for conservative
+producers. The backend obtains the guarantee from the catalog, including for
+`host.exit`; callers receive its may-effects separately from this guarantee.
+Unsafe C ABI imports retain their distinct calling-convention contract.
+
+Bootstrap checks generated artifacts against the catalog before publishing a
+toolchain. Regeneration uses `--write <repository-root>`; verification uses
+`--check <repository-root>` on the executable built from
+`tooling/abi/manifest.json`. The checked-in artifacts support compilation from
+the pinned seed.
+
+This use of one declarative description to produce several consumers follows
+the approach documented by [LLVM TableGen](https://llvm.org/docs/TableGen/).
+Effect summaries retain Neri's own semantics; LLVM's distinction between
+[memory effects and control-flow attributes](https://llvm.org/docs/LangRef.html#function-attributes)
+also motivates keeping `noreturn` separate during call-graph propagation.
+
 The compiler and runtime jointly verify managed representations across the ABI.
 Source declarations provide the scoped-task operation and user-facing signature;
 the compiler proves callback and capture requirements, emits its IR operation,
@@ -165,6 +211,19 @@ This follows the normal intrinsic boundary: LLVM defines intrinsic semantics and
 restrictions in its [Language Reference](https://llvm.org/docs/LangRef.html#intrinsic-functions)
 and recommends intrinsics for extensions expressible as calls in its [extension guide](https://llvm.org/docs/ExtendingLLVM.html).
 Rust provides a related model with compiler-recognized marked [library items](https://rustc-dev-guide.rust-lang.org/lang-items.html).
+
+## Project loading
+
+Project loading retains each failure's typed classification together with its
+display message. Callers use the classification when recovery depends on the
+failure's meaning. The language server can analyze the first unsaved source of
+an empty implicit project; other project-loading failures remain diagnostics.
+The diagnostic wording is presentation data.
+
+This boundary applies the information-hiding criterion in
+[Parnas (1972)](https://www.cs.lafayette.edu/~gexia/cs301/resources/parnas.html):
+the project loader owns failure classification, while its callers own their
+recovery policies.
 
 ## Build driver
 
@@ -179,9 +238,10 @@ compiler source list, build graph or language expectations.
 
 The bootstrap release contains a Neri compiler plus its matching codegen and runtime. It compiles the current sources, and the resulting compiler performs the next verified generation.
 Only the pinned seed stage substitutes compiler paths that have mirrored
-`bootstrap/compiler/*` declarations. The mirrors express declaration modifiers
-and native imports in syntax accepted by the pinned seed; they do not enumerate
-compiler sources. Stage 1 and later compile the canonical sources from the
+`bootstrap/compiler/*` declarations. The mirrors express declaration modifiers,
+native imports and the isolated project-error classification in syntax accepted
+by the pinned seed. The build driver owns source discovery. Stage 1 and later
+compile the canonical sources from the
 current manifest, and bootstrap verification compares canonical IR, objects,
 and binaries to a fixed point.
 

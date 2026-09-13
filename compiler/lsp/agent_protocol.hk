@@ -1,0 +1,359 @@
+use console
+use host
+
+# Minimal MCP 2025-11-25 stdio transport.  Workspace semantics live in
+# NeriAgentWorkspace; this file only owns framing, lifecycle and validation.
+
+def agentJsonError(id: String, code: Int, message: String): String
+  return "{\"jsonrpc\":\"2.0\",\"id\":" + id + ",\"error\":{\"code\":" + (code as String) + ",\"message\":" + lspQuote(message) + "}}"
+end
+
+def agentId(message: LspJson): String
+  let node = message.get("id")
+
+  if node.kind == "string"
+    return lspQuote(node.value)
+  end
+  if node.kind == "number"
+    return node.value
+  end
+  return "null"
+end
+
+def agentHasId(message: LspJson): Bool
+  return message.get("id").kind != "missing"
+end
+
+def agentSend(body: String): Void
+  # MCP stdio is newline-delimited; stdout must contain protocol messages only.
+  console.println(body)
+end
+
+class AgentInputLine
+  public status: String = "eof"
+  public text: String = ""
+end
+
+def agentReadLine(input: LspInput): AgentInputLine
+  let limits = new AgentLimits()
+  let result = new AgentInputLine()
+  let parts = new StringBuffer()
+  var bytes: Byte[] = []
+  var continuation = 0
+  var length = 0
+  var exceeded = false
+  var invalid = false
+
+  while true
+    let byte = input.readByte()
+
+    if byte < 0 || byte == 10
+      if byte < 0 && length == 0
+        return result
+      end
+      if exceeded
+        result.status = "limit"
+        return result
+      end
+      if invalid || continuation != 0
+        result.status = "invalid"
+        return result
+      end
+      if bytes.Length > 0
+        let part = host.stringFromBytes(bytes)
+
+        if part == null
+          result.status = "invalid"
+          return result
+        end
+        parts.add(part)
+      end
+      result.status = byte < 0 ? "truncated" : "complete"
+      result.text = lspJoin(parts, 0, parts.size)
+      return result
+    end
+    length = length + 1
+    if length > limits.messageBytes()
+      exceeded = true
+    else if !invalid
+      if continuation > 0
+        if byte < 128 || byte > 191
+          invalid = true
+          bytes = []
+        else
+          bytes = host.appendByte(bytes, byte as Byte)
+          continuation = continuation - 1
+        end
+      else if byte < 128
+        bytes = host.appendByte(bytes, byte as Byte)
+      else if byte >= 194 && byte <= 244
+        bytes = host.appendByte(bytes, byte as Byte)
+        continuation = utf8Width(byte) - 1
+      else
+        invalid = true
+        bytes = []
+      end
+      if !invalid && bytes.Length >= 256 && continuation == 0
+        let part = host.stringFromBytes(bytes)
+
+        if part == null
+          invalid = true
+          bytes = []
+        else
+          parts.add(part)
+          bytes = []
+        end
+      end
+    end
+  end
+  return result
+end
+
+def agentValidEnvelope(message: LspJson): Bool
+  if message.kind != "object" || message.get("jsonrpc").kind != "string" || message.get("jsonrpc").value != "2.0"
+    return false
+  end
+  if message.get("method").kind != "string"
+    return false
+  end
+  let id = message.get("id")
+
+  if id.kind != "missing" && id.kind != "string" && id.kind != "number"
+    return false
+  end
+  return true
+end
+
+def agentValidInitialize(message: LspJson): Bool
+  let params = message.get("params")
+  let version = params.get("protocolVersion")
+  let capabilities = params.get("capabilities")
+  let clientInfo = params.get("clientInfo")
+
+  return params.kind == "object" && version.kind == "string" && capabilities.kind == "object" && clientInfo.kind == "object" && clientInfo.get("name").kind == "string" && clientInfo.get("version").kind == "string"
+end
+
+def agentOutputSchema(): String
+  let point = "{\"type\":\"object\",\"properties\":{\"line\":{\"type\":\"integer\",\"minimum\":0},\"character\":{\"type\":\"integer\",\"minimum\":0}},\"required\":[\"line\",\"character\"],\"additionalProperties\":false}"
+  let range = "{\"type\":\"object\",\"properties\":{\"start\":{\"$ref\":\"#/$defs/point\"},\"end\":{\"$ref\":\"#/$defs/point\"}},\"required\":[\"start\",\"end\"],\"additionalProperties\":false}"
+  let diagnostic = "{\"type\":\"object\",\"properties\":{\"uri\":{\"type\":\"string\"},\"range\":{\"$ref\":\"#/$defs/range\"},\"severity\":{\"type\":\"integer\"},\"code\":{\"type\":\"string\"},\"message\":{\"type\":\"string\"}},\"required\":[\"uri\",\"range\",\"severity\",\"code\",\"message\"],\"additionalProperties\":false}"
+  let effects = "{\"type\":\"object\",\"properties\":{\"applied\":{\"type\":\"boolean\"},\"analyzed\":{\"type\":\"boolean\"},\"persisted\":{\"type\":\"boolean\"},\"executed\":{\"type\":\"boolean\"}},\"required\":[\"applied\",\"analyzed\",\"persisted\",\"executed\"],\"additionalProperties\":false}"
+  let type = "{\"type\":\"object\",\"properties\":{\"kind\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"},\"identity\":{\"type\":\"string\"},\"semanticIdentity\":{\"type\":\"string\"},\"identityStatus\":{\"type\":\"string\"}},\"required\":[\"kind\",\"name\",\"identity\",\"semanticIdentity\",\"identityStatus\"],\"additionalProperties\":false}"
+  let target = "{\"type\":\"object\",\"properties\":{\"kind\":{\"type\":\"string\"},\"start\":{\"type\":\"integer\",\"minimum\":0},\"length\":{\"type\":\"integer\",\"minimum\":0},\"prefix\":{\"type\":\"string\"}},\"required\":[\"kind\",\"start\",\"length\",\"prefix\"],\"additionalProperties\":false}"
+  let receiver = "{\"type\":\"object\",\"properties\":{\"kind\":{\"type\":\"string\"},\"type\":{\"type\":\"string\"}},\"required\":[\"kind\",\"type\"],\"additionalProperties\":false}"
+  let textEdit = "{\"type\":\"object\",\"properties\":{\"range\":{\"$ref\":\"#/$defs/range\"},\"newText\":{\"type\":\"string\"}},\"required\":[\"range\",\"newText\"],\"additionalProperties\":false}"
+  let candidate = "{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"},\"insertText\":{\"type\":\"string\"},\"kind\":{\"type\":\"integer\"},\"detail\":{\"type\":\"string\"},\"identity\":{\"type\":\"string\"},\"semanticIdentity\":{\"type\":\"string\"},\"identityStatus\":{\"type\":\"string\"},\"textEdit\":{\"$ref\":\"#/$defs/textEdit\"},\"cursorByteOffset\":{\"type\":\"integer\",\"minimum\":0}},\"required\":[\"name\",\"insertText\",\"kind\",\"detail\",\"identity\",\"semanticIdentity\",\"identityStatus\",\"textEdit\",\"cursorByteOffset\"],\"additionalProperties\":false}"
+  let context = "{\"type\":\"object\",\"properties\":{\"status\":{\"type\":\"string\"},\"target\":{\"anyOf\":[{\"$ref\":\"#/$defs/target\"},{\"type\":\"null\"}]},\"expectedType\":{\"$ref\":\"#/$defs/type\"},\"receiver\":{\"$ref\":\"#/$defs/receiver\"},\"callableIdentity\":{\"type\":\"string\"},\"callableSemanticIdentity\":{\"type\":\"string\"},\"callableIdentityStatus\":{\"type\":\"string\"},\"count\":{\"type\":\"integer\",\"minimum\":0},\"truncated\":{\"type\":\"boolean\"},\"candidates\":{\"type\":\"array\",\"items\":{\"$ref\":\"#/$defs/candidate\"}}},\"required\":[\"status\",\"count\",\"truncated\",\"candidates\"],\"additionalProperties\":false}"
+  let excerpt = "{\"type\":\"object\",\"properties\":{\"text\":{\"type\":\"string\"},\"range\":{\"$ref\":\"#/$defs/range\"},\"truncated\":{\"type\":\"boolean\"}},\"required\":[\"text\",\"range\",\"truncated\"],\"additionalProperties\":false}"
+
+  return "{\"$schema\":\"https://json-schema.org/draft/2020-12/schema\",\"type\":\"object\",\"properties\":{\"schemaVersion\":{\"type\":\"integer\",\"minimum\":0},\"operationId\":{\"type\":\"string\"},\"uri\":{\"type\":\"string\"},\"projectKey\":{\"type\":\"string\"},\"revision\":{\"type\":\"integer\",\"minimum\":0},\"documentVersion\":{\"type\":\"integer\",\"minimum\":0},\"status\":{\"type\":\"string\"},\"analysisStatus\":{\"type\":\"string\"},\"diagnostics\":{\"type\":\"array\",\"items\":{\"$ref\":\"#/$defs/diagnostic\"}},\"effects\":{\"$ref\":\"#/$defs/effects\",\"type\":\"object\"},\"context\":{\"$ref\":\"#/$defs/context\",\"type\":\"object\"},\"message\":{\"type\":\"string\"},\"analysisRevision\":{\"type\":\"integer\",\"minimum\":0},\"snapshot\":{\"type\":\"string\"},\"diagnosticCount\":{\"type\":\"integer\",\"minimum\":0},\"diagnosticsTruncated\":{\"type\":\"boolean\"},\"sourceExcerpt\":{\"$ref\":\"#/$defs/sourceExcerpt\",\"type\":\"object\"}},\"required\":[\"schemaVersion\",\"operationId\",\"uri\",\"projectKey\",\"revision\",\"documentVersion\",\"status\",\"analysisStatus\",\"diagnostics\",\"effects\",\"message\",\"analysisRevision\",\"snapshot\",\"diagnosticCount\",\"diagnosticsTruncated\"],\"additionalProperties\":false,\"$defs\":{\"point\":" + point + ",\"range\":" + range + ",\"diagnostic\":" + diagnostic + ",\"effects\":" + effects + ",\"type\":" + type + ",\"target\":" + target + ",\"receiver\":" + receiver + ",\"textEdit\":" + textEdit + ",\"candidate\":" + candidate + ",\"context\":" + context + ",\"sourceExcerpt\":" + excerpt + "}}"
+end
+
+def agentToolsList(): String
+  var result = "{\"tools\":["
+  var separator = ""
+  var tool: AgentToolDescriptor? = agentTools()
+
+  while tool != null
+    result = result + separator + "{\"name\":" + lspQuote(tool.name()) + ",\"description\":" + lspQuote(tool.description()) + ",\"inputSchema\":" + tool.inputSchema() + ",\"outputSchema\":" + tool.outputSchema() + "}"
+    separator = ","
+    tool = tool.next()
+  end
+  return result + "]}"
+end
+
+def agentToolResult(output: String): String
+  let status = (new LspJsonParser(output)).parse().get("status")
+  let isError = status.kind != "string" || (status.value != "valid" && status.value != "invalid")
+
+  return "{\"content\":[{\"type\":\"text\",\"text\":" + lspQuote(output) + "}],\"structuredContent\":" + output + ",\"isError\":" + (isError ? "true" : "false") + "}"
+end
+
+def agentInvalidToolResult(workspace: NeriAgentWorkspace, arguments: LspJson): String
+  let operationNode = arguments.get("operationId")
+  let uriNode = arguments.get("uri")
+  let operation = operationNode.kind == "string" ? operationNode.value : ""
+  var uri = uriNode.kind == "string" ? uriNode.value : ""
+  var document: LspDocument? = null
+
+  workspace.refresh()
+  if uri != ""
+    let rawPath = lspPath(uri)
+
+    if rawPath != null
+      let path = neriCanonicalPath(rawPath)
+
+      if path != null
+        uri = lspUri(path)
+        document = workspace.server.find(uri)
+      end
+    end
+  end
+  return agentToolResult(workspace.response(operation, uri, "invalid_request", "Invalid tool arguments.", document))
+end
+
+def agentToolCall(workspace: NeriAgentWorkspace, tool: AgentToolDescriptor, params: LspJson): String
+  let arguments = params.get("arguments")
+  let request = tool.decode(arguments)
+
+  if request == null
+    # Invalid arguments have no domain result to satisfy a tool's output schema.
+    return "{\"content\":[{\"type\":\"text\",\"text\":\"Invalid tool arguments.\"}],\"isError\":true}"
+  end
+  let output = request.execute(workspace)
+
+  return agentToolResult(output)
+end
+
+def agentHandle(workspace: NeriAgentWorkspace, message: LspJson, initialized: Bool): Bool
+  let method = message.get("method")
+  let request = agentHasId(message)
+  let id = agentId(message)
+
+  if method.kind != "string"
+    if request
+      agentSend(agentJsonError(id, -32600, "Invalid Request"))
+    end
+    return true
+  end
+  if method.value == "initialize" && !request
+    agentSend(agentJsonError("null", -32600, "initialize must be a request"))
+    return true
+  end
+  if method.value == "notifications/initialized" && request
+    agentSend(agentJsonError(id, -32600, "initialized must be a notification"))
+    return true
+  end
+  if method.value == "initialize" && request
+    if !agentValidInitialize(message)
+      agentSend(agentJsonError(id, -32602, "Invalid initialize params"))
+      return true
+    end
+    agentSend("{\"jsonrpc\":\"2.0\",\"id\":" + id + ",\"result\":{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{\"tools\":{}},\"serverInfo\":{\"name\":\"neri\",\"version\":" + lspQuote(neriVersion()) + "}}}")
+    return true
+  end
+  if method.value == "notifications/initialized"
+    return true
+  end
+  if method.value == "ping" && request
+    agentSend("{\"jsonrpc\":\"2.0\",\"id\":" + id + ",\"result\":{}}")
+    return true
+  end
+  if !initialized
+    if request
+      agentSend(agentJsonError(id, -32002, "Server not initialized"))
+    end
+    return true
+  end
+  if method.value == "tools/list" && request
+    agentSend("{\"jsonrpc\":\"2.0\",\"id\":" + id + ",\"result\":" + agentToolsList() + "}")
+    return true
+  end
+  if method.value == "tools/call" && request
+    let params = message.get("params")
+    let name = params.get("name")
+    var tool: AgentToolDescriptor? = null
+
+    if name.kind == "string"
+      tool = agentFindTool(name.value)
+    end
+
+    if params.kind != "object"
+      agentSend(agentJsonError(id, -32602, "Invalid tools/call params"))
+    else if tool == null
+      agentSend(agentJsonError(id, -32602, "Unknown tool"))
+    else
+      agentSend("{\"jsonrpc\":\"2.0\",\"id\":" + id + ",\"result\":" + agentToolCall(workspace, tool, params) + "}")
+    end
+    return true
+  end
+  if request
+    agentSend(agentJsonError(id, -32601, "Method not found"))
+  end
+  return true
+end
+
+def agentMain(): Void
+  var root = ""
+  var unit = ""
+  var index = 1
+
+  while index < host.argumentCount()
+    let argument = host.argumentAt(index)
+
+    if argument == null
+      host.exit(2)
+      return
+    else if argument == "--project" && index + 1 < host.argumentCount()
+      let value = host.argumentAt(index + 1)
+
+      if value != null
+        root = value
+      end
+      index = index + 2
+    else if argument == "--unit" && index + 1 < host.argumentCount()
+      let value = host.argumentAt(index + 1)
+
+      if value != null
+        unit = value
+      end
+      index = index + 2
+    else
+      host.exit(2)
+      return
+    end
+  end
+  if root == ""
+    host.exit(2)
+    return
+  end
+  let absolute = host.pathAbsolute(root)
+
+  if absolute == null
+    host.exit(2)
+    return
+  end
+  let workspace = new NeriAgentWorkspace(absolute, unit)
+  let input = new LspInput()
+  var negotiated = false
+  var initialized = false
+
+  while true
+    let line = agentReadLine(input)
+
+    if line.status == "eof"
+      return
+    end
+    if line.status == "limit"
+      agentSend(agentJsonError("null", -32700, "Message exceeds 2 MiB"))
+    else if line.status != "complete"
+      agentSend(agentJsonError("null", -32700, "Parse error"))
+    else
+      let parser = new LspJsonParser(line.text)
+      let message = parser.parse()
+
+      parser.spaces()
+      if parser.failed || parser.position != host.stringByteLength(line.text)
+        agentSend(agentJsonError("null", -32700, "Parse error"))
+      else if !agentValidEnvelope(message)
+        agentSend(agentJsonError("null", -32600, "Invalid Request"))
+      else
+        let method = message.get("method")
+
+        if method.kind == "string" && method.value == "initialize" && negotiated
+          agentSend(agentJsonError(agentId(message), -32600, "Duplicate initialize"))
+        else
+          if method.kind == "string" && method.value == "initialize" && agentHasId(message) && agentValidInitialize(message)
+            negotiated = true
+          end
+          if method.kind == "string" && method.value == "notifications/initialized" && negotiated && !agentHasId(message)
+            initialized = true
+          end
+          if !agentHandle(workspace, message, initialized)
+            return
+          end
+        end
+      end
+    end
+  end
+end

@@ -10,20 +10,26 @@ def lspAnalyzeQueryText(document: LspDocument, primaryText: String): SemanticMod
   if document.tokens == null
     return null
   end
-  var source = primaryText + "\n"
+  let sourceParts = new StringBuffer()
   let starts = new IntBuffer()
   let ids = new StringBuffer()
+  var offset = (new IrSourceMap(primaryText)).utf16Length() + 1
 
+  sourceParts.add(primaryText + "\n")
   starts.add(0)
   ids.add(document.uri)
   var index = 1
 
   while index < document.sourceTexts.size
-    starts.add((new IrSourceMap(source)).utf16Length())
+    let text = document.sourceTexts.get(index)
+
+    starts.add(offset)
     ids.add(document.sourceUris.get(index))
-    source = source + document.sourceTexts.get(index) + "\n"
+    sourceParts.add(text + "\n")
+    offset = offset + (new IrSourceMap(text)).utf16Length() + 1
     index = index + 1
   end
+  let source = lspJoin(sourceParts, 0, sourceParts.size)
   let tokens = (new BootstrapLexer(source)).lex()
   let parser = new BootstrapParser(tokens)
 
@@ -75,6 +81,93 @@ def lspCompletionAccessible(model: SemanticModel, site: SemanticCompletionSite, 
   return semanticCompletionAccessible(model, site, owner, access)
 end
 
+# A protocol-independent completion query. Both editor completion and local
+# agent context consume the same repaired source, bound model and selected site.
+# A complete result means that this particular query was resolved; the
+# candidate list remains intentionally bounded and is not a proof that every
+# valid insertion is represented.
+class LspCompletionContext
+  public status: String = "unavailable"
+  public target: SemanticCompletionTarget?
+  public model: SemanticModel?
+  public site: SemanticCompletionSite?
+  public querySourceStarts: IntBuffer = new IntBuffer()
+  public queryInsertedLength: Int = 0
+  public queryMapsAfterInsertion: Bool = false
+end
+
+def lspCompletionQuerySources(document: LspDocument, primaryText: String, context: LspCompletionContext): Void
+  var offset = (new IrSourceMap(primaryText)).utf16Length() + 1
+
+  context.querySourceStarts.add(0)
+  var index = 1
+
+  while index < document.sourceTexts.size
+    context.querySourceStarts.add(offset)
+    offset = offset + (new IrSourceMap(document.sourceTexts.get(index))).utf16Length() + 1
+    index = index + 1
+  end
+end
+
+def lspCompletionContext(document: LspDocument, position: Int): LspCompletionContext
+  let result = new LspCompletionContext()
+  let target = lspCompletionTarget(document.text, position)
+
+  result.target = target
+  if !target.valid
+    result.status = "invalid-position"
+    return result
+  end
+  let marker = "__neri_completion_site_7f31__"
+  let map = new IrSourceMap(document.text)
+  let first = map.offsetAt(target.start)
+  let last = map.offsetAt(target.start + target.length)
+  let suffix = target.addCall ? "()" : ""
+  let repaired = host.stringSlice(document.text, 0, first) + marker + suffix + host.stringSlice(document.text, last, host.stringByteLength(document.text) - last)
+  var queryText = repaired
+  var mapsAfterInsertion = true
+  var model = lspAnalyzeQueryText(document, repaired)
+
+  if model == null && target.length == 0 && target.start == position
+    let repairPosition = target.start + (new IrSourceMap(marker + suffix)).utf16Length()
+    let closed = lspSignatureRepairText(repaired, repairPosition)
+
+    if closed != null
+      model = lspAnalyzeQueryText(document, closed)
+      if model != null
+        queryText = closed
+        mapsAfterInsertion = false
+      end
+    end
+  end
+  if model == null
+    result.status = "unavailable"
+    return result
+  end
+  result.model = model
+  lspCompletionQuerySources(document, queryText, result)
+  result.queryInsertedLength = (new IrSourceMap(marker + suffix)).utf16Length()
+  result.queryMapsAfterInsertion = mapsAfterInsertion
+  if target.kind == "import"
+    let importSite = new SemanticCompletionSite()
+
+    importSite.receiverKind = "import"
+    importSite.receiverType = target.receiverType
+    result.site = importSite
+    result.status = "complete"
+    return result
+  end
+  let site = lspCompletionSite(model, target)
+
+  if site == null
+    result.status = "no-context"
+    return result
+  end
+  result.site = site
+  result.status = "complete"
+  return result
+end
+
 def lspCompletionItems(document: LspDocument, target: SemanticCompletionTarget, model: SemanticModel, site: SemanticCompletionSite, prefix: String, snippets: Bool = false): String
   let filter = new SemanticCompletionFilter()
 
@@ -83,6 +176,7 @@ def lspCompletionItems(document: LspDocument, target: SemanticCompletionTarget, 
   let editRange = "{\"start\":" + lspPosition(document.text, target.start) + ",\"end\":" + lspPosition(document.text, target.start + target.length) + "}"
   let items = new StringBuffer()
   var candidate = candidates.first
+  var rank = 0
 
   while candidate != null
     let separator = items.size == 0 ? "" : ","
@@ -91,6 +185,8 @@ def lspCompletionItems(document: LspDocument, target: SemanticCompletionTarget, 
     let insertion = semanticCompletionInsertion(candidate, target, site)
     let snippet = snippets && insertion.text != candidate.insertText
     var text = insertion.text
+    let order = "000" + (rank as String)
+    let sortText = host.stringSlice(order, host.stringByteLength(order) - 3, 3)
 
     if snippet
       let cursor = insertion.cursorByteOffset
@@ -98,7 +194,8 @@ def lspCompletionItems(document: LspDocument, target: SemanticCompletionTarget, 
       text = host.stringSlice(text, 0, cursor) + "$0" + host.stringSlice(text, cursor, host.stringByteLength(text) - cursor)
     end
 
-    items.add(separator + "{\"label\":" + lspQuote(candidate.name) + ",\"filterText\":" + lspQuote(candidate.name) + ",\"kind\":" + (candidate.kind as String) + ",\"detail\":" + lspQuote(candidate.detail) + ",\"insertTextFormat\":" + (snippet ? "2" : "1") + ",\"textEdit\":{\"range\":" + editRange + ",\"newText\":" + lspQuote(text) + "}" + dataProperty + "}")
+    items.add(separator + "{\"label\":" + lspQuote(candidate.name) + ",\"filterText\":" + lspQuote(candidate.name) + ",\"sortText\":" + lspQuote(sortText) + ",\"kind\":" + (candidate.kind as String) + ",\"detail\":" + lspQuote(candidate.detail) + ",\"insertTextFormat\":" + (snippet ? "2" : "1") + ",\"textEdit\":{\"range\":" + editRange + ",\"newText\":" + lspQuote(text) + "}" + dataProperty + "}")
+    rank = rank + 1
     candidate = candidate.next
   end
   let serialized = "[" + lspJoin(items, 0, items.size) + "]"
@@ -120,32 +217,12 @@ def lspCompletion(document: LspDocument, position: Int, snippets: Bool = false):
   if overriding != null
     return overriding
   end
-  let target = lspCompletionTarget(document.text, position)
+  let context = lspCompletionContext(document, position)
+  let target = context.target
+  let model = context.model
+  let site = context.site
 
-  if !target.valid
-    return "[]"
-  end
-  let marker = "__neri_completion_site_7f31__"
-  let map = new IrSourceMap(document.text)
-  let first = map.offsetAt(target.start)
-  let last = map.offsetAt(target.start + target.length)
-  let suffix = target.addCall ? "()" : ""
-  let repaired = host.stringSlice(document.text, 0, first) + marker + suffix + host.stringSlice(document.text, last, host.stringByteLength(document.text) - last)
-  let model = lspAnalyzeQueryText(document, repaired)
-
-  if model == null
-    return "[]"
-  end
-  if target.kind == "import"
-    let importSite = new SemanticCompletionSite()
-
-    importSite.receiverKind = "import"
-    importSite.receiverType = target.receiverType
-    return lspCompletionItems(document, target, model, importSite, target.prefix, snippets)
-  end
-  let site = lspCompletionSite(model, target)
-
-  if site == null
+  if context.status != "complete" || target == null || model == null || site == null
     return "[]"
   end
   return lspCompletionItems(document, target, model, site, target.prefix, snippets)

@@ -32,6 +32,20 @@ Neri retains flat immutable strings and supplies a separate mutable builder.
 
 ## Run latency
 
+`neri profile --project ROOT` measures release builds of all declared project
+members and referenced libraries. Its structured output records per-phase
+duration totals and sample counts, binary artifact digests, input fingerprints
+and project snapshots before and after the run. Libraries are measured as object
+builds. The profiler builds executables without running them.
+
+`NERI_TIMING_OUTPUT` selects the JSONL timing sink when `--timings` is enabled.
+The terminal `build-complete` event establishes that all successful build phases
+were recorded; a write failure fails the profiling build. The sink is bounded
+to 8 MiB. Repeated phases, such as object code generation, are grouped in the
+project response. Nested durations overlap; `build-complete` supplies the total.
+Measurements are individual observations with the current cache state, not
+statistical regressions or application profiles.
+
 `neri source.hk --timings` separates frontend, cache lookup, code generation,
 linking and program execution. `--no-cache` provides an uncached comparison with
 the same compiler, runtime and safety checks. A cache hit still parses, type-checks,
@@ -397,3 +411,30 @@ sizes used `wc -c`. Timing includes the launcher and native linker. The 96-byte
 size difference and noisy short build times describe this two-specialization
 example only; they are not regression thresholds or a projection for large
 generic programs. More concrete argument combinations can increase generated code.
+
+## Agent feedback latency
+
+Project feedback shares bounded content, digest and import observations within
+each graph pass. Its final verification uses fresh observations. Diagnostics
+run the complete parser and binder without building editor navigation indexes.
+Persisted analysis reuse follows source and compiler fingerprints; message
+deduplication separately follows the host session, turn and transcript.
+
+A local macOS ARM64 Release comparison on 2026-09-13 measured the repository's
+95 declared units with `/usr/bin/time -p`. Both full analyses reported complete
+coverage and zero diagnostics:
+
+| Workload | Baseline | Optimized |
+|---|---:|---:|
+| Complete analysis without saved state | 199.54 s | 129.15 s |
+| Unchanged inputs, same delivery scope | 11.90 s | 3.57 s |
+| Unchanged inputs, new delivery scope | Reanalyzes all units | 3.69 s; reuses 95 units |
+
+Measure the first case with a fresh `--state FILE`, then repeat the same
+`feedback --project ROOT --codex-hook` invocation and hook input for the second.
+Change `turn_id` while preserving the state file for the third. Same-scope
+repetition returns `{}`; a new scope receives an operation-correlated report.
+These are individual wall-time observations, not regression thresholds. A
+changed compiler invalidates all unit results; changed sources invalidate their
+consumer closures. The first full analysis remains substantially more expensive
+than verification of reusable results.

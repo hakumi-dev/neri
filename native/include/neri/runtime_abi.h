@@ -22,41 +22,7 @@ extern "C" {
 #define NERI_RT_NORETURN __attribute__((noreturn))
 #endif
 
-#define NERI_RUNTIME_ABI_MAJOR UINT16_C(1)
-#define NERI_RUNTIME_ABI_MINOR UINT16_C(25)
-
-#define NERI_RT_FEATURE_PRECISE_GC UINT64_C(1)
-#define NERI_RT_FEATURE_NONMOVING_GC (UINT64_C(1) << 1)
-#define NERI_RT_FEATURE_SCOPED_BORROWS (UINT64_C(1) << 2)
-#define NERI_RT_FEATURE_NATIVE_MEMORY (UINT64_C(1) << 3)
-#define NERI_RT_FEATURE_ROOT_FRAMES (UINT64_C(1) << 4)
-#define NERI_RT_FEATURE_SOURCE_LOCATIONS (UINT64_C(1) << 5)
-#define NERI_RT_FEATURE_NATIVE_STRINGS (UINT64_C(1) << 6)
-#define NERI_RT_FEATURE_CONSOLE_IO (UINT64_C(1) << 7)
-/* ABI v1.4 capability bits. Extended scalars are advertised since ABI v1.9;
- * inline aggregates and multiple mutators remain reserved. */
-#define NERI_RT_FEATURE_INLINE_AGGREGATES (UINT64_C(1) << 8)
-#define NERI_RT_FEATURE_EXTENDED_SCALARS (UINT64_C(1) << 9)
-#define NERI_RT_FEATURE_MULTIPLE_MUTATORS (UINT64_C(1) << 10)
-#define NERI_RT_FEATURE_BOOTSTRAP_HOST (UINT64_C(1) << 11)
-#define NERI_RT_FEATURE_SOCKETS (UINT64_C(1) << 12)
-#define NERI_RT_FEATURE_INTERACTIVE_IO (UINT64_C(1) << 13)
-#define NERI_RT_FEATURE_SCOPED_TASKS (UINT64_C(1) << 14)
-#define NERI_RT_FEATURE_FILES (UINT64_C(1) << 15)
-#define NERI_RT_FEATURE_INTERRUPTS (UINT64_C(1) << 16)
-#define NERI_RT_FEATURE_WALL_CLOCK (UINT64_C(1) << 17)
-#define NERI_RT_FEATURE_CRYPTO (UINT64_C(1) << 18)
-#define NERI_RT_FEATURE_ROOTED_FILES (UINT64_C(1) << 19)
-#define NERI_RT_FEATURE_PROCESS (UINT64_C(1) << 20)
-#define NERI_RT_FEATURE_DIRECTORY (UINT64_C(1) << 21)
-#define NERI_RT_FEATURE_SOCKET_CLOSE_RESULT (UINT64_C(1) << 22)
-/* Bit 23 is reserved for ABI 1.19 session support. */
-#define NERI_RT_FEATURE_DRAIN (UINT64_C(1) << 24)
-#define NERI_RT_FEATURE_SESSION_MODULES (UINT64_C(1) << 23)
-#define NERI_RT_FEATURE_OPTIONAL_CONSOLE_READ (UINT64_C(1) << 25)
-#define NERI_RT_FEATURE_PROCESS_IO (UINT64_C(1) << 26)
-#define NERI_RT_FEATURE_FILESYSTEM_MUTATION (UINT64_C(1) << 27)
-#define NERI_RT_FEATURE_SOCKET_ENDPOINTS (UINT64_C(1) << 28)
+#include "neri/abi_catalog.h"
 
 #define NERI_TYPE_KIND_CLASS_V1 UINT32_C(1)
 #define NERI_TYPE_KIND_STRING_V1 UINT32_C(2)
@@ -369,6 +335,11 @@ NERI_RT_API neri_int_v1 neri_rt_v1_host_canonical_path(
 NERI_RT_API neri_ref_v1
 neri_rt_v1_host_path_file_name(neri_ref_v1 path);
 NERI_RT_API neri_int_v1 neri_rt_v1_host_argument_count(void);
+/* ABI 1.26: canonical current executable path in UTF-8. Returns byte length,
+   excluding NUL, or -1 on failure. Writes only when capacity exceeds length;
+   output may be NULL when capacity is zero. */
+NERI_RT_API neri_int_v1 neri_rt_v1_host_executable_path(
+    neri_byte_v1 *output, neri_int_v1 capacity);
 NERI_RT_API neri_ref_v1
 neri_rt_v1_host_argument_at(neri_int_v1 index);
 NERI_RT_API neri_ref_v1

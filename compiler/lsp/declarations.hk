@@ -1,117 +1,95 @@
 # Syntax-only declaration templates run before project analysis. A null result
 # delegates to semantic completion; an empty list is a handled position.
-def lspDeclarationCompletion(document: LspDocument, position: Int, snippets: Bool): String?
-  let site = lspDeclarationSite(document, position)
-
-  if site == null
-    return null
-  end
+def lspDeclarationCompletionForTemplate(document: LspDocument, snippets: Bool, template: LspDeclarationTemplate, site: LspDeclarationSite): String?
+  site.parser = new BootstrapParser((new BootstrapLexer(site.header)).lex())
+  site.modifiers = site.parser.parseDeclarationModifiers()
   let parser = site.parser
-  let tokens = parser.tokens
-  let keyword = tokens.textAt(parser.currentIndex())
-  let keywordStart = tokens.startAt(parser.currentIndex())
-  let modifiers = semanticCompletionUtf16Slice(site.header, 0, keywordStart)
   let abstractMethod = syntaxModifierIn(parser.arena, site.modifiers, "abstract") >= 0
   let overriding = syntaxModifierIn(parser.arena, site.modifiers, "override") >= 0
 
   if overriding
     return null
   end
-  let method = bootstrapStartsWith("def", keyword)
-  let classDeclaration = bootstrapStartsWith("class", keyword)
+  let method = template.provider == "functionDeclaration"
+  let classDeclaration = template.provider == "classDeclaration"
+
+  if template.provider == "staticDeclaration"
+    if site.modifiers.Length != 0 || parser.tokens.count() != 2
+      return ""
+    end
+    let staticSnippet = new LspSnippet()
+
+    lspTemplateAppend(staticSnippet, template.headerText)
+    if template.bodyKind == "block" && !lspDeclarationBody(document, site, staticSnippet, false, template)
+      return ""
+    end
+    if template.bodyKind == "none" && !template.hasFinalStop
+      staticSnippet.finalStop()
+    end
+    return lspDeclarationItem(document, site, template.label, template.detail, staticSnippet, snippets)
+  end
 
   if (!method && !classDeclaration) || (classDeclaration && site.className != "") || (method && abstractMethod && !site.abstractClass)
-    return "[]"
+    return ""
   end
   for modifier in site.modifiers
     if !semanticDeclarationModifierAllowed(parser.arena.dataAt(modifier), classDeclaration ? "Class" : (site.className == "" ? "Function" : "Method"))
-      return "[]"
+      return ""
     end
   end
-  parser.next()
   let snippet = new LspSnippet()
+  let rendered = lspRenderTemplateHeader(template, site, snippet)
 
-  snippet.literal(modifiers + (method ? "def " : "class "))
-  var name = ""
-
-  if parser.currentKind() == "Identifier"
-    name = tokens.textAt(parser.next())
-    if keyword == "def" || keyword == "class"
-      snippet.text = ""
-      snippet.plain = ""
-      snippet.literal(semanticCompletionUtf16Slice(site.header, 0, tokens.startAt(parser.currentIndex())))
-    else
-      # Prefix templates apply while writing the declaration keyword itself.
-      return "[]"
-    end
-  else if parser.currentKind() == "EndOfFile"
-    snippet.field(method ? "method" : "Name")
-  else
-    return "[]"
+  if rendered == "defer"
+    return null
   end
-  if !method
-    let suffixStart = tokens.startAt(parser.currentIndex())
-
-    parser.parseTypeParameters()
-    if parser.accept("Colon")
-      parser.parseTypeName()
-    end
-    if parser.diagnostics.count() != 0 || parser.currentKind() != "EndOfFile"
-      return null
-    end
-    snippet.literal(semanticCompletionUtf16Slice(site.header, suffixStart, tokens.startAt(parser.currentIndex()) - suffixStart))
-    if !lspDeclarationBody(document, site, snippet, false)
-      return "[]"
-    end
-    return "{\"isIncomplete\":true,\"items\":[" + lspDeclarationItem(document, site, "class", "Declare a class", snippet, snippets) + "]}"
+  if rendered != "applied"
+    return ""
   end
-  if parser.currentKind() == "EndOfFile"
-    snippet.literal("(")
-    snippet.field("")
-    snippet.literal("): ")
-    snippet.field("Void")
-  else
-    let suffixStart = tokens.startAt(parser.currentIndex())
-
-    parser.parseTypeParameters()
-    parser.expect("LParen")
-    let emptyParameters = parser.currentKind() == "EndOfFile"
-
-    if !emptyParameters
-      parser.parseParameters()
-    end
-    let missingParen = parser.currentKind() == "EndOfFile"
-
-    if missingParen && !emptyParameters
-      return null
-    end
-    if !missingParen
-      parser.expect("RParen")
-    end
-    if parser.diagnostics.count() != 0
-      return null
-    end
-    let suffixEnd = tokens.startAt(parser.currentIndex())
-
-    snippet.literal(semanticCompletionUtf16Slice(site.header, suffixStart, suffixEnd - suffixStart))
-    snippet.field("") if emptyParameters
-    snippet.literal(")") if missingParen
-    if parser.currentKind() == "EndOfFile"
-      snippet.literal(": ")
-      snippet.field("Void")
-    else
-      # Type annotations use semantic candidates; Enter already completes a
-      # finished signature's body without replacing its explicitly written type.
-      return null
-    end
+  if !lspDeclarationBody(document, site, snippet, abstractMethod, template)
+    return ""
   end
-  if !lspDeclarationBody(document, site, snippet, abstractMethod)
-    return "[]"
-  end
-  return "{\"isIncomplete\":true,\"items\":[" + lspDeclarationItem(document, site, "def", name == "" ? "Declare a method" : "Complete " + name, snippet, snippets) + "]}"
+  snippet.finalStop() if abstractMethod
+  return lspDeclarationItem(document, site, template.label, template.detail, snippet, snippets)
 end
 
-def lspCompletionTriggerApplies(document: LspDocument, position: Int, context: LspJson): Bool
+def lspDeclarationCompletion(document: LspDocument, position: Int, snippets: Bool, catalog: LspDeclarationCatalog): String?
+  if catalog.error != ""
+    return null
+  end
+  let site = lspDeclarationSite(document, position, false, catalog)
+
+  if site == null
+    return null
+  end
+  if syntaxModifierIn(site.parser.arena, site.modifiers, "override") >= 0
+    return null
+  end
+  let keyword = site.parser.tokens.textAt(site.parser.currentIndex())
+  let context = site.className == "" ? "global" : "class"
+  let items = new StringBuffer()
+  var deferred = false
+  var template = catalog.first
+
+  while template != null
+    if template.context == context && (bootstrapStartsWith(template.prefix, keyword) || (template.provider != "staticDeclaration" && bootstrapStartsWith(template.declarationKeyword, keyword)))
+      let completion = lspDeclarationCompletionForTemplate(document, snippets, template, site)
+
+      if completion == null
+        deferred = true
+      else if completion != ""
+        items.add((items.size == 0 ? "" : ",") + completion)
+      end
+    end
+    template = template.nextTemplate
+  end
+  if items.size == 0 && deferred
+    return null
+  end
+  return "{\"isIncomplete\":true,\"items\":[" + lspJoin(items, 0, items.size) + "]}"
+end
+
+def lspCompletionTriggerApplies(document: LspDocument, position: Int, context: LspJson, catalog: LspDeclarationCatalog? = null): Bool
   if context.get("triggerKind").value != "2"
     return true
   end
@@ -120,7 +98,7 @@ def lspCompletionTriggerApplies(document: LspDocument, position: Int, context: L
   if character != " " && character != ":" && character != ")"
     return true
   end
-  if lspDeclarationSite(document, position, true) != null
+  if lspDeclarationSite(document, position, true, catalog) != null
     return true
   end
   let target = lspCompletionTarget(document.text, position)

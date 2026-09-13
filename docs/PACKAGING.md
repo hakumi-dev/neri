@@ -25,10 +25,10 @@ records:
   `runtimeManifest` with ABI/IR versions and feature bits, validation gate,
   source/artifact manifest digests and trusted seed provenance digest.
 
-The package includes and hashes every `.hk` library source directly under
-`stdlib/`, discovered in sorted order. Library membership comes from those
-files; the compiler, language server and package driver have no library-name
-registry.
+The package includes and hashes `stdlib/manifest.json` and every `.hk` library
+source recursively under `stdlib/`, discovered in sorted order. Relative paths
+are preserved. The manifest declares module membership through library units;
+compilation, editor analysis, sessions and documentation share its resolution.
 
 The driver creates two separate trees, normalizes permissions and timestamps,
 writes sorted USTAR members with fixed owner/group metadata, and compresses with

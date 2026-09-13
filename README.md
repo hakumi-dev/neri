@@ -63,6 +63,7 @@ Use [LLDB or an IDE with DAP support](docs/DEBUGGING.md) to debug an executable.
 
 - [Examples](examples/README.md) — output, functions, arrays and program arguments.
 - [Language reference](docs/LANGUAGE.md) — syntax, types and command-line behavior.
+- [Agent feedback](docs/AGENT-FEEDBACK.md) — local MCP tools for versioned edits, diagnostics and inferred context.
 - [Documentation index](docs/README.md) — installation, development and internals.
 - [Supported platforms](docs/BUILDING.md#supported-platforms) — native targets and platform limits.
 

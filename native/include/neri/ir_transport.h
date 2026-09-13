@@ -72,16 +72,7 @@ enum neri_ir_comparison_v1 {
     NERI_IR_COMPARISON_GREATER_OR_EQUAL_V1 = 6,
 };
 
-enum neri_ir_effect_v1 {
-    NERI_IR_EFFECT_READ_V1 = UINT32_C(1) << 0U,
-    NERI_IR_EFFECT_WRITE_V1 = UINT32_C(1) << 1U,
-    NERI_IR_EFFECT_MAY_PANIC_V1 = UINT32_C(1) << 2U,
-    NERI_IR_EFFECT_MANAGED_ALLOCATE_V1 = UINT32_C(1) << 3U,
-    NERI_IR_EFFECT_NATIVE_ALLOCATE_V1 = UINT32_C(1) << 4U,
-    NERI_IR_EFFECT_SAFEPOINT_V1 = UINT32_C(1) << 5U,
-    NERI_IR_EFFECT_UNSAFE_V1 = UINT32_C(1) << 6U,
-    NERI_IR_EFFECT_NO_RETURN_V1 = UINT32_C(1) << 7U,
-};
+#include "neri/abi_catalog.h"
 
 enum neri_ir_type_tag_v1 {
     NERI_IR_TYPE_VOID_V1 = 1,

@@ -1,0 +1,418 @@
+use host
+
+class QuotationBuilder
+  public body: BootstrapBodyBinder
+  public closureName: String
+  public parameterIdentities: StringBuffer
+  public nodeValues: Int[] = []
+  public valid: Bool = true
+
+  def init(body: BootstrapBodyBinder, closureName: String, parameterIdentities: StringBuffer): Void
+    this.body = body
+    this.closureName = closureName
+    this.parameterIdentities = parameterIdentities
+  end
+
+  def literal(kind: String, typeName: String, value: String, source: Int): Int
+    return this.body.addBoundValue(kind, typeName, "", value, source, [])
+  end
+
+  def integer(value: Int, source: Int): Int
+    return this.literal("IntLiteral", "Int", "i:" + (value as String), source)
+  end
+
+  def text(value: String, source: Int): Int
+    return this.literal("StringLiteral", "String", "s:" + value, source)
+  end
+
+  def boolean(value: Bool, source: Int): Int
+    return this.literal("BoolLiteral", "Bool", value ? "b:true" : "b:false", source)
+  end
+
+  def alternative(typeName: String, caseName: String, children: Int[], source: Int): Int
+    return quotationAlternative(this.body, typeName, caseName, children, source)
+  end
+
+  def node(kind: String, typeName: String, source: Int, first: Int = -1, second: Int = -1, index: Int = -1, identity: String = "", intValue: Int = -1, boolValue: Int = -1, textValue: Int = -1): Int
+    let kindValue = this.alternative("quotation.NodeKind", kind, [], source)
+    let integerValue = intValue >= 0 ? intValue : this.integer(0, source)
+    let booleanValue = boolValue >= 0 ? boolValue : this.boolean(false, source)
+    let stringValue = textValue >= 0 ? textValue : this.text("", source)
+    let value = this.body.addBound("New", "quotation.Node", "quotation.Node", source, [
+        kindValue,
+        this.text(typeName, source),
+        this.integer(first, source),
+        this.integer(second, source),
+        this.integer(index, source),
+        this.text(identity, source),
+        integerValue,
+        booleanValue,
+        stringValue
+      ])
+    let result = this.nodeValues.Length
+
+    this.nodeValues = host.appendInt(this.nodeValues, value)
+    return result
+  end
+
+  def parameterIndex(identity: String): Int
+    var index = 0
+
+    while index < this.parameterIdentities.size
+      if this.parameterIdentities.get(index) == identity
+        return index
+      end
+      index = index + 1
+    end
+    return -1
+  end
+
+  def captureIndex(identity: String): Int
+    let prefix = this.closureName + ".capture"
+
+    if !semanticStartsWith(identity, prefix)
+      return -1
+    end
+    let suffix = host.stringSlice(identity, host.stringByteLength(prefix), host.stringByteLength(identity) - host.stringByteLength(prefix))
+    let parsed = host.parseInt(suffix)
+
+    if parsed != null
+      return parsed
+    end
+    return -1
+  end
+
+  def translate(boundNode: Int, diagnosticNode: Int): Int
+    let bound = this.body.model().bound
+    let kind = bound.kindAt(boundNode)
+    let typeName = bound.typeAt(boundNode)
+
+    if kind == "Name"
+      let parameter = this.parameterIndex(bound.symbolAt(boundNode))
+
+      if parameter >= 0
+        return this.node("Parameter", typeName, diagnosticNode, -1, -1, parameter)
+      end
+      return this.rejectAt(boundNode, "can only read its parameters and immutable scalar captures")
+    end
+    if kind == "Member"
+      let capture = this.captureIndex(bound.dataAt(boundNode))
+
+      if capture >= 0 && bound.childCountAt(boundNode) == 1 && bound.kindAt(bound.childAt(boundNode, 0)) == "This"
+        return this.node("Capture", typeName, diagnosticNode, -1, -1, capture)
+      end
+      if bound.childCountAt(boundNode) == 1
+        let receiver = this.translate(bound.childAt(boundNode, 0), diagnosticNode)
+
+        if receiver >= 0
+          return this.node("Member", typeName, diagnosticNode, receiver, -1, -1, bound.dataAt(boundNode))
+        end
+      end
+      return this.rejectAt(boundNode, "contains an unsupported member access")
+    end
+    if kind == "IntLiteral"
+      return this.node("IntLiteral", typeName, diagnosticNode, -1, -1, -1, "", boundNode)
+    end
+    if kind == "BoolLiteral"
+      return this.node("BoolLiteral", typeName, diagnosticNode, -1, -1, -1, "", -1, boundNode)
+    end
+    if kind == "StringLiteral"
+      return this.node("TextLiteral", typeName, diagnosticNode, -1, -1, -1, "", -1, -1, boundNode)
+    end
+    if kind == "NullLiteral"
+      return this.node("NullLiteral", typeName, diagnosticNode)
+    end
+    if kind == "Binary" && bound.childCountAt(boundNode) == 2
+      let operation = bound.dataAt(boundNode)
+      var nodeKind = ""
+
+      nodeKind = "Equal" if operation == "=="
+      nodeKind = "NotEqual" if operation == "!="
+      nodeKind = "Less" if operation == "<"
+      nodeKind = "LessEqual" if operation == "<="
+      nodeKind = "Greater" if operation == ">"
+      nodeKind = "GreaterEqual" if operation == ">="
+      nodeKind = "And" if operation == "&&"
+      nodeKind = "Or" if operation == "||"
+      if nodeKind != ""
+        let left = this.translate(bound.childAt(boundNode, 0), diagnosticNode)
+        let right = this.translate(bound.childAt(boundNode, 1), diagnosticNode)
+
+        if left >= 0 && right >= 0
+          return this.node(nodeKind, typeName, diagnosticNode, left, right)
+        end
+      end
+      return this.rejectAt(boundNode, "uses unsupported binary operator '" + operation + "'")
+    end
+    if kind == "Unary" && bound.childCountAt(boundNode) == 1
+      let operation = bound.dataAt(boundNode)
+      let nodeKind = operation == "!" ? "Not" : (operation == "-" ? "Negate" : "")
+
+      if nodeKind != ""
+        let operand = this.translate(bound.childAt(boundNode, 0), diagnosticNode)
+
+        if operand >= 0
+          return this.node(nodeKind, typeName, diagnosticNode, operand)
+        end
+      end
+      return this.rejectAt(boundNode, "uses unsupported unary operator '" + operation + "'")
+    end
+    return this.rejectAt(boundNode, "contains unsupported bound operation '" + kind + "'")
+  end
+
+  def rejectAt(boundNode: Int, detail: String): Int
+    this.valid = false
+    let bound = this.body.model().bound
+
+    this.body.model().diagnostics.add("NR276", bound.startAt(boundNode), bound.lengthAt(boundNode), "Quoted expression " + detail + ".")
+    return -1
+  end
+end
+
+def quotationAlternative(body: BootstrapBodyBinder, typeName: String, caseName: String, children: Int[], node: Int): Int
+  let symbol = body.model().findClass(typeName)
+  var caseIndex = -1
+
+  if symbol != null
+    caseIndex = body.alternativeCaseIndex(symbol, caseName)
+  end
+  if caseIndex < 0
+    body.report("NR276", node, "Quotation runtime type '" + typeName + "' is missing case '" + caseName + "'.")
+  end
+  return body.addBound("AlternativeConstruct", typeName, typeName + "|" + (caseIndex as String), node, children)
+end
+
+def quotationArray(body: BootstrapBodyBinder, typeName: String, values: Int[], node: Int): Int
+  return body.addBound("ArrayLiteral", typeName + "[]", "", node, values)
+end
+
+def quotationConstructorMatches(body: BootstrapBodyBinder, className: String, types: StringBuffer): Bool
+  let symbol = body.model().findClass(className)
+
+  if symbol == null || symbol.representation != "" || symbol.isAlternative || symbol.isAbstract
+    return false
+  end
+  let constructor = body.owner.findDeclaredMethod(symbol, "init")
+
+  if constructor == null || constructor.returnType != "Void" || constructor.parameterCount != types.size
+    return false
+  end
+  var index = 0
+
+  while index < types.size
+    let parameter = constructor.parameterAt(index)
+
+    if parameter == null || parameter.typeName != types.get(index)
+      return false
+    end
+    index = index + 1
+  end
+  return true
+end
+
+def quotationCaseMatches(body: BootstrapBodyBinder, className: String, caseName: String, types: StringBuffer): Bool
+  let symbol = body.model().findClass(className)
+
+  if symbol == null || !symbol.isAlternative
+    return false
+  end
+  let caseIndex = body.alternativeCaseIndex(symbol, caseName)
+
+  if caseIndex < 0
+    return false
+  end
+  let caseNode = alternativeCaseNode(body.owner, symbol, caseIndex)
+
+  if body.syntax().childCountAt(caseNode) != types.size
+    return false
+  end
+  var index = 0
+
+  while index < types.size
+    if body.alternativePayloadType(symbol, caseIndex, index) != types.get(index)
+      return false
+    end
+    index = index + 1
+  end
+  return true
+end
+
+def quotationAbiValid(body: BootstrapBodyBinder, node: Int): Bool
+  let noTypes = new StringBuffer()
+  let boolType = new StringBuffer()
+  let intType = new StringBuffer()
+  let textType = new StringBuffer()
+
+  boolType.add("Bool")
+  intType.add("Int")
+  textType.add("String")
+  let nodeConstructor = new StringBuffer()
+
+  nodeConstructor.add("quotation.NodeKind")
+  nodeConstructor.add("String")
+  nodeConstructor.add("Int")
+  nodeConstructor.add("Int")
+  nodeConstructor.add("Int")
+  nodeConstructor.add("String")
+  nodeConstructor.add("Int")
+  nodeConstructor.add("Bool")
+  nodeConstructor.add("String")
+  let treeConstructor = new StringBuffer()
+
+  treeConstructor.add("quotation.Node[]")
+  treeConstructor.add("quotation.CaptureValue[]")
+  treeConstructor.add("Int")
+  treeConstructor.add("String[]")
+  treeConstructor.add("String")
+  var valid = quotationConstructorMatches(body, "quotation.Node", nodeConstructor)
+
+  valid = quotationConstructorMatches(body, "quotation.Tree", treeConstructor) && valid
+  let nodeCases = ["Parameter", "Capture", "Member", "IntLiteral", "BoolLiteral", "TextLiteral", "NullLiteral", "Equal", "NotEqual", "Less", "LessEqual", "Greater", "GreaterEqual", "And", "Or", "Not", "Negate"]
+
+  for caseName in nodeCases
+    valid = quotationCaseMatches(body, "quotation.NodeKind", caseName, noTypes) && valid
+  end
+  valid = quotationCaseMatches(body, "quotation.CaptureValue", "Bool", boolType) && valid
+  valid = quotationCaseMatches(body, "quotation.CaptureValue", "Int", intType) && valid
+  valid = quotationCaseMatches(body, "quotation.CaptureValue", "Text", textType) && valid
+  valid = quotationCaseMatches(body, "quotation.CaptureValue", "Null", noTypes) && valid
+  if !valid
+    body.report("NR276", node, "Quoted expressions require the standard quotation.Node, quotation.Tree, NodeKind, and CaptureValue ABI.")
+  end
+  return valid
+end
+
+def quotationBoxScalar(body: BootstrapBodyBinder, value: Int, declaredType: String, node: Int, diagnosticCode: String): Int
+  let scalar = semanticIsOptional(declaredType) ? semanticInnerType(declaredType) : declaredType
+  let suffix = scalar == "String" ? "Text" : scalar
+  let name = "quotation.capture" + suffix
+  let callable = body.model().findFunction(name)
+  var valid = scalar == "Bool" || scalar == "Int" || scalar == "String"
+
+  if callable == null || callable.isUnsafe || callable.cAbiSymbol != "" || callable.intrinsicName != "" || callable.parameterCount != 1 || callable.returnType != "quotation.CaptureValue"
+    valid = false
+  else
+    let parameter = callable.firstParameter
+
+    if parameter == null || parameter.typeName != scalar + "?"
+      valid = false
+    end
+  end
+  if !valid
+    body.report(diagnosticCode, node, "Quotation scalar capture functions require a safe function with one optional scalar argument and a CaptureValue result.")
+  end
+  return body.addBound("Call", "quotation.CaptureValue", name, node, [value])
+end
+
+def quotationCapture(body: BootstrapBodyBinder, value: Int, node: Int): Int
+  let bound = body.model().bound
+  let typeName = bound.typeAt(value)
+
+  if typeName == "Bool"
+    return quotationAlternative(body, "quotation.CaptureValue", "Bool", [value], node)
+  end
+  if typeName == "Int"
+    return quotationAlternative(body, "quotation.CaptureValue", "Int", [value], node)
+  end
+  if typeName == "String"
+    return quotationAlternative(body, "quotation.CaptureValue", "Text", [value], node)
+  end
+  if semanticIsOptional(typeName)
+    let scalar = semanticInnerType(typeName)
+
+    if scalar == "Bool" || scalar == "Int" || scalar == "String"
+      return quotationBoxScalar(body, value, typeName, node, "NR276")
+    end
+  end
+  if typeName == "Null" || bound.kindAt(value) == "NullLiteral"
+    return quotationAlternative(body, "quotation.CaptureValue", "Null", [], node)
+  end
+  body.report("NR276", node, "Quoted expression captures must be Bool, Int, String, or null.")
+  return quotationAlternative(body, "quotation.CaptureValue", "Null", [], node)
+end
+
+def bindQuotation(body: BootstrapBodyBinder, node: Int, expectedType: String): BoundValue
+  if !quotationAbiValid(body, node)
+    return new BoundValue("Error", body.addBound("ErrorExpression", "Error", "", node, []))
+  end
+  var expectedValue = expectedType
+
+  if semanticIsOptional(expectedValue)
+    expectedValue = semanticInnerType(expectedValue)
+  end
+  let expectedClass = body.model().findClass(semanticMutableType(expectedValue))
+  var expectedFunction = ""
+
+  if expectedClass != null
+    expectedFunction = expectedClass.quotedFunctionType
+  end
+  var closureNode = node
+
+  if body.syntax().kindAt(node) == "QuoteExpression"
+    closureNode = body.syntax().childAt(node, 0)
+  end
+  let closure = bindClosure(body, closureNode, expectedFunction)
+  let closureClass = body.model().findClass(body.model().bound.dataAt(closure.boundNode))
+
+  if closureClass == null
+    body.report("NR276", node, "Quoted expression could not bind its typed body.")
+    return new BoundValue("Error", body.addBound("ErrorExpression", "Error", "", node, []))
+  end
+  let invoke = closureClass.firstMethod
+
+  if invoke == null
+    body.report("NR276", node, "Quoted expression has no typed body.")
+    return new BoundValue("Error", body.addBound("ErrorExpression", "Error", "", node, []))
+  end
+  let parameterTypes = new StringBuffer()
+  let parameterIdentities = new StringBuffer()
+  var parameter = invoke.firstParameter
+
+  while parameter != null
+    parameterTypes.add(parameter.typeName)
+    parameterIdentities.add(parameter.identity)
+    parameter = parameter.nextParameter
+  end
+  let wrapper = semanticQuotationType(body.owner, parameterTypes, invoke.returnType, node)
+  let bound = body.model().bound
+  let functionNode = invoke.boundNode
+
+  if bound.childCountAt(functionNode) != 1
+    body.report("NR276", node, "Quoted expression body must contain one return expression.")
+    return new BoundValue("Error", body.addBound("ErrorExpression", "Error", "", node, []))
+  end
+  let returnNode = bound.childAt(functionNode, 0)
+
+  if bound.kindAt(returnNode) != "Return" || bound.childCountAt(returnNode) != 1
+    body.report("NR276", node, "Quoted expression body must contain one return expression.")
+    return new BoundValue("Error", body.addBound("ErrorExpression", "Error", "", node, []))
+  end
+  let builder = new QuotationBuilder(body, closureClass.fullName, parameterIdentities)
+  let root = builder.translate(bound.childAt(returnNode, 0), node)
+  var captures: Int[] = []
+  var captureIndex = 0
+
+  while captureIndex < bound.childCountAt(closure.boundNode)
+    captures = host.appendInt(captures, quotationCapture(body, bound.childAt(closure.boundNode, captureIndex), node))
+    captureIndex = captureIndex + 1
+  end
+  if !builder.valid
+    return new BoundValue("Error", body.addBound("ErrorExpression", "Error", "", node, []))
+  end
+  var parameterValues: Int[] = []
+  var index = 0
+
+  while index < parameterTypes.size
+    parameterValues = host.appendInt(parameterValues, builder.text(parameterTypes.get(index), node))
+    index = index + 1
+  end
+  let tree = body.addBound("New", "quotation.Tree", "quotation.Tree", node, [
+      quotationArray(body, "quotation.Node", builder.nodeValues, node),
+      quotationArray(body, "quotation.CaptureValue", captures, node),
+      builder.integer(root, node),
+      quotationArray(body, "String", parameterValues, node),
+      builder.text(invoke.returnType, node)
+    ])
+
+  return new BoundValue(wrapper.fullName, body.addBound("Quotation", wrapper.fullName, wrapper.fullName, node, [tree]))
+end

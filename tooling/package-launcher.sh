@@ -29,4 +29,5 @@ exec env "NERI_HOST=$PACKAGE_ROOT/libexec/neri-host" \
   "NERI_RUNTIME_MANIFEST=$PACKAGE_ROOT/lib/neri-runtime.json" \
   "NERI_LINKER=$LLVM_PREFIX/bin/clang++" \
   "NERI_STDLIB=$PACKAGE_ROOT/stdlib" \
+  "NERI_TEMPLATE_CATALOG=${NERI_TEMPLATE_CATALOG:-$PACKAGE_ROOT/share/neri/templates/declarations.json}" \
   "$PACKAGE_ROOT/libexec/neri" "$@"

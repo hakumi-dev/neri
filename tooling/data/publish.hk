@@ -1,0 +1,579 @@
+use files
+use host
+
+def dataRevisionName(value: String): Bool
+  if host.stringByteLength(value) != 64
+    return false
+  end
+  var index = 0
+
+  while index < 64
+    let byte = host.stringByteAt(value, index) as Int
+
+    if !(byte >= 48 && byte <= 57) && !(byte >= 97 && byte <= 102)
+      return false
+    end
+    index = index + 1
+  end
+  return true
+end
+
+def dataRelativePath(root: String, path: String): String
+  if path == root
+    return "."
+  end
+  if bootstrapStartsWith(path, root + "/")
+    return host.stringSlice(path, host.stringByteLength(root) + 1, host.stringByteLength(path) - host.stringByteLength(root) - 1)
+  end
+  let rootLength = host.stringByteLength(root)
+  let pathLength = host.stringByteLength(path)
+  let sharedLength = rootLength < pathLength ? rootLength : pathLength
+  var index = 0
+  var slash = 0
+
+  while index < sharedLength && host.stringByteAt(root, index) == host.stringByteAt(path, index)
+    if host.stringByteAt(root, index) == (47 as Byte)
+      slash = index
+    end
+    index = index + 1
+  end
+  if index == rootLength && index < pathLength && host.stringByteAt(path, index) == (47 as Byte)
+    return host.stringSlice(path, index + 1, pathLength - index - 1)
+  end
+  var result = ""
+
+  index = slash + 1
+  while index <= rootLength
+    if index == rootLength || host.stringByteAt(root, index) == (47 as Byte)
+      result = result + "../"
+    end
+    index = index + 1
+  end
+  return result + host.stringSlice(path, slash + 1, pathLength - slash - 1)
+end
+
+def dataPublishInputPath(mapping: DataMapping, path: String): String
+  let standardLibrary = host.environment("NERI_STDLIB")
+
+  if standardLibrary != null
+    let prefix = standardLibrary + "/"
+
+    if bootstrapStartsWith(path, prefix)
+      return "@stdlib/" + host.stringSlice(path, host.stringByteLength(prefix), host.stringByteLength(path) - host.stringByteLength(prefix))
+    end
+  end
+  return dataRelativePath(mapping.projectRoot, path)
+end
+
+def dataArtifactName(name: String): Bool
+  let length = host.stringByteLength(name)
+
+  if length < 4 || !semanticEndsWith(name, ".hk") || host.stringByteAt(name, 0) == (46 as Byte)
+    return false
+  end
+  var index = 0
+
+  while index < length
+    let value = host.stringByteAt(name, index) as Int
+    let valid = (value >= 65 && value <= 90) || (value >= 97 && value <= 122) || (value >= 48 && value <= 57) || value == 95 || value == 45 || value == 46
+
+    if !valid
+      return false
+    end
+    index = index + 1
+  end
+  return true
+end
+
+def dataPublishAddInput(first: DataPublishInput?, path: String, value: String): DataPublishInput
+  var current = first
+  var last: DataPublishInput? = null
+
+  while current != null
+    if current.path == path
+      return current
+    end
+    last = current
+    current = current.next
+  end
+  let input = new DataPublishInput()
+
+  input.path = path
+  input.text = value
+  input.digest = sha256FastText(value)
+  if last != null
+    last.next = input
+  end
+  return input
+end
+
+def dataPublishInputs(mapping: DataMapping): DataPublishInput?
+  let mappingText = host.readText(mapping.mappingPath)
+  let projectText = host.readText(mapping.projectPath)
+
+  if mappingText == null || projectText == null
+    mapping.fail("Cannot re-read the mapping and project manifests before publication.")
+    return null
+  end
+  if mappingText != mapping.mappingText
+    mapping.fail("Mapping changed while neri-data was generating: " + mapping.mappingPath)
+    return null
+  end
+  if projectText != mapping.projectText
+    mapping.fail("Project manifest changed while neri-data was generating: " + mapping.projectPath)
+    return null
+  end
+  let first = dataPublishAddInput(null, mapping.mappingPath, mapping.mappingText)
+
+  dataPublishAddInput(first, mapping.projectPath, mapping.projectText)
+  var source = mapping.firstSource
+
+  while source != null
+    let current = host.readText(source.path)
+
+    if current == null || current != source.text
+      mapping.fail("Source changed while neri-data was generating: " + source.path)
+      return null
+    end
+    dataPublishAddInput(first, source.path, source.text)
+    source = source.nextSource
+  end
+  return first
+end
+
+def dataPublishRevision(mapping: DataMapping, inputs: DataPublishInput, emission: DataEmission): String
+  var framed = "neri-data\n1\n"
+  var input: DataPublishInput? = inputs
+
+  while input != null
+    framed = framed + dataPublishInputPath(mapping, input.path) + "\n" + input.digest + "\n"
+    input = input.next
+  end
+  var artifact = emission.firstArtifact
+
+  while artifact != null
+    framed = framed + artifact.name + "\n" + sha256FastText(artifact.text) + "\n"
+    artifact = artifact.nextArtifact
+  end
+  return sha256FastText(framed)
+end
+
+def dataPublishVerifyInputs(mapping: DataMapping, inputs: DataPublishInput): Bool
+  var input: DataPublishInput? = inputs
+
+  while input != null
+    let current = host.readText(input.path)
+
+    if current == null || current != input.text
+      return mapping.fail("Input changed before publication: " + input.path)
+    end
+    input = input.next
+  end
+  return true
+end
+
+def dataPublishOriginInput(inputs: DataPublishInput, path: String): DataPublishInput?
+  var input: DataPublishInput? = inputs
+
+  while input != null
+    if input.path == path
+      return input
+    end
+    input = input.next
+  end
+  return null
+end
+
+def dataPublishValidateOrigins(mapping: DataMapping, emission: DataEmission, inputs: DataPublishInput): Bool
+  var artifact = emission.firstArtifact
+
+  while artifact != null
+    let outputLength = (new IrSourceMap(artifact.text)).utf16Length()
+    var emitted = artifact.firstOrigin
+
+    while emitted != null
+      let origin = emitted.origin
+      let input = dataPublishOriginInput(inputs, origin.sourcePath)
+
+      if emitted.start < 0 || emitted.length < 1 || emitted.start > outputLength || emitted.length > outputLength - emitted.start || origin.identity == "" || input == null
+        return mapping.fail("Generated origin is invalid for artifact: " + artifact.name)
+      end
+      let inputLength = (new IrSourceMap(input.text)).utf16Length()
+
+      if origin.start < 0 || origin.length < 1 || origin.start > inputLength || origin.length > inputLength - origin.start
+        return mapping.fail("Generated origin exceeds its source for artifact: " + artifact.name)
+      end
+      emitted = emitted.nextOrigin
+    end
+    artifact = artifact.nextArtifact
+  end
+  return true
+end
+
+def dataPublishOldOutputs(mapping: DataMapping, emission: DataEmission, revision: String): DataOldOutput?
+  let manifestPath = mapping.outputPath + "/manifest.json"
+  let statusResult = files.status(manifestPath)
+
+  if statusResult.failure != null
+    mapping.fail("Cannot inspect the previous generation manifest.")
+    return null
+  end
+  let manifestStatus = statusResult.status
+
+  if manifestStatus == null || !manifestStatus.exists
+    let listed = files.Root.open(mapping.outputPath)
+    let openFailure = listed.failure
+
+    if openFailure != null
+      mapping.fail("Cannot inspect the generated output directory.")
+      return null
+    end
+    let root = listed.root
+
+    if root == null
+      mapping.fail("Cannot inspect the generated output directory.")
+      return null
+    end
+    let entries = root.list("")
+
+    root.close()
+    if entries.failure != null || entries.closeFailure != null
+      mapping.fail("Cannot inspect the generated output directory.")
+      return null
+    end
+    if entries.entries.Length == 1 && entries.entries[0].name == ".publish-" + revision && entries.entries[0].kind == "directory" && dataPublishDirectoryContainsOnly(mapping.outputPath + "/.publish-" + revision, emission)
+      return null
+    end
+    if entries.entries.Length > 0
+      mapping.fail("Existing generated output directory has no ownership manifest.")
+    end
+    return null
+  end
+  if manifestStatus.kind != "file" || manifestStatus.symlink
+    mapping.fail("Previous generation manifest is not a regular file.")
+    return null
+  end
+  let text = host.readText(manifestPath)
+
+  if text == null
+    mapping.fail("Cannot read the previous generation manifest.")
+    return null
+  end
+  let parser = new LspJsonParser(text)
+  let document = parser.parse()
+
+  parser.spaces()
+  if parser.failed || parser.position != host.stringByteLength(text) || !dataObject(mapping, document, "existing generation manifest", ["version", "generator", "generatorVersion", "inputs", "outputs", "origins"]) || document.get("version").kind != "number" || document.get("version").value != "1" || document.get("generator").kind != "string" || document.get("generator").value != "neri-data" || document.get("generatorVersion").kind != "string" || document.get("generatorVersion").value != "1"
+    mapping.fail("Existing output is not owned by a valid neri-data manifest.")
+    return null
+  end
+  let outputs = document.get("outputs")
+
+  if outputs.kind != "array"
+    mapping.fail("Existing neri-data manifest has invalid outputs.")
+    return null
+  end
+  var first: DataOldOutput? = null
+  var last: DataOldOutput? = null
+  var entry = outputs.first
+
+  while entry != null
+    let path = entry.get("path")
+    let digest = entry.get("sha256")
+
+    if !dataObject(mapping, entry, "existing generation output", ["path", "sha256"]) || path.kind != "string" || digest.kind != "string" || !neriGenerationDigest(digest) || !neriRelativeProjectPath(path.value) || !semanticEndsWith(path.value, ".hk")
+      mapping.fail("Existing neri-data manifest has an invalid output path.")
+      return null
+    end
+    let absolute = mapping.projectRoot + "/" + path.value
+    let canonical = neriCanonicalPath(absolute)
+    let revisionDirectory = bootstrapDirectory(absolute)
+    let revisionName = host.pathFileName(revisionDirectory)
+    let canonicalRevision = neriCanonicalPath(revisionDirectory)
+
+    if revisionName == null || !dataRevisionName(revisionName) || bootstrapDirectory(revisionDirectory) != mapping.outputPath || (canonical != null && canonical != absolute) || (canonicalRevision != null && canonicalRevision != revisionDirectory)
+      mapping.fail("Existing neri-data manifest does not own its declared output.")
+      return null
+    end
+    var duplicate = first
+
+    while duplicate != null
+      if duplicate.path == absolute
+        mapping.fail("Existing neri-data manifest declares an output more than once: " + path.value)
+        return null
+      end
+      duplicate = duplicate.next
+    end
+    let output = new DataOldOutput()
+
+    output.path = absolute
+    if last == null
+      first = output
+    else
+      last.next = output
+    end
+    last = output
+    entry = entry.next
+  end
+  return first
+end
+
+def dataPublishDirectoryContainsOnly(directory: String, emission: DataEmission, repairs: Bool = false): Bool
+  let opened = files.Root.open(directory)
+
+  if opened.failure != null
+    return false
+  end
+  let root = opened.root
+
+  if root == null
+    return false
+  end
+  let listed = root.list("")
+
+  root.close()
+  if listed.failure != null || listed.closeFailure != null
+    return false
+  end
+  for entry in listed.entries
+    var known = false
+    var artifact = emission.firstArtifact
+
+    while artifact != null
+      known = true if artifact.name == entry.name || (repairs && ".repair-" + artifact.name == entry.name)
+      artifact = artifact.nextArtifact
+    end
+    if !known || entry.kind != "file"
+      return false
+    end
+  end
+  return true
+end
+
+def dataPublishWriteArtifact(directory: String, artifact: DataArtifact, repair: Bool): Bool
+  let path = directory + "/" + artifact.name
+  let current = host.readText(path)
+
+  if current != null && current == artifact.text
+    return true
+  end
+  let target = repair ? directory + "/.repair-" + artifact.name : path
+
+  if !host.writeText(target, artifact.text)
+    return false
+  end
+  let written = host.readText(target)
+
+  if written == null || written != artifact.text
+    return false
+  end
+  if repair && files.move(target, path).failure != null
+    return false
+  end
+  return true
+end
+
+def dataPublishVerifyRevision(mapping: DataMapping, emission: DataEmission, revision: String): Bool
+  let directory = mapping.outputPath + "/" + revision
+  var artifact = emission.firstArtifact
+
+  while artifact != null
+    let value = host.readText(directory + "/" + artifact.name)
+
+    if value == null || value != artifact.text
+      return mapping.fail("Generated revision changed before publication: " + artifact.name)
+    end
+    artifact = artifact.nextArtifact
+  end
+  return true
+end
+
+def dataPublishCleanup(mapping: DataMapping, old: DataOldOutput?, revision: String): Void
+  var current = old
+  let currentPrefix = mapping.outputPath + "/" + revision + "/"
+
+  while current != null
+    if !bootstrapStartsWith(current.path, currentPrefix)
+      let directory = bootstrapDirectory(current.path)
+
+      files.removeFile(current.path)
+      if dataPathWithin(mapping.outputPath, directory) && directory != mapping.outputPath
+        # Removal succeeds only for an empty directory, preserving untracked files.
+        files.removeDirectory(directory)
+      end
+    end
+    current = current.next
+  end
+end
+
+def dataPublishWriteRevision(mapping: DataMapping, emission: DataEmission, revision: String): Bool
+  let finalDirectory = mapping.outputPath + "/" + revision
+  let finalStatus = files.status(finalDirectory)
+
+  if finalStatus.failure != null
+    return mapping.fail("Cannot inspect generated revision directory.")
+  end
+  let status = finalStatus.status
+
+  if status != null && status.exists
+    if status.kind != "directory" || status.symlink
+      return mapping.fail("Generated revision path is not an owned directory.")
+    end
+    if !dataPublishDirectoryContainsOnly(finalDirectory, emission, true)
+      return mapping.fail("Existing generated revision contains an unowned artifact: " + revision)
+    end
+    var existing = emission.firstArtifact
+
+    while existing != null
+      if !dataPublishWriteArtifact(finalDirectory, existing, true)
+        return mapping.fail("Cannot repair generated artifact: " + existing.name)
+      end
+      existing = existing.nextArtifact
+    end
+    return true
+  end
+  let staging = mapping.outputPath + "/.publish-" + revision
+  let stagedStatus = files.status(staging)
+
+  if stagedStatus.failure != null
+    return mapping.fail("Cannot inspect publication staging directory.")
+  end
+  let staged = stagedStatus.status
+
+  if staged != null && staged.exists
+    if staged.kind != "directory" || staged.symlink || !dataPublishDirectoryContainsOnly(staging, emission)
+      return mapping.fail("Publication staging directory contains unowned data: " + staging)
+    end
+  else if files.createDirectory(staging).failure != null
+    return mapping.fail("Cannot create publication staging directory.")
+  end
+  var artifact = emission.firstArtifact
+
+  while artifact != null
+    if !dataPublishWriteArtifact(staging, artifact, false)
+      return mapping.fail("Cannot write generated artifact: " + artifact.name)
+    end
+    artifact = artifact.nextArtifact
+  end
+  if files.move(staging, finalDirectory).failure != null
+    return mapping.fail("Cannot publish immutable generated revision.")
+  end
+  return true
+end
+
+def dataPublishManifest(mapping: DataMapping, emission: DataEmission, inputs: DataPublishInput, revision: String): String
+  var result = "{\n  \"version\": 1,\n  \"generator\": \"neri-data\",\n  \"generatorVersion\": \"1\",\n  \"inputs\": ["
+  var input: DataPublishInput? = inputs
+  var separator = "\n"
+
+  while input != null
+    result = result + separator + "    {\"path\": " + lspQuote(dataPublishInputPath(mapping, input.path)) + ", \"sha256\": \"" + input.digest + "\"}"
+    separator = ",\n"
+    input = input.next
+  end
+  result = result + "\n  ],\n  \"outputs\": ["
+  var artifact = emission.firstArtifact
+
+  separator = "\n"
+  while artifact != null
+    let output = mapping.outputPath + "/" + revision + "/" + artifact.name
+
+    result = result + separator + "    {\"path\": " + lspQuote(dataRelativePath(mapping.projectRoot, output)) + ", \"sha256\": \"" + sha256FastText(artifact.text) + "\"}"
+    separator = ",\n"
+    artifact = artifact.nextArtifact
+  end
+  result = result + "\n  ],\n  \"origins\": ["
+  artifact = emission.firstArtifact
+  separator = "\n"
+  while artifact != null
+    var emitted = artifact.firstOrigin
+
+    while emitted != null
+      let origin = emitted.origin
+      let output = mapping.outputPath + "/" + revision + "/" + artifact.name
+
+      result = result + separator + "    {\"path\": " + lspQuote(dataRelativePath(mapping.projectRoot, output)) + ", \"start\": " + (emitted.start as String) + ", \"length\": " + (emitted.length as String) + ", \"source\": " + lspQuote(dataPublishInputPath(mapping, origin.sourcePath)) + ", \"sourceStart\": " + (origin.start as String) + ", \"sourceLength\": " + (origin.length as String) + ", \"identity\": " + lspQuote(origin.identity) + "}"
+      separator = ",\n"
+      emitted = emitted.nextOrigin
+    end
+    artifact = artifact.nextArtifact
+  end
+  return result + "\n  ]\n}\n"
+end
+
+def dataPublish(mapping: DataMapping, emission: DataEmission): Bool
+  if mapping.error != ""
+    return false
+  end
+  if emission.error != ""
+    return mapping.fail(emission.error)
+  end
+  if emission.firstArtifact == null
+    return mapping.fail("Generator produced no artifacts.")
+  end
+  if !dataPathWithin(mapping.projectRoot, mapping.outputPath)
+    return mapping.fail("Generated output must remain within the mapped project.")
+  end
+  var artifact = emission.firstArtifact
+
+  while artifact != null
+    if !dataArtifactName(artifact.name)
+      return mapping.fail("Generated artifact name must be a safe .hk basename: " + artifact.name)
+    end
+    var duplicate = artifact.nextArtifact
+
+    while duplicate != null
+      if duplicate.name == artifact.name
+        return mapping.fail("Generated artifact name is duplicated: " + artifact.name)
+      end
+      duplicate = duplicate.nextArtifact
+    end
+    artifact = artifact.nextArtifact
+  end
+  let outputStatus = files.status(mapping.outputPath)
+
+  if outputStatus.failure != null
+    return mapping.fail("Cannot inspect generated output directory.")
+  end
+  let status = outputStatus.status
+
+  if status == null || !status.exists
+    if files.createDirectory(mapping.outputPath, true).failure != null
+      return mapping.fail("Cannot create generated output directory.")
+    end
+  else if status.kind != "directory" || status.symlink
+    return mapping.fail("Generated output path must be a directory without symlinks.")
+  end
+  let inputs = dataPublishInputs(mapping)
+
+  if inputs == null
+    return false
+  end
+  if !dataPublishValidateOrigins(mapping, emission, inputs)
+    return false
+  end
+  let revision = dataPublishRevision(mapping, inputs, emission)
+  let oldOutputs = dataPublishOldOutputs(mapping, emission, revision)
+
+  if mapping.error != ""
+    return false
+  end
+
+  if !dataPublishWriteRevision(mapping, emission, revision) || !dataPublishVerifyInputs(mapping, inputs) || !dataPublishVerifyRevision(mapping, emission, revision)
+    return false
+  end
+  let manifest = dataPublishManifest(mapping, emission, inputs, revision)
+  let temporary = mapping.outputPath + "/manifest." + revision + ".tmp"
+
+  if !host.writeText(temporary, manifest)
+    return mapping.fail("Cannot write generation manifest staging file.")
+  end
+  if !dataPublishVerifyInputs(mapping, inputs) || !dataPublishVerifyRevision(mapping, emission, revision)
+    return false
+  end
+  if files.move(temporary, mapping.outputPath + "/manifest.json").failure != null
+    return mapping.fail("Cannot atomically publish generation manifest.")
+  end
+  dataPublishCleanup(mapping, oldOutputs, revision)
+  return true
+end

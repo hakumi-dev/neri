@@ -38,20 +38,7 @@ namespace {
 constexpr uintptr_t root_frame_cookie = UINT64_C(0x484b524f4f545631);
 constexpr uintptr_t borrow_cookie = UINT64_C(0x484b424f52525631);
 constexpr uint64_t collection_floor_bytes = 4 * 1024 * 1024;
-constexpr uint64_t runtime_features =
-    NERI_RT_FEATURE_PRECISE_GC | NERI_RT_FEATURE_NONMOVING_GC |
-    NERI_RT_FEATURE_SCOPED_BORROWS | NERI_RT_FEATURE_NATIVE_MEMORY |
-    NERI_RT_FEATURE_ROOT_FRAMES | NERI_RT_FEATURE_SOURCE_LOCATIONS |
-    NERI_RT_FEATURE_NATIVE_STRINGS | NERI_RT_FEATURE_CONSOLE_IO |
-    NERI_RT_FEATURE_BOOTSTRAP_HOST | NERI_RT_FEATURE_SOCKETS |
-    NERI_RT_FEATURE_INTERACTIVE_IO | NERI_RT_FEATURE_EXTENDED_SCALARS |
-    NERI_RT_FEATURE_SCOPED_TASKS | NERI_RT_FEATURE_FILES | NERI_RT_FEATURE_INTERRUPTS |
-    NERI_RT_FEATURE_WALL_CLOCK | NERI_RT_FEATURE_CRYPTO |
-    NERI_RT_FEATURE_ROOTED_FILES | NERI_RT_FEATURE_PROCESS |
-    NERI_RT_FEATURE_DIRECTORY | NERI_RT_FEATURE_SOCKET_CLOSE_RESULT |
-    NERI_RT_FEATURE_DRAIN | NERI_RT_FEATURE_SESSION_MODULES |
-    NERI_RT_FEATURE_OPTIONAL_CONSOLE_READ | NERI_RT_FEATURE_PROCESS_IO |
-    NERI_RT_FEATURE_FILESYSTEM_MUTATION | NERI_RT_FEATURE_SOCKET_ENDPOINTS;
+constexpr uint64_t runtime_features = NERI_RT_ADVERTISED_FEATURES;
 constexpr uint32_t known_type_flags = NERI_TYPE_FLAG_CONTAINS_REFS_V1 |
                                       NERI_TYPE_FLAG_IMMUTABLE_V1;
 
@@ -1927,6 +1914,19 @@ neri_rt_v1_host_path_file_name(neri_ref_v1 path) {
 NERI_RT_API neri_int_v1 neri_rt_v1_host_argument_count(void) {
   require_initialized();
   return current_state().process_argument_count;
+}
+
+NERI_RT_API neri_int_v1 neri_rt_v1_host_executable_path(
+    neri_byte_v1 *output, neri_int_v1 capacity) {
+  require_initialized();
+  if (capacity < 0 || (capacity > 0 && output == nullptr)) return -1;
+  const auto path = neri::platform::executable_path();
+  if (!path || !is_strict_utf8(reinterpret_cast<const uint8_t *>(path->data()), path->size())) return -1;
+  const auto length = static_cast<neri_int_v1>(path->size());
+  if (capacity <= length) return length;
+  std::memcpy(output, path->data(), path->size());
+  output[path->size()] = 0;
+  return length;
 }
 
 NERI_RT_API neri_ref_v1

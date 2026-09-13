@@ -1,0 +1,254 @@
+use host
+use process
+use test
+
+def agentTestWrite(path: String, text: String): Void
+  test.assertTrue(host.writeText(path, text))
+end
+
+def agentTestBytes(text: String): Byte[]
+  var result: Byte[] = []
+  var index = 0
+
+  while index < host.stringByteLength(text)
+    result = host.appendByte(result, host.stringByteAt(text, index))
+    index = index + 1
+  end
+  return result
+end
+
+def agentTestObject(text: String): LspJson
+  let parser = new LspJsonParser(text)
+  let value = parser.parse()
+
+  parser.spaces()
+
+  test.assertTrue(!parser.failed && parser.position == host.stringByteLength(text) && value.kind == "object")
+  return value
+end
+
+def agentTestProtocolResponse(output: String, id: String): LspJson
+  var remaining = output
+
+  while host.stringByteLength(remaining) > 0
+    let newline = bootstrapFindText(remaining, "\n")
+    let length = newline < 0 ? host.stringByteLength(remaining) : newline
+    let line = host.stringSlice(remaining, 0, length)
+
+    if line != ""
+      let message = agentTestObject(line)
+
+      if message.get("id").value == id
+        return message
+      end
+    end
+    if newline < 0
+      break
+    end
+    remaining = host.stringSlice(remaining, newline + 1, host.stringByteLength(remaining) - newline - 1)
+  end
+
+  test.assertTrue(false)
+  return new LspJson()
+end
+
+def agentTestInvoke(compiler: String, workspace: String, operation: String): LspJson
+  let initialize = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{},\"clientInfo\":{\"name\":\"agent-test-contract\",\"version\":\"1\"}}}\n"
+  let initialized = "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\",\"params\":{}}\n"
+  let call = "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"neri.test\",\"arguments\":{\"operationId\":" + lspQuote(operation) + "}}}\n"
+  let options = new process.SpawnOptions(compiler)
+
+  options.arguments = ["agent", "--project", workspace, "--unit", "app"]
+  options.input = agentTestBytes(initialize + initialized + call)
+  options.workingDirectory = workspace
+  options.stdoutLimit = 1048576
+  options.stderrLimit = 65536
+  let started = process.spawn(options)
+  let child = started.child()
+
+  test.assertTrue(started.failure() == null && child != null)
+  if child == null
+    return new LspJson()
+  end
+  var completed = child.wait(60000)
+  var waits = 1
+
+  while completed.failure == null && completed.running && waits < 4
+    completed = child.wait(60000)
+    waits = waits + 1
+  end
+
+  test.assertTrue(completed.failure == null && !completed.running && !completed.stdoutTruncated && !completed.stderrTruncated)
+  let exit = completed.exit
+  let output = host.stringFromBytes(completed.stdout)
+
+  test.assertTrue(exit != null && exit.kind == "exit" && exit.value == 0)
+  test.assertTrue(output != null)
+  test.assertTrue(child.dispose())
+  if output == null
+    return new LspJson()
+  end
+  return agentTestProtocolResponse(output, "2").get("result").get("structuredContent")
+end
+
+def agentTestAssertEnvelope(result: LspJson, operation: String, state: String, status: String, complete: Bool): Void
+  test.assertEqual(result.get("schemaVersion").value, "1")
+  test.assertEqual(result.get("operationId").value, operation)
+  test.assertEqual(result.get("state").value, state)
+  test.assertEqual(result.get("status").value, status)
+  test.assertEqual(result.get("complete").value, complete ? "true" : "false")
+  test.assertTrue(result.get("projectKey").value != "")
+  test.assertTrue(result.get("snapshot").value != "")
+  let effects = result.get("effects")
+
+  test.assertEqual(effects.get("applied").value, "false")
+  test.assertEqual(effects.get("analyzed").value, "false")
+  test.assertEqual(effects.get("persisted").value, "false")
+end
+
+def agentTestFirstResult(result: LspJson): LspJson
+  let unit = result.get("tests").first
+
+  test.assertTrue(unit != null)
+  if unit != null
+    return unit
+  end
+  return new LspJson()
+end
+
+def agentTestPassingSource(): String
+  return "use host\n\ndef main(): Void\n  let project = host.argumentAt(0)\n  let compiler = host.argumentAt(1)\n  let work = host.argumentAt(2)\n  let literal = host.argumentAt(3)\n  var status = 0\n\n  if project == null || compiler == null || work == null || literal == null\n    status = 10\n  else\n    let marker = host.readText(project + \"/marker.txt\")\n    let compilerExit = host.run(compiler, [\"--version\"])\n\n    if marker == null || marker != \"project\"\n      status = 11\n    else if compilerExit == null || compilerExit != 0\n      status = 12\n    else if literal != \"literal:{project}\"\n      status = 13\n    else if !host.writeText(work + \"/witness\", \"ok\")\n      status = 14\n    end\n  end\n  host.exit(status)\nend\n"
+end
+
+def agentTestRegisteredContract(compiler: String, work: String): Void
+  let project = work + "/agent-test-registered"
+  let external = work + "/agent-test-external"
+  let removed = host.run("rm", ["-rf", project, external])
+
+  test.assertTrue(removed != null && removed == 0)
+  let made = host.run("mkdir", ["-p", project + "/nested", external])
+
+  test.assertTrue(made != null && made == 0)
+  agentTestWrite(external + "/manifest.json", "{\"version\":2,\"defaultUnit\":\"shared\",\"units\":{\"shared\":{\"kind\":\"library\",\"sources\":[\"shared.hk\"]},\"external-test\":{\"kind\":\"executable\",\"sources\":[\"external-test.hk\"],\"test\":{\"arguments\":[]}}}}\n")
+  agentTestWrite(external + "/shared.hk", "namespace shared\n\ndef value(): Int\n  return 1\nend\n")
+  agentTestWrite(external + "/external-test.hk", "use host\n\ndef main(): Void\n  host.exit(44)\nend\n")
+  let manifest = "{\"version\":2,\"defaultUnit\":\"app\",\"projects\":[\"nested/manifest.json\"],\"units\":{\"app\":{\"kind\":\"executable\",\"sources\":[\"app.hk\"],\"references\":[{\"project\":\"../agent-test-external/manifest.json\",\"unit\":\"shared\"}]},\"suite\":{\"kind\":\"executable\",\"sources\":[\"suite.hk\"],\"test\":{\"arguments\":[\"{project}\",\"{compiler}\",\"{work}\",\"literal:{project}\"],\"timeoutMs\":5000}}}}\n"
+  let singleManifest = "{\"version\":2,\"defaultUnit\":\"app\",\"units\":{\"app\":{\"kind\":\"executable\",\"sources\":[\"app.hk\"],\"references\":[{\"project\":\"../agent-test-external/manifest.json\",\"unit\":\"shared\"}]},\"suite\":{\"kind\":\"executable\",\"sources\":[\"suite.hk\"],\"test\":{\"arguments\":[\"{project}\",\"{compiler}\",\"{work}\",\"literal:{project}\"],\"timeoutMs\":5000}}}}\n"
+
+  agentTestWrite(project + "/manifest.json", manifest)
+  agentTestWrite(project + "/nested/manifest.json", "{\"version\":2,\"defaultUnit\":\"nested-test\",\"units\":{\"nested-test\":{\"kind\":\"executable\",\"sources\":[\"main.hk\"],\"test\":{\"arguments\":[]}}}}\n")
+  agentTestWrite(project + "/nested/main.hk", "def main(): Void\nend\n")
+  agentTestWrite(project + "/marker.txt", "project")
+  agentTestWrite(project + "/app.hk", "use shared\n\ndef main(): Void\n  let value = shared.value()\nend\n")
+  agentTestWrite(project + "/suite.hk", agentTestPassingSource())
+  let passed = agentTestInvoke(compiler, project, "passed")
+
+  agentTestAssertEnvelope(passed, "passed", "complete", "valid", true)
+
+  test.assertEqual(passed.get("unitsTotal").value, "3")
+  test.assertEqual(passed.get("testsTotal").value, "2")
+  test.assertEqual(passed.get("noTests").value, "false")
+  test.assertEqual(passed.get("effects").get("executed").value, "true")
+  let unit = agentTestFirstResult(passed)
+
+  test.assertEqual(unit.get("name").value, "suite")
+  test.assertEqual(unit.get("status").value, "valid")
+  test.assertEqual(unit.get("phase").value, "run")
+  test.assertEqual(unit.get("exitCode").value, "0")
+  test.assertEqual(host.stringByteLength(unit.get("artifactDigest").value), 64)
+  test.assertEqual(host.stringByteLength(unit.get("buildSnapshot").value), 64)
+  let nested = unit.next
+
+  test.assertTrue(nested != null)
+  if nested != null
+    test.assertEqual(nested.get("name").value, "nested-test")
+    test.assertEqual(nested.get("status").value, "valid")
+  end
+  agentTestWrite(project + "/manifest.json", singleManifest)
+  agentTestWrite(project + "/suite.hk", "use host\n\ndef main(): Void\n  host.exit(7)\nend\n")
+  let failed = agentTestInvoke(compiler, project, "failed")
+
+  agentTestAssertEnvelope(failed, "failed", "complete", "invalid", true)
+
+  test.assertEqual(agentTestFirstResult(failed).get("exitCode").value, "7")
+  let timeoutManifest = "{\"version\":2,\"defaultUnit\":\"app\",\"units\":{\"app\":{\"kind\":\"executable\",\"sources\":[\"app.hk\"],\"references\":[{\"project\":\"../agent-test-external/manifest.json\",\"unit\":\"shared\"}]},\"suite\":{\"kind\":\"executable\",\"sources\":[\"suite.hk\"],\"test\":{\"arguments\":[],\"timeoutMs\":50}}}}\n"
+
+  agentTestWrite(project + "/manifest.json", timeoutManifest)
+  agentTestWrite(project + "/suite.hk", "def main(): Void\n  while true\n  end\nend\n")
+  let timedOut = agentTestInvoke(compiler, project, "timeout")
+
+  agentTestAssertEnvelope(timedOut, "timeout", "complete", "invalid", true)
+
+  test.assertTrue(bootstrapFindText(agentTestFirstResult(timedOut).get("message").value, "exceeded 50 milliseconds") >= 0)
+end
+
+def agentTestNoTestsContract(compiler: String, work: String): Void
+  let project = work + "/agent-test-none"
+  let removed = host.run("rm", ["-rf", project])
+
+  test.assertTrue(removed != null && removed == 0)
+  let made = host.run("mkdir", ["-p", project])
+
+  test.assertTrue(made != null && made == 0)
+  agentTestWrite(project + "/manifest.json", "{\"version\":2,\"defaultUnit\":\"app\",\"units\":{\"app\":{\"kind\":\"executable\",\"sources\":[\"main.hk\"]}}}\n")
+  agentTestWrite(project + "/main.hk", "def main(): Void\nend\n")
+  let result = agentTestInvoke(compiler, project, "none")
+
+  agentTestAssertEnvelope(result, "none", "noTests", "unavailable", false)
+
+  test.assertEqual(result.get("noTests").value, "true")
+  test.assertEqual(result.get("testsTotal").value, "0")
+  test.assertEqual(result.get("effects").get("executed").value, "false")
+end
+
+def agentTestConflictContract(compiler: String, work: String): Void
+  let project = work + "/agent-test-conflict"
+  let removed = host.run("rm", ["-rf", project])
+
+  test.assertTrue(removed != null && removed == 0)
+  let made = host.run("mkdir", ["-p", project])
+
+  test.assertTrue(made != null && made == 0)
+  agentTestWrite(project + "/manifest.json", "{\"version\":2,\"defaultUnit\":\"app\",\"units\":{\"app\":{\"kind\":\"executable\",\"sources\":[\"main.hk\"],\"test\":{\"arguments\":[\"{project}\"]}}}}\n")
+  agentTestWrite(project + "/main.hk", "use host\n\ndef main(): Void\n  let project = host.argumentAt(0)\n\n  if project != null\n    host.writeText(project + \"/main.hk\", \"def main(): Void\\nend\\n\")\n  end\nend\n")
+  let result = agentTestInvoke(compiler, project, "conflict")
+
+  agentTestAssertEnvelope(result, "conflict", "conflict", "conflict", false)
+
+  test.assertEqual(result.get("testsTotal").value, "1")
+  test.assertEqual(agentTestFirstResult(result).get("status").value, "valid")
+end
+
+def agentTestManifestContract(work: String): Void
+  let project = work + "/agent-test-invalid"
+  let removed = host.run("rm", ["-rf", project])
+
+  test.assertTrue(removed != null && removed == 0)
+  let made = host.run("mkdir", ["-p", project])
+
+  test.assertTrue(made != null && made == 0)
+  agentTestWrite(project + "/library.hk", "namespace library\n")
+  agentTestWrite(project + "/manifest.json", "{\"version\":2,\"defaultUnit\":\"library\",\"units\":{\"library\":{\"kind\":\"library\",\"sources\":[\"library.hk\"],\"test\":{\"arguments\":[]}}}}\n")
+  let library = neriLoadProject(project, "library")
+
+  test.assertTrue(bootstrapFindText(library.error(), "Only executable units may declare test metadata") >= 0)
+  agentTestWrite(project + "/main.hk", "def main(): Void\nend\n")
+  agentTestWrite(project + "/manifest.json", "{\"version\":2,\"defaultUnit\":\"app\",\"units\":{\"app\":{\"kind\":\"executable\",\"sources\":[\"main.hk\"],\"test\":{\"arguments\":[],\"timeoutMs\":0}}}}\n")
+  let timeout = neriLoadProject(project, "app")
+
+  test.assertTrue(bootstrapFindText(timeout.error(), "timeoutMs must be an integer from 1 through 600000") >= 0)
+end
+
+def main(): Void
+  let compiler = host.argumentAt(1)
+  let work = host.argumentAt(2)
+
+  test.assertTrue(compiler != null && work != null)
+  if compiler == null || work == null
+    return
+  end
+  agentTestRegisteredContract(compiler, work)
+  agentTestNoTestsContract(compiler, work)
+  agentTestConflictContract(compiler, work)
+  agentTestManifestContract(work)
+end

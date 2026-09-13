@@ -1,0 +1,150 @@
+use console
+use host
+use test
+
+def contains(text: String, part: String): Bool
+  return bootstrapFindText(text, part) >= 0
+end
+
+def projectSnapshot(): SessionSourceSnapshot
+  let project = neriLoadProject("experiments/neri-data/generated-example/manifest.json", "data")
+
+  test.assertEqual(project.error, "")
+  let snapshot = sessionSnapshotFromProject(project)
+
+  test.assertEqual(snapshot.error, "")
+  return snapshot
+end
+
+def sourceText(): String
+  return projectSnapshot().source()
+end
+
+def projectDocument(source: String): LspDocument
+  let document = new LspDocument()
+  let path = host.pathAbsolute("experiments/neri-data/generated-example/database.hk")
+
+  test.assertTrue(path != null)
+  if path != null
+    document.uri = lspUri(path)
+    document.sourcePath = path
+  end
+  document.text = source
+  document.version = 1
+  document.publishDiagnostics = false
+  let server = new LspServer()
+
+  server.rootPath = "experiments/neri-data/generated-example"
+  server.unit = "data"
+  server.documents = document
+  server.analyze(document)
+  return document
+end
+
+def sessionCompletionHas(result: SessionCompletionResult, name: String): Bool
+  var item = result.first
+
+  while item != null
+    if item.name == name
+      return true
+    end
+    item = item.next
+  end
+  return false
+end
+
+def lspContracts(): Void
+  let receiverSource = "use app_data\n\ndef probe(): Void\n  let db = new Database()\n  db.customers.\nend\n"
+  let receiver = projectDocument(receiverSource)
+  let receiverResult = lspCompletion(receiver, bootstrapFindText(receiverSource, ".\nend") + 1)
+
+  for name in ["where", "matching", "take", "compile"]
+    test.assertTrue(contains(receiverResult, "\"label\":\"" + name + "\""))
+  end
+
+  let navigationSource = "use app_data\nuse neri_data\n\ndef probe(): Void\n  let db = new Database()\n  db.customers.where(active: true)\nend\n"
+  let navigation = projectDocument(navigationSource)
+
+  test.assertTrue(contains(lspDefinition(navigation, bootstrapFindText(navigationSource, "app_data")), "context.hk"))
+  test.assertTrue(contains(lspDefinition(navigation, bootstrapFindText(navigationSource, "neri_data")), "runtime.hk"))
+  test.assertTrue(contains(lspDefinition(navigation, bootstrapFindText(navigationSource, "customers.where")), "context.hk"))
+  test.assertTrue(contains(lspDefinition(navigation, bootstrapFindText(navigationSource, "customers.where") + 10), "runtime.hk"))
+
+  let labelSource = "use app_data\n\ndef probe(): Void\n  let db = new Database()\n  let fallback: Bool = false\n  let query = db.customers.where(active: fallback)\nend\n"
+  let labelDocument = projectDocument(labelSource)
+  let labelPosition = bootstrapFindText(labelSource, "active:")
+  let labels = lspCompletion(labelDocument, labelPosition)
+  let valuePosition = bootstrapFindText(labelSource, "fallback)") + 2
+  let values = lspCompletion(labelDocument, valuePosition)
+  let signature = lspSignatureHelp(labelDocument, bootstrapFindText(labelSource, "fallback)") + 4)
+  let definition = lspDefinition(labelDocument, labelPosition)
+  let hover = lspHover(labelDocument, bootstrapFindText(labelSource, "where(active") + 2)
+
+  test.assertTrue(contains(labels, "\"label\":\"active\""))
+  test.assertTrue(contains(labels, "\"label\":\"name\""))
+  test.assertTrue(contains(values, "Bool"))
+  test.assertTrue(contains(signature, "labels filters: (fields of model.Customer)"))
+  test.assertTrue(contains(definition, "entities.hk"))
+  test.assertTrue(contains(hover, "labels filters: (fields of model.Customer)"))
+  test.assertTrue(contains(hover, "Adds equality filters checked against the entity's declared public fields."))
+end
+
+def retainedSessionContract(): Void
+  let snapshot = projectSnapshot()
+  let source = sourceText()
+  let tokens = new BootstrapLexer(source).lex()
+  let parser = new BootstrapParser(tokens)
+  let root = parser.parseProgram()
+  let binder = new BootstrapBinder(parser.arena, root, utf16Length(source))
+
+  binder.requireEntryPoint = false
+  let retained = new SessionCompilation(binder.bind(), parser.arena, source)
+  let query = "use app_data\nlet db = new Database()\ndb.customers."
+  let result = sessionCompleteSource(query, host.stringByteLength(query), 0, null, retained, snapshot, "", new StringBuffer())
+
+  test.assertEqual(result.status, "complete")
+  test.assertTrue(sessionCompletionHas(result, "where"))
+  test.assertTrue(sessionCompletionHas(result, "matching"))
+  test.assertTrue(sessionCompletionHas(result, "take"))
+  test.assertTrue(sessionCompletionHas(result, "compile"))
+end
+
+def diagnosticContract(expression: String, code: String): Void
+  let data = sourceText()
+  let document = new LspDocument()
+
+  document.uri = "untitled:neri-data-negative"
+  document.text = "use app_data\nuse model\n\ndef main(): Void\n  let invalid = " + expression + "\nend\n\n" + data
+  document.publishDiagnostics = false
+  let server = new LspServer()
+
+  server.analyze(document)
+  let semantic = document.semantic
+
+  test.assertTrue(semantic != null)
+  if semantic != null
+    test.assertTrue(semantic.diagnostics.count() > 0)
+    test.assertEqual(semantic.diagnostics.codes.get(0), code)
+  end
+  let snapshot = projectSnapshot()
+  let session = new SessionEnvironment("neri-data-negative", snapshot)
+  let prepared = session.prepare("use app_data\nuse model\nlet invalid = " + expression)
+  let diagnostic = prepared.diagnostics
+
+  test.assertEqual(prepared.status, "invalid")
+  test.assertTrue(diagnostic != null)
+  if diagnostic != null
+    test.assertEqual(diagnostic.code, code)
+  end
+end
+
+def main(): Void
+  lspContracts()
+  retainedSessionContract()
+  diagnosticContract("(new Database()).customers.where(active: 1)", "NR112")
+  diagnosticContract("(new Database()).customers.where(unknown: true)", "NR278")
+  diagnosticContract("(new Database()).customers.matching(quote do |order: Order|: Bool\n    return order.total > 0\n  end)", "NR112")
+  diagnosticContract("(new Database()).customers.matching(quote do |customer: Customer|: Bool\n    return customer.active > true\n  end)", "NR120")
+  diagnosticContract("mappingEntitty_8_Customer()", "NR110")
+  console.println("Neri Data verification passed")
+end

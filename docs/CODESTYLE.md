@@ -1,8 +1,9 @@
 # Neri CodeStyle
 
 Neri CodeStyle shares one syntax-based rule engine between the compiler CLI and
-the language server. Rules inspect sibling statements in the compiler's syntax
-tree and propose edits against the original source text.
+the language server. Rules inspect the compiler's syntax, block metadata and
+tokens, report diagnostics and propose safe layout edits against the original
+source text.
 
 ## Commands
 
@@ -22,7 +23,7 @@ Exit status `0` means success, `1` means `format --check` found changes or
 `lint` has remaining diagnostics, and `2` means a usage, configuration, syntax,
 project-loading or I/O failure.
 
-`format` applies enabled spacing rules. `format --check` reports whether those
+`format` applies enabled layout rules. `format --check` reports whether those
 rules require changes. `lint` reports rule diagnostics, and `lint --fix` applies
 safe corrections before reporting remaining diagnostics. All input files are
 read, parsed and checked before writing begins. Each changed file is written
@@ -38,11 +39,30 @@ outside that guarantee.
 | --- | --- | --- |
 | `NRSTYLE001` | Separate a group of sibling `let`/`var` declarations from the following statement with a blank line. | Enabled, warning |
 | `NRSTYLE002` | Separate an assertion group from a preceding non-assertion statement with a blank line. | Enabled, warning |
+| `NRSTYLE003` | Remove trailing spaces and tabs, including after comments. | Enabled, warning |
+| `NRSTYLE004` | Add a final newline to a nonempty file that lacks one. | Enabled, warning |
+| `NRSTYLE005` | Indent parser-defined block bodies and parenthesized/bracketed continuations. | Enabled, warning |
+| `NRSTYLE006` | Normalize horizontal spacing around commas, colons, dots, delimiter interiors, assignments, casts and syntax-resolved unary/binary operators. | Enabled, warning |
+| `NRSTYLE007` | Report each class or enum declaration after the first top-level class or enum in a file. | Disabled, warning; enabled for `compiler/`, `tooling/` and `stdlib/` |
 
 Consecutive declarations and consecutive assertions stay together. An assertion
 at the start of a body needs no leading blank line. Closing delimiters end a
 body; they do not begin another statement. Comments attached to the following
 statement stay with it.
+
+Indentation defaults to two spaces and follows `indent_style`, `indent_size`
+and `tab_width`. `indent_size = tab` uses `tab_width`. Inline bodies keep their
+existing line structure. A delimiter continuation adds one indentation level;
+its closing delimiter returns to the enclosing level. Blank lines retain their
+number, and trailing-whitespace cleanup removes their spaces and tabs.
+With tab indentation, tabs cover `tab_width` columns and any remainder uses
+spaces. An unspecified indentation size uses the tab width for tab indentation.
+
+Token spacing distinguishes unary operators, binary operators, ternary colons,
+type annotations and named arguments. Generic angle brackets and optional/pointer
+type suffixes retain their existing spacing. Literals retain their exact spelling.
+Existing line endings are preserved; an inserted newline uses the file's detected
+line ending. Empty files remain empty.
 
 Configuration lives in `.editorconfig` and follows its directory hierarchy,
 `root = true`, section matching, property precedence and `unset` behavior.
@@ -51,11 +71,27 @@ Configuration lives in `.editorconfig` and follows its directory hierarchy,
 root = true
 
 [*.hk]
+indent_style = space
+indent_size = 2
+trim_trailing_whitespace = true
+insert_final_newline = true
 neri_blank_line_after_declarations = true
 neri_blank_line_before_assertions = true
+neri_indentation = true
+neri_token_spacing = true
+neri_one_class_per_file = false
 neri_diagnostic.NRSTYLE001.severity = warning
 neri_diagnostic.NRSTYLE002.severity = warning
 neri_assertion_helpers = test/assert*, assert
+
+[compiler/**/*.hk]
+neri_one_class_per_file = true
+
+[tooling/**/*.hk]
+neri_one_class_per_file = true
+
+[stdlib/**/*.hk]
+neri_one_class_per_file = true
 ```
 
 Severity values are `none`, `suggestion`, `warning` and `error`. Assertion helper
@@ -67,6 +103,22 @@ Neri also accepts dot-qualified values. Slash qualification keeps each helper
 as one value identifier in Rider's EditorConfig parser.
 Severity `none` suppresses reporting while keeping the formatting preference.
 Set a rule's boolean option to `false` to disable its analysis and correction.
+NRSTYLE007 has no automatic correction because moving declarations can change
+source ownership and project structure.
+
+## Source organization
+
+Compiler, tooling and standard-library sources keep one top-level class or enum
+per file, grouped in directories by responsibility. Extracted types use their full name in
+snake_case, for example `IrFunction` in `compiler/ir/ir_function.hk`. Related
+top-level functions can share a file. The project manifest determines source
+ownership and references across units.
+
+The repository enables NRSTYLE007 for `compiler/`, `tooling/` and `stdlib/`.
+Tests can keep multiple types together to express a language contract.
+Standard-library modules declare their source files in `stdlib/manifest.json`.
+Bootstrap compatibility sources mirror the canonical compiler paths for the
+types that need a seed-compatible definition.
 
 ## Editor integration
 
@@ -97,15 +149,36 @@ The CLI and LSP consume those descriptors and results through the shared
 engine. Add a behavior contract for the rule's intended change and important
 false-positive boundary.
 
-Edits retain the original source outside their ranges. The spacing engine
-accepts non-overlapping newline insertions at physical line boundaries and
-checks token preservation and syntactic validity before adapters offer or
-apply corrections. The initial rules insert blank lines and preserve existing
-indentation and line endings. Their contracts include idempotence, overlapping
-rule requests, multiline expressions, comments and UTF-16 editor coordinates.
+Edits retain the original source outside their ranges. The layout engine accepts
+non-overlapping UTF-16 whitespace replacements. Before adapters offer or apply
+corrections, it checks token spelling and values, syntax-tree structure and
+comment content, allowing comment trailing whitespace to follow the cleanup rule.
+These checks preserve statement boundaries as well as literals. Coincident
+blank-line and indentation changes share one edit. Contracts cover idempotence,
+overlapping rule requests, multiline expressions, comments and UTF-16 coordinates.
+
+## Repository checks
+
+`scripts/build.sh test` checks formatting and lints owned project sources with
+the freshly bootstrapped compiler before running the language contracts.
+The CI jobs that run this entry point,
+including packaging, enforce the same checks. Its scope covers the root manifest,
+ABI tooling and Neri Data generation/runtime/verification/example manifests.
+The standard-library manifest receives the same formatting and lint checks.
+Manifest-owned sources are deduplicated and declared generated outputs
+are excluded. Parser fixtures outside these units retain their purpose-specific
+layout; source snippets inside test literals remain unchanged.
 
 ## Verified references
 
+- [.NET runtime source-file guidelines](https://github.com/dotnet/runtime/blob/main/docs/coding-guidelines/project-guidelines.md)
+  provide a precedent for one class per file, type-based filenames and directory
+  organization. Neri applies its own configurable scope and snake_case naming.
+- [Effective Go: formatting](https://go.dev/doc/effective_go#formatting)
+  supports a shared automated formatter as the project's layout convention.
+- [Microsoft coding conventions](https://learn.microsoft.com/en-us/dotnet/csharp/fundamentals/coding-style/coding-conventions)
+  illustrates configurable style analysis and CI enforcement. Neri retains its
+  own syntax and indentation conventions.
 - [Roslyn analyzer and code-fix tutorial](https://learn.microsoft.com/en-us/dotnet/csharp/roslyn-sdk/tutorials/how-to-write-csharp-analyzer-code-fix)
   grounds the separation between rule diagnostics and proposed corrections.
 - [Roslyn syntax model](https://learn.microsoft.com/en-us/dotnet/csharp/roslyn-sdk/work-with-syntax)

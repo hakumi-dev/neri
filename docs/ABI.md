@@ -1,9 +1,16 @@
 # Runtime and IR boundary
 
 The canonical exported declarations and layouts are in
-[`runtime_abi.h`](../native/include/neri/runtime_abi.h). Runtime ABI 1.25 uses a
+[`runtime_abi.h`](../native/include/neri/runtime_abi.h). Runtime ABI 1.26 uses a
 C calling convention on macOS ARM64 and Linux x86-64. Generated programs negotiate
 major version, minimum minor version and required feature bits before execution.
+
+ABI 1.26 adds `neri_rt_v1_host_executable_path` under `BOOTSTRAP_HOST`.
+`host.executablePath()` returns the canonical current process image path or
+`null`. It uses the operating system's process image API independently of user
+arguments: [dyld on macOS](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man3/dyld.3.html),
+[`/proc/self/exe` on Linux](https://www.man7.org/linux/man-pages/man5/proc_pid_exe.5.html),
+and [GetModuleFileNameW on Windows](https://learn.microsoft.com/en-us/windows/win32/api/libloaderapi/nf-libloaderapi-getmodulefilenamew).
 The package manifest also identifies the toolchain version and native target.
 
 `neri_rt_v1_file_wait_readable(fd, milliseconds)` waits without consuming input.

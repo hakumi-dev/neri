@@ -20,5 +20,6 @@ exec env \
   "NERI_CODEGEN=$TOOLCHAIN_DIR/bin/neri-codegen" \
   "NERI_RUNTIME_MANIFEST=$TOOLCHAIN_DIR/lib/neri-runtime.json" \
   "NERI_LINKER=$LINKER" \
-  "NERI_STDLIB=$TOOLCHAIN_DIR/stdlib" \
+  "NERI_STDLIB=$ROOT_DIR/stdlib" \
+  "NERI_TEMPLATE_CATALOG=${NERI_TEMPLATE_CATALOG:-$ROOT_DIR/share/neri/templates/declarations.json}" \
   "$TOOLCHAIN_DIR/bin/neri" "$@"

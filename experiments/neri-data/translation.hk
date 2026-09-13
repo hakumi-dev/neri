@@ -1,0 +1,724 @@
+use fields
+use host
+use quotation
+
+namespace neri_data
+
+class MappingColumn
+  private storedIdentity: String
+  private storedTypeName: String
+  private storedColumn: String
+
+  def init(identity: String, typeName: String, column: String): Void
+    this.storedIdentity = identity
+    this.storedTypeName = typeName
+    this.storedColumn = column
+  end
+
+  public readonly def identity(): String
+    return this.storedIdentity
+  end
+
+  public readonly def typeName(): String
+    return this.storedTypeName
+  end
+
+  public readonly def column(): String
+    return this.storedColumn
+  end
+end
+
+class MappingColumnNode
+  public value: MappingColumn
+  public next: MappingColumnNode?
+
+  internal def init(value: MappingColumn): Void
+    this.value = value
+  end
+end
+
+class EntityMapping
+  private storedEntityType: String
+  private storedTable: String
+  private firstColumn: MappingColumnNode?
+  private columnCount: Int = 0
+
+  def init(entityType: String, table: String, columns: MappingColumn[]): Void
+    this.storedEntityType = entityType
+    this.storedTable = table
+    var tail: MappingColumnNode? = null
+
+    for value in columns
+      let node = new MappingColumnNode(value)
+
+      if tail == null
+        this.firstColumn = node
+      else
+        tail.next = node
+      end
+      tail = node
+      this.columnCount = this.columnCount + 1
+    end
+  end
+
+  public readonly def entityType(): String
+    return this.storedEntityType
+  end
+
+  public readonly def table(): String
+    return this.storedTable
+  end
+
+  public readonly def count(): Int
+    return this.columnCount
+  end
+
+  public readonly def find(identity: String): readonly MappingColumn?
+    var current = this.firstColumn
+
+    while current != null
+      if current.value.identity() == identity
+        return current.value
+      end
+      current = current.next
+    end
+    return null
+  end
+
+  readonly def failure(): QueryFailure?
+    if this.storedEntityType == ""
+      return QueryFailure.Provider("entity mapping requires a canonical entity identity")
+    end
+    if !identifierValid(this.storedTable)
+      return QueryFailure.InvalidIdentifier(this.storedTable)
+    end
+    var index = 0
+
+    var current = this.firstColumn
+
+    while current != null
+      let value = current.value
+
+      if value.identity() == "" || !translationScalar(value.typeName())
+        return QueryFailure.Provider("entity mapping contains an invalid field identity or type")
+      end
+      if !identifierValid(value.column())
+        return QueryFailure.InvalidIdentifier(value.column())
+      end
+      var previous = this.firstColumn
+      var previousIndex = 0
+
+      while previous != null && previousIndex < index
+        if previous.value.identity() == value.identity() || previous.value.column() == value.column()
+          return QueryFailure.Provider("entity mapping field identities and columns must be unique")
+        end
+        previous = previous.next
+        previousIndex = previousIndex + 1
+      end
+      index = index + 1
+      current = current.next
+    end
+    return null
+  end
+end
+
+enum TranslationResult
+  case Expression(value: Expression?)
+  case Failure(error: QueryFailure)
+end
+
+enum SelectionResult
+  case Column(value: readonly MappingColumn)
+  case Failure(error: QueryFailure)
+end
+
+def translationFailure(reason: String): TranslationResult
+  return TranslationResult.Failure(QueryFailure.UnsupportedCapability(reason))
+end
+
+def translationScalar(typeName: String): Bool
+  let value = semanticTranslationInner(typeName)
+
+  return value == "Bool" || value == "Int" || value == "String"
+end
+
+def semanticTranslationInner(typeName: String): String
+  if host.stringByteLength(typeName) > 0 && host.stringSlice(typeName, host.stringByteLength(typeName) - 1, 1) == "?"
+    return host.stringSlice(typeName, 0, host.stringByteLength(typeName) - 1)
+  end
+  return typeName
+end
+
+def translationOptional(typeName: String): Bool
+  return semanticTranslationInner(typeName) != typeName
+end
+
+def translationParameter(value: readonly quotation.CaptureValue): Parameter?
+  match value
+    case quotation.CaptureValue.Bool(item)
+      return Parameter.Bool(item)
+    case quotation.CaptureValue.Int(item)
+      return Parameter.Int(item)
+    case quotation.CaptureValue.Text(item)
+      return Parameter.Text(item)
+    case quotation.CaptureValue.Null()
+      return null
+  end
+end
+
+def translationValueType(value: readonly quotation.CaptureValue): String
+  match value
+    case quotation.CaptureValue.Bool(item)
+      return "Bool"
+    case quotation.CaptureValue.Int(item)
+      return "Int"
+    case quotation.CaptureValue.Text(item)
+      return "String"
+    case quotation.CaptureValue.Null()
+      return "Null"
+  end
+end
+
+def translationEqual(mapping: EntityMapping, column: readonly MappingColumn, parameter: Parameter): Expression
+  let equal = new Expression(ExpressionKind.Equal(), mapping.table(), column.column(), parameter)
+
+  if translationOptional(column.typeName())
+    let present = new Expression(ExpressionKind.IsNotNull(), mapping.table(), column.column())
+
+    return new Expression(ExpressionKind.And(), left: present, right: equal)
+  end
+  return equal
+end
+
+def translationConjoin(left: Expression?, right: Expression): Expression
+  if left == null
+    return right
+  end
+  return new Expression(ExpressionKind.And(), left: left, right: right)
+end
+
+def translateFields(mapping: EntityMapping, pack: readonly fields.Pack): TranslationResult
+  let invalid = mapping.failure()
+
+  if invalid != null
+    return TranslationResult.Failure(invalid)
+  end
+  if pack.entityType() != mapping.entityType()
+    return translationFailure("field pack entity does not match mapping")
+  end
+  var result: Expression? = null
+  var index = 0
+
+  while index < pack.count()
+    let entry = pack.entryAt(index)
+
+    if entry == null
+      return translationFailure("field pack contains a missing entry")
+    end
+    let column = mapping.find(entry.identity())
+
+    if column == null || column.typeName() != entry.typeName()
+      return translationFailure("field pack identity or type does not match mapping")
+    end
+    let value = entry.value()
+    let actual = translationValueType(value)
+    var expression: Expression? = null
+
+    if actual == "Null"
+      if !translationOptional(column.typeName())
+        return translationFailure("null field filter requires an optional field")
+      end
+      expression = new Expression(ExpressionKind.IsNull(), mapping.table(), column.column())
+    else
+      if semanticTranslationInner(column.typeName()) != actual
+        return translationFailure("field filter scalar type does not match mapping")
+      end
+      let parameter = translationParameter(value)
+
+      if parameter != null
+        expression = translationEqual(mapping, column, parameter)
+      end
+    end
+    if expression == null
+      return translationFailure("field filter value is not representable")
+    end
+    result = translationConjoin(result, expression)
+    index = index + 1
+  end
+  return TranslationResult.Expression(result)
+end
+
+class TranslationOperand
+  public column: readonly MappingColumn?
+  public parameter: Parameter?
+  public isNull: Bool
+  public typeName: String
+
+  def init(column: readonly MappingColumn? = null, parameter: Parameter? = null, isNull: Bool = false, typeName: String = ""): Void
+    this.column = column
+    this.parameter = parameter
+    this.isNull = isNull
+    this.typeName = typeName
+  end
+end
+
+enum OperandResult
+  case Value(value: TranslationOperand)
+  case Failure(reason: String)
+end
+
+def translationNodeCode(kind: readonly quotation.NodeKind): Int
+  match kind
+    case quotation.NodeKind.Parameter()
+      return 0
+    case quotation.NodeKind.Capture()
+      return 1
+    case quotation.NodeKind.Member()
+      return 2
+    case quotation.NodeKind.IntLiteral()
+      return 3
+    case quotation.NodeKind.BoolLiteral()
+      return 4
+    case quotation.NodeKind.TextLiteral()
+      return 5
+    case quotation.NodeKind.NullLiteral()
+      return 6
+    case quotation.NodeKind.Equal()
+      return 7
+    case quotation.NodeKind.NotEqual()
+      return 8
+    case quotation.NodeKind.Less()
+      return 9
+    case quotation.NodeKind.LessEqual()
+      return 10
+    case quotation.NodeKind.Greater()
+      return 11
+    case quotation.NodeKind.GreaterEqual()
+      return 12
+    case quotation.NodeKind.And()
+      return 13
+    case quotation.NodeKind.Or()
+      return 14
+    case quotation.NodeKind.Not()
+      return 15
+    case quotation.NodeKind.Negate()
+      return 16
+  end
+end
+
+class QuotationTranslator
+  public mapping: EntityMapping
+  public tree: readonly quotation.Tree
+
+  def init(mapping: EntityMapping, tree: readonly quotation.Tree): Void
+    this.mapping = mapping
+    this.tree = tree
+  end
+
+  def operand(index: Int): OperandResult
+    let node = this.tree.nodeAt(index)
+
+    if node == null
+      return OperandResult.Failure("quotation operand index is invalid")
+    end
+    match node.kind()
+      case quotation.NodeKind.Member()
+        let receiver = this.tree.nodeAt(node.first())
+
+        if receiver == null
+          return OperandResult.Failure("quotation member receiver is missing")
+        end
+        match receiver.kind()
+          case quotation.NodeKind.Parameter()
+            if receiver.index() != 0
+              return OperandResult.Failure("quotation member must read parameter zero")
+            end
+          case quotation.NodeKind.Capture()
+            return OperandResult.Failure("quotation member must be a direct parameter member")
+          case quotation.NodeKind.Member()
+            return OperandResult.Failure("quotation member must be a direct parameter member")
+          case quotation.NodeKind.IntLiteral()
+            return OperandResult.Failure("quotation member must be a direct parameter member")
+          case quotation.NodeKind.BoolLiteral()
+            return OperandResult.Failure("quotation member must be a direct parameter member")
+          case quotation.NodeKind.TextLiteral()
+            return OperandResult.Failure("quotation member must be a direct parameter member")
+          case quotation.NodeKind.NullLiteral()
+            return OperandResult.Failure("quotation member must be a direct parameter member")
+          case quotation.NodeKind.Equal()
+            return OperandResult.Failure("quotation member must be a direct parameter member")
+          case quotation.NodeKind.NotEqual()
+            return OperandResult.Failure("quotation member must be a direct parameter member")
+          case quotation.NodeKind.Less()
+            return OperandResult.Failure("quotation member must be a direct parameter member")
+          case quotation.NodeKind.LessEqual()
+            return OperandResult.Failure("quotation member must be a direct parameter member")
+          case quotation.NodeKind.Greater()
+            return OperandResult.Failure("quotation member must be a direct parameter member")
+          case quotation.NodeKind.GreaterEqual()
+            return OperandResult.Failure("quotation member must be a direct parameter member")
+          case quotation.NodeKind.And()
+            return OperandResult.Failure("quotation member must be a direct parameter member")
+          case quotation.NodeKind.Or()
+            return OperandResult.Failure("quotation member must be a direct parameter member")
+          case quotation.NodeKind.Not()
+            return OperandResult.Failure("quotation member must be a direct parameter member")
+          case quotation.NodeKind.Negate()
+            return OperandResult.Failure("quotation member must be a direct parameter member")
+        end
+        let column = this.mapping.find(node.identity())
+
+        if column == null || column.typeName() != node.typeName()
+          return OperandResult.Failure("quotation member identity or type does not match mapping")
+        end
+        return OperandResult.Value(new TranslationOperand(column: column, typeName: node.typeName()))
+      case quotation.NodeKind.IntLiteral()
+        return OperandResult.Value(new TranslationOperand(parameter: Parameter.Int(node.intValue()), typeName: "Int"))
+      case quotation.NodeKind.BoolLiteral()
+        return OperandResult.Value(new TranslationOperand(parameter: Parameter.Bool(node.boolValue()), typeName: "Bool"))
+      case quotation.NodeKind.TextLiteral()
+        return OperandResult.Value(new TranslationOperand(parameter: Parameter.Text(node.textValue()), typeName: "String"))
+      case quotation.NodeKind.NullLiteral()
+        return OperandResult.Value(new TranslationOperand(isNull: true, typeName: "Null"))
+      case quotation.NodeKind.Capture()
+        let capture = this.tree.captureAt(node.index())
+
+        if capture == null
+          return OperandResult.Failure("quotation capture index is invalid")
+        end
+        let typeName = translationValueType(capture)
+
+        if typeName == "Null"
+          return OperandResult.Value(new TranslationOperand(isNull: true, typeName: "Null"))
+        end
+        if semanticTranslationInner(node.typeName()) != typeName
+          return OperandResult.Failure("quotation capture type is invalid")
+        end
+        return OperandResult.Value(new TranslationOperand(parameter: translationParameter(capture), typeName: typeName))
+      case quotation.NodeKind.Parameter()
+        return OperandResult.Failure("quotation comparison operand is unsupported")
+      case quotation.NodeKind.Equal()
+        return OperandResult.Failure("quotation comparison operand is unsupported")
+      case quotation.NodeKind.NotEqual()
+        return OperandResult.Failure("quotation comparison operand is unsupported")
+      case quotation.NodeKind.Less()
+        return OperandResult.Failure("quotation comparison operand is unsupported")
+      case quotation.NodeKind.LessEqual()
+        return OperandResult.Failure("quotation comparison operand is unsupported")
+      case quotation.NodeKind.Greater()
+        return OperandResult.Failure("quotation comparison operand is unsupported")
+      case quotation.NodeKind.GreaterEqual()
+        return OperandResult.Failure("quotation comparison operand is unsupported")
+      case quotation.NodeKind.And()
+        return OperandResult.Failure("quotation comparison operand is unsupported")
+      case quotation.NodeKind.Or()
+        return OperandResult.Failure("quotation comparison operand is unsupported")
+      case quotation.NodeKind.Not()
+        return OperandResult.Failure("quotation comparison operand is unsupported")
+      case quotation.NodeKind.Negate()
+        return OperandResult.Failure("quotation comparison operand is unsupported")
+    end
+    return OperandResult.Failure("quotation comparison operand is unsupported")
+  end
+
+  def comparison(kind: readonly quotation.NodeKind, first: Int, second: Int): TranslationResult
+    let leftResult = this.operand(first)
+    let rightResult = this.operand(second)
+    var left: TranslationOperand? = null
+    var right: TranslationOperand? = null
+
+    match leftResult
+      case OperandResult.Value(value)
+        left = value
+      case OperandResult.Failure(reason)
+        return translationFailure(reason)
+    end
+    match rightResult
+      case OperandResult.Value(value)
+        right = value
+      case OperandResult.Failure(reason)
+        return translationFailure(reason)
+    end
+    if left == null || right == null
+      return translationFailure("quotation comparison operands are missing")
+    end
+    var column = left.column
+    var value = right
+    var reversed = false
+
+    if column == null && right.column != null
+      column = right.column
+      value = left
+      reversed = true
+    end
+    if column == null || value.column != null
+      return translationFailure("quotation comparison requires one mapped member")
+    end
+    let code = translationNodeCode(kind)
+    let equal = code == 7 || code == 8
+
+    if value.isNull
+      if !equal || !translationOptional(column.typeName())
+        return translationFailure("null comparison requires equality on an optional member")
+      end
+      let nullKind = code == 7 ? ExpressionKind.IsNull() : ExpressionKind.IsNotNull()
+
+      return TranslationResult.Expression(new Expression(nullKind, this.mapping.table(), column.column()))
+    end
+    if semanticTranslationInner(column.typeName()) != value.typeName || value.parameter == null
+      return translationFailure("quotation comparison types do not match")
+    end
+    if equal
+      let parameter = value.parameter
+
+      if parameter == null
+        return translationFailure("quotation comparison value is missing")
+      end
+      var expression = translationEqual(this.mapping, column, parameter)
+
+      if code == 8
+        expression = new Expression(ExpressionKind.Not(), left: expression)
+      end
+      return TranslationResult.Expression(expression)
+    end
+    if translationOptional(column.typeName())
+      return translationFailure("ordered comparison of an optional member is unsupported")
+    end
+    var expressionKind = ExpressionKind.Less()
+
+    if code == 9
+      expressionKind = reversed ? ExpressionKind.Greater() : ExpressionKind.Less()
+    end
+    if code == 10
+      expressionKind = reversed ? ExpressionKind.GreaterOrEqual() : ExpressionKind.LessOrEqual()
+    end
+    if code == 11
+      expressionKind = reversed ? ExpressionKind.Less() : ExpressionKind.Greater()
+    end
+    if code == 12
+      expressionKind = reversed ? ExpressionKind.LessOrEqual() : ExpressionKind.GreaterOrEqual()
+    end
+    return TranslationResult.Expression(new Expression(expressionKind, this.mapping.table(), column.column(), value.parameter))
+  end
+
+  def expression(index: Int, depth: Int = 0): TranslationResult
+    if depth > this.tree.count()
+      return translationFailure("quotation tree contains a cycle")
+    end
+    let node = this.tree.nodeAt(index)
+
+    if node == null
+      return translationFailure("quotation node index is invalid")
+    end
+    match node.kind()
+      case quotation.NodeKind.Member()
+        let operand = this.operand(index)
+
+        match operand
+          case OperandResult.Value(value)
+            let column = value.column
+
+            if column == null
+              return translationFailure("quotation root member must be Bool")
+            end
+            if column.typeName() != "Bool"
+              return translationFailure("quotation root member must be Bool")
+            end
+            return TranslationResult.Expression(translationEqual(this.mapping, column, Parameter.Bool(true)))
+          case OperandResult.Failure(reason)
+            return translationFailure(reason)
+        end
+      case quotation.NodeKind.Equal()
+        return this.comparison(node.kind(), node.first(), node.second())
+      case quotation.NodeKind.NotEqual()
+        return this.comparison(node.kind(), node.first(), node.second())
+      case quotation.NodeKind.Less()
+        return this.comparison(node.kind(), node.first(), node.second())
+      case quotation.NodeKind.LessEqual()
+        return this.comparison(node.kind(), node.first(), node.second())
+      case quotation.NodeKind.Greater()
+        return this.comparison(node.kind(), node.first(), node.second())
+      case quotation.NodeKind.GreaterEqual()
+        return this.comparison(node.kind(), node.first(), node.second())
+      case quotation.NodeKind.Not()
+        let child = this.expression(node.first(), depth + 1)
+
+        match child
+          case TranslationResult.Expression(value)
+            if value == null
+              return translationFailure("quotation Not operand is empty")
+            end
+            return TranslationResult.Expression(new Expression(ExpressionKind.Not(), left: value))
+          case TranslationResult.Failure(error)
+            return TranslationResult.Failure(error)
+        end
+      case quotation.NodeKind.And()
+        return this.combine(node, true, depth)
+      case quotation.NodeKind.Or()
+        return this.combine(node, false, depth)
+      case quotation.NodeKind.Parameter()
+        return translationFailure("quotation expression node is unsupported")
+      case quotation.NodeKind.Capture()
+        return translationFailure("quotation expression node is unsupported")
+      case quotation.NodeKind.IntLiteral()
+        return translationFailure("quotation expression node is unsupported")
+      case quotation.NodeKind.BoolLiteral()
+        return translationFailure("quotation expression node is unsupported")
+      case quotation.NodeKind.TextLiteral()
+        return translationFailure("quotation expression node is unsupported")
+      case quotation.NodeKind.NullLiteral()
+        return translationFailure("quotation expression node is unsupported")
+      case quotation.NodeKind.Negate()
+        return translationFailure("quotation expression node is unsupported")
+    end
+    return translationFailure("quotation expression node is unsupported")
+  end
+
+  def combine(node: readonly quotation.Node, conjunction: Bool, depth: Int): TranslationResult
+    let left = this.expression(node.first(), depth + 1)
+    let right = this.expression(node.second(), depth + 1)
+    var leftValue: Expression? = null
+    var rightValue: Expression? = null
+
+    match left
+      case TranslationResult.Expression(value)
+        leftValue = value
+      case TranslationResult.Failure(error)
+        return TranslationResult.Failure(error)
+    end
+    match right
+      case TranslationResult.Expression(value)
+        rightValue = value
+      case TranslationResult.Failure(error)
+        return TranslationResult.Failure(error)
+    end
+    if leftValue == null || rightValue == null
+      return translationFailure("quotation logical operand is empty")
+    end
+    let kind = conjunction ? ExpressionKind.And() : ExpressionKind.Or()
+
+    return TranslationResult.Expression(new Expression(kind, left: leftValue, right: rightValue))
+  end
+end
+
+def translateQuotation(mapping: EntityMapping, tree: readonly quotation.Tree): TranslationResult
+  let invalid = mapping.failure()
+
+  if invalid != null
+    return TranslationResult.Failure(invalid)
+  end
+  if tree.parameterCount() != 1
+    return translationFailure("quotation signature does not match mapped entity predicate")
+  end
+  let parameterType = tree.parameterTypeAt(0)
+
+  if parameterType == null || parameterType != mapping.entityType() || tree.resultType() != "Bool"
+    return translationFailure("quotation signature does not match mapped entity predicate")
+  end
+  return (new QuotationTranslator(mapping, tree)).expression(tree.root())
+end
+
+def translateSelection(mapping: EntityMapping, tree: readonly quotation.Tree): SelectionResult
+  let invalid = mapping.failure()
+
+  if invalid != null
+    return SelectionResult.Failure(invalid)
+  end
+  if tree.parameterCount() != 1
+    return SelectionResult.Failure(QueryFailure.UnsupportedCapability("selection quotation requires one mapped entity parameter"))
+  end
+  let parameterType = tree.parameterTypeAt(0)
+
+  if parameterType == null || parameterType != mapping.entityType()
+    return SelectionResult.Failure(QueryFailure.UnsupportedCapability("selection quotation entity does not match mapping"))
+  end
+  let node = tree.nodeAt(tree.root())
+
+  if node == null
+    return SelectionResult.Failure(QueryFailure.UnsupportedCapability("selection quotation root is missing"))
+  end
+  match node.kind()
+    case quotation.NodeKind.Member()
+      let receiver = tree.nodeAt(node.first())
+
+      if receiver == null
+        return SelectionResult.Failure(QueryFailure.UnsupportedCapability("selection member receiver is missing"))
+      end
+      match receiver.kind()
+        case quotation.NodeKind.Parameter()
+          if receiver.index() != 0
+            return SelectionResult.Failure(QueryFailure.UnsupportedCapability("selection member must read parameter zero"))
+          end
+        case quotation.NodeKind.Capture()
+          return SelectionResult.Failure(QueryFailure.UnsupportedCapability("selection must be a direct entity member"))
+        case quotation.NodeKind.Member()
+          return SelectionResult.Failure(QueryFailure.UnsupportedCapability("selection must be a direct entity member"))
+        case quotation.NodeKind.IntLiteral()
+          return SelectionResult.Failure(QueryFailure.UnsupportedCapability("selection must be a direct entity member"))
+        case quotation.NodeKind.BoolLiteral()
+          return SelectionResult.Failure(QueryFailure.UnsupportedCapability("selection must be a direct entity member"))
+        case quotation.NodeKind.TextLiteral()
+          return SelectionResult.Failure(QueryFailure.UnsupportedCapability("selection must be a direct entity member"))
+        case quotation.NodeKind.NullLiteral()
+          return SelectionResult.Failure(QueryFailure.UnsupportedCapability("selection must be a direct entity member"))
+        case quotation.NodeKind.Equal()
+          return SelectionResult.Failure(QueryFailure.UnsupportedCapability("selection must be a direct entity member"))
+        case quotation.NodeKind.NotEqual()
+          return SelectionResult.Failure(QueryFailure.UnsupportedCapability("selection must be a direct entity member"))
+        case quotation.NodeKind.Less()
+          return SelectionResult.Failure(QueryFailure.UnsupportedCapability("selection must be a direct entity member"))
+        case quotation.NodeKind.LessEqual()
+          return SelectionResult.Failure(QueryFailure.UnsupportedCapability("selection must be a direct entity member"))
+        case quotation.NodeKind.Greater()
+          return SelectionResult.Failure(QueryFailure.UnsupportedCapability("selection must be a direct entity member"))
+        case quotation.NodeKind.GreaterEqual()
+          return SelectionResult.Failure(QueryFailure.UnsupportedCapability("selection must be a direct entity member"))
+        case quotation.NodeKind.And()
+          return SelectionResult.Failure(QueryFailure.UnsupportedCapability("selection must be a direct entity member"))
+        case quotation.NodeKind.Or()
+          return SelectionResult.Failure(QueryFailure.UnsupportedCapability("selection must be a direct entity member"))
+        case quotation.NodeKind.Not()
+          return SelectionResult.Failure(QueryFailure.UnsupportedCapability("selection must be a direct entity member"))
+        case quotation.NodeKind.Negate()
+          return SelectionResult.Failure(QueryFailure.UnsupportedCapability("selection must be a direct entity member"))
+      end
+      let column = mapping.find(node.identity())
+
+      if column == null || column.typeName() != node.typeName() || tree.resultType() != node.typeName()
+        return SelectionResult.Failure(QueryFailure.UnsupportedCapability("selection member identity or type does not match mapping"))
+      end
+      return SelectionResult.Column(column)
+    case quotation.NodeKind.Parameter()
+      return SelectionResult.Failure(QueryFailure.UnsupportedCapability("selection must be a direct entity member"))
+    case quotation.NodeKind.Capture()
+      return SelectionResult.Failure(QueryFailure.UnsupportedCapability("selection must be a direct entity member"))
+    case quotation.NodeKind.IntLiteral()
+      return SelectionResult.Failure(QueryFailure.UnsupportedCapability("selection must be a direct entity member"))
+    case quotation.NodeKind.BoolLiteral()
+      return SelectionResult.Failure(QueryFailure.UnsupportedCapability("selection must be a direct entity member"))
+    case quotation.NodeKind.TextLiteral()
+      return SelectionResult.Failure(QueryFailure.UnsupportedCapability("selection must be a direct entity member"))
+    case quotation.NodeKind.NullLiteral()
+      return SelectionResult.Failure(QueryFailure.UnsupportedCapability("selection must be a direct entity member"))
+    case quotation.NodeKind.Equal()
+      return SelectionResult.Failure(QueryFailure.UnsupportedCapability("selection must be a direct entity member"))
+    case quotation.NodeKind.NotEqual()
+      return SelectionResult.Failure(QueryFailure.UnsupportedCapability("selection must be a direct entity member"))
+    case quotation.NodeKind.Less()
+      return SelectionResult.Failure(QueryFailure.UnsupportedCapability("selection must be a direct entity member"))
+    case quotation.NodeKind.LessEqual()
+      return SelectionResult.Failure(QueryFailure.UnsupportedCapability("selection must be a direct entity member"))
+    case quotation.NodeKind.Greater()
+      return SelectionResult.Failure(QueryFailure.UnsupportedCapability("selection must be a direct entity member"))
+    case quotation.NodeKind.GreaterEqual()
+      return SelectionResult.Failure(QueryFailure.UnsupportedCapability("selection must be a direct entity member"))
+    case quotation.NodeKind.And()
+      return SelectionResult.Failure(QueryFailure.UnsupportedCapability("selection must be a direct entity member"))
+    case quotation.NodeKind.Or()
+      return SelectionResult.Failure(QueryFailure.UnsupportedCapability("selection must be a direct entity member"))
+    case quotation.NodeKind.Not()
+      return SelectionResult.Failure(QueryFailure.UnsupportedCapability("selection must be a direct entity member"))
+    case quotation.NodeKind.Negate()
+      return SelectionResult.Failure(QueryFailure.UnsupportedCapability("selection must be a direct entity member"))
+  end
+end

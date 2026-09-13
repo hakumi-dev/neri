@@ -175,6 +175,43 @@ recursion and forward calls are supported. A program defines exactly one
 non-namespaced top-level `main(): Void` with no parameters. Non-Void functions
 return on every statically recognized path. Overloading is outside this surface.
 
+Calls to declared functions, methods and constructors accept named arguments:
+
+```neri
+def rangeLength(start: Int, finish: Int = start + 1): Int
+  return finish - start
+end
+
+def main(): Void
+  let length = rangeLength(finish: 10, start: 3)
+end
+```
+
+Each label binds to a parameter in the resolved declaration. Positional arguments
+precede named arguments. Named arguments may appear in any order; each parameter
+is supplied at most once. Required parameters must be supplied, and omitted
+defaulted parameters use their declared expressions. Labels are case-sensitive.
+Renaming a public parameter changes the named-call source API.
+
+The receiver of an instance call is evaluated first. Supplied argument expressions
+are evaluated exactly once in source order, followed by omitted defaults in
+declaration order. Defaults can use earlier parameter values. Parameter placement
+does not reorder evaluation. Virtual calls use the compile-time receiver's
+declaration for labels and defaults and preserve runtime method dispatch.
+
+Generic inference matches each argument to its labeled parameter before using
+its type. Contextual expressions, including empty arrays, receive the resolved
+parameter type through the ordinary inference and checking rules. For example,
+`headOr(values: [], fallback: 7)` can infer `T = Int` when `headOr<T>` declares
+`values: T[]` and `fallback: T`.
+
+Function values retain their positional function-type contract; parameter labels
+are available on declared callables. Alternative-case payload construction and
+`native.*` intrinsic syntax use positional arguments. Declared `@intrinsic` and
+`@cabi` functions expose the labels in their Neri signatures. Arrays contain
+expressions rather than labeled arguments. Named calls to unsafe and C ABI
+declarations require every parameter explicitly (`NR275` for omitted defaults).
+
 `if`, `while`, and `for` have lexical scopes. A `for` element binding is immutable.
 `break` and `continue` require an enclosing loop.
 
@@ -509,6 +546,27 @@ snapshot can be captured instead of a `var`; a raw pointer is never a managed
 capture. Callback signatures contain safe value types, and an unsafe enclosing
 block does not grant unsafe access inside a callback. Unsafe and C ABI functions
 require an explicitly written callback wrapper with its own unsafe block.
+
+### Typed quotations
+
+`quote fn(Parameters): Result` describes an inspectable expression. An explicit
+`quote do |parameter: Type|: Result ... end` expression constructs one. A
+quotation parameter also supplies the expected types for a trailing `do` block.
+The compiler preserves resolved field identities, parameter types and scalar
+captures in a readonly tree exposed through `tree()`.
+
+Quotations use `use quotation` and a body containing one supported return
+expression. Their signatures participate in ordinary generic inference. See
+[typed quotations](QUOTATIONS.md) for supported operations, capture rules and
+diagnostics.
+
+### Typed field arguments
+
+`fields of T` preserves a declared class's identity in a collection of supplied
+field values. A final `labels values: fields of T` parameter accepts named
+arguments checked against `T`'s public instance fields. Generic inference,
+completion and navigation use the entity declarations. See
+[typed field arguments](FIELDS.md) for presence, evaluation and inspection rules.
 
 ### Shared callbacks
 
