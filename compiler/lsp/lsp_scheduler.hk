@@ -1,0 +1,160 @@
+class LspScheduler
+  private server: LspServer
+  private input: LspInput
+  private reader: LspMessageReader
+  private first: LspQueuedMessage?
+  private last: LspQueuedMessage?
+  private active: LspQueuedMessage?
+  private count: Int = 0
+  private bytes: Int = 0
+
+  def init(server: LspServer, input: LspInput): Void
+    this.server = server
+    this.input = input
+    this.reader = new LspMessageReader(input)
+  end
+
+  # Input collection never dispatches a message or mutates semantic state.
+  private def pump(): Void
+    var polls = 0
+
+    while polls < 4 && this.count < 32 && this.bytes < 4194304
+      let body = this.reader.poll()
+
+      if body == null
+        return
+      end
+      this.enqueue(body)
+      polls = polls + 1
+    end
+  end
+
+  private def enqueue(body: String): Void
+    let item = new LspQueuedMessage(body)
+    let message = item.message
+
+    if message != null && item.method == "$/cancelRequest" && message.get("id").isMissing()
+      let target = lspRequestIdentity(message.get("params").get("id"))
+
+      if target != null
+        let active = this.active
+
+        if active != null && active.canCancel()
+          let id = active.id
+
+          if id != null && id == target
+            active.cancelled = true
+          end
+        end
+        var queued = this.first
+
+        while queued != null
+          let id = queued.id
+
+          if queued.canCancel() && id != null && id == target
+            queued.cancelled = true
+          end
+          queued = queued.next
+        end
+      end
+    end
+    let last = this.last
+
+    if last == null
+      this.first = item
+    else
+      last.next = item
+    end
+    this.last = item
+    this.count = this.count + 1
+    this.bytes = this.bytes + item.byteLength
+  end
+
+  private def continueOperation(): Bool
+    this.pump()
+    let active = this.active
+
+    if active != null
+      return !active.cancelled
+    end
+    var queued = this.first
+
+    while queued != null
+      if queued.interruptsIdle()
+        return false
+      end
+      queued = queued.next
+    end
+    return !this.reader.isClosed()
+  end
+
+  private def beginOperation(): AnalysisControl
+    let control = new AnalysisControl() do
+      return this.continueOperation()
+    end
+
+    this.server.control = control
+    return control
+  end
+
+  private def dispatch(item: LspQueuedMessage): Bool
+    let message = item.message
+
+    if message == null
+      lspError("null", -32700, "Parse error")
+      return true
+    end
+    this.active = item
+    let control = this.beginOperation()
+    var running = true
+
+    if !item.cancelled
+      running = this.server.handle(message)
+    end
+    this.server.control = null
+    this.active = null
+    let id = item.id
+
+    # The server's response boundary performs the final poll. Polling again
+    # here could cancel a request after its successful response was sent.
+    if id != null && (item.cancelled || control.isCancelled())
+      lspError(id, -32800, "Request cancelled")
+    end
+    return running
+  end
+
+  def run(): Void
+    while true
+      this.pump()
+      let item = this.first
+
+      if item != null
+        this.first = item.next
+        item.next = null
+        if this.first == null
+          this.last = null
+        end
+        this.count = this.count - 1
+        this.bytes = this.bytes - item.byteLength
+        if !this.dispatch(item)
+          return
+        end
+        continue
+      end
+      if this.reader.isClosed()
+        return
+      end
+      let pending = this.server.pendingAnalysis()
+
+      if pending != null
+        if !this.input.waitReadable(150)
+          this.beginOperation()
+          this.server.analyze(pending)
+          this.server.control = null
+        end
+      else
+        this.input.waitReadable(1000)
+      end
+    end
+  end
+end

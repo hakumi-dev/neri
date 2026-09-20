@@ -1,0 +1,133 @@
+use files
+use host
+use process
+use tasks
+use test
+
+def schedulingFrame(body: String): String
+  return "Content-Length: " + (host::stringByteLength(body) as String) + "\r\n\r\n" + body
+end
+
+def schedulingNotification(method: String, parameters: String): String
+  return schedulingFrame("{\"jsonrpc\":\"2.0\",\"method\":" + lspQuote(method) + ",\"params\":" + parameters + "}")
+end
+
+def schedulingOpen(uri: String, text: String): String
+  return schedulingNotification("textDocument/didOpen", "{\"textDocument\":{\"uri\":" + lspQuote(uri) + ",\"languageId\":\"neri\",\"version\":1,\"text\":" + lspQuote(text) + "}}")
+end
+
+def schedulingChange(uri: String, text: String, version: Int): String
+  return schedulingNotification("textDocument/didChange", "{\"textDocument\":{\"uri\":" + lspQuote(uri) + ",\"version\":" + (version as String) + "},\"contentChanges\":[{\"text\":" + lspQuote(text) + "}]}")
+end
+
+def schedulingCompletion(uri: String, id: String): String
+  return schedulingFrame("{\"jsonrpc\":\"2.0\",\"id\":" + id + ",\"method\":\"textDocument/completion\",\"params\":{\"textDocument\":{\"uri\":" + lspQuote(uri) + "},\"position\":{\"line\":1,\"character\":7}}}")
+end
+
+def schedulingResponse(messages: LspJson, id: String): LspJson
+  var message = messages.first
+  var selected = new LspJson()
+  var count = 0
+
+  while message != null
+    let identity = lspRequestIdentity(message.get("id"))
+
+    if identity != null && identity == id
+      selected = message
+      count = count + 1
+    end
+    message = message.next
+  end
+
+  test::assertEqual(count, 1)
+  return selected
+end
+
+def schedulingHasLabel(response: LspJson, label: String, resultType: String = ""): Bool
+  var item = response.get("result").first
+
+  while item != null
+    if item.get("label").scalarText() == label
+      return resultType == "" || semanticEndsWith(item.get("detail").scalarText(), "): " + resultType)
+    end
+    item = item.next
+  end
+  return false
+end
+
+def main(): Void
+  let compiler = host::argumentAt(1)
+  let work = host::argumentAt(2)
+
+  test::assertTrue(compiler != null && work != null)
+  if compiler == null || work == null
+    return
+  end
+  let directory = work + "/lsp-scheduling"
+  let created = files::createDirectory(directory, true)
+  let original = "namespace dep\ndef original(): Int\n  return 1\nend\n"
+  let updated = "namespace dep\ndef updated(): String\n  return \"new\"\nend\n"
+  let source = "def main(): Void\n  dep::\nend\n"
+
+  test::assertTrue(created.failure == null)
+  test::assertTrue(host::writeText(directory + "/manifest.json", "{\"version\":2,\"defaultUnit\":\"app\",\"units\":{\"dependency\":{\"kind\":\"library\",\"sources\":[\"dependency.hk\"]},\"app\":{\"kind\":\"executable\",\"sources\":[\"main.hk\"],\"references\":[\"dependency\"]}}}"))
+  test::assertTrue(host::writeText(directory + "/dependency.hk", original))
+  test::assertTrue(host::writeText(directory + "/main.hk", source))
+  let uri = lspUri(directory + "/main.hk")
+  let dependency = lspUri(directory + "/dependency.hk")
+  var input = schedulingFrame("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"rootUri\":" + lspQuote(lspUri(directory)) + "}}")
+
+  input = input + schedulingOpen(uri, source) + schedulingOpen(dependency, original)
+  input = input + schedulingCompletion(uri, "7")
+  input = input + schedulingNotification("$/cancelRequest", "{\"id\":7}")
+  input = input + schedulingNotification("$/cancelRequest", "{\"id\":7}")
+  # A string id is distinct, and queued edits preserve this request's snapshot.
+  input = input + schedulingCompletion(uri, "\"7\"")
+  input = input + schedulingChange(uri, "def main(): Void\n  dep::or\nend\n", 2)
+  input = input + schedulingChange(uri, "def main(): Void\n  dep::o\nend\n", 3)
+  input = input + schedulingChange(uri, source, 4)
+  input = input + schedulingChange(dependency, updated, 2)
+  input = input + schedulingCompletion(uri, "8")
+  input = input + schedulingFrame("{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"shutdown\"}")
+  input = input + schedulingNotification("exit", "{}")
+  let options = new process::SpawnOptions(compiler)
+  let frames = input
+
+  options.arguments = ["lsp"]
+  options.workingDirectory = directory
+  options.input = tasks::generate(host::stringByteLength(frames), 1) do |index|
+    return host::stringByteAt(frames, index)
+  end
+  let execution = AgentProcessResult.run(options, 20000)
+
+  test::assertTrue(execution.exitedWith(0) && !execution.stdoutTruncated && execution.stderr == "")
+  let reader = new LspMessageReader(new LspInput())
+  let messages = new LspJson(LspJsonValue.Array())
+  var offset = 0
+
+  while offset < host::stringByteLength(execution.stdout)
+    let body = reader.feedByte(host::stringByteAt(execution.stdout, offset))
+
+    if body != null
+      let parser = new LspJsonParser(body)
+      let message = parser.parse()
+
+      parser.spaces()
+
+      test::assertTrue(!parser.failed && parser.position == host::stringByteLength(body))
+      messages.add(message)
+    end
+    offset = offset + 1
+  end
+
+  test::assertTrue(!reader.isClosed() && !reader.hasPendingFrame())
+  let cancelled = schedulingResponse(messages, "7")
+  let before = schedulingResponse(messages, "\"7\"")
+  let after = schedulingResponse(messages, "8")
+  let shutdown = schedulingResponse(messages, "9")
+
+  test::assertEqual(cancelled.get("error").get("code").scalarText(), "-32800")
+  test::assertTrue(schedulingHasLabel(before, "original", "Int") && !schedulingHasLabel(before, "updated"))
+  test::assertTrue(schedulingHasLabel(after, "updated", "String") && !schedulingHasLabel(after, "original"))
+  test::assertTrue(shutdown.get("result").isNull())
+end

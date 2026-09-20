@@ -1,0 +1,263 @@
+use clock
+use console
+use host
+use process
+use result
+use text
+
+def benchmarkNow(): Int
+  let now = clock::milliseconds()
+
+  if now == null
+    console::println("benchmark error: monotonic clock unavailable")
+    host::exit(1)
+    return 0
+  end
+  return now
+end
+
+def benchmarkFind(source: String, needle: String): Int
+  var position = 0
+
+  while position + text::byteLength(needle) <= text::byteLength(source)
+    if host::stringSlice(source, position, text::byteLength(needle)) == needle
+      return position
+    end
+    position = position + 1
+  end
+  return -1
+end
+
+def benchmarkPosition(source: String, byteOffset: Int): String
+  let cursor = new IrUtf16Cursor(host::stringSlice(source, 0, byteOffset))
+  var units = 0
+
+  while cursor.hasNext()
+    cursor.nextUnit()
+    units = units + 1
+  end
+  return lspPosition(source, units)
+end
+
+def benchmarkCommand(executable: String, arguments: String[]): String?
+  let options = new process::SpawnOptions(executable)
+
+  options.arguments = arguments
+  match process::run(options, 10000)
+    case result::Result.Ok(completed)
+      let status = completed.exit
+
+      if status != null && status.isExited() && status.value() == 0 && !completed.stdoutTruncated
+        return host::stringFromBytes(completed.stdout)
+      end
+    case result::Result.Error(failure)
+      return null
+  end
+  return null
+end
+
+def benchmarkArgument(index: Int): String
+  let argument = host::argumentAt(index)
+
+  if argument == null
+    console::println("usage: lsp-completion-benchmark <compiler> <workspace> <document> <samples> <warm-requests> [unrelated-document] [synthetic|data]")
+    host::exit(2)
+    return ""
+  end
+  return argument
+end
+
+def benchmarkCount(index: Int): Int
+  let count = host::parseInt(benchmarkArgument(index))
+
+  if count == null || count < 1 || count > 1000
+    console::println("benchmark error: sample counts must be 1..1000")
+    host::exit(2)
+    return 0
+  end
+  return count
+end
+
+def benchmarkOpen(server: BenchmarkStdioProcess, uri: String, source: String): Void
+  server.send("{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":" + lspQuote(uri) + ",\"languageId\":\"neri\",\"version\":1,\"text\":" + lspQuote(source) + "}}}")
+end
+
+def benchmarkChange(server: BenchmarkStdioProcess, uri: String, source: String, version: Int): Void
+  server.send("{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didChange\",\"params\":{\"textDocument\":{\"uri\":" + lspQuote(uri) + ",\"version\":" + (version as String) + "},\"contentChanges\":[{\"text\":" + lspQuote(source) + "}]}}")
+end
+
+def benchmarkQuery(server: BenchmarkStdioProcess, uri: String, position: String, id: Int, scenario: String, sample: Int, iteration: Int): Int
+  let request = "{\"jsonrpc\":\"2.0\",\"id\":" + (id as String) + ",\"method\":\"textDocument/completion\",\"params\":{\"textDocument\":{\"uri\":" + lspQuote(uri) + "},\"position\":" + position + "}}"
+  let notifications = server.notifications
+  let started = benchmarkNow()
+
+  server.send(request)
+  let response = server.response(id)
+  let elapsed = benchmarkNow() - started
+  var items = response.get("result")
+
+  if items.isObject()
+    items = items.get("items")
+  end
+  var item = items.first
+  var count = 0
+  var correct = false
+
+  while item != null
+    if item.get("label").scalarText() == "active" && benchmarkFind(item.get("detail").scalarText(), "Bool") >= 0
+      correct = true
+    end
+    count = count + 1
+    item = item.next
+  end
+  if !correct
+    server.fail("completion did not contain active with Bool semantic detail: " + scenario)
+  end
+  console::println("{\"kind\":\"sample\",\"scenario\":" + lspQuote(scenario) + ",\"sample\":" + (sample as String) + ",\"iteration\":" + (iteration as String) + ",\"milliseconds\":" + (elapsed as String) + ",\"items\":" + (count as String) + ",\"notificationsDuringRequest\":" + ((server.notifications - notifications) as String) + "}")
+  return elapsed
+end
+
+def benchmarkSummary(scenario: String, values: Int[]): Void
+  var index = 1
+
+  while index < values.Length
+    let value = values[index]
+    var position = index
+
+    while position > 0 && values[position - 1] > value
+      values[position] = values[position - 1]
+      position = position - 1
+    end
+    values[position] = value
+    index = index + 1
+  end
+  if values.Length == 0
+    return
+  end
+  let median = (values.Length + 1) / 2 - 1
+  let p95 = (values.Length * 95 + 99) / 100 - 1
+
+  console::println("{\"kind\":\"summary\",\"scenario\":" + lspQuote(scenario) + ",\"count\":" + (values.Length as String) + ",\"minMs\":" + (values[0] as String) + ",\"medianMs\":" + (values[median] as String) + ",\"p95Ms\":" + (values[p95] as String) + ",\"maxMs\":" + (values[values.Length - 1] as String) + "}")
+end
+
+def main(): Void
+  let compiler = benchmarkArgument(0)
+  let workspace = benchmarkArgument(1)
+  let path = benchmarkArgument(2)
+  let samples = benchmarkCount(3)
+  let warmRequests = benchmarkCount(4)
+  let unrelatedPath = host::argumentAt(5)
+  let profile = host::argumentAt(6)
+  let original = host::readText(path)
+  let operatingSystem = benchmarkCommand("/usr/bin/uname", ["-s"])
+
+  if operatingSystem == null || operatingSystem != "Darwin\n"
+    console::println("benchmark error: the native transport currently supports Darwin64 only")
+    host::exit(2)
+    return
+  end
+
+  if original == null
+    console::println("benchmark error: document cannot be read")
+    host::exit(2)
+    return
+  end
+  let suffix = "\nclass BenchmarkData\n  public active: Bool = true\nend\ndef benchmarkAccept(active: Bool, count: Int): Void\nend\ndef benchmarkProbe(): Void\n  let data = new BenchmarkData()\n  let observed = data.active\n  benchmarkAccept()\nend\n"
+  var source = original + suffix
+  let fieldOffset = text::byteLength(original) + benchmarkFind(suffix, "data.active") + 5
+  let namedOffset = text::byteLength(original) + benchmarkFind(suffix, "benchmarkAccept()") + text::byteLength("benchmarkAccept(")
+  var positions = [benchmarkPosition(source, fieldOffset), benchmarkPosition(source, namedOffset)]
+  var scenarios = ["fields", "named-arguments"]
+  let uri = lspUri(path)
+  var unrelatedSource = ""
+  var unrelatedUri = ""
+
+  if profile != null && profile == "data"
+    let needle = "where(active: true)"
+    let callOffset = benchmarkFind(original, needle)
+
+    if callOffset < 0
+      console::println("benchmark error: Data profile requires where(active: true) in the original probe")
+      host::exit(2)
+      return
+    end
+    source = host::stringSlice(original, 0, callOffset) + "where()" + host::stringSlice(original, callOffset + text::byteLength(needle), text::byteLength(original) - callOffset - text::byteLength(needle))
+    positions = [benchmarkPosition(source, callOffset + 6)]
+    scenarios = ["data-where"]
+  else if profile != null && profile != "synthetic"
+    console::println("benchmark error: unknown profile")
+    host::exit(2)
+    return
+  end
+  if unrelatedPath != null && unrelatedPath != ""
+    let loaded = host::readText(unrelatedPath)
+
+    if loaded == null
+      console::println("benchmark error: unrelated document cannot be read")
+      host::exit(2)
+      return
+    end
+    unrelatedSource = loaded
+    unrelatedUri = lspUri(unrelatedPath)
+  end
+  console::println("{\"kind\":\"configuration\",\"compiler\":" + lspQuote(compiler) + ",\"workspace\":" + lspQuote(workspace) + ",\"document\":" + lspQuote(path) + ",\"sourceBytes\":" + (text::byteLength(source) as String) + ",\"samples\":" + (samples as String) + ",\"warmRequests\":" + (warmRequests as String) + ",\"inflightDelayMs\":200,\"clockResolutionMs\":1}")
+  var scenarioIndex = 0
+
+  for scenario in scenarios
+    var cold: Int[] = []
+    var warm: Int[] = []
+    var queued: Int[] = []
+    var delayed: Int[] = []
+    var sample = 0
+
+    while sample < samples
+      let start = benchmarkNow()
+      let server = new BenchmarkStdioProcess(compiler)
+
+      server.send("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"rootUri\":" + lspQuote(lspUri(workspace)) + ",\"capabilities\":{}}}")
+      server.response(1)
+      console::println("{\"kind\":\"initialize\",\"scenario\":" + lspQuote(scenario) + ",\"sample\":" + (sample as String) + ",\"milliseconds\":" + ((benchmarkNow() - start) as String) + ",\"pid\":" + ((server.pid as Int) as String) + "}")
+      server.send("{\"jsonrpc\":\"2.0\",\"method\":\"initialized\",\"params\":{}}")
+      benchmarkOpen(server, uri, source)
+      cold = host::appendInt(cold, benchmarkQuery(server, uri, positions[scenarioIndex], 2, scenario + "/cold", sample, 0))
+      # Completion performs current document analysis. Warm requests reuse this
+      # server and text; no arbitrary sleep is included in the latency interval.
+      var iteration = 0
+
+      while iteration < warmRequests
+        warm = host::appendInt(warm, benchmarkQuery(server, uri, positions[scenarioIndex], iteration + 3, scenario + "/warm", sample, iteration))
+        iteration = iteration + 1
+      end
+      if unrelatedUri != ""
+        benchmarkOpen(server, unrelatedUri, unrelatedSource)
+        server.diagnostics(unrelatedUri, 1)
+        benchmarkChange(server, unrelatedUri, unrelatedSource + "\n# queued benchmark edit\n", 2)
+        queued = host::appendInt(queued, benchmarkQuery(server, uri, positions[scenarioIndex], warmRequests + 3, scenario + "/unrelated-queued", sample, 0))
+        server.diagnostics(unrelatedUri, 2)
+        benchmarkChange(server, unrelatedUri, unrelatedSource + "\n# delayed benchmark edit\n", 3)
+        unsafe
+          benchmarkPoll(null, 0 as UInt32, 200 as Int32)
+        end
+        delayed = host::appendInt(delayed, benchmarkQuery(server, uri, positions[scenarioIndex], warmRequests + 4, scenario + "/unrelated-delay-200ms", sample, 0))
+      end
+      # This is current server RSS after queries, not the client's peak RSS.
+      let resident = benchmarkCommand("/bin/ps", ["-o", "rss=", "-p", (server.pid as Int) as String])
+
+      if resident == null
+        server.fail("server RSS unavailable")
+        return
+      end
+      console::println("{\"kind\":\"rss-observation\",\"scenario\":" + lspQuote(scenario) + ",\"sample\":" + (sample as String) + ",\"serverRssKiBText\":" + lspQuote(resident) + "}")
+      server.send("{\"jsonrpc\":\"2.0\",\"id\":999999,\"method\":\"shutdown\",\"params\":null}")
+      server.response(999999)
+      server.send("{\"jsonrpc\":\"2.0\",\"method\":\"exit\",\"params\":null}")
+      server.close()
+      sample = sample + 1
+    end
+    benchmarkSummary(scenario + "/cold", cold)
+    benchmarkSummary(scenario + "/warm", warm)
+    benchmarkSummary(scenario + "/unrelated-queued", queued)
+    benchmarkSummary(scenario + "/unrelated-delay-200ms", delayed)
+    scenarioIndex = scenarioIndex + 1
+  end
+end

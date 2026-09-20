@@ -1,0 +1,257 @@
+use buffers
+use clock
+use console
+use host
+use text
+
+class BenchmarkStdioProcess
+  public pid: Int32 = -1 as Int32
+  private input: Int32 = -1 as Int32
+  private output: Int32 = -1 as Int32
+  public notifications: Int = 0
+  private diagnosticUris: String[] = []
+  private diagnosticVersions: Int[] = []
+  private diagnosticFailures: String[] = []
+
+  def init(executable: String): Void
+    let program = host::appendByte(text::bytes(executable), 0 as Byte)
+    let command = host::appendByte(text::bytes("lsp"), 0 as Byte)
+
+    unsafe
+      let incoming = stackalloc Int32[2]
+      let outgoing = stackalloc Int32[2]
+      let arguments = stackalloc (Byte*?)[3]
+
+      if benchmarkPipe(incoming) != 0 as Int32
+        this.fail("create input pipe")
+      end
+      if benchmarkPipe(outgoing) != 0 as Int32
+        benchmarkClose(incoming[0])
+        benchmarkClose(incoming[1])
+        this.fail("create output pipe")
+      end
+      borrow program as programPointer
+        borrow command as commandPointer
+          arguments[0] = programPointer
+          arguments[1] = commandPointer
+          arguments[2] = null
+          let child = benchmarkFork()
+
+          if child == 0 as Int32
+            # All argv storage exists before fork. Only async-signal-safe native
+            # calls are permitted in this branch, including the failure path.
+            if benchmarkDup(incoming[0], 0 as Int32) < 0 as Int32 || benchmarkDup(outgoing[1], 1 as Int32) < 0 as Int32
+              benchmarkExit(126 as Int32)
+            end
+            benchmarkClose(incoming[0])
+            benchmarkClose(incoming[1])
+            benchmarkClose(outgoing[0])
+            benchmarkClose(outgoing[1])
+            benchmarkExec(programPointer, arguments)
+            benchmarkExit(127 as Int32)
+          end
+          this.pid = child
+        end
+      end
+      benchmarkClose(incoming[0])
+      benchmarkClose(outgoing[1])
+      this.input = incoming[1]
+      this.output = outgoing[0]
+      if this.pid < 0 as Int32
+        this.fail("fork")
+      end
+    end
+  end
+
+  def fail(message: String): Void
+    this.close()
+    console::println("benchmark error: " + message)
+    host::exit(1)
+  end
+
+  def close(): Void
+    unsafe
+      if this.input >= 0 as Int32
+        benchmarkClose(this.input)
+        this.input = -1 as Int32
+      end
+      if this.output >= 0 as Int32
+        benchmarkClose(this.output)
+        this.output = -1 as Int32
+      end
+      if this.pid > 0 as Int32
+        let status = stackalloc Int32[1]
+
+        benchmarkKill(this.pid, 9 as Int32)
+        benchmarkWait(this.pid, status, 0 as Int32)
+        this.pid = -1 as Int32
+      end
+    end
+  end
+
+  private def ready(fd: Int32, writing: Bool, deadline: Int): Void
+    let remaining = deadline - benchmarkNow()
+
+    if remaining <= 0
+      this.fail("stdio deadline exceeded")
+    end
+    unsafe
+      let descriptors = stackalloc BenchmarkPollDescriptor[1]
+
+      descriptors[0].fd = fd
+      descriptors[0].events[0] = writing ? 4 as Byte : 1 as Byte
+      descriptors[0].events[1] = 0 as Byte
+      descriptors[0].returned[0] = 0 as Byte
+      descriptors[0].returned[1] = 0 as Byte
+      if benchmarkPoll(descriptors, 1 as UInt32, remaining as Int32) <= 0 as Int32
+        this.fail("poll failed or timed out")
+      end
+    end
+  end
+
+  def send(body: String): Void
+    let bytes = text::bytes("Content-Length: " + (text::byteLength(body) as String) + "\r\n\r\n" + body)
+    let deadline = benchmarkNow() + 120000
+    var sent = 0
+
+    unsafe
+      borrow bytes as pointer
+        while sent < bytes.Length
+          this.ready(this.input, true, deadline)
+          let count = benchmarkWrite(this.input, pointer + sent, (bytes.Length - sent) as UInt64)
+
+          if count <= 0
+            this.fail("write failed")
+          end
+          sent = sent + count
+        end
+      end
+    end
+  end
+
+  private def readExact(length: Int, deadline: Int): String
+    let bytes = buffers::zeroBytes(length)
+    var received = 0
+
+    unsafe
+      borrow bytes as pointer
+        while received < length
+          this.ready(this.output, false, deadline)
+          let count = benchmarkRead(this.output, pointer + received, (length - received) as UInt64)
+
+          if count <= 0
+            this.fail("unexpected server EOF/read failure")
+          end
+          received = received + count
+        end
+      end
+    end
+    let decoded = host::stringFromBytes(bytes)
+
+    if decoded == null
+      this.fail("invalid response UTF-8")
+      return ""
+    end
+    return decoded
+  end
+
+  def receive(deadline: Int): LspJson
+    var header = ""
+
+    while benchmarkFind(header, "\r\n\r\n") < 0
+      if text::byteLength(header) >= 8192
+        this.fail("response header limit exceeded")
+      end
+      header = header + this.readExact(1, deadline)
+    end
+    if benchmarkFind(header, "Content-Length: ") != 0
+      this.fail("invalid response header")
+    end
+    let length = host::parseInt(host::stringSlice(header, 16, text::byteLength(header) - 20))
+
+    if length == null || length < 0 || length > 16777216
+      this.fail("invalid content length")
+      return new LspJson()
+    end
+    let body = this.readExact(length, deadline)
+    let parser = new LspJsonParser(body)
+    let value = parser.parse()
+
+    parser.spaces()
+    if parser.failed || parser.position != text::byteLength(body)
+      this.fail("invalid JSON response")
+    end
+    if value.get("method").scalarText() == "textDocument/publishDiagnostics"
+      let params = value.get("params")
+      let uri = params.get("uri").scalarText()
+      let version = host::parseInt(params.get("version").scalarText())
+
+      if version != null
+        var diagnostic = params.get("diagnostics").first
+        var failure = ""
+
+        while diagnostic != null
+          if diagnostic.get("severity").scalarText() == "1"
+            failure = diagnostic.get("code").scalarText() + ": " + diagnostic.get("message").scalarText()
+            break
+          end
+          diagnostic = diagnostic.next
+        end
+        this.diagnosticUris = host::appendString(this.diagnosticUris, uri)
+        this.diagnosticVersions = host::appendInt(this.diagnosticVersions, version)
+        this.diagnosticFailures = host::appendString(this.diagnosticFailures, failure)
+      end
+    end
+    return value
+  end
+
+  def response(id: Int): LspJson
+    let deadline = benchmarkNow() + 120000
+
+    while true
+      let message = this.receive(deadline)
+
+      if message.get("id").scalarText() == (id as String)
+        if !message.get("error").isMissing()
+          this.fail("server error: " + message.get("error").get("message").scalarText())
+        end
+        return message
+      end
+      if !message.get("id").isMissing()
+        this.fail("unexpected response id")
+      end
+      this.notifications = this.notifications + 1
+    end
+    return new LspJson()
+  end
+
+  def diagnostics(uri: String, version: Int): Void
+    let deadline = benchmarkNow() + 120000
+    var index = 0
+
+    while index < this.diagnosticUris.Length
+      if this.diagnosticUris[index] == uri && this.diagnosticVersions[index] == version
+        if this.diagnosticFailures[index] != ""
+          this.fail("unrelated document analysis failed: " + this.diagnosticFailures[index])
+        end
+        return
+      end
+      index = index + 1
+    end
+
+    while true
+      let message = this.receive(deadline)
+      let params = message.get("params")
+
+      this.notifications = this.notifications + 1
+      if message.get("method").scalarText() == "textDocument/publishDiagnostics" && params.get("uri").scalarText() == uri && params.get("version").scalarText() == (version as String)
+        let failure = this.diagnosticFailures[this.diagnosticFailures.Length - 1]
+
+        if failure != ""
+          this.fail("unrelated document analysis failed: " + failure)
+        end
+        return
+      end
+    end
+  end
+end
