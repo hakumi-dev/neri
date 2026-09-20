@@ -15,7 +15,8 @@ class BootstrapBodyBinder
   public flowNames: StringBuffer = new StringBuffer()
   public flowTypes: StringBuffer = new StringBuffer()
   public flowDepths: IntBuffer = new IntBuffer()
-  public flowActive: IntBuffer = new IntBuffer()
+  public flowActive: BoolBuffer = new BoolBuffer()
+  public resourceMoves: readonly ResourceMoveStates = new ResourceMoveStates()
   public flowDepth: Int = 0
   public returnTransferDepth: Int = 0
 
@@ -65,7 +66,7 @@ class BootstrapBodyBinder
     this.flowNames = new StringBuffer()
     this.flowTypes = new StringBuffer()
     this.flowDepths = new IntBuffer()
-    this.flowActive = new IntBuffer()
+    this.flowActive = new BoolBuffer()
     this.flowDepth = 0
     this.returnTransferDepth = 0
   end
@@ -79,7 +80,7 @@ class BootstrapBodyBinder
 
     while local != null
       if local.depth == this.scopeDepth
-        if this.directResourceType(local.typeName) && (!local.resourceMoved || local.resourceMaybeMoved) && !local.resourceScoped
+        if this.directResourceType(local.typeName) && !local.resourceMove.isMoved() && !local.resourceScoped
           this.report("NR262", local.syntaxNode, "Owned resource must be acquired with 'using' or transferred before its scope ends.")
         end
         local.active = false
@@ -129,7 +130,7 @@ class BootstrapBodyBinder
   def declareLocal(name: String, typeName: String, mutable: Bool, syntaxNode: Int): SemanticLocal
     let position = this.syntax().startAt(syntaxNode)
     let identity = this.currentCallable().fullName + "/local@" + this.owner.sourceIdAt(position) + ":" + ((position - this.owner.sourceStartAt(position)) as String)
-    let local = new SemanticLocal(identity, name, typeName, mutable, this.scopeDepth, syntaxNode)
+    let local = new SemanticLocal(identity, name, typeName, mutable, this.scopeDepth, syntaxNode, this.resourceMoves.available)
 
     this.owner.recordDeclaration(identity, name, typeName, syntaxNode)
     if this.firstLocal == null
@@ -426,7 +427,7 @@ class BootstrapBodyBinder
     var index = this.flowNames.size - 1
 
     while index >= 0
-      if this.flowActive.get(index) == 1 && this.flowDepths.get(index) <= this.flowDepth && this.flowNames.get(index) == name
+      if this.flowActive.get(index) && this.flowDepths.get(index) <= this.flowDepth && this.flowNames.get(index) == name
         return this.flowTypes.get(index)
       end
       index = index - 1
@@ -443,7 +444,7 @@ class BootstrapBodyBinder
 
     while index < this.flowNames.size
       if this.flowDepths.get(index) == this.flowDepth
-        this.flowActive.set(index, 0)
+        this.flowActive.set(index, false)
       end
       index = index + 1
     end
@@ -454,15 +455,15 @@ class BootstrapBodyBinder
     this.flowNames.add(name)
     this.flowTypes.add(typeName)
     this.flowDepths.add(this.flowDepth)
-    this.flowActive.add(1)
+    this.flowActive.add(true)
   end
 
   def invalidateNarrowing(name: String): Void
     var index = 0
 
     while index < this.flowNames.size
-      if this.flowActive.get(index) == 1 && this.flowNames.get(index) == name
-        this.flowActive.set(index, 0)
+      if this.flowActive.get(index) && this.flowNames.get(index) == name
+        this.flowActive.set(index, false)
       end
       index = index + 1
     end
@@ -634,7 +635,7 @@ class BootstrapBodyBinder
 
       while local != null
         if local.depth == 0
-          callable.addSessionLocal(new SemanticLocal(local.identity, local.name, local.typeName, local.mutable, 0, local.syntaxNode))
+          callable.addSessionLocal(new SemanticLocal(local.identity, local.name, local.typeName, local.mutable, 0, local.syntaxNode, this.resourceMoves.available))
         end
         local = local.nextLocal
       end
@@ -646,7 +647,7 @@ class BootstrapBodyBinder
     var local = this.firstLocal
 
     while local != null
-      if local.active && this.directResourceType(local.typeName) && (!local.resourceMoved || local.resourceMaybeMoved) && !local.resourceScoped
+      if local.active && this.directResourceType(local.typeName) && !local.resourceMove.isMoved() && !local.resourceScoped
         this.report("NR262", node, "Owned resource must be acquired with 'using' or transferred before returning.")
       end
       local = local.nextLocal
@@ -659,38 +660,31 @@ class BootstrapBodyBinder
     return symbol != null && symbol.isResource
   end
 
-  def resourceMoveSnapshot(): Int[]
-    var values: Int[] = []
-    var local = this.firstLocal
-
-    while local != null
-      values = host.appendInt(values, local.resourceMoved ? 2 : (local.resourceMaybeMoved ? 1 : 0))
-      local = local.nextLocal
-    end
-    return values
+  def resourceMoveSnapshot(): readonly ResourceMoveSnapshot?
+    return ResourceMoveSnapshot.capture(this.firstLocal)
   end
 
-  def restoreResourceMoves(values: Int[]): Void
+  def restoreResourceMoves(values: readonly ResourceMoveSnapshot?): Void
     var local = this.firstLocal
-    var index = 0
+    var current = values
 
-    while local != null && index < values.Length
-      local.resourceMoved = values[index] == 2
-      local.resourceMaybeMoved = values[index] == 1
+    while local != null && current != null
+      local.resourceMove = current.state
       local = local.nextLocal
-      index = index + 1
+      current = current.next
     end
   end
 
-  def joinResourceMoves(left: Int[], right: Int[]): Void
+  def joinResourceMoves(left: readonly ResourceMoveSnapshot?, right: readonly ResourceMoveSnapshot?): Void
     var local = this.firstLocal
-    var index = 0
+    var leftState = left
+    var rightState = right
 
-    while local != null && index < left.Length && index < right.Length
-      local.resourceMoved = left[index] == 2 && right[index] == 2
-      local.resourceMaybeMoved = !local.resourceMoved && (left[index] != 0 || right[index] != 0)
+    while local != null && leftState != null && rightState != null
+      local.resourceMove = this.resourceMoves.join(leftState.state, rightState.state)
       local = local.nextLocal
-      index = index + 1
+      leftState = leftState.next
+      rightState = rightState.next
     end
   end
 
@@ -1107,8 +1101,7 @@ class BootstrapBodyBinder
         if this.loopResourceDepth >= 0 && source.depth <= this.loopResourceDepth
           this.report("NR262", acquisitionNode, "A resource declared outside a loop cannot be consumed inside the loop; acquire it within each iteration.")
         end
-        source.resourceMoved = true
-        source.resourceMaybeMoved = false
+        source.resourceMove = this.resourceMoves.moved
       end
     end
     if isResult && this.resourceOutcomeArgument(returnType, 1) != resultErrorType
@@ -1736,7 +1729,7 @@ class BootstrapBodyBinder
     end
     let local = this.findLocal(name)
 
-    if local != null && (local.resourceMoved || local.resourceMaybeMoved)
+    if local != null && !local.resourceMove.isAvailable()
       this.report("NR262", node, "Resource ownership was already transferred or released.")
     end
     let identity = this.findVariableIdentity(name)
@@ -1759,7 +1752,7 @@ class BootstrapBodyBinder
       this.report("NR262", node, "Transfer requires an owned local resource.")
       return new BoundValue("Error", this.addBound(this.boundKinds().getTransfer(), "Error", name, node, emptyInts()))
     end
-    if local.resourceMoved || local.resourceMaybeMoved
+    if !local.resourceMove.isAvailable()
       this.report("NR262", node, "Resource ownership was already transferred or released.")
     end
     if this.loopResourceDepth >= 0 && local.depth <= this.loopResourceDepth
@@ -1768,8 +1761,7 @@ class BootstrapBodyBinder
     if expectedType != local.typeName
       this.report("NR262", node, "Transfer requires a matching owned-resource return type.")
     end
-    local.resourceMoved = true
-    local.resourceMaybeMoved = false
+    local.resourceMove = this.resourceMoves.moved
     return new BoundValue(local.typeName, this.addBoundSymbol(this.boundKinds().getTransfer(), local.typeName, name, local.identity, node, emptyInts()), local.identity)
   end
 
