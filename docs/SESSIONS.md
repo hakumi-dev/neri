@@ -271,10 +271,10 @@ The preparation and execution calls are separate:
 ```neri
 let prepared = session.prepare("app.increment()\n")
 
-if prepared.status == "complete"
+if prepared.status.isComplete()
   let execution = session.execute(prepared)
 
-  if execution.succeeded && execution.resultType != "Void"
+  if execution.succeeded() && execution.resultType != "Void"
     console.println(execution.resultText)
   end
 end

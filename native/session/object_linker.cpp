@@ -27,12 +27,13 @@ struct neri_session_linker_v1 final {
   }
 };
 
+enum class generation_phase { live, resources_removed };
+
 struct neri_session_generation_v1 final {
   neri_session_linker_v1 *owner{};
   llvm::orc::JITDylib *dylib{};
   llvm::orc::ResourceTrackerSP resources;
-  bool resources_removed{};
-  bool removed{};
+  generation_phase phase = generation_phase::live;
 };
 
 namespace {
@@ -103,7 +104,7 @@ extern "C" neri_session_generation_v1 *neri_session_linker_add_object_v1(
   for (size_t index = 0; index < dependency_count; ++index) {
     auto *dependency = dependencies[index];
     if (dependency == nullptr || dependency->owner != linker ||
-        dependency->removed) {
+        dependency->phase != generation_phase::live) {
       copy_error(error, error_size, "invalid object linker dependency");
       return nullptr;
     }
@@ -141,11 +142,15 @@ extern "C" void *
 neri_session_linker_symbol_v1(neri_session_generation_v1 *generation,
                               const char *name, char *error,
                               size_t error_size) {
-  if (generation == nullptr || generation->removed || name == nullptr) {
+  if (generation == nullptr || name == nullptr) {
     copy_error(error, error_size, "invalid object linker symbol lookup");
     return nullptr;
   }
   std::lock_guard lock(generation->owner->mutex);
+  if (generation->phase != generation_phase::live) {
+    copy_error(error, error_size, "invalid object linker symbol lookup");
+    return nullptr;
+  }
   std::string mangled;
   if (generation->owner->global_prefix != '\0')
     mangled.push_back(generation->owner->global_prefix);
@@ -164,17 +169,16 @@ neri_session_linker_remove_v1(neri_session_generation_v1 *generation,
   if (generation == nullptr)
     return 0;
   std::lock_guard lock(generation->owner->mutex);
-  if (!generation->removed) {
-    if (!generation->resources_removed) {
-      if (auto removed = generation->resources->remove())
-        return fail(error, error_size, std::move(removed), 0);
-      generation->resources_removed = true;
-    }
-    if (auto removed =
-            generation->owner->session->removeJITDylib(*generation->dylib))
+  if (generation->phase == generation_phase::live) {
+    if (auto removed = generation->resources->remove())
       return fail(error, error_size, std::move(removed), 0);
-    generation->removed = true;
+    generation->phase = generation_phase::resources_removed;
   }
+  // Failed dylib removal can be retried, but its removed resources can no
+  // longer satisfy lookups or dependencies. Success consumes the handle.
+  if (auto removed =
+          generation->owner->session->removeJITDylib(*generation->dylib))
+    return fail(error, error_size, std::move(removed), 0);
   delete generation;
   return 1;
 }

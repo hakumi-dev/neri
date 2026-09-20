@@ -27,22 +27,21 @@ class AgentTestService
       candidate = candidate.next
     end
     if graph.error != ""
-      return agentTestResponse(operationId, projectKey, before, "unavailable", "unavailable", graph.error, false, false, unitsTotal, testsTotal, "", false)
+      return agentTestResponse(operationId, projectKey, before, AgentTestOutcome.unavailable(), graph.error, unitsTotal, testsTotal, "", false)
     end
     if testsTotal == 0
-      return agentTestResponse(operationId, projectKey, before, "noTests", "unavailable", "No project test units are registered.", false, true, unitsTotal, 0, "", false)
+      return agentTestResponse(operationId, projectKey, before, AgentTestOutcome.noTests(), "No project test units are registered.", unitsTotal, 0, "", false)
     end
     let compiler = graph.compilerPath
     let compilerDigest = graph.compilerDigest
     let directory = bootstrapRunDirectory()
 
     if directory == null
-      return agentTestResponse(operationId, projectKey, before, "unavailable", "unavailable", "Cannot create the test work directory.", false, false, unitsTotal, testsTotal, "", false)
+      return agentTestResponse(operationId, projectKey, before, AgentTestOutcome.unavailable(), "Cannot create the test work directory.", unitsTotal, testsTotal, "", false)
     end
     var results = ""
     var separator = ""
-    var status = "valid"
-    var complete = true
+    var status: readonly AnalysisStatus = AnalysisStatus.valid()
     var executed = false
     var cleanupFailed = false
     var capturedBytes = 0
@@ -52,21 +51,18 @@ class AgentTestService
       if neriProjectListed(graph.projects, unit.manifest) && unit.project.testDeclared
         let work = bootstrapTemporaryDirectory(directory, "test")
         let buildSnapshot = agentTestBuildSnapshot(before, compiler, compilerDigest, unit)
-        var testStatus = "unavailable"
-        var phase = "build"
+        var testStatus: readonly AnalysisStatus = AnalysisStatus.unavailable()
+        var phase: readonly AgentTestPhase = AgentTestPhase.build()
         var message = ""
         var artifactDigest = ""
-        var exitKind = ""
-        var exitCode = 0
+        var exit: readonly process.ExitStatus? = null
         var stdout = ""
         var stderr = ""
         var stdoutTruncated = false
         var stderrTruncated = false
-        var testExecuted = false
 
         if work == null
           message = "Cannot create the unit test work directory."
-          complete = false
         else
           let artifact = agentTestExecutable(work + "/program")
           let buildOptions = new process.SpawnOptions(compiler)
@@ -75,18 +71,16 @@ class AgentTestService
           buildOptions.workingDirectory = bootstrapDirectory(unit.manifest)
           buildOptions.stdoutLimit = 65536
           buildOptions.stderrLimit = 65536
-          let build = new AgentProcessResult()
+          let build = AgentProcessResult.run(buildOptions, 120000)
 
-          build.run(buildOptions, 120000)
-          executed = executed || build.started
-          if build.status == "unavailable"
+          executed = executed || build.outcome.started()
+          if build.outcome.isUnavailable()
             message = build.message
-            complete = false
-          else if build.status == "timeout"
-            testStatus = "invalid"
+          else if build.outcome.isTimeout()
+            testStatus = AnalysisStatus.invalid()
             message = "Building the test unit exceeded 120000 milliseconds."
-          else if build.exitKind != "exit" || build.exitCode != 0
-            testStatus = "invalid"
+          else if !build.exitedWith(0)
+            testStatus = AnalysisStatus.invalid()
             message = "Building the test unit failed."
           else
             let digest = agentArtifactDigest(artifact)
@@ -96,44 +90,38 @@ class AgentTestService
             end
             if artifactDigest == ""
               message = "The build completed without a readable executable artifact."
-              complete = false
             else
-              phase = "run"
               let runOptions = new process.SpawnOptions(artifact)
 
               runOptions.arguments = agentTestArguments(bootstrapDirectory(unit.manifest), compiler, work, unit.project.testArguments)
               runOptions.workingDirectory = bootstrapDirectory(unit.manifest)
               runOptions.stdoutLimit = 65536
               runOptions.stderrLimit = 65536
-              let run = new AgentProcessResult()
+              let run = AgentProcessResult.run(runOptions, unit.project.testTimeoutMs)
 
-              run.run(runOptions, unit.project.testTimeoutMs)
-              testExecuted = run.started
-              executed = executed || run.started
-              if run.status == "unavailable"
+              phase = AgentTestPhase.run(run.outcome.started())
+              executed = executed || run.outcome.started()
+              if run.outcome.isUnavailable()
                 message = run.message
-                complete = false
-              else if run.status == "timeout"
-                testStatus = "invalid"
+              else if run.outcome.isTimeout()
+                testStatus = AnalysisStatus.invalid()
                 message = "Test exceeded " + (unit.project.testTimeoutMs as String) + " milliseconds."
-              else if run.exitKind != "exit" || run.exitCode != 0
-                testStatus = "invalid"
+              else if !run.exitedWith(0)
+                testStatus = AnalysisStatus.invalid()
                 message = "Test exited unsuccessfully."
               else
-                testStatus = "valid"
+                testStatus = AnalysisStatus.valid()
                 message = "Test completed successfully."
               end
-              exitKind = run.exitKind
-              exitCode = run.exitCode
+              exit = run.exit()
               stdout = run.stdout
               stderr = run.stderr
               stdoutTruncated = run.stdoutTruncated
               stderrTruncated = run.stderrTruncated
             end
           end
-          if phase == "build"
-            exitKind = build.exitKind
-            exitCode = build.exitCode
+          if phase.isBuild()
+            exit = build.exit()
             stdout = build.stdout
             stderr = build.stderr
             stdoutTruncated = build.stdoutTruncated
@@ -142,16 +130,15 @@ class AgentTestService
           let cleaned = files.removeTree(work)
 
           if cleaned.failure != null
-            testStatus = "unavailable"
+            testStatus = AnalysisStatus.unavailable()
             message = "Cannot remove the unit test work directory."
-            complete = false
             cleanupFailed = true
           end
         end
-        if testStatus == "unavailable"
-          status = "unavailable"
-        else if testStatus == "invalid" && status == "valid"
-          status = "invalid"
+        if testStatus.isUnavailable()
+          status = AnalysisStatus.unavailable()
+        else if testStatus.isInvalid() && status.isValid()
+          status = AnalysisStatus.invalid()
         end
         let outputBytes = host.stringByteLength(stdout) + host.stringByteLength(stderr)
 
@@ -163,7 +150,7 @@ class AgentTestService
         else
           capturedBytes = capturedBytes + outputBytes
         end
-        results = results + separator + "{\"projectKey\":" + lspQuote(unit.key) + ",\"name\":" + lspQuote(unit.name) + ",\"status\":" + lspQuote(testStatus) + ",\"phase\":" + lspQuote(phase) + ",\"message\":" + lspQuote(message) + ",\"buildSnapshot\":" + lspQuote(buildSnapshot) + ",\"artifactDigest\":" + lspQuote(artifactDigest) + ",\"exitKind\":" + lspQuote(exitKind) + ",\"exitCode\":" + (exitCode as String) + ",\"stdout\":" + lspQuote(stdout) + ",\"stderr\":" + lspQuote(stderr) + ",\"stdoutTruncated\":" + (stdoutTruncated ? "true" : "false") + ",\"stderrTruncated\":" + (stderrTruncated ? "true" : "false") + ",\"executed\":" + (testExecuted ? "true" : "false") + "}"
+        results = results + separator + "{\"projectKey\":" + lspQuote(unit.key) + ",\"name\":" + lspQuote(unit.name) + ",\"status\":" + lspQuote(testStatus.wireName()) + ",\"phase\":" + lspQuote(phase.wireName()) + ",\"message\":" + lspQuote(message) + ",\"buildSnapshot\":" + lspQuote(buildSnapshot) + ",\"artifactDigest\":" + lspQuote(artifactDigest) + ",\"exitKind\":" + lspQuote(agentProcessExitName(exit)) + ",\"exitCode\":" + (agentProcessExitCode(exit) as String) + ",\"stdout\":" + lspQuote(stdout) + ",\"stderr\":" + lspQuote(stderr) + ",\"stdoutTruncated\":" + (stdoutTruncated ? "true" : "false") + ",\"stderrTruncated\":" + (stderrTruncated ? "true" : "false") + ",\"executed\":" + (phase.executed() ? "true" : "false") + "}"
         separator = ","
       end
       unit = unit.next
@@ -171,25 +158,26 @@ class AgentTestService
     let cleaned = files.removeTree(directory)
 
     if cleaned.failure != null
-      status = "unavailable"
-      complete = false
+      status = AnalysisStatus.unavailable()
       cleanupFailed = true
     end
     graph.refresh()
     if graph.snapshot != before
-      return agentTestResponse(operationId, projectKey, before, "conflict", "conflict", "Project inputs changed while tests ran; retry against the current graph.", false, false, unitsTotal, testsTotal, results, executed)
+      return agentTestResponse(operationId, projectKey, before, AgentTestOutcome.conflict(), "Project inputs changed while tests ran; retry against the current graph.", unitsTotal, testsTotal, results, executed)
     end
-    let state = complete ? "complete" : "unavailable"
+    var outcome: readonly AgentTestOutcome = AgentTestOutcome.passed()
     var message = "All registered project tests completed successfully."
 
-    if status == "invalid"
+    if status.isInvalid()
+      outcome = AgentTestOutcome.failed()
       message = "One or more registered project tests failed."
-    else if status == "unavailable"
+    else if status.isUnavailable()
+      outcome = AgentTestOutcome.unavailable()
       message = "The registered project test run was incomplete."
     end
     if cleanupFailed
       message = "The registered project test run could not remove its temporary work directory."
     end
-    return agentTestResponse(operationId, projectKey, before, state, status, message, complete, false, unitsTotal, testsTotal, results, executed)
+    return agentTestResponse(operationId, projectKey, before, outcome, message, unitsTotal, testsTotal, results, executed)
   end
 end
