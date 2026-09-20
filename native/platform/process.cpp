@@ -34,6 +34,13 @@ extern char **environ;
 namespace {
 constexpr uint64_t maximum_capture = 134217728;
 
+enum class process_exit_kind : int64_t {
+  pending = 0,
+  exited = 1,
+  signaled = 2,
+  cancelled = 3,
+};
+
 struct parser {
   const uint8_t *data;
   size_t size;
@@ -121,7 +128,7 @@ struct child {
   std::atomic<bool> stop_readers{false};
   std::atomic<bool> stop_writer{false};
   std::atomic<bool> writer_done{false};
-  int64_t exit_kind = 0;
+  process_exit_kind exit_kind = process_exit_kind::pending;
   int64_t exit_value = 0;
   std::thread output_reader;
   std::thread error_reader;
@@ -478,7 +485,7 @@ bool refresh(const std::shared_ptr<child> &process, int64_t &os_code) {
   DWORD code = 0;
   if (!GetExitCodeProcess(process->process, &code)) { os_code = GetLastError(); return false; }
   TerminateJobObject(process->job, code);
-  process->exit_kind = process->cancelled ? 3 : 1;
+  process->exit_kind = process->cancelled ? process_exit_kind::cancelled : process_exit_kind::exited;
   process->exit_value = code;
 #else
   int status = 0;
@@ -486,7 +493,8 @@ bool refresh(const std::shared_ptr<child> &process, int64_t &os_code) {
   if (waited == 0) return true;
   if (waited < 0) { if (errno == EINTR) return true; os_code = errno; return false; }
   kill(-process->process, SIGKILL);
-  process->exit_kind = process->cancelled ? 3 : WIFEXITED(status) ? 1 : 2;
+  process->exit_kind = process->cancelled ? process_exit_kind::cancelled :
+      WIFEXITED(status) ? process_exit_kind::exited : process_exit_kind::signaled;
   process->exit_value = WIFEXITED(status) ? WEXITSTATUS(status) : WTERMSIG(status);
 #endif
   process->running = false;
@@ -583,7 +591,7 @@ extern "C" int64_t neri_rt_v1_process_poll(int64_t token, int64_t wait_ms,
   if (finished) join_readers(*process);
   std::lock_guard guard(process->lock);
   state[0] = process->running ? 0 : 1;
-  state[1] = process->exit_kind;
+  state[1] = static_cast<int64_t>(process->exit_kind);
   state[2] = process->exit_value;
   state[3] = static_cast<int64_t>(process->output.size());
   state[4] = static_cast<int64_t>(process->errors.size());
@@ -644,7 +652,7 @@ extern "C" int64_t neri_rt_v1_process_cancel(int64_t token, int64_t *os_code) {
   int status = 0;
   while (waitpid(process->process, &status, 0) < 0) if (errno != EINTR) { *os_code = errno; return -1; }
 #endif
-  { std::lock_guard guard(process->lock); process->running = false; process->exit_kind = 3; process->exit_value = 1; }
+  { std::lock_guard guard(process->lock); process->running = false; process->exit_kind = process_exit_kind::cancelled; process->exit_value = 1; }
   process->stop_writer.store(true);
   process->stop_readers.store(true);
   join_readers(*process);

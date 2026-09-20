@@ -9,7 +9,7 @@ namespace neri::codegen {
 /* Emit guards before potentially poison-producing LLVM conversions. */
 template <typename Guard>
 llvm::Value *numeric_cast(llvm::IRBuilder<> &builder, llvm::Value *source,
-                         unsigned source_tag, unsigned target_tag,
+                         neri_ir_type_tag_v1 source_tag, neri_ir_type_tag_v1 target_tag,
                          llvm::Type *target, Guard guard) {
   const bool from_float = floating_scalar(source_tag);
   const bool to_float = floating_scalar(target_tag);

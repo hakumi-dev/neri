@@ -44,9 +44,7 @@
 namespace neri::codegen {
 namespace {
 
-constexpr std::string_view lowering_error = "NCG002";
 constexpr std::uint16_t source_location_runtime_minor = 1U;
-constexpr std::uint16_t native_string_runtime_minor = 2U;
 constexpr std::uint16_t native_array_runtime_minor = 4U;
 constexpr std::uint16_t native_class_runtime_minor = 4U;
 
@@ -190,7 +188,7 @@ void append_qualified_parts(std::vector<std::string_view> &parts,
   case NERI_IR_TYPE_BORROW_CAPABILITY_V1:
     return "cb" + type_code(value.arguments.front()) + "e";
   default:
-    throw codegen_error(std::string(lowering_error),
+    throw codegen_error(codegen_error_kind::lowering,
                         "Cannot mangle an unsupported native type.");
   }
 }
@@ -220,7 +218,7 @@ public:
       : input_(input), context_(context),
         output_(std::make_unique<llvm::Module>(input.id, context)),
         retained_modules_(std::ranges::find(input.required_features,
-                              "retained-modules-v1") != input.required_features.end()),
+                              ir_feature::RetainedModules) != input.required_features.end()),
         aot_unit_(retained_modules_ && !input.session.has_value()),
         c_library_module_(!retained_modules_ && !input.session.has_value() &&
                           has_c_export_definitions(input) && !owns_program_entry(input)),
@@ -270,7 +268,7 @@ private:
         input_.sources,
         [id](const auto &candidate) { return candidate.id == id; });
     if (found == input_.sources.end()) {
-      throw codegen_error(std::string(lowering_error),
+      throw codegen_error(codegen_error_kind::lowering,
                           "Verified debug source disappeared.");
     }
     return *found;
@@ -874,7 +872,7 @@ private:
     [[nodiscard]] llvm::Value *compare_scalar(llvm::Value *left,
                                               llvm::Value *right,
                                               const type &operand_type,
-                                              std::uint8_t predicate) {
+                                              neri_ir_comparison_v1 predicate) {
       if (floating_scalar(operand_type.tag)) {
         if (predicate == NERI_IR_COMPARISON_EQUAL_V1 ||
             predicate == NERI_IR_COMPARISON_NOT_EQUAL_V1) {
@@ -900,7 +898,7 @@ private:
           case NERI_IR_COMPARISON_GREATER_OR_EQUAL_V1:
             return llvm::CmpInst::FCMP_OGE;
           default:
-            throw codegen_error(std::string(lowering_error),
+            throw codegen_error(codegen_error_kind::lowering,
                                 "Invalid floating comparison predicate.");
           }
         }();
@@ -930,7 +928,7 @@ private:
                      ? llvm::CmpInst::ICMP_UGE
                      : llvm::CmpInst::ICMP_SGE;
         default:
-          throw codegen_error(std::string(lowering_error),
+          throw codegen_error(codegen_error_kind::lowering,
                               "Invalid integer comparison predicate.");
         }
       }();
@@ -940,7 +938,7 @@ private:
     [[nodiscard]] llvm::Value *compare_optional(llvm::Value *left,
                                                 llvm::Value *right,
                                                 const type &operand_type,
-                                                std::uint8_t predicate) {
+                                                neri_ir_comparison_v1 predicate) {
       if (uses_null_representation(operand_type)) {
         llvm::Value *equal = nullptr;
         if (is_string(operand_type.arguments.front())) {
@@ -1162,7 +1160,7 @@ private:
     }
 
     [[nodiscard]] llvm::Value *compare_pointer(
-        llvm::Value *left, llvm::Value *right, std::uint8_t predicate) {
+        llvm::Value *left, llvm::Value *right, neri_ir_comparison_v1 predicate) {
       switch (predicate) {
       case NERI_IR_COMPARISON_EQUAL_V1:
         return builder_.CreateICmpEQ(left, right, "pointer.equal");
@@ -1177,7 +1175,7 @@ private:
       case NERI_IR_COMPARISON_GREATER_OR_EQUAL_V1:
         return builder_.CreateICmpUGE(left, right, "pointer.greater.equal");
       default:
-        throw codegen_error(std::string(lowering_error),
+        throw codegen_error(codegen_error_kind::lowering,
                             "Verified pointer predicate disappeared.");
       }
     }
@@ -1724,7 +1722,7 @@ private:
         break;
       }
       default:
-        throw codegen_error(std::string(lowering_error),
+        throw codegen_error(codegen_error_kind::lowering,
                             "Verified IR contains an unsupported opcode.");
       }
 
@@ -1800,7 +1798,7 @@ private:
             terminator.location);
         return;
       default:
-        throw codegen_error(std::string(lowering_error),
+        throw codegen_error(codegen_error_kind::lowering,
                             "Verified IR contains an unsupported terminator.");
       }
     }
@@ -1851,7 +1849,7 @@ private:
         return candidate;
       }
     }
-    throw codegen_error(std::string(lowering_error),
+    throw codegen_error(codegen_error_kind::lowering,
                         "Verified class declaration disappeared.");
   }
 
@@ -1908,7 +1906,7 @@ private:
     for (const auto &[slot, index] : inserted->second.dispatch_slots) {
       if (const auto existing = dispatch_slot_indices_.find(slot);
           existing != dispatch_slot_indices_.end() && existing->second != index) {
-        throw codegen_error(std::string(lowering_error),
+        throw codegen_error(codegen_error_kind::lowering,
                             "Virtual dispatch slot changed ABI index.");
       }
       dispatch_slot_indices_.insert_or_assign(slot, index);
@@ -2003,7 +2001,7 @@ private:
       }
     }
     if (signature == nullptr) {
-      throw codegen_error(std::string(lowering_error),
+      throw codegen_error(codegen_error_kind::lowering,
                           "Verified virtual dispatch slot disappeared.");
     }
     return *signature;
@@ -2057,7 +2055,7 @@ private:
       return llvm::StructType::get(context_, {tag, padding, payload});
     }
     default:
-      throw codegen_error(std::string(lowering_error),
+      throw codegen_error(codegen_error_kind::lowering,
                           "Verified semantic type has no LLVM mapping.");
     }
   }
@@ -2123,7 +2121,7 @@ private:
           context_, llvm::APFloat(llvm::APFloat::IEEEdouble(),
                                   llvm::APInt(64U, value.bits)));
     default:
-      throw codegen_error(std::string(lowering_error),
+      throw codegen_error(codegen_error_kind::lowering,
                           "Verified scalar constant has no LLVM mapping.");
     }
   }
@@ -2168,7 +2166,7 @@ private:
                                        {tag, padding, payload});
     }
     default:
-      throw codegen_error(std::string(lowering_error),
+      throw codegen_error(codegen_error_kind::lowering,
                           "Verified constant has no LLVM mapping.");
     }
   }
@@ -2217,7 +2215,7 @@ private:
     if (size != 0U && count > (std::numeric_limits<std::uint64_t>::max() -
                               prefix) /
                                  size) {
-      throw codegen_error(std::string(lowering_error),
+      throw codegen_error(codegen_error_kind::lowering,
                           "Array allocation size exceeds the ABI range.");
     }
     return prefix + count * size;
@@ -2278,7 +2276,7 @@ private:
       case NERI_IR_TYPE_UINT64_V1: return NERI_SCALAR_KIND_UINT64_V1;
       case NERI_IR_TYPE_FLOAT32_V1: return NERI_SCALAR_KIND_FLOAT32_V1;
       default:
-        throw codegen_error(std::string(lowering_error),
+        throw codegen_error(codegen_error_kind::lowering,
                             "Array element has no scalar ABI descriptor.");
       }
     }();
@@ -2742,28 +2740,15 @@ private:
     if (aot_unit_ && !owns_entry && !has_c_exports) return;
     const auto private_requirements = has_c_exports && !owns_entry;
     std::uint16_t minimum_minor = source_location_runtime_minor;
-    if (has_c_exports) minimum_minor = 27U;
     if (aot_unit_) {
       minimum_minor = std::max(minimum_minor, native_array_runtime_minor);
       minimum_minor = std::max(minimum_minor, native_class_runtime_minor);
     }
     std::uint64_t required_features = NERI_RT_FEATURE_SOURCE_LOCATIONS;
-    if (input_.session.has_value()) {
-      minimum_minor = std::max(minimum_minor, std::uint16_t{19});
-      required_features |= NERI_RT_FEATURE_SESSION_MODULES;
-    }
-    if (std::ranges::find(input_.required_features, "extended-scalars-v1") != input_.required_features.end()) {
-      minimum_minor = std::max(minimum_minor, uint16_t{9});
-      required_features |= NERI_RT_FEATURE_EXTENDED_SCALARS;
-    }
-    if (std::ranges::find(input_.required_features, "scoped-tasks-v1") != input_.required_features.end()) {
-      minimum_minor = std::max(minimum_minor, uint16_t{10});
-      required_features |= NERI_RT_FEATURE_SCOPED_TASKS;
-    }
-    if (std::ranges::find(input_.required_features, "native-strings-v1") !=
-        input_.required_features.end()) {
-      minimum_minor = std::max(minimum_minor, native_string_runtime_minor);
-      required_features |= NERI_RT_FEATURE_NATIVE_STRINGS;
+    for (const auto feature : input_.required_features) {
+      const auto &contract = ir_feature_metadata(feature);
+      minimum_minor = std::max(minimum_minor, contract.runtime_minor);
+      required_features |= contract.runtime_features;
     }
     const auto module_uses_arrays = [&] {
       for (const auto &global : input_.globals) {
@@ -2954,7 +2939,7 @@ private:
     for (const auto &function : input_.functions) {
       if (function.retained || function.export_name.empty()) continue;
       if (program_requirements_ == nullptr)
-        throw codegen_error(std::string(lowering_error), "C export has no runtime requirements.");
+        throw codegen_error(codegen_error_kind::lowering, "C export has no runtime requirements.");
       auto *wrapper = c_exports_.at(symbol_key(function.id));
       auto *body = llvm::BasicBlock::Create(context_, "entry", wrapper);
       llvm::IRBuilder<> builder(body);
@@ -2993,7 +2978,7 @@ private:
         return candidate;
       }
     }
-    throw codegen_error(std::string(lowering_error),
+    throw codegen_error(codegen_error_kind::lowering,
                         "Verified direct-call target disappeared.");
   }
 
@@ -3004,7 +2989,7 @@ private:
         return candidate;
       }
     }
-    throw codegen_error(std::string(lowering_error),
+    throw codegen_error(codegen_error_kind::lowering,
                         "Verified import target disappeared.");
   }
 
@@ -3015,7 +3000,7 @@ private:
         return candidate;
       }
     }
-    throw codegen_error(std::string(lowering_error),
+    throw codegen_error(codegen_error_kind::lowering,
                         "Verified branch target disappeared.");
   }
 
@@ -3038,7 +3023,7 @@ private:
         }
       }
     }
-    throw codegen_error(std::string(lowering_error),
+    throw codegen_error(codegen_error_kind::lowering,
                         "Verified SSA type disappeared.");
   }
 
@@ -3048,7 +3033,7 @@ private:
     auto *signature = llvm::FunctionType::get(result, parameters, false);
     if (auto *existing = output_->getFunction(name)) {
       if (existing->getFunctionType() != signature)
-        throw codegen_error(std::string(lowering_error),
+        throw codegen_error(codegen_error_kind::lowering,
                             "Runtime symbol has an incompatible LLVM signature: " +
                                 std::string(name) + ".");
       return existing;

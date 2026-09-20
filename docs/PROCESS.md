@@ -151,8 +151,8 @@ def main(): Void
 
       test.assertTrue(status != null)
       if status != null
-        test.assertEqual(status.kind, "exit")
-        test.assertEqual(status.value, 0)
+        test.assertTrue(status.isExited())
+        test.assertEqual(status.value(), 0)
       end
       test.assertTrue(!completed.stdoutTruncated)
     case result.Result.Error(failure)

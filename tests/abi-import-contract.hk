@@ -25,9 +25,9 @@ end
 
 def abiImportModule(name: String, linkName: String, resultType: String, parameterTypes: String[], effects: EffectSet, minor: Int, features: RuntimeFeatures): IrModule
   let module = new IrModule(name, "")
-  let declaration = new IrImport(irSymbol(name, 7, "runtime.import." + name), irType(resultType), 1, linkName, effects, irNoLocation())
+  let declaration = new IrImport(irSymbol(name, module.domains.symbolKind.getLibraryFunction(), "runtime.import." + name), irType(resultType), module.domains.importKind.getRuntime(), linkName, effects, irNoLocation())
 
-  module.requireFeature("native-strings-v1")
+  module.requiredFeatures.requireNativeStrings()
   declaration.runtimeMajor = 1
   declaration.runtimeMinor = minor
   declaration.runtimeFeatures = features
@@ -38,19 +38,25 @@ def abiImportModule(name: String, linkName: String, resultType: String, paramete
   return module
 end
 
-def abiImportTarget(): String
-  let manifest = host.environment("NERI_RUNTIME_MANIFEST")
+def abiImportTarget(): TargetPlatform?
+  let path = host.environment("NERI_RUNTIME_MANIFEST")
 
-  if manifest != null && abiImportContains(manifest, "linux-x86_64")
-    return "linux-x86_64"
+  if path == null
+    return null
   end
-  if manifest != null && abiImportContains(manifest, "windows-x86_64")
-    return "windows-x86_64"
+  let manifest = host.readText(path)
+
+  if manifest == null
+    return null
   end
-  return "macos-arm64"
+  return TargetPlatform.parse(bootstrapManifestString(manifest, "target"))
 end
 
 def abiImportCodegen(module: IrModule, directory: String, name: String): process.PollResult
+  return abiWireCodegen(irSerializeEnvelopeHex(module), directory, name)
+end
+
+def abiWireCodegen(envelope: String, directory: String, name: String): process.PollResult
   let codegen = host.environment("NERI_CODEGEN")
 
   test.assertTrue(codegen != null && codegen != "")
@@ -59,14 +65,20 @@ def abiImportCodegen(module: IrModule, directory: String, name: String): process
   end
   let input = directory + "/" + name + ".nir.hex"
   let output = directory + "/" + name + ".ll"
+  let target = abiImportTarget()
 
-  test.assertTrue(host.writeText(input, irSerializeEnvelopeHex(module)))
+  test.assertTrue(target != null)
+  if target == null
+    return new process.PollResult()
+  end
+
+  test.assertTrue(host.writeText(input, envelope))
   let options = new process.SpawnOptions(codegen)
 
   options.arguments = [
     "--input", input,
     "--input-format", "hex",
-    "--target", abiImportTarget(),
+    "--target", target.name(),
     "--optimization", "debug",
     "--emit", "llvm-ir",
     "--output", output
@@ -89,7 +101,7 @@ def abiImportAccept(module: IrModule, directory: String, name: String): Void
   let completed = abiImportCodegen(module, directory, name)
   let status = completed.exit
 
-  test.assertTrue(status != null && status.kind == "exit" && status.value == 0)
+  test.assertTrue(status != null && status.isExited() && status.value() == 0)
 end
 
 def abiImportReject(module: IrModule, directory: String, name: String, code: String, message: String): Void
@@ -97,7 +109,7 @@ def abiImportReject(module: IrModule, directory: String, name: String, code: Str
   let status = completed.exit
   let errors = host.stringFromBytes(completed.stderr)
 
-  test.assertTrue(status != null && status.kind == "exit" && status.value == 2)
+  test.assertTrue(status != null && status.isExited() && status.value() == 2)
   test.assertTrue(errors != null && abiImportContains(errors, code) && abiImportContains(errors, message))
 end
 
@@ -237,18 +249,18 @@ end
 def cInteropModule(): IrModule
   let module = new IrModule("c-interop-contract", "callback")
   let location = module.location(0, 8)
-  let function = new IrFunction(irSymbol(module.id, 4, "callback"), "void", 1, false, location)
+  let function = new IrFunction(irSymbol(module.id, module.domains.symbolKind.getFunction(), "callback"), "void", module.domains.functionKind.getFunction(), false, location)
   let body = function.createBlock()
 
-  module.requireFeature("c-interop-v1")
+  module.requiredFeatures.requireCInterop()
   function.cExportSymbol = "contract_callback"
-  body.terminator = new IrTerminator(3, location)
+  body.terminator = new IrTerminator(module.domains.terminatorKind.getReturn(), location)
   module.addFunction(function)
   return module
 end
 
 def cInteropImport(module: IrModule, resultType: String, parameters: String[]): IrImport
-  let imported = new IrImport(irSymbol(module.id, 4, "foreign"), resultType, 2, "contract_foreign", irCAbiEffects(), irNoLocation())
+  let imported = new IrImport(irSymbol(module.id, module.domains.symbolKind.getFunction(), "foreign"), resultType, module.domains.importKind.getCAbi(), "contract_foreign", irCAbiEffects(), irNoLocation())
 
   for parameter in parameters
     imported.parameterTypes.add(parameter)
@@ -287,10 +299,10 @@ def verifiesCInteropDeclarations(directory: String): Void
     abiImportReject(module, directory, "c-interop-runtime-" + reserved, "NIR005", "compiler-controlled runtime symbol")
   end
   imported.linkName = "contract_foreign"
-  module.requiredFeatures = new StringBuffer()
+  module.requiredFeatures = new IrFeatureSet()
 
   abiImportReject(module, directory, "c-interop-missing-feature", "NIR003", "C function types require c-interop-v1")
-  module.requireFeature("c-interop-v1")
+  module.requiredFeatures.requireCInterop()
   imported.effects = new EffectSet().withRead().withWrite().withUnsafe()
 
   abiImportReject(module, directory, "c-interop-effects", "NIR009", "conservative effect contract")
@@ -329,10 +341,10 @@ def verifiesCInteropInstructions(directory: String): Void
   end
   let location = module.location(0, 8)
   let callback = cInteropSignature("void", [])
-  let address = new IrInstruction(62, 0, callback, [], [], exported.symbol, 0, "", 0, false, location)
-  let begin = new IrInstruction(41, 1, "!unsafe", [], [], null, 0, "", 0, false, location)
-  let call = new IrInstruction(63, -1, "void", [1, 0], [], null, 0, "", 0, false, location)
-  let finish = new IrInstruction(42, -1, "void", [1], [], null, 0, "", 0, false, location)
+  let address = new IrInstruction(module.domains.opcode.getCFunctionAddress(), 0, callback, [], [], exported.symbol, null, "", null, false, location)
+  let begin = new IrInstruction(module.domains.opcode.getUnsafeBegin(), 1, "!unsafe", [], [], null, null, "", null, false, location)
+  let call = new IrInstruction(module.domains.opcode.getCallCIndirect(), -1, "void", [1, 0], [], null, null, "", null, false, location)
+  let finish = new IrInstruction(module.domains.opcode.getUnsafeEnd(), -1, "void", [1], [], null, null, "", null, false, location)
 
   exported.effects = irCAbiEffects()
   body.addInstruction(address)
@@ -357,6 +369,31 @@ def verifiesCInteropInstructions(directory: String): Void
   abiImportReject(module, directory, "c-interop-address-signature", "NIR006", "result has the wrong semantic type")
 end
 
+def rejectsFeatureWire(directory: String, name: String, features: String[], diagnostic: String): Void
+  let module = new IrModule(name, "")
+  let payload = new IrWireBuffer(module.domains)
+
+  payload.writeUInt16(irSemanticMajor())
+  payload.writeUInt16(irSemanticMinor())
+  payload.writeUtf8(name)
+  payload.writeUInt32(features.Length)
+  for feature in features
+    payload.writeUtf8(feature)
+  end
+  payload.writeUInt32(0)
+  payload.writeUInt32(0)
+  payload.writeUInt32(0)
+  payload.writeUInt32(0)
+  payload.writeUInt32(0)
+  let envelope = irSerializeEnvelopePayloadHex(module, payload, sha256FastWire(payload.bytes))
+  let completed = abiWireCodegen(envelope, directory, name)
+  let status = completed.exit
+  let errors = host.stringFromBytes(completed.stderr)
+
+  test.assertTrue(status != null && status.isExited() && status.value() == 2)
+  test.assertTrue(errors != null && abiImportContains(errors, diagnostic))
+end
+
 def main(): Void
   let compiler = host.argumentAt(1)
   let directory = host.argumentAt(2)
@@ -373,4 +410,8 @@ def main(): Void
   verifiesForeignCallEffects(directory)
   verifiesCInteropDeclarations(directory)
   verifiesCInteropInstructions(directory)
+  rejectsFeatureWire(directory, "feature-unknown", ["future-v1"], "Unknown required semantic feature")
+  rejectsFeatureWire(directory, "feature-duplicate", ["native-strings-v1", "native-strings-v1"], "unique canonical order")
+  rejectsFeatureWire(directory, "feature-order", ["string-data-v1", "native-strings-v1"], "unique canonical order")
+  rejectsFeatureWire(directory, "feature-transport", ["c-interop-v1"], "requires IR transport 1.8")
 end

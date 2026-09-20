@@ -123,8 +123,9 @@ containment capability: their parent path components use the host's usual path
 resolution rules. Use `Root` for untrusted relative read paths.
 
 `status(path)` returns `StatusResult`; successful statuses contain `exists`,
-`kind` (`missing`, `file`, `directory`, `symlink` or `other`), `executable` and
-`symlink`. It observes the directory entry itself rather than following its
+`kind: readonly FileKind`, `executable` and `symlink`. `FileKind` exposes
+`isMissing()`, `isFile()`, `isDirectory()`, `isSymlink()` and `isOther()`;
+`name()` supplies its text representation. Status observes the directory entry itself rather than following its
 final symbolic link. POSIX execution means at least one execute permission bit
 on a regular file. Windows reports executable file extensions (`.exe`, `.com`,
 `.bat`, `.cmd`) and treats reparse points as symbolic links for this API.

@@ -17,7 +17,7 @@ def main(): Void
   while running
     let key = session.readKey(100)
     if key != null
-      running = false if key == "q" || key == "closed"
+      running = false if key.isCharacter("q") || key.isClosed()
     end
   end
   session.close()
@@ -29,14 +29,13 @@ stdin and terminal stdout. Opening disables canonical input, echo and software
 flow control, switches to the alternate screen and hides the cursor. Failure or
 an existing session returns `null` without taking over its terminal.
 
-`Session.readKey(timeout: Int): String?` waits up to 0–60000 milliseconds for the
-first byte. `null` means timeout. Printable ASCII characters return themselves;
-arrow keys return `up`, `down`, `left`, `right`. Space, Enter, Backspace and Escape
-return `space`, `enter`, `backspace`, `escape`. Escape sequences allow two further
-20-millisecond reads. Other bytes return `unknown`; this is not a Unicode text
-input or complete terminal-protocol API. Unknown escape sequences are discarded.
+`Session.readKey(timeout: Int): Key?` waits up to 0–60000 milliseconds for the
+first byte. `null` means timeout. `Key.characterText()` returns printable ASCII
+input; named predicates identify arrows, Space, Enter, Backspace, Escape, unknown
+input and closure. Escape sequences allow two further 20-millisecond reads.
+Unknown escape sequences are discarded.
 
-EOF, I/O failure, invalid timeout, or an interruption returns `closed` and closes
+EOF, I/O failure, invalid timeout, or an interruption returns `Key.closed()` and closes
 the session. SIGINT, SIGTERM, SIGHUP, SIGQUIT and SIGTSTP request cooperative
 closure on the next read; SIGTSTP closes this session rather than suspending it.
 `Session.isOpen()` reports the session state. Signal handlers are restored on

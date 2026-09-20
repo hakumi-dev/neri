@@ -150,6 +150,8 @@ try {
   Invoke-Checked "$tree/bin/neri.exe" @('--version')
   Invoke-Checked "$tree/bin/neri.exe" @("$root/examples/hello.hk")
   if ($Action -eq 'build') { Write-Host "Toolchain: $tree/bin/neri.exe"; return }
+  Invoke-Checked "$tree/bin/neri.exe" @('run','--project',"$root/tooling/abi/manifest.json",'--','--check',$root)
+  Invoke-Checked "$tree/bin/neri.exe" @('run','--project',"$root/tooling/kinds/manifest.json",'--','--check',$root)
   Invoke-Checked node @("$PSScriptRoot/test-windows.mjs","$tree/bin/neri.exe",$native)
   Invoke-Checked "$tree/bin/neri.exe" @('run','--project',"$root/tests/native/cabi-exports/manifest.json",'--unit','driver','--',"$tree/bin/neri.exe",$root,$native,"$env:LLVM_PREFIX/bin",'windows-x86_64',"$work/cabi-exports")
   & "$root/tests/windows-launcher.ps1" -Compiler "$tree/bin/neri.exe"

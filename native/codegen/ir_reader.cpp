@@ -18,21 +18,17 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
 namespace neri::codegen {
 namespace {
 
-constexpr std::string_view incompatible_major = "NIR001";
-constexpr std::string_view unsupported_minor = "NIR002";
-constexpr std::string_view unsupported_feature = "NIR003";
-constexpr std::string_view malformed_module = "NIR004";
-constexpr std::string_view invalid_source = "NIR010";
 
-[[noreturn]] void fail(std::string_view code, std::string message,
+[[noreturn]] void fail(reader_error_kind code, std::string message,
                        std::size_t offset) {
-  throw reader_error(std::string(code), std::move(message), offset);
+  throw reader_error(code, std::move(message), offset);
 }
 
 [[nodiscard]] std::uint16_t read_u16(std::span<const std::uint8_t> bytes,
@@ -117,7 +113,7 @@ void validate_identity(std::string_view value, std::string_view description,
     const auto scalar = decode_scalar(bytes, index);
     if (scalar <= UINT32_C(0x001f) ||
         (scalar >= UINT32_C(0x007f) && scalar <= UINT32_C(0x009f))) {
-      fail(malformed_module,
+      fail(reader_error_kind::malformed_module,
            std::string(description) + " cannot contain control characters.",
            offset);
     }
@@ -125,7 +121,7 @@ void validate_identity(std::string_view value, std::string_view description,
   }
 
   if (!non_whitespace) {
-    fail(malformed_module, std::string(description) + " cannot be empty.",
+    fail(reader_error_kind::malformed_module, std::string(description) + " cannot be empty.",
          offset);
   }
 }
@@ -150,7 +146,7 @@ public:
     const auto field_offset = offset();
     const auto value = u8();
     if (value > 1U) {
-      fail(malformed_module,
+      fail(reader_error_kind::malformed_module,
            "Boolean byte must be 0 or 1, found " + std::to_string(value) +
                ".",
            field_offset);
@@ -174,7 +170,7 @@ public:
     const auto field_offset = offset();
     const auto value = u32();
     if (value > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())) {
-      fail(malformed_module,
+      fail(reader_error_kind::malformed_module,
            std::string(description) + " " + std::to_string(value) +
                " exceeds transport v1's signed model range.",
            field_offset);
@@ -186,14 +182,14 @@ public:
     const auto field_offset = offset();
     const auto value = u32();
     if (value > options_.max_collection_count) {
-      fail(malformed_module,
+      fail(reader_error_kind::malformed_module,
            std::string(description) + " count " + std::to_string(value) +
                " exceeds reader limit " +
                std::to_string(options_.max_collection_count) + ".",
            field_offset);
     }
     if (value > remaining()) {
-      fail(malformed_module,
+      fail(reader_error_kind::malformed_module,
            std::string(description) + " count " + std::to_string(value) +
                " cannot fit in the remaining " +
                std::to_string(remaining()) + " bytes.",
@@ -207,7 +203,7 @@ public:
     const auto field_offset = offset();
     const auto contents = bytes(byte_count);
     if (!strict_utf8(contents)) {
-      fail(invalid_source, "Field is not strict UTF-8.", field_offset);
+      fail(reader_error_kind::invalid_source, "Field is not strict UTF-8.", field_offset);
     }
     return {reinterpret_cast<const char *>(contents.data()), contents.size()};
   }
@@ -220,7 +216,7 @@ public:
 
   [[nodiscard]] std::span<const std::uint8_t> bytes(std::size_t length) {
     if (length > remaining()) {
-      fail(malformed_module,
+      fail(reader_error_kind::malformed_module,
            "Unexpected end of payload while reading " +
                std::to_string(length) + " byte(s).",
            offset());
@@ -232,7 +228,7 @@ public:
 
   void require_end() const {
     if (remaining() != 0U) {
-      fail(malformed_module,
+      fail(reader_error_kind::malformed_module,
            "Payload has " + std::to_string(remaining()) +
                " trailing corruption byte(s).",
            offset());
@@ -244,14 +240,14 @@ private:
     const auto field_offset = offset();
     const auto value = u32();
     if (value > options_.max_string_bytes) {
-      fail(malformed_module,
+      fail(reader_error_kind::malformed_module,
            std::string(description) + " length " + std::to_string(value) +
                " exceeds reader limit " +
                std::to_string(options_.max_string_bytes) + ".",
            field_offset);
     }
     if (value > remaining()) {
-      fail(malformed_module,
+      fail(reader_error_kind::malformed_module,
            std::string(description) + " length " + std::to_string(value) +
                " exceeds remaining payload " +
                std::to_string(remaining()) + ".",
@@ -287,13 +283,48 @@ template <typename T, typename Reader>
   return read();
 }
 
-void require_tag(std::uint64_t tag, std::uint64_t first, std::uint64_t last,
-                 std::string_view description, std::size_t offset) {
+// Contiguous wire domains are checked before converting to their enum type.
+// Sparse domains, including semantic types, require explicit membership checks.
+template <typename Tag>
+[[nodiscard]] Tag decode_contiguous_tag(std::uint64_t tag, Tag first, Tag last,
+                                         std::string_view description,
+                                         std::size_t offset) {
+  static_assert(std::is_enum_v<Tag>);
   if (tag < first || tag > last) {
-    fail(unsupported_feature,
+    fail(reader_error_kind::unsupported_feature,
          "Unknown " + std::string(description) + " tag '" +
              std::to_string(tag) + "'.",
          offset);
+  }
+  return static_cast<Tag>(tag);
+}
+
+[[nodiscard]] neri_ir_type_tag_v1 decode_type_tag(std::uint8_t tag,
+                                                 std::size_t offset) {
+  switch (tag) {
+  case NERI_IR_TYPE_VOID_V1:
+  case NERI_IR_TYPE_BOOL_V1:
+  case NERI_IR_TYPE_BYTE_V1:
+  case NERI_IR_TYPE_INT_V1:
+  case NERI_IR_TYPE_FLOAT_V1:
+  case NERI_IR_TYPE_STRING_V1:
+  case NERI_IR_TYPE_INT32_V1:
+  case NERI_IR_TYPE_UINT32_V1:
+  case NERI_IR_TYPE_UINT64_V1:
+  case NERI_IR_TYPE_FLOAT32_V1:
+  case NERI_IR_TYPE_ARRAY_V1:
+  case NERI_IR_TYPE_CLASS_V1:
+  case NERI_IR_TYPE_OPTIONAL_V1:
+  case NERI_IR_TYPE_POINTER_V1:
+  case NERI_IR_TYPE_NATIVE_RECORD_V1:
+  case NERI_IR_TYPE_FIXED_ARRAY_V1:
+  case NERI_IR_TYPE_C_FUNCTION_V1:
+  case NERI_IR_TYPE_UNSAFE_CAPABILITY_V1:
+  case NERI_IR_TYPE_BORROW_CAPABILITY_V1:
+    return static_cast<neri_ir_type_tag_v1>(tag);
+  default:
+    fail(reader_error_kind::unsupported_feature,
+         "Unknown semantic type tag '" + std::to_string(tag) + "'.", offset);
   }
 }
 
@@ -308,27 +339,22 @@ public:
     ir_module result;
     result.semantic_version = {input_.u16(), input_.u16()};
     result.id = identity("Module identity");
-    result.required_features = read_vector<std::string>(
-        input_, "required features", [this] { return input_.utf8(); });
+    result.required_features = read_vector<ir_feature>(
+        input_, "required features", [this] { return read_feature(); });
     for (const auto &feature : result.required_features) {
-      if (feature == "native-libraries-v1") native_libraries_ = true;
-      if (feature == "native-records-v1") native_records_ = true;
-      if (feature == "session-module-v1") session_module_ = true;
-      if (feature == "retained-modules-v1") retained_modules_ = true;
-      if (feature == "c-interop-v1") {
-        c_interop_ = true;
-        if (transport_minor_ < 8U)
-          fail(unsupported_feature, "C interoperability requires IR transport 1.8.", input_.offset());
-      }
-      if (feature == "retained-modules-v1" && transport_minor_ < 7U)
-        fail(unsupported_feature, "Retained modules require IR transport 1.7.", input_.offset());
-      if (feature == "scoped-tasks-v1" && transport_minor_ < 4U)
-        fail(unsupported_feature, "Scoped tasks require IR transport 1.4.", input_.offset());
-      if (feature == "debug-scopes-v1" && transport_minor_ < 6U)
-        fail(unsupported_feature, "Debug scopes require IR transport 1.6.", input_.offset());
+      const auto &contract = ir_feature_metadata(feature);
+      if (transport_minor_ < contract.transport_minor)
+        fail(reader_error_kind::unsupported_feature, std::string(contract.transport_diagnostic), input_.offset());
+      if (feature == ir_feature::NativeLibraries) native_libraries_ = true;
+      if (feature == ir_feature::NativeRecords) native_records_ = true;
+      if (feature == ir_feature::SessionModule) session_module_ = true;
+      if (feature == ir_feature::RetainedModules) retained_modules_ = true;
+      if (feature == ir_feature::CInterop) c_interop_ = true;
     }
-    if (native_libraries_ && transport_minor_ < 2U) {
-      fail(unsupported_feature, "Native libraries require IR transport 1.2.", input_.offset());
+    if (!std::ranges::is_sorted(result.required_features, {}, ir_feature_name) ||
+        std::adjacent_find(result.required_features.begin(), result.required_features.end()) !=
+            result.required_features.end()) {
+      fail(reader_error_kind::malformed_module, "Required features are not in unique canonical order.", input_.offset());
     }
     result.sources = read_vector<source>(input_, "sources",
                                          [this] { return read_source(); });
@@ -341,8 +367,6 @@ public:
     result.functions = read_vector<function>(
         input_, "functions", [this] { return read_function(); });
     if (native_records_) {
-      if (transport_minor_ < 3U)
-        fail(unsupported_feature, "Native records require transport 1.3.", input_.offset());
       result.native_records = read_vector<native_record>(input_, "native records", [this] {
         native_record record;
         record.id = read_symbol();
@@ -352,8 +376,6 @@ public:
       });
     }
     if (session_module_) {
-      if (transport_minor_ < 5U)
-        fail(unsupported_feature, "Session modules require transport 1.5.", input_.offset());
       result.session = session_export{read_symbol(), read_type(), read_type(),
                                       retained_modules_ ? identity("Session artifact identity") : ""};
     }
@@ -362,6 +384,22 @@ public:
   }
 
 private:
+  [[nodiscard]] ir_feature read_feature() {
+    const auto offset = input_.offset();
+    const auto name = input_.utf8();
+    const auto valid_character = [](char character) {
+      return (character >= 'a' && character <= 'z') ||
+             (character >= '0' && character <= '9') || character == '-';
+    };
+    if (name.empty() || name.front() == '-' || name.back() == '-' ||
+        !std::ranges::all_of(name, valid_character) || name.find("--") != std::string::npos)
+      fail(reader_error_kind::malformed_module, "Required feature '" + name + "' is not a canonical feature identifier.", offset);
+    const auto feature = ir_feature_from_name(name);
+    if (!feature)
+      fail(reader_error_kind::unsupported_feature, "Unknown required semantic feature '" + name + "'.", offset);
+    return *feature;
+  }
+
   [[nodiscard]] std::string identity(std::string_view description) {
     const auto field_offset = input_.offset();
     auto value = input_.utf8();
@@ -373,9 +411,9 @@ private:
     symbol_id value;
     value.module = identity("Symbol module identity");
     const auto kind_offset = input_.offset();
-    value.kind = input_.u8();
-    require_tag(value.kind, NERI_IR_SYMBOL_CLASS_V1,
-                NERI_IR_SYMBOL_NATIVE_RECORD_V1, "symbol-kind", kind_offset);
+    value.kind = decode_contiguous_tag(input_.u8(), NERI_IR_SYMBOL_CLASS_V1,
+                                      NERI_IR_SYMBOL_NATIVE_RECORD_V1,
+                                      "symbol-kind", kind_offset);
     value.semantic_name = identity("Symbol semantic identity");
     return value;
   }
@@ -390,7 +428,7 @@ private:
 
   [[nodiscard]] type read_type(std::uint32_t depth = 0U) {
     if (depth > options_.max_nesting_depth) {
-      fail(malformed_module,
+      fail(reader_error_kind::malformed_module,
            "Semantic type nesting exceeds reader limit " +
                std::to_string(options_.max_nesting_depth) + ".",
            input_.offset());
@@ -398,7 +436,7 @@ private:
 
     type result;
     const auto tag_offset = input_.offset();
-    result.tag = input_.u8();
+    result.tag = decode_type_tag(input_.u8(), tag_offset);
     switch (result.tag) {
     case NERI_IR_TYPE_VOID_V1:
     case NERI_IR_TYPE_BOOL_V1:
@@ -412,23 +450,23 @@ private:
     case NERI_IR_TYPE_UINT32_V1:
     case NERI_IR_TYPE_UINT64_V1:
     case NERI_IR_TYPE_FLOAT32_V1:
-      if (transport_minor_ < 2U) fail(unsupported_feature, "Extended scalars require transport 1.2.", tag_offset);
+      if (transport_minor_ < ir_feature_metadata(ir_feature::ExtendedScalars).transport_minor) fail(reader_error_kind::unsupported_feature, "Extended scalars require transport 1.2.", tag_offset);
       return result;
     case NERI_IR_TYPE_CLASS_V1:
       result.symbol = read_symbol();
       return result;
     case NERI_IR_TYPE_NATIVE_RECORD_V1:
-      if (transport_minor_ < 3U) fail(unsupported_feature, "Native records require transport 1.3.", tag_offset);
+      if (transport_minor_ < ir_feature_metadata(ir_feature::NativeRecords).transport_minor) fail(reader_error_kind::unsupported_feature, "Native records require transport 1.3.", tag_offset);
       result.symbol = read_symbol();
       return result;
     case NERI_IR_TYPE_FIXED_ARRAY_V1:
-      if (transport_minor_ < 3U) fail(unsupported_feature, "Fixed arrays require transport 1.3.", tag_offset);
+      if (transport_minor_ < ir_feature_metadata(ir_feature::NativeRecords).transport_minor) fail(reader_error_kind::unsupported_feature, "Fixed arrays require transport 1.3.", tag_offset);
       result.element_count = input_.u32();
       result.arguments.push_back(read_type(depth + 1U));
       return result;
     case NERI_IR_TYPE_C_FUNCTION_V1: {
       if (!c_interop_)
-        fail(unsupported_feature, "C function types require c-interop-v1.", tag_offset);
+        fail(reader_error_kind::unsupported_feature, "C function types require c-interop-v1.", tag_offset);
       const auto count = input_.count("C function parameters");
       result.arguments.push_back(read_type(depth + 1U));
       for (std::uint32_t index = 0; index < count; ++index)
@@ -442,7 +480,7 @@ private:
       result.arguments.push_back(read_type(depth + 1U));
       return result;
     default:
-      fail(unsupported_feature,
+      fail(reader_error_kind::unsupported_feature,
            "Unknown semantic type tag '" + std::to_string(result.tag) +
                "'.",
            tag_offset);
@@ -451,7 +489,7 @@ private:
 
   [[nodiscard]] constant read_constant(std::uint32_t depth = 0U) {
     if (depth > options_.max_nesting_depth) {
-      fail(malformed_module,
+      fail(reader_error_kind::malformed_module,
            "Constant nesting exceeds reader limit " +
                std::to_string(options_.max_nesting_depth) + ".",
            input_.offset());
@@ -459,7 +497,9 @@ private:
 
     constant result;
     const auto tag_offset = input_.offset();
-    result.tag = input_.u8();
+    result.tag = decode_contiguous_tag(input_.u8(), NERI_IR_CONSTANT_BOOL_V1,
+                                      NERI_IR_CONSTANT_STRING_UTF8_V1,
+                                      "constant", tag_offset);
     switch (result.tag) {
     case NERI_IR_CONSTANT_BOOL_V1:
       result.bits = input_.boolean() ? 1U : 0U;
@@ -485,7 +525,7 @@ private:
       result.text = input_.utf8();
       break;
     default:
-      fail(unsupported_feature,
+      fail(reader_error_kind::unsupported_feature,
            "Unknown constant tag '" + std::to_string(result.tag) + "'.",
            tag_offset);
     }
@@ -499,10 +539,9 @@ private:
   [[nodiscard]] field read_field() {
     field result{read_symbol(), read_type(), {}, {}};
     const auto access_offset = input_.offset();
-    result.access = input_.u8();
-    require_tag(result.access, NERI_IR_ACCESS_PUBLIC_V1,
-                NERI_IR_ACCESS_INTERNAL_V1, "access-modifier",
-                access_offset);
+    result.access = decode_contiguous_tag(input_.u8(), NERI_IR_ACCESS_PUBLIC_V1,
+                                        NERI_IR_ACCESS_INTERNAL_V1,
+                                        "access-modifier", access_offset);
     result.location = read_location();
     return result;
   }
@@ -511,10 +550,9 @@ private:
     method result;
     result.function_id = read_symbol();
     const auto dispatch_offset = input_.offset();
-    result.dispatch = input_.u8();
-    require_tag(result.dispatch, NERI_IR_DISPATCH_STATIC_V1,
-                NERI_IR_DISPATCH_VIRTUAL_V1, "dispatch-kind",
-                dispatch_offset);
+    result.dispatch = decode_contiguous_tag(input_.u8(), NERI_IR_DISPATCH_STATIC_V1,
+                                          NERI_IR_DISPATCH_VIRTUAL_V1,
+                                          "dispatch-kind", dispatch_offset);
     result.dispatch_slot =
         read_optional<symbol_id>(input_, [this] { return read_symbol(); });
     result.location = read_location();
@@ -527,10 +565,9 @@ private:
     result.base =
         read_optional<symbol_id>(input_, [this] { return read_symbol(); });
     const auto access_offset = input_.offset();
-    result.access = input_.u8();
-    require_tag(result.access, NERI_IR_ACCESS_PUBLIC_V1,
-                NERI_IR_ACCESS_INTERNAL_V1, "access-modifier",
-                access_offset);
+    result.access = decode_contiguous_tag(input_.u8(), NERI_IR_ACCESS_PUBLIC_V1,
+                                        NERI_IR_ACCESS_INTERNAL_V1,
+                                        "access-modifier", access_offset);
     if (retained_modules_) result.retained = input_.boolean();
     result.fields = read_vector<field>(input_, "class fields",
                                        [this] { return read_field(); });
@@ -543,10 +580,9 @@ private:
   [[nodiscard]] global_declaration read_global() {
     global_declaration result{read_symbol(), read_type(), read_constant(), {}, {}};
     const auto linkage_offset = input_.offset();
-    result.linkage = input_.u8();
-    require_tag(result.linkage, NERI_IR_GLOBAL_INTERNAL_V1,
-                NERI_IR_GLOBAL_EXPORTED_V1, "global-linkage",
-                linkage_offset);
+    result.linkage = decode_contiguous_tag(input_.u8(), NERI_IR_GLOBAL_INTERNAL_V1,
+                                         NERI_IR_GLOBAL_EXPORTED_V1,
+                                         "global-linkage", linkage_offset);
     result.location = read_location();
     return result;
   }
@@ -558,9 +594,9 @@ private:
         input_, "import parameters", [this] { return read_type(); });
     result.result_type = read_type();
     const auto kind_offset = input_.offset();
-    result.kind = input_.u8();
-    require_tag(result.kind, NERI_IR_IMPORT_RUNTIME_V1,
-                NERI_IR_IMPORT_C_ABI_V1, "import-kind", kind_offset);
+    result.kind = decode_contiguous_tag(input_.u8(), NERI_IR_IMPORT_RUNTIME_V1,
+                                      NERI_IR_IMPORT_C_ABI_V1,
+                                      "import-kind", kind_offset);
     result.link_name = input_.utf8();
     result.effects = read_effects();
     result.minimum_runtime = read_optional<runtime_requirement>(input_, [this] {
@@ -583,7 +619,7 @@ private:
                                  NERI_IR_EFFECT_UNSAFE_V1 |
                                  NERI_IR_EFFECT_NO_RETURN_V1;
     if ((effects & ~all_effects) != 0U) {
-      fail(unsupported_feature,
+      fail(reader_error_kind::unsupported_feature,
            "Unknown effect bits '" + std::to_string(effects & ~all_effects) +
                "'.",
            effects_offset);
@@ -611,11 +647,11 @@ private:
   [[nodiscard]] instruction read_instruction() {
     instruction result;
     const auto opcode_offset = input_.offset();
-    result.opcode = input_.u16();
-    require_tag(result.opcode, NERI_IR_OPCODE_CONSTANT_V1,
-                NERI_IR_OPCODE_CALL_C_INDIRECT_V1, "opcode", opcode_offset);
+    result.opcode = decode_contiguous_tag(input_.u16(), NERI_IR_OPCODE_CONSTANT_V1,
+                                        NERI_IR_OPCODE_CALL_C_INDIRECT_V1,
+                                        "opcode", opcode_offset);
     if (result.opcode >= NERI_IR_OPCODE_C_FUNCTION_ADDRESS_V1 && !c_interop_)
-      fail(unsupported_feature, "C function instructions require c-interop-v1.", opcode_offset);
+      fail(reader_error_kind::unsupported_feature, "C function instructions require c-interop-v1.", opcode_offset);
     result.results = read_vector<value_definition>(
         input_, "instruction results",
         [this] { return read_value_definition(); });
@@ -628,17 +664,15 @@ private:
         read_optional<symbol_id>(input_, [this] { return read_symbol(); });
     result.constant_value = read_optional<constant>(
         input_, [this] { return read_constant(); });
-    result.predicate = read_optional<std::uint8_t>(input_, [this] {
+    result.predicate = read_optional<neri_ir_comparison_v1>(input_, [this] {
       const auto predicate_offset = input_.offset();
-      const auto predicate = input_.u8();
-      require_tag(predicate, NERI_IR_COMPARISON_EQUAL_V1,
-                  NERI_IR_COMPARISON_GREATER_OR_EQUAL_V1,
-                  "comparison-predicate", predicate_offset);
-      return predicate;
+      return decode_contiguous_tag(input_.u8(), NERI_IR_COMPARISON_EQUAL_V1,
+                                   NERI_IR_COMPARISON_GREATER_OR_EQUAL_V1,
+                                   "comparison-predicate", predicate_offset);
     });
     result.flag = input_.boolean();
     result.location = read_location();
-    if (transport_minor_ >= 6U) {
+    if (transport_minor_ >= ir_feature_metadata(ir_feature::DebugScopes).transport_minor) {
       result.debug_scope_id = input_.model_id("instruction debug scope");
     }
     return result;
@@ -647,7 +681,9 @@ private:
   [[nodiscard]] terminator read_terminator() {
     terminator result;
     const auto tag_offset = input_.offset();
-    result.tag = input_.u8();
+    result.tag = decode_contiguous_tag(input_.u8(), NERI_IR_TERMINATOR_BRANCH_V1,
+                                      NERI_IR_TERMINATOR_PANIC_V1,
+                                      "terminator", tag_offset);
     switch (result.tag) {
     case NERI_IR_TERMINATOR_BRANCH_V1:
       result.edges.push_back(read_edge());
@@ -666,12 +702,12 @@ private:
       result.panic_message = input_.utf8();
       break;
     default:
-      fail(unsupported_feature,
+      fail(reader_error_kind::unsupported_feature,
            "Unknown terminator tag '" + std::to_string(result.tag) + "'.",
            tag_offset);
     }
     result.location = read_location();
-    if (transport_minor_ >= 6U) {
+    if (transport_minor_ >= ir_feature_metadata(ir_feature::DebugScopes).transport_minor) {
       result.debug_scope_id = input_.model_id("terminator debug scope");
     }
     return result;
@@ -695,9 +731,9 @@ private:
         input_, "function parameters", [this] { return read_type(); });
     result.result_type = read_type();
     const auto kind_offset = input_.offset();
-    result.kind = input_.u8();
-    require_tag(result.kind, NERI_IR_FUNCTION_V1,
-                NERI_IR_DEFAULT_ADAPTER_V1, "function-kind", kind_offset);
+    result.kind = decode_contiguous_tag(input_.u8(), NERI_IR_FUNCTION_V1,
+                                      NERI_IR_DEFAULT_ADAPTER_V1,
+                                      "function-kind", kind_offset);
     result.effects = read_effects();
     result.unsafe_call = input_.boolean();
     if (retained_modules_) result.retained = input_.boolean();
@@ -712,14 +748,14 @@ private:
     result.location = read_location();
     result.blocks = read_vector<block>(input_, "function blocks",
                                        [this] { return read_block(); });
-    if (transport_minor_ >= 6U) {
+    if (transport_minor_ >= ir_feature_metadata(ir_feature::DebugScopes).transport_minor) {
       result.debug_scopes = read_vector<debug_scope>(
           input_, "debug scopes", [this] {
             debug_scope value{input_.model_id("debug scope ID"),
                               input_.model_id("debug scope parent"), {}};
             const auto location = read_location();
             if (!location.has_value()) {
-              fail(malformed_module, "Debug scope requires a source location.",
+              fail(reader_error_kind::malformed_module, "Debug scope requires a source location.",
                    input_.offset());
             }
             value.location = *location;
@@ -731,13 +767,13 @@ private:
           input_, "debug locals", [this] {
             debug_local value{input_.utf8(),
                               input_.model_id("debug local value"),
-                              transport_minor_ >= 6U
+                              transport_minor_ >= ir_feature_metadata(ir_feature::DebugScopes).transport_minor
                                   ? input_.model_id("debug local scope")
                                   : 0U,
                               {}};
             const auto location = read_location();
             if (!location.has_value()) {
-              fail(malformed_module, "Debug local requires a source location.",
+              fail(reader_error_kind::malformed_module, "Debug local requires a source location.",
                    input_.offset());
             }
             value.location = *location;
@@ -769,12 +805,12 @@ void validate_options(const reader_options &options) {
 
 } // namespace
 
-reader_error::reader_error(std::string code, std::string message,
+reader_error::reader_error(reader_error_kind code, std::string message,
                            std::size_t byte_offset)
-    : std::runtime_error(std::move(message)), code_(std::move(code)),
+    : std::runtime_error(std::move(message)), code_(code),
       byte_offset_(byte_offset) {}
 
-const std::string &reader_error::code() const noexcept { return code_; }
+reader_error_kind reader_error::code() const noexcept { return code_; }
 
 std::size_t reader_error::byte_offset() const noexcept { return byte_offset_; }
 
@@ -786,7 +822,7 @@ verified_module read_verified_module(std::span<const std::uint8_t> input,
                                      const reader_options &options) {
   validate_options(options);
   if (input.size() > options.max_input_bytes) {
-    fail(malformed_module,
+    fail(reader_error_kind::malformed_module,
          "Input length " + std::to_string(input.size()) +
              " exceeds reader limit " +
              std::to_string(options.max_input_bytes) + ".",
@@ -796,13 +832,13 @@ verified_module read_verified_module(std::span<const std::uint8_t> input,
   const std::vector<std::uint8_t> snapshot(input.begin(), input.end());
   const auto envelope = std::span(snapshot);
   if (envelope.size() < NERI_IR_HEADER_SIZE_V1) {
-    fail(malformed_module,
+    fail(reader_error_kind::malformed_module,
          "Input is shorter than the Neri IR envelope header.",
          envelope.size());
   }
   if (!std::ranges::equal(std::span(NERI_IR_MAGIC_V1),
                           envelope.first(std::size(NERI_IR_MAGIC_V1)))) {
-    fail(malformed_module, "Neri IR magic is missing or corrupt.", 0U);
+    fail(reader_error_kind::malformed_module, "Neri IR magic is missing or corrupt.", 0U);
   }
 
   const auto transport_major =
@@ -813,14 +849,14 @@ verified_module read_verified_module(std::span<const std::uint8_t> input,
   const auto payload_length =
       read_u64(envelope, NERI_IR_PAYLOAD_LENGTH_OFFSET_V1);
   if (transport_major != NERI_IR_TRANSPORT_MAJOR_V1) {
-    fail(incompatible_major,
+    fail(reader_error_kind::incompatible_major,
          "Transport major " + std::to_string(transport_major) +
              " is incompatible with supported major " +
              std::to_string(NERI_IR_TRANSPORT_MAJOR_V1) + ".",
          NERI_IR_VERSION_MAJOR_OFFSET_V1);
   }
   if (transport_minor > NERI_IR_TRANSPORT_MINOR_V1) {
-    fail(unsupported_minor,
+    fail(reader_error_kind::unsupported_minor,
          "Transport minor " + std::to_string(transport_minor) +
              " is newer than supported minor " +
              std::to_string(NERI_IR_TRANSPORT_MINOR_V1) + ".",
@@ -830,11 +866,11 @@ verified_module read_verified_module(std::span<const std::uint8_t> input,
     std::ostringstream message;
     message << "Unknown required envelope flags '0x" << std::hex << flags
             << "'.";
-    fail(unsupported_feature, message.str(), NERI_IR_FLAGS_OFFSET_V1);
+    fail(reader_error_kind::unsupported_feature, message.str(), NERI_IR_FLAGS_OFFSET_V1);
   }
   if (payload_length >
       options.max_input_bytes - NERI_IR_HEADER_SIZE_V1) {
-    fail(malformed_module,
+    fail(reader_error_kind::malformed_module,
          "Declared payload length " + std::to_string(payload_length) +
              " exceeds reader limits.",
          NERI_IR_PAYLOAD_LENGTH_OFFSET_V1);
@@ -846,7 +882,7 @@ verified_module read_verified_module(std::span<const std::uint8_t> input,
     const auto description = envelope.size() < expected_length
                                  ? "Payload is truncated."
                                  : "Envelope has trailing corruption bytes.";
-    fail(malformed_module, description,
+    fail(reader_error_kind::malformed_module, description,
          std::min(envelope.size(), expected_length));
   }
 
@@ -859,7 +895,7 @@ verified_module read_verified_module(std::span<const std::uint8_t> input,
         digest[index] ^ envelope[NERI_IR_DIGEST_OFFSET_V1 + index]);
   }
   if (digest_difference != 0U) {
-    fail(malformed_module,
+    fail(reader_error_kind::malformed_module,
          "Payload SHA-256 digest does not match the envelope.",
          NERI_IR_DIGEST_OFFSET_V1);
   }

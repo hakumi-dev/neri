@@ -184,9 +184,11 @@ extern "C" neri_int_v1 neri_rt_v1_file_root_open_at(neri_int_v1 parent,
 }
 
 namespace {
-constexpr neri_int_v1 remove_file_kind = 1;
-constexpr neri_int_v1 remove_directory_kind = 2;
-constexpr neri_int_v1 remove_tree_kind = 3;
+enum class file_removal_kind : neri_int_v1 {
+  file = 1,
+  directory = 2,
+  tree = 3,
+};
 constexpr neri_int_v1 status_missing = 0;
 constexpr neri_int_v1 status_file = 1;
 constexpr neri_int_v1 status_directory = 2;
@@ -395,9 +397,12 @@ extern "C" neri_int_v1 neri_rt_v1_file_mutation_rename(const uint8_t *source,
 
 extern "C" neri_int_v1 neri_rt_v1_file_mutation_remove(const uint8_t *path,
     neri_int_v1 length, neri_int_v1 kind, neri_int_v1 *os_code) {
-  if (!valid_removal_path(path, length) || !os_code || kind < remove_file_kind || kind > remove_tree_kind) {
+  if (!valid_removal_path(path, length) || !os_code ||
+      kind < static_cast<neri_int_v1>(file_removal_kind::file) ||
+      kind > static_cast<neri_int_v1>(file_removal_kind::tree)) {
     if (os_code) *os_code = EINVAL; return -1;
   }
+  const auto removal = static_cast<file_removal_kind>(kind);
   try {
     const auto native = neri::host_path(path_bytes(path, length));
 #if defined(_WIN32)
@@ -406,14 +411,14 @@ extern "C" neri_int_v1 neri_rt_v1_file_mutation_remove(const uint8_t *path,
     if (error) { *os_code = error.value(); return -1; }
     const bool directory = std::filesystem::is_directory(state) && !std::filesystem::is_symlink(state);
     bool removed = false;
-    if (kind == remove_file_kind) removed = !directory && std::filesystem::remove(native, error);
-    else if (kind == remove_directory_kind) removed = directory && std::filesystem::remove(native, error);
+    if (removal == file_removal_kind::file) removed = !directory && std::filesystem::remove(native, error);
+    else if (removal == file_removal_kind::directory) removed = directory && std::filesystem::remove(native, error);
     else removed = std::filesystem::remove_all(native, error) != 0;
     if (!removed || error) { *os_code = error ? error.value() : ERROR_DIRECTORY; return -1; }
 #else
     int status = -1;
-    if (kind == remove_file_kind) status = unlink(native.c_str());
-    else if (kind == remove_directory_kind) status = rmdir(native.c_str());
+    if (removal == file_removal_kind::file) status = unlink(native.c_str());
+    else if (removal == file_removal_kind::directory) status = rmdir(native.c_str());
     else {
       struct stat metadata {};
       if (lstat(native.c_str(), &metadata) == 0) {

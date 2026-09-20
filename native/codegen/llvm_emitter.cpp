@@ -39,10 +39,6 @@
 namespace neri::codegen {
 namespace {
 
-constexpr std::string_view driver_error = "NCG001";
-constexpr std::string_view verification_error = "NCG003";
-constexpr std::string_view emission_error = "NCG004";
-constexpr std::string_view output_error = "NCG005";
 
 void initialize_targets() {
   static std::once_flag initialized;
@@ -67,7 +63,7 @@ create_target_machine(target_platform target, optimization_mode optimization) {
   const auto *backend = llvm::TargetRegistry::lookupTarget(triple, lookup_error);
   if (backend == nullptr) {
     throw codegen_error(
-        std::string(emission_error),
+        codegen_error_kind::emission,
         "LLVM cannot select target '" + triple.str() + "': " + lookup_error);
   }
 
@@ -78,7 +74,7 @@ create_target_machine(target_platform target, optimization_mode optimization) {
       optimization == optimization_mode::debug ? llvm::CodeGenOptLevel::None
                                                : llvm::CodeGenOptLevel::Default));
   if (machine == nullptr) {
-    throw codegen_error(std::string(emission_error),
+    throw codegen_error(codegen_error_kind::emission,
                         "LLVM could not create a target machine for '" +
                             triple.str() + "'.");
   }
@@ -90,7 +86,7 @@ void verify_module(const llvm::Module &module, std::string_view stage) {
   llvm::raw_string_ostream stream(detail);
   if (llvm::verifyModule(module, &stream)) {
     stream.flush();
-    throw codegen_error(std::string(verification_error),
+    throw codegen_error(codegen_error_kind::verification,
                         "LLVM rejected the module " + std::string(stage) +
                             ": " + detail);
   }
@@ -135,7 +131,7 @@ void optimize_module(llvm::Module &module, llvm::TargetMachine &machine,
   if (machine.addPassesToEmitFile(passes, stream, nullptr, file_type,
                                   false)) {
     throw codegen_error(
-        std::string(emission_error),
+        codegen_error_kind::emission,
         "LLVM target '" + module.getTargetTriple().str() +
             "' cannot emit " + std::string(output_kind_name(kind)) + ".");
   }
@@ -146,10 +142,10 @@ void optimize_module(llvm::Module &module, llvm::TargetMachine &machine,
 
 } // namespace
 
-codegen_error::codegen_error(std::string code, std::string message)
-    : std::runtime_error(std::move(message)), code_(std::move(code)) {}
+codegen_error::codegen_error(codegen_error_kind code, std::string message)
+    : std::runtime_error(std::move(message)), code_(code) {}
 
-const std::string &codegen_error::code() const noexcept { return code_; }
+codegen_error_kind codegen_error::code() const noexcept { return code_; }
 
 target_platform parse_target(std::string_view value) {
   if (value == "windows-x86_64") return target_platform::windows_x86_64;
@@ -160,7 +156,7 @@ target_platform parse_target(std::string_view value) {
     return target_platform::linux_x86_64;
   }
   throw codegen_error(
-      std::string(driver_error), "Unsupported target '" + std::string(value) +
+      codegen_error_kind::driver, "Unsupported target '" + std::string(value) +
                                      "'; expected macos-arm64, linux-x86_64 or windows-x86_64.");
 }
 
@@ -171,7 +167,7 @@ optimization_mode parse_optimization(std::string_view value) {
   if (value == optimization_name(optimization_mode::release)) {
     return optimization_mode::release;
   }
-  throw codegen_error(std::string(driver_error),
+  throw codegen_error(codegen_error_kind::driver,
                       "Unsupported optimization mode '" + std::string(value) +
                           "'; expected debug or release.");
 }
@@ -186,7 +182,7 @@ output_kind parse_output_kind(std::string_view value) {
   if (value == output_kind_name(output_kind::object)) {
     return output_kind::object;
   }
-  throw codegen_error(std::string(driver_error),
+  throw codegen_error(codegen_error_kind::driver,
                       "Unsupported output kind '" + std::string(value) +
                           "'; expected llvm-ir, assembly, or object.");
 }
@@ -284,7 +280,7 @@ artifact emit_module(const verified_module &input, target_platform target,
 void write_artifact_atomically(const std::filesystem::path &path,
                                std::span<const std::uint8_t> bytes) {
   if (path.empty() || path.filename().empty()) {
-    throw codegen_error(std::string(output_error),
+    throw codegen_error(codegen_error_kind::output,
                         "Output path must name a file.");
   }
 
@@ -293,7 +289,7 @@ void write_artifact_atomically(const std::filesystem::path &path,
   llvm::SmallString<256> temporary;
   if (const auto error =
           llvm::sys::fs::createUniqueFile(model, descriptor, temporary)) {
-    throw codegen_error(std::string(output_error),
+    throw codegen_error(codegen_error_kind::output,
                         "Cannot create an atomic output beside '" +
                             neri::path_text(path) + "': " + error.message());
   }
@@ -310,13 +306,13 @@ void write_artifact_atomically(const std::filesystem::path &path,
   }
   if (write_error) {
     static_cast<void>(llvm::sys::fs::remove(temporary));
-    throw codegen_error(std::string(output_error),
+    throw codegen_error(codegen_error_kind::output,
                         "Cannot write output '" + neri::path_text(path) + "': " +
                             write_error.message());
   }
   if (const auto error = llvm::sys::fs::rename(temporary, neri::path_text(path))) {
     static_cast<void>(llvm::sys::fs::remove(temporary));
-    throw codegen_error(std::string(output_error),
+    throw codegen_error(codegen_error_kind::output,
                         "Cannot publish output '" + neri::path_text(path) + "': " +
                             error.message());
   }

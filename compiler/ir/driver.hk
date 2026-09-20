@@ -92,19 +92,7 @@ def bootstrapManifestRequiredInt(text: String, name: String): Int
 end
 
 def bootstrapRequiredRuntimeMinor(module: IrModule): Int
-  var required = module.hasFeature("native-strings-v1") ? 2 : 1
-
-  if module.hasFeature("session-module-v1")
-    required = 19
-  end
-  if module.hasFeature("c-interop-v1")
-    required = 27
-  end
-  if module.hasFeature("scoped-tasks-v1") && required < 10
-    required = 10
-  else if module.hasFeature("extended-scalars-v1") && required < 9
-    required = 9
-  end
+  var required = module.requiredFeatures.minimumRuntimeMinor()
   var importValue = module.firstImport
 
   while importValue != null
@@ -113,7 +101,7 @@ def bootstrapRequiredRuntimeMinor(module: IrModule): Int
     if symbolMinor > required
       required = symbolMinor
     end
-    if importValue.kind == 1 && importValue.runtimeMinor > required
+    if importValue.kind.isRuntime() && importValue.runtimeMinor > required
       required = importValue.runtimeMinor
     end
     importValue = importValue.nextImport
@@ -122,17 +110,12 @@ def bootstrapRequiredRuntimeMinor(module: IrModule): Int
 end
 
 def bootstrapRequiredRuntimeFeatures(module: IrModule): RuntimeFeatures
-  var required = new RuntimeFeatures().withSourceLocations()
-
-  required = required.withSessionModules() if module.hasFeature("session-module-v1")
-  required = required.withScopedTasks() if module.hasFeature("scoped-tasks-v1")
-  required = required.withExtendedScalars() if module.hasFeature("extended-scalars-v1")
-  required = required.withNativeStrings() if module.hasFeature("native-strings-v1")
+  var required = module.requiredFeatures.runtimeFeatures().withSourceLocations()
   var importValue = module.firstImport
 
   while importValue != null
     required = required.mergedWith(abiRuntimeSymbolFeatures(importValue.linkName))
-    if importValue.kind == 1
+    if importValue.kind.isRuntime()
       required = required.mergedWith(importValue.runtimeFeatures)
     end
     importValue = importValue.nextImport
@@ -180,17 +163,13 @@ def bootstrapRun(executable: String, arguments: String[]): Bool
   return true
 end
 
-def bootstrapCodegenEmitName(emit: String): String
-  if emit == "asm"
-    return "assembly"
-  end
-  if emit == "obj" || emit == "executable"
-    return "object"
-  end
-  return "llvm-ir"
-end
+def bootstrapInvokeCodegen(module: IrModule, emit: readonly EmissionKind, output: String, target: readonly TargetPlatform, release: Bool, debugSources: BootstrapSourceInput? = null, metricsPath: String = "", serializedInput: String = ""): Bool
+  let codegenEmit = emit.codegenName()
 
-def bootstrapInvokeCodegen(module: IrModule, emit: String, output: String, target: String, release: Bool, debugSources: BootstrapSourceInput? = null, metricsPath: String = "", serializedInput: String = ""): Bool
+  if codegenEmit == null
+    console.println("native code generation does not support emit kind: " + emit.name())
+    return false
+  end
   let optionalCodegen = host.environment("NERI_CODEGEN")
 
   if optionalCodegen == null || optionalCodegen == ""
@@ -217,9 +196,9 @@ def bootstrapInvokeCodegen(module: IrModule, emit: String, output: String, targe
   var arguments: String[] = [
     "--input", transport,
     "--input-format", "hex",
-    "--target", target,
+    "--target", target.name(),
     "--optimization", release ? "release" : "debug",
-    "--emit", bootstrapCodegenEmitName(emit),
+    "--emit", codegenEmit,
     "--output", output
   ]
   var writeMilliseconds = 0
@@ -260,14 +239,14 @@ def bootstrapInvokeCodegen(module: IrModule, emit: String, output: String, targe
   return succeeded
 end
 
-def bootstrapLinkExecutable(module: IrModule, objectPath: String, output: String, target: String): Bool
+def bootstrapLinkExecutable(module: IrModule, objectPath: String, output: String, target: readonly TargetPlatform): Bool
   let objects = new StringBuffer()
 
   objects.add(objectPath)
   return bootstrapLinkObjects(module, objects, output, target)
 end
 
-def bootstrapLinkObjects(module: IrModule, objects: StringBuffer, output: String, target: String): Bool
+def bootstrapLinkObjects(module: IrModule, objects: StringBuffer, output: String, target: readonly TargetPlatform): Bool
   let optionalManifest = host.environment("NERI_RUNTIME_MANIFEST")
 
   if optionalManifest == null || optionalManifest == ""
@@ -295,8 +274,8 @@ def bootstrapLinkObjects(module: IrModule, objects: StringBuffer, output: String
     console.println("runtime manifest is missing a required field")
     return false
   end
-  if schemaVersion != 2 || bootstrapManifestString(manifestText, "toolchainVersion") != "0.2.0-dev" || transportMajor != 1 || transportMinor != 8 || bootstrapManifestString(manifestText, "target") != target || abiMajor != 1
-    console.println("runtime manifest does not match Neri 0.2.0-dev, IR transport 1.8, target '" + target + "', and ABI v1")
+  if schemaVersion != 2 || bootstrapManifestString(manifestText, "toolchainVersion") != "0.2.0-dev" || transportMajor != irTransportMajor() || transportMinor != irTransportMinor() || bootstrapManifestString(manifestText, "target") != target.name() || abiMajor != 1
+    console.println("runtime manifest does not match Neri 0.2.0-dev, IR transport 1.8, target '" + target.name() + "', and ABI v1")
     return false
   end
   if abiMinor < requiredMinor
@@ -319,7 +298,7 @@ def bootstrapLinkObjects(module: IrModule, objects: StringBuffer, output: String
     console.println("runtime artifact path is invalid")
     return false
   end
-  var linker = platformLinker(target)
+  var linker = target.linker()
   let configuredLinker = host.environment("NERI_LINKER")
 
   if configuredLinker != null && configuredLinker != ""
@@ -330,11 +309,11 @@ def bootstrapLinkObjects(module: IrModule, objects: StringBuffer, output: String
 
   # Session-loaded code can use crypto even when the host object has no direct
   # crypto call, so Linux must link libcrypto for a session host as well.
-  if target == "linux-x86_64" && (requiredFeatures.hasCrypto() || sessionRuntime)
+  if target.isLinux() && (requiredFeatures.hasCrypto() || sessionRuntime)
     arguments = host.appendString(arguments, "-lcrypto")
   end
-  if module.hasFeature("native-libraries-v1")
-    var directory = target == "macos-arm64" ? "/opt/homebrew/lib" : ""
+  if module.requiredFeatures.hasNativeLibraries()
+    var directory = target.isMacOS() ? "/opt/homebrew/lib" : ""
     let configuredDirectory = host.environment("NERI_LIBRARY_PATH")
 
     if configuredDirectory != null && configuredDirectory != ""
@@ -378,8 +357,8 @@ def bootstrapLinkObjects(module: IrModule, objects: StringBuffer, output: String
   return bootstrapRun(linker, arguments)
 end
 
-def bootstrapEmitNative(module: IrModule, emit: String, output: String, target: String, release: Bool, timings: Bool = false, debugSources: BootstrapSourceInput? = null): Bool
-  if emit != "executable"
+def bootstrapEmitNative(module: IrModule, emit: readonly EmissionKind, output: String, target: readonly TargetPlatform, release: Bool, timings: Bool = false, debugSources: BootstrapSourceInput? = null): Bool
+  if !emit.isExecutable()
     return bootstrapInvokeCodegen(module, emit, output, target, release)
   end
   let objectPath = output + ".o"
@@ -399,8 +378,8 @@ def bootstrapEmitNative(module: IrModule, emit: String, output: String, target: 
   return linked && symbols
 end
 
-def bootstrapExecutableSymbols(output: String, target: String, release: Bool): Bool
-  if !release && target == "macos-arm64"
+def bootstrapExecutableSymbols(output: String, target: readonly TargetPlatform, release: Bool): Bool
+  if !release && target.isMacOS()
     var symbolTool = "dsymutil"
     let configured = host.environment("NERI_DSYMUTIL")
 
@@ -472,7 +451,7 @@ def bootstrapAotConfiguration(owners: StringBuffer): String?
   return result
 end
 
-def bootstrapCompileUnit(unit: IrCompilationUnit, target: String, release: Bool, timings: Bool, noCache: Bool, sources: BootstrapSourceInput?, configuration: String, temporaryDirectories: StringBuffer): String?
+def bootstrapCompileUnit(unit: IrCompilationUnit, target: readonly TargetPlatform, release: Bool, timings: Bool, noCache: Bool, sources: BootstrapSourceInput?, configuration: String, temporaryDirectories: StringBuffer): String?
   let started = runCacheTime()
   let payload = irSerializePayload(unit.module)
   let payloadDigest = sha256FastWire(payload.bytes)
@@ -504,7 +483,7 @@ def bootstrapCompileUnit(unit: IrCompilationUnit, target: String, release: Bool,
   let codegenStarted = runCacheTime()
   let serialized = irSerializeEnvelopePayloadHex(unit.module, payload, payloadDigest)
 
-  if !bootstrapInvokeCodegen(unit.module, "obj", path, target, release, unitSources, "", serialized)
+  if !bootstrapInvokeCodegen(unit.module, EmissionKind.object(), path, target, release, unitSources, "", serialized)
     bootstrapRemoveRunDirectory(directory)
     return null
   end
@@ -520,7 +499,7 @@ def bootstrapCompileUnit(unit: IrCompilationUnit, target: String, release: Bool,
   return path
 end
 
-def bootstrapEmitCompilationUnits(module: IrModule, units: IrCompilationUnit, output: String, target: String, release: Bool, timings: Bool, noCache: Bool, sources: BootstrapSourceInput?, configuration: String): Bool
+def bootstrapEmitCompilationUnits(module: IrModule, units: IrCompilationUnit, output: String, target: readonly TargetPlatform, release: Bool, timings: Bool, noCache: Bool, sources: BootstrapSourceInput?, configuration: String): Bool
   let objects = new StringBuffer()
   let temporaryDirectories = new StringBuffer()
   var unit: IrCompilationUnit? = units
