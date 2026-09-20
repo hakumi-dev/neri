@@ -75,91 +75,13 @@ discarding slow samples. Sample counts are process repetitions; warm requests
 within one process are correlated and should not be treated as independent
 process samples.
 
-## Issue 72 baseline
+## Result publication
 
-Measured on an Apple M4 Pro (14 CPU cores, 24 GiB RAM), Darwin 27.0.0 arm64.
-Each row uses 10 fresh servers and 10 warm queries per server. These are local
-development-workstation observations with filesystem caches warm; background
-desktop activity was not controlled. Times are milliseconds, shown as
-median / p95. With 10 process samples, nearest-rank p95 equals the maximum.
+Save baseline and candidate JSONL files and process-accounting output in a
+separate ignored `build/` directory for each experiment. Include the exact
+compiler digests, source revisions, hardware, commands and environment alongside
+the samples. Compare matching workloads and report both distributions; record
+latency targets with the issue or experiment that defines them.
 
-| Corpus/query | Cold | Warm | Unrelated queued | Unrelated +200 ms |
-| --- | --- | --- | --- | --- |
-| Small field | 8 / 9 | 2 / 3 | 6 / 9 | 2 / 2 |
-| Small named argument | 9 / 12 | 2 / 4 | 9 / 14 | 5 / 8 |
-| Data editor, `where` | 140 / 149 | 62 / 74 | — | — |
-| Data in repo, unrelated lexer | 138 / 153 | 63 / 75 | 112 / 123 | 1801 / 1880 |
-
-The Data editor process RSS observations ranged from 78,640 to 79,216 KiB.
-Opening and editing the compiler lexer raised that range to 629,824–643,696 KiB.
-Total command wall times were 11.50 s (both small queries), 8.33 s (Data editor),
-and 66.13 s (repository). The delayed repository result shows substantial
-head-of-line blocking under this request sequence; it does not identify an
-internal phase by itself.
-
-Reproduction identity:
-
-- Server SHA-256: `fe271ba657faf04027bca005386b87e3a7a0f4cf81756840099d3177ef06c924`.
-- Release client SHA-256: `b24eb8f8f78fcf3d943123e1fb4396526533851d7cc11cb9c7305dccf6b953ba`.
-- Data/repository corpus: Git archive of `ec6e357feae1372d1bd1bb3abad00ab147de0588`.
-- Client compiled against that archived `compiler-core`; the tracked manifest
-  references the current checkout for normal builds. All six benchmark Neri
-  sources passed `neri format --check`; the Release client build succeeded.
-- `NERI_HOST` and runtime manifest came from the configured macOS arm64 native
-  Release build. `NERI_STDLIB` and `NERI_TEMPLATE_CATALOG` pointed to this
-  completion worktree. Both variables and native assets were identical across
-  the three runs.
-
-Raw samples: [small](results/baseline-small.jsonl),
-[Data editor](results/baseline-data.jsonl),
-[repository](results/baseline-repository.jsonl). Supplemental `/usr/bin/time -l`
-output: [small](results/baseline-small.time.txt),
-[Data editor](results/baseline-data.time.txt),
-[repository](results/baseline-repository.time.txt).
-
-## Cooperative scheduling and scoped query results
-
-The candidate uses the same Release client, archived Data/repository corpus,
-stdlib, template catalog, native assets, hardware and 10-by-10 sample counts as
-the baseline. Desktop activity was not controlled. Each completion validates
-the same semantic `active: Bool` candidate. Times are median / p95 milliseconds.
-
-| Corpus/query | Cold | Warm | Unrelated queued | Unrelated +200 ms |
-| --- | --- | --- | --- | --- |
-| Small field | 8 / 11 | 2 / 3 | 8 / 11 | 3 / 4 |
-| Small named argument | 11 / 12 | 3 / 5 | 12 / 13 | 5 / 5 |
-| Data editor, `where` | 91 / 98 | 52 / 57 | — | — |
-| Data in repo, unrelated lexer | 86 / 91 | 52 / 57 | 78 / 87 | 61 / 74 |
-
-The measured acceptance targets are p95 at most 160 ms cold, 75 ms warm, and
-200 ms in the delayed unrelated-unit scenario. All Data measurements meet
-these targets. The delayed repository median falls from 1,801 to 61 ms and
-p95 from 1,880 to 74 ms. These observations describe this workload, not a
-worst-case deadline for every program. The small workloads remain below 15 ms
-p95 in every scenario.
-
-Current server RSS observations range from 43,248 to 43,840 KiB for the Data
-editor and 597,296 to 603,296 KiB with the unrelated compiler unit. Total command
-wall times are 11.81 s for both small queries, 6.22 s for the Data editor, and
-48.97 s for the repository. These are the same observation and accounting
-methods used above, rather than measurements of peak server RSS.
-
-The server registers declarations and binds the enclosing completion scope;
-it does not cache a partially checked model as full diagnostics. Cooperative
-checkpoints allow pending interactive messages to interrupt idle diagnostics.
-Source collection imports each source once instead of repeatedly scanning the
-accumulating source text for library imports. Reuse is restricted to verified
-document and dependency inputs; full diagnostics still analyze the whole unit.
-
-Candidate server SHA-256:
-`4ef866e18c2c5e38330be58c85dfac4b8f8d96eaacead78b1bad4f5c22bc71ed`.
-The compiler passed the Stage 1–3 IR, object and executable fixed-point checks
-and the complete native and language contract suite. The benchmark ran before
-the full validation suite.
-
-Raw samples: [small](results/candidate-small.jsonl),
-[Data editor](results/candidate-data.jsonl),
-[repository](results/candidate-repository.jsonl). Supplemental process-accounting
-output: [small](results/candidate-small.time.txt),
-[Data editor](results/candidate-data.time.txt),
-[repository](results/candidate-repository.time.txt).
+Publish the evidence with its PR, issue or CI run according to the
+[source and result policy](../README.md#source-and-result-policy).

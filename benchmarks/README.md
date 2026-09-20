@@ -4,6 +4,28 @@ Benchmarks measure current contracts, not universal language rankings. Orchestra
 and Neri workloads use `.hk`; `reference-dotnet` is only the explicitly comparable
 C# workload, not an alternative build or test toolchain for Neri.
 
+## Source and result policy
+
+Keep benchmark programs, deterministic inputs, correctness oracles, manifests,
+methodology and enforced resource budgets in Git. Store measurements from each
+execution under an ignored `build/` directory, using a separate directory per run.
+This includes timings, memory samples, profiles, logs, generated reports, machine
+identity and binary hashes. Keep those files together as one evidence bundle.
+
+Publish CI measurements as workflow artifacts. The
+[Native compute observations workflow](../.github/workflows/performance.yml)
+already uploads raw results, host/tool identities and failure evidence. Link the
+specific run and summarize the comparison in the relevant PR or issue. For local
+runs, attach the evidence bundle to that discussion. Preserve evidence needed for
+a published release as a release asset; CI artifacts have a retention period.
+
+Every comparison identifies both commits, workload inputs, compiler/runtime
+versions, build mode, hardware, cache state, commands and raw samples. Compare
+baseline and candidate under matching conditions. Keep historical measurements
+with their original context; source documentation describes how to measure and
+what the current contracts require. Machine-specific observations do not become
+test thresholds automatically.
+
 ## Compute and allocation
 
 Build both programs once from the repository root:
@@ -167,34 +189,12 @@ the [GitHub-hosted environment](https://docs.github.com/en/actions/reference/run
 is a virtual machine, not a dedicated bare-metal PC. This measures kernel
 execution, not a Linux self-hosted frontend, and defines no CI timing threshold.
 
-### Measurement records
-
-Records retain workload parameters, source and binary fingerprints, hardware,
-runtime identity, raw samples and process metrics. They are evidence for the
-specified configurations, not a ranking of languages.
-
-| Record | Scope |
-|---|---|
-| [ARM64 kernels and allocator comparison](compute-macos-arm64.json) | Kernel samples and paired allocator variants. |
-| [ARM64 matrix](compute-matrix-macos-arm64.json) | 112 processes, 784 checked kernel samples, M4 Pro. |
-| [Runtime-pinned ARM64 matrix](compute-matrix-macos-arm64-pinned.json) | 112 processes with actual .NET runtime identity and substantial host variability. |
-| [Native x86-64 matrix](compute-matrix-linux-x86_64.json) | 88 processes, 616 checked samples, four-vCPU AMD EPYC VM. |
-| [Scoped-task ARM64 matrix](scoped-tasks-macos-arm64.json) | 128 processes, 896 checked samples, Neri and .NET worker limits 1, 2, 4, 8 and 14. |
-| [Scoped-task x86-64 matrix](scoped-tasks-linux-x86_64.json) | 96 processes, 672 checked samples, native Intel Xeon VM with four vCPU. |
-| [GC sweep ARM64 comparison](gc-sweep-macos-arm64.json) | 32 paired-variant processes, 224 checked samples, identical program object with separate runtime archives. |
-| [GC leaf-frame ARM64 comparison](gc-leaf-macos-arm64.json) | 32 paired-variant processes, 224 checked samples, effect-proven root-frame omission with the same frontend and runtime. |
-| [Allocation-task ARM64 matrix](allocation-tasks-macos-arm64.json) | 208 processes, 1456 checked samples, integer and allocation-heavy task scaling; .NET references use workstation GC. |
-| [Allocation-task x86-64 matrix](allocation-tasks-linux-x86_64.json) | 144 processes, 1008 checked samples, four-vCPU AMD EPYC VM; workstation GC references. |
-| [Allocation GC-mode ARM64 comparison](allocation-gc-macos-arm64.json) | 90 processes, 630 checked samples, Neri and the same JIT assembly with workstation/server GC; kernel means and process memory accompany medians. |
-| [Allocation GC-mode x86-64 comparison](allocation-gc-linux-x86_64.json) | 54 processes, 378 checked samples, workstation/server GC comparison on a four-vCPU EPYC 7763 VM. |
-
 Summarize each process by its median, then compare those process summaries.
 Keep process and kernel timers separate. Absolute times require matching workload
 and host conditions; runtime pinning alone does not control power mode or background
-load. Record power and load before and after workstation runs. The runtime-pinned
-ARM64 data contain large changes within the same binary: no per-sample telemetry
-isolates their cause. Neither VM results nor local Mac samples establish
-dedicated-PC performance.
+load. Record power and load before and after workstation runs. Treat variation
+within the same binary as part of the experiment. Record whether the host is a
+workstation, virtual machine or dedicated server.
 
 ## Compiler effect analysis
 
@@ -218,22 +218,7 @@ libraries and an otherwise idle host. Retain binary hashes and process records.
 The forward chain stresses transitive propagation; it does not represent every
 program shape or isolate the time spent in a single compiler pass.
 
-The [ARM64 effect-analysis record](compiler-effects-macos-arm64.json) contains
-all 40 process measurements, compiler/source hashes and host conditions. Its
-paired variants must satisfy the same canonical-IR contract. Timing values are
-descriptive evidence; no timing threshold is part of the test suite.
-
 ## Runtime heap isolation
-
-The [ARM64 heap comparison](runtime-heaps-macos-arm64.json) records four balanced
-process pairs for each of the integer, array and allocation kernels. Each process
-performs one warmup and seven checked samples. Binary/source hashes and parameters
-identify the global-heap and thread-local-heap variants; both use Release mode.
-The median process medians are 92/92 ms for integer, 22.5/22.5 ms for array and
-77/82.5 ms for allocation (global/thread-local). The allocation workload includes
-reference stores and collection; no measurement isolates the cost of TLS lookup
-from ownership checking. These local battery-powered observations quantify a
-tradeoff, not a throughput improvement or parallel scaling result.
 
 `scripts/build.sh native-test --thread-sanitize` instruments runtime heap access
 and the native worker probe with ThreadSanitizer. The probe checks simultaneous
@@ -249,23 +234,6 @@ join. It records participating threads to check the outer pool bound. These are
 correctness contracts, not parallel Neri throughput measurements.
 It uses C because native entry callbacks are not expressible in Neri's current
 C ABI. Address/undefined-behavior checks use the separate `--sanitize` build.
-
-The [ARM64 task-context comparison](task-heaps-macos-arm64.json) contains three
-paired runtime variants, 72 processes and 504 checked kernel samples. Each pair
-links the same program object against the independent-thread baseline and a
-scoped-context runtime. The current variant uses a constant-initialized active
-context pointer, initializes its base context on first access, and retains a heap
-reference throughout allocation and collection. Its median process medians are
-60/60 ms for integer, 16/16 ms for array and 56/59 ms for allocation
-(baseline/current). The roughly 5% allocation cost includes context and ownership
-checks; these measurements do not isolate their individual costs.
-
-The record also includes dynamically initialized TLS and lazy-base variants
-(allocation medians 57/100 and 57/61 ms within their respective pairs).
-Dynamic TLS guards and repeated heap lookup can materially affect an allocation
-path even when the language-level program is unchanged. Results are descriptive
-observations on AC power, not timing gates, confidence intervals or evidence of
-parallel Neri scaling.
 
 ## Analytical foundations
 
