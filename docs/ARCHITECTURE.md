@@ -1,6 +1,35 @@
 # Architecture
 
-Neri has three explicit implementation layers.
+This page maps implementation ownership and cross-layer invariants. For source
+syntax and examples, use the [language reference](LANGUAGE.md); for native calls,
+use [C interoperability](C-INTEROP.md). Source-checkout guides cover
+[build commands](../docs/BUILDING.md) and
+[seed prerequisites](../docs/BOOTSTRAP.md).
+
+| Question | Start here | Source of truth in a source checkout |
+| --- | --- | --- |
+| Where is source syntax or typing implemented? | [Compiler](#compiler) | [Parser](../compiler/frontend/bootstrap_parser.hk), [binder](../compiler/semantic/binder.hk) |
+| How do call effects and parallel callbacks propagate? | [Effect summaries](#effect-summaries) | [Effect solver](../compiler/ir/effects.hk), [parallel checking](../compiler/ir/parallel.hk) |
+| Who owns library signatures and intrinsic contracts? | [Source and intrinsic boundary](#source-and-intrinsic-boundary) | [Library catalog](../compiler/frontend/standard_library_catalog.hk), [ABI catalog](../tooling/abi/catalog.hk) |
+| What does the native backend accept? | [Native boundary](#native-boundary) | [IR reader](../native/codegen/ir_reader.cpp), [verifier](../native/codegen/ir_verifier.cpp) |
+| How are compiler generations built and compared? | [Build driver](#build-driver) | [Build driver](../tooling/build.hk), [seed generation](../tooling/seed.hk) |
+| What may a parallel task read, mutate or return? | [Execution and optimization boundaries](#execution-and-optimization-boundaries) | [Task heap](../native/runtime/task_heap.h), [executor](../native/runtime/task_executor.cpp) |
+
+```mermaid
+flowchart TD
+  Source["Neri source + library declarations"] --> Parse["Frontend: tokens and syntax"]
+  Parse --> Bind["Semantic binding: types and diagnostics"]
+  Bind --> IR["Neri IR: lowering, effects and verification"]
+  IR --> Transport["Canonical IR transport"]
+  Transport --> Verify["Native reader and verifier"]
+  Verify --> LLVM["LLVM code generation"]
+  LLVM --> Object["Native object"]
+  Object --> Link["Linker"]
+  Runtime["Versioned runtime archive"] --> Link
+  Link --> Program["Executable or shared library"]
+```
+
+The compiler, native backend/runtime, and build tooling have separate ownership.
 
 ## Compiler
 
@@ -19,7 +48,7 @@ existing field layout and precise tracing rules; concrete functions use the same
 IR and runtime ABI as ordinary functions. Specializations are cached by qualified
 declaration name and canonical type arguments, with bounded expansion.
 
-Function types are structural language types. Closure conversion represents each
+Managed function types are structural language types. Closure conversion represents each
 signature with a hidden managed class and virtual invocation slot, and each
 closure with an implementation class containing its captures. Class
 allocation, tracing and indirect dispatch provide closure lifetime and invocation
@@ -27,7 +56,21 @@ through the ordinary IR transport and runtime ABI. The signature class is not
 source-constructible, and its fallback invocation traps. A callee's `noreturn`
 property does not propagate to callers or other implementations of its slot.
 
-`compiler/ir/main.hk` is the executable entry point. `frontend/main.hk` and `semantic/main.hk` belong to separate development units and are excluded from the compiler unit.
+`cabi fn` is a distinct structural type with native function-pointer storage.
+It does not use a managed signature class or capture object. Named
+`@cabiImport` and `@cabiExport` functions can supply matching native pointers;
+indirect invocation requires an unsafe context. Signature encoding and call
+binding live in [cabi_types.hk](../compiler/semantic/cabi_types.hk) and
+[cabi_calls.hk](../compiler/semantic/cabi_calls.hk). See
+[C interoperability](C-INTEROP.md) for exact type, lifetime and nullable-pointer
+contracts.
+
+[`compiler/ir/main.hk`](../compiler/ir/main.hk) is the executable entry point.
+The root [manifest](../manifest.json) defines the `compiler` unit and its
+`compiler-core` dependency. `frontend/main.hk` and `semantic/main.hk` belong to
+separate development units. Session sources also belong to a separate unit:
+changes to shared compiler APIs must be checked through session consumers as
+well as the compiler executable.
 
 `semantic/readonly.hk` defines transitive readonly views. Binding preserves the
 qualifier on reachable references and checks receiver contracts, assignments,
@@ -122,7 +165,7 @@ for every literal. General user classes still have their ordinary managed class
 representation, not the String storage layout.
 
 The runtime ABI is the boundary for managed values and garbage collection.
-Ordinary C ABI imports accept native scalar/pointer signatures; a managed String
+Ordinary C ABI imports accept native scalar, pointer and C function-pointer signatures; a managed String
 or array is not a portable C argument. Text operations reuse the reviewed runtime
 entry points through the existing host services.
 
@@ -228,22 +271,21 @@ recovery policies.
 ## Build driver
 
 `tooling/build.hk` owns native build orchestration, compiler source discovery,
-staged bootstrap comparisons, and native/language test selection. The seed compiles
-it before it builds the current compiler. CMake builds the native targets.
+staged bootstrap comparisons, and native/language test selection. The launcher
+builds the native targets with CMake and materializes the checked-in compiler IR
+seed. That compiler builds the driver through the root project manifest.
 `native/tools/host.cpp` provides sorted file discovery and subprocess capture with
 EOF stdin, separate output channels and a process-group timeout. It contains no
 compiler source list, build graph or language expectations.
 
 ## Trusted seed
 
-The bootstrap release contains a Neri compiler plus its matching codegen and runtime. It compiles the current sources, and the resulting compiler performs the next verified generation.
-Only the pinned seed stage substitutes compiler paths that have mirrored
-`bootstrap/compiler/*` declarations. The mirrors express declaration modifiers,
-native imports and the isolated project-error classification in syntax accepted
-by the pinned seed. The build driver owns source discovery. Stage 1 and later
-compile the canonical sources from the
-current manifest, and bootstrap verification compares canonical IR, objects,
-and binaries to a fixed point.
+The bootstrap contract uses `bootstrap/compiler.nir.gz` for canonical binary IR
+and `bootstrap/seed.json` for its artifact and source-inventory hashes. The
+current native backend and runtime materialize the seed on each host. Every
+generation compiles current sources through the root manifest; verification
+compares canonical IR, objects and binaries to a fixed point. See the
+[required seed artifacts in the source checkout](../docs/BOOTSTRAP.md#required-seed-artifacts).
 
 ## Execution and optimization boundaries
 

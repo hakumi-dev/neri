@@ -38,6 +38,10 @@ constexpr std::string_view invalid_control_flow = "NIR007";
 constexpr std::string_view invalid_ssa = "NIR008";
 constexpr std::string_view invalid_safety = "NIR009";
 constexpr std::string_view invalid_source = "NIR010";
+constexpr std::uint32_t c_call_effects = NERI_IR_EFFECT_READ_V1 |
+    NERI_IR_EFFECT_WRITE_V1 | NERI_IR_EFFECT_MAY_PANIC_V1 |
+    NERI_IR_EFFECT_MANAGED_ALLOCATE_V1 | NERI_IR_EFFECT_NATIVE_ALLOCATE_V1 |
+    NERI_IR_EFFECT_SAFEPOINT_V1 | NERI_IR_EFFECT_UNSAFE_V1;
 
 [[noreturn]] void fail(std::string_view code, std::string message) {
   throw reader_error(std::string(code), std::move(message), 0U);
@@ -118,13 +122,24 @@ constexpr std::string_view invalid_source = "NIR010";
          value.arguments.size() == 1U;
 }
 
+[[nodiscard]] bool is_c_abi_type(const type &value, bool allow_void);
+
+[[nodiscard]] bool is_c_function(const type &value) {
+  return value.tag == NERI_IR_TYPE_C_FUNCTION_V1 && !value.symbol &&
+         value.element_count == 0U && !value.arguments.empty() &&
+         is_c_abi_type(value.arguments.front(), true) &&
+         std::ranges::all_of(value.arguments.begin() + 1, value.arguments.end(),
+             [](const type &argument) { return is_c_abi_type(argument, false); });
+}
+
 [[nodiscard]] bool is_nullable_pointer(const type &value) {
   return value.tag == NERI_IR_TYPE_OPTIONAL_V1 && !value.symbol.has_value() &&
-         value.arguments.size() == 1U && is_pointer(value.arguments.front());
+         value.arguments.size() == 1U &&
+         (is_pointer(value.arguments.front()) || is_c_function(value.arguments.front()));
 }
 
 [[nodiscard]] bool is_c_abi_type(const type &value, bool allow_void) {
-  return is_scalar(value) || is_pointer(value) || is_nullable_pointer(value) ||
+  return is_scalar(value) || is_pointer(value) || is_c_function(value) || is_nullable_pointer(value) ||
          (allow_void && is_void(value));
 }
 
@@ -139,7 +154,7 @@ constexpr std::string_view invalid_source = "NIR010";
 }
 
 [[nodiscard]] bool is_pointer_element(const type &value) {
-  return is_void(value) || is_scalar(value) ||
+  return is_void(value) || is_scalar(value) || is_c_function(value) ||
          (value.tag == NERI_IR_TYPE_NATIVE_RECORD_V1 && value.symbol && value.arguments.empty()) ||
          (value.tag == NERI_IR_TYPE_FIXED_ARRAY_V1 && !value.symbol && value.arguments.size() == 1U && value.element_count > 0U && is_pointer_element(value.arguments.front())) ||
          is_nullable_pointer(value) ||
@@ -155,7 +170,7 @@ constexpr std::string_view invalid_source = "NIR010";
 }
 
 [[nodiscard]] bool is_supported_value(const type &value) {
-  return is_scalar(value) || is_string(value) || is_class(value) ||
+  return is_scalar(value) || is_string(value) || is_class(value) || is_c_function(value) ||
          (value.tag == NERI_IR_TYPE_NATIVE_RECORD_V1 && is_pointer_element(value)) ||
          (value.tag == NERI_IR_TYPE_FIXED_ARRAY_V1 && is_pointer_element(value)) ||
          (is_pointer(value) && is_pointer_element(value.arguments.front())) ||
@@ -184,6 +199,8 @@ constexpr std::string_view invalid_source = "NIR010";
 }
 
 void require_result_type(const type &value, std::string_view description) {
+  if (value.tag == NERI_IR_TYPE_C_FUNCTION_V1 && !is_c_function(value))
+    fail(invalid_type, "C function signature requires C-compatible result and parameters.");
   if (!is_void(value) && !is_supported_value(value)) {
     fail(unsupported_feature,
          std::string(description) +
@@ -193,6 +210,8 @@ void require_result_type(const type &value, std::string_view description) {
 }
 
 void require_value_type(const type &value, std::string_view description) {
+  if (value.tag == NERI_IR_TYPE_C_FUNCTION_V1 && !is_c_function(value))
+    fail(invalid_type, "C function signature requires C-compatible result and parameters.");
   if (!is_supported_value(value)) {
     fail(unsupported_feature,
          std::string(description) +
@@ -409,6 +428,9 @@ void require_declared_type(const ir_module &module, const type &value,
   if (value.tag != NERI_IR_TYPE_FIXED_ARRAY_V1 && value.element_count != 0U)
     fail(invalid_type, "Only fixed arrays carry an element count.");
   require_value_type(value, description);
+  if (value.tag == NERI_IR_TYPE_C_FUNCTION_V1 &&
+      std::ranges::find(module.required_features, "c-interop-v1") == module.required_features.end())
+    fail(unsupported_feature, "C function types require c-interop-v1.");
   if (value.tag == NERI_IR_TYPE_NATIVE_RECORD_V1 || value.tag == NERI_IR_TYPE_FIXED_ARRAY_V1) {
     if (std::ranges::find(module.required_features, "native-records-v1") == module.required_features.end())
       fail(unsupported_feature, "Native aggregate types require native-records-v1.");
@@ -421,8 +443,9 @@ void require_declared_type(const ir_module &module, const type &value,
     fail(invalid_reference,
          std::string(description) + " references a missing class.");
   }
-  for (const auto &argument : value.arguments) {
-    if (!(is_pointer(value) && is_void(argument)))
+  for (std::size_t index = 0; index < value.arguments.size(); ++index) {
+    const auto &argument = value.arguments[index];
+    if (!((is_pointer(value) || (is_c_function(value) && index == 0U)) && is_void(argument)))
       require_declared_type(module, argument, description);
   }
 }
@@ -579,6 +602,49 @@ void require_binary(const function_context &context, const instruction &value,
   }
   return (effects & ~NERI_IR_EFFECT_NO_RETURN_V1) |
          (unsafe_call ? NERI_IR_EFFECT_UNSAFE_V1 : 0U);
+}
+
+[[nodiscard]] std::uint32_t verify_c_function_instruction(
+    function_context &context, const instruction &value) {
+  if (std::ranges::find(context.module.required_features, "c-interop-v1") ==
+      context.module.required_features.end())
+    fail(unsupported_feature, "C function instructions require c-interop-v1.");
+  if (value.opcode == NERI_IR_OPCODE_C_FUNCTION_ADDRESS_V1) {
+    verify_instruction_shape(value, 1U, 0U, 0U, true, false, false);
+    const std::vector<type> *parameters = nullptr;
+    const type *result = nullptr;
+    if (const auto *target = find_import(context.module, *value.symbol)) {
+      if (target->kind != NERI_IR_IMPORT_C_ABI_V1)
+        fail(invalid_reference, "C function address requires a C ABI import.");
+      parameters = &target->parameter_types;
+      result = &target->result_type;
+    } else if (const auto *target = find_function(context.module, *value.symbol)) {
+      if (target->export_name.empty())
+        fail(invalid_reference, "C function address requires an exported function.");
+      parameters = &target->parameter_types;
+      result = &target->result_type;
+    } else {
+      fail(invalid_reference, "C function address references a missing target.");
+    }
+    type signature{NERI_IR_TYPE_C_FUNCTION_V1, std::nullopt, {*result}};
+    signature.arguments.insert(signature.arguments.end(), parameters->begin(), parameters->end());
+    require_result_type(value, 0U, signature);
+    return 0U;
+  }
+  if (value.operands.size() < 2U)
+    fail(invalid_type, "Indirect C call requires a capability and callable.");
+  const auto &signature = definition_type(context, value.operands[1]);
+  if (!is_c_function(signature))
+    fail(invalid_type, "Indirect C call requires a non-null C function pointer.");
+  const auto &result = signature.arguments.front();
+  verify_instruction_shape(value, is_void(result) ? 0U : 1U,
+                           signature.arguments.size() + 1U, 0U, false, false, false);
+  require_operand_type(context, value, 0U,
+                       type{NERI_IR_TYPE_UNSAFE_CAPABILITY_V1, std::nullopt, {}});
+  for (std::size_t index = 1U; index < signature.arguments.size(); ++index)
+    require_operand_type(context, value, index + 1U, signature.arguments[index]);
+  if (!is_void(result)) require_result_type(value, 0U, result);
+  return c_call_effects;
 }
 
 [[nodiscard]] std::uint32_t verify_virtual_call(function_context &context,
@@ -858,6 +924,9 @@ void require_binary(const function_context &context, const instruction &value,
     return verify_call(context, value, true);
   case NERI_IR_OPCODE_CALL_C_ABI_V1:
     return verify_call(context, value, true, false, true);
+  case NERI_IR_OPCODE_C_FUNCTION_ADDRESS_V1:
+  case NERI_IR_OPCODE_CALL_C_INDIRECT_V1:
+    return verify_c_function_instruction(context, value);
   case NERI_IR_OPCODE_CALL_UNSAFE_V1:
     return verify_call(context, value, false, false, false, true);
   case NERI_IR_OPCODE_ARRAY_NEW_V1: {
@@ -1411,6 +1480,18 @@ void verify_dominance(const function_context &context) {
 
 void verify_function(const ir_module &module, const function &value) {
   verify_location(value.location, module);
+  if (!value.export_name.empty()) {
+    if (std::ranges::find(module.required_features, "c-interop-v1") == module.required_features.end())
+      fail(unsupported_feature, "C exports require c-interop-v1.");
+    if (!portable_c_identifier(value.export_name) || value.export_name == "main" ||
+        value.export_name.starts_with("neri_") || value.export_name.starts_with("hk1_") ||
+        value.export_name.starts_with("__") ||
+        value.kind != NERI_IR_FUNCTION_V1 ||
+        !is_c_abi_type(value.result_type, true) ||
+        !std::ranges::all_of(value.parameter_types,
+            [](const type &parameter) { return is_c_abi_type(parameter, false); }))
+      fail(invalid_type, "C export requires a portable unreserved symbol and C-compatible top-level signature.");
+  }
   const auto is_method = value.kind == NERI_IR_STATIC_METHOD_V1 ||
                          value.kind == NERI_IR_INSTANCE_METHOD_V1 ||
                          value.kind == NERI_IR_CONSTRUCTOR_V1;
@@ -1643,7 +1724,7 @@ void verify_supported_module(const ir_module &value) {
            "Required feature '" + feature +
                "' is not a canonical feature identifier.");
     }
-    if (feature != "string-data-v1" && feature != "native-strings-v1" && feature != "native-libraries-v1" && feature != "extended-scalars-v1" && feature != "native-records-v1" && feature != "scoped-tasks-v1" && feature != "session-module-v1" && feature != "debug-scopes-v1" && feature != "retained-modules-v1") {
+    if (feature != "string-data-v1" && feature != "native-strings-v1" && feature != "native-libraries-v1" && feature != "extended-scalars-v1" && feature != "native-records-v1" && feature != "scoped-tasks-v1" && feature != "session-module-v1" && feature != "debug-scopes-v1" && feature != "retained-modules-v1" && feature != "c-interop-v1") {
       fail(unsupported_feature,
            "Unknown required semantic feature '" + feature + "'.");
     }
@@ -1877,10 +1958,11 @@ void verify_supported_module(const ir_module &value) {
     if (import.kind == NERI_IR_IMPORT_RUNTIME_V1) {
       verify_runtime_import(import);
     } else if (import.kind == NERI_IR_IMPORT_C_ABI_V1) {
-      const auto required_effects = NERI_IR_EFFECT_READ_V1 |
-                                    NERI_IR_EFFECT_WRITE_V1 |
-                                    NERI_IR_EFFECT_UNSAFE_V1;
-      if ((import.effects & required_effects) != required_effects) {
+      if (import.link_name == "neri_rt_v1_foreign_enter" ||
+          import.link_name == "neri_rt_v1_foreign_leave" ||
+          neri_abi_runtime_import(import.link_name.c_str()) != nullptr)
+        fail(invalid_reference, "C ABI import names a compiler-controlled runtime symbol.");
+      if ((import.effects & c_call_effects) != c_call_effects) {
         fail(invalid_safety,
              "C ABI import weakens the conservative effect contract.");
       }
@@ -1917,11 +1999,15 @@ void verify_supported_module(const ir_module &value) {
       links.emplace(import.link_name, &import);
     }
   }
+  std::set<std::string> exported_links;
   for (const auto &function : value.functions) {
     if (!declarations.insert(symbol_key(function.id)).second) {
       fail(malformed_module,
            "Function symbol duplicates another module declaration.");
     }
+    if (!function.export_name.empty() &&
+        (links.contains(function.export_name) || !exported_links.insert(function.export_name).second))
+      fail(invalid_reference, "C export link name conflicts with another export or import.");
   }
   for (const auto &function : value.functions) {
     verify_function(value, function);

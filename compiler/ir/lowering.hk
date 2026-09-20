@@ -382,6 +382,8 @@ class IrLowerer
         let function = new IrFunction(sourceFunction.symbol, sourceFunction.resultType, sourceFunction.kind, sourceFunction.unsafeCall, irNoLocation())
 
         function.retained = true
+        function.cExportSymbol = sourceFunction.cExportSymbol
+        this.module.requireFeature("c-interop-v1") if function.cExportSymbol != ""
         function.effects = sourceFunction.effects
         function.localEffects = sourceFunction.effects
         function.declaringClass = sourceFunction.declaringClass
@@ -418,6 +420,14 @@ class IrLowerer
       this.addRetainedName(classes, irTypeInner(typeName))
     else if kind == "fixed-array"
       this.addRetainedType(classes, irFixedArrayInner(typeName))
+    else if kind == "cabi"
+      let components = semanticCFunctionComponents(typeName)
+      var component = components.first.nextNode
+
+      while component != null
+        this.addRetainedType(classes, component.value)
+        component = component.nextNode
+      end
     else if kind == "array" || kind == "optional" || kind == "pointer"
       this.addRetainedType(classes, irTypeInner(typeName))
     end
@@ -499,6 +509,17 @@ class IrLowerer
   end
 
   def requireType(typeName: String): Void
+    if semanticIsCFunction(typeName)
+      this.module.requireFeature("c-interop-v1")
+      let components = semanticCFunctionComponents(typeName)
+      var component = components.first.nextNode
+
+      while component != null
+        this.requireType(component.value)
+        component = component.nextNode
+      end
+      return
+    end
     if irIsExtendedScalar(typeName)
       this.module.requireFeature("extended-scalars-v1")
       return
@@ -639,6 +660,8 @@ class IrLowerer
     end
     let function = new IrFunction(irSymbol(this.module.id, symbolKind, callable.fullName), irType(callable.returnType), functionKind, callable.isUnsafe, this.location(callable.boundNode))
 
+    function.cExportSymbol = callable.cExportSymbol
+    this.module.requireFeature("c-interop-v1") if callable.cExportSymbol != ""
     function.parallelCallees = new StringBuffer() if this.checkParallel
     function.parallelUnsafe = callable.isUnsafe
     if callable.className != "" && !represented
@@ -1170,6 +1193,10 @@ class IrLowerer
 
       context.function.localEffects = context.function.localEffects.mergedWith(new EffectSet().withRead().withUnsafe())
       return context.emitTyped(44, typeName, [this.currentUnsafe(context), pointer.id], typeName, location)
+    else if kind == "CFunction"
+      return irLowerCFunction(this, context, node)
+    else if kind == "CCall"
+      return irLowerCCall(this, context, node)
     else if kind == "Closure"
       return this.lowerClosure(context, node)
     else if kind == "Quotation"
@@ -1471,7 +1498,7 @@ class IrLowerer
     if value.typeName == target
       return value
     end
-    if irIsExtendedScalar(value.typeName) || irIsExtendedScalar(target)
+    if irIsExtendedScalar(value.typeName) || irIsExtendedScalar(target) || (value.typeName == "byte" && target == "float") || (value.typeName == "float" && target == "byte")
       context.function.localEffects = context.function.localEffects.withMayPanic()
       return context.emitValue(58, target, [value.id], this.location(node))
     end
@@ -2622,9 +2649,22 @@ class IrLowerer
 
   def lowerCAbiCall(context: IrFunctionContext, node: Int, callable: SemanticCallable): IrValue
     context.function.parallelUnsafe = true
-    if !this.hasImport(callable.fullName)
-      let declaration = new IrImport(irSymbol(this.module.id, 4, callable.fullName), irType(callable.returnType), 2, callable.cAbiSymbol, new EffectSet().withRead().withWrite().withUnsafe(), this.location(callable.boundNode))
+    this.requireCAbiImport(callable)
+    var operands: Int[] = [this.currentUnsafe(context)]
 
+    for value in this.lowerArguments(context, node, 0, callable)
+      operands = host.appendInt(operands, value)
+    end
+    context.function.localEffects = context.function.localEffects.mergedWith(irCAbiEffects())
+    return context.emitSymbol(33, irType(callable.returnType), operands, irSymbol(this.module.id, 4, callable.fullName), this.location(node))
+  end
+
+  def requireCAbiImport(callable: SemanticCallable): Void
+    this.module.requireFeature("c-interop-v1")
+    if !this.hasImport(callable.fullName)
+      let declaration = new IrImport(irSymbol(this.module.id, 4, callable.fullName), irType(callable.returnType), 2, callable.cAbiSymbol, irCAbiEffects(), this.location(callable.boundNode))
+
+      this.requireType(declaration.resultType)
       declaration.nativeLibrary = callable.nativeLibrary
       if callable.nativeLibrary != "" && !this.module.hasFeature("native-libraries-v1")
         this.module.requiredFeatures.add("native-libraries-v1")
@@ -2632,18 +2672,14 @@ class IrLowerer
       var parameter = callable.firstParameter
 
       while parameter != null
-        declaration.parameterTypes.add(irType(parameter.typeName))
+        let typeName = irType(parameter.typeName)
+
+        this.requireType(typeName)
+        declaration.parameterTypes.add(typeName)
         parameter = parameter.nextParameter
       end
       this.module.addImport(declaration)
     end
-    var operands: Int[] = [this.currentUnsafe(context)]
-
-    for value in this.lowerArguments(context, node, 0, callable)
-      operands = host.appendInt(operands, value)
-    end
-    context.function.localEffects = context.function.localEffects.mergedWith(new EffectSet().withRead().withWrite().withUnsafe())
-    return context.emitSymbol(33, irType(callable.returnType), operands, irSymbol(this.module.id, 4, callable.fullName), this.location(node))
   end
 
   def hasImport(name: String): Bool

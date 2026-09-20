@@ -159,6 +159,7 @@ class BootstrapBinder
     this.validateInheritedMembers()
     validateAbstractClasses(this)
     this.registerFunctions()
+    semanticValidateCDeclarations(this)
     registerContractRequirements(this)
     referenceGenericTemplateUses(this)
     validateConstrainedGenericFunctions(this)
@@ -406,6 +407,24 @@ class BootstrapBinder
   end
 
   def resolveTypeNode(node: Int, namespaceName: String, fieldName: String): String
+    if this.syntax.dataAt(node) == "cabi fn"
+      let components = new StringBuffer()
+      let count = this.syntax.childCountAt(node)
+
+      components.add(this.resolveTypeNode(this.syntax.childAt(node, count - 1), namespaceName, ""))
+      var index = 0
+
+      while index < count - 1
+        components.add(this.resolveTypeNode(this.syntax.childAt(node, index), namespaceName, ""))
+        index = index + 1
+      end
+      let signature = semanticCFunctionType(components)
+
+      if !semanticCAbiType(signature, false)
+        this.report("NR281", node, "C function signatures require C-compatible scalar, pointer, or function-pointer types.")
+      end
+      return signature
+    end
     if this.syntax.dataAt(node) == "#fields"
       let entity = this.resolveTypeNode(this.syntax.childAt(node, 0), namespaceName, "")
 
@@ -487,6 +506,10 @@ class BootstrapBinder
     end
     if semanticEndsWith(resolved, "Void?")
       this.report("NR167", node, "Type 'Void' cannot be optional.")
+      return "Error"
+    end
+    if !semanticArrayStorageValid(this.model, resolved)
+      this.report("NR282", node, "Managed arrays require scalar values or managed references; use native storage for pointers, C functions, and native aggregates.")
       return "Error"
     end
     this.recordTypeOccurrence(resolved, node)
@@ -595,7 +618,7 @@ class BootstrapBinder
     while semanticIsArray(baseName) || nativeFixedArray(baseName) || semanticIsOptional(baseName) || semanticIsPointer(baseName)
       baseName = semanticInnerType(baseName)
     end
-    if !semanticIsNumeric(baseName) && baseName != "Bool" && baseName != "Void" && !nativeValueType(semanticResolveType(this.model, baseName, this.currentNamespace))
+    if !semanticIsNumeric(baseName) && baseName != "Bool" && baseName != "Void" && baseName != "cabi fn" && !nativeValueType(semanticResolveType(this.model, baseName, this.currentNamespace))
       this.reportSecondary("NR191", node, "Type '" + baseName + "' cannot be the element type of a raw pointer.")
     end
   end
@@ -676,7 +699,7 @@ class BootstrapBinder
     end
     this.validatePointerType(typeNode, true)
     classSymbol.addField(new SemanticField(classSymbol.fullName, name, typeName, access, node))
-    this.recordDeclaration("field:" + classSymbol.fullName + "." + name, name, typeName, node, classSymbol.fullName + "." + name + ": " + typeName)
+    this.recordDeclaration("field:" + classSymbol.fullName + "." + name, name, typeName, node, classSymbol.fullName + "." + name + ": " + semanticCFunctionDisplay(typeName))
   end
 
   def registerMethod(classSymbol: SemanticClass, node: Int, validateAbstract: Bool = true): Void
@@ -809,6 +832,7 @@ class BootstrapBinder
     callable.bodyCount = bodyCount
     var annotationIndex = 0
     var sawCAbi = false
+    var sawExport = false
     var sawLibrary = false
     var sawIntrinsic = false
     var sawExact = false
@@ -832,6 +856,18 @@ class BootstrapBinder
         if semanticIntrinsic(this.model, callable.intrinsicName) == null
           this.report("NR247", annotationNode, "Annotation '@intrinsic' requires one supported intrinsic name.")
         end
+      else if annotationName == "cabiExport"
+        if sawExport
+          this.report("NR280", annotationNode, "Function annotation '@cabiExport' cannot be repeated.")
+        end
+        sawExport = true
+        callable.cExportSymbol = this.classAnnotationArgument(annotationNode)
+        if !semanticPortableCSymbol(callable.cExportSymbol)
+          this.report("NR280", annotationNode, "Annotation '@cabiExport' requires exactly one portable C symbol string.")
+        end
+        if !isUnsafe || classSymbol != null
+          this.report("NR280", functionNode, "A C export must be a module-level unsafe function.")
+        end
       else if annotationName == "library"
         if sawLibrary
           this.report("NR213", annotationNode, "Annotation '@library' cannot be repeated.")
@@ -847,10 +883,10 @@ class BootstrapBinder
         if !semanticNativeLibraryName(callable.nativeLibrary)
           this.report("NR213", annotationNode, "Annotation '@library' requires one library name: letters, digits, '_', '-', or '.', starting with a letter or digit.")
         end
-      else if annotationName != "cabi"
+      else if annotationName != "cabiImport"
         this.report("NR205", annotationNode, "Unknown function annotation '@" + annotationName + "'.")
       else if sawCAbi
-        this.report("NR206", annotationNode, "Function annotation '@cabi' cannot be repeated.")
+        this.report("NR206", annotationNode, "Function annotation '@cabiImport' cannot be repeated.")
       else
         sawCAbi = true
         if this.syntax.childCountAt(annotationNode) == 1
@@ -860,20 +896,23 @@ class BootstrapBinder
             callable.cAbiSymbol = host.stringSlice(rawSymbol, 1, host.stringByteLength(rawSymbol) - 2)
           end
         end
-        if callable.cAbiSymbol == ""
-          this.report("NR210", annotationNode, "Annotation '@cabi' requires exactly one portable C symbol string.")
+        if !semanticPortableCSymbol(callable.cAbiSymbol)
+          this.report("NR210", annotationNode, "Annotation '@cabiImport' requires exactly one portable C symbol string.")
         end
         if !isUnsafe
-          this.report("NR207", functionNode, "A '@cabi' declaration must use 'unsafe def'.")
+          this.report("NR207", functionNode, "A '@cabiImport' declaration must use 'unsafe def'.")
         end
         if bodyCount > 0
-          this.report("NR208", functionNode, "A '@cabi' declaration describes an external symbol and must have an empty body.")
+          this.report("NR208", functionNode, "A '@cabiImport' declaration describes an external symbol and must have an empty body.")
         end
       end
       annotationIndex = annotationIndex + 1
     end
     if sawLibrary && !sawCAbi
       this.report("NR213", functionNode, "Annotation '@library' requires a C ABI import.")
+    end
+    if sawExport && (sawCAbi || sawLibrary || sawIntrinsic || sawExact)
+      this.report("NR280", functionNode, "A C export cannot combine import, library, intrinsic, or exact annotations.")
     end
     var index = 0
     var sawDefault = false
@@ -915,6 +954,19 @@ class BootstrapBinder
       end
       index = index + 1
     end
+    if sawExport || (sawCAbi && abiRuntimeContract(callable.cAbiSymbol) == null)
+      if !semanticCAbiType(callable.returnType, true)
+        this.report("NR281", returnNode, "C ABI results require Void, scalars, pointers, or C function pointers.")
+      end
+      var parameter = callable.firstParameter
+
+      while parameter != null
+        if !semanticCAbiType(parameter.typeName, false) || parameter.hasDefault || parameter.mode != "ordinary"
+          this.report("NR281", parameter.syntaxNode, "C ABI parameters require scalar, pointer, or C function-pointer types without defaults or parameter modes.")
+        end
+        parameter = parameter.nextParameter
+      end
+    end
     if callable.intrinsicName != ""
       let intrinsic = semanticIntrinsic(this.model, callable.intrinsicName)
       var valid = false
@@ -942,11 +994,11 @@ class BootstrapBinder
       var separator = ""
 
       while parameter != null
-        display = display + separator + (parameter.mode == "labels" ? "labels " : "") + parameter.name + ": " + parameter.typeName
+        display = display + separator + (parameter.mode == "labels" ? "labels " : "") + parameter.name + ": " + semanticCFunctionDisplay(parameter.typeName)
         separator = ", "
         parameter = parameter.nextParameter
       end
-      display = display + "): " + returnType
+      display = display + "): " + semanticCFunctionDisplay(returnType)
       this.recordDeclaration("callable:" + fullName, name, returnType, functionNode, display)
     end
     return callable

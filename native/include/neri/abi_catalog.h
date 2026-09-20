@@ -6,7 +6,7 @@
 #include <string.h>
 
 #define NERI_RUNTIME_ABI_MAJOR UINT16_C(1)
-#define NERI_RUNTIME_ABI_MINOR UINT16_C(26)
+#define NERI_RUNTIME_ABI_MINOR UINT16_C(28)
 
 enum neri_ir_effect_v1 {
   NERI_IR_EFFECT_READ_V1 = UINT32_C(1),
@@ -72,6 +72,9 @@ static inline uint16_t neri_abi_symbol_minimum_minor(const char *link_name) {
   if (strcmp(link_name, "neri_rt_v1_stdin_read_line_optional") == 0 && result < UINT16_C(21)) result = UINT16_C(21);
   if (strcmp(link_name, "neri_rt_v1_host_canonical_path") == 0 && result < UINT16_C(23)) result = UINT16_C(23);
   if (strcmp(link_name, "neri_rt_v1_host_executable_path") == 0 && result < UINT16_C(26)) result = UINT16_C(26);
+  if (strncmp(link_name, "neri_rt_v1_foreign_", sizeof("neri_rt_v1_foreign_") - 1U) == 0 && result < UINT16_C(27)) result = UINT16_C(27);
+  if (strncmp(link_name, "neri_rt_v1_cache_", sizeof("neri_rt_v1_cache_") - 1U) == 0 && result < UINT16_C(28)) result = UINT16_C(28);
+  if (strcmp(link_name, "neri_rt_v1_stderr_write_bytes") == 0 && result < UINT16_C(28)) result = UINT16_C(28);
   if (strncmp(link_name, "neri_rt_v1_terminal_", sizeof("neri_rt_v1_terminal_") - 1U) == 0 && result < UINT16_C(8)) result = UINT16_C(8);
   if (strncmp(link_name, "neri_rt_v1_clock_", sizeof("neri_rt_v1_clock_") - 1U) == 0 && result < UINT16_C(8)) result = UINT16_C(8);
   if (strncmp(link_name, "neri_rt_v1_net_", sizeof("neri_rt_v1_net_") - 1U) == 0 && result < UINT16_C(7)) result = UINT16_C(7);

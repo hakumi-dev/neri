@@ -18,7 +18,9 @@ Neri LSP contracts verify style diagnostics and corrections with the default
 client settings.
 
 `smoke-test` selects the documented run/argument contracts; `negative-test` selects
-compiler diagnostics and runtime panics. Both commands first build a current
+compiler diagnostics and runtime panics. `cabi-test` selects the independent C
+host contracts for exports, typed function pointers, reentry, and generated
+C17/C++23 headers in Debug and Release. These commands first build a current
 fixed-point compiler and preserve the published toolchain. `native-test` selects
 the native probes. `test` (also named `check`) runs the full suite and publishes
 only after every contract passes.

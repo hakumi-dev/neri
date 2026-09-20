@@ -81,7 +81,8 @@ constexpr std::uint16_t native_class_runtime_minor = 4U;
 
 [[nodiscard]] bool is_nullable_pointer(const type &value) {
   return is_optional(value) && value.arguments.size() == 1U &&
-         value.arguments.front().tag == NERI_IR_TYPE_POINTER_V1;
+         (value.arguments.front().tag == NERI_IR_TYPE_POINTER_V1 ||
+          value.arguments.front().tag == NERI_IR_TYPE_C_FUNCTION_V1);
 }
 
 [[nodiscard]] bool uses_null_representation(const type &value) {
@@ -94,6 +95,19 @@ constexpr std::uint16_t native_class_runtime_minor = 4U;
 
 [[nodiscard]] bool contains_array(const type &value) {
   return is_array(value) || std::ranges::any_of(value.arguments, contains_array);
+}
+
+[[nodiscard]] bool owns_program_entry(const ir_module &module) {
+  return std::ranges::any_of(module.functions, [&](const function &value) {
+    return !value.retained && value.id.module == module.id &&
+           value.id.kind == NERI_IR_SYMBOL_FUNCTION_V1 && value.id.semantic_name == "main" &&
+           value.kind == NERI_IR_FUNCTION_V1 && value.parameter_types.empty() && is_void(value.result_type);
+  });
+}
+
+[[nodiscard]] bool has_c_export_definitions(const ir_module &module) {
+  return std::ranges::any_of(module.functions,
+      [](const function &value) { return !value.retained && !value.export_name.empty(); });
 }
 
 void append_hex(std::string &output, std::string_view value) {
@@ -166,6 +180,11 @@ void append_qualified_parts(std::vector<std::string_view> &parts,
     return "o" + type_code(value.arguments.front()) + "e";
   case NERI_IR_TYPE_POINTER_V1:
     return "p" + type_code(value.arguments.front()) + "e";
+  case NERI_IR_TYPE_C_FUNCTION_V1: {
+    auto result = "cf" + std::to_string(value.arguments.size() - 1U) + "_";
+    for (const auto &argument : value.arguments) result += type_code(argument) + "_";
+    return result + "e";
+  }
   case NERI_IR_TYPE_UNSAFE_CAPABILITY_V1:
     return "cu";
   case NERI_IR_TYPE_BORROW_CAPABILITY_V1:
@@ -203,6 +222,8 @@ public:
         retained_modules_(std::ranges::find(input.required_features,
                               "retained-modules-v1") != input.required_features.end()),
         aot_unit_(retained_modules_ && !input.session.has_value()),
+        c_library_module_(!retained_modules_ && !input.session.has_value() &&
+                          has_c_export_definitions(input) && !owns_program_entry(input)),
         emit_debug_information_(emit_debug_information),
         debug_sources_(debug_sources) {
     output_->setTargetTriple(triple);
@@ -223,6 +244,7 @@ public:
     declare_class_metadata();
     emit_session_exports();
     lower_functions();
+    emit_c_exports();
     if (debug_builder_ != nullptr) {
       debug_builder_->finalize();
     }
@@ -354,6 +376,14 @@ private:
           debug_type(value.arguments.front()), 64U, 64U, std::nullopt,
           "Pointer");
       break;
+    case NERI_IR_TYPE_C_FUNCTION_V1: {
+      std::vector<llvm::Metadata *> signature;
+      for (const auto &argument : value.arguments) signature.push_back(debug_type(argument));
+      result = debug_builder_->createPointerType(
+          debug_builder_->createSubroutineType(debug_builder_->getOrCreateTypeArray(signature)),
+          64U, 64U, std::nullopt, "CFunction");
+      break;
+    }
     case NERI_IR_TYPE_FIXED_ARRAY_V1: {
       auto *subrange =
           debug_builder_->getOrCreateSubrange(0, value.element_count);
@@ -960,7 +990,8 @@ private:
     [[nodiscard]] llvm::Value *lower_call_target(
         const instruction &instruction, const std::vector<type> &parameters,
         const type &result, llvm::Value *callee,
-        llvm::FunctionType *function_type, std::size_t operand_offset = 0U) {
+        llvm::FunctionType *function_type, std::size_t operand_offset = 0U,
+        bool c_abi = false) {
       std::vector<llvm::Value *> arguments;
       llvm::AllocaInst *result_slot = nullptr;
       if (is_indirect_optional(result)) {
@@ -985,6 +1016,7 @@ private:
                                            ? ""
                                            : "call.value");
       call->setCallingConv(llvm::CallingConv::C);
+      if (c_abi) module_.apply_c_abi_attributes(*call, parameters, result);
       if (is_indirect_optional(result)) {
         return builder_.CreateLoad(module_.semantic_type(result), result_slot,
                                    "call.result.value");
@@ -1004,7 +1036,7 @@ private:
         return lower_call_target(instruction, target.parameter_types,
                                  target.result_type, callee,
                                  callee->getFunctionType(),
-                                 has_capability ? 1U : 0U);
+                                 has_capability ? 1U : 0U, true);
       }
       const auto &target = module_.find_function(*instruction.symbol);
       auto *callee = module_.functions_.at(symbol_key(*instruction.symbol));
@@ -1446,6 +1478,21 @@ private:
       case NERI_IR_OPCODE_CALL_C_ABI_V1:
         result = lower_call(instruction, true, true);
         break;
+      case NERI_IR_OPCODE_C_FUNCTION_ADDRESS_V1: {
+        const auto key = symbol_key(*instruction.symbol);
+        if (const auto imported = module_.imports_.find(key); imported != module_.imports_.end())
+          result = imported->second;
+        else result = module_.c_exports_.at(key);
+        break;
+      }
+      case NERI_IR_OPCODE_CALL_C_INDIRECT_V1: {
+        const auto &signature = module_.value_type(input_, instruction.operands[1]);
+        const auto &return_type = signature.arguments.front();
+        const std::vector<type> parameters(signature.arguments.begin() + 1, signature.arguments.end());
+        result = lower_call_target(instruction, parameters, return_type,
+            value(instruction.operands[1]), module_.physical_function_type(parameters, return_type), 2U, true);
+        break;
+      }
       case NERI_IR_OPCODE_ARRAY_NEW_V1: {
         const auto &element = instruction.type_arguments.front();
         const auto count = static_cast<std::uint64_t>(instruction.operands.size());
@@ -1990,6 +2037,7 @@ private:
     case NERI_IR_TYPE_ARRAY_V1:
     case NERI_IR_TYPE_CLASS_V1:
     case NERI_IR_TYPE_POINTER_V1:
+    case NERI_IR_TYPE_C_FUNCTION_V1:
     case NERI_IR_TYPE_UNSAFE_CAPABILITY_V1:
     case NERI_IR_TYPE_BORROW_CAPABILITY_V1:
       return llvm::PointerType::getUnqual(context_);
@@ -2041,6 +2089,25 @@ private:
     }
     return llvm::FunctionType::get(physical_result_type(result), arguments,
                                    false);
+  }
+
+  template <typename Callable>
+  void apply_c_abi_attributes(Callable &target, const std::vector<type> &parameters,
+                             const type &result) const {
+    target.setCallingConv(llvm::CallingConv::C);
+    target.addFnAttr(llvm::Attribute::NoUnwind);
+    // Clang's C ABI extends uint8_t on SysV x86-64 and Apple AArch64.
+    // Win64 and AAPCS64 leave these values unextended in the LLVM signature.
+    const auto &triple = output_->getTargetTriple();
+    if (!((triple.getArch() == llvm::Triple::x86_64 && !triple.isOSWindows()) ||
+          (triple.getArch() == llvm::Triple::aarch64 && triple.isOSDarwin()))) return;
+    const auto byte = [](const type &value) {
+      return value.tag == NERI_IR_TYPE_BYTE_V1 || value.tag == NERI_IR_TYPE_BOOL_V1;
+    };
+    if (byte(result)) target.addRetAttr(llvm::Attribute::ZExt);
+    const auto offset = is_indirect_optional(result) ? 1U : 0U;
+    for (std::size_t index = 0; index < parameters.size(); ++index)
+      if (byte(parameters[index])) target.addParamAttr(index + offset, llvm::Attribute::ZExt);
   }
 
   [[nodiscard]] llvm::Constant *physical_scalar_constant(
@@ -2415,7 +2482,7 @@ private:
   }
 
   void apply_aot_symbol_visibility(llvm::GlobalValue &value) const {
-    if (!aot_unit_) return;
+    if (!aot_unit_ || value.hasLocalLinkage()) return;
     value.setVisibility(llvm::GlobalValue::HiddenVisibility);
     value.setDSOLocal(true);
   }
@@ -2670,26 +2737,19 @@ private:
   }
 
   void emit_program_requirements() {
-    if (aot_unit_) {
-      const auto owns_entry = std::ranges::any_of(
-          input_.functions, [&](const auto &function) {
-            return !function.retained && function.id.module == input_.id &&
-                   function.id.kind == NERI_IR_SYMBOL_FUNCTION_V1 &&
-                   function.id.semantic_name == "main" &&
-                   function.kind == NERI_IR_FUNCTION_V1 &&
-                   function.parameter_types.empty() &&
-                   function.result_type.tag == NERI_IR_TYPE_VOID_V1;
-          });
-      if (!owns_entry) return;
-    }
+    const auto has_c_exports = has_c_export_definitions(input_);
+    const auto owns_entry = owns_program_entry(input_);
+    if (aot_unit_ && !owns_entry && !has_c_exports) return;
+    const auto private_requirements = has_c_exports && !owns_entry;
     std::uint16_t minimum_minor = source_location_runtime_minor;
+    if (has_c_exports) minimum_minor = 27U;
     if (aot_unit_) {
       minimum_minor = std::max(minimum_minor, native_array_runtime_minor);
       minimum_minor = std::max(minimum_minor, native_class_runtime_minor);
     }
     std::uint64_t required_features = NERI_RT_FEATURE_SOURCE_LOCATIONS;
     if (input_.session.has_value()) {
-      minimum_minor = 19;
+      minimum_minor = std::max(minimum_minor, std::uint16_t{19});
       required_features |= NERI_RT_FEATURE_SESSION_MODULES;
     }
     if (std::ranges::find(input_.required_features, "extended-scalars-v1") != input_.required_features.end()) {
@@ -2770,11 +2830,12 @@ private:
                                 required_features)});
     auto *declaration = new llvm::GlobalVariable(
         *output_, requirements_type, true,
-        input_.session.has_value() ? llvm::GlobalValue::InternalLinkage
+        input_.session.has_value() || private_requirements ? llvm::GlobalValue::InternalLinkage
                                    : llvm::GlobalValue::ExternalLinkage,
-        requirements, "neri_program_v1_abi_requirements");
+        requirements, private_requirements ? ".neri.c_abi.requirements" : "neri_program_v1_abi_requirements");
     declaration->setAlignment(llvm::Align(8));
     apply_aot_symbol_visibility(*declaration);
+    program_requirements_ = declaration;
   }
 
   [[nodiscard]] llvm::GlobalVariable *string_literal_descriptor() {
@@ -2789,7 +2850,7 @@ private:
 
   void declare_globals() {
     for (const auto &global : input_.globals) {
-      const auto linkage = global.linkage == NERI_IR_GLOBAL_INTERNAL_V1
+      const auto linkage = c_library_module_ || global.linkage == NERI_IR_GLOBAL_INTERNAL_V1
                                ? llvm::GlobalValue::InternalLinkage
                                : llvm::GlobalValue::ExternalLinkage;
       if (is_string(global.value_type)) {
@@ -2841,6 +2902,7 @@ private:
             llvm::GlobalValue::ExternalLinkage, import.link_name, output_.get());
         created->setCallingConv(llvm::CallingConv::C);
         created->addFnAttr(llvm::Attribute::NoUnwind);
+        apply_c_abi_attributes(*created, import.parameter_types, import.result_type);
         const auto *contract = import.kind == NERI_IR_IMPORT_RUNTIME_V1
                                    ? neri_abi_runtime_import(import.link_name.c_str())
                                    : nullptr;
@@ -2863,7 +2925,7 @@ private:
                                  function.result_type),
           function.retained || retained_modules_
               ? llvm::GlobalValue::ExternalLinkage
-              : (input_.session.has_value() ? llvm::GlobalValue::InternalLinkage
+              : (input_.session.has_value() || c_library_module_ ? llvm::GlobalValue::InternalLinkage
                                             : llvm::GlobalValue::ExternalLinkage),
           mangle_function(function),
           output_.get());
@@ -2874,6 +2936,46 @@ private:
         declaration->addFnAttr(llvm::Attribute::NoReturn);
       }
       functions_.emplace(symbol_key(function.id), declaration);
+      if (!function.export_name.empty()) {
+        auto *entry = llvm::Function::Create(
+            physical_function_type(function.parameter_types, function.result_type),
+            llvm::GlobalValue::ExternalLinkage, function.export_name, output_.get());
+        apply_c_abi_attributes(*entry, function.parameter_types, function.result_type);
+        if (!function.retained && output_->getTargetTriple().isOSWindows())
+          entry->setDLLStorageClass(llvm::GlobalValue::DLLExportStorageClass);
+        if ((function.effects & NERI_IR_EFFECT_NO_RETURN_V1) != 0U)
+          entry->addFnAttr(llvm::Attribute::NoReturn);
+        c_exports_.emplace(symbol_key(function.id), entry);
+      }
+    }
+  }
+
+  void emit_c_exports() {
+    for (const auto &function : input_.functions) {
+      if (function.retained || function.export_name.empty()) continue;
+      if (program_requirements_ == nullptr)
+        throw codegen_error(std::string(lowering_error), "C export has no runtime requirements.");
+      auto *wrapper = c_exports_.at(symbol_key(function.id));
+      auto *body = llvm::BasicBlock::Create(context_, "entry", wrapper);
+      llvm::IRBuilder<> builder(body);
+      auto *word = output_->getDataLayout().getIntPtrType(context_);
+      constexpr auto token_words = sizeof(neri_foreign_entry_v1) / sizeof(std::uintptr_t);
+      auto *token_type = llvm::ArrayType::get(word, token_words);
+      auto *token = builder.CreateAlloca(token_type, nullptr, "foreign.entry");
+      auto *pointer = llvm::PointerType::getUnqual(context_);
+      auto *enter = runtime_function("neri_rt_v1_foreign_enter", builder.getVoidTy(), {pointer, pointer});
+      auto *leave = runtime_function("neri_rt_v1_foreign_leave", builder.getVoidTy(), {pointer});
+      builder.CreateCall(enter, {token, program_requirements_});
+      std::vector<llvm::Value *> arguments;
+      for (auto &argument : wrapper->args()) arguments.push_back(&argument);
+      auto *result = builder.CreateCall(functions_.at(symbol_key(function.id)), arguments);
+      if ((function.effects & NERI_IR_EFFECT_NO_RETURN_V1) != 0U) {
+        builder.CreateUnreachable();
+        continue;
+      }
+      builder.CreateCall(leave, {token});
+      if (is_void(function.result_type)) builder.CreateRetVoid();
+      else builder.CreateRet(result);
     }
   }
 
@@ -2943,11 +3045,16 @@ private:
   [[nodiscard]] llvm::Function *runtime_function(
       std::string_view name, llvm::Type *result,
       llvm::ArrayRef<llvm::Type *> parameters) {
+    auto *signature = llvm::FunctionType::get(result, parameters, false);
     if (auto *existing = output_->getFunction(name)) {
+      if (existing->getFunctionType() != signature)
+        throw codegen_error(std::string(lowering_error),
+                            "Runtime symbol has an incompatible LLVM signature: " +
+                                std::string(name) + ".");
       return existing;
     }
     auto *declaration = llvm::Function::Create(
-        llvm::FunctionType::get(result, parameters, false),
+        signature,
         llvm::GlobalValue::ExternalLinkage, name, output_.get());
     declaration->setCallingConv(llvm::CallingConv::C);
     declaration->addFnAttr(llvm::Attribute::NoUnwind);
@@ -3179,6 +3286,7 @@ private:
   std::unique_ptr<llvm::Module> output_;
   bool retained_modules_{};
   bool aot_unit_{};
+  bool c_library_module_{};
   bool emit_debug_information_{};
   const std::vector<std::pair<std::string, std::string>> &debug_sources_;
   std::unique_ptr<llvm::DIBuilder> debug_builder_;
@@ -3188,6 +3296,8 @@ private:
   std::map<decltype(symbol_key(symbol_id{})), llvm::GlobalVariable *> globals_;
   std::map<decltype(symbol_key(symbol_id{})), llvm::Function *> imports_;
   std::map<decltype(symbol_key(symbol_id{})), llvm::Function *> functions_;
+  std::map<decltype(symbol_key(symbol_id{})), llvm::Function *> c_exports_;
+  llvm::GlobalVariable *program_requirements_{};
   std::map<decltype(symbol_key(symbol_id{})), lowered_class> class_layouts_;
   std::map<decltype(symbol_key(symbol_id{})), lowered_field> field_layouts_;
   std::map<decltype(symbol_key(symbol_id{})), std::size_t>

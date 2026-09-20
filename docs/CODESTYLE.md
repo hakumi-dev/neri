@@ -117,8 +117,6 @@ ownership and references across units.
 The repository enables NRSTYLE007 for `compiler/`, `tooling/` and `stdlib/`.
 Tests can keep multiple types together to express a language contract.
 Standard-library modules declare their source files in `stdlib/manifest.json`.
-Bootstrap compatibility sources mirror the canonical compiler paths for the
-types that need a seed-compatible definition.
 
 ## Editor integration
 

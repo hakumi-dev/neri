@@ -26,7 +26,7 @@ Tools and these dependencies:
 
 - LLVM 22.1.8 and zstd.
 - CMake 3.28 or newer and Ninja 1.11 or newer.
-- `curl` for downloading the verified bootstrap seed.
+- `gzip` for unpacking the verified compiler IR seed included in the repository.
 
 ```sh
 brew install llvm@22 zstd cmake ninja
@@ -34,7 +34,7 @@ brew install llvm@22 zstd cmake ninja
 
 For native Windows x86-64 builds, use the [Windows build guide](WINDOWS.md).
 It covers the PowerShell 7 entry point, Visual Studio C++ and Windows SDK
-requirements, the pinned LLVM and GitHub Actions seed downloads, and the
+requirements, the pinned LLVM download, and the
 Windows CMake presets.
 
 Clone the source from GitHub, then run the following commands from its root:
@@ -59,9 +59,9 @@ neri check --project manifest.json --unit build
 neri check --project manifest.json --unit install
 ```
 
-The trusted bootstrap seed predates manifests. `scripts/build.sh` enumerates
-the bootstrap sources for the seed; the current compiler uses the root
-manifest for package installation and seed transport generation.
+The native backend materializes the checked-in IR seed as a host compiler.
+That compiler builds the Neri build driver through the root manifest. Every
+compiler generation uses the current compiler unit and standard library.
 
 ```sh
 scripts/build.sh doctor

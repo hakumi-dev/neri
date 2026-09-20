@@ -1,17 +1,38 @@
 # Runtime and IR boundary
 
 The canonical exported declarations and layouts are in
-[`runtime_abi.h`](../native/include/neri/runtime_abi.h). Runtime ABI 1.26 uses a
-C calling convention on macOS ARM64 and Linux x86-64. Generated programs negotiate
+[`runtime_abi.h`](../native/include/neri/runtime_abi.h). Runtime ABI 1.28 uses a
+C calling convention on macOS ARM64, Linux x86-64 and Windows x86-64. Generated programs negotiate
 major version, minimum minor version and required feature bits before execution.
 
-ABI 1.26 adds `neri_rt_v1_host_executable_path` under `BOOTSTRAP_HOST`.
+Checked C entry uses `neri_rt_v1_foreign_enter` and
+`neri_rt_v1_foreign_leave`. Each stack token records heap ownership and the
+outer root/borrow chains. Entries preserve initialized host heaps and reclaim
+their own temporary heaps on return. Explicit shutdown requires completed
+entries. [C interoperability](C-INTEROP.md) defines the public export, native
+function-pointer, thread, lifetime, and failure contracts.
+
+`neri_rt_v1_host_executable_path` belongs to `BOOTSTRAP_HOST`.
 `host.executablePath()` returns the canonical current process image path or
 `null`. It uses the operating system's process image API independently of user
 arguments: [dyld on macOS](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man3/dyld.3.html),
 [`/proc/self/exe` on Linux](https://www.man7.org/linux/man-pages/man5/proc_pid_exe.5.html),
 and [GetModuleFileNameW on Windows](https://learn.microsoft.com/en-us/windows/win32/api/libloaderapi/nf-libloaderapi-getmodulefilenamew).
 The package manifest also identifies the toolchain version and native target.
+
+Compiler cache metadata requires ABI 1.28. `neri_rt_v1_cache_supported` reports
+whether the current host supports persistent compiler caching: macOS ARM64 does;
+Linux and Windows use the normal build path. `neri_rt_v1_cache_metadata` returns
+normalized file kind, permission bits, real-user ownership and a 32-byte SHA-256
+fingerprint. The fingerprint covers device, inode, mode, owner, group, modification
+and change timestamps, and size, using fixed-width little-endian fields. Access
+time and platform structure padding are excluded. The `follow` flag selects
+`stat` or `lstat`; symbolic links remain distinguishable when it is false.
+Invalid arguments, unsupported hosts and filesystem failures return `-1`.
+Metadata is a snapshot and retains no handle. The compiler requires owned `0700`
+cache directories and owned regular executable files before accepting a hit.
+`neri_rt_v1_stderr_write_bytes` writes and flushes an explicit byte range to
+standard error, returning `0` on complete success and `-1` on failure.
 
 `neri_rt_v1_file_wait_readable(fd, milliseconds)` waits without consuming input.
 It returns `1` for readable input or EOF, `0` for timeout, `-2` for interruption
@@ -192,13 +213,22 @@ Runtime contract failures panic; no exception unwinds into Neri code.
 The compiler emits canonical Neri IR with transport 1.1, 1.2 for extended
 scalars or external library metadata, 1.3 for native records and fixed arrays,
 1.4 for `scoped-tasks-v1`, 1.5 for `session-module-v1`, 1.6 for
-`debug-scopes-v1`, and 1.7 for `retained-modules-v1`.
+`debug-scopes-v1`, 1.7 for `retained-modules-v1`, and 1.8 for `c-interop-v1`.
 The `native-libraries-v1` feature carries a library
 name after each import's source location; empty names retain platform-default
 symbol resolution. Only C ABI imports may declare a library. The transport header
 includes versions, flags, payload size and a SHA-256 digest. The native reader
 validates the envelope and the typed program before constructing LLVM objects.
 Malformed, unsupported and incompatible inputs produce stable NIR diagnostics.
+
+`c-interop-v1` carries each function's C export name after its retained flag
+when present and before its entry block. Type tag 22 carries a C function
+pointer: parameter count, result type, and parameter types. Its nullable form
+uses the null pointer representation. `cabi.address` (62) selects a declared
+C import or export; `call.cabi.indirect` (63) consumes an unsafe capability,
+a typed function pointer, and exactly matching arguments. C calls conservatively
+carry every may-effect, including collection and native allocation, and exclude
+the unconditional no-return effect. Exports use checked runtime entry wrappers.
 
 `retained-modules-v1` marks class shapes and function signatures whose storage
 and bodies are owned by an earlier immutable session module. Retained functions

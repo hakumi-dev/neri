@@ -1,95 +1,195 @@
-# Seed transport carries canonical IR, not executable code for the source host.
-def exportSeed(build: Build): Void
-  build.test()
-  let directory = build.root + "/build/seed-transport"
+use crypto
+use files
+use process
 
-  execute("mkdir", ["-p", directory])
-  build.compile(build.compiler, build.sourceFiles(), "neri-ir-hex", directory + "/compiler.nir.hex")
+# The producer inventory includes compiler and standard-library inputs.
+# Generated bootstrap artifacts belong to the separate validation inventory.
+def seedSourceManifest(build: Build): String
+  var paths: String[] = build.sourceFiles()
+
+  for source in build.standardLibrarySources()
+    paths = host.appendString(paths, build.root + "/stdlib/" + source)
+  end
+  for name in ["manifest.json", "stdlib/manifest.json"]
+    paths = host.appendString(paths, build.root + "/" + name)
+  end
+  for asset in build.templateAssets()
+    paths = host.appendString(paths, build.root + "/share/neri/templates/" + asset)
+  end
+  let manifest = new ToolingTextBuffer()
+
+  for path in paths
+    let relative = host.stringSlice(path, host.stringByteLength(build.root) + 1, host.stringByteLength(path) - host.stringByteLength(build.root) - 1)
+
+    manifest.add(build.digest(path) + "  " + relative + "\n")
+  end
+  return toolingText(manifest)
+end
+
+def seedCompileIR(build: Build, compiler: String, output: String): Void
+  let options = new process.SpawnOptions("/usr/bin/env")
   var arguments = build.environment()
 
-  for option in [build.compiler, "build", "--project", build.root + "/manifest.json", "--unit", "build", "--source-root", build.root,
-    "--module", "neri-build", "--emit=neri-ir-hex", "--output", directory + "/driver.nir.hex"]
-    arguments = host.appendString(arguments, option)
+  for argument in [compiler, "build", "--project", "manifest.json", "--unit", "compiler", "--source-root", "compiler",
+    "--module", "neri-compiler", "--target", build.target, "--release", "--emit=neri-ir-hex", "--output", output]
+    arguments = host.appendString(arguments, argument)
   end
-  execute("/usr/bin/env", arguments)
-  if build.capture(["git", "-C", build.root, "rev-parse", "HEAD"], "source-commit", 30) != 0
-    fail("cannot identify seed sources")
-  end
-  if !host.writeText(directory + "/commit.txt", requiredText(build.work + "/source-commit.stdout")) || !host.writeText(directory + "/SOURCE-MANIFEST.sha256", build.sourceManifest())
-    fail("cannot record seed source identity")
-  end
-  execute("cp", [build.root + "/build/current/ARTIFACTS.sha256", directory + "/frontend-artifacts.sha256"])
-  var manifest = ""
+  options.arguments = arguments
+  options.workingDirectory = build.root
+  let started = process.spawn(options)
+  let child = started.child()
 
-  for file in ["compiler.nir.hex", "driver.nir.hex", "commit.txt", "SOURCE-MANIFEST.sha256", "frontend-artifacts.sha256"]
-    manifest = manifest + build.digest(directory + "/" + file) + "  " + file + "\n"
+  if child == null || started.failure() != null
+    fail("cannot start canonical seed compiler")
+    return
   end
-  if !host.writeText(directory + "/SHA256SUMS", manifest)
-    fail("cannot record seed transport hashes")
+  var completed = child.wait(60000)
+  var attempts = 1
+
+  while completed.running && completed.failure == null && attempts < 30
+    completed = child.wait(60000)
+    attempts = attempts + 1
+  end
+  let status = completed.exit
+
+  if completed.failure != null || completed.running || status == null || status.kind != "exit" || status.value != 0
+    let errors = host.stringFromBytes(completed.stderr)
+
+    console.println(errors) if errors != null
+    child.dispose()
+    fail("canonical seed compiler failed")
+    return
+  end
+  if !child.dispose()
+    fail("cannot release canonical seed compiler")
   end
 end
 
-def seedArchive(build: Build, directory: String, transport: String): String
-  let name = "neri-bootstrap-seed-v1-" + build.target
-  let tree = directory + "/" + name
+# Each replacement is atomic; the metadata pin is published last. A launcher
+# rejects mixed generations, and detected publication failures restore backups.
+def seedPublish(build: Build, directory: String, validationInputs: String): Void
+  let names = ["compiler.nir.gz", "SOURCE-MANIFEST.sha256", "VALIDATION-SOURCE-MANIFEST.sha256", "seed.json"]
+  let lock = build.root + "/build/seed-refresh.lock"
 
-  execute("mkdir", ["-p", tree + "/bin", tree + "/lib"])
-  execute("cp", [build.compiler, tree + "/bin/neri"])
-  execute("cp", [build.nativeDirectory() + "/neri-codegen", tree + "/bin/neri-codegen"])
-  execute("cp", [build.nativeDirectory() + "/libneri-runtime.a", tree + "/lib/libneri-runtime.a"])
-  execute("cp", [build.nativeDirectory() + "/neri-runtime-" + build.target + ".json", tree + "/lib/neri-runtime-" + build.target + ".json"])
-  execute("cp", [transport + "/SOURCE-MANIFEST.sha256", tree + "/SOURCE-MANIFEST.sha256"])
-  if build.capture([build.llvm + "/bin/llvm-config", "--version"], "seed-llvm-version", 30) != 0
-    fail("cannot identify native LLVM")
+  if files.createDirectory(lock).failure != null
+    fail("seed publication is already active; inspect build/seed-refresh.lock before retrying")
+    return
   end
-  let provenance = "{\n  \"schemaVersion\": 1,\n  \"target\": \"" + build.target + "\",\n  \"sourceCommit\": \"" + lines(requiredText(transport + "/commit.txt"))[0] + "\",\n  \"llvmVersion\": \"" + lines(requiredText(build.work + "/seed-llvm-version.stdout"))[0] + "\",\n  \"verification\": \"transport-identity-native-fixed-point-and-language-contracts\",\n  \"sourceManifestSha256\": \"" + build.digest(tree + "/SOURCE-MANIFEST.sha256") + "\",\n  \"transportManifestSha256\": \"" + build.digest(transport + "/SHA256SUMS") + "\",\n  \"frontendArtifactManifestSha256\": \"" + build.digest(transport + "/frontend-artifacts.sha256") + "\",\n  \"runtimeManifest\": " + requiredText(tree + "/lib/neri-runtime-" + build.target + ".json") + "}\n"
+  if build.sourceManifest() != validationInputs
+    files.removeDirectory(lock)
+    fail("source tree changed before seed publication")
+    return
+  end
+  var existed: Bool[] = [false, false, false, false]
+  var index = 0
 
-  if !host.writeText(tree + "/PROVENANCE.json", provenance)
-    fail("cannot record seed provenance")
-  end
-  var hashes = ""
-  var members = ""
+  while index < names.Length
+    let path = build.root + "/bootstrap/" + names[index]
+    let inspected = files.status(path)
+    let state = inspected.status
 
-  for file in ["bin/neri", "bin/neri-codegen", "lib/libneri-runtime.a", "lib/neri-runtime-" + build.target + ".json", "SOURCE-MANIFEST.sha256", "PROVENANCE.json"]
-    hashes = hashes + build.digest(tree + "/" + file) + "  " + file + "\n"
-    members = members + name + "/" + file + "\n"
-  end
-  if !host.writeText(directory + "/files.sha256", hashes) || !host.writeText(directory + "/members", members)
-    fail("cannot record seed archive members")
-  end
-  execute("chmod", ["-R", "u=rwX,go=rX", tree])
-  execute(build.nativeDirectory() + "/neri-host", ["stamp", tree, "0"])
-  let archive = directory + "/" + name + ".tar"
+    if inspected.failure != null || state == null
+      files.removeDirectory(lock)
+      fail("cannot inspect previous seed generation")
+      return
+    end
+    existed[index] = state.exists
+    if state.exists
+      let copied = host.run("cp", [path, directory + "/previous-" + names[index]])
 
-  execute(build.target == "linux-x86_64" ? "bsdtar" : "tar", ["--format=ustar", "--uid", "0", "--gid", "0", "--uname", "root", "--gname", "root", "-cf", archive, "-C", directory, "-T", directory + "/members"])
-  execute("gzip", ["-n", archive])
-  return archive + ".gz"
+      if copied == null || copied != 0
+        files.removeDirectory(lock)
+        fail("cannot back up previous seed generation")
+        return
+      end
+    end
+    index = index + 1
+  end
+  index = 0
+  while index < names.Length
+    let name = names[index]
+    let promoted = files.move(directory + "/" + name, build.root + "/bootstrap/" + name)
+
+    if promoted.failure != null
+      var restored = true
+      var rollback = 0
+
+      while rollback < index
+        let previousName = names[rollback]
+        let destination = build.root + "/bootstrap/" + previousName
+
+        if existed[rollback]
+          restored = false if files.move(directory + "/previous-" + previousName, destination).failure != null
+        else
+          restored = false if files.removeFile(destination).failure != null
+        end
+        rollback = rollback + 1
+      end
+      files.removeDirectory(lock)
+      fail(restored ? "seed publication failed; previous generation restored" : "seed publication failed; restore backups from " + directory)
+      return
+    end
+    index = index + 1
+  end
+  if files.removeDirectory(lock).failure != null
+    fail("seed published but publication lock cleanup failed")
+  end
 end
 
-def prepareSeed(build: Build): Void
-  let transport = build.root + "/build/seed-transport"
-
-  build.test()
-  if build.sourceManifest() != requiredText(transport + "/SOURCE-MANIFEST.sha256")
-    fail("native seed sources differ from the verified transport")
+# Call only after the captured source tree completed Build.test successfully.
+def seedFromValidatedBuild(build: Build, inputs: String, validationInputs: String): Void
+  if seedSourceManifest(build) != inputs || build.sourceManifest() != validationInputs
+    fail("source tree changed during seed validation")
   end
-  build.compile(build.compiler, build.sourceFiles(), "neri-ir-hex", build.work + "/native-compiler.nir.hex")
-  execute("cmp", [transport + "/compiler.nir.hex", build.work + "/native-compiler.nir.hex"])
-  let first = seedArchive(build, build.work + "/seed-a", transport)
-  let second = seedArchive(build, build.work + "/seed-b", transport)
-
-  execute("cmp", [first, second])
-  let directory = build.root + "/build/seeds"
+  let directory = build.work + "/seed-refresh"
+  let relative = host.stringSlice(directory, host.stringByteLength(build.root) + 1, host.stringByteLength(directory) - host.stringByteLength(build.root) - 1)
 
   execute("mkdir", ["-p", directory])
-  let name = "neri-bootstrap-seed-v1-" + build.target + ".tar.gz"
+  seedCompileIR(build, build.work + "/stage2/neri", relative + "/compiler.stage2.nir.hex")
+  seedCompileIR(build, build.compiler, relative + "/compiler.nir.hex")
+  execute("cmp", [directory + "/compiler.stage2.nir.hex", directory + "/compiler.nir.hex"])
+  let decoded = crypto.decodeHex(requiredText(directory + "/compiler.nir.hex"), 134217728).bytes()
 
-  execute("cp", [first, directory + "/" + name])
-  execute("cp", [build.work + "/seed-a/files.sha256", directory + "/" + build.target + ".files.sha256"])
-  let pin = "repository=hakumi-dev/neri\ntag=bootstrap-seed-v1\nasset=" + name + "\nsha256=" + build.digest(first) + "\n"
-
-  if !host.writeText(directory + "/" + build.target + ".seed", pin)
-    fail("cannot record candidate seed pin")
+  if decoded == null || !host.writeBytes(directory + "/compiler.nir", decoded)
+    fail("cannot decode canonical seed IR")
+    return
   end
-  console.println("[seed] Verified candidate: " + directory + "/" + name)
+  let irDigest = build.digest(directory + "/compiler.nir")
+
+  execute("cp", [directory + "/compiler.nir", directory + "/compiler.repeat.nir"])
+  execute("gzip", ["-n", "-f", directory + "/compiler.nir"])
+  execute("gzip", ["-n", "-f", directory + "/compiler.repeat.nir"])
+  execute("cmp", [directory + "/compiler.nir.gz", directory + "/compiler.repeat.nir.gz"])
+  if seedSourceManifest(build) != inputs || build.sourceManifest() != validationInputs
+    fail("compiler inputs changed during seed generation")
+  end
+  if !host.writeText(directory + "/SOURCE-MANIFEST.sha256", inputs) || !host.writeText(directory + "/VALIDATION-SOURCE-MANIFEST.sha256", validationInputs)
+    fail("cannot record canonical seed source hashes")
+  end
+  let metadata = new ToolingTextBuffer()
+
+  metadata.add("{\n  \"schemaVersion\": 1,\n  \"format\": \"neri-ir-binary-gzip\",\n  \"artifact\": \"compiler.nir.gz\",\n")
+  metadata.add("  \"artifactSha256\": \"" + build.digest(directory + "/compiler.nir.gz") + "\",\n")
+  metadata.add("  \"irSha256\": \"" + irDigest + "\",\n  \"sourceManifest\": \"SOURCE-MANIFEST.sha256\",\n")
+  metadata.add("  \"sourceManifestSha256\": \"" + build.digest(directory + "/SOURCE-MANIFEST.sha256") + "\",\n")
+  metadata.add("  \"validationSourceManifestSha256\": \"" + build.digest(directory + "/VALIDATION-SOURCE-MANIFEST.sha256") + "\",\n")
+  metadata.add("  \"producerCompilerSha256\": \"" + build.digest(build.compiler) + "\",\n  \"workingDirectory\": \"repository-root\",\n")
+  metadata.add("  \"compilerArguments\": [\"build\", \"--project\", \"manifest.json\", \"--unit\", \"compiler\", \"--source-root\", \"compiler\", \"--module\", \"neri-compiler\", \"--target\", \"" + build.target + "\", \"--release\", \"--emit=neri-ir-hex\", \"--output\", \"" + relative + "/compiler.nir.hex\"],\n")
+  metadata.add("  \"binaryDecoding\": \"crypto.decodeHex\",\n  \"compressionArguments\": [\"gzip\", \"-n\", \"-f\", \"" + relative + "/compiler.nir\"],\n")
+  metadata.add("  \"verification\": {\n    \"fixedPoint\": true,\n    \"languageContracts\": true,\n    \"testSuite\": \"tooling/build.hk:Build.test\",\n    \"reproducibleCompression\": true\n  }\n}\n")
+  if !host.writeText(directory + "/seed.json", toolingText(metadata))
+    fail("cannot record canonical seed provenance")
+  end
+  seedPublish(build, directory, validationInputs)
+  console.println("[seed] Refreshed canonical compiler IR with verified source and artifact hashes")
+end
+
+def refreshSeed(build: Build): Void
+  build.nativeBuild()
+  build.startWork()
+  let inputs = seedSourceManifest(build)
+  let validationInputs = build.sourceManifest()
+
+  build.test()
+  seedFromValidatedBuild(build, inputs, validationInputs)
 end

@@ -3,6 +3,21 @@
 Neri compiles typed source to native code. Debug and Release preserve the same
 arithmetic, null, bounds, evaluation-order, and lifetime rules.
 
+## Find a language rule
+
+| Topic | Section |
+| --- | --- |
+| Tokens, precedence, evaluation order | [Source and expressions](#source-and-expressions) |
+| Numbers, strings, optionals, mutation | [Values and variables](#values-and-variables), [readonly views](#readonly-views) |
+| Declarations, visibility, inheritance | [Functions, modules and classes](#functions-modules-and-classes) |
+| Type parameters and constraints | [Generics](#generics), [generic contracts](#generic-contracts) |
+| Enumerated cases and matching | [Closed alternatives](#closed-alternatives) |
+| `fn`, captures, shared callbacks and tasks | [Function values and closures](#function-values-and-closures) |
+| C scalar types, records, pointers and borrows | [Unsafe and memory boundary](#unsafe-and-memory-boundary) |
+| `@cabiImport`, `@cabiExport`, `cabi fn`, C headers | [C interoperability](C-INTEROP.md) |
+| Disposal and resource scopes | [Resources](#resources) |
+| Run, check, build and emit | [Tooling](#tooling) |
+
 ## Source and expressions
 
 Names are case-sensitive Unicode identifiers. `#` introduces a line comment.
@@ -171,8 +186,9 @@ view alone is not proof of exclusive access or safe cross-thread sharing.
 ## Functions, modules and classes
 
 Functions declare parameter and return types. Trailing default arguments,
-recursion and forward calls are supported. A program defines exactly one
-non-namespaced top-level `main(): Void` with no parameters. Non-Void functions
+recursion and forward calls are supported. An executable unit defines exactly
+one non-namespaced top-level `main(): Void` with no parameters. Library units
+must not declare `main`. Non-Void functions
 return on every statically recognized path. Overloading is outside this surface.
 
 Calls to declared functions, methods and constructors accept named arguments:
@@ -208,7 +224,7 @@ parameter type through the ordinary inference and checking rules. For example,
 Function values retain their positional function-type contract; parameter labels
 are available on declared callables. Alternative-case payload construction and
 `native.*` intrinsic syntax use positional arguments. Declared `@intrinsic` and
-`@cabi` functions expose the labels in their Neri signatures. Arrays contain
+`@cabiImport` functions expose the labels in their Neri signatures. Arrays contain
 expressions rather than labeled arguments. Named calls to unsafe and C ABI
 declarations require every parameter explicitly (`NR275` for omitted defaults).
 
@@ -240,8 +256,9 @@ Declaration modifiers are keywords before `class` or `def`. When combined, they
 use this order: access (`public`, `internal`, `protected`, or `private`),
 `abstract` or `sealed`, `override`, `static`, `readonly`, `unsafe`, `resource`,
 then `class` or `def`. Only modifiers supported by that declaration kind may
-appear. Compiler annotations such as `@cabi`, `@intrinsic`, `@operator`,
-`@conversion`, `@exact`, `@operation`, and `@representation` remain annotations.
+appear. Compiler annotations such as `@cabiImport`, `@cabiExport`, `@intrinsic`,
+`@operator`, `@conversion`, `@exact`, `@operation`, and `@representation` remain
+annotations.
 
 Classes have single inheritance. Classes default to `internal`, fields to
 `private`, and methods to `public`. `internal` is module visibility, `private`
@@ -781,8 +798,18 @@ behavior; safe wrappers must restore the language invariants before returning.
 
 `borrow values as pointer ... end` exposes an unmanaged array payload for a
 lexical scope. The owner remains alive and its address stable. The pointer cannot
-escape the scope or acquire ownership. `@cabi("symbol")` on an empty unsafe
-function declaration imports a C symbol with supported scalar and pointer types.
+escape the scope or acquire ownership. `@cabiImport("symbol")` on an empty unsafe
+function declaration imports a C symbol with supported scalar, pointer, and
+native function-pointer types.
+
+`@cabiExport("symbol")` on a module-level `unsafe def` exposes its implementation
+through a C entry point. `cabi fn(Parameters): Result` is a typed, unmanaged C
+function pointer. Imported and exported functions supply these pointers in a
+typed context; invoking them requires `unsafe`. Parentheses make the whole
+pointer nullable: `(cabi fn(Int32): Int32)?`. Native function signatures accept
+C-compatible scalars, pointers, and native function pointers. Managed closures
+retain their separate `fn` contract. See [C interoperability](C-INTEROP.md) for
+library builds, generated headers, runtime entry, and callback lifetime.
 
 `@library("name")` on a C ABI declaration adds its external library when linking
 an executable that imports the function. The name is passed as one `-lname`
@@ -797,7 +824,7 @@ available to the operating system's loader when running the program.
 
 ```ruby
 @library("m")
-@cabi("cos")
+@cabiImport("cos")
 unsafe def cosine(value: Float): Float
 end
 ```
@@ -840,7 +867,10 @@ without executing language cleanup.
 
 ## Tooling
 
-`check` validates and emits canonical NIR by default. A source file without a
+`check` validates and emits readable NIR text by default. `--emit=neri-ir-hex`
+emits the hexadecimal encoding of the serialized NIR envelope consumed by the
+native backend; `--emit=neri-ir` selects the readable inspection format.
+A source file without a
 subcommand is equivalent to `run`. `build` emits an executable by default, named
 after the first source file without `.hk` in the working directory. `--output`
 overrides that path. Native emission defaults to the installed runtime manifest's

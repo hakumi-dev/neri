@@ -170,6 +170,7 @@ struct function final {
   std::uint32_t effects{};
   bool unsafe_call{};
   bool retained{};
+  std::string export_name;
   std::uint32_t entry_block{};
   std::optional<value_definition> unsafe_root;
   std::optional<symbol_id> declaring_class;

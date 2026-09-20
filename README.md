@@ -25,8 +25,8 @@ For other installation methods, see [standalone installation](docs/PACKAGING.md#
 or [building from source](docs/BUILDING.md).
 
 On Linux x86-64, follow [the GitHub source setup guide](docs/LINUX.md).
-It builds, tests and installs the complete compiler using the pinned Linux seed
-candidate from GitHub Actions. Downloading that candidate requires GitHub CLI access.
+It builds, tests and installs the complete compiler using the verified IR seed
+included in the repository.
 
 On native Windows x86-64, follow the [Windows build guide](docs/WINDOWS.md).
 It uses the Win32/MSVC ABI and PowerShell 7; WSL and MinGW are outside the

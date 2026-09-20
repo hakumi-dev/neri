@@ -34,7 +34,7 @@ try {
       $archive = Join-Path $downloads $pin.llvmArchive
       if (!(Test-Path $archive)) {
         Write-Host "Downloading LLVM $($pin.llvmVersion) development archive..."
-        Invoke-Checked gh @('release','download',"llvmorg-$($pin.llvmVersion)",'-R','llvm/llvm-project','-p',$pin.llvmArchive,'-D',$downloads)
+        Invoke-WebRequest -Uri "https://github.com/llvm/llvm-project/releases/download/llvmorg-$($pin.llvmVersion)/$($pin.llvmArchive)" -OutFile $archive
       }
       Assert-Hash $archive $pin.llvmSha256
       Invoke-Checked tar @('-xf',$archive,'-C',$tools)
@@ -52,58 +52,67 @@ try {
   Invoke-Checked ctest @('--test-dir',$native,'--output-on-failure','--no-tests=error')
   if ($Action -eq 'native') { return }
 
-  $transport = Join-Path $root 'build/seed-transport'
-  if (!(Test-Path "$transport/compiler.nir.hex")) {
-    Invoke-Checked gh @('run','download',$pin.seedRun,'-R',$pin.seedRepository,'-n',$pin.seedArtifact,'-D',$transport)
+  $seed = Get-Content "$root/bootstrap/seed.json" -Raw | ConvertFrom-Json
+  if ($seed.schemaVersion -ne 1 -or $seed.format -ne 'neri-ir-binary-gzip' -or
+      $seed.artifact -ne 'compiler.nir.gz' -or $seed.sourceManifest -ne 'SOURCE-MANIFEST.sha256') {
+    throw 'Unsupported canonical bootstrap seed metadata'
   }
-  Assert-Hash "$transport/compiler.nir.hex" $pin.seedCompilerSha256
-  if ((Get-Content "$transport/commit.txt" -Raw).Trim() -ne $pin.seedCommit) { throw 'Unexpected seed provenance' }
+  Assert-Hash "$root/bootstrap/compiler.nir.gz" $seed.artifactSha256
+  Assert-Hash "$root/bootstrap/SOURCE-MANIFEST.sha256" $seed.sourceManifestSha256
+  Assert-Hash "$root/bootstrap/VALIDATION-SOURCE-MANIFEST.sha256" $seed.validationSourceManifestSha256
   $work = Join-Path $root ("build/windows/work-" + [Guid]::NewGuid().ToString('N'))
   New-Item -ItemType Directory -Force $work | Out-Null
+  $compressed = [IO.File]::OpenRead("$root/bootstrap/compiler.nir.gz")
+  try {
+    $gzip = [IO.Compression.GZipStream]::new($compressed, [IO.Compression.CompressionMode]::Decompress)
+    try {
+      $binary = [IO.File]::Create("$work/seed.nir")
+      try { $gzip.CopyTo($binary) } finally { $binary.Dispose() }
+    } finally { $gzip.Dispose() }
+  } finally { $compressed.Dispose() }
+  Assert-Hash "$work/seed.nir" $seed.irSha256
   $env:NERI_STDLIB = Forward-Path "$root/stdlib"
   $env:NERI_HOST = Forward-Path "$native/neri-host.exe"
   $env:NERI_CODEGEN = Forward-Path "$native/neri-codegen.exe"
   $env:NERI_RUNTIME_MANIFEST = Forward-Path "$native/neri-runtime-windows-x86_64.json"
   $env:NERI_LINKER = Forward-Path "$env:LLVM_PREFIX/bin/clang++.exe"
   $env:TMPDIR = Forward-Path $work
-  $sources = @(Get-ChildItem -LiteralPath "$root/compiler" -Recurse -Filter '*.hk' -File |
-    Where-Object { (Forward-Path $_.FullName) -notmatch '/(frontend|semantic)/main\.hk$|/compiler/session/' } |
-    ForEach-Object { Forward-Path $_.FullName } | Sort-Object)
+  function Compiler-Sources {
+    @(Get-ChildItem -LiteralPath "$root/compiler" -Recurse -Filter '*.hk' -File |
+      Where-Object { (Forward-Path $_.FullName) -notmatch '/(frontend|semantic)/main\.hk$|/compiler/session/' } |
+      ForEach-Object { Forward-Path $_.FullName } | Sort-Object)
+  }
+  $sources = @(Compiler-Sources)
   [IO.File]::WriteAllLines("$work/compiler-sources.txt", $sources)
   $templateAssets = @("$root/share/neri/templates/declarations.json", "$root/share/neri/templates/declarations.schema.json")
-  $inventory = @(($sources + $templateAssets) | ForEach-Object { (Get-FileHash -LiteralPath $_).Hash + '  ' + $_ })
+  function Compiler-Inventory {
+    $library = @(Get-ChildItem -LiteralPath "$root/stdlib" -Recurse -File |
+      Where-Object { $_.Extension -in '.hk','.json' } | ForEach-Object { Forward-Path $_.FullName })
+    $inputs = @((Compiler-Sources) + $library + $templateAssets + @("$root/manifest.json", "$root/.editorconfig") | Sort-Object -Unique)
+    @($inputs | ForEach-Object { (Get-FileHash -LiteralPath $_).Hash + '  ' + $_ })
+  }
+  $inventory = @(Compiler-Inventory)
   [IO.File]::WriteAllLines("$work/SOURCE-MANIFEST.sha256", $inventory)
 
-  function Materialize([string]$IR, [string]$Stage) {
+  function Materialize([string]$IR, [string]$Format, [string]$Stage) {
     New-Item -ItemType Directory -Force $Stage | Out-Null
-    Invoke-Checked $env:NERI_CODEGEN @('--input',$IR,'--input-format','hex','--target','windows-x86_64','--optimization','release','--emit','object','--output',"$Stage/compiler.obj")
+    Invoke-Checked $env:NERI_CODEGEN @('--input',$IR,'--input-format',$Format,'--target','windows-x86_64','--optimization','release','--emit','object','--output',"$Stage/compiler.obj")
     Invoke-Checked $env:NERI_LINKER @("$Stage/compiler.obj","$native/neri-runtime.lib",'-o',"$Stage/neri.exe",'-lws2_32','-lbcrypt','-lshell32','-Wl,/Brepro')
   }
-  Materialize "$transport/compiler.nir.hex" "$work/stage0"
+  Materialize "$work/seed.nir" 'binary' "$work/stage0"
   for ($generation = 1; $generation -le 3; $generation++) {
     $stage = "$work/stage$generation"
     New-Item -ItemType Directory -Force $stage | Out-Null
     $previous = "$work/stage$($generation - 1)/neri.exe"
     Write-Host "Compiling generation $generation on Windows..."
-    if ($generation -eq 1) {
-      $stageSources = @($sources | ForEach-Object {
-        $relative = $_.Substring((Forward-Path $root).Length + 1)
-        $compatible = "$root/bootstrap/$relative"
-        if (Test-Path -LiteralPath $compatible) { Forward-Path $compatible } else { $_ }
-      })
-      $env:NERI_STDLIB = ''
-      $buildArguments = @('build') + $stageSources + @('--source-root', $root)
-    } else {
-      $env:NERI_STDLIB = Forward-Path "$root/stdlib"
-      $buildArguments = @('build','--project',"$root/manifest.json",'--unit','compiler','--source-root',"$root/compiler")
-    }
+    $buildArguments = @('build','--project',"$root/manifest.json",'--unit','compiler','--source-root',"$root/compiler")
     Invoke-Checked $previous ($buildArguments + @('--module','neri-compiler','--emit=neri-ir-hex','--output',"$stage/compiler.nir.hex"))
-    Materialize "$stage/compiler.nir.hex" $stage
+    Materialize "$stage/compiler.nir.hex" 'hex' $stage
   }
   foreach ($artifact in @('compiler.nir.hex','compiler.obj','neri.exe')) {
     Assert-Hash "$work/stage3/$artifact" (Get-FileHash "$work/stage2/$artifact").Hash
   }
-  $after = @(($sources + $templateAssets) | ForEach-Object { (Get-FileHash -LiteralPath $_).Hash + '  ' + $_ })
+  $after = @(Compiler-Inventory)
   if (Compare-Object $inventory $after) { throw 'Compiler sources changed during bootstrap' }
   Write-Host 'Verified native Windows compiler fixed point (IR, COFF and PE).'
 
@@ -113,6 +122,8 @@ try {
   Copy-Item "$work/stage3/neri.exe" "$tree/libexec/neri-compiler.exe"
   Copy-Item "$native/neri-codegen.exe","$native/neri-host.exe" "$tree/libexec"
   Copy-Item "$native/neri-runtime.lib","$native/neri-runtime-windows-x86_64.json" "$tree/lib"
+  New-Item -ItemType Directory -Force "$tree/include/neri" | Out-Null
+  Copy-Item "$root/native/include/neri/runtime_abi.h","$root/native/include/neri/abi_catalog.h" "$tree/include/neri"
   Copy-Item "$root/stdlib" "$tree/stdlib" -Recurse
   New-Item -ItemType Directory -Force "$tree/share/neri/templates" | Out-Null
   Copy-Item $templateAssets "$tree/share/neri/templates"
@@ -140,6 +151,7 @@ try {
   Invoke-Checked "$tree/bin/neri.exe" @("$root/examples/hello.hk")
   if ($Action -eq 'build') { Write-Host "Toolchain: $tree/bin/neri.exe"; return }
   Invoke-Checked node @("$PSScriptRoot/test-windows.mjs","$tree/bin/neri.exe",$native)
+  Invoke-Checked "$tree/bin/neri.exe" @('run','--project',"$root/tests/native/cabi-exports/manifest.json",'--unit','driver','--',"$tree/bin/neri.exe",$root,$native,"$env:LLVM_PREFIX/bin",'windows-x86_64',"$work/cabi-exports")
   & "$root/tests/windows-launcher.ps1" -Compiler "$tree/bin/neri.exe"
   [IO.File]::WriteAllText("$work/VALIDATED", "Windows native, language, UTF-8 paths and LSP contracts passed.`n")
   if ($Action -eq 'test') { Write-Host "Validated toolchain: $tree/bin/neri.exe"; return }

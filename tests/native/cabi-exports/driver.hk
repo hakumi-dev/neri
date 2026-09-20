@@ -1,0 +1,166 @@
+use console
+use files
+use host
+use process
+use test
+
+def argument(index: Int): String
+  let value = host.argumentAt(index)
+
+  test.assertTrue(value != null)
+  if value != null
+    return value
+  end
+  return ""
+end
+
+def text(bytes: Byte[]): String
+  let value = host.stringFromBytes(bytes)
+
+  test.assertTrue(value != null)
+  if value != null
+    return value
+  end
+  return ""
+end
+
+def contains(value: String, part: String): Bool
+  var offset = 0
+
+  while offset + host.stringByteLength(part) <= host.stringByteLength(value)
+    var matched = true
+    var index = 0
+
+    while matched && index < host.stringByteLength(part)
+      matched = host.stringByteAt(value, offset + index) == host.stringByteAt(part, index)
+      index = index + 1
+    end
+    if matched
+      return true
+    end
+    offset = offset + 1
+  end
+  return false
+end
+
+def execute(command: String, arguments: String[], status: Int, evidence: String): process.PollResult
+  let options = new process.SpawnOptions(command)
+
+  options.arguments = arguments
+  let started = process.spawn(options)
+  let child = started.child()
+
+  test.assertTrue(started.failure() == null && child != null)
+
+  if child == null
+    return new process.PollResult()
+  end
+  let completed = child.wait(60000)
+  let stdout = text(completed.stdout)
+  let stderr = text(completed.stderr)
+
+  test.assertTrue(host.writeText(evidence + ".stdout", stdout))
+  test.assertTrue(host.writeText(evidence + ".stderr", stderr))
+  test.assertTrue(completed.failure == null && !completed.running)
+  test.assertTrue(child.dispose())
+
+  let exit = completed.exit
+
+  if exit == null || exit.kind != "exit" || exit.value != status
+    console.println(command + " failed; evidence: " + evidence)
+    console.print(stdout)
+    console.print(stderr)
+  end
+
+  test.assertTrue(exit != null && exit.kind == "exit" && exit.value == status)
+  return completed
+end
+
+def main(): Void
+  let compiler = argument(0)
+  let root = argument(1)
+  let nativeDirectory = argument(2)
+  let llvm = argument(3)
+  let target = argument(4)
+  let work = argument(5)
+  let windows = target == "windows-x86_64"
+  let suffix = windows ? ".exe" : ""
+  let manifest = root + "/tests/native/cabi-exports/manifest.json"
+  let created = files.createDirectory(work, true)
+
+  test.assertTrue(created.failure == null)
+
+  let rejected = execute(compiler, ["check", root + "/tests/contracts/cabi-callback-errors.hk", "--target", target], 1, work + "/diagnostics")
+  let diagnostics = text(rejected.stdout) + text(rejected.stderr)
+
+  for expected in ["error NR280:", "error NR281:", "error NR282:", "error NR162:", "error NR189:", "error NR190:",
+    "C ABI results require", "C ABI parameters require", "does not match", "Managed closures cannot convert",
+    "Foreign entry runtime symbols are controlled by the compiler", "unsafe def forbiddenEnter", "unsafe def forbiddenLeave"]
+    if !contains(diagnostics, expected)
+      console.println("Missing C boundary rejection: " + expected)
+    end
+
+    test.assertTrue(contains(diagnostics, expected))
+  end
+  let cycle = execute(compiler, ["build", "--project", manifest, "--unit", "cycle", "--target", target,
+      "--emit=c-header", "--output", work + "/cycle.h"], 1, work + "/header-cycle")
+
+  test.assertTrue(contains(text(cycle.stdout) + text(cycle.stderr), "array element completeness dependencies form a cycle"))
+
+  let namesDirectory = work + "/header-names"
+  let namesCreated = files.createDirectory(namesDirectory, true)
+
+  test.assertTrue(namesCreated.failure == null)
+  test.assertTrue(host.writeText(namesDirectory + "/manifest.json", "{\"version\":2,\"defaultUnit\":\"fixture\",\"units\":{\"fixture\":{\"kind\":\"library\",\"sources\":[\"symbol.hk\"]}}}"))
+
+  for name in ["for", "class", "int32_t", "_foo", "app__hook"]
+    test.assertTrue(host.writeText(namesDirectory + "/symbol.hk", "@cabiExport(\"" + name + "\")\nunsafe def callable(): Int32\n  return 0 as Int32\nend\n"))
+
+    let base = namesDirectory + "/" + name
+
+    execute(compiler, ["build", "--project", namesDirectory + "/manifest.json", "--target", target,
+        "--emit=obj", "--output", base + ".o"], 0, base + "-object")
+    let header = execute(compiler, ["build", "--project", namesDirectory + "/manifest.json", "--target", target,
+        "--emit=c-header", "--output", base + ".h"], 1, base + "-header")
+
+    test.assertTrue(contains(text(header.stdout) + text(header.stderr), "cannot be declared portably in C and C++"))
+  end
+
+  for optimization in ["debug", "release"]
+    let output = work + "/" + optimization
+
+    for unit in ["fixture", "other"]
+      var build = ["build", "--project", manifest, "--unit", unit, "--target", target,
+        "--emit=obj", "--output", output + "-" + unit + ".o"]
+
+      build = host.appendString(build, "--release") if optimization == "release"
+      execute(compiler, build, 0, output + "-" + unit + "-build")
+      let name = unit == "fixture" ? "app" : "other"
+
+      execute(compiler, ["build", "--project", manifest, "--unit", unit, "--target", target,
+          "--emit=c-header", "--output", work + "/" + name + "_exports.h"], 0, output + "-" + unit + "-header")
+    end
+    let source = root + "/tests/native/cabi_exports.c"
+
+    execute(llvm + "/clang" + suffix, ["-std=c17", "-Wall", "-Wextra", "-Werror", "-I", work,
+        "-c", source, "-o", work + "/host.o"], 0, output + "-host")
+    execute(llvm + "/clang++" + suffix, ["-std=c++23", "-Wall", "-Wextra", "-Werror", "-x", "c++", "-I", work,
+        "-fsyntax-only", source], 0, output + "-cpp-header")
+    let runtime = nativeDirectory + (windows ? "/neri-runtime.lib" : "/libneri-runtime.a")
+    var link = [work + "/host.o", output + "-fixture.o", output + "-other.o", runtime, "-o", output + suffix]
+
+    if windows
+      for library in ["-lws2_32", "-lbcrypt", "-lshell32"]
+        link = host.appendString(link, library)
+      end
+    else
+      link = host.appendString(link, "-pthread")
+      link = host.appendString(link, "-lcrypto") if target == "linux-x86_64"
+    end
+    execute(llvm + "/clang++" + suffix, link, 0, output + "-link")
+    execute(output + suffix, [], 0, output + "-run")
+    let panic = execute(output + suffix, ["panic"], 70, output + "-panic")
+
+    test.assertTrue(contains(text(panic.stderr), "NRP002"))
+  end
+end

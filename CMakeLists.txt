@@ -134,7 +134,7 @@ endif()
 
 find_package(Threads REQUIRED)
 if(WIN32)
-  set(NERI_PLATFORM_SOURCES native/platform/socket_windows.c native/platform/terminal_windows.c native/platform/windows_seed_compat.cpp)
+  set(NERI_PLATFORM_SOURCES native/platform/socket_windows.c native/platform/terminal_windows.c)
 else()
   set(NERI_PLATFORM_SOURCES native/platform/socket_posix.c native/platform/terminal_posix.c)
 endif()
@@ -143,6 +143,7 @@ add_library(neri_runtime STATIC
   native/platform/drain.cpp
   native/platform/directory.cpp
   native/platform/files.cpp
+  native/platform/cache.cpp
   native/platform/crypto.c
   native/platform/host.cpp
   native/platform/posix_launch.cpp
@@ -229,6 +230,14 @@ if(BUILD_TESTING)
   target_link_libraries(neri_abi_probe PRIVATE neri_build_options neri_runtime)
   add_test(NAME native_abi COMMAND neri_abi_probe)
 
+  add_executable(neri_foreign_entry tests/native/foreign_entry.c)
+  target_link_libraries(neri_foreign_entry PRIVATE neri_build_options neri_runtime Threads::Threads)
+  if(NERI_THREAD_SANITIZER)
+    target_compile_options(neri_foreign_entry PRIVATE -fsanitize=thread -fno-omit-frame-pointer)
+  endif()
+  add_test(NAME native_foreign_entry COMMAND neri_foreign_entry)
+  set_tests_properties(native_foreign_entry PROPERTIES TIMEOUT 30)
+
   add_executable(neri_string_probe tests/native/string_runtime_probe.cpp)
   target_link_libraries(neri_string_probe PRIVATE neri_build_options neri_runtime)
   add_test(NAME native_strings COMMAND neri_string_probe)
@@ -272,10 +281,11 @@ endif()
 set(NERI_ABI_FEATURES "${CMAKE_MATCH_1}")
   file(GENERATE
     OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/${NERI_MANIFEST_NAME}"
-    CONTENT "{\n  \"schemaVersion\": 2,\n  \"toolchainVersion\": \"${NERI_MANIFEST_VERSION}\",\n  \"irTransportMajor\": 1,\n  \"irTransportMinor\": 7,\n  \"target\": \"${NERI_TARGET}\",\n  \"abiMajor\": 1,\n  \"abiMinor\": ${NERI_ABI_MINOR},\n  \"features\": ${NERI_ABI_FEATURES},\n  \"artifact\": \"$<TARGET_FILE_NAME:neri_runtime>\"\n}\n"
+    CONTENT "{\n  \"schemaVersion\": 2,\n  \"toolchainVersion\": \"${NERI_MANIFEST_VERSION}\",\n  \"irTransportMajor\": 1,\n  \"irTransportMinor\": 8,\n  \"target\": \"${NERI_TARGET}\",\n  \"abiMajor\": 1,\n  \"abiMinor\": ${NERI_ABI_MINOR},\n  \"features\": ${NERI_ABI_FEATURES},\n  \"artifact\": \"$<TARGET_FILE_NAME:neri_runtime>\"\n}\n"
   )
 install(TARGETS neri_codegen_cli neri_runtime RUNTIME DESTINATION bin ARCHIVE DESTINATION lib)
 if(APPLE)
   install(TARGETS neri_session_object_linker LIBRARY DESTINATION lib)
 endif()
 install(FILES "${CMAKE_CURRENT_BINARY_DIR}/neri-runtime-${NERI_TARGET}.json" DESTINATION lib)
+install(FILES native/include/neri/runtime_abi.h native/include/neri/abi_catalog.h DESTINATION include/neri)

@@ -1,5 +1,10 @@
 # Compilation projects
 
+`manifest.json` defines source ownership, library dependencies and workspace
+membership. Use [workspace members](#workspace-members) for `projects` versus
+`references`, [registered tests](#registered-project-tests) for test discovery,
+and [command line](#command-line) for unit selection.
+
 `neri project-units --project <directory|manifest.json>` lists each executable
 unit with each owned source, separated by a tab. Automation can select source
 roles from this validated membership instead of deriving a unit name from a
@@ -39,7 +44,7 @@ directory layout:
 The manifest uses strict JSON. Unknown keys, duplicate keys, trailing content,
 and values with incorrect types are configuration errors, including in units
 other than the selected unit. `exclude`, `references` and `generated` are optional.
-Existing `neri.json` manifests remain supported; a project directory must
+The accepted filenames are `manifest.json` and `neri.json`; a project directory must
 contain at most one of the two filenames.
 
 `defaultUnit` selects the unit used when the command does not pass `--unit`.
@@ -57,9 +62,14 @@ source file are configuration errors. A diamond dependency is loaded once.
 
 ## Workspace members
 
+| Manifest field | Makes available | Effect on tests |
+| --- | --- | --- |
+| Unit `references` | Library declarations in that unit's compilation closure | Does not register the referenced project's executable tests |
+| Top-level `projects` | Member units for project-wide inventory and operations | Registers the member's explicitly declared test units |
+
 The optional top-level `projects` array declares other manifests that belong to
 the same workspace. Each entry is a relative path ending in `manifest.json` or
-legacy `neri.json`, using the same normalized path rules as an external unit
+`neri.json`, using the same normalized path rules as an external unit
 reference. Entries are literal paths and are not interpolated. Duplicate entries
 are configuration errors.
 
@@ -75,6 +85,22 @@ adds a library to one compilation closure without registering the external
 project's tests. A path in `projects` registers the member's declared test units
 for project-wide test operations even when no root unit references them.
 
+```mermaid
+flowchart LR
+    Root["Root manifest"] -->|projects| Tools["Tools manifest"]
+    Web["web executable"] -->|references| Core["core library"]
+    Tools -->|owns| Check["check executable with test metadata"]
+    Root -->|owns| Web
+    Root -->|owns| Core
+    Run["neri test --project ."] -->|inventories| Root
+    Run -->|builds and runs registered test| Check
+```
+
+In this graph, `web` can use `core` declarations. The `check` test is discovered
+through `projects`; accessing `core` from `check` additionally requires a library
+reference. Owning an executable does not register it as a test without `test`
+metadata.
+
 ## Sources and exclusions
 
 Each `sources` entry is relative to the manifest and is either an explicit
@@ -83,7 +109,7 @@ recursively. `exclude` entries are literal relative files or directory
 subtrees. Version 2 does not support globs.
 
 Discovery skips symlinks, generated-output directories, and descendant
-directories containing their own `manifest.json` or legacy `neri.json`. The generated directories are
+directories containing their own `manifest.json` or `neri.json`. The generated directories are
 `.git`, `.neri`, `.cache`, `.idea`, `.bootstrap`, `build`, `out`, `dist`,
 `target`, and `bin`. Manifest aliases resolve to canonical paths, but discovery
 does not follow symlinks. `.hk` basenames must not contain whitespace, including
@@ -103,6 +129,11 @@ and original-source navigation.
 
 Libraries must not declare `main`. Executable units must declare exactly one
 `main`; additional entry points are rejected by the binder.
+
+A library unit can expose C-callable functions with `@cabiExport`.
+`build --emit=obj` emits its linkable native object, and `build --emit=c-header`
+emits the corresponding public declarations and reachable native record layouts.
+See [C interoperability](C-INTEROP.md) for host linking and runtime ownership.
 
 ## Registered project tests
 
@@ -154,16 +185,20 @@ several programs. The original semantic error remains the primary diagnostic.
 
 ## Standard-library sources
 
-The compiler and language server resolve the leading identifier of a `use`
-declaration against `<NERI_STDLIB>/<identifier>.hk`. Available library sources
-are loaded once, including their transitive imports and cycles. Names supplied
-by the program or built-in libraries use ordinary semantic resolution; unresolved
-imports produce compiler diagnostics. The toolchain launcher sets `NERI_STDLIB`
-to its own library directory.
+The compiler and language server resolve standard-library module names through
+`<NERI_STDLIB>/manifest.json`. Each module is a library unit and may own multiple
+`.hk` files. The `core` unit must include `core.hk`. Sources must remain inside
+the standard-library directory. Without that manifest, module lookup uses
+`<NERI_STDLIB>/<identifier>.hk`.
+
+Available sources are loaded once, including transitive imports and cycles.
+Names supplied by the program or built-in libraries use ordinary semantic
+resolution; unresolved imports produce compiler diagnostics. The toolchain
+launcher selects its library directory through `NERI_STDLIB`.
 
 ## Language server
 
-For each document, the server selects the nearest ancestor `manifest.json` or legacy `neri.json`, stopping
+For each document, the server selects the nearest ancestor `manifest.json` or `neri.json`, stopping
 at the workspace root for documents inside it. Nested manifests are independent
 project boundaries. Within a v2 manifest, a source is analyzed in the unit that
 owns it. This is important for shared code: opening a library source selects the
@@ -181,15 +216,17 @@ contents for subsequent analysis.
 
 A `workspace/didChangeWatchedFiles` notification reloads manifests and automatic
 directory membership. Clients must report create, change and delete events for
-closed `.hk` files, source directories, and relevant `manifest.json` or legacy `neri.json` files. This
+closed `.hk` files, source directories, and relevant `manifest.json` or `neri.json` files. This
 makes newly created or removed sources, exclusions, references, and nested
 project boundaries take effect without restarting the server.
 
 Compilation units describe source and type dependencies. The compiler flattens
 only the selected unit's reference closure into one analysis. Declared workspace
 members provide a bounded project-wide inventory without inferring membership
-from the directory tree. Neri does not provide dependency artifacts, version
-resolution, fetching, incremental graph caching, or background cancellation.
+from the directory tree. Neri does not provide dependency artifact distribution,
+package version resolution or package fetching. Agent operations reuse unchanged
+unit analyses as described in
+[revisions and snapshots](AGENT-FEEDBACK.md#revisions-and-snapshots).
 
 ## Contract project discovery
 

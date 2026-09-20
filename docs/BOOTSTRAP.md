@@ -1,122 +1,173 @@
 # Bootstrapping Neri
 
+This page defines the seed trust boundary, compiler fixed point and seed-refresh
+contract. For dependency installation, use [Building](BUILDING.md) or
+[Windows](WINDOWS.md). Run the commands below from the repository root.
+
+| Task | Entry point | Result |
+| --- | --- | --- |
+| Build native components without a seed | `scripts/build-native.sh` | Native backend, runtime and host helper |
+| Bootstrap on macOS or Linux | `scripts/build.sh bootstrap` | Fixed-point compiler tuple selected by `build/current` |
+| Validate before publishing a compiler tuple | `scripts/build.sh test` | Native and language contracts pass before publication |
+| Regenerate the canonical seed | `scripts/build.sh refresh-seed` | Validated seed candidate and provenance replace the previous set |
+| Build and test on Windows | `scripts/build.ps1 -Action test` | Windows fixed point and platform contracts |
+
+The last four entries require the complete seed artifact set below. Native-only
+compilation does not establish compiler or seed validation.
+
+## Required seed artifacts
+
+Bootstrapping requires these four files together. The launcher fails when a
+file is absent or a digest does not match.
+
+| File under `bootstrap/` | Contract |
+| --- | --- |
+| `compiler.nir.gz` | Canonical binary Neri IR, compressed with `gzip -n` |
+| `SOURCE-MANIFEST.sha256` | Exact compiler, standard-library, manifest and template inputs |
+| `VALIDATION-SOURCE-MANIFEST.sha256` | Broader source snapshot used by the validation run |
+| `seed.json` | Artifact, IR and manifest hashes; producer identity, arguments and validation record |
+
+[`scripts/build.sh`](../scripts/build.sh) and
+[`scripts/build.ps1`](../scripts/build.ps1) require these files and verify their
+hashes. They do not fetch an alternate compiler when a file is missing.
+
 ## Trust root
 
-The pinned `v0.2.0-dev` release is the bootstrap input for `macos-arm64`.
-Its provenance records fixed-point and native/language verification and the
-provenance digest of its predecessor, `bootstrap-seed-v1`. The archive and
-extracted compiler/native artifacts are independently pinned in this repository.
+The seed format is canonical binary compiler IR in `bootstrap/compiler.nir.gz`, compressed
+with gzip's filename and timestamp metadata disabled. The same seed is used on
+macOS ARM64, Linux x86-64 and Windows x86-64. The host's C++ toolchain builds
+Neri's native backend and runtime, which materialize this IR as the Stage0
+compiler.
 
-The seed contains:
+The `bootstrap/seed.json` schema records SHA-256 digests for the compressed artifact, its
+uncompressed IR and `bootstrap/SOURCE-MANIFEST.sha256`. That source manifest
+records repository-relative paths and exact content hashes for the seed's
+inputs. Generated seed artifacts are excluded from their own source inventory.
+The provenance identifies the producing compiler and compilation arguments.
+`bootstrap/VALIDATION-SOURCE-MANIFEST.sha256` identifies the broader source tree
+used for verification, including native code, tooling and tests. Its digest is
+also recorded in the seed metadata. It records the bootstrap inputs present
+during that verification run.
 
-- a Neri-native compiler executable;
-- the C++ `neri-codegen` executable;
-- the C++ Neri runtime archive and manifest.
+The launcher verifies the seed's artifact, IR and source-manifest digests before
+executing it. Ordinary builds can compile changed sources using the fixed seed;
+the current checkout need not match the seed's source inventory. Refreshing the
+seed verifies source identity throughout generation and validation.
 
-The compiler is invoked directly at `libexec/neri`; the package's user-facing
-`bin/neri` wrapper is not used for bootstrap. The extracted cache directory
-includes the archive digest so an earlier seed cache remains untouched.
-
-`SOURCE-MANIFEST.sha256` identifies the compiler, native implementation, native
-test inputs, CMake configuration, and version used to produce and verify the seed.
-
-`bootstrap/macos-arm64.seed` pins the release, asset name, and archive SHA-256. `scripts/fetch-bootstrap-seed.sh` rejects any mismatch before extracting or executing the seed. `bootstrap/macos-arm64.files.sha256` pins the extracted tools, runtime manifest, and provenance; these hashes are checked on every cached-seed launch.
+The seed IR, native backend, runtime and host toolchain form the trust
+root. Content hashes detect mismatched artifacts; fixed-point checks establish
+reproducibility for the checked sources and toolchain.
 
 ## Fixed point
 
-`scripts/build.sh bootstrap` compiles the Neri driver with the trusted seed.
-The driver builds the native backend and runtime from this checkout, then performs
-three generations in an isolated `build/work.*` directory:
+The Unix flow is implemented by [the launcher](../scripts/build.sh) and
+[`Build.bootstrap`](../tooling/build.hk):
 
-1. the trusted seed compiles `compiler/` into Stage1;
-2. Stage1 compiles the same sources into Stage2;
-3. Stage2 compiles the same sources into Stage3;
-4. Stage1 and Stage2 must emit byte-identical canonical NIR and objects, and
+```mermaid
+flowchart TD
+  Native["Current C++ backend and runtime"] --> Materialize["Verify and materialize canonical seed IR"]
+  Seed["Seed artifact set"] --> Materialize
+  Materialize --> S0["Stage0 compiler"]
+  S0 --> Driver["Compile current Neri build driver"]
+  Driver --> Stages["Orchestrate compiler generations"]
+  S0 -->|"Current compiler sources"| S1["Stage1"]
+  S1 -->|"Same sources"| S2["Stage2"]
+  S2 -->|"Same sources"| S3["Stage3"]
+  Stages -.-> S1
+  S3 --> Verify["Compare IR, objects and executables"]
+  Verify --> Publish["Publish only after required checks pass"]
+```
+
+`scripts/build.sh bootstrap` builds the native components, materializes Stage0
+and uses it to compile the Neri build driver through the root `manifest.json`.
+The driver performs three generations in an isolated `build/work.*` directory:
+
+1. Stage0 compiles the current compiler unit into Stage1.
+2. Stage1 compiles the same sources into Stage2.
+3. Stage2 compiles the same sources into Stage3.
+4. Stage1 and Stage2 must emit byte-identical serialized NIR envelopes and objects, and
    Stage2 and Stage3 executables must match byte for byte.
 
-The seed establishes Stage1; it may use an older internal IR naming convention.
-Fixed-point checks compare generations running the current compiler sources,
-without normalizing or ignoring any output differences.
+Every generation uses the current project manifest, compiler sources and
+standard library. The NIR comparison uses the envelope's hexadecimal encoding;
+objects and executables are compared directly. Each compiler
+process receives the current native artifacts, LLVM linker, platform settings,
+C locale, UTC and host `PATH`. Native configuration checks the supported
+Clang/LLVM and Ninja versions and requires an explicit CMake build type.
 
-The pinned seed stage has no current standard library. Its mirrored agent test
-and profile services report those execution capabilities as unavailable while
-preserving their protocol shapes. Stage2 and later compile the canonical
-services with the current `files`, `crypto`, and `process` libraries.
-
-Compiler, tooling and user sources use `console`. The pinned release already
-supports this spelling, so no legacy import alias or source rewriting is needed.
-
-The `scripts/neri.sh` development launcher runs the published compiler and
-runtime with the standard-library sources from the same checkout. Packaged
-launchers use the standard library shipped in their immutable toolchain.
-
-Every compiler process receives the current native artifact paths, the pinned LLVM linker, the macOS SDK path, a C locale, UTC, and the host `PATH`. Any unexplained difference fails the bootstrap. Native configuration independently checks Clang/LLVM and Ninja versions.
-
-Native builds require an explicit CMake build type. Seed preparation and the
-Neri driver use the same absolute compiler paths under `LLVM_PREFIX`, preserving
-the compiler identity and Release configuration across native build invocations.
-
-The pinned compiler uses the `0.2.0-dev` toolchain label. Seed, Stage1 and Stage2
-calls all receive the current native runtime manifest; artifact compatibility
-checks and fixed-point comparisons remain enabled. The seed emits the Stage1
-object through current codegen; the driver links it with the current runtime.
-Stage1 and later compilers validate and link the current manifest directly.
-The initial build-driver compilation uses the pinned package's own codegen and runtime.
-
-Both generations use the executable basename `neri` in separate directories.
-The macOS linker embeds that basename in its ad-hoc signing identifier, so the
-basename is part of the reproducibility contract.
+The compiler executable basename is `neri` in each generation's directory.
+The macOS linker embeds that basename in its ad-hoc signing identifier, making
+it part of the reproducibility contract.
 
 The verified Stage3 compiler, codegen, runtime and manifest are copied together
 under `build/toolchains/<artifact-manifest-sha256>`. An atomic symlink replacement
-selects that immutable tuple at `build/current`. `build/neri` is a compatibility
-link to its compiler. Failures preserve the last published tuple; native build
-directories are development outputs and are not used by an already published
-toolchain. Work directories retain comparisons and test output for inspection.
+selects that immutable tuple at `build/current`. Failures preserve the last
+published tuple. Work directories retain comparisons and test output for
+inspection.
 
-`scripts/build.sh test` runs native probes and language contracts against the current
-native artifacts and candidate compiler, then publishes the tuple only after
-those tests pass. `scripts/neri.sh` resolves `build/current` once and uses the
-compiler, codegen and runtime from that immutable directory for the whole invocation.
+`scripts/build.sh test` runs native probes and language contracts against the
+current native artifacts and candidate compiler, then publishes the tuple after
+those tests pass. `scripts/neri.sh` resolves `build/current` once and uses its
+compiler, codegen and runtime with the standard-library sources from the same
+checkout. Packaged launchers use their toolchain's bundled standard library.
 
-## Provenance
+Windows uses `scripts/build.ps1` to materialize the same seed, compile the
+current compiler unit, compare NIR, COFF and PE output, and run its platform
+contracts. See [Windows](WINDOWS.md) for dependencies and commands.
 
-- Release: `v0.2.0-dev`
-- Target: `macos-arm64`
-- Compiler implementation: Neri
-- Runtime ABI: `1.8`
-- Neri IR transport: `1.1`
+## Refreshing the seed
 
-The archive's `PROVENANCE.json` records its source-manifest digest and artifact hashes. The archive SHA-256 is pinned in `bootstrap/macos-arm64.seed`.
+This command requires a working canonical seed; it cannot create the first seed
+from native components alone.
 
-Linux x86-64 uses the candidate pinned in `bootstrap/linux-x86_64.seed` and its
-extracted-file manifest. The pin identifies GitHub Actions run `34046783143`
-and the archive digest. It bootstraps locally using `bin/neri` and the
-target-specific runtime manifest; GitHub CLI access is needed to download it.
+```sh
+scripts/build.sh refresh-seed
+```
 
-## Preparing a Linux seed
+The Neri implementation in [`tooling/seed.hk`](../tooling/seed.hk) runs the native and language
+contracts and fixed-point checks, emits canonical compiler IR, verifies its
+source inventory and checks deterministic compression. It records the exact
+source contents and producing compiler rather than treating a Git commit as
+proof of the working tree's contents.
 
-The manual `Linux bootstrap seed candidate` workflow produces a `linux-x86_64`
-candidate on Ubuntu 24.04 with Clang/LLVM 22.1.8. It has read-only repository
-permissions and publishes workflow artifacts, not a release or a new trust pin.
+`seedSourceManifest` covers the compiler and standard-library source files,
+their manifests and template assets. `Build.sourceManifest` captures the broader
+validation inputs. Refresh compares both inventories before generation and
+publication. `seedPublish` serializes publication with `build/seed-refresh.lock`,
+backs up the previous files and attempts rollback if a replacement fails.
 
-`scripts/build.sh export-seed` runs the current compiler contracts and exports
-canonical IR for the compiler and Neri build driver. The transport includes the
-source commit, source inventory, frontend artifact hashes and transport hashes.
-The Linux job checks those identities before generating native entry tools.
+Review the refreshed artifact, source manifest and provenance together. The
+repository's supported-platform CI jobs are configured to materialize the seed
+on each host and validate current sources using that host's native toolchain.
+Refresh prepares the candidate in an isolated work directory and promotes its
+metadata last. Launchers reject mismatched artifact sets during publication;
+the repository files are not a single atomic filesystem transaction.
 
-The native driver performs the fixed-point and language/native contract checks,
-compares its compiler IR with the transported IR, and creates two byte-identical
-normalized seed archives. `tooling/seed.hk` owns this preparation logic. Archive
-normalization uses `bsdtar` from `libarchive-tools` on Linux.
+Linux launchers use `/usr/lib/llvm-22` by default; `LLVM_PREFIX` selects another
+installation. The persistent executable run cache supports macOS ARM64. Linux
+and Windows compile and execute without persistent executable-cache reuse.
 
-The candidate contains the native compiler, code generator, runtime archive and
-manifest, source inventory and provenance. `build/seeds/` also contains candidate
-archive and extracted-file pins. A final job step extracts the candidate, checks
-its file pins and bootstraps through `scripts/build.sh` on Linux. Publishing a
-release seed remains a separate publication step. The current Linux pin downloads
-the verified Actions candidate instead; its availability depends on artifact retention.
+## Implementation and evidence
 
-Linux source launchers use `/usr/lib/llvm-22` by default; `LLVM_PREFIX` selects
-another installation. The run cache currently supports macOS ARM64. Linux runs
-compile and execute without persistent executable-cache reuse.
+| Contract | Source |
+| --- | --- |
+| Native tool versions, target selection and runtime manifest | [CMakeLists.txt](../CMakeLists.txt), [native launcher](../scripts/build-native.sh) |
+| Unix seed hash verification and Stage0 materialization | [scripts/build.sh](../scripts/build.sh) |
+| Generations, comparisons and compiler publication | [tooling/build.hk](../tooling/build.hk) |
+| Seed inventories, compression and publication | [tooling/seed.hk](../tooling/seed.hk) |
+| Windows materialization, comparisons and source stability | [scripts/build.ps1](../scripts/build.ps1) |
+
+These links identify implementation checks. Passing a fixed-point comparison
+does not establish independent compiler correctness or cross-platform test
+completion; those claims require the corresponding validation output.
+
+## References
+
+- [Zig's portable bootstrap seed](https://ziglang.org/news/goodbye-cpp/) describes
+  a checked-in WebAssembly compiler seed materialized using the system toolchain.
+  Neri applies that portable-artifact approach using its own canonical IR and
+  native backend.
+- [Wheeler, *Fully Countering Trusting Trust through Diverse Double-Compiling*](https://dwheeler.com/trusting-trust/dissertation/)
+  distinguishes self-regeneration from independent source-to-binary assurance.
+  Neri's fixed-point gate verifies self-regeneration; diverse double-compilation
+  requires an independently trusted compiler.
