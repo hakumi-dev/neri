@@ -163,16 +163,16 @@ static void completion_contract(void) {
   free(reply);
 
   open_document("file:///completion-builtins.hk",
-    "use console\ndef main(): Void\n  console.println(\"ok\")\nend\n", 0);
+    "# Qualified library call\ndef main(): Void\n  console::println(\"ok\")\nend\n", 0);
   empty_diagnostics(1);
   send_message("{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/completion\",\"id\":\"builtins\","
     "\"params\":{\"textDocument\":{\"uri\":\"file:///completion-builtins.hk\"},"
-    "\"position\":{\"line\":2,\"character\":10}}}", 0);
+    "\"position\":{\"line\":2,\"character\":11}}}", 0);
   reply = receive();
   items = field(reply, "result");
   item = completion_item(items, "read");
   require(completion_item(items, "print") != NULL && completion_item(items, "println") != NULL &&
-          item != NULL && string_is(field(item, "detail"), "console.read(): String"),
+          item != NULL && string_is(field(item, "detail"), "console::read(): String"),
           "library completion is rendered from source callable signatures");
   free(reply);
 }

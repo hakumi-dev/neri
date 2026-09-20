@@ -402,7 +402,7 @@ static void project_contract(const char *compiler, const char *root) {
     "\"params\":{\"textDocument\":{\"uri\":\"%s\"},\"position\":{\"line\":4,\"character\":16}}}", main_uri);
   send_message(message, 0);
   reply = receive();
-  require(string_is(field(field(field(reply, "result"), "contents"), "value"), "def sample.answer(): Int"),
+  require(string_is(field(field(field(reply, "result"), "contents"), "value"), "def sample::answer(): Int"),
           "call hover presents the resolved callable signature, not a variable type");
   free(reply);
   snprintf(message, sizeof(message), "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/documentHighlight\",\"id\":\"local-highlights\","
@@ -579,7 +579,7 @@ int main(int argc, char **argv) {
   }
 
   open_document("file:///folder%20name/unsaved.hk",
-      "use console\r\ndef main(): Void\r\n\tconsole.println(\"😀\" + missing)\r\nend\r\n", 1);
+      "# UTF-16 fixture\r\ndef main(): Void\r\n\tconsole::println(\"😀\" + missing)\r\nend\r\n", 1);
   reply = receive();
   const char *list = diagnostics(reply);
   const char *diagnostic = spaces(list + 1);
@@ -587,12 +587,12 @@ int main(int argc, char **argv) {
   require(string_is(field(diagnostic, "source"), "neri"), "compiler diagnostic authority");
   const char *start = field(field(diagnostic, "range"), "start");
   require(strtol(field(start, "line"), NULL, 10) == 2 &&
-          strtol(field(start, "character"), NULL, 10) == 24,
+          strtol(field(start, "character"), NULL, 10) == 25,
           "non-BMP/tab/CRLF source range");
   free(reply);
   send_message("{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didChange\",\"params\":{"
     "\"textDocument\":{\"uri\":\"file:///folder%20name/unsaved.hk\",\"version\":2},"
-    "\"contentChanges\":[{\"text\":\"use console\\ndef main(): Void\\n  console.println(\\\"\\ud83d\\ude00\\\")\\nend\\n\"}]}}", 0);
+    "\"contentChanges\":[{\"text\":\"# UTF-16 fixture\\ndef main(): Void\\n  console::println(\\\"\\ud83d\\ude00\\\")\\nend\\n\"}]}}", 0);
   empty_diagnostics(2);
   send_message("{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didChange\",\"params\":{"
     "\"textDocument\":{\"uri\":\"file:///folder%20name/unsaved.hk\",\"version\":1},"
@@ -601,19 +601,19 @@ int main(int argc, char **argv) {
     "\"params\":{\"textDocument\":{\"uri\":\"file:///folder%20name/unsaved.hk\"}}}", 0);
   empty_diagnostics(2);
 
-  open_document("file:///incremental.hk", "use console\r\ndef main(): Void\r\n\tconsole.println(\"😀\")\r\nend\r\n", 0);
+  open_document("file:///incremental.hk", "# UTF-16 fixture\r\ndef main(): Void\r\n\tconsole::println(\"😀\")\r\nend\r\n", 0);
   empty_diagnostics(1);
   send_message("{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didChange\",\"params\":{"
     "\"textDocument\":{\"uri\":\"file:///incremental.hk\",\"version\":2},\"contentChanges\":["
-    "{\"range\":{\"start\":{\"line\":2,\"character\":18},\"end\":{\"line\":2,\"character\":20}},\"text\":\"ok\"},"
-    "{\"range\":{\"start\":{\"line\":2,\"character\":21},\"end\":{\"line\":2,\"character\":21}},\"text\":\" + missing\"}]}}", 0);
+    "{\"range\":{\"start\":{\"line\":2,\"character\":19},\"end\":{\"line\":2,\"character\":21}},\"text\":\"ok\"},"
+    "{\"range\":{\"start\":{\"line\":2,\"character\":22},\"end\":{\"line\":2,\"character\":22}},\"text\":\" + missing\"}]}}", 0);
   reply = receive();
   start = field(field(spaces(diagnostics(reply) + 1), "range"), "start");
-  require(strtol(field(start, "character"), NULL, 10) == 24, "sequential UTF-16 incremental edits");
+  require(strtol(field(start, "character"), NULL, 10) == 25, "sequential UTF-16 incremental edits");
   free(reply);
   send_message("{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didChange\",\"params\":{"
     "\"textDocument\":{\"uri\":\"file:///incremental.hk\",\"version\":3},\"contentChanges\":["
-    "{\"range\":{\"start\":{\"line\":2,\"character\":21},\"end\":{\"line\":2,\"character\":31}},\"text\":\"\"},"
+    "{\"range\":{\"start\":{\"line\":2,\"character\":22},\"end\":{\"line\":2,\"character\":32}},\"text\":\"\"},"
     "{\"range\":{\"start\":{\"line\":99,\"character\":0},\"end\":{\"line\":99,\"character\":0}},\"text\":\"bad\"}]}}", 0);
   reply = receive();
   require(string_is(field(reply, "method"), "window/logMessage"), "invalid batch rejected");
@@ -622,7 +622,7 @@ int main(int argc, char **argv) {
    * version from the rejected batch may have been committed. */
   send_message("{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didChange\",\"params\":{"
     "\"textDocument\":{\"uri\":\"file:///incremental.hk\",\"version\":3},\"contentChanges\":["
-    "{\"range\":{\"start\":{\"line\":2,\"character\":21},\"end\":{\"line\":2,\"character\":31}},\"text\":\"\"}]}}", 0);
+    "{\"range\":{\"start\":{\"line\":2,\"character\":22},\"end\":{\"line\":2,\"character\":32}},\"text\":\"\"}]}}", 0);
   empty_diagnostics(3);
 
   char *callback_source = fixture(argv[2]);
@@ -635,7 +635,7 @@ int main(int argc, char **argv) {
   reply = receive();
   require(*spaces(diagnostics(reply) + 1) == '{', "incomplete do block diagnostics");
   free(reply);
-  open_document("file:///clock.hk", "use clock\ndef main(): Void\n  clock.milliseconds()\nend\n", 0);
+  open_document("file:///clock.hk", "def main(): Void\n  clock::milliseconds()\nend\n", 0);
   empty_diagnostics(1);
 
   const char *unit = "abc😀é";

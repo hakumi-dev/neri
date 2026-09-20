@@ -117,8 +117,9 @@ Unicode whitespace; directory names may contain spaces.
 
 Source paths define compilation membership, not namespaces. Files in unrelated
 folders may declare the same namespace, and folder names never create or infer
-namespaces. `namespace` and `use` resolve names inside the selected unit and its
-explicit reference closure; they do not add dependencies.
+namespaces. Project namespace paths and aliases resolve inside the selected unit
+and its explicit reference closure. Standard-library imports and qualified
+references such as `console::println(...)` load the corresponding bundled module.
 
 `generated` lists relative JSON generation manifests. The selected reference
 closure validates their input/output digests and loads their emitted `.hk`

@@ -50,7 +50,7 @@ execute(['examples/arguments.hk', '--', 'Ada', 'Grace Hopper'], 0, 'Hello, Ada!\
 // Exercise process quoting, UTF-8 filesystem paths, and default .exe output.
 const unicodeRoot = path.join(evidence, 'proyecto español con espacios');
 fs.mkdirSync(unicodeRoot, {recursive: true});
-fs.writeFileSync(path.join(unicodeRoot, 'hello.hk'), 'use console\ndef main(): Void\n  console.println("¡Hola!")\nend\n');
+fs.writeFileSync(path.join(unicodeRoot, 'hello.hk'), 'def main(): Void\n  console::println("¡Hola!")\nend\n');
 execute(['build', 'hello.hk', '--release'], 0, undefined, true, {cwd: unicodeRoot});
 const hello = spawnSync(path.join(unicodeRoot, 'hello.exe'), [], {windowsHide: true, encoding: 'utf8', timeout: 10000});
 assert.equal(hello.status, 0);

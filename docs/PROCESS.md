@@ -4,18 +4,18 @@
 `SpawnOptions` keeps the executable separate from its arguments, so spaces,
 Unicode, quotes, and shell metacharacters remain literal argument data.
 
-`process.ScopedChild.spawn(options)` returns
-`result.Result<ScopedChild, result.Failure>`. Acquiring it with `using` cancels
+`process::ScopedChild.spawn(options)` returns
+`result::Result<ScopedChild, result::Failure>`. Acquiring it with `using` cancels
 and reaps the child when the scope exits, including early return and a failed
 later acquisition. Its `close` is idempotent and forwards native cleanup errors
-to the enclosing `resources.Outcome`. `poll` and `wait` after closure report
+to the enclosing `resources::Outcome`. `poll` and `wait` after closure report
 `disposed`. The process token and underlying `Child` remain private.
 
-`process.spawn(options)` returns a `SpawnResult`. A successful result contains a
+`process::spawn(options)` returns a `SpawnResult`. A successful result contains a
 `Child`; failure contains a stable `Failure.code()`, its `operation`, and the
 exact platform `osCode` when the operating system supplied one. `spawnOutcome`,
 `pollOutcome`, `waitOutcome`, `cancelOutcome`, and `disposeOutcome` expose the
-same ownership model through `result.Result` and `result.Failure`. Arguments and environment
+same ownership model through `result::Result` and `result::Failure`. Arguments and environment
 are encoded with explicit byte lengths. Embedded NUL is rejected. A configuration
 may contain at most 1024 total arguments, 1024 environment overrides, and 1 MiB
 of encoded configuration. Environment names are nonempty, contain no `=`, and
@@ -57,10 +57,10 @@ the child's process group; the call reports `interrupt_failed` when the child
 does not share the caller's console. An interrupted child keeps its ordinary
 `exit` or `signal` status. Only `cancel()` produces `cancelled`.
 
-`process.run(options, timeoutMilliseconds)` covers bounded one-shot commands.
+`process::run(options, timeoutMilliseconds)` covers bounded one-shot commands.
 It starts the child, waits for completion, always disposes it, and returns an
 owned output snapshot. A command still running at the deadline is cancelled
-and returns a `timeout` failure from `process.run`.
+and returns a `timeout` failure from `process::run`.
 
 On POSIX systems each child starts in a new process group with SIGINT unblocked
 and its default disposition restored before executable replacement. Cancellation signals
@@ -126,7 +126,7 @@ slave as its controlling terminal using
 ## CLI integration tests in Neri
 
 Compile a test executable that receives the application executable as an
-argument. `process.run` owns the command lifecycle; the test checks its exit
+argument. `process::run` owns the command lifecycle; the test checks its exit
 status and captured bytes after disposal:
 
 ```neri
@@ -136,32 +136,32 @@ use result
 use test
 
 def main(): Void
-  let executable = host.argumentAt(0)
+  let executable = host::argumentAt(0)
 
-  test.assertTrue(executable != null)
+  test::assertTrue(executable != null)
   if executable == null
     return
   end
-  let options = new process.SpawnOptions(executable)
+  let options = new process::SpawnOptions(executable)
 
   options.arguments = ["--help"]
-  match process.run(options, 5000)
-    case result.Result.Ok(completed)
+  match process::run(options, 5000)
+    case result::Result.Ok(completed)
       let status = completed.exit
 
-      test.assertTrue(status != null)
+      test::assertTrue(status != null)
       if status != null
-        test.assertTrue(status.isExited())
-        test.assertEqual(status.value(), 0)
+        test::assertTrue(status.isExited())
+        test::assertEqual(status.value(), 0)
       end
-      test.assertTrue(!completed.stdoutTruncated)
-    case result.Result.Error(failure)
-      test.assertTrue(false)
+      test::assertTrue(!completed.stdoutTruncated)
+    case result::Result.Error(failure)
+      test::assertTrue(false)
   end
 end
 ```
 
-Use `files.TemporaryDirectory.create` with `using` for isolated fixtures and cleanup,
+Use `files::TemporaryDirectory.create` with `using` for isolated fixtures and cleanup,
 `files` operations for filesystem changes, and `httpclient` for bounded
 loopback requests. The runtime-contract test manifests declare a `fixture`
 and a `driver`; the build discovers those manifests and runs both debug and

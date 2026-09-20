@@ -9,11 +9,11 @@ use console
 use host
 
 def main(): Void
-  let error = http.serve("127.0.0.1:8080") do |request|
-    return http.text(200, "Hello, world!")
+  let error = http::serve("127.0.0.1:8080") do |request|
+    return http::text(200, "Hello, world!")
   end
-  console.println(error)
-  host.exit(1)
+  console::println(error)
+  host::exit(1)
 end
 ```
 
@@ -35,7 +35,7 @@ An invalid or empty `PORT` reports an error and exits with status 1.
 
 ## API
 
-`http.serve(address: String, handler: fn(Request): Response, options: Options? = null): String` binds
+`http::serve(address: String, handler: fn(Request): Response, options: Options? = null): String` binds
 `127.0.0.1:<port>`, where the port is between 1 and 65535. It serves synchronously
 until programmatic stop, process termination or a listener failure. Startup and listener failures
 return an error string, including the failing operation. An occupied port is a
@@ -43,7 +43,7 @@ startup failure. Individual connection failures close that connection and allow
 the next request. `serve` formats a listener failure as text and returns
 `"Listener stopped"` after programmatic shutdown.
 
-`http.serveResult(address, handler, options): Failure?` exposes the same server
+`http::serveResult(address, handler, options): Failure?` exposes the same server
 with null on normal shutdown and a structured failure otherwise. Invalid
 configuration uses `invalid_address` or `invalid_port`. Socket failures use
 `socket_error`, with an operation distinguishing `listen.open`,
@@ -52,7 +52,7 @@ configuration uses `invalid_address` or `invalid_port`. Socket failures use
 
 ### Stop and drain
 
-Set `options.stop` to an `http.Stop` and call its `request()` synchronously from
+Set `options.stop` to an `http::Stop` and call its `request()` synchronously from
 `onListening`, the handler or the log callback to finish serving. A request in
 progress completes its response under the existing I/O deadline; then the server
 closes the connection and listener and returns normally. A request from
@@ -102,7 +102,7 @@ or blocks forever.
 
 ### Callbacks
 
-`http.Options` provides optional callbacks for listener startup and logging:
+`http::Options` provides optional callbacks for listener startup and logging:
 
 - `onListening: (fn(String): Void)?` receives the address once, after successful
   bind and listen and before accepting connections. Startup failures skip it.
@@ -117,12 +117,12 @@ choose a destination and format. Startup and listener errors are returned to the
 caller, which decides how to report them.
 
 ```ruby
-let options = new http.Options()
+let options = new http::Options()
 options.onListening = fn(address)
-  console.println("Listening on http://" + address)
+  console::println("Listening on http://" + address)
 end
 options.log = fn(message)
-  console.println(message)
+  console::println(message)
 end
 ```
 
@@ -134,7 +134,7 @@ the first `?`. The query excludes that separator and remains encoded. Neither
 field is decoded or normalized. Mutating the request changes only the handler's
 local request object.
 
-`Request.headers` and `Response.headers` are `http.Headers` collections.
+`Request.headers` and `Response.headers` are `http::Headers` collections.
 `add(name, value): Bool` validates an ASCII token name and an ASCII value
 (horizontal tabs are allowed), returning false without mutation on invalid
 input or a capacity limit. Each collection holds at most 64 field lines and
@@ -153,18 +153,18 @@ of these fields, or repeating another response field, substitutes a plain 500
 response and discards application headers. These rules also apply to HEAD.
 
 ```ruby
-let response = http.text(200, "<h1>Hello</h1>")
+let response = http::text(200, "<h1>Hello</h1>")
 response.headers.add("Content-Type", "text/html; charset=utf-8")
 response.headers.add("ETag", "\"page-v1\"")
 ```
 
-`http.text(status: Int, body: String): Response` constructs a response with an
+`http::text(status: Int, body: String): Response` constructs a response with an
 explicit status and UTF-8 body. Text responses default to `text/plain; charset=utf-8`, a byte
 `Content-Length`, and `Connection: close`. Status 204 and 304 omit the body and
 content length; status 205 sends an empty body. Statuses outside 200–599 or bodies
 larger than 1 MiB produce status 500 instead of the supplied response.
 
-`http.binary(status: Int, body: Byte[]): Response` retains the managed byte array
+`http::binary(status: Int, body: Byte[]): Response` retains the managed byte array
 and defaults to `application/octet-stream`. Set `response.headers` to declare a
 specific media type. Bytes are sent unchanged, including NUL and invalid UTF-8.
 `Response.bodyBytes`, when present, takes precedence over `body`. The array stays
@@ -172,7 +172,7 @@ alive through synchronous sending; applications finish mutations before handing
 the response to the transport. The same 1 MiB limit and bodyless-status rules
 apply to binary responses.
 
-`http.wire(response, head): EncodedResponse` prepares the exact header string and
+`http::wire(response, head): EncodedResponse` prepares the exact header string and
 either a text body or retained byte array for inspection without opening a
 socket. Its `headers`, `text` and optional `bytes` fields describe the validated
 response, including any substituted 500. HEAD and bodyless statuses contain no
@@ -183,7 +183,7 @@ callers own the socket.
 
 ## Structured transport failures
 
-`http.Failure` carries `code`, `operation` and `detail`. Codes identify causes
+`http::Failure` carries `code`, `operation` and `detail`. Codes identify causes
 without parsing human-readable text. Detail contains the available platform
 message for socket/clock failures and is otherwise empty; it belongs in internal
 diagnostics, not public response bodies.
@@ -257,12 +257,12 @@ forced process termination does not unwind application scopes; the operating
 system reclaims the process's sockets. On supported returns and I/O error paths,
 the Neri library closes each accepted descriptor explicitly.
 
-`Options.onConnection` receives `result.Result<Exchange, ExchangeFailure>` once
+`Options.onConnection` receives `result::Result<Exchange, ExchangeFailure>` once
 after the accepted socket is closed. `Exchange` records consumed request bytes,
 written response bytes, and response status. `ExchangeFailure` preserves the
 primary failure, any failure sending a rejection response, and an ordered
 `closeFailures` collection. Binary responses and response headers share one write deadline.
-`serveOutcome` exposes listener completion through `result.Result`.
+`serveOutcome` exposes listener completion through `result::Result`.
 
 ## Implementation boundary
 

@@ -43,7 +43,7 @@ Save this as `main.hk`:
 use console
 
 def main(): Void
-  console.println("Hello, Neri!")
+  console::println("Hello, Neri!")
 end
 ```
 

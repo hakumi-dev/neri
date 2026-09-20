@@ -47,15 +47,15 @@ operators and conditional expressions evaluate only the required branch.
 
 ## Console
 
-Standard-library namespaces are source declarations loaded by `use`.
-`use console` provides terminal input and output: `console.print(value)` writes
-without a newline, `console.println(value)` appends a newline, and
-`console.read()` reads a line as a string. Both output functions require a
+Standard-library namespaces are source declarations loaded by `use` or a qualified reference.
+`use console` provides terminal input and output: `console::print(value)` writes
+without a newline, `console::println(value)` appends a newline, and
+`console::read()` reads a line as a string. Both output functions require a
 `String`; convert numeric values explicitly with `as String`. End of input
 produces an empty string. Output is flushed after each call.
 
-`use test` provides assertions. `test.assert`, `test.assertTrue`, and
-`test.assertFalse` require a `Bool`. `test.assertEqual` requires two arguments
+`use test` provides assertions. `test::assert`, `test::assertTrue`, and
+`test::assertFalse` require a `Bool`. `test::assertEqual` requires two arguments
 of the same type, with equality supported by the language's `==` operator.
 
 ## Values and variables
@@ -96,7 +96,7 @@ UTF-8. `new String()` and inheritance from `String` are unavailable.
 Readonly instance methods expose byte length, nullable byte access, checked
 byte slices, scalar boundaries, scalar count, scalar access, concatenation, and
 equality. A scalar is a Unicode scalar value rather than a grapheme cluster.
-The `text` library retains matching namespace functions and `text.Scalar` for
+The `text` library retains matching namespace functions and `text::Scalar` for
 explicit scalar construction and UTF-8 encoding.
 
 `sealed` closes an ordinary class to inheritance. `@representation("utf8")`
@@ -111,7 +111,7 @@ an arbitrary native symbol through `@intrinsic`.
 
 `@exact` marks a generic or non-generic module function whose arguments must
 have exactly the instantiated parameter types. Ordinary functions continue to
-accept assignable subtype arguments. The standard-library `test.assertEqual<T>`
+accept assignable subtype arguments. The standard-library `test::assertEqual<T>`
 uses this rule, evaluates its arguments once from left to right, and applies the
 ordinary `==` operation for `T`.
 
@@ -223,7 +223,7 @@ parameter type through the ordinary inference and checking rules. For example,
 
 Function values retain their positional function-type contract; parameter labels
 are available on declared callables. Alternative-case payload construction and
-`native.*` intrinsic syntax use positional arguments. Declared `@intrinsic` and
+`native::*` intrinsic syntax use positional arguments. Declared `@intrinsic` and
 `@cabiImport` functions expose the labels in their Neri signatures. Arrays contain
 expressions rather than labeled arguments. Named calls to unsafe and C ABI
 declarations require every parameter explicitly (`NR275` for omitted defaults).
@@ -239,10 +239,30 @@ multiline actions use a block instead. Block `if` bodies begin on the next line;
 `else` and `end` begin separate lines. `else if` chains remain supported.
 
 All supplied source files contribute to one compilation module. `namespace`
-applies to subsequent declarations; `use` exposes a namespace throughout the
-module. A `use` matching a bundled standard-library source loads that library and
-its transitive imports. Other namespaces do not load files. Duplicate or ambiguous
-declarations are errors.
+applies to subsequent declarations. `::` qualifies namespaces; `.` accesses type
+and instance members. Qualified paths resolve from the root namespace.
+
+```neri
+namespace App::Services
+
+class Printer
+  static def print(): Void
+    console::println("ready")
+  end
+end
+```
+
+`App::Services::Printer.print()` selects the static method without an import.
+`use App::Services` opens that namespace throughout the module.
+`use Services = App::Services` defines a module-wide namespace alias:
+`Services::Printer.print()`. An alias target is a root namespace; alias targets
+do not resolve through other aliases. Alias names must be unique and distinct
+from root namespace names. Local value names do not shadow namespace qualifiers.
+
+A `use` or qualified reference to a bundled standard-library module loads its
+sources and transitive dependencies. Project namespaces resolve within supplied
+sources and explicit project references. Duplicate or ambiguous declarations are
+errors.
 An unqualified function name resolves in the current namespace before imported
 namespaces, including when an imported function is generic. Explicit type
 arguments apply to the selected declaration; a selected ordinary function reports
@@ -342,7 +362,7 @@ specialization. Operands are evaluated once, in order. Readonly receivers requir
 declare these annotations. Operator and conversion methods remain callable by
 name. Adding a library type requires no new compiler case for its name.
 
-See [text](TEXT.md) for `text.Scalar`, a library class with validated construction,
+See [text](TEXT.md) for `text::Scalar`, a library class with validated construction,
 explicit conversion to `Int` and Unicode encoding implemented in Neri.
 
 ## Generics
@@ -425,7 +445,7 @@ above.
 The core library declares `Equality` as an ordinary contract with a `==`
 requirement. Its spelling has no separate generic rule. Built-in operator
 implementations and source classes are checked against the same requirement.
-`test.assertEqual<T: Equality>` therefore uses the declared contract. A contract
+`test::assertEqual<T: Equality>` therefore uses the declared contract. A contract
 states callable shape only; it does not promise algebraic laws such as
 reflexivity, symmetry, or transitivity.
 
@@ -440,7 +460,7 @@ It follows the general idea of stated generic requirements in
 The current generic surface consists of module functions and classes with their
 own fields and methods. Static methods accept an explicitly specialized class
 receiver, such as `Container<Int>.create(42)` or
-`library.Container<String>.create("value")`; constructor and method visibility
+`library::Container<String>.create("value")`; constructor and method visibility
 still apply. Method-level type parameters, generic class inheritance,
 class bounds, multiple bounds, generic contracts, and higher-kinded types are
 outside this surface. Templates are supplied as source files in the same
@@ -645,8 +665,8 @@ exclusive ownership of explicit mutable arguments.
 
 ### Scoped task generation
 
-`use tasks` provides `tasks.generate(count, callback)` and
-`tasks.generate(count, parallelism, callback)`. The callback has type
+`use tasks` provides `tasks::generate(count, callback)` and
+`tasks::generate(count, parallelism, callback)`. The callback has type
 `parallel fn(Int): R`; the result is a new `R[]` in index order.
 The generic source declaration carries `@operation("tasks.generate")`; this
 closed operation identifier selects task-generation binding while source
@@ -658,13 +678,13 @@ safe body.
 use tasks
 
 def squares(count: Int): Int[]
-  return tasks.generate(count) do |index|
+  return tasks::generate(count) do |index|
     return index * index
   end
 end
 ```
 
-The expected array type, an explicit `tasks.generate<R>` argument, or a typed
+The expected array type, an explicit `tasks::generate<R>` argument, or a typed
 callback supplies `R`. Elements use the array storage contract: scalars, managed
 references, or nullable managed references. An empty range returns an empty array
 without invoking the callback. Count must be nonnegative. Parallelism is an Int
@@ -738,9 +758,9 @@ union EventStorage
 end
 
 def main(): Void
-  let pointSize = native.sizeOf<Point>()
-  let alignment = native.alignOf<EventStorage>()
-  let yOffset = native.offsetOf<Point>("y")
+  let pointSize = native::sizeOf<Point>()
+  let alignment = native::alignOf<EventStorage>()
+  let yOffset = native::offsetOf<Point>("y")
 end
 ```
 
@@ -752,7 +772,7 @@ four-byte alignment for 32-bit numbers and eight-byte alignment for 64-bit
 numbers and pointers.
 
 Native records are value types: copying a record copies its inline fields.
-`stackalloc Record[count]` and `native.allocZeroed<Record>(count)` provide
+`stackalloc Record[count]` and `native::allocZeroed<Record>(count)` provide
 contiguous record storage with the declared alignment. Pointer arithmetic uses
 the complete record size, including tail padding. Inside an unsafe block,
 `pointer.field` reads or writes a field and `&pointer.field` obtains its typed
@@ -768,13 +788,13 @@ end
 
 def main(): Void
   unsafe
-    let sample = native.allocZeroed<Sample>(1)
+    let sample = native::allocZeroed<Sample>(1)
     sample.position[0] = 1.5 as Float32
     sample.code = 42 as UInt32
     let codeAddress = &sample.code
     var copy = *sample
     copy.code = 7 as UInt32
-    native.free(sample)
+    native::free(sample)
   end
 end
 ```
@@ -790,9 +810,9 @@ is non-null; `T*?` requires a null check before access. Raw pointers do not reta
 managed allocations. Address-of applies to mutable unmanaged locals.
 
 `stackalloc T[count]` allocates uninitialized storage for the function lifetime.
-`native.alloc<T>` and `native.allocZeroed<T>` allocate manually owned storage.
-`native.realloc` consumes the previous allocation and preserves its common prefix;
-`native.free` releases native storage. Stack and borrowed storage cannot be freed
+`native::alloc<T>` and `native::allocZeroed<T>` allocate manually owned storage.
+`native::realloc` consumes the previous allocation and preserves its common prefix;
+`native::free` releases native storage. Stack and borrowed storage cannot be freed
 or reallocated. Invalid pointer access inside unsafe code may have undefined
 behavior; safe wrappers must restore the language invariants before returning.
 
@@ -839,7 +859,7 @@ errors produce diagnostics and prevent artifact emission.
 ## Resources
 
 A `resource class` owns a value that is acquired with `using` and released when
-its scope ends. A resource defines `close(): result.Failure?`. Nested resources
+its scope ends. A resource defines `close(): result::Failure?`. Nested resources
 close in reverse acquisition order, including after `return`, `break`, or
 `continue`.
 
@@ -847,10 +867,10 @@ close in reverse acquisition order, including after `return`, `break`, or
 callable with the same resource return type. Resource values cannot be copied,
 stored, captured, passed to ordinary calls, or cast.
 
-A callable containing `using` returns `resources.Outcome<T, E>`. Its
+A callable containing `using` returns `resources::Outcome<T, E>`. Its
 `completion` contains the value or body failure, and `closeFailures` contains
 each cleanup failure in close order. A `using` acquisition may return a resource
-or `result.Result<Resource, E>`; the result error type matches the enclosing
+or `result::Result<Resource, E>`; the result error type matches the enclosing
 outcome error type.
 
 Factories may return `Result<R, E>.Ok(transfer owned)` from a fresh local `R`.

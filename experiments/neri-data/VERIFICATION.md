@@ -29,8 +29,8 @@ The executable `runtime-contract` covers the shared runtime surface:
 - Plans expose placeholders and separately typed parameters. Values are never
   interpolated into preview SQL.
 
-The generated example runs with `model.Customer` and `model.Order`. Its
-generated context contains `Query<model.Customer>` and `Query<model.Order>`,
+The generated example runs with `model::Customer` and `model::Order`. Its
+generated context contains `Query<model::Customer>` and `Query<model::Order>`,
 mapping metadata, strict entity decoders, `snapshot_Entity` and `key_Entity`
 functions, and the mapped `Customer.id` to `Order.customerId` dependent query.
 It does not generate per-entity query, field or snapshot classes.
@@ -84,7 +84,7 @@ corresponding negative diagnostics. The current real Rider checks passed for
 entity declaration. A real Rider quotation-body check also inserted
 `customer.active` after typing `.` then `ac` and accepting completion. The
 Rider quick documentation displays the specialized
-`Query<model.Customer>.where(labels filters: (fields of model.Customer))`
+`Query<model::Customer>.where(labels filters: (fields of model::Customer))`
 signature and the source method documentation. The language-service trace
 `Neri-20260912-160304-587.log`, request 26, records the same hover response at
 line 6, character 28. Generic source bodies with ambiguous specializations

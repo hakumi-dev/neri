@@ -33,6 +33,10 @@ project owns the JetBrains client, grammar, configuration UI and Run/Build/Check
   References are resolved by the compiler across the compilation unit and its
   loaded sources; an import needed by that analysis remains active. Syntax or
   semantic errors suppress unused-import hints until analysis succeeds.
+  Open imports are used by unqualified lookup. Fully qualified calls such as
+  `console::println()` do not consume `use console`. Namespace aliases track
+  their own references across the compilation unit: `IO::println()` consumes
+  `use IO = console`, independently of other aliases for that namespace.
 - The same `http`, `terminal`, `clock` standard-library sources as the CLI,
   located using the launcher's `NERI_STDLIB` environment.
 - Hover for resolved variable/parameter declarations and reads, `this` and literals, using the
@@ -75,6 +79,10 @@ project owns the JetBrains client, grammar, configuration UI and Run/Build/Check
   library APIs with unknown consumers are rejected. Inheritance method renames
   and matching identifiers that remain unresolved in lazy generic bodies are
   rejected until their complete binding relationships can be established.
+  Namespace aliases have their own binding identity. Renaming `IO` in
+  `use IO = App::Nested` edits references through `IO::` and preserves the
+  target namespace and independently qualified calls. Namespace declarations
+  themselves are not rename targets.
 - Clients supporting code-action literals and versioned workspace edits receive
   unused-import quick fixes and `source.organizeImports`. Edits remove proven
   unused directives, preserve trailing comments, and are checked by reanalysis.
@@ -97,6 +105,12 @@ project owns the JetBrains client, grammar, configuration UI and Run/Build/Check
   adapter supplies protocol positions and edits. Results are bounded to 128
   candidates and use `CompletionList.isIncomplete` when truncated. Import
   targets include known namespaces and the installed standard-library inventory.
+  Namespace qualification uses `::`, including after an alias and in alias
+  targets (`use IO = App::`). Member access retains `.`, as in
+  `App::Factory.create()`. Completion after `App::` or `IO::` offers the
+  namespace's declarations without requiring an open import. Inserted source
+  and displayed signatures use `::`; canonical semantic identities retain
+  their dotted encoding.
   Opening parenthesis and comma trigger argument completion. Ordinary parameters
   supply their declared names and types; `labels` parameters derive candidates
   from the resolved entity's public fields. Supplied labels are excluded.
@@ -256,7 +270,7 @@ Editable fields and refresh behavior follow the
 [LSP completion contract](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#textDocument_completion).
 
 Streaming input uses bounded byte-array chunks, decoded at UTF-8 boundaries,
-and a balanced string join. Repeated `host.appendByte` on an ever-growing array
+and a balanced string join. Repeated `host::appendByte` on an ever-growing array
 copies the previous contents on each append and causes quadratic copying.
 
 ## Validate

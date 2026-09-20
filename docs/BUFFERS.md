@@ -25,7 +25,7 @@ logical content. This matches the
 
 `snapshot()` returns a distinct byte array containing the logical content. Later
 buffer writes do not change an earlier snapshot. `text()` decodes a snapshot as
-UTF-8 with `host.stringFromBytes` and returns null for invalid UTF-8. Accepted
+UTF-8 with `host::stringFromBytes` and returns null for invalid UTF-8. Accepted
 text follows [RFC 3629](https://www.rfc-editor.org/rfc/rfc3629).
 
 `TextBuffer.create` applies the same byte limit and geometric growth to UTF-8 strings.

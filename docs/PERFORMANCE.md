@@ -2,8 +2,8 @@
 
 ## UTF-8 construction
 
-`benchmarks/text.hk` compares the `String` concatenation operator, the `text.concat` library
-wrapper and `buffers.TextBuffer` with a reserved final capacity. Each appends
+`benchmarks/text.hk` compares the `String` concatenation operator, the `text::concat` library
+wrapper and `buffers::TextBuffer` with a reserved final capacity. Each appends
 `abcdé😀` (10 bytes, six scalars) and checks the resulting byte/scalar lengths.
 Build with `neri build benchmarks/text.hk --release --output build/text-benchmark`;
 run `/usr/bin/time -l build/text-benchmark <concat|library|builder> <count>` on macOS.
@@ -330,7 +330,7 @@ an implementation of that paper's formal proof.
 ## Compute and scoped tasks
 
 Release kernels retain checked arithmetic, bounds checks and managed collection.
-`tasks.generate` executes independent index callbacks on a bounded worker pool,
+`tasks::generate` executes independent index callbacks on a bounded worker pool,
 shares captured graphs through read-only views and joins before returning ordered
 results. Task-local allocation and mutation are permitted. Workload definitions,
 raw samples, compiler/runtime fingerprints and host conditions are in the
@@ -451,7 +451,7 @@ samples are recorded for trend review; the table is a target-specific baseline,
 not a universal throughput guarantee. Wall time includes the helper's polling
 interval; CPU time is the more useful signal for these short processes.
 
-`host.appendByte`, `host.appendInt`, and `host.appendString` return a new flat
+`host::appendByte`, `host::appendInt`, and `host::appendString` return a new flat
 array and copy its prior contents. Appending N elements copies N(N-1)/2 existing
 elements. A single append is linear, so array append is appropriate for bounded
 argument lists but requires a capacity-based or chunked representation for growing

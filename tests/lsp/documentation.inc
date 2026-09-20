@@ -78,9 +78,9 @@ static void documentation_contract(void) {
   free(reply);
 
   open_document("file:///documentation-stdlib.hk",
-    "use clock\n"
+    "# Qualified library call\n"
     "def main(): Void\n"
-    "  let value = clock.milliseconds()\n"
+    "  let value = clock::milliseconds()\n"
     "end\n", 0);
   empty_diagnostics(1);
   send_message("{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/hover\",\"id\":\"stdlib-docs\","
@@ -88,21 +88,21 @@ static void documentation_contract(void) {
     "\"position\":{\"line\":2,\"character\":24}}}", 0);
   reply = receive();
   require(string_is(field(field(field(reply, "result"), "contents"), "value"),
-            "def clock.milliseconds(): Int?\\u000a\\u000aReturns an arbitrary monotonic epoch in milliseconds.\\u000aSuitable for elapsed time and deadlines, not wall-clock time."),
+            "def clock::milliseconds(): Int?\\u000a\\u000aReturns an arbitrary monotonic epoch in milliseconds.\\u000aSuitable for elapsed time and deadlines, not wall-clock time."),
           "standard-library source documentation is available through the semantic model");
   free(reply);
 
   open_document("file:///documentation-stdlib-incomplete.hk",
-    "use clock\n"
+    "# Qualified library call\n"
     "def main(): Void\n"
-    "  clock.\n"
+    "  clock::\n"
     "end\n", 0);
   reply = receive();
   require(*spaces(diagnostics(reply) + 1) == '{', "incomplete standard-library member reports its parse diagnostic");
   free(reply);
   send_message("{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/completion\",\"id\":\"stdlib-incomplete-completion\","
     "\"params\":{\"textDocument\":{\"uri\":\"file:///documentation-stdlib-incomplete.hk\"},"
-    "\"position\":{\"line\":2,\"character\":8}}}", 0);
+    "\"position\":{\"line\":2,\"character\":9}}}", 0);
   reply = receive();
   item = completion_item(field(reply, "result"), "milliseconds");
   require(item != NULL, "semantic repair completes an incomplete standard-library namespace");
@@ -159,9 +159,9 @@ static void documentation_incomplete_and_no_sidecar_contract(const char *compile
   free(reply);
 
   open_document("file:///documentation-no-sidecar.hk",
-    "use clock\n"
+    "# Qualified library call\n"
     "def main(): Void\n"
-    "  let value = clock.milliseconds()\n"
+    "  let value = clock::milliseconds()\n"
     "end\n", 0);
   empty_diagnostics(1);
   send_message("{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/hover\",\"id\":\"no-sidecar-hover\","
@@ -169,7 +169,7 @@ static void documentation_incomplete_and_no_sidecar_contract(const char *compile
     "\"position\":{\"line\":2,\"character\":24}}}", 0);
   reply = receive();
   const char *value = field(field(field(reply, "result"), "contents"), "value");
-  require(string_is(value, "```neri\\u000adef clock.milliseconds(): Int?\\u000a```") &&
+  require(string_is(value, "```neri\\u000adef clock::milliseconds(): Int?\\u000a```") &&
           strstr(value, "monotonic") == NULL,
           "a no-doc toolchain preserves the standard-library signature without prose");
   free(reply);

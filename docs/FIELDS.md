@@ -51,12 +51,12 @@ ordinary values. The compiler constructs them through checked labeled calls.
 
 ## Inspection
 
-`values.pack()` returns a readonly `fields.Pack`, exposing `entityType()`,
+`values.pack()` returns a readonly `fields::Pack`, exposing `entityType()`,
 `count()` and checked `entryAt(index)`. Each entry exposes the resolved declaring
-field identity, declared type and a readonly `quotation.CaptureValue`. Entries
+field identity, declared type and a readonly `quotation::CaptureValue`. Entries
 retain their source order. The underlying arrays remain private.
 
-Public `fields.Entry` and `fields.Pack` constructors create untyped inspection
+Public `fields::Entry` and `fields::Pack` constructors create untyped inspection
 data. Typed wrappers require compiler validation. Incompatible library
 constructors or scalar capture functions produce `NR277` before native lowering.
 

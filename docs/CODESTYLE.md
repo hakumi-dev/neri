@@ -96,7 +96,8 @@ neri_one_class_per_file = true
 
 Severity values are `none`, `suggestion`, `warning` and `error`. Assertion helper
 names are case-sensitive. Use `/` between name components in configuration:
-`test/assert*` matches calls whose qualified name starts with `test.assert`.
+`test/assert*` matches calls such as `test::assertTrue()` by their canonical
+qualified name, which starts with `test.assert`.
 A final `*` matches a name prefix. Each matching section replaces the whole
 helper list; `unset` restores the defaults (`test/assert*`, `assert`).
 Neri also accepts dot-qualified values. Slash qualification keeps each helper
@@ -107,6 +108,10 @@ NRSTYLE007 has no automatic correction because moving declarations can change
 source ownership and project structure.
 
 ## Source organization
+
+Namespace separators have no surrounding spaces: `App::Nested::Type`.
+Member access also has no surrounding spaces: `App::Type.create()`.
+Namespace aliases use assignment spacing: `use IO = App::Nested`.
 
 Compiler, tooling and standard-library sources keep one top-level class or enum
 per file, grouped in directories by responsibility. Extracted types use their full name in

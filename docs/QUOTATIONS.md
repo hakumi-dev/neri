@@ -58,8 +58,8 @@ identity and static type. Parameter and capture nodes refer to indexed slots.
 Captures use immutable bindings and scalar `Bool`, `Int`, `String` or null values.
 Each captured binding is read once when the quotation is constructed. Repeated
 reads in the expression refer to the same capture slot. Optional `Bool?`, `Int?`
-and `String?` values use the standard `quotation.captureBool`,
-`quotation.captureInt` and `quotation.captureText` helpers, preserving either
+and `String?` values use the standard `quotation::captureBool`,
+`quotation::captureInt` and `quotation::captureText` helpers, preserving either
 the scalar value or `CaptureValue.Null` without a conversion. Field packs use
 the same validated capture ABI. A different optional type is rejected.
 
@@ -71,7 +71,7 @@ diagnostics point to the bound operation's source span.
 
 ## Inspection
 
-`expression.tree()` returns a readonly `quotation.Tree`. It exposes the root
+`expression.tree()` returns a readonly `quotation::Tree`. It exposes the root
 index, node and capture counts, parameter types and result type. `nodeAt`,
 `captureAt` and `parameterTypeAt` return null for an invalid index.
 
