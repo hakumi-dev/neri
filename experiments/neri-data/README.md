@@ -2,8 +2,8 @@
 
 Neri Data is a bounded feasibility prototype for generated, typed data access.
 It uses ordinary Neri declarations, typed quotations and `fields of T`; it has
-no ORM or database driver. The generated example maps `model.Customer` and
-`model.Order`, including the `Customer.id` to `Order.customerId` relation.
+no ORM or database driver. The generated example maps `model::Customer` and
+`model::Order`, including the `Customer.id` to `Order.customerId` relation.
 
 The hand-written runtime is [`runtime.hk`](runtime.hk). The default sample is
 [`generated-example/sample.hk`](generated-example/sample.hk). Generation and
@@ -14,8 +14,8 @@ generated-source loading are specified in
 
 Generated context members have the shared generic type `Query<T>`. The generator
 does not create a query class, field class or snapshot class for each entity. A
-generated context contains mapped `Query<model.Customer>` and
-`Query<model.Order>` values backed by entity metadata and typed decoders.
+generated context contains mapped `Query<model::Customer>` and
+`Query<model::Order>` values backed by entity metadata and typed decoders.
 
 ```neri
 use app_data
@@ -25,12 +25,12 @@ use quotation
 
 def example(): Void
   let db = database()
-  let byId: quote fn(model.Customer): Int = quote do |customer: model.Customer|: Int
+  let byId: quote fn(model::Customer): Int = quote do |customer: model::Customer|: Int
     return customer.id
   end
 
   let filtered = db.customers.where(active: true, nickname: null)
-  let query = filtered.matching(quote do |customer: model.Customer|: Bool
+  let query = filtered.matching(quote do |customer: model::Customer|: Bool
     return customer.id > 10
   end).orderBy(byId, true).take(20)
 
@@ -63,10 +63,10 @@ Ordering uses typed quotation overloads:
 
 ```neri
 query.orderBy(byId, true)
-let byName: quote fn(model.Customer): String = quote do |customer: model.Customer|: String
+let byName: quote fn(model::Customer): String = quote do |customer: model::Customer|: String
   return customer.name
 end
-let byActive: quote fn(model.Customer): Bool = quote do |customer: model.Customer|: Bool
+let byActive: quote fn(model::Customer): Bool = quote do |customer: model::Customer|: Bool
   return customer.active
 end
 query.orderByString(byName)
@@ -93,10 +93,10 @@ Generated snapshots use the compiler field representation; key accessors retain
 the declared key type:
 
 ```neri
-snapshot_Customer(entity: model.Customer): fields of model.Customer
-key_Customer(entity: model.Customer): Int
-snapshot_Order(entity: model.Order): fields of model.Order
-key_Order(entity: model.Order): Int
+snapshot_Customer(entity: model::Customer): fields of model::Customer
+key_Customer(entity: model::Customer): Int
+snapshot_Order(entity: model::Order): fields of model::Order
+key_Order(entity: model::Order): Int
 ```
 
 The generated relation method applies the mapped foreign key as a dependent
@@ -105,8 +105,10 @@ query filter. It does not join, lazy-load or mutate entities.
 ## Generated metadata and provenance
 
 The mapping at [`generated-example/mapping.json`](generated-example/mapping.json)
-declares entity types, sets, tables, columns, keys and relations. Generated
-sources contain:
+declares entity types, sets, tables, columns, keys and relations. Mapping JSON
+uses canonical dotted names for namespace and entity identities, such as
+`model.Customer`; Neri source spells the same type `model::Customer`.
+Generated sources contain:
 
 - `Database` members with `Query<T>` values and relation traversal methods;
 - `EntityMapping` and `MappingColumn` metadata with canonical entity and field

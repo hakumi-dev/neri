@@ -6,14 +6,14 @@ to maintained operating-system or platform libraries.
 
 ## Results and failures
 
-Operations that can fail return `crypto.BytesResult`. Exactly one branch is
+Operations that can fail return `crypto::BytesResult`. Exactly one branch is
 selected: `bytes()` contains owned output on success, while `failure()` contains
-a `crypto.Failure` with a stable `code()` on failure. Successful byte arrays
+a `crypto::Failure` with a stable `code()` on failure. Successful byte arrays
 belong to the caller and remain mutable.
 
 ## SHA-256
 
-`crypto.sha256(input)` hashes the exact bytes in `input`, including embedded
+`crypto::sha256(input)` hashes the exact bytes in `input`, including embedded
 zero bytes, and returns a 32-byte digest. It uses CommonCrypto on Apple
 platforms, OpenSSL's high-level EVP digest API on Linux, and CNG BCrypt on
 Windows. A native provider or input-size failure has code `digest_failed`.
@@ -29,7 +29,7 @@ and the digest contract is checked against NIST's published
 
 ## Operating-system entropy
 
-`crypto.randomBytes(count)` obtains `count` bytes from the operating system.
+`crypto::randomBytes(count)` obtains `count` bytes from the operating system.
 `count` must be between zero and 256 inclusive; invalid sizes have code
 `invalid_length`, and an operating-system failure has code `entropy_failed`.
 The limit matches the small-request guarantee of Linux
@@ -48,10 +48,10 @@ supports deterministic and failure-path tests without shared mutable state.
 
 ## Hexadecimal encoding
 
-`crypto.encodeHex(bytes)` produces lower-case hexadecimal. It returns `null`
+`crypto::encodeHex(bytes)` produces lower-case hexadecimal. It returns `null`
 when doubling the input would exceed the 128 MiB buffer limit.
 
-`crypto.decodeHex(text, limit = 4096)` accepts upper- or lower-case ASCII
+`crypto::decodeHex(text, limit = 4096)` accepts upper- or lower-case ASCII
 hexadecimal and returns bytes. `limit` bounds the decoded byte count before
 allocation and may be at most 128 MiB. Odd-length input, non-hexadecimal bytes,
 and non-ASCII text have code `invalid_hex`; excess input has code

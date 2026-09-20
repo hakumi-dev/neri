@@ -13,7 +13,7 @@ entries. [C interoperability](C-INTEROP.md) defines the public export, native
 function-pointer, thread, lifetime, and failure contracts.
 
 `neri_rt_v1_host_executable_path` belongs to `BOOTSTRAP_HOST`.
-`host.executablePath()` returns the canonical current process image path or
+`host::executablePath()` returns the canonical current process image path or
 `null`. It uses the operating system's process image API independently of user
 arguments: [dyld on macOS](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man3/dyld.3.html),
 [`/proc/self/exe` on Linux](https://www.man7.org/linux/man-pages/man5/proc_pid_exe.5.html),
@@ -80,8 +80,8 @@ native watchdog for explicitly configured whole-process termination after stop.
 The `SESSION_MODULES` feature (8388608), introduced in ABI 1.19, provides the
 versioned session metadata and coordinator bridge. The
 `OPTIONAL_CONSOLE_READ` feature (33554432), introduced in ABI 1.21, adds
-`console.readLine(): String?`: EOF before any byte returns none, while a blank
-line returns an empty string. The existing `console.read()` contract is unchanged.
+`console::readLine(): String?`: EOF before any byte returns none, while a blank
+line returns an empty string. The existing `console::read()` contract is unchanged.
 
 ABI 1.22 adds `PROCESS_IO` (67108864) for initial child stdin, terminal capture
 and controlled interruption, and `FILESYSTEM_MUTATION` (134217728) for temporary

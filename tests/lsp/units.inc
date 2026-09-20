@@ -74,14 +74,14 @@ static void unit_project_contract(const char *compiler, const char *root) {
   snprintf(message, sizeof(message),
     "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didChange\",\"params\":{"
     "\"textDocument\":{\"uri\":\"%s\",\"version\":2},\"contentChanges\":[{\"text\":"
-    "\"def main(): Void\\n  let value = shared.\\nend\\n\"}]}}", main_uri);
+    "\"def main(): Void\\n  let value = shared::\\nend\\n\"}]}}", main_uri);
   send_message(message, 0);
   reply = receive();
   require(*spaces(diagnostics(reply) + 1) == '{', "incomplete qualified unit source reports diagnostics");
   free(reply);
   snprintf(message, sizeof(message),
     "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/completion\",\"id\":\"unit-completion\","
-    "\"params\":{\"textDocument\":{\"uri\":\"%s\"},\"position\":{\"line\":1,\"character\":21}}}", main_uri);
+    "\"params\":{\"textDocument\":{\"uri\":\"%s\"},\"position\":{\"line\":1,\"character\":22}}}", main_uri);
   send_message(message, 0);
   reply = receive();
   const char *items = field(reply, "result");

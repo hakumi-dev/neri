@@ -1,14 +1,14 @@
 # Binary file reads
 
-`files.ScopedRoot.open(absolutePath)` acquires a root through
-`result.Result<ScopedRoot, result.Failure>`. Use it with `using` inside a callable
-returning `resources.Outcome<T, result.Failure>` to release the root on scope
+`files::ScopedRoot.open(absolutePath)` acquires a root through
+`result::Result<ScopedRoot, result::Failure>`. Use it with `using` inside a callable
+returning `resources::Outcome<T, result::Failure>` to release the root on scope
 exit, early return, or failure acquiring a later resource. The scoped root exposes
 bounded reads and directory enumeration while retaining its private handle.
 Its `close` is idempotent; reads and enumeration after closure report `closed`.
 
 
-`use files` loads bounded binary file reads. `files.readBytes(path, limit)`
+`use files` loads bounded binary file reads. `files::readBytes(path, limit)`
 returns a result with optional `bytes`, `failure` and `closeFailure`. Success
 contains the exact bytes of a regular file, including invalid UTF-8, and closes
 its descriptor before returning. The caller limit is 0–128 MiB; the file size is
@@ -32,7 +32,7 @@ and reports its failure; it does not retry a potentially reused descriptor.
 
 ## Rooted reads
 
-`files.Root.open(absolutePath)` pins an existing directory and returns a root or
+`files::Root.open(absolutePath)` pins an existing directory and returns a root or
 an owned failure. The configured root path is UTF-8, NUL-free, at most 1 MiB and
 absolute, with no trailing separator except for `/` itself. Its final component must not be a symbolic link. Parent components may
 resolve symbolic links intentionally as part of choosing the configured root;
@@ -92,8 +92,8 @@ alone are not the containment primitive promised here.
 
 ## Filesystem mutation
 
-`files.TemporaryDirectory.create(prefix)` creates a unique private temporary directory
-and returns `result.Result<TemporaryDirectory, result.Failure>`. The prefix is a
+`files::TemporaryDirectory.create(prefix)` creates a unique private temporary directory
+and returns `result::Result<TemporaryDirectory, result::Failure>`. The prefix is a
 nonempty UTF-8 label without `/`, `\\` or NUL. The returned
 `TemporaryDirectory` is a resource: use `using` where possible, or call its
 idempotent `close()` to remove the whole tree. `path()` exposes the created
@@ -102,11 +102,11 @@ Temporary directories are created
 with owner-only permissions on POSIX. The cleanup walk removes symbolic links
 themselves and never follows them.
 Cleanup can still fail when another process changes permissions or retains a
-directory entry; its `result.Failure` reports `remove_tree_failed` and its OS
+directory entry; its `result::Failure` reports `remove_tree_failed` and its OS
 code.
 
 The general path APIs accept nonempty UTF-8 paths up to 1 MiB without embedded
-NUL. They report a `files.OperationResult`, whose `failure` is null on success:
+NUL. They report a `files::OperationResult`, whose `failure` is null on success:
 `createDirectory(path, parents)`, `move(source, destination)`,
 `removeFile(path)`, `removeDirectory(path)`, `removeTree(path)` and
 `copyFile(source, destination)`. `createDirectory` uses owner-only mode on

@@ -17,13 +17,13 @@ static void automatic_project_contract(const char *compiler, const char *root) {
   char *main_uri = file_uri(path);
   open_document(main_uri,
     "def main(): Void\n"
-    "  let value = dependencies.\n"
+    "  let value = dependencies::\n"
     "end\n", 0);
   char *reply = receive();
   require(*spaces(diagnostics(reply) + 1) == '{', "incomplete automatic project source reports a parse diagnostic");
   free(reply);
   snprintf(message, sizeof(message), "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/completion\",\"id\":\"auto-project-completion\","
-    "\"params\":{\"textDocument\":{\"uri\":\"%s\"},\"position\":{\"line\":1,\"character\":27}}}", main_uri);
+    "\"params\":{\"textDocument\":{\"uri\":\"%s\"},\"position\":{\"line\":1,\"character\":28}}}", main_uri);
   send_message(message, 0);
   reply = receive();
   const char *items = field(reply, "result");
@@ -34,11 +34,11 @@ static void automatic_project_contract(const char *compiler, const char *root) {
 
   snprintf(message, sizeof(message), "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didChange\",\"params\":{"
     "\"textDocument\":{\"uri\":\"%s\",\"version\":2},\"contentChanges\":[{\"text\":"
-    "\"def main(): Void\\n  let value: Int = dependencies.library()\\nend\\n\"}]}}", main_uri);
+    "\"def main(): Void\\n  let value: Int = dependencies::library()\\nend\\n\"}]}}", main_uri);
   send_message(message, 0);
   empty_diagnostics(2);
   snprintf(message, sizeof(message), "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/definition\",\"id\":\"auto-project-definition\","
-    "\"params\":{\"textDocument\":{\"uri\":\"%s\"},\"position\":{\"line\":1,\"character\":34}}}", main_uri);
+    "\"params\":{\"textDocument\":{\"uri\":\"%s\"},\"position\":{\"line\":1,\"character\":35}}}", main_uri);
   send_message(message, 0);
   reply = receive();
   snprintf(path, sizeof(path), "%s/tests/lsp/auto-library/src/library.hk", root);
@@ -74,13 +74,13 @@ static void automatic_project_contract(const char *compiler, const char *root) {
   open_document(left_uri,
     "namespace dependencies\n"
     "def left(): Int\n"
-    "  return dependencies.\n"
+    "  return dependencies::\n"
     "end\n", 0);
   reply = receive();
   require(*spaces(diagnostics(reply) + 1) == '{', "incomplete library project source reports its parse diagnostic");
   free(reply);
   snprintf(message, sizeof(message), "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/completion\",\"id\":\"library-project-completion\","
-    "\"params\":{\"textDocument\":{\"uri\":\"%s\"},\"position\":{\"line\":2,\"character\":22}}}", left_uri);
+    "\"params\":{\"textDocument\":{\"uri\":\"%s\"},\"position\":{\"line\":2,\"character\":23}}}", left_uri);
   send_message(message, 0);
   reply = receive();
   require(completion_item(field(reply, "result"), "library") != NULL,

@@ -186,9 +186,10 @@ defines its namespace, name, parameters, result type, documentation, navigation,
 completion and import requirement; runtime symbol names do not define that
 surface.
 
-`StandardLibraryCatalog` resolves a `use` target through the library units in
-`NERI_STDLIB/manifest.json`. Each unit can own multiple source files, and imports
-in every file participate in dependency discovery. Compilation, LSP analysis,
+`BootstrapLibraryReferences` collects imports, namespace aliases and `::` roots
+across a compilation module. `StandardLibraryCatalog` resolves referenced roots
+through the library units in `NERI_STDLIB/manifest.json`. Each unit can own multiple
+source files, and references in every file participate in dependency discovery. Compilation, LSP analysis,
 session snapshots and documentation indexing use this catalog. Source identities
 preserve relative paths as `@stdlib/<path>.hk`; namespaces remain source
 declarations. The `core` unit includes `core.hk`, which owns the intrinsic
@@ -230,7 +231,7 @@ rejected before LLVM generation.
 `noreturn` is a positive control-flow guarantee: an import may assert it only
 when the catalog guarantees it. Its omission remains valid for conservative
 producers. The backend obtains the guarantee from the catalog, including for
-`host.exit`; callers receive its may-effects separately from this guarantee.
+`host::exit`; callers receive its may-effects separately from this guarantee.
 Unsafe C ABI imports retain their distinct calling-convention contract.
 
 Bootstrap checks generated artifacts against the catalog before publishing a
@@ -346,7 +347,7 @@ Range calls include worker startup, queue access, task execution and joining.
 The [benchmark methodology](../benchmarks/README.md#analytical-foundations)
 distinguishes measured execution costs from theoretical work/span bounds.
 
-`tasks.generate` binds an index callback with a `parallel fn` signature. Shared
+`tasks::generate` binds an index callback with a `parallel fn` signature. Shared
 capture checking restricts access to ancestors; transitive effect checking
 rejects unsafe operations and native services. The caller is suspended until
 all callbacks finish. The compiler emits a typed adapter into the joined range

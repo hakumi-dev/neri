@@ -34,32 +34,32 @@ static void signature_help_contract(void) {
   free(reply);
 
   open_document("file:///signature-library.hk",
-    "use console\n"
+    "# Qualified library call\n"
     "def main(): Void\n"
-    "  console.println(\"value\")\n"
+    "  console::println(\"value\")\n"
     "end\n", 0);
   empty_diagnostics(1);
   send_message("{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/signatureHelp\",\"id\":\"signature-library\","
-    "\"params\":{\"textDocument\":{\"uri\":\"file:///signature-library.hk\"},\"position\":{\"line\":2,\"character\":18}}}", 0);
+    "\"params\":{\"textDocument\":{\"uri\":\"file:///signature-library.hk\"},\"position\":{\"line\":2,\"character\":19}}}", 0);
   reply = receive();
   result = field(reply, "result");
   signature = spaces(field(result, "signatures") + 1);
-  require(string_is(field(signature, "label"), "def console.println(value: String): Void"),
+  require(string_is(field(signature, "label"), "def console::println(value: String): Void"),
           "signature help uses the declared library callable");
   free(reply);
 
   open_document("file:///signature-equality.hk",
-    "use test\n"
+    "# Qualified generic call\n"
     "def main(): Void\n"
-    "  test.assertEqual(1, 1)\n"
+    "  test::assertEqual(1, 1)\n"
     "end\n", 0);
   empty_diagnostics(1);
   send_message("{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/signatureHelp\",\"id\":\"signature-equality\","
-    "\"params\":{\"textDocument\":{\"uri\":\"file:///signature-equality.hk\"},\"position\":{\"line\":2,\"character\":22}}}", 0);
+    "\"params\":{\"textDocument\":{\"uri\":\"file:///signature-equality.hk\"},\"position\":{\"line\":2,\"character\":23}}}", 0);
   reply = receive();
   result = field(reply, "result");
   signature = spaces(field(result, "signatures") + 1);
-  require(string_is(field(signature, "label"), "def test.assertEqual<Int>(left: Int, right: Int): Void"),
+  require(string_is(field(signature, "label"), "def test::assertEqual<Int>(left: Int, right: Int): Void"),
           "signature help resolves the generic library callable");
   free(reply);
 

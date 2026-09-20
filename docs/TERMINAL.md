@@ -8,9 +8,9 @@ use terminal
 use console
 
 def main(): Void
-  let session = terminal.open()
+  let session = terminal::open()
   if session == null
-    console.println("A foreground interactive terminal is required.")
+    console::println("A foreground interactive terminal is required.")
     return
   end
   var running = true
@@ -40,7 +40,7 @@ the session. SIGINT, SIGTERM, SIGHUP, SIGQUIT and SIGTSTP request cooperative
 closure on the next read; SIGTSTP closes this session rather than suspending it.
 `Session.isOpen()` reports the session state. Signal handlers are restored on
 close. Applications should keep reading while interactive and avoid mixing
-`console.read()` with an active session.
+`console::read()` with an active session.
 
 `Session.columns()` and `rows()` query current dimensions, returning zero when
 unavailable. `Session.close()` restores terminal settings, cursor and screen;
@@ -50,8 +50,8 @@ Neri runtime panic also restore an active terminal. SIGKILL, native crashes and
 loss of the terminal cannot guarantee restoration; `stty sane` restores a shell
 left in a noncanonical mode. Garbage collection is not a session-close mechanism.
 
-`terminal.escape(): String` supplies the ASCII Escape character for applications
-that render ANSI control sequences through `console.print`.
+`terminal::escape(): String` supplies the ASCII Escape character for applications
+that render ANSI control sequences through `console::print`.
 
 The [`clock` standard-library contract](CLOCK.md) documents monotonic durations
 and deadlines, explicit wall-clock timestamps, deterministic UTC formatting, and

@@ -46,6 +46,8 @@ a candidate from another environment is rejected. It atomically adopts
 declarations, binding metadata and the next frame. `discard`
 consumes a candidate without changing the environment. Stale and repeated
 operations fail. Invalid preparation never changes the generation or registry.
+Namespace aliases follow the same commit boundary: `use Output = console`
+makes `Output::println(...)` available to subsequent submissions after commit.
 The environment accepts at most 1 MiB of submitted source, 1024 declarations and
 1024 bindings.
 
@@ -224,10 +226,11 @@ zero-argument non-`Void` function, and executed independently of the project's
 accepts an optional binding name (default `service`) and a string containing only
 `use` declarations (default empty). The imports and named initializer result are
 available in the first committed generation, using one compiled module. The
-initializer still executes once per successful initialization. Names must be
-single identifiers outside the reserved session namespace; executable statements
-are rejected in `imports`. Reset discards the instance and allows initialization
-of a fresh one. Existing three-argument callers keep the `service` binding.
+initializer executes once per successful initialization. `functionName` accepts
+a function identifier or a namespace path such as `services::createSessionService`,
+including aliases declared in `imports`. Binding names are single identifiers
+outside the reserved session namespace. `imports` contains only declarations.
+Reset discards the instance and allows initialization of a fresh one.
 
 `SessionTerminal` is a small frontend over this API. It accepts optional
 context before the first prompt, collects multiline input through a line
@@ -275,7 +278,7 @@ if prepared.status.isComplete()
   let execution = session.execute(prepared)
 
   if execution.succeeded() && execution.resultType != "Void"
-    console.println(execution.resultText)
+    console::println(execution.resultText)
   end
 end
 ```

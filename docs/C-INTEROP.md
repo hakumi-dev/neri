@@ -196,10 +196,10 @@ native allocation, collection, and panic.
 
 | Calling thread's runtime state | Heap ownership and return behavior |
 | --- | --- |
-| Uninitialized | Outermost export owns a temporary heap; return reclaims managed objects and `native.alloc` allocations. |
+| Uninitialized | Outermost export owns a temporary heap; return reclaims managed objects and `native::alloc` allocations. |
 | Already initialized | Export reuses the heap and preserves host ownership; leaving an export does not shut it down. |
 
-- To retain `native.alloc` memory across calls, the host initializes that thread
+- To retain `native::alloc` memory across calls, the host initializes that thread
   with `neri_rt_v1_initialize`, checks its ABI status, and calls
   `neri_rt_v1_shutdown` after final use. Shutdown requires completed foreign
   entries and released roots and borrows.
