@@ -1,0 +1,234 @@
+use host
+
+# Source anchors identify tokens. Declaration anchors are not body ranges.
+def semanticQueryContains(owner: BootstrapBinder, node: Int, position: Int): Bool
+  if node < 0 || !owner.checkpoint()
+    return false
+  end
+  let syntax = owner.syntax.nodeAt(node)
+
+  if syntax.start <= position && position < syntax.start + syntax.length
+    return true
+  end
+  for child in syntax.children
+    if semanticQueryContains(owner, child, position)
+      return true
+    end
+    return false if owner.cancelled()
+  end
+  for argument in syntax.typeArguments
+    if semanticQueryContains(owner, argument, position)
+      return true
+    end
+  end
+  for constraint in syntax.typeParameterConstraints
+    if semanticQueryContains(owner, constraint, position)
+      return true
+    end
+  end
+  return false
+end
+
+def semanticQueryRequiresBody(owner: BootstrapBinder, node: Int, position: Int): Bool
+  let kind = owner.syntax.kindAt(node)
+
+  if kind.isField()
+    return owner.syntax.childCountAt(node) > 1 && semanticQueryContains(owner, owner.syntax.childAt(node, 1), position)
+  end
+  if kind.isClass()
+    var index = owner.classMemberStart(node)
+
+    while index < owner.syntax.childCountAt(node) && owner.checkpoint()
+      if semanticQueryRequiresBody(owner, owner.syntax.childAt(node, index), position)
+        return true
+      end
+      index = index + 1
+    end
+    return false
+  end
+  if !kind.isFunction() && !kind.isMethod()
+    return false
+  end
+  let declaration = semanticDeclaration(owner, node)
+
+  if declaration == null
+    return false
+  end
+  if kind.isMethod()
+    return semanticQueryRequiresBody(owner, owner.syntax.childAt(node, declaration.annotationCount), position)
+  end
+  var index = declaration.annotationCount
+  let parameterEnd = index + declaration.parameterCount
+
+  while index < parameterEnd && owner.checkpoint()
+    let parameter = owner.syntax.childAt(node, index)
+
+    if owner.syntax.childCountAt(parameter) > 1 && semanticQueryContains(owner, owner.syntax.childAt(parameter, 1), position)
+      return true
+    end
+    index = index + 1
+  end
+  index = parameterEnd + 1
+  while index < owner.syntax.childCountAt(node) && owner.checkpoint()
+    if semanticQueryContains(owner, owner.syntax.childAt(node, index), position)
+      return true
+    end
+    index = index + 1
+  end
+  return false
+end
+
+def semanticQueryArguments(owner: BootstrapBinder, template: Int): StringBuffer
+  let source = owner.syntax.nodeAt(template)
+  let arguments = new StringBuffer()
+  var index = 0
+
+  while index < source.typeParameters.Length && owner.checkpoint()
+    let name = genericContractParameterName(template, index)
+    let contract = semanticGenericContract(owner, template, index, false)
+    var capability = ""
+
+    if contract != null
+      capability = contract.fullName
+    end
+    owner.model.addTypeParameter(new SemanticTypeParameter(name, capability))
+    arguments.add(name)
+    index = index + 1
+  end
+  return arguments
+end
+
+def semanticQueryCallable(owner: BootstrapBinder, callable: SemanticCallable, classSymbol: SemanticClass?): Void
+  owner.currentClass = classSymbol
+  owner.currentNamespace = callable.namespaceName
+  let body = new BootstrapBodyBinder(owner)
+
+  body.bindCallable(callable)
+  var site = owner.model.completionSites
+
+  while site != null && owner.checkpoint()
+    let contract = semanticTypeParameterContract(owner.model, site.receiverType)
+
+    if contract != null
+      site.receiverKind = "contract"
+      site.receiverType = contract.fullName
+    end
+    site = site.next
+  end
+  owner.currentCallable = null
+  owner.currentClass = null
+  owner.currentNamespace = ""
+end
+
+def semanticBindQuery(owner: BootstrapBinder, position: Int): SemanticQueryAnalysis
+  let result = new SemanticQueryAnalysis(position)
+
+  if position < 0 || position > owner.sourceLength
+    return result
+  end
+  owner.registerDeclarations()
+  return result if owner.cancelled()
+  var index = 0
+
+  while index < owner.functionCount() && owner.checkpoint()
+    let node = owner.functionNodeAt(index)
+
+    if semanticQueryContains(owner, node, position)
+      if !semanticQueryRequiresBody(owner, node, position)
+        if !owner.cancelled()
+          result.model = owner.model
+        end
+        return result
+      end
+      let declaration = semanticDeclaration(owner, node)
+
+      if declaration == null
+        return result
+      end
+      var callable = owner.model.findFunction(semanticQualifiedName(declaration.namespaceName, declaration.name))
+
+      if owner.syntax.nodeAt(node).typeParameters.Length > 0
+        callable = instantiateGenericFunction(owner, node, semanticQueryArguments(owner, node), node)
+      end
+      if callable == null || owner.cancelled()
+        return result
+      end
+      semanticQueryCallable(owner, callable, null)
+      result.enclosingSyntaxNode = node
+      if !owner.cancelled()
+        result.model = owner.model
+      end
+      return result
+    end
+    index = index + 1
+  end
+  index = 0
+  while index < owner.classCount() && owner.checkpoint()
+    let classNode = owner.classNodeAt(index)
+
+    if semanticQueryContains(owner, classNode, position)
+      if !semanticQueryRequiresBody(owner, classNode, position)
+        if !owner.cancelled()
+          result.model = owner.model
+        end
+        return result
+      end
+      let declaration = semanticDeclaration(owner, classNode)
+
+      if declaration == null
+        return result
+      end
+      var symbol = owner.model.findClass(semanticQualifiedName(declaration.namespaceName, declaration.name))
+
+      if owner.syntax.nodeAt(classNode).typeParameters.Length > 0
+        symbol = instantiateGenericClass(owner, classNode, semanticQueryArguments(owner, classNode), classNode)
+      end
+      if symbol == null || owner.cancelled()
+        return result
+      end
+      var method = symbol.firstMethod
+
+      while method != null && owner.checkpoint()
+        if semanticQueryContains(owner, method.syntaxNode, position)
+          semanticQueryCallable(owner, method, symbol)
+          result.enclosingSyntaxNode = method.syntaxNode
+          if !owner.cancelled()
+            result.model = owner.model
+          end
+          return result
+        end
+        method = method.nextCallable
+      end
+      var field = symbol.firstField
+
+      while field != null && owner.checkpoint()
+        if semanticQueryContains(owner, field.syntaxNode, position)
+          owner.currentClass = symbol
+          owner.currentNamespace = symbol.namespaceName
+          let body = new BootstrapBodyBinder(owner)
+
+          if owner.syntax.childCountAt(field.syntaxNode) > 1
+            let initializer = owner.syntax.childAt(field.syntaxNode, 1)
+            let value = body.bindExpression(initializer, field.typeName)
+
+            field.boundInitializer = value.boundNode
+          end
+          owner.currentClass = null
+          owner.currentNamespace = ""
+          result.enclosingSyntaxNode = field.syntaxNode
+          if !owner.cancelled()
+            result.model = owner.model
+          end
+          return result
+        end
+        field = field.nextField
+      end
+      break
+    end
+    index = index + 1
+  end
+  if !owner.cancelled()
+    result.model = owner.model
+  end
+  return result
+end

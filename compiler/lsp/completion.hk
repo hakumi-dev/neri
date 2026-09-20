@@ -4,10 +4,11 @@ end
 
 # Shared by completion and other semantic queries which repair a copy of the
 # current text. It never falls back to the document's previous semantic model.
-def lspAnalyzeQueryText(document: LspDocument, primaryText: String): SemanticModel?
-  # analyze() deliberately leaves this null when project setup, file-name or
-  # standard-library loading failed. A semantic query must preserve that gate.
-  if document.tokens == null
+def lspAnalyzeQueryText(document: LspDocument, primaryText: String, queryPosition: Int = -1): SemanticModel?
+  # Queries require a verified source context, including generated artifacts.
+  let control = document.control
+
+  if !document.sourcesReady || (control != null && !control.poll())
     return null
   end
   let sourceParts = new StringBuffer()
@@ -21,6 +22,9 @@ def lspAnalyzeQueryText(document: LspDocument, primaryText: String): SemanticMod
   var index = 1
 
   while index < document.sourceTexts.size
+    if control != null && !control.checkpoint()
+      return null
+    end
     let text = document.sourceTexts.get(index)
 
     starts.add(offset)
@@ -30,9 +34,16 @@ def lspAnalyzeQueryText(document: LspDocument, primaryText: String): SemanticMod
     index = index + 1
   end
   let source = lspJoin(sourceParts, 0, sourceParts.size)
-  let tokens = (new BootstrapLexer(source)).lex()
+  let lexer = new BootstrapLexer(source)
+
+  lexer.control = control
+  let tokens = lexer.lex()
   let parser = new BootstrapParser(tokens)
 
+  if control != null && !control.poll()
+    return null
+  end
+  parser.control = control
   index = 0
   while index < starts.size
     parser.addSourceBoundary(starts.get(index))
@@ -40,11 +51,12 @@ def lspAnalyzeQueryText(document: LspDocument, primaryText: String): SemanticMod
   end
   let root = parser.parseProgram()
 
-  if parser.diagnostics.count() != 0
+  if parser.diagnostics.count() != 0 || (control != null && !control.poll())
     return null
   end
   let binder = new BootstrapBinder(parser.arena, root, tokens.startAt(tokens.count() - 1))
 
+  binder.control = control
   binder.recordSourceSymbols = true
   binder.recordCompletionSites = true
   binder.requireEntryPoint = document.requireEntryPoint
@@ -55,7 +67,20 @@ def lspAnalyzeQueryText(document: LspDocument, primaryText: String): SemanticMod
     binder.addSource(ids.get(index), starts.get(index))
     index = index + 1
   end
-  return binder.bind()
+  var model: SemanticModel? = null
+
+  if queryPosition >= 0
+    let query = binder.bindQuery(queryPosition)
+
+    model = query.model
+  else
+    model = binder.bind()
+  end
+
+  if control != null && !control.poll()
+    return null
+  end
+  return model
 end
 
 def lspCompletionSite(model: SemanticModel, target: SemanticCompletionTarget): SemanticCompletionSite?
@@ -126,14 +151,14 @@ def lspCompletionContext(document: LspDocument, position: Int): LspCompletionCon
   let repaired = host::stringSlice(document.text, 0, first) + marker + suffix + host::stringSlice(document.text, last, host::stringByteLength(document.text) - last)
   var queryText = repaired
   var mapsAfterInsertion = true
-  var model = lspAnalyzeQueryText(document, repaired)
+  var model = lspAnalyzeQueryText(document, repaired, target.start)
 
   if model == null && target.length == 0 && target.start == position
     let repairPosition = target.start + (new IrSourceMap(marker + suffix)).utf16Length()
     let closed = lspSignatureRepairText(repaired, repairPosition)
 
     if closed != null
-      model = lspAnalyzeQueryText(document, closed)
+      model = lspAnalyzeQueryText(document, closed, target.start)
       if model != null
         queryText = closed
         mapsAfterInsertion = false

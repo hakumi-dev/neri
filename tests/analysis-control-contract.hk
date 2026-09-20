@@ -1,0 +1,150 @@
+use host
+use test
+
+def analysisControlStop(): Bool
+  return false
+end
+
+def analysisControlContracts(): Void
+  semanticQueryBindingContracts()
+  var longText = "x"
+  var doubling = 0
+
+  while doubling < 14
+    longText = longText + longText
+    doubling = doubling + 1
+  end
+  for prefix in ["#", "\"", ""]
+    let lexer = new BootstrapLexer(prefix + longText)
+    let control = new AnalysisControl(analysisControlStop)
+
+    lexer.control = control
+    let tokens = lexer.lex()
+
+    test::assertTrue(control.isCancelled())
+    test::assertTrue(lexer.bytePosition < host::stringByteLength(longText))
+    test::assertTrue(tokens.kindAt(tokens.count() - 1).isEndOfFile())
+  end
+
+  var malformed = "def pending(): Void\n"
+  var index = 0
+
+  while index < 80
+    malformed = malformed + "if true\n"
+    index = index + 1
+  end
+  malformed = malformed + "target(first: [1, 2,\n"
+  let tokens = (new BootstrapLexer(malformed)).lex()
+  let parser = new BootstrapParser(tokens)
+  let parseControl = new AnalysisControl(analysisControlStop)
+
+  parser.addSourceBoundary(0)
+  parser.addSourceBoundary(host::stringByteLength(malformed))
+  parser.control = parseControl
+  parser.parseProgram()
+
+  test::assertTrue(parseControl.isCancelled())
+  test::assertTrue(parser.currentKind().isEndOfFile())
+
+  var source = "def value(): Int\n  var sum = 0\n"
+
+  index = 0
+  while index < 600
+    source = source + "  sum = sum + 1\n"
+    index = index + 1
+  end
+  source = source + "  return sum\nend\n"
+  let completeTokens = (new BootstrapLexer(source)).lex()
+  let completeParser = new BootstrapParser(completeTokens)
+  let root = completeParser.parseProgram()
+  let interrupted = new BootstrapBinder(completeParser.arena, root, host::stringByteLength(source))
+  let bindControl = new AnalysisControl(analysisControlStop)
+
+  interrupted.requireEntryPoint = false
+  interrupted.control = bindControl
+  interrupted.bind()
+
+  test::assertTrue(bindControl.isCancelled())
+  let query = new BootstrapBinder(completeParser.arena, root, host::stringByteLength(source))
+  let queryControl = new AnalysisControl(analysisControlStop)
+
+  query.requireEntryPoint = false
+  query.control = queryControl
+  let cancelledQuery = query.bindQuery(bootstrapFindText(source, "return sum"))
+
+  test::assertTrue(queryControl.isCancelled())
+  test::assertTrue(cancelledQuery.model == null)
+  let retry = new BootstrapBinder(completeParser.arena, root, host::stringByteLength(source))
+
+  retry.requireEntryPoint = false
+  let model = retry.bind()
+  let value = model.findFunction("value")
+
+  test::assertEqual(model.diagnostics.count(), 0)
+  test::assertTrue(value != null && value.boundNode >= 0)
+end
+
+def semanticQueryBindingCase(source: String, marker: String, expected: String): Void
+  let markerByte = bootstrapFindText(source, marker)
+  let position = (new IrSourceMap(host::stringSlice(source, 0, markerByte))).utf16Length()
+  let parser = new BootstrapParser((new BootstrapLexer(source)).lex())
+  let root = parser.parseProgram()
+
+  test::assertEqual(parser.diagnostics.count(), 0)
+  let full = new BootstrapBinder(parser.arena, root, host::stringByteLength(source))
+
+  full.requireEntryPoint = false
+  full.recordCompletionSites = true
+  let complete = full.bind()
+  let query = new BootstrapBinder(parser.arena, root, host::stringByteLength(source))
+
+  query.requireEntryPoint = false
+  query.recordCompletionSites = true
+  let result = query.bindQuery(position)
+  let model = result.model
+
+  test::assertTrue(model != null)
+  if model == null
+    return
+  end
+  let target = semanticCompletionTarget(source, position)
+  let completeSite = semanticCompletionSite(complete, target)
+  let querySite = semanticCompletionSite(model, target)
+
+  test::assertTrue(completeSite != null && querySite != null)
+  if completeSite == null || querySite == null
+    return
+  end
+  let completeCandidates = semanticCompletionCandidates(complete, completeSite, "")
+  let queryCandidates = semanticCompletionCandidates(model, querySite, "")
+  var left = completeCandidates.first
+  var right = queryCandidates.first
+  var found = false
+
+  test::assertEqual(querySite.receiverType, completeSite.receiverType)
+  test::assertEqual(queryCandidates.count, completeCandidates.count)
+  while left != null && right != null
+    test::assertEqual(left.name, right.name)
+    test::assertEqual(left.detail, right.detail)
+    found = found || right.name == expected
+    left = left.next
+    right = right.next
+  end
+  let unrelated = model.findFunction("unrelated")
+
+  test::assertTrue(found)
+  test::assertTrue(unrelated != null && unrelated.boundNode < 0)
+end
+
+def semanticQueryBindingContracts(): Void
+  let declarations = "class Base\n  public inherited: Int = 1\nend\nclass Derived : Base\nend\nclass Box<T>\n  public value: T\nend\ndef unrelated(): Int\n  return unknownValue\nend\n"
+
+  semanticQueryBindingCase(declarations + "def selected(value: Derived): Int\n  return value.__queryInherited\nend\n", "__queryInherited", "inherited")
+  semanticQueryBindingCase(declarations + "def selected(value: Box<Int>): Int\n  return value.__queryGeneric\nend\n", "__queryGeneric", "value")
+  semanticQueryBindingCase(declarations + "# 水 😀\ndef selected(value: Derived): Int\n  let callback = fn(): Int\n    return value.__queryClosure\n  end\n  return callback()\nend\n", "__queryClosure", "inherited")
+  semanticQueryBindingCase(declarations + "def named(first: Int, second: Int): Int\n  return first + second\nend\ndef selected(): Int\n  return named(__queryLabel: 1)\nend\n", "__queryLabel", "second")
+  semanticQueryBindingCase(declarations + "class Initializer\n  public value: Int = (new Derived()).__queryField\nend\n", "__queryField", "inherited")
+  semanticQueryBindingCase(declarations + "class Methods\n  def selected(value: Derived): Int\n    return value.__queryMethod\n  end\nend\n", "__queryMethod", "inherited")
+  semanticQueryBindingCase(declarations + "class Methods<T>\n  def selected(value: Derived): Int\n    return value.__queryTemplate\n  end\nend\ndef create(): Methods<Int>\n  return new Methods<Int>()\nend\n", "__queryTemplate", "inherited")
+  semanticQueryBindingCase(declarations + "contract Named\n  readonly def label(): String\n  end\nend\ndef selected<T: Named>(value: T): String\n  return value.__queryConstraint()\nend\n", "__queryConstraint", "label")
+end

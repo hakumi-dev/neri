@@ -201,25 +201,44 @@ units require exactly one entry point for language-server analysis. See
 Text changes apply immediately in protocol order and invalidate affected models.
 Consecutive changes coalesce into one pending analysis per document. Semantic
 queries analyze their current document on demand; newline formatting uses only
-its current syntax. After 150 ms without pending input, the server analyzes one
+its current syntax. Completion prepares the unit's verified sources, registers
+declarations, and binds the enclosing callable or field initializer in a repaired
+copy. This query model covers that scope and is never published as diagnostics.
+After 150 ms without pending input, the server analyzes one
 dirty document for diagnostics, then checks input again. The last edited document
 has priority. Source membership is retained across text edits and rediscovered
 after open, close and watched-file notifications.
 
-The selected unit's source graph is flattened for synchronous analysis, and its
-bound model is retained for queries. A single large analysis can still delay
-later messages; background cancellation and incremental semantic analysis remain
-unsupported. Diagnostic versions let clients discard obsolete results.
+Analysis runs cooperatively on the protocol thread. Lexer, parser and binder
+checkpoints collect input without dispatching messages or changing source state.
+Requests and document changes interrupt idle diagnostics; interrupted models are
+discarded. Dispatch preserves protocol order. Explicit `$/cancelRequest` cancels
+a matching queued or active request and returns one `RequestCancelled` response.
+Later edits remain queued until an active request finishes; clients can cancel
+that request when its result is no longer useful. Completion items resolve only
+against their document version and verified source generation.
+
+The selected unit's source graph is still lexed and parsed for each repaired
+query. Declaration registration is shared with full binding; unrelated callable
+bodies are deferred. Filesystem operations and work between checkpoints remain
+synchronous. [Completion measurements](../benchmarks/lsp/README.md) cover cold,
+warm and unrelated-unit workloads.
 Transport limits are 2 MiB per message, 8 KiB of headers and 64 nested JSON
 containers. Malformed framing terminates the session; malformed JSON gets a
-parse-error reply. Protocol notices use `window/logMessage`.
+parse-error reply. Input collection pauses at 32 queued messages or 4 MiB of
+queued bodies, with at most one additional bounded frame. Protocol notices use
+`window/logMessage`.
 
 Semantic tokens are not advertised or implemented. Built-in types
 and intrinsic operations without source declarations have no definition location.
 Completion and signature repairs do not
-provide general error-tolerant analysis. Background cancellation is unsupported.
+provide general error-tolerant analysis.
 Language-service improvements and acceptance requirements are tracked in the
 [Kanban](https://github.com/hakumi-dev/neri/issues/55).
+
+Protocol reference: [LSP 3.17 cancellation and message ordering](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/).
+Query architecture references: [rust-analyzer architecture](https://rust-analyzer.github.io/book/contributing/architecture.html)
+and [Three architectures for a responsive IDE](https://rust-analyzer.github.io/blog/2020/07/20/three-architectures-for-responsive-ide.html).
 
 ## Optional symbol documentation
 
