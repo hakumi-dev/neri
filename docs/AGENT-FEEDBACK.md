@@ -6,13 +6,9 @@ them with Neri's parser and binder, and returns diagnostics and semantic context
 Project tools inspect saved sources across declared project members. The test
 tool builds and runs explicitly registered test units.
 
-The coding agent controls the improvement cycle: observe the project, edit its
-sources, run the relevant checks and decide whether to retain the change.
-Diagnostics establish syntax and type correctness; test results establish the
-registered behavioral contracts; timings report the measured build workload.
-Neri supplies these observations and their input identities. Scheduling work,
-choosing an improvement objective and applying or reverting disk edits belong
-to the agent host.
+The agent host owns disk edits and commits. Compiler diagnostics describe syntax
+and types, tests exercise registered behavior, and profiling measures compiler
+work. Each result identifies its observed inputs.
 
 Start one server for one project unit. MCP clients use their own configuration
 shape, but a generic server entry is:
@@ -35,6 +31,17 @@ contains protocol messages only.
 
 ## Tools
 
+| Task | Tool | Input state |
+| --- | --- | --- |
+| Find declarations by name, signature or type | `neri.describe` | Saved project graph |
+| Check all declared units | `neri.feedback` | Saved project graph |
+| Open source and inspect types at a position | `neri.open`, `neri.inspect` | In-memory buffers |
+| Try one source replacement | `neri.edit` | In-memory buffer, guarded by `expectedRevision` |
+| Build and run registered tests | `neri.test` | Saved project graph |
+| Measure release compilation | `neri.profile` | Saved project graph; applications are not run |
+
+### neri.open, neri.inspect and neri.edit
+
 `neri.open` opens an existing source from the selected unit or its references.
 The optional `text` value supplies an unsaved overlay; otherwise Neri reads the
 current file. A source can have only one open buffer.
@@ -53,6 +60,8 @@ limits validate. It advances the buffer version and workspace revision, then
 reanalyzes the source's owning compilation unit and its references. The result reports
 `persisted: false` and `executed: false`.
 
+### neri.feedback
+
 `neri.feedback` takes an `operationId` and analyzes every unit in the root
 manifest, declared `projects` members and their referenced libraries. Each unit
 retains its own reference visibility and entry-point rules. A library change is
@@ -62,6 +71,8 @@ snapshot, unit diagnostics, `complete`, `unitsTotal`, `unitsAnalyzed` and
 `unitsReused`. `invalidatedUnits` identifies units whose input closure required
 analysis; `removedUnits` identifies previously reported units absent now.
 
+### neri.describe
+
 `neri.describe` takes `operationId` and a nonempty `query`. It searches bound
 declarations across the project graph and returns signatures, inferred types,
 documentation, identities, source URIs, UTF-16 ranges and the unit context.
@@ -70,6 +81,8 @@ case-sensitive substring of declaration names, identities, signatures or types.
 `omittedUnits` and `resultsTruncated` make incomplete coverage explicit. Results
 are limited to 128 declarations and 64 KiB.
 
+### neri.test
+
 `neri.test` builds and executes units carrying [test metadata](PROJECTS.md)
 in the root or declared member manifests. A referenced library alone does not
 enroll its project's executable tests. Results include the phase, exit kind and
@@ -77,6 +90,8 @@ code, captured output, timeout failures, build snapshot and executable SHA-256.
 `noTests: true` has `status: "unavailable"`. Temporary artifacts are removed
 after execution. Output truncation is explicit. Test code has the host process's
 filesystem and process capabilities.
+
+### neri.profile
 
 `neri.profile` builds all graph units with release optimization and measures
 compiler phases. Libraries produce object files and executable units produce
@@ -90,6 +105,8 @@ be added to derive total time. Applications are not launched. A missing artifact
 or incomplete timing stream produces an unavailable result. Builds have a
 120-second limit per unit. This measures compiler work; application CPU, memory,
 SQL and distributed tracing require runtime instrumentation.
+
+### Shared result contracts
 
 The project tools use disk state independently of unsaved editor overlays. They
 check the complete graph again before returning and report `conflict` when its
@@ -115,14 +132,49 @@ Analyzed overlay responses include a source excerpt of at most 4 KiB, its UTF-16
 and an explicit truncation flag. Inspection places the excerpt around the
 requested position. Clients can inspect another position to obtain more text.
 
+### Overlay edit cycle
+
+For a source owned by the selected unit, call `neri.open` with these tool
+arguments, replacing the URI with that source's absolute URI:
+
+```json
+{
+  "operationId": "open-main",
+  "uri": "file:///absolute/project/app/main.hk"
+}
+```
+
+Use the returned workspace revision as `expectedRevision` on the next
+`neri.inspect` or `neri.edit` call. Positions and edit ranges count UTF-16 code
+units. After a conflict, use the returned state to inspect again before editing.
+
+```mermaid
+sequenceDiagram
+    participant A as Agent host
+    participant N as neri agent
+    participant D as Saved files
+    A->>N: neri.open(uri)
+    N-->>A: Workspace revision and diagnostics
+    A->>N: neri.inspect(uri, expectedRevision, position)
+    N-->>A: Types, candidates and diagnostics
+    A->>N: neri.edit(uri, expectedRevision, range, text)
+    alt Revision and inputs remain valid
+        N-->>A: New revision, persisted=false, executed=false
+        A->>D: Save chosen source through host file tools
+        A->>N: neri.feedback / neri.test
+        N->>D: Read saved project inputs
+        N-->>A: Project snapshot and result
+    else Stale revision or concurrent input change
+        N-->>A: conflict, revision and edit application state
+        A->>N: Inspect again using returned state
+    end
+```
+
+`neri.test` sees saved sources. A successful overlay edit alone does not change
+what the test runner builds.
+
 ## Revisions and snapshots
 
-The dependency model follows the separation of task inputs, dependency graphs
-and rebuilding conditions studied in
-[Build Systems à la Carte (Mokhov, Mitchell and Peyton Jones, 2018)](https://simon.peytonjones.org/assets/pdfs/build-systems-original.pdf).
-Neri uses input digests and explicit member/reference edges; the integration
-contracts verify consumer invalidation and independent-unit reuse. This is a
-design application of that work, not a formal proof of the implementation.
 Each tool publishes its own output schema through the
 [MCP tools contract](https://modelcontextprotocol.io/specification/2025-11-25/server/tools).
 Malformed arguments produce an error content item without a fabricated domain
@@ -162,9 +214,8 @@ have separate binary digests. Snapshots describe observations before and after
 an operation; they are not filesystem transactions or locks.
 
 Coverage follows explicit manifest membership. Nested projects enter the graph
-through `projects`; directories of negative fixtures and bootstrap seed overlays
-retain their own validation workflows. Seed overlays target the pinned compiler
-syntax and are verified by the bootstrap build. The MCP feedback reports compiler
+through `projects`; directories of negative fixtures retain their own validation
+workflows. The MCP feedback reports compiler
 diagnostics; it does not subscribe to Rider's inspection panel.
 
 The selected unit's reference closure defines which files can be opened. Each
@@ -222,38 +273,6 @@ payload contains the fields available to that operation. Workspace execution
 consumes those requests; JSON parsing and tool-name lookup belong to the protocol
 boundary. Shared input limits measure source text in UTF-8 bytes, while positions
 and ranges use UTF-16 code units.
-
-This applies the single-description approach used by
-[MLIR's Operation Definition Specification](https://mlir.llvm.org/docs/DefiningDialects/Operations/):
-declarative facts drive multiple consistent representations. Neri evaluates its
-descriptors directly in Neri; the descriptors describe the agent protocol.
-
-## Research basis
-
-[SWE-agent: Agent-Computer Interfaces Enable Automated Software Engineering
-(Yang et al., 2024)](https://arxiv.org/abs/2405.15793) shows that a purpose-built
-agent-computer interface can materially affect software-engineering agent
-performance. Its benchmark results motivate a compact structured interface;
-they do not establish Neri's effectiveness.
-
-[Hazelnut: A Bidirectionally Typed Structure Editor Calculus (Omar et al.,
-2017)](https://www.cs.cmu.edu/~comar/hazelnut-popl17/) gives a mechanized account
-of statically meaningful incomplete programs with typed holes. Neri's temporary
-completion marker and delimiter repair do not implement Hazelnut's edit calculus
-or inherit its soundness results.
-
-[Synchromesh: Reliable Code Generation from Pre-trained Language Models
-(Poesia et al., 2022)](https://arxiv.org/abs/2201.11227) demonstrates constrained
-semantic decoding with language-specific completion engines. Neri exposes
-semantic feedback after tool calls; it does not constrain a model's token
-sampling, so Synchromesh's validity results do not transfer.
-
-[Type-Constrained Code Generation with Language Models (Mündler et al.,
-2025)](https://doi.org/10.1145/3729274) develops a sound prefix automaton for a
-foundational typed calculus and evaluates a restricted TypeScript
-implementation. Neri does not implement that automaton. Its guarantee is the
-direct engineering contract that reported diagnostics and types come from the
-current Neri parser and binder snapshot.
 
 The wire protocol follows the official [MCP base
 protocol](https://modelcontextprotocol.io/specification/2025-11-25/basic),

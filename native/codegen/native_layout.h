@@ -69,15 +69,33 @@ public:
       completed_.emplace(key, result);
       return result;
     }
+    if (value.tag == NERI_IR_TYPE_C_FUNCTION_V1) {
+      if (value.symbol || value.arguments.empty())
+        reject("Invalid C function pointer shape.");
+      for (std::size_t index = 0; index < value.arguments.size(); ++index) {
+        const auto &argument = value.arguments[index];
+        if (index == 0U && argument.tag == NERI_IR_TYPE_VOID_V1) {
+          if (argument.symbol || !argument.arguments.empty() || argument.element_count != 0U)
+            reject("Invalid void C function result.");
+        } else {
+          if (argument.tag == NERI_IR_TYPE_NATIVE_RECORD_V1 || argument.tag == NERI_IR_TYPE_FIXED_ARRAY_V1)
+            reject("C function signatures require scalars and pointers.");
+          (void)layout(argument, depth + 1U);
+        }
+      }
+      return {8U, 8U, {}};
+    }
     if (value.tag == NERI_IR_TYPE_POINTER_V1 || value.tag == NERI_IR_TYPE_OPTIONAL_V1) {
       const type *pointer = &value;
       if (value.tag == NERI_IR_TYPE_OPTIONAL_V1) {
         if (value.symbol || value.arguments.size() != 1U ||
-            value.arguments.front().tag != NERI_IR_TYPE_POINTER_V1)
+            (value.arguments.front().tag != NERI_IR_TYPE_POINTER_V1 &&
+             value.arguments.front().tag != NERI_IR_TYPE_C_FUNCTION_V1))
           reject("Only pointer optionals have a C-compatible layout.");
         pointer = &value.arguments.front();
       }
-      validate_pointer(*pointer, depth + 1U);
+      if (pointer->tag == NERI_IR_TYPE_C_FUNCTION_V1) (void)layout(*pointer, depth + 1U);
+      else validate_pointer(*pointer, depth + 1U);
       return {8U, 8U, {}};
     }
     if (value.symbol || !value.arguments.empty()) reject("Invalid native scalar shape.");
@@ -98,12 +116,22 @@ private:
   void validate_pointer(const type &value, unsigned depth) {
     if (depth >= 128U || value.symbol || value.arguments.size() != 1U || value.element_count != 0U)
       reject("Invalid native pointer shape.");
-    const auto &element = value.arguments.front();
+    validate_pointee(value.arguments.front(), depth + 1U, true);
+  }
+
+  void validate_pointee(const type &element, unsigned depth, bool allow_void) {
+    if (depth >= 128U) reject("Native pointer element exceeds 128 nested types.");
     if (element.tag == NERI_IR_TYPE_VOID_V1) {
-      if (element.symbol || !element.arguments.empty() || element.element_count != 0U)
+      if (!allow_void || element.symbol || !element.arguments.empty() || element.element_count != 0U)
         reject("Invalid void pointer element.");
     } else if (element.tag == NERI_IR_TYPE_NATIVE_RECORD_V1) {
       (void)declaration(element);
+    } else if (element.tag == NERI_IR_TYPE_FIXED_ARRAY_V1) {
+      if (element.symbol || element.arguments.size() != 1U || element.element_count == 0U)
+        reject("Invalid fixed native array.");
+      // A pointer terminates layout dependencies even when its referent is an
+      // array. Referenced records need declarations, not completed layouts.
+      validate_pointee(element.arguments.front(), depth + 1U, false);
     } else {
       (void)layout(element, depth + 1U);
     }

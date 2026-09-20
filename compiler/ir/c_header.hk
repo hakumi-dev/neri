@@ -1,0 +1,411 @@
+# C declarators are built inside out so nested function pointers retain their
+# exact signature, including pointer returns and pointers to fixed arrays.
+def irCIdentifier(name: String): String
+  var result = ""
+  var index = 0
+
+  while index < host.stringByteLength(name)
+    let byte = host.stringByteAt(name, index) as Int
+    let text = host.stringSlice(name, index, 1)
+
+    result = result + (((byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) || (byte >= 48 && byte <= 57)) ? text : "_" + irHex(text))
+    index = index + 1
+  end
+  return result
+end
+
+def irCRecordName(name: String, identity: String): String
+  return "neri_record_" + irCIdentifier(name) + "_" + identity
+end
+
+def irCDeclaration(typeName: String, name: String, identity: String): String
+  let kind = irTypeKind(typeName)
+
+  if kind == "optional"
+    return irCDeclaration(irTypeInner(typeName), name, identity)
+  end
+  if kind == "pointer"
+    let inner = irTypeInner(typeName)
+    let declarator = irTypeKind(inner) == "fixed-array" ? "(*" + name + ")" : "*" + name
+
+    return irCDeclaration(inner, declarator, identity)
+  end
+  if kind == "fixed-array"
+    return irCDeclaration(irFixedArrayInner(typeName), name + "[" + (irFixedArrayCount(typeName) as String) + "]", identity)
+  end
+  if kind == "cabi"
+    let components = semanticCFunctionComponents(typeName)
+    let parameters = new StringBuffer()
+    var index = 1
+
+    while index < components.size
+      parameters.add(components.get(index))
+      index = index + 1
+    end
+    return irCDeclaration(components.get(0), "(*" + name + ")(" + irCParameters(parameters, identity) + ")", identity)
+  end
+  var scalar = "void"
+
+  if kind == "record"
+    scalar = irCRecordName(irTypeInner(typeName), identity)
+  else if typeName == "int"
+    scalar = "int64_t"
+  else if typeName == "int32"
+    scalar = "int32_t"
+  else if typeName == "uint32"
+    scalar = "uint32_t"
+  else if typeName == "uint64"
+    scalar = "uint64_t"
+  else if typeName == "bool" || typeName == "byte"
+    scalar = "uint8_t"
+  else if typeName == "float"
+    scalar = "double"
+  else if typeName == "float32"
+    scalar = "float"
+  end
+  return scalar + (name == "" ? "" : " " + name)
+end
+
+def irCParameters(types: StringBuffer, identity: String): String
+  if types.size == 0
+    return "void"
+  end
+  var result = ""
+  var parameter = types.first.nextNode
+
+  while parameter != null
+    result = result + ", " if result != ""
+    result = result + irCDeclaration(parameter.value, "", identity)
+    parameter = parameter.nextNode
+  end
+  return result
+end
+
+def irCHeaderCompleteType(typeName: String, records: StringTable<IrNativeRecord>, emitted: StringTable<Bool>, identity: String, complete: Bool): String
+  let kind = irTypeKind(typeName)
+
+  if kind == "record" && complete
+    let dependency = records.find(irTypeInner(typeName))
+
+    if dependency != null
+      return irCHeaderRecord(dependency.value, records, emitted, identity)
+    end
+    return ""
+  end
+  if kind == "pointer" || kind == "optional"
+    return irCHeaderCompleteType(irTypeInner(typeName), records, emitted, identity, false)
+  end
+  if kind == "fixed-array"
+    # Array elements must be complete even when the array is behind a pointer.
+    return irCHeaderCompleteType(irFixedArrayInner(typeName), records, emitted, identity, true)
+  end
+  if kind == "cabi"
+    var component = semanticCFunctionComponents(typeName).first.nextNode
+    var result = ""
+
+    while component != null
+      result = result + irCHeaderCompleteType(component.value, records, emitted, identity, false)
+      component = component.nextNode
+    end
+    return result
+  end
+  return ""
+end
+
+def irCHeaderRecord(record: IrNativeRecord, records: StringTable<IrNativeRecord>, emitted: StringTable<Bool>, identity: String): String
+  if emitted.find(record.symbol.name) != null
+    return ""
+  end
+  emitted.add(record.symbol.name, true)
+  var result = ""
+  var field = record.firstField
+
+  while field != null
+    result = result + irCHeaderCompleteType(field.typeName, records, emitted, identity, true)
+    field = field.nextField
+  end
+  let name = irCRecordName(record.symbol.name, identity)
+
+  result = result + "/* Neri " + record.symbol.name + " */\n" + (record.unionType ? "union " : "struct ") + name + " {\n"
+  field = record.firstField
+  while field != null
+    let prefixLength = host.stringByteLength(record.symbol.name) + 1
+    let fieldName = host.stringSlice(field.symbol.name, prefixLength, host.stringByteLength(field.symbol.name) - prefixLength)
+
+    result = result + "  " + irCDeclaration(field.typeName, "neri_field_" + irCIdentifier(fieldName), identity) + "; /* " + fieldName + " */\n"
+    field = field.nextField
+  end
+  return result + "};\n\n"
+end
+
+def irCHeaderNeedType(typeName: String, needed: StringTable<Bool>, queue: StringBuffer): Void
+  let kind = irTypeKind(typeName)
+
+  if kind == "record"
+    let name = irTypeInner(typeName)
+
+    queue.add(name) if needed.add(name, true)
+  else if kind == "pointer" || kind == "optional"
+    irCHeaderNeedType(irTypeInner(typeName), needed, queue)
+  else if kind == "fixed-array"
+    irCHeaderNeedType(irFixedArrayInner(typeName), needed, queue)
+  else if kind == "cabi"
+    var component = semanticCFunctionComponents(typeName).first.nextNode
+
+    while component != null
+      irCHeaderNeedType(component.value, needed, queue)
+      component = component.nextNode
+    end
+  end
+end
+
+def irCHeaderReachableRecords(module: IrModule, records: StringTable<IrNativeRecord>): IrOrderList<IrNativeRecord>
+  let ordered = new IrOrderList<IrNativeRecord>()
+  let needed = new StringTable<Bool>()
+  let queue = new StringBuffer()
+  var record = module.firstRecord
+
+  while record != null
+    records.add(record.symbol.name, record)
+    record = record.nextRecord
+  end
+  var function = module.firstFunction
+
+  while function != null
+    if function.cExportSymbol != "" && !function.retained
+      irCHeaderNeedType(function.resultType, needed, queue)
+      var parameter = function.parameterTypes.first.nextNode
+
+      while parameter != null
+        irCHeaderNeedType(parameter.value, needed, queue)
+        parameter = parameter.nextNode
+      end
+    end
+    function = function.nextFunction
+  end
+  var pending = queue.first.nextNode
+
+  while pending != null
+    let entry = records.find(pending.value)
+
+    if entry != null
+      let value = entry.value
+
+      ordered.add(value, 0, value.symbol.name)
+      var field = value.firstField
+
+      while field != null
+        irCHeaderNeedType(field.typeName, needed, queue)
+        field = field.nextField
+      end
+    end
+    pending = pending.nextNode
+  end
+  return ordered
+end
+
+def irCHeaderValidateType(typeName: String, records: StringTable<IrNativeRecord>, states: StringTable<Int>, complete: Bool): String
+  let kind = irTypeKind(typeName)
+
+  if kind == "record" && complete
+    let record = records.find(irTypeInner(typeName))
+
+    if record != null
+      return irCHeaderValidateRecord(record.value, records, states)
+    end
+  else if kind == "pointer" || kind == "optional"
+    return irCHeaderValidateType(irTypeInner(typeName), records, states, false)
+  else if kind == "fixed-array"
+    return irCHeaderValidateType(irFixedArrayInner(typeName), records, states, true)
+  else if kind == "cabi"
+    var component = semanticCFunctionComponents(typeName).first.nextNode
+
+    while component != null
+      let error = irCHeaderValidateType(component.value, records, states, false)
+
+      if error != ""
+        return error
+      end
+      component = component.nextNode
+    end
+  end
+  return ""
+end
+
+def irCHeaderValidateRecord(record: IrNativeRecord, records: StringTable<IrNativeRecord>, states: StringTable<Int>): String
+  let previous = states.find(record.symbol.name)
+
+  if previous != null
+    return previous.value == 1 ? "Public native record '" + record.symbol.name + "' cannot be declared in C: array element completeness dependencies form a cycle." : ""
+  end
+  states.add(record.symbol.name, 1)
+  var field = record.firstField
+
+  while field != null
+    let error = irCHeaderValidateType(field.typeName, records, states, true)
+
+    if error != ""
+      return error
+    end
+    field = field.nextField
+  end
+  let state = states.find(record.symbol.name)
+
+  if state != null
+    state.value = 2
+  end
+  return ""
+end
+
+def irCHeaderReservedNames(): StringTable<Bool>
+  let names = new StringTable<Bool>()
+
+  # C17 6.4.1/6.10.9 and C++23 [lex.key]/[lex.digraph] reserve these tokens.
+  # https://timsong-cpp.github.io/cppwp/n4950/lex.key
+  for name in ["_Alignas", "_Alignof", "_Atomic", "_Bool", "_Complex", "_Generic", "_Imaginary", "_Noreturn", "_Static_assert", "_Thread_local", "_Pragma", "alignas", "alignof", "and", "and_eq", "asm", "auto", "bitand", "bitor", "bool", "break", "case", "catch", "char", "char8_t", "char16_t", "char32_t", "class", "compl", "concept", "const", "consteval", "constexpr", "constinit", "const_cast", "continue", "co_await", "co_return", "co_yield", "decltype", "default", "delete", "do", "double", "dynamic_cast", "else", "enum", "explicit", "export", "extern", "false", "float", "for", "friend", "goto", "if", "inline", "int", "long", "mutable", "namespace", "new", "noexcept", "not", "not_eq", "nullptr", "operator", "or", "or_eq", "private", "protected", "public", "register", "reinterpret_cast", "requires", "restrict", "return", "short", "signed", "sizeof", "static", "static_assert", "static_cast", "struct", "switch", "template", "this", "thread_local", "throw", "true", "try", "typedef", "typeid", "typename", "union", "unsigned", "using", "virtual", "void", "volatile", "wchar_t", "while", "xor", "xor_eq"]
+    names.add(name, true)
+  end
+  # The generated header includes stdint.h. Its types and object/function-like
+  # macros, together with the C++ standard namespace, cannot name our exports.
+  # https://timsong-cpp.github.io/cppwp/n4950/cstdint.syn
+  for name in ["std", "intmax_t", "uintmax_t", "intptr_t", "uintptr_t", "INTMAX_MIN", "INTMAX_MAX", "UINTMAX_MAX", "INTPTR_MIN", "INTPTR_MAX", "UINTPTR_MAX", "PTRDIFF_MIN", "PTRDIFF_MAX", "SIZE_MAX", "SIG_ATOMIC_MIN", "SIG_ATOMIC_MAX", "WCHAR_MIN", "WCHAR_MAX", "WINT_MIN", "WINT_MAX", "INTMAX_C", "UINTMAX_C"]
+    names.add(name, true)
+  end
+  return names
+end
+
+def irCHeaderWidthName(name: String, prefix: String, suffix: String): Bool
+  let start = host.stringByteLength(prefix)
+  let finish = host.stringByteLength(name) - host.stringByteLength(suffix)
+
+  if finish <= start || !bootstrapStartsWith(name, prefix) || !semanticEndsWith(name, suffix)
+    return false
+  end
+  var index = start
+
+  while index < finish
+    let byte = host.stringByteAt(name, index) as Int
+
+    if byte < 48 || byte > 57
+      return false
+    end
+    index = index + 1
+  end
+  return true
+end
+
+def irCHeaderReservedInteger(name: String): Bool
+  # Optional implementation widths reserve the same names as 8/16/32/64.
+  for prefix in ["int", "uint", "int_fast", "uint_fast", "int_least", "uint_least"]
+    if irCHeaderWidthName(name, prefix, "_t")
+      return true
+    end
+  end
+  for prefix in ["INT", "UINT", "INT_FAST", "UINT_FAST", "INT_LEAST", "UINT_LEAST"]
+    if irCHeaderWidthName(name, prefix, "_MAX") || (!bootstrapStartsWith(prefix, "U") && irCHeaderWidthName(name, prefix, "_MIN"))
+      return true
+    end
+  end
+  return irCHeaderWidthName(name, "INT", "_C") || irCHeaderWidthName(name, "UINT", "_C")
+end
+
+def irCHeaderError(module: IrModule): String
+  let reserved = irCHeaderReservedNames()
+  var exported = irOrderedFunctions(module)
+
+  while exported != null
+    let value = exported.value
+    let name = value.cExportSymbol
+
+    # C++23 [lex.name] also reserves global leading underscores and every
+    # identifier containing a double underscore for the implementation.
+    if name != "" && !value.retained && (bootstrapStartsWith(name, "_") || bootstrapFindText(name, "__") >= 0 || reserved.find(name) != null || irCHeaderReservedInteger(name))
+      return "Export symbol '" + name + "' cannot be declared portably in C and C++: it is reserved by the language or the included standard library."
+    end
+    exported = exported.next
+  end
+  let records = new StringTable<IrNativeRecord>()
+  let states = new StringTable<Int>()
+  var record = irCHeaderReachableRecords(module, records).sorted()
+
+  while record != null
+    let error = irCHeaderValidateRecord(record.value, records, states)
+
+    if error != ""
+      return error
+    end
+    record = record.next
+  end
+  return ""
+end
+
+def irCHeader(module: IrModule): String
+  let records = new StringTable<IrNativeRecord>()
+  let ordered = irCHeaderReachableRecords(module, records)
+  let exports = new IrOrderList<IrFunction>()
+  var function = module.firstFunction
+
+  while function != null
+    exports.add(function, 0, function.cExportSymbol) if function.cExportSymbol != "" && !function.retained
+    function = function.nextFunction
+  end
+  # Public shapes determine both the include guard and record namespace, so
+  # independently generated headers with the default module id can coexist.
+  var shape = "module " + irQuote(module.id) + "\n"
+  var orderedRecord = ordered.sorted()
+
+  while orderedRecord != null
+    let value = orderedRecord.value
+
+    shape = shape + (value.unionType ? "union " : "struct ") + irQuote(value.symbol.name) + "\n"
+    var field = value.firstField
+
+    while field != null
+      shape = shape + irQuote(field.symbol.name) + " " + irQuote(field.typeName) + "\n"
+      field = field.nextField
+    end
+    orderedRecord = orderedRecord.next
+  end
+  var exported = exports.sorted()
+
+  while exported != null
+    let value = exported.value
+
+    shape = shape + "export " + irQuote(value.cExportSymbol) + " " + irQuote(value.resultType) + "\n"
+    var parameter = value.parameterTypes.first.nextNode
+
+    while parameter != null
+      shape = shape + irQuote(parameter.value) + "\n"
+      parameter = parameter.nextNode
+    end
+    exported = exported.next
+  end
+  let identity = sha256FastText(shape)
+  let guard = "NERI_C_HEADER_" + identity + "_H"
+  var result = "/* Generated by Neri. Bool uses uint8_t: zero is false, nonzero is true.\n * Exports enter the runtime automatically on the calling thread.\n * C function pointers remain valid while their defining library is loaded.\n * Native pointers keep caller-defined ownership; they do not retain Neri objects.\n * Exceptions and longjmp must not cross active Neri frames; panic terminates.\n * Record names include the public API digest. Field names use neri_field_.\n * Names preserve ASCII letters/digits; every other UTF-8 byte becomes _xx.\n */\n#ifndef " + guard + "\n#define " + guard + "\n\n#include <stdint.h>\n\n#ifdef __cplusplus\nextern \"C\" {\n#endif\n\n"
+
+  orderedRecord = ordered.sorted()
+  while orderedRecord != null
+    let value = orderedRecord.value
+    let name = irCRecordName(value.symbol.name, identity)
+
+    result = result + "typedef " + (value.unionType ? "union " : "struct ") + name + " " + name + ";\n"
+    orderedRecord = orderedRecord.next
+  end
+  let emitted = new StringTable<Bool>()
+
+  orderedRecord = ordered.sorted()
+  while orderedRecord != null
+    result = result + irCHeaderRecord(orderedRecord.value, records, emitted, identity)
+    orderedRecord = orderedRecord.next
+  end
+  exported = exports.sorted()
+
+  while exported != null
+    let value = exported.value
+
+    result = result + irCDeclaration(value.resultType, value.cExportSymbol + "(" + irCParameters(value.parameterTypes, identity) + ")", identity) + ";\n"
+    exported = exported.next
+  end
+  return result + "\n#ifdef __cplusplus\n}\n#endif\n\n#endif\n"
+end

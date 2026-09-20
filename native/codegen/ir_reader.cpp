@@ -315,6 +315,11 @@ public:
       if (feature == "native-records-v1") native_records_ = true;
       if (feature == "session-module-v1") session_module_ = true;
       if (feature == "retained-modules-v1") retained_modules_ = true;
+      if (feature == "c-interop-v1") {
+        c_interop_ = true;
+        if (transport_minor_ < 8U)
+          fail(unsupported_feature, "C interoperability requires IR transport 1.8.", input_.offset());
+      }
       if (feature == "retained-modules-v1" && transport_minor_ < 7U)
         fail(unsupported_feature, "Retained modules require IR transport 1.7.", input_.offset());
       if (feature == "scoped-tasks-v1" && transport_minor_ < 4U)
@@ -421,6 +426,15 @@ private:
       result.element_count = input_.u32();
       result.arguments.push_back(read_type(depth + 1U));
       return result;
+    case NERI_IR_TYPE_C_FUNCTION_V1: {
+      if (!c_interop_)
+        fail(unsupported_feature, "C function types require c-interop-v1.", tag_offset);
+      const auto count = input_.count("C function parameters");
+      result.arguments.push_back(read_type(depth + 1U));
+      for (std::uint32_t index = 0; index < count; ++index)
+        result.arguments.push_back(read_type(depth + 1U));
+      return result;
+    }
     case NERI_IR_TYPE_ARRAY_V1:
     case NERI_IR_TYPE_OPTIONAL_V1:
     case NERI_IR_TYPE_POINTER_V1:
@@ -599,7 +613,9 @@ private:
     const auto opcode_offset = input_.offset();
     result.opcode = input_.u16();
     require_tag(result.opcode, NERI_IR_OPCODE_CONSTANT_V1,
-                NERI_IR_OPCODE_TASK_GENERATE_V1, "opcode", opcode_offset);
+                NERI_IR_OPCODE_CALL_C_INDIRECT_V1, "opcode", opcode_offset);
+    if (result.opcode >= NERI_IR_OPCODE_C_FUNCTION_ADDRESS_V1 && !c_interop_)
+      fail(unsupported_feature, "C function instructions require c-interop-v1.", opcode_offset);
     result.results = read_vector<value_definition>(
         input_, "instruction results",
         [this] { return read_value_definition(); });
@@ -685,6 +701,7 @@ private:
     result.effects = read_effects();
     result.unsafe_call = input_.boolean();
     if (retained_modules_) result.retained = input_.boolean();
+    if (c_interop_) result.export_name = input_.utf8();
     result.entry_block = input_.model_id("block ID");
     result.unsafe_root = read_optional<value_definition>(
         input_, [this] { return read_value_definition(); });
@@ -737,6 +754,7 @@ private:
   bool native_records_{};
   bool session_module_{};
   bool retained_modules_{};
+  bool c_interop_{};
 };
 
 void validate_options(const reader_options &options) {

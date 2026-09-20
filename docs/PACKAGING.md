@@ -1,9 +1,17 @@
 # Toolchain packages
 
+Use the documentation bundled with an installed compiler for that compiler's
+syntax and APIs. This checkout documents its own source revision; a published
+archive can contain a different language surface.
+
 The package includes the public language, ABI, library and session references.
 The package driver owns that explicit document selection and verifies each
 selected source plus inline links to relative `.md` targets in that selection
 before it builds the archive.
+
+C hosts use the packaged runtime archive and public headers in `include/neri`.
+The [C interoperability reference](C-INTEROP.md) documents exported functions,
+generated declarations, host linking, and runtime ownership.
 
 `scripts/build.sh package` produces a Release toolchain archive for the bootstrap
 host. The command builds the current native components, reaches the compiler

@@ -211,6 +211,10 @@ typedef struct neri_gc_borrow_v1 {
   uintptr_t runtime_words[4];
 } neri_gc_borrow_v1;
 
+typedef struct neri_foreign_entry_v1 {
+  uintptr_t runtime_words[6];
+} neri_foreign_entry_v1;
+
 typedef struct neri_gc_stats_v1 {
   uint32_t struct_size;
   uint32_t reserved;
@@ -251,6 +255,20 @@ neri_rt_v1_initialize(const neri_runtime_abi_requirements_v1 *requirements);
 NERI_RT_API void neri_rt_v1_set_process_arguments(int argc,
                                                        const char *const *argv);
 NERI_RT_API void neri_rt_v1_shutdown(void);
+
+/* ABI 1.27: synchronous C entry on the calling native thread. The token needs
+ * writable, pointer-aligned storage and requires no initial contents. Tokens
+ * are thread-confined and leave in LIFO order with balanced roots and borrows.
+ * An entry reuses an initialized heap, preserving its ownership and state;
+ * otherwise it owns a temporary heap reclaimed on leave. Managed and native
+ * allocations from that temporary heap must not escape. Hosts requiring longer
+ * allocation lifetimes initialize explicitly before entering and shut down
+ * after their final use. Panic terminates the process; unwinding and longjmp
+ * across an entry are outside this contract. */
+NERI_RT_API void neri_rt_v1_foreign_enter(
+    neri_foreign_entry_v1 *entry,
+    const neri_runtime_abi_requirements_v1 *requirements);
+NERI_RT_API void neri_rt_v1_foreign_leave(neri_foreign_entry_v1 *entry);
 
 NERI_RT_API neri_ref_v1
 neri_rt_v1_gc_alloc(const neri_type_descriptor_v1 *type,
@@ -296,6 +314,8 @@ neri_rt_v1_string_from_float(neri_float_v1 value);
 NERI_RT_API void neri_rt_v1_stdout_write(neri_ref_v1 value);
 NERI_RT_API void neri_rt_v1_stdout_write_line(neri_ref_v1 value);
 NERI_RT_API void neri_rt_v1_stderr_write(neri_ref_v1 value);
+/* ABI 1.28: writes exactly length bytes, returns 0 on success, -1 on failure. */
+NERI_RT_API neri_int_v1 neri_rt_v1_stderr_write_bytes(const uint8_t *bytes, neri_int_v1 length);
 NERI_RT_API neri_ref_v1 neri_rt_v1_stdin_read_line(void);
 NERI_RT_API neri_ref_v1 neri_rt_v1_stdin_read_line_optional(void);
 
@@ -393,6 +413,18 @@ NERI_RT_API neri_int_v1 neri_rt_v1_file_mutation_mkdir(const uint8_t *path, neri
 NERI_RT_API neri_int_v1 neri_rt_v1_file_mutation_rename(const uint8_t *source, neri_int_v1 source_length, const uint8_t *destination, neri_int_v1 destination_length, neri_int_v1 *os_code);
 NERI_RT_API neri_int_v1 neri_rt_v1_file_mutation_remove(const uint8_t *path, neri_int_v1 length, neri_int_v1 kind, neri_int_v1 *os_code);
 NERI_RT_API neri_int_v1 neri_rt_v1_file_mutation_status(const uint8_t *path, neri_int_v1 length, neri_int_v1 *exists, neri_int_v1 *kind, neri_int_v1 *executable, neri_int_v1 *symlink, neri_int_v1 *os_code);
+/* ABI 1.28: compiler cache metadata, available only on macOS arm64.
+ * supported returns 1 when the current compiler cache policy is implemented.
+ * metadata returns 0 on success, -1 on invalid input, failure or unsupported host.
+ * Paths are nonempty byte sequences without NUL, at most 1 MiB; follow is 0/1.
+ * Outputs are kind (regular=1, directory=2, symlink=3, other=4), permission bits
+ * (07777), ownership by the real user (0/1), and a 32-byte SHA-256 fingerprint.
+ * The fingerprint hashes ten little-endian uint64 values: device, inode, mode,
+ * uid, gid, mtime seconds/nanoseconds, ctime seconds/nanoseconds, and byte size.
+ * atime and platform padding are excluded. All output pointers are required.
+ * This is a metadata snapshot; it does not acquire or retain a file handle. */
+NERI_RT_API neri_int_v1 neri_rt_v1_cache_supported(void);
+NERI_RT_API neri_int_v1 neri_rt_v1_cache_metadata(const uint8_t *path, neri_int_v1 length, neri_int_v1 follow, neri_int_v1 *kind, neri_int_v1 *permissions, neri_int_v1 *owned, uint8_t *fingerprint32);
 NERI_RT_API neri_int_v1 neri_rt_v1_file_mutation_copy(const uint8_t *source, neri_int_v1 source_length, const uint8_t *destination, neri_int_v1 destination_length, neri_int_v1 *os_code);
 /* ABI 1.12: one serving-thread-owned interrupt lease; 0 means unavailable.
  * Positive generation tokens prevent stale closes affecting a later lease. */

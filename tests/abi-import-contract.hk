@@ -190,9 +190,9 @@ def acceptsConservativeEffectsWithExactNoReturn(directory: String): Void
 
   abiImportAccept(exit, directory, "exact-noreturn")
 
-  let legacyExit = abiImportModule("legacy-noreturn", "neri_rt_v1_host_exit", "Void", ["Int"], new EffectSet().withWrite().withMayPanic(), 6, new RuntimeFeatures().withBootstrapHost())
+  let omittedNoReturn = abiImportModule("omitted-noreturn", "neri_rt_v1_host_exit", "Void", ["Int"], new EffectSet().withWrite().withMayPanic(), 6, new RuntimeFeatures().withBootstrapHost())
 
-  abiImportAccept(legacyExit, directory, "legacy-noreturn")
+  abiImportAccept(omittedNoReturn, directory, "omitted-noreturn")
 
   let falseNoReturn = abiImportModule("false-noreturn", "neri_rt_v1_math_abs", "Int", ["Int"], new EffectSet().withMayPanic().withNoReturn(), 4, new RuntimeFeatures())
 
@@ -224,6 +224,139 @@ def conditionalNoReturnCaller(compiler: String, directory: String): Void
   test.assertTrue(runStatus != null && runStatus == 0)
 end
 
+def cInteropSignature(resultType: String, parameterTypes: String[]): String
+  let components = new StringBuffer()
+
+  components.add(resultType)
+  for parameter in parameterTypes
+    components.add(parameter)
+  end
+  return semanticCFunctionType(components)
+end
+
+def cInteropModule(): IrModule
+  let module = new IrModule("c-interop-contract", "callback")
+  let location = module.location(0, 8)
+  let function = new IrFunction(irSymbol(module.id, 4, "callback"), "void", 1, false, location)
+  let body = function.createBlock()
+
+  module.requireFeature("c-interop-v1")
+  function.cExportSymbol = "contract_callback"
+  body.terminator = new IrTerminator(3, location)
+  module.addFunction(function)
+  return module
+end
+
+def cInteropImport(module: IrModule, resultType: String, parameters: String[]): IrImport
+  let imported = new IrImport(irSymbol(module.id, 4, "foreign"), resultType, 2, "contract_foreign", irCAbiEffects(), irNoLocation())
+
+  for parameter in parameters
+    imported.parameterTypes.add(parameter)
+  end
+  module.addImport(imported)
+  return imported
+end
+
+def verifiesForeignCallEffects(directory: String): Void
+  let module = new IrModule("foreign-effects", "")
+  let imported = cInteropImport(module, "int", ["int"])
+  let complete = irCAbiEffects()
+
+  abiImportAccept(module, directory, "foreign-effects-complete")
+  var index = 0
+
+  for incomplete in [complete.withoutRead(), complete.withoutWrite(), complete.withoutMayPanic(),
+    complete.withoutManagedAllocate(), complete.withoutNativeAllocate(), complete.withoutSafepoint(), complete.withoutUnsafe()]
+    imported.effects = incomplete
+
+    abiImportReject(module, directory, "foreign-effects-" + (index as String), "NIR009", "conservative effect contract")
+
+    index = index + 1
+  end
+end
+
+def verifiesCInteropDeclarations(directory: String): Void
+  let module = cInteropModule()
+  let callback = cInteropSignature("void", [])
+  let imported = cInteropImport(module, "optional|" + callback, [callback, "pointer|" + callback])
+
+  abiImportAccept(module, directory, "c-interop-signatures")
+  for reserved in ["neri_rt_v1_foreign_enter", "neri_rt_v1_foreign_leave", "neri_rt_v1_math_abs"]
+    imported.linkName = reserved
+
+    abiImportReject(module, directory, "c-interop-runtime-" + reserved, "NIR005", "compiler-controlled runtime symbol")
+  end
+  imported.linkName = "contract_foreign"
+  module.requiredFeatures = new StringBuffer()
+
+  abiImportReject(module, directory, "c-interop-missing-feature", "NIR003", "C function types require c-interop-v1")
+  module.requireFeature("c-interop-v1")
+  imported.effects = new EffectSet().withRead().withWrite().withUnsafe()
+
+  abiImportReject(module, directory, "c-interop-effects", "NIR009", "conservative effect contract")
+  imported.effects = irCAbiEffects()
+  imported.parameterTypes.set(0, cInteropSignature("void", ["void"]))
+
+  abiImportReject(module, directory, "c-interop-invalid-parameter", "NIR006", "C-compatible result and parameters")
+  imported.parameterTypes.set(0, callback)
+  let exported = module.firstFunction
+
+  test.assertTrue(exported != null)
+  if exported == null
+    return
+  end
+  exported.cExportSymbol = imported.linkName
+
+  abiImportReject(module, directory, "c-interop-conflict", "NIR005", "conflicts with another export or import")
+  exported.cExportSymbol = "neri_rt_v1_foreign_enter"
+
+  abiImportReject(module, directory, "c-interop-reserved", "NIR006", "portable unreserved symbol")
+end
+
+def verifiesCInteropInstructions(directory: String): Void
+  let module = cInteropModule()
+  let exported = module.firstFunction
+
+  test.assertTrue(exported != null)
+  if exported == null
+    return
+  end
+  let body = exported.firstBlock
+
+  test.assertTrue(body != null)
+  if body == null
+    return
+  end
+  let location = module.location(0, 8)
+  let callback = cInteropSignature("void", [])
+  let address = new IrInstruction(62, 0, callback, [], [], exported.symbol, 0, "", 0, false, location)
+  let begin = new IrInstruction(41, 1, "!unsafe", [], [], null, 0, "", 0, false, location)
+  let call = new IrInstruction(63, -1, "void", [1, 0], [], null, 0, "", 0, false, location)
+  let finish = new IrInstruction(42, -1, "void", [1], [], null, 0, "", 0, false, location)
+
+  exported.effects = irCAbiEffects()
+  body.addInstruction(address)
+  body.addInstruction(begin)
+  body.addInstruction(call)
+  body.addInstruction(finish)
+
+  abiImportAccept(module, directory, "c-interop-indirect")
+  exported.cExportSymbol = ""
+
+  abiImportReject(module, directory, "c-interop-non-exported", "NIR005", "requires an exported function")
+  exported.cExportSymbol = "contract_callback"
+  call.operands = [1]
+
+  abiImportReject(module, directory, "c-interop-missing-callee", "NIR006", "capability and callable")
+  call.operands = [0, 0]
+
+  abiImportReject(module, directory, "c-interop-missing-capability", "NIR006", "operand has the wrong semantic type")
+  call.operands = [1, 0]
+  address.resultType = cInteropSignature("byte", [])
+
+  abiImportReject(module, directory, "c-interop-address-signature", "NIR006", "result has the wrong semantic type")
+end
+
 def main(): Void
   let compiler = host.argumentAt(1)
   let directory = host.argumentAt(2)
@@ -237,4 +370,7 @@ def main(): Void
   rejectsWeakenedContract(directory)
   acceptsConservativeEffectsWithExactNoReturn(directory)
   conditionalNoReturnCaller(compiler, directory)
+  verifiesForeignCallEffects(directory)
+  verifiesCInteropDeclarations(directory)
+  verifiesCInteropInstructions(directory)
 end

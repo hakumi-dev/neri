@@ -1,11 +1,9 @@
 # Build from GitHub on Linux
 
 This guide builds, tests and installs Neri from source on Linux x86-64.
-Bootstrap uses the hash-pinned `linux-seed-candidate` artifact from GitHub Actions
-run `34046783143`, built from commit `561344b201a9c3801a76f311328bfaaad06d4bf2`.
-It is not yet a published release asset. GitHub CLI (`gh`) access to the artifact
-is required for the first download; Actions artifacts expire, so this candidate
-is a temporary installation source. Distribution packages are deferred.
+Bootstrap uses the hash-verified compiler IR seed included in the repository.
+The native backend and runtime materialize it as a Linux compiler before
+building the current sources. Distribution packages are deferred.
 
 ## Requirements
 
@@ -20,7 +18,7 @@ and the native development dependencies:
 sudo apt-get update
 sudo apt-get install -y git ca-certificates curl gnupg lsb-release \
   software-properties-common cmake ninja-build build-essential \
-  zlib1g-dev libzstd-dev libedit-dev libffi-dev libxml2-dev libssl-dev libarchive-tools gh
+  zlib1g-dev libzstd-dev libedit-dev libffi-dev libxml2-dev libssl-dev libarchive-tools gzip
 ```
 
 Clang/LLVM 22 must be available from your configured package repositories before
@@ -55,13 +53,9 @@ older tags may not include the Linux presets.
 
 ## Install the compiler
 
-Authenticate GitHub CLI if needed, then build and install:
+Build and install:
 
 ```sh
-gh auth status
-# If not authenticated:
-gh auth login
-
 env -u PKG_CONFIG_PATH -u CPPFLAGS -u LDFLAGS -u LIBRARY_PATH -u LD_LIBRARY_PATH \
   scripts/build.sh install
 export PATH="$HOME/.neri/bin:$PATH"
@@ -73,10 +67,9 @@ neri build examples/functions.hk --release --output build/functions
 ```
 
 The clean environment prevents inherited library paths from another project from
-affecting the build. If a stale `GITHUB_TOKEN` overrides working GitHub CLI
-credentials, remove that variable from this invocation as well.
+affecting the build.
 
-Installation verifies the archive and extracted seed hashes, bootstraps the
+Installation verifies the compressed and binary IR seed hashes, bootstraps the
 compiler, runs native and language contracts, checks reproducible packaging and
 installs under `~/.neri`. Add its `bin` directory to your shell's PATH permanently,
 or create a symlink from an existing PATH directory. A custom location can be
@@ -96,7 +89,7 @@ ctest --preset linux-release
 ```
 
 The build produces `neri-codegen`, `libneri-runtime.a`, the runtime manifest,
-native helpers and tests under `build/native/linux-release/`. All five native
+native helpers and tests under `build/native/linux-release/`. All native
 contracts should pass. `neri-codegen` consumes compiler IR; it cannot compile
 `.hk` source by itself. These artifacts stay in the checkout and do not add a
 `neri` command to your PATH.

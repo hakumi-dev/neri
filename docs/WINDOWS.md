@@ -9,19 +9,15 @@ Use a native x64 Windows terminal with PowerShell 7, Git and:
 
 - Visual Studio's **Desktop development with C++** workload, including the x64
   MSVC tools and a Windows SDK.
-- GitHub CLI (`gh`), authenticated with access to repository Actions artifacts.
 - Node.js 22 or newer for the Windows language and LSP checks.
 - CMake 3.28 or newer and Ninja 1.11 or newer. The Visual Studio installation
   may provide these; `scripts/windows-env.ps1` adds its copies to `PATH`.
 
 LLVM 22.1.8 is downloaded from the LLVM GitHub release on first use. The
 archive is about 862 MB and its SHA-256 is pinned in
-`bootstrap/windows-x86_64.json`. The same file pins the seed transport from
-Actions run `34046783143`; authenticate `gh` before starting the build:
-
-```powershell
-gh auth login
-```
+`bootstrap/windows-x86_64.json`. The compiler IR seed is included in the
+repository. PowerShell verifies its SHA-256 digests and decompresses it through
+the .NET gzip API before the native backend materializes the host compiler.
 
 ## Build, test and install
 

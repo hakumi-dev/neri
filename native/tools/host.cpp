@@ -1,4 +1,4 @@
-// OS services for seed-compatible Neri tooling. Build and test policy lives in Neri.
+// OS services for Neri tooling. Build and test policy lives in Neri.
 #include <algorithm>
 #include <cerrno>
 #include <chrono>

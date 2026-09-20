@@ -36,6 +36,7 @@
 
 namespace {
 constexpr uintptr_t root_frame_cookie = UINT64_C(0x484b524f4f545631);
+constexpr uintptr_t foreign_entry_cookie = UINT64_C(0x4e52464f52454947);
 constexpr uintptr_t borrow_cookie = UINT64_C(0x484b424f52525631);
 constexpr uint64_t collection_floor_bytes = 4 * 1024 * 1024;
 constexpr uint64_t runtime_features = NERI_RT_ADVERTISED_FEATURES;
@@ -74,6 +75,7 @@ struct runtime_state final {
   native_allocation *native_head;
   neri_gc_root_frame_v1 *root_frame;
   neri_gc_borrow_v1 *borrow;
+  neri_foreign_entry_v1 *foreign_entry;
   uint64_t managed_object_count;
   uint64_t managed_byte_count;
   uint64_t native_byte_count;
@@ -220,6 +222,25 @@ void require_initialized() {
   if (current_state().suspended) {
     contract_panic("managed operations require an active heap, not a suspended task parent");
   }
+}
+
+[[nodiscard]] neri_abi_status_v1 validate_requirements(
+    const neri_runtime_abi_requirements_v1 *requirements) {
+  if (requirements == nullptr ||
+      requirements->struct_size < sizeof(neri_runtime_abi_requirements_v1)) {
+    return NERI_ABI_STATUS_INVALID_ARGUMENT_V1;
+  }
+  if (requirements->major != runtime_abi.major) {
+    return NERI_ABI_STATUS_INCOMPATIBLE_MAJOR_V1;
+  }
+  if (requirements->minimum_minor > runtime_abi.minor) {
+    return NERI_ABI_STATUS_RUNTIME_TOO_OLD_V1;
+  }
+  if ((requirements->required_features & runtime_abi.features) !=
+      requirements->required_features) {
+    return NERI_ABI_STATUS_MISSING_FEATURE_V1;
+  }
+  return NERI_ABI_STATUS_OK_V1;
 }
 
 [[nodiscard]] bool is_power_of_two(uint64_t value) {
@@ -935,8 +956,8 @@ void release_heap() {
   require_initialized();
   auto &heap = current_state();
   if (heap.root_frame != nullptr || heap.borrow != nullptr || heap.collecting ||
-      !heap.persistent_roots.empty()) {
-    contract_panic("runtime shutdown requires no live root frames or borrows");
+      heap.foreign_entry != nullptr || !heap.persistent_roots.empty()) {
+    contract_panic("runtime shutdown requires no live roots, borrows or foreign entries");
   }
   while (heap.managed_head != nullptr) {
     auto *allocation = heap.managed_head;
@@ -1284,8 +1305,9 @@ void neri_task_execute(neri_task_ticket *ticket, neri_task_body body, void *cont
     release_heap();
   } else {
     require_initialized();
-    if (child.root_frame != &results || child.borrow != nullptr || child.collecting) {
-      contract_panic("task results require no live body roots or native borrows");
+    if (child.root_frame != &results || child.borrow != nullptr || child.collecting ||
+        child.foreign_entry != nullptr) {
+      contract_panic("task results require no live body roots, borrows or foreign entries");
     }
     collect_impl();
     neri_rt_v1_gc_root_frame_leave(&results);
@@ -1313,23 +1335,60 @@ NERI_RT_API neri_abi_status_v1 neri_rt_v1_initialize(
   if (current_state().suspended) {
     contract_panic("cannot initialize a suspended task parent");
   }
-  if (requirements == nullptr ||
-      requirements->struct_size < sizeof(neri_runtime_abi_requirements_v1)) {
-    return NERI_ABI_STATUS_INVALID_ARGUMENT_V1;
-  }
-  if (requirements->major != runtime_abi.major) {
-    return NERI_ABI_STATUS_INCOMPATIBLE_MAJOR_V1;
-  }
-  if (requirements->minimum_minor > runtime_abi.minor) {
-    return NERI_ABI_STATUS_RUNTIME_TOO_OLD_V1;
-  }
-  if ((requirements->required_features & runtime_abi.features) !=
-      requirements->required_features) {
-    return NERI_ABI_STATUS_MISSING_FEATURE_V1;
-  }
+  const auto status = validate_requirements(requirements);
+  if (status != NERI_ABI_STATUS_OK_V1) return status;
   current_state().initialized = true;
   current_state().host_error.clear();
   return NERI_ABI_STATUS_OK_V1;
+}
+
+NERI_RT_API void neri_rt_v1_foreign_enter(
+    neri_foreign_entry_v1 *entry,
+    const neri_runtime_abi_requirements_v1 *requirements) {
+  auto &heap = current_state();
+  if (entry == nullptr || heap.suspended || heap.collecting) {
+    contract_panic("foreign entry requires a token and an active, non-collecting heap");
+  }
+  // Inspect registered tokens only: caller storage may be uninitialized.
+  // Suspended ancestor heaps may still own tokens while a task is helping.
+  for (const auto *owner = &heap; owner != nullptr; owner = owner->read_parent) {
+    for (auto *active = owner->foreign_entry; active != nullptr;
+         active = reinterpret_cast<neri_foreign_entry_v1 *>(active->runtime_words[0])) {
+      if (active == entry) contract_panic("foreign entry token is already active");
+    }
+  }
+  if (validate_requirements(requirements) != NERI_ABI_STATUS_OK_V1) {
+    panic_raw(NERI_PANIC_ABI_MISMATCH_V1,
+              "foreign entry runtime ABI negotiation failed", nullptr);
+  }
+  const bool owns_heap = !heap.initialized;
+  heap.initialized = true;
+  *entry = {{reinterpret_cast<uintptr_t>(heap.foreign_entry),
+             reinterpret_cast<uintptr_t>(&heap),
+             reinterpret_cast<uintptr_t>(heap.root_frame),
+             reinterpret_cast<uintptr_t>(heap.borrow),
+             owns_heap ? uintptr_t{1} : uintptr_t{0}, foreign_entry_cookie}};
+  heap.foreign_entry = entry;
+}
+
+NERI_RT_API void neri_rt_v1_foreign_leave(neri_foreign_entry_v1 *entry) {
+  require_initialized();
+  auto &heap = current_state();
+  // Check membership before reading token storage, including wrong-thread use.
+  if (entry == nullptr || heap.foreign_entry != entry ||
+      entry->runtime_words[1] != reinterpret_cast<uintptr_t>(&heap) ||
+      entry->runtime_words[5] != foreign_entry_cookie || heap.collecting) {
+    contract_panic("foreign entries must leave their owning heap in LIFO order");
+  }
+  if (entry->runtime_words[2] != reinterpret_cast<uintptr_t>(heap.root_frame) ||
+      entry->runtime_words[3] != reinterpret_cast<uintptr_t>(heap.borrow)) {
+    contract_panic("foreign entry must restore its root and borrow chains");
+  }
+  const bool owns_heap = entry->runtime_words[4] != 0;
+  heap.foreign_entry =
+      reinterpret_cast<neri_foreign_entry_v1 *>(entry->runtime_words[0]);
+  *entry = {};
+  if (owns_heap) release_heap();
 }
 
 NERI_RT_API void
@@ -1561,6 +1620,14 @@ NERI_RT_API void neri_rt_v1_stdout_write_line(neri_ref_v1 value) {
 
 NERI_RT_API void neri_rt_v1_stderr_write(neri_ref_v1 value) {
   write_console(stderr, value, false, "standard error write failed");
+}
+
+NERI_RT_API neri_int_v1 neri_rt_v1_stderr_write_bytes(const uint8_t *bytes,
+                                                   neri_int_v1 length) {
+  if (!bytes || length < 0) return -1;
+  return std::fwrite(bytes, 1, static_cast<size_t>(length), stderr) ==
+                 static_cast<size_t>(length) && std::fflush(stderr) == 0
+             ? 0 : -1;
 }
 
 static neri_ref_v1 read_console_line(bool distinguish_eof) {
