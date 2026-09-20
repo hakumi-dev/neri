@@ -70,6 +70,10 @@ struct native_allocation final {
   uint64_t alignment;
 };
 
+// Tracing and joined-task suspension are exclusive phases of an initialized
+// heap. Independent ownership, roots and allocation marks remain separate.
+enum class heap_phase { uninitialized, active, collecting, suspended };
+
 struct runtime_state final {
   managed_allocation *managed_head;
   native_allocation *native_head;
@@ -83,9 +87,7 @@ struct runtime_state final {
   uint64_t next_collection_bytes = collection_floor_bytes;
   int process_argument_count;
   const char *const *process_arguments;
-  bool initialized;
-  bool collecting;
-  bool suspended;
+  heap_phase phase = heap_phase::uninitialized;
   const runtime_state *read_parent;
   std::string host_error;
   std::vector<neri_ref_v1 *> persistent_roots;
@@ -95,6 +97,20 @@ struct task_result_heap final {
   runtime_state heap{};
   task_result_heap *next = nullptr;
 };
+
+enum class borrow_slot : size_t { previous, owner, byte_length, cookie };
+enum class foreign_entry_slot : size_t {
+  previous, heap, roots, borrows, owns_heap, cookie
+};
+
+uintptr_t &borrow_word(neri_gc_borrow_v1 *token, borrow_slot slot) {
+  return token->runtime_words[static_cast<size_t>(slot)];
+}
+
+uintptr_t &foreign_entry_word(neri_foreign_entry_v1 *token,
+                              foreign_entry_slot slot) {
+  return token->runtime_words[static_cast<size_t>(slot)];
+}
 } // namespace
 
 struct neri_task_scope final {
@@ -216,10 +232,10 @@ const neri_runtime_abi_info_v1 runtime_abi = {
 }
 
 void require_initialized() {
-  if (!current_state().initialized) {
+  if (current_state().phase == heap_phase::uninitialized) {
     contract_panic("runtime operation requires successful initialization");
   }
-  if (current_state().suspended) {
+  if (current_state().phase == heap_phase::suspended) {
     contract_panic("managed operations require an active heap, not a suspended task parent");
   }
 }
@@ -276,7 +292,7 @@ void require_initialized() {
   }
   for (auto *parent = current_state().read_parent; parent != nullptr;
        parent = parent->read_parent) {
-    if (allocation->owner == parent && parent->suspended) {
+    if (allocation->owner == parent && parent->phase == heap_phase::suspended) {
       return allocation;
     }
   }
@@ -303,7 +319,7 @@ void assert_consistent() {
     assert(allocation->previous == managed_previous);
     assert(allocation->object != nullptr);
     assert(allocation->owner == &current_state());
-    assert(current_state().collecting || !allocation->marked);
+    assert(current_state().phase == heap_phase::collecting || !allocation->marked);
     managed_previous = allocation;
     ++managed_count;
     managed_bytes += sizeof(neri_object_header_v1) + allocation->payload_size;
@@ -399,10 +415,10 @@ void unlink_native(native_allocation *allocation) {
 
 void collect_impl() {
   auto &heap = current_state();
-  if (heap.collecting) {
+  if (heap.phase == heap_phase::collecting) {
     contract_panic("nested GC collection is not supported by ABI v1.0");
   }
-  heap.collecting = true;
+  heap.phase = heap_phase::collecting;
   mark_stack stack{};
   active_mark_stack = &stack;
   for (auto *frame = heap.root_frame; frame != nullptr;
@@ -421,11 +437,11 @@ void collect_impl() {
   }
   for (auto *borrow = heap.borrow; borrow != nullptr;
        borrow = reinterpret_cast<neri_gc_borrow_v1 *>(
-           borrow->runtime_words[0])) {
-    if (borrow->runtime_words[3] != borrow_cookie) {
+           borrow_word(borrow, borrow_slot::previous))) {
+    if (borrow_word(borrow, borrow_slot::cookie) != borrow_cookie) {
       contract_panic("managed-borrow chain is corrupt");
     }
-    mark_object(reinterpret_cast<neri_ref_v1>(borrow->runtime_words[1]));
+    mark_object(reinterpret_cast<neri_ref_v1>(borrow_word(borrow, borrow_slot::owner)));
   }
 
   while (stack.count != 0) {
@@ -456,7 +472,7 @@ void collect_impl() {
   heap.collection_count += 1;
   heap.next_collection_bytes = std::max(collection_floor_bytes,
       heap.managed_byte_count > UINT64_MAX / 2 ? UINT64_MAX : heap.managed_byte_count * 2);
-  heap.collecting = false;
+  heap.phase = heap_phase::active;
   assert_consistent();
 }
 
@@ -955,7 +971,7 @@ void release_native_allocations(runtime_state &heap) {
 void release_heap() {
   require_initialized();
   auto &heap = current_state();
-  if (heap.root_frame != nullptr || heap.borrow != nullptr || heap.collecting ||
+  if (heap.root_frame != nullptr || heap.borrow != nullptr || heap.phase == heap_phase::collecting ||
       heap.foreign_entry != nullptr || !heap.persistent_roots.empty()) {
     contract_panic("runtime shutdown requires no live roots, borrows or foreign entries");
   }
@@ -1014,9 +1030,10 @@ void generate_range(uint64_t begin, uint64_t end, void *context) {
 }
 } // namespace
 
+enum class session_phase { ready, executing, reset_failed };
+
 struct session_layout_record final {
   std::string canonical_layout;
-  uint32_t kind{};
   uint32_t flags{};
   uint64_t payload_size{};
   uint64_t payload_alignment{};
@@ -1026,8 +1043,7 @@ struct session_layout_record final {
 struct session_coordinator final {
   std::recursive_mutex mutex;
   std::thread::id owner_thread;
-  bool busy{};
-  bool reset_failed{};
+  session_phase phase = session_phase::ready;
   uint64_t nonce{};
   neri_ref_v1 state{};
   uint64_t display_offset{UINT64_MAX};
@@ -1057,7 +1073,7 @@ std::atomic<uint64_t> next_session_metric{1};
 
 [[nodiscard]] bool session_layout_equal(const session_layout_record &left,
                                         const session_layout_record &right) {
-  return left.kind == right.kind && left.flags == right.flags &&
+  return left.flags == right.flags &&
          left.canonical_layout == right.canonical_layout &&
          left.payload_size == right.payload_size &&
          left.payload_alignment == right.payload_alignment &&
@@ -1077,8 +1093,6 @@ std::atomic<uint64_t> next_session_metric{1};
   static_assert(sizeof(accessor) == sizeof(accessor_symbol));
   std::memcpy(&accessor, &accessor_symbol, sizeof(accessor));
   metadata = accessor();
-  void *metadata_entry{};
-  if (metadata != nullptr) std::memcpy(&metadata_entry, &metadata->entry, sizeof(metadata_entry));
   constexpr auto metadata_v1_size = offsetof(neri_session_module_metadata_v1, display_offset);
   if (metadata == nullptr || metadata->struct_size < metadata_v1_size ||
       metadata->version_major != 1 || metadata->version_minor > 1 ||
@@ -1086,9 +1100,15 @@ std::atomic<uint64_t> next_session_metric{1};
        metadata->struct_size < sizeof(neri_session_module_metadata_v1)) ||
       metadata->entry_name == nullptr ||
       std::strcmp(metadata->entry_name, entry_name) != 0 ||
-      metadata_entry != entry_symbol || metadata->source_type_id == nullptr ||
+      metadata->source_type_id == nullptr ||
       metadata->target_type_id == nullptr || metadata->layouts == nullptr ||
       metadata->layout_count == 0 || metadata->layout_count > 4096) {
+    session.error = "session module metadata header is invalid";
+    return NERI_SESSION_INVALID_METADATA_V1;
+  }
+  void *metadata_entry{};
+  std::memcpy(&metadata_entry, &metadata->entry, sizeof(metadata_entry));
+  if (metadata_entry != entry_symbol) {
     session.error = "session module metadata header is invalid";
     return NERI_SESSION_INVALID_METADATA_V1;
   }
@@ -1097,7 +1117,9 @@ std::atomic<uint64_t> next_session_metric{1};
     const auto &layout = metadata->layouts[index];
     if (layout.type_id == nullptr || layout.type_id[0] == '\0' ||
         layout.canonical_layout == nullptr || layout.canonical_layout[0] == '\0' ||
-        layout.kind != NERI_TYPE_KIND_CLASS_V1 || layout.payload_size > SIZE_MAX ||
+        layout.kind != NERI_TYPE_KIND_CLASS_V1 ||
+        (layout.flags & ~known_type_flags) != 0 ||
+        layout.payload_size > SIZE_MAX - sizeof(neri_object_header_v1) ||
         !session_power_of_two(layout.payload_alignment) ||
         layout.payload_alignment > alignof(std::max_align_t) ||
         layout.trace_offset_count > 4096 ||
@@ -1105,7 +1127,7 @@ std::atomic<uint64_t> next_session_metric{1};
       session.error = "session module layout is invalid";
       return NERI_SESSION_INVALID_METADATA_V1;
     }
-    session_layout_record record{layout.canonical_layout, layout.kind, layout.flags, layout.payload_size,
+    session_layout_record record{layout.canonical_layout, layout.flags, layout.payload_size,
                                  layout.payload_alignment, {}};
     uint64_t previous = 0;
     for (uint64_t offset_index = 0; offset_index < layout.trace_offset_count; ++offset_index) {
@@ -1227,11 +1249,11 @@ NERI_RT_API neri_ref_v1 neri_rt_v1_task_generate(neri_int_v1 count,
 void neri_task_scope_run(neri_task_coordinator coordinate, void *context) {
   require_initialized();
   auto &parent = current_state();
-  if (coordinate == nullptr || parent.collecting || parent.borrow != nullptr) {
+  if (coordinate == nullptr || parent.phase == heap_phase::collecting || parent.borrow != nullptr) {
     contract_panic("task scopes require a coordinator and no active trace or native borrow");
   }
   neri_task_scope scope{&parent};
-  parent.suspended = true;
+  parent.phase = heap_phase::suspended;
   coordinate(&scope, context);
   {
     std::unique_lock lock(scope.mutex);
@@ -1239,7 +1261,7 @@ void neri_task_scope_run(neri_task_coordinator coordinate, void *context) {
     scope.completed.wait(lock, [&scope] { return scope.outstanding == 0; });
   }
   adopt_results(scope);
-  parent.suspended = false;
+  parent.phase = heap_phase::active;
   assert_consistent();
 }
 
@@ -1250,7 +1272,7 @@ neri_task_ticket *neri_task_register(neri_task_scope *scope) {
 neri_task_ticket *neri_task_register_results(neri_task_scope *scope,
                                             neri_ref_v1 *slots, uint64_t count) {
   if (scope == nullptr || scope->parent != &current_state() ||
-      !current_state().suspended) {
+      current_state().phase != heap_phase::suspended) {
     contract_panic("only the suspended coordinator may register a task");
   }
   if ((count != 0 && slots == nullptr) || count > SIZE_MAX / sizeof(neri_ref_v1)) {
@@ -1277,7 +1299,7 @@ void neri_task_execute(neri_task_ticket *ticket, neri_task_body body, void *cont
   auto *parent = scope->parent;
   {
     std::lock_guard lock(scope->mutex);
-    if (scope->outstanding == 0 || !parent->suspended) {
+    if (scope->outstanding == 0 || parent->phase != heap_phase::suspended) {
       contract_panic("task execution requires a suspended parent scope");
     }
   }
@@ -1290,7 +1312,7 @@ void neri_task_execute(neri_task_ticket *ticket, neri_task_body body, void *cont
     }
   }
   auto &child = result == nullptr ? local : result->heap;
-  child.initialized = true;
+  child.phase = heap_phase::active;
   child.read_parent = parent;
   child.process_argument_count = parent->process_argument_count;
   child.process_arguments = parent->process_arguments;
@@ -1305,7 +1327,7 @@ void neri_task_execute(neri_task_ticket *ticket, neri_task_body body, void *cont
     release_heap();
   } else {
     require_initialized();
-    if (child.root_frame != &results || child.borrow != nullptr || child.collecting ||
+    if (child.root_frame != &results || child.borrow != nullptr || child.phase == heap_phase::collecting ||
         child.foreign_entry != nullptr) {
       contract_panic("task results require no live body roots, borrows or foreign entries");
     }
@@ -1332,12 +1354,13 @@ void neri_task_execute(neri_task_ticket *ticket, neri_task_body body, void *cont
 
 NERI_RT_API neri_abi_status_v1 neri_rt_v1_initialize(
     const neri_runtime_abi_requirements_v1 *requirements) {
-  if (current_state().suspended) {
+  if (current_state().phase == heap_phase::suspended) {
     contract_panic("cannot initialize a suspended task parent");
   }
   const auto status = validate_requirements(requirements);
   if (status != NERI_ABI_STATUS_OK_V1) return status;
-  current_state().initialized = true;
+  if (current_state().phase == heap_phase::uninitialized)
+    current_state().phase = heap_phase::active;
   current_state().host_error.clear();
   return NERI_ABI_STATUS_OK_V1;
 }
@@ -1346,14 +1369,14 @@ NERI_RT_API void neri_rt_v1_foreign_enter(
     neri_foreign_entry_v1 *entry,
     const neri_runtime_abi_requirements_v1 *requirements) {
   auto &heap = current_state();
-  if (entry == nullptr || heap.suspended || heap.collecting) {
+  if (entry == nullptr || heap.phase == heap_phase::suspended || heap.phase == heap_phase::collecting) {
     contract_panic("foreign entry requires a token and an active, non-collecting heap");
   }
   // Inspect registered tokens only: caller storage may be uninitialized.
   // Suspended ancestor heaps may still own tokens while a task is helping.
   for (const auto *owner = &heap; owner != nullptr; owner = owner->read_parent) {
     for (auto *active = owner->foreign_entry; active != nullptr;
-         active = reinterpret_cast<neri_foreign_entry_v1 *>(active->runtime_words[0])) {
+         active = reinterpret_cast<neri_foreign_entry_v1 *>(foreign_entry_word(active, foreign_entry_slot::previous))) {
       if (active == entry) contract_panic("foreign entry token is already active");
     }
   }
@@ -1361,13 +1384,14 @@ NERI_RT_API void neri_rt_v1_foreign_enter(
     panic_raw(NERI_PANIC_ABI_MISMATCH_V1,
               "foreign entry runtime ABI negotiation failed", nullptr);
   }
-  const bool owns_heap = !heap.initialized;
-  heap.initialized = true;
-  *entry = {{reinterpret_cast<uintptr_t>(heap.foreign_entry),
-             reinterpret_cast<uintptr_t>(&heap),
-             reinterpret_cast<uintptr_t>(heap.root_frame),
-             reinterpret_cast<uintptr_t>(heap.borrow),
-             owns_heap ? uintptr_t{1} : uintptr_t{0}, foreign_entry_cookie}};
+  const bool owns_heap = heap.phase == heap_phase::uninitialized;
+  heap.phase = heap_phase::active;
+  foreign_entry_word(entry, foreign_entry_slot::previous) = reinterpret_cast<uintptr_t>(heap.foreign_entry);
+  foreign_entry_word(entry, foreign_entry_slot::heap) = reinterpret_cast<uintptr_t>(&heap);
+  foreign_entry_word(entry, foreign_entry_slot::roots) = reinterpret_cast<uintptr_t>(heap.root_frame);
+  foreign_entry_word(entry, foreign_entry_slot::borrows) = reinterpret_cast<uintptr_t>(heap.borrow);
+  foreign_entry_word(entry, foreign_entry_slot::owns_heap) = owns_heap ? 1 : 0;
+  foreign_entry_word(entry, foreign_entry_slot::cookie) = foreign_entry_cookie;
   heap.foreign_entry = entry;
 }
 
@@ -1376,17 +1400,17 @@ NERI_RT_API void neri_rt_v1_foreign_leave(neri_foreign_entry_v1 *entry) {
   auto &heap = current_state();
   // Check membership before reading token storage, including wrong-thread use.
   if (entry == nullptr || heap.foreign_entry != entry ||
-      entry->runtime_words[1] != reinterpret_cast<uintptr_t>(&heap) ||
-      entry->runtime_words[5] != foreign_entry_cookie || heap.collecting) {
+      foreign_entry_word(entry, foreign_entry_slot::heap) != reinterpret_cast<uintptr_t>(&heap) ||
+      foreign_entry_word(entry, foreign_entry_slot::cookie) != foreign_entry_cookie || heap.phase == heap_phase::collecting) {
     contract_panic("foreign entries must leave their owning heap in LIFO order");
   }
-  if (entry->runtime_words[2] != reinterpret_cast<uintptr_t>(heap.root_frame) ||
-      entry->runtime_words[3] != reinterpret_cast<uintptr_t>(heap.borrow)) {
+  if (foreign_entry_word(entry, foreign_entry_slot::roots) != reinterpret_cast<uintptr_t>(heap.root_frame) ||
+      foreign_entry_word(entry, foreign_entry_slot::borrows) != reinterpret_cast<uintptr_t>(heap.borrow)) {
     contract_panic("foreign entry must restore its root and borrow chains");
   }
-  const bool owns_heap = entry->runtime_words[4] != 0;
+  const bool owns_heap = foreign_entry_word(entry, foreign_entry_slot::owns_heap) != 0;
   heap.foreign_entry =
-      reinterpret_cast<neri_foreign_entry_v1 *>(entry->runtime_words[0]);
+      reinterpret_cast<neri_foreign_entry_v1 *>(foreign_entry_word(entry, foreign_entry_slot::previous));
   *entry = {};
   if (owns_heap) release_heap();
 }
@@ -1402,7 +1426,7 @@ neri_rt_v1_set_process_arguments(int argc, const char *const *argv) {
 }
 
 NERI_RT_API void neri_rt_v1_shutdown(void) {
-  if (!current_state().initialized) {
+  if (current_state().phase == heap_phase::uninitialized) {
     return;
   }
   release_heap();
@@ -1416,7 +1440,7 @@ neri_rt_v1_gc_alloc(const neri_type_descriptor_v1 *type,
                       uint64_t payload_size, uint64_t payload_alignment) {
   require_initialized();
   auto &heap = current_state();
-  if (heap.collecting) {
+  if (heap.phase == heap_phase::collecting) {
     contract_panic("managed allocation is not allowed during tracing");
   }
   validate_type(type, payload_size, payload_alignment);
@@ -2093,19 +2117,19 @@ NERI_RT_API void *neri_rt_v1_gc_borrow_begin(
     neri_gc_borrow_v1 *borrow) {
   require_initialized();
   auto *allocation = find_managed(owner);
-  const bool empty_token = borrow != nullptr && borrow->runtime_words[0] == 0 &&
-                           borrow->runtime_words[1] == 0 &&
-                           borrow->runtime_words[2] == 0 &&
-                           borrow->runtime_words[3] == 0;
+  const bool empty_token = borrow != nullptr && borrow_word(borrow, borrow_slot::previous) == 0 &&
+                           borrow_word(borrow, borrow_slot::owner) == 0 &&
+                           borrow_word(borrow, borrow_slot::byte_length) == 0 &&
+                           borrow_word(borrow, borrow_slot::cookie) == 0;
   if (allocation == nullptr || !empty_token ||
       payload_offset > allocation->payload_size ||
       byte_length > allocation->payload_size - payload_offset) {
     contract_panic("invalid managed borrow");
   }
-  borrow->runtime_words[0] = reinterpret_cast<uintptr_t>(current_state().borrow);
-  borrow->runtime_words[1] = reinterpret_cast<uintptr_t>(owner);
-  borrow->runtime_words[2] = byte_length;
-  borrow->runtime_words[3] = borrow_cookie;
+  borrow_word(borrow, borrow_slot::previous) = reinterpret_cast<uintptr_t>(current_state().borrow);
+  borrow_word(borrow, borrow_slot::owner) = reinterpret_cast<uintptr_t>(owner);
+  borrow_word(borrow, borrow_slot::byte_length) = byte_length;
+  borrow_word(borrow, borrow_slot::cookie) = borrow_cookie;
   current_state().borrow = borrow;
   return reinterpret_cast<uint8_t *>(owner) +
          sizeof(neri_object_header_v1) + payload_offset;
@@ -2114,11 +2138,11 @@ NERI_RT_API void *neri_rt_v1_gc_borrow_begin(
 NERI_RT_API void neri_rt_v1_gc_borrow_end(neri_gc_borrow_v1 *borrow) {
   require_initialized();
   if (borrow == nullptr || borrow != current_state().borrow ||
-      borrow->runtime_words[3] != borrow_cookie) {
+      borrow_word(borrow, borrow_slot::cookie) != borrow_cookie) {
     contract_panic("managed borrows must end in LIFO order");
   }
   current_state().borrow =
-      reinterpret_cast<neri_gc_borrow_v1 *>(borrow->runtime_words[0]);
+      reinterpret_cast<neri_gc_borrow_v1 *>(borrow_word(borrow, borrow_slot::previous));
   std::memset(borrow, 0, sizeof(*borrow));
 }
 
@@ -2267,9 +2291,9 @@ static neri_int_v1 session_load_execute_impl(
   }
   std::lock_guard coordinator_lock(pinned->mutex);
   auto &session = *pinned;
-  if (session.owner_thread != std::this_thread::get_id() || session.busy)
+  if (session.owner_thread != std::this_thread::get_id() || session.phase == session_phase::executing)
     return NERI_SESSION_INVOKE_STATE_V1;
-  if (session.reset_failed) {
+  if (session.phase == session_phase::reset_failed) {
     session.error = "session reset must be retried before execution";
     return NERI_SESSION_INVOKE_STATE_V1;
   }
@@ -2308,7 +2332,7 @@ static neri_int_v1 session_load_execute_impl(
     target = metadata->target_type_id;
     for (uint64_t index = 0; index < metadata->layout_count; ++index) {
       const auto &layout = metadata->layouts[index];
-      session_layout_record record{layout.canonical_layout, layout.kind, layout.flags,
+      session_layout_record record{layout.canonical_layout, layout.flags,
                                    layout.payload_size, layout.payload_alignment, {}};
       if (layout.trace_offset_count != 0)
         record.trace_offsets.assign(layout.trace_offsets,
@@ -2324,9 +2348,9 @@ static neri_int_v1 session_load_execute_impl(
     return NERI_SESSION_INVOKE_STATE_V1;
   }
   const auto entry_started = std::chrono::steady_clock::now();
-  session.busy = true;
+  session.phase = session_phase::executing;
   session.state = metadata->entry(session.state);
-  session.busy = false;
+  session.phase = session_phase::ready;
   const auto gc_started = std::chrono::steady_clock::now();
   session.target_type.swap(target);
   session.display_offset = metadata->version_minor >= 1 &&
@@ -2404,8 +2428,8 @@ NERI_RT_API neri_int_v1 neri_rt_v1_session_load_execute_object(
   }
   std::lock_guard coordinator_lock(pinned->mutex);
   auto &session = *pinned;
-  if (session.owner_thread != std::this_thread::get_id() || session.busy ||
-      session.reset_failed)
+  if (session.owner_thread != std::this_thread::get_id() || session.phase == session_phase::executing ||
+      session.phase == session_phase::reset_failed)
     return NERI_SESSION_INVOKE_STATE_V1;
   if (session.object_generations.size() >= 256 || session.layouts.size() >= 8192) {
     session.error = "session resource limit reached";
@@ -2455,8 +2479,7 @@ NERI_RT_API neri_int_v1 neri_rt_v1_session_load_execute_object(
     target = metadata->target_type_id;
     for (uint64_t index = 0; index < metadata->layout_count; ++index) {
       const auto &layout = metadata->layouts[index];
-      session_layout_record record{layout.canonical_layout, layout.kind,
-                                   layout.flags, layout.payload_size,
+      session_layout_record record{layout.canonical_layout, layout.flags, layout.payload_size,
                                    layout.payload_alignment, {}};
       if (layout.trace_offset_count != 0)
         record.trace_offsets.assign(layout.trace_offsets,
@@ -2470,9 +2493,9 @@ NERI_RT_API neri_int_v1 neri_rt_v1_session_load_execute_object(
     session.error = "session metadata exceeds resource limits";
     return NERI_SESSION_INVOKE_STATE_V1;
   }
-  session.busy = true;
+  session.phase = session_phase::executing;
   session.state = metadata->entry(session.state);
-  session.busy = false;
+  session.phase = session_phase::ready;
   session.target_type.swap(target);
   session.display_offset = metadata->display_offset;
   session.layouts.swap(merged);
@@ -2491,7 +2514,7 @@ NERI_RT_API neri_int_v1 neri_rt_v1_session_reset(neri_int_v1 handle) {
   }
   std::lock_guard coordinator_lock(pinned->mutex);
   auto &session = *pinned;
-  if (session.owner_thread != std::this_thread::get_id() || session.busy)
+  if (session.owner_thread != std::this_thread::get_id() || session.phase == session_phase::executing)
     return NERI_SESSION_INVOKE_STATE_V1;
   session.state = nullptr;
   session.display_offset = UINT64_MAX;
@@ -2507,7 +2530,7 @@ NERI_RT_API neri_int_v1 neri_rt_v1_session_reset(neri_int_v1 handle) {
       auto *generation = session.object_generations.back();
       if (session.object_remove(generation, error.data(), error.size()) == 0) {
         session.error = error.data();
-        session.reset_failed = true;
+        session.phase = session_phase::reset_failed;
         return NERI_SESSION_LOAD_FAILED_V1;
       }
       session.object_generations.pop_back();
@@ -2520,7 +2543,7 @@ NERI_RT_API neri_int_v1 neri_rt_v1_session_reset(neri_int_v1 handle) {
   if (session.object_linker_library != nullptr) {
     if (!neri::platform::session_module_close(session.object_linker_library,
                                               session.error)) {
-      session.reset_failed = true;
+      session.phase = session_phase::reset_failed;
       return NERI_SESSION_LOAD_FAILED_V1;
     }
     session.object_linker_library = nullptr;
@@ -2534,11 +2557,11 @@ NERI_RT_API neri_int_v1 neri_rt_v1_session_reset(neri_int_v1 handle) {
   if (!remaining.empty()) {
     std::reverse(remaining.begin(), remaining.end());
     session.modules.swap(remaining);
-    session.reset_failed = true;
+    session.phase = session_phase::reset_failed;
     return NERI_SESSION_LOAD_FAILED_V1;
   }
   session.modules.clear();
-  session.reset_failed = false;
+  session.phase = session_phase::ready;
   return NERI_SESSION_OK_V1;
 }
 

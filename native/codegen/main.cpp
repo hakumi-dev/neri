@@ -29,9 +29,11 @@ namespace {
 
 constexpr std::size_t max_ir_size = 256U * 1024U * 1024U;
 
+enum class input_format { binary, hex };
+
 struct arguments final {
   std::filesystem::path input;
-  std::string input_format;
+  input_format format{};
   neri::codegen::target_platform target{};
   neri::codegen::optimization_mode optimization{};
   neri::codegen::output_kind kind{};
@@ -59,7 +61,7 @@ arguments parse_arguments(int argc, char **argv) {
   }
 
   std::string input;
-  std::string input_format;
+  std::string format_name;
   std::string target;
   std::string optimization;
   std::string emit;
@@ -87,7 +89,7 @@ arguments parse_arguments(int argc, char **argv) {
         return input;
       }
       if (option == "--input-format") {
-        return input_format;
+        return format_name;
       }
       if (option == "--target") {
         return target;
@@ -112,12 +114,12 @@ arguments parse_arguments(int argc, char **argv) {
     destination = argv[index + 1];
   }
 
-  if (input.empty() || input_format.empty() || target.empty() ||
+  if (input.empty() || format_name.empty() || target.empty() ||
       optimization.empty() || emit.empty() || output.empty()) {
     usage_error("Input, input format, target, optimization, emit kind, and "
                 "output are all required; host defaults are forbidden.");
   }
-  if (input_format != "binary" && input_format != "hex") {
+  if (format_name != "binary" && format_name != "hex") {
     usage_error("Input format must be binary or hex.");
   }
   const auto kind = neri::codegen::parse_output_kind(emit);
@@ -132,7 +134,7 @@ arguments parse_arguments(int argc, char **argv) {
     }
   }
   return {neri::host_path(input),
-          input_format,
+          format_name == "hex" ? input_format::hex : input_format::binary,
           neri::codegen::parse_target(target),
           neri::codegen::parse_optimization(optimization),
           kind,
@@ -261,11 +263,11 @@ int main(int argc, char **argv) {
     }
     const auto options = parse_arguments(argc, argv);
     const auto input_started = std::chrono::steady_clock::now();
-    const auto physical_size_limit = options.input_format == "hex"
+    const auto physical_size_limit = options.format == input_format::hex
                                          ? max_ir_size * 2U
                                          : max_ir_size;
     auto bytes = read_file(options.input, physical_size_limit);
-    if (options.input_format == "hex") {
+    if (options.format == input_format::hex) {
       bytes = decode_hex(bytes);
     }
     const auto reader_started = std::chrono::steady_clock::now();
@@ -290,14 +292,14 @@ int main(int argc, char **argv) {
         metrics);
     return 0;
   } catch (const neri::codegen::reader_error &error) {
-    std::cerr << error.code() << " at byte " << error.byte_offset() << ": "
+    std::cerr << diagnostic_code(error.code()) << " at byte " << error.byte_offset() << ": "
               << error.what() << '\n';
     return 2;
   } catch (const neri::codegen::codegen_error &error) {
-    std::cerr << error.code() << ": " << error.what() << '\n';
+    std::cerr << diagnostic_code(error.code()) << ": " << error.what() << '\n';
     return 2;
   } catch (const std::exception &error) {
-    std::cerr << "NCG001: " << error.what() << '\n';
+    std::cerr << diagnostic_code(neri::codegen::codegen_error_kind::driver) << ": " << error.what() << '\n';
     print_usage(std::cerr);
     return 2;
   }

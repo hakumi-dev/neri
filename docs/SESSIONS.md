@@ -215,8 +215,9 @@ library sources retain separate parser boundaries, including the boundary before
 the first captured library. Their aggregate snapshot is limited to 1 MiB.
 
 `SessionToolchain(compiler, linker, target, workRoot, release = false,
-cacheEnabled = true)` selects Debug or Release module compilation and code-cache
-use. A project
+cacheEnabled = true)` takes a `TargetPlatform` and selects Debug or Release
+module compilation and code-cache use. `TargetPlatform.parse(name)` validates
+external target names and returns `null` for an unsupported target. A project
 initializer is loaded through the normal project manifest, validated as a safe
 zero-argument non-`Void` function, and executed independently of the project's
 `main`. `initializeProject(projectPath, unit, functionName, bindingName, imports)`
@@ -270,10 +271,10 @@ The preparation and execution calls are separate:
 ```neri
 let prepared = session.prepare("app.increment()\n")
 
-if prepared.status == "complete"
+if prepared.status.isComplete()
   let execution = session.execute(prepared)
 
-  if execution.succeeded && execution.resultType != "Void"
+  if execution.succeeded() && execution.resultType != "Void"
     console.println(execution.resultText)
   end
 end

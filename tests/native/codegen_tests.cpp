@@ -125,7 +125,7 @@ void test_debug_scope_validation() {
   ir_module module;
   module.semantic_version = {1, 0};
   module.id = "debug-scope-contract";
-  module.required_features = {"debug-scopes-v1"};
+  module.required_features = {ir_feature::DebugScopes};
   module.sources.push_back({"scope.hk", {'d', 'e', 'f', ' ', 'm', 'a', 'i',
                                           'n', '\n', ' ', ' ', 'l', 'e', 't',
                                           ' ', 'v', '\n'}});
@@ -173,7 +173,7 @@ void test_retained_module_lowering() {
   ir_module module;
   module.semantic_version = {1, 0};
   module.id = "retained-contract";
-  module.required_features = {"retained-modules-v1"};
+  module.required_features = {ir_feature::RetainedModules};
 
   class_declaration retained_class;
   retained_class.id = {module.id, NERI_IR_SYMBOL_CLASS_V1, "Prior"};
@@ -235,7 +235,7 @@ void expect_error(std::span<const std::uint8_t> bytes,
   try {
     static_cast<void>(neri::codegen::read_verified_module(bytes));
   } catch (const neri::codegen::reader_error &error) {
-    require(error.code() == expected_code,
+    require(diagnostic_code(error.code()) == expected_code,
             "reader returned a non-canonical diagnostic code");
     return;
   }
@@ -318,7 +318,7 @@ void test_primitive_codegen(const std::vector<std::uint8_t> &bytes) {
   try {
     static_cast<void>(neri::codegen::parse_target("invalid-triple"));
   } catch (const neri::codegen::codegen_error &error) {
-    require(error.code() == "NCG001",
+    require(diagnostic_code(error.code()) == "NCG001",
             "invalid target returned a non-canonical diagnostic");
     return;
   }

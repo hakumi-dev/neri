@@ -1,6 +1,7 @@
 #ifndef NERI_CODEGEN_READER_H
 #define NERI_CODEGEN_READER_H
 
+#include "neri/codegen/diagnostic.h"
 #include "neri/codegen/ir.h"
 
 #include <cstddef>
@@ -20,13 +21,13 @@ struct reader_options final {
 
 class reader_error final : public std::runtime_error {
 public:
-  reader_error(std::string code, std::string message, std::size_t byte_offset);
+  reader_error(reader_error_kind code, std::string message, std::size_t byte_offset);
 
-  [[nodiscard]] const std::string &code() const noexcept;
+  [[nodiscard]] reader_error_kind code() const noexcept;
   [[nodiscard]] std::size_t byte_offset() const noexcept;
 
 private:
-  std::string code_;
+  reader_error_kind code_;
   std::size_t byte_offset_{};
 };
 

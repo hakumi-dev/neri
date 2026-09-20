@@ -1,6 +1,9 @@
 #ifndef NERI_CODEGEN_IR_H
 #define NERI_CODEGEN_IR_H
 
+#include "neri/ir_transport.h"
+#include "neri/ir_features.h"
+
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -15,7 +18,7 @@ struct version final {
 
 struct symbol_id final {
   std::string module;
-  std::uint8_t kind{};
+  neri_ir_symbol_kind_v1 kind{};
   std::string semantic_name;
 };
 
@@ -26,14 +29,14 @@ struct source_location final {
 };
 
 struct type final {
-  std::uint8_t tag{};
+  neri_ir_type_tag_v1 tag{};
   std::optional<symbol_id> symbol;
   std::vector<type> arguments;
   std::uint32_t element_count{};
 };
 
 struct constant final {
-  std::uint8_t tag{};
+  neri_ir_constant_tag_v1 tag{};
   std::uint64_t bits{};
   std::vector<type> types;
   std::vector<constant> nested;
@@ -49,13 +52,13 @@ struct source final {
 struct field final {
   symbol_id id;
   type value_type;
-  std::uint8_t access{};
+  neri_ir_access_v1 access{};
   std::optional<source_location> location;
 };
 
 struct method final {
   symbol_id function_id;
-  std::uint8_t dispatch{};
+  neri_ir_dispatch_kind_v1 dispatch{};
   std::optional<symbol_id> dispatch_slot;
   std::optional<source_location> location;
 };
@@ -63,7 +66,7 @@ struct method final {
 struct class_declaration final {
   symbol_id id;
   std::optional<symbol_id> base;
-  std::uint8_t access{};
+  neri_ir_access_v1 access{};
   bool retained{};
   std::vector<field> fields;
   std::vector<method> methods;
@@ -80,7 +83,7 @@ struct global_declaration final {
   symbol_id id;
   type value_type;
   constant initializer;
-  std::uint8_t linkage{};
+  neri_ir_global_linkage_v1 linkage{};
   std::optional<source_location> location;
 };
 
@@ -94,7 +97,7 @@ struct import_declaration final {
   symbol_id id;
   std::vector<type> parameter_types;
   type result_type;
-  std::uint8_t kind{};
+  neri_ir_import_kind_v1 kind{};
   std::string link_name;
   std::string native_library;
   std::uint32_t effects{};
@@ -119,20 +122,20 @@ struct edge final {
 };
 
 struct instruction final {
-  std::uint16_t opcode{};
+  neri_ir_opcode_v1 opcode{};
   std::vector<value_definition> results;
   std::vector<std::uint32_t> operands;
   std::vector<type> type_arguments;
   std::optional<symbol_id> symbol;
   std::optional<constant> constant_value;
-  std::optional<std::uint8_t> predicate;
+  std::optional<neri_ir_comparison_v1> predicate;
   bool flag{};
   std::optional<source_location> location;
   std::uint32_t debug_scope_id{};
 };
 
 struct terminator final {
-  std::uint8_t tag{};
+  neri_ir_terminator_tag_v1 tag{};
   std::optional<std::uint32_t> condition;
   std::vector<edge> edges;
   std::optional<std::uint32_t> return_value;
@@ -166,7 +169,7 @@ struct function final {
   symbol_id id;
   std::vector<type> parameter_types;
   type result_type;
-  std::uint8_t kind{};
+  neri_ir_function_kind_v1 kind{};
   std::uint32_t effects{};
   bool unsafe_call{};
   bool retained{};
@@ -191,7 +194,7 @@ struct session_export final {
 struct ir_module final {
   version semantic_version;
   std::string id;
-  std::vector<std::string> required_features;
+  std::vector<ir_feature> required_features;
   std::vector<source> sources;
   std::vector<class_declaration> classes;
   std::vector<global_declaration> globals;

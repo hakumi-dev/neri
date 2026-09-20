@@ -28,23 +28,13 @@
 namespace neri::codegen {
 namespace {
 
-constexpr std::string_view incompatible_major = "NIR001";
-constexpr std::string_view unsupported_minor = "NIR002";
-constexpr std::string_view unsupported_feature = "NIR003";
-constexpr std::string_view malformed_module = "NIR004";
-constexpr std::string_view invalid_reference = "NIR005";
-constexpr std::string_view invalid_type = "NIR006";
-constexpr std::string_view invalid_control_flow = "NIR007";
-constexpr std::string_view invalid_ssa = "NIR008";
-constexpr std::string_view invalid_safety = "NIR009";
-constexpr std::string_view invalid_source = "NIR010";
 constexpr std::uint32_t c_call_effects = NERI_IR_EFFECT_READ_V1 |
     NERI_IR_EFFECT_WRITE_V1 | NERI_IR_EFFECT_MAY_PANIC_V1 |
     NERI_IR_EFFECT_MANAGED_ALLOCATE_V1 | NERI_IR_EFFECT_NATIVE_ALLOCATE_V1 |
     NERI_IR_EFFECT_SAFEPOINT_V1 | NERI_IR_EFFECT_UNSAFE_V1;
 
-[[noreturn]] void fail(std::string_view code, std::string message) {
-  throw reader_error(std::string(code), std::move(message), 0U);
+[[noreturn]] void fail(reader_error_kind code, std::string message) {
+  throw reader_error(code, std::move(message), 0U);
 }
 
 [[nodiscard]] auto symbol_key(const symbol_id &value) {
@@ -200,9 +190,9 @@ constexpr std::uint32_t c_call_effects = NERI_IR_EFFECT_READ_V1 |
 
 void require_result_type(const type &value, std::string_view description) {
   if (value.tag == NERI_IR_TYPE_C_FUNCTION_V1 && !is_c_function(value))
-    fail(invalid_type, "C function signature requires C-compatible result and parameters.");
+    fail(reader_error_kind::invalid_type, "C function signature requires C-compatible result and parameters.");
   if (!is_void(value) && !is_supported_value(value)) {
-    fail(unsupported_feature,
+    fail(reader_error_kind::unsupported_feature,
          std::string(description) +
              " uses a semantic type whose native lowering belongs to a later "
              "roadmap card.");
@@ -211,9 +201,9 @@ void require_result_type(const type &value, std::string_view description) {
 
 void require_value_type(const type &value, std::string_view description) {
   if (value.tag == NERI_IR_TYPE_C_FUNCTION_V1 && !is_c_function(value))
-    fail(invalid_type, "C function signature requires C-compatible result and parameters.");
+    fail(reader_error_kind::invalid_type, "C function signature requires C-compatible result and parameters.");
   if (!is_supported_value(value)) {
-    fail(unsupported_feature,
+    fail(reader_error_kind::unsupported_feature,
          std::string(description) +
              " uses a semantic type whose native lowering belongs to a later "
              "roadmap card.");
@@ -230,7 +220,7 @@ void verify_location(const std::optional<source_location> &location,
         return candidate.id == location->source;
       });
   if (source == module.sources.end()) {
-    fail(invalid_source,
+    fail(reader_error_kind::invalid_source,
          "Source location references missing source '" + location->source +
              "'.");
   }
@@ -240,7 +230,7 @@ void verify_location(const std::optional<source_location> &location,
   if (start > contents.size() || length > contents.size() - start ||
       !utf8_boundary(contents, start) ||
       !utf8_boundary(contents, start + length)) {
-    fail(invalid_source,
+    fail(reader_error_kind::invalid_source,
          "Source location is outside UTF-8 scalar boundaries for source '" +
              location->source + "'.");
   }
@@ -249,7 +239,7 @@ void verify_location(const std::optional<source_location> &location,
 void verify_constant(const constant &value, const type &expected,
                      std::uint32_t depth = 0U) {
   if (depth > 64U) {
-    fail(invalid_type, "Constant nesting exceeds semantic depth 64.");
+    fail(reader_error_kind::invalid_type, "Constant nesting exceeds semantic depth 64.");
   }
   const auto no_extra_metadata = [&value] {
     return value.types.empty() && value.nested.empty() &&
@@ -259,23 +249,23 @@ void verify_constant(const constant &value, const type &expected,
   case NERI_IR_CONSTANT_BOOL_V1:
     if (expected.tag != NERI_IR_TYPE_BOOL_V1 || value.bits > 1U ||
         !no_extra_metadata()) {
-      fail(invalid_type, "Malformed bool constant.");
+      fail(reader_error_kind::invalid_type, "Malformed bool constant.");
     }
     return;
   case NERI_IR_CONSTANT_BYTE_V1:
     if (expected.tag != NERI_IR_TYPE_BYTE_V1 || value.bits > UINT64_C(255) ||
         !no_extra_metadata()) {
-      fail(invalid_type, "Malformed byte constant.");
+      fail(reader_error_kind::invalid_type, "Malformed byte constant.");
     }
     return;
   case NERI_IR_CONSTANT_INT_V1:
     if (expected.tag != NERI_IR_TYPE_INT_V1 || !no_extra_metadata()) {
-      fail(invalid_type, "Malformed int constant.");
+      fail(reader_error_kind::invalid_type, "Malformed int constant.");
     }
     return;
   case NERI_IR_CONSTANT_FLOAT_V1:
     if (expected.tag != NERI_IR_TYPE_FLOAT_V1 || !no_extra_metadata()) {
-      fail(invalid_type, "Malformed float constant.");
+      fail(reader_error_kind::invalid_type, "Malformed float constant.");
     }
     return;
   case NERI_IR_CONSTANT_OPTIONAL_NONE_V1:
@@ -283,7 +273,7 @@ void verify_constant(const constant &value, const type &expected,
         value.types.size() != 1U || !same_type(value.types.front(), expected) ||
         !value.nested.empty() || value.symbol.has_value() ||
         !value.text.empty()) {
-      fail(invalid_type, "Malformed optional.none constant.");
+      fail(reader_error_kind::invalid_type, "Malformed optional.none constant.");
     }
     return;
   case NERI_IR_CONSTANT_OPTIONAL_SOME_V1:
@@ -291,7 +281,7 @@ void verify_constant(const constant &value, const type &expected,
         expected.arguments.size() != 1U || value.types.size() != 1U ||
         !same_type(value.types.front(), expected) || value.nested.size() != 1U ||
         value.symbol.has_value() || !value.text.empty()) {
-      fail(invalid_type, "Malformed optional.some constant.");
+      fail(reader_error_kind::invalid_type, "Malformed optional.some constant.");
     }
     verify_constant(value.nested.front(), expected.arguments.front(), depth + 1U);
     return;
@@ -299,7 +289,7 @@ void verify_constant(const constant &value, const type &expected,
     if (!is_string(expected) || value.types.size() != 0U ||
         !value.nested.empty() || !value.symbol.has_value() ||
         !value.text.empty()) {
-      fail(invalid_type, "Malformed string.global constant.");
+      fail(reader_error_kind::invalid_type, "Malformed string.global constant.");
     }
     return;
   case NERI_IR_CONSTANT_STRING_UTF8_V1:
@@ -308,11 +298,11 @@ void verify_constant(const constant &value, const type &expected,
         !strict_utf8(std::span(
             reinterpret_cast<const std::uint8_t *>(value.text.data()),
             value.text.size()))) {
-      fail(invalid_type, "Malformed string.utf8 constant.");
+      fail(reader_error_kind::invalid_type, "Malformed string.utf8 constant.");
     }
     return;
   default:
-    fail(unsupported_feature,
+    fail(reader_error_kind::unsupported_feature,
          "Constant form is not supported by native lowering.");
   }
 }
@@ -357,7 +347,7 @@ void require_unique_order(const std::vector<T> &values,
                           Projection projection) {
   for (std::size_t index = 1; index < values.size(); ++index) {
     if (!(projection(values[index - 1U]) < projection(values[index]))) {
-      fail(malformed_module,
+      fail(reader_error_kind::malformed_module,
            std::string(description) + " are not in unique canonical order.");
     }
   }
@@ -426,21 +416,21 @@ struct found_field final {
 void require_declared_type(const ir_module &module, const type &value,
                            std::string_view description) {
   if (value.tag != NERI_IR_TYPE_FIXED_ARRAY_V1 && value.element_count != 0U)
-    fail(invalid_type, "Only fixed arrays carry an element count.");
+    fail(reader_error_kind::invalid_type, "Only fixed arrays carry an element count.");
   require_value_type(value, description);
   if (value.tag == NERI_IR_TYPE_C_FUNCTION_V1 &&
-      std::ranges::find(module.required_features, "c-interop-v1") == module.required_features.end())
-    fail(unsupported_feature, "C function types require c-interop-v1.");
+      std::ranges::find(module.required_features, ir_feature::CInterop) == module.required_features.end())
+    fail(reader_error_kind::unsupported_feature, "C function types require c-interop-v1.");
   if (value.tag == NERI_IR_TYPE_NATIVE_RECORD_V1 || value.tag == NERI_IR_TYPE_FIXED_ARRAY_V1) {
-    if (std::ranges::find(module.required_features, "native-records-v1") == module.required_features.end())
-      fail(unsupported_feature, "Native aggregate types require native-records-v1.");
+    if (std::ranges::find(module.required_features, ir_feature::NativeRecords) == module.required_features.end())
+      fail(reader_error_kind::unsupported_feature, "Native aggregate types require native-records-v1.");
     (void)native_layouts(module).layout(value);
   }
   if (extended_scalar(value.tag) &&
-      std::ranges::find(module.required_features, "extended-scalars-v1") == module.required_features.end())
-    fail(unsupported_feature, "Extended scalar types require extended-scalars-v1.");
+      std::ranges::find(module.required_features, ir_feature::ExtendedScalars) == module.required_features.end())
+    fail(reader_error_kind::unsupported_feature, "Extended scalar types require extended-scalars-v1.");
   if (is_class(value) && find_class(module, *value.symbol) == nullptr) {
-    fail(invalid_reference,
+    fail(reader_error_kind::invalid_reference,
          std::string(description) + " references a missing class.");
   }
   for (std::size_t index = 0; index < value.arguments.size(); ++index) {
@@ -485,7 +475,7 @@ void verify_instruction_shape(const instruction &value, std::size_t results,
       value.symbol.has_value() != symbol ||
       value.constant_value.has_value() != constant_value ||
       value.predicate.has_value() != predicate || value.flag) {
-    fail(invalid_type, "Instruction has invalid operand or metadata shape.");
+    fail(reader_error_kind::invalid_type, "Instruction has invalid operand or metadata shape.");
   }
 }
 
@@ -493,7 +483,7 @@ void verify_instruction_shape(const instruction &value, std::size_t results,
                                           std::uint32_t id) {
   const auto found = context.definitions.find(id);
   if (found == context.definitions.end()) {
-    fail(invalid_ssa, "Instruction references undefined SSA value " +
+    fail(reader_error_kind::invalid_ssa, "Instruction references undefined SSA value " +
                           std::to_string(id) + ".");
   }
   return *found->second.value_type;
@@ -504,7 +494,7 @@ void require_operand_type(const function_context &context,
                           const type &expected) {
   if (index >= value.operands.size() ||
       !same_type(definition_type(context, value.operands[index]), expected)) {
-    fail(invalid_type, "Instruction operand has the wrong semantic type in " +
+    fail(reader_error_kind::invalid_type, "Instruction operand has the wrong semantic type in " +
          context.value.id.semantic_name + " (opcode " +
          std::to_string(value.opcode) + ", operand " + std::to_string(index) + ").");
   }
@@ -514,12 +504,12 @@ void require_result_type(const instruction &value, std::size_t index,
                          const type &expected) {
   if (index >= value.results.size() ||
       !same_type(value.results[index].value_type, expected)) {
-    fail(invalid_type, "Instruction result has the wrong semantic type.");
+    fail(reader_error_kind::invalid_type, "Instruction result has the wrong semantic type.");
   }
 }
 
 void require_unary(const function_context &context, const instruction &value,
-                   std::uint8_t operand_tag, std::uint8_t result_tag) {
+                   neri_ir_type_tag_v1 operand_tag, neri_ir_type_tag_v1 result_tag) {
   verify_instruction_shape(value, 1U, 1U, 0U, false, false, false);
   const type operand{operand_tag, std::nullopt, {}};
   const type result{result_tag, std::nullopt, {}};
@@ -528,7 +518,7 @@ void require_unary(const function_context &context, const instruction &value,
 }
 
 void require_binary(const function_context &context, const instruction &value,
-                    std::uint8_t operand_tag, std::uint8_t result_tag) {
+                    neri_ir_type_tag_v1 operand_tag, neri_ir_type_tag_v1 result_tag) {
   verify_instruction_shape(value, 1U, 2U, 0U, false, false, false);
   const type operand{operand_tag, std::nullopt, {}};
   const type result{result_tag, std::nullopt, {}};
@@ -544,7 +534,7 @@ void require_binary(const function_context &context, const instruction &value,
                                         bool c_abi = false,
                                         bool unsafe_call = false) {
   if (!value.symbol.has_value()) {
-    fail(invalid_reference, "Call instruction has no target symbol.");
+    fail(reader_error_kind::invalid_reference, "Call instruction has no target symbol.");
   }
   const std::vector<type> *parameters = nullptr;
   const type *result = nullptr;
@@ -554,7 +544,7 @@ void require_binary(const function_context &context, const instruction &value,
     const auto expected_kind = c_abi ? NERI_IR_IMPORT_C_ABI_V1
                                      : NERI_IR_IMPORT_RUNTIME_V1;
     if (target == nullptr || target->kind != expected_kind) {
-      fail(invalid_reference,
+      fail(reader_error_kind::invalid_reference,
            "Import call references a missing or wrong-kind import.");
     }
     parameters = &target->parameter_types;
@@ -574,7 +564,7 @@ void require_binary(const function_context &context, const instruction &value,
                                        target->kind == NERI_IR_STATIC_METHOD_V1 ||
                                        target->kind == NERI_IR_DEFAULT_ADAPTER_V1);
     if (!valid_kind || target->unsafe_call != unsafe_call) {
-      fail(invalid_reference,
+      fail(reader_error_kind::invalid_reference,
            "Direct call references a missing or unsupported function: " +
                value.symbol->semantic_name + ".");
     }
@@ -606,25 +596,25 @@ void require_binary(const function_context &context, const instruction &value,
 
 [[nodiscard]] std::uint32_t verify_c_function_instruction(
     function_context &context, const instruction &value) {
-  if (std::ranges::find(context.module.required_features, "c-interop-v1") ==
+  if (std::ranges::find(context.module.required_features, ir_feature::CInterop) ==
       context.module.required_features.end())
-    fail(unsupported_feature, "C function instructions require c-interop-v1.");
+    fail(reader_error_kind::unsupported_feature, "C function instructions require c-interop-v1.");
   if (value.opcode == NERI_IR_OPCODE_C_FUNCTION_ADDRESS_V1) {
     verify_instruction_shape(value, 1U, 0U, 0U, true, false, false);
     const std::vector<type> *parameters = nullptr;
     const type *result = nullptr;
     if (const auto *target = find_import(context.module, *value.symbol)) {
       if (target->kind != NERI_IR_IMPORT_C_ABI_V1)
-        fail(invalid_reference, "C function address requires a C ABI import.");
+        fail(reader_error_kind::invalid_reference, "C function address requires a C ABI import.");
       parameters = &target->parameter_types;
       result = &target->result_type;
     } else if (const auto *target = find_function(context.module, *value.symbol)) {
       if (target->export_name.empty())
-        fail(invalid_reference, "C function address requires an exported function.");
+        fail(reader_error_kind::invalid_reference, "C function address requires an exported function.");
       parameters = &target->parameter_types;
       result = &target->result_type;
     } else {
-      fail(invalid_reference, "C function address references a missing target.");
+      fail(reader_error_kind::invalid_reference, "C function address references a missing target.");
     }
     type signature{NERI_IR_TYPE_C_FUNCTION_V1, std::nullopt, {*result}};
     signature.arguments.insert(signature.arguments.end(), parameters->begin(), parameters->end());
@@ -632,10 +622,10 @@ void require_binary(const function_context &context, const instruction &value,
     return 0U;
   }
   if (value.operands.size() < 2U)
-    fail(invalid_type, "Indirect C call requires a capability and callable.");
+    fail(reader_error_kind::invalid_type, "Indirect C call requires a capability and callable.");
   const auto &signature = definition_type(context, value.operands[1]);
   if (!is_c_function(signature))
-    fail(invalid_type, "Indirect C call requires a non-null C function pointer.");
+    fail(reader_error_kind::invalid_type, "Indirect C call requires a non-null C function pointer.");
   const auto &result = signature.arguments.front();
   verify_instruction_shape(value, is_void(result) ? 0U : 1U,
                            signature.arguments.size() + 1U, 0U, false, false, false);
@@ -651,7 +641,7 @@ void require_binary(const function_context &context, const instruction &value,
                                                 const instruction &value) {
   if (!value.symbol.has_value() ||
       value.symbol->kind != NERI_IR_SYMBOL_METHOD_V1) {
-    fail(invalid_reference,
+    fail(reader_error_kind::invalid_reference,
          "Virtual call requires a dispatch-slot method symbol.");
   }
 
@@ -663,7 +653,7 @@ void require_binary(const function_context &context, const instruction &value,
     }
   }
   if (candidates.empty()) {
-    fail(invalid_reference,
+    fail(reader_error_kind::invalid_reference,
          "Virtual call references a dispatch slot without implementations.");
   }
 
@@ -676,14 +666,14 @@ void require_binary(const function_context &context, const instruction &value,
         !is_class(candidate->parameter_types.front()) ||
         candidate->parameter_types.size() != signature->parameter_types.size() ||
         !same_type(candidate->result_type, signature->result_type)) {
-      fail(invalid_reference,
+      fail(reader_error_kind::invalid_reference,
            "Virtual dispatch slot has an incompatible implementation.");
     }
     for (std::size_t index = 1U; index < candidate->parameter_types.size();
          ++index) {
       if (!same_type(candidate->parameter_types[index],
                      signature->parameter_types[index])) {
-        fail(invalid_reference,
+        fail(reader_error_kind::invalid_reference,
              "Virtual dispatch slot has incompatible parameter types.");
       }
     }
@@ -717,15 +707,15 @@ void require_binary(const function_context &context, const instruction &value,
     static_cast<void>(definition_type(context, operand));
   }
   if (value.opcode >= NERI_IR_OPCODE_INT_NEG_CHECKED_V1 && value.opcode <= NERI_IR_OPCODE_FLOAT_DIV_V1 && value.results.size() != 1U)
-    fail(invalid_type, "Numeric arithmetic requires one result.");
+    fail(reader_error_kind::invalid_type, "Numeric arithmetic requires one result.");
 
   switch (value.opcode) {
   case NERI_IR_OPCODE_TASK_GENERATE_V1: {
     verify_instruction_shape(value, 1U, 4U, 1U, true, false, false);
-    if (std::ranges::find(context.module.required_features, "scoped-tasks-v1") == context.module.required_features.end())
-      fail(unsupported_feature, "Task generation requires scoped-tasks-v1.");
+    if (std::ranges::find(context.module.required_features, ir_feature::ScopedTasks) == context.module.required_features.end())
+      fail(reader_error_kind::unsupported_feature, "Task generation requires scoped-tasks-v1.");
     if (!is_unsafe_capability(definition_type(context, value.operands[0])))
-      fail(invalid_safety, "Task generation requires the compiler's noninterference capability.");
+      fail(reader_error_kind::invalid_safety, "Task generation requires the compiler's noninterference capability.");
     const type integer{NERI_IR_TYPE_INT_V1, std::nullopt, {}};
     require_operand_type(context, value, 1U, integer);
     require_operand_type(context, value, 2U, integer);
@@ -753,14 +743,14 @@ void require_binary(const function_context &context, const instruction &value,
                    global.initializer.tag == NERI_IR_CONSTANT_STRING_UTF8_V1;
           });
       if (match == context.module.globals.end()) {
-        fail(invalid_reference,
+        fail(reader_error_kind::invalid_reference,
              "string.global references a missing or non-string global.");
       }
     }
     return 0U;
   case NERI_IR_OPCODE_INT_NEG_CHECKED_V1:
     if (!integer_scalar(value.results.at(0).value_type.tag) || value.results.at(0).value_type.tag == NERI_IR_TYPE_BYTE_V1)
-      fail(invalid_type, "Integer negation requires an arithmetic integer.");
+      fail(reader_error_kind::invalid_type, "Integer negation requires an arithmetic integer.");
     require_unary(context, value, value.results.at(0).value_type.tag,
                   value.results.at(0).value_type.tag);
     return NERI_IR_EFFECT_MAY_PANIC_V1;
@@ -769,12 +759,12 @@ void require_binary(const function_context &context, const instruction &value,
   case NERI_IR_OPCODE_INT_MUL_CHECKED_V1:
   case NERI_IR_OPCODE_INT_DIV_CHECKED_V1:
     if (!integer_scalar(value.results.at(0).value_type.tag) || value.results.at(0).value_type.tag == NERI_IR_TYPE_BYTE_V1)
-      fail(invalid_type, "Integer arithmetic requires an arithmetic integer.");
+      fail(reader_error_kind::invalid_type, "Integer arithmetic requires an arithmetic integer.");
     require_binary(context, value, value.results.at(0).value_type.tag,
                    value.results.at(0).value_type.tag);
     return NERI_IR_EFFECT_MAY_PANIC_V1;
   case NERI_IR_OPCODE_FLOAT_NEG_V1:
-    if (!floating_scalar(value.results.at(0).value_type.tag)) fail(invalid_type, "Float negation requires a floating-point type.");
+    if (!floating_scalar(value.results.at(0).value_type.tag)) fail(reader_error_kind::invalid_type, "Float negation requires a floating-point type.");
     require_unary(context, value, value.results.at(0).value_type.tag,
                   value.results.at(0).value_type.tag);
     return 0U;
@@ -782,7 +772,7 @@ void require_binary(const function_context &context, const instruction &value,
   case NERI_IR_OPCODE_FLOAT_SUB_V1:
   case NERI_IR_OPCODE_FLOAT_MUL_V1:
   case NERI_IR_OPCODE_FLOAT_DIV_V1:
-    if (!floating_scalar(value.results.at(0).value_type.tag)) fail(invalid_type, "Float arithmetic requires a floating-point type.");
+    if (!floating_scalar(value.results.at(0).value_type.tag)) fail(reader_error_kind::invalid_type, "Float arithmetic requires a floating-point type.");
     require_binary(context, value, value.results.at(0).value_type.tag,
                    value.results.at(0).value_type.tag);
     return 0U;
@@ -801,7 +791,7 @@ void require_binary(const function_context &context, const instruction &value,
     const auto &left = definition_type(context, value.operands[0]);
     const auto &right = definition_type(context, value.operands[1]);
     if (!same_type(left, right)) {
-      fail(invalid_type, "Comparison operands have different semantic types.");
+      fail(reader_error_kind::invalid_type, "Comparison operands have different semantic types.");
     }
     const auto equality = *value.predicate == NERI_IR_COMPARISON_EQUAL_V1 ||
                           *value.predicate == NERI_IR_COMPARISON_NOT_EQUAL_V1;
@@ -809,7 +799,7 @@ void require_binary(const function_context &context, const instruction &value,
         ((left.tag == NERI_IR_TYPE_BOOL_V1 ||
           left.tag == NERI_IR_TYPE_OPTIONAL_V1) &&
          !equality)) {
-      fail(invalid_type, "Comparison predicate is invalid for its operand type.");
+      fail(reader_error_kind::invalid_type, "Comparison predicate is invalid for its operand type.");
     }
     return 0U;
   }
@@ -823,7 +813,7 @@ void require_binary(const function_context &context, const instruction &value,
     const auto target = value.results.front().value_type.tag;
     if (!(integer_scalar(source) || floating_scalar(source)) ||
         !(integer_scalar(target) || floating_scalar(target)))
-      fail(invalid_type, "Numeric conversion requires numeric operands and results.");
+      fail(reader_error_kind::invalid_type, "Numeric conversion requires numeric operands and results.");
     return NERI_IR_EFFECT_MAY_PANIC_V1;
   }
   case NERI_IR_OPCODE_CAST_FLOAT_TO_INT_CHECKED_V1:
@@ -845,7 +835,7 @@ void require_binary(const function_context &context, const instruction &value,
     if (!is_class(source) || !is_class(target) ||
         same_symbol(*source.symbol, *target.symbol) ||
         !is_same_or_base(context.module, *source.symbol, *target.symbol)) {
-      fail(invalid_type,
+      fail(reader_error_kind::invalid_type,
            "class.upcast requires a strict declared base-class conversion.");
     }
     return 0U;
@@ -856,7 +846,7 @@ void require_binary(const function_context &context, const instruction &value,
     if (result.tag != NERI_IR_TYPE_OPTIONAL_V1 ||
         result.arguments.size() != 1U ||
         !same_type(result.arguments.front(), value.type_arguments.front())) {
-      fail(invalid_type, "optional.none has inconsistent type metadata.");
+      fail(reader_error_kind::invalid_type, "optional.none has inconsistent type metadata.");
     }
     return 0U;
   }
@@ -867,7 +857,7 @@ void require_binary(const function_context &context, const instruction &value,
         result.arguments.size() != 1U ||
         !same_type(result.arguments.front(),
                    definition_type(context, value.operands.front()))) {
-      fail(invalid_type, "optional.some has inconsistent operand type.");
+      fail(reader_error_kind::invalid_type, "optional.some has inconsistent operand type.");
     }
     return 0U;
   }
@@ -876,7 +866,7 @@ void require_binary(const function_context &context, const instruction &value,
     require_result_type(value, 0U, bool_type);
     if (definition_type(context, value.operands.front()).tag !=
         NERI_IR_TYPE_OPTIONAL_V1) {
-      fail(invalid_type, "optional.is_some requires an optional operand.");
+      fail(reader_error_kind::invalid_type, "optional.is_some requires an optional operand.");
     }
     return 0U;
   case NERI_IR_OPCODE_OPTIONAL_GET_CHECKED_V1: {
@@ -885,7 +875,7 @@ void require_binary(const function_context &context, const instruction &value,
     if (operand.tag != NERI_IR_TYPE_OPTIONAL_V1 ||
         operand.arguments.size() != 1U ||
         !same_type(operand.arguments.front(), value.results.front().value_type)) {
-      fail(invalid_type, "optional.get.checked has an invalid result type.");
+      fail(reader_error_kind::invalid_type, "optional.get.checked has an invalid result type.");
     }
     return NERI_IR_EFFECT_MAY_PANIC_V1;
   }
@@ -931,7 +921,7 @@ void require_binary(const function_context &context, const instruction &value,
     return verify_call(context, value, false, false, false, true);
   case NERI_IR_OPCODE_ARRAY_NEW_V1: {
     if (value.type_arguments.size() != 1U) {
-      fail(invalid_type, "array.new requires one element type argument.");
+      fail(reader_error_kind::invalid_type, "array.new requires one element type argument.");
     }
     verify_instruction_shape(value, 1U, value.operands.size(), 1U, false,
                              false, false);
@@ -948,7 +938,7 @@ void require_binary(const function_context &context, const instruction &value,
     verify_instruction_shape(value, 1U, 1U, 0U, false, false, false);
     const auto &array = definition_type(context, value.operands.front());
     if (array.tag != NERI_IR_TYPE_ARRAY_V1 || array.arguments.size() != 1U) {
-      fail(invalid_type, "array.length requires an array operand.");
+      fail(reader_error_kind::invalid_type, "array.length requires an array operand.");
     }
     const type int_type{NERI_IR_TYPE_INT_V1, std::nullopt, {}};
     require_result_type(value, 0U, int_type);
@@ -959,7 +949,7 @@ void require_binary(const function_context &context, const instruction &value,
     const auto &array = definition_type(context, value.operands[0]);
     const type int_type{NERI_IR_TYPE_INT_V1, std::nullopt, {}};
     if (array.tag != NERI_IR_TYPE_ARRAY_V1 || array.arguments.size() != 1U) {
-      fail(invalid_type, "array.load.checked requires an array operand.");
+      fail(reader_error_kind::invalid_type, "array.load.checked requires an array operand.");
     }
     require_operand_type(context, value, 1U, int_type);
     require_result_type(value, 0U, array.arguments.front());
@@ -970,7 +960,7 @@ void require_binary(const function_context &context, const instruction &value,
     const auto &array = definition_type(context, value.operands[0]);
     const type int_type{NERI_IR_TYPE_INT_V1, std::nullopt, {}};
     if (array.tag != NERI_IR_TYPE_ARRAY_V1 || array.arguments.size() != 1U) {
-      fail(invalid_type, "array.store.checked requires an array operand.");
+      fail(reader_error_kind::invalid_type, "array.store.checked requires an array operand.");
     }
     require_operand_type(context, value, 1U, int_type);
     require_operand_type(context, value, 2U, array.arguments.front());
@@ -981,7 +971,7 @@ void require_binary(const function_context &context, const instruction &value,
     if (!value.symbol.has_value() ||
         value.symbol->kind != NERI_IR_SYMBOL_CLASS_V1 ||
         find_class(context.module, *value.symbol) == nullptr) {
-      fail(invalid_reference,
+      fail(reader_error_kind::invalid_reference,
            "object.alloc references a missing or wrong-kind class.");
     }
     const type expected{NERI_IR_TYPE_CLASS_V1, value.symbol, {}};
@@ -995,17 +985,17 @@ void require_binary(const function_context &context, const instruction &value,
     verify_instruction_shape(value, store ? 0U : 1U, store ? 2U : 1U, 0U,
                              true, false, false);
     if (!value.symbol.has_value()) {
-      fail(invalid_reference, "Field access has no field symbol.");
+      fail(reader_error_kind::invalid_reference, "Field access has no field symbol.");
     }
     const auto match = find_field(context.module, *value.symbol);
     if (!match.has_value()) {
-      fail(invalid_reference,
+      fail(reader_error_kind::invalid_reference,
            "Field access references a missing or wrong-kind field.");
     }
     const auto &receiver = definition_type(context, value.operands.front());
     if (!is_class(receiver) ||
         !is_same_or_base(context.module, *receiver.symbol, match->owner->id)) {
-      fail(invalid_type,
+      fail(reader_error_kind::invalid_type,
            "Field access receiver is incompatible with its declaring class.");
     }
     if (store) {
@@ -1026,30 +1016,30 @@ void require_binary(const function_context &context, const instruction &value,
     verify_instruction_shape(value, 0U, 1U, 0U, false, false, false);
     if (!is_unsafe_capability(
             definition_type(context, value.operands.front()))) {
-      fail(invalid_safety, "unsafe.end requires an unsafe capability.");
+      fail(reader_error_kind::invalid_safety, "unsafe.end requires an unsafe capability.");
     }
     return NERI_IR_EFFECT_UNSAFE_V1;
   }
   case NERI_IR_OPCODE_NATIVE_FIELD_ADDRESS_V1: {
     verify_instruction_shape(value, 1U, 2U, 0U, true, false, false);
     if (!is_unsafe_capability(definition_type(context, value.operands[0])))
-      fail(invalid_safety, "Native field address requires an unsafe capability.");
+      fail(reader_error_kind::invalid_safety, "Native field address requires an unsafe capability.");
     const auto &pointer = definition_type(context, value.operands[1]);
     if (!is_pointer(pointer) || pointer.arguments.front().tag != NERI_IR_TYPE_NATIVE_RECORD_V1)
-      fail(invalid_type, "Native field address requires a record pointer.");
+      fail(reader_error_kind::invalid_type, "Native field address requires a record pointer.");
     const auto &record = native_layouts(context.module).declaration(pointer.arguments.front());
     const auto field = std::ranges::find_if(record.fields, [&](const auto &item) { return same_symbol(item.id, *value.symbol); });
-    if (field == record.fields.end()) fail(invalid_reference, "Native field does not belong to its pointer type.");
+    if (field == record.fields.end()) fail(reader_error_kind::invalid_reference, "Native field does not belong to its pointer type.");
     require_result_type(value, 0U, type{NERI_IR_TYPE_POINTER_V1, std::nullopt, {field->value_type}});
     return NERI_IR_EFFECT_UNSAFE_V1;
   }
   case NERI_IR_OPCODE_NATIVE_INDEX_ADDRESS_CHECKED_V1: {
     verify_instruction_shape(value, 1U, 3U, 0U, false, false, false);
     if (!is_unsafe_capability(definition_type(context, value.operands[0])))
-      fail(invalid_safety, "Native array access requires an unsafe capability.");
+      fail(reader_error_kind::invalid_safety, "Native array access requires an unsafe capability.");
     const auto &pointer = definition_type(context, value.operands[1]);
     if (!is_pointer(pointer) || pointer.arguments.front().tag != NERI_IR_TYPE_FIXED_ARRAY_V1)
-      fail(invalid_type, "Native array access requires a fixed-array pointer.");
+      fail(reader_error_kind::invalid_type, "Native array access requires a fixed-array pointer.");
     const auto &array = pointer.arguments.front();
     require_operand_type(context, value, 2U, type{NERI_IR_TYPE_INT_V1, std::nullopt, {}});
     require_result_type(value, 0U, type{NERI_IR_TYPE_POINTER_V1, std::nullopt, {array.arguments.front()}});
@@ -1089,28 +1079,28 @@ void require_binary(const function_context &context, const instruction &value,
         value.symbol.has_value() || value.constant_value.has_value() ||
         value.predicate.has_value() != is_compare ||
         (value.flag && !permits_flag)) {
-      fail(invalid_type,
+      fail(reader_error_kind::invalid_type,
            "Pointer instruction has invalid operand or metadata shape.");
     }
     if (!is_unsafe_capability(definition_type(context, value.operands[0]))) {
-      fail(invalid_safety,
+      fail(reader_error_kind::invalid_safety,
            "Pointer instruction requires an unsafe capability operand.");
     }
     if (is_borrow_end) {
       if (!is_borrow_capability(
               definition_type(context, value.operands[1]))) {
-        fail(invalid_safety, "borrow.end requires a borrow capability.");
+        fail(reader_error_kind::invalid_safety, "borrow.end requires a borrow capability.");
       }
       return NERI_IR_EFFECT_UNSAFE_V1;
     }
 
     const auto &element = value.type_arguments.front();
     if (is_void(element) && !is_cast && !is_compare && !is_free) {
-      fail(invalid_type,
+      fail(reader_error_kind::invalid_type,
            "Pointer instruction requires a sized element type.");
     }
     if (!is_pointer_element(element)) {
-      fail(invalid_type,
+      fail(reader_error_kind::invalid_type,
            "Pointer instruction uses an unsupported element type.");
     }
     const type pointer{NERI_IR_TYPE_POINTER_V1, std::nullopt, {element}};
@@ -1145,12 +1135,12 @@ void require_binary(const function_context &context, const instruction &value,
           *value.predicate != NERI_IR_COMPARISON_LESS_OR_EQUAL_V1 &&
           *value.predicate != NERI_IR_COMPARISON_GREATER_V1 &&
           *value.predicate != NERI_IR_COMPARISON_GREATER_OR_EQUAL_V1) {
-        fail(invalid_type, "pointer.compare has an invalid predicate.");
+        fail(reader_error_kind::invalid_type, "pointer.compare has an invalid predicate.");
       }
     } else if (is_cast) {
       const auto &target = value.type_arguments[1];
       if (!is_pointer_element(target)) {
-        fail(invalid_type, "pointer.cast has an invalid target element type.");
+        fail(reader_error_kind::invalid_type, "pointer.cast has an invalid target element type.");
       }
       require_operand_type(context, value, 1U, pointer);
       require_result_type(
@@ -1188,7 +1178,7 @@ void require_binary(const function_context &context, const instruction &value,
     return effects;
   }
   default:
-    fail(unsupported_feature,
+    fail(reader_error_kind::unsupported_feature,
          "Opcode " + std::to_string(value.opcode) +
              " belongs to a later native-lowering card.");
   }
@@ -1203,7 +1193,7 @@ void register_definitions(function_context &context) {
                       definition{&root.value_type,
                                  context.value.entry_block, -1})
              .second) {
-      fail(invalid_safety,
+      fail(reader_error_kind::invalid_safety,
            "Function unsafe root is malformed or has a duplicate SSA ID.");
     }
   }
@@ -1215,7 +1205,7 @@ void register_definitions(function_context &context) {
                .emplace(parameter.id,
                         definition{&parameter.value_type, block.id, -1})
                .second) {
-        fail(invalid_ssa, "SSA value has multiple definitions.");
+        fail(reader_error_kind::invalid_ssa, "SSA value has multiple definitions.");
       }
     }
     for (std::size_t index = 0; index < block.instructions.size(); ++index) {
@@ -1228,7 +1218,7 @@ void register_definitions(function_context &context) {
                           definition{&result.value_type, block.id,
                                      static_cast<std::int64_t>(index)})
                  .second) {
-          fail(invalid_ssa, "SSA value has multiple definitions.");
+          fail(reader_error_kind::invalid_ssa, "SSA value has multiple definitions.");
         }
       }
     }
@@ -1238,7 +1228,7 @@ void register_definitions(function_context &context) {
 void register_use(function_context &context, std::uint32_t value,
                   std::uint32_t block, std::int64_t instruction) {
   if (!context.definitions.contains(value)) {
-    fail(invalid_ssa,
+    fail(reader_error_kind::invalid_ssa,
          "Use references undefined SSA value " + std::to_string(value) + ".");
   }
   context.uses.push_back({value, block, instruction});
@@ -1248,22 +1238,22 @@ void verify_edge(function_context &context, const block &source,
                  const edge &value, std::int64_t instruction) {
   const auto target = context.blocks.find(value.target);
   if (target == context.blocks.end()) {
-    fail(invalid_control_flow, "Edge references a missing block.");
+    fail(reader_error_kind::invalid_control_flow, "Edge references a missing block.");
   }
   if (value.target == context.value.entry_block) {
-    fail(unsupported_feature,
+    fail(reader_error_kind::unsupported_feature,
          "Native lowering does not accept backedges to the "
          "function entry block.");
   }
   if (value.arguments.size() != target->second->parameters.size()) {
-    fail(invalid_control_flow,
+    fail(reader_error_kind::invalid_control_flow,
          "Edge argument count does not match target block parameters.");
   }
   for (std::size_t index = 0; index < value.arguments.size(); ++index) {
     register_use(context, value.arguments[index], source.id, instruction);
     if (!same_type(definition_type(context, value.arguments[index]),
                    target->second->parameters[index].value_type)) {
-      fail(invalid_control_flow,
+      fail(reader_error_kind::invalid_control_flow,
            "Edge argument type does not match target block parameter.");
     }
   }
@@ -1276,26 +1266,26 @@ void verify_blocks_and_uses(function_context &context) {
     context.blocks.emplace(block.id, &block);
   }
   if (context.blocks.size() != context.value.blocks.size()) {
-    fail(invalid_control_flow, "Function contains duplicate block identities.");
+    fail(reader_error_kind::invalid_control_flow, "Function contains duplicate block identities.");
   }
   if (context.value.blocks.empty() ||
       !context.blocks.contains(context.value.entry_block)) {
-    fail(invalid_control_flow, "Function has no valid entry block.");
+    fail(reader_error_kind::invalid_control_flow, "Function has no valid entry block.");
   }
   if (context.value.blocks.front().id != context.value.entry_block) {
-    fail(invalid_control_flow, "Function entry block is not first.");
+    fail(reader_error_kind::invalid_control_flow, "Function entry block is not first.");
   }
 
   register_definitions(context);
   const auto &entry = *context.blocks.at(context.value.entry_block);
   if (entry.parameters.size() != context.value.parameter_types.size()) {
-    fail(invalid_type,
+    fail(reader_error_kind::invalid_type,
          "Entry block parameter count does not match function signature.");
   }
   for (std::size_t index = 0; index < entry.parameters.size(); ++index) {
     if (!same_type(entry.parameters[index].value_type,
                    context.value.parameter_types[index])) {
-      fail(invalid_type,
+      fail(reader_error_kind::invalid_type,
            "Entry block parameter type does not match function signature.");
     }
   }
@@ -1316,7 +1306,7 @@ void verify_blocks_and_uses(function_context &context) {
            instruction.opcode == NERI_IR_OPCODE_CALL_IMPORT_V1 ||
            instruction.opcode == NERI_IR_OPCODE_CALL_C_ABI_V1) &&
           !instruction.location.has_value()) {
-        fail(invalid_source,
+        fail(reader_error_kind::invalid_source,
              "Panicking and call instructions require a source location.");
       }
     }
@@ -1329,7 +1319,7 @@ void verify_blocks_and_uses(function_context &context) {
       if (block.ending.edges.size() != 1U ||
           block.ending.condition.has_value() ||
           block.ending.return_value.has_value()) {
-        fail(invalid_control_flow, "Malformed branch terminator.");
+        fail(reader_error_kind::invalid_control_flow, "Malformed branch terminator.");
       }
       verify_edge(context, block, block.ending.edges.front(), instruction_index);
       break;
@@ -1337,14 +1327,14 @@ void verify_blocks_and_uses(function_context &context) {
       if (block.ending.edges.size() != 2U ||
           !block.ending.condition.has_value() ||
           block.ending.return_value.has_value()) {
-        fail(invalid_control_flow, "Malformed conditional branch terminator.");
+        fail(reader_error_kind::invalid_control_flow, "Malformed conditional branch terminator.");
       }
       register_use(context, *block.ending.condition, block.id,
                    instruction_index);
       const type bool_type{NERI_IR_TYPE_BOOL_V1, std::nullopt, {}};
       if (!same_type(definition_type(context, *block.ending.condition),
                      bool_type)) {
-        fail(invalid_type, "Conditional branch condition is not bool.");
+        fail(reader_error_kind::invalid_type, "Conditional branch condition is not bool.");
       }
       verify_edge(context, block, block.ending.edges[0], instruction_index);
       verify_edge(context, block, block.ending.edges[1], instruction_index);
@@ -1352,21 +1342,21 @@ void verify_blocks_and_uses(function_context &context) {
     }
     case NERI_IR_TERMINATOR_RETURN_V1:
       if (!block.ending.edges.empty() || block.ending.condition.has_value()) {
-        fail(invalid_control_flow, "Malformed return terminator.");
+        fail(reader_error_kind::invalid_control_flow, "Malformed return terminator.");
       }
       if (is_void(context.value.result_type)) {
         if (block.ending.return_value.has_value()) {
-          fail(invalid_type, "Void function returns an SSA value.");
+          fail(reader_error_kind::invalid_type, "Void function returns an SSA value.");
         }
       } else {
         if (!block.ending.return_value.has_value()) {
-          fail(invalid_type, "Non-void function returns no SSA value.");
+          fail(reader_error_kind::invalid_type, "Non-void function returns no SSA value.");
         }
         register_use(context, *block.ending.return_value, block.id,
                      instruction_index);
         if (!same_type(definition_type(context, *block.ending.return_value),
                        context.value.result_type)) {
-          fail(invalid_type, "Return value does not match function result type.");
+          fail(reader_error_kind::invalid_type, "Return value does not match function result type.");
         }
       }
       break;
@@ -1376,12 +1366,12 @@ void verify_blocks_and_uses(function_context &context) {
           block.ending.panic_code.empty() ||
           block.ending.panic_message.empty() ||
           !block.ending.location.has_value()) {
-        fail(invalid_control_flow, "Malformed panic terminator.");
+        fail(reader_error_kind::invalid_control_flow, "Malformed panic terminator.");
       }
       context.required_effects |= NERI_IR_EFFECT_MAY_PANIC_V1;
       break;
     default:
-      fail(unsupported_feature, "Unsupported terminator tag.");
+      fail(reader_error_kind::unsupported_feature, "Unsupported terminator tag.");
     }
   }
 }
@@ -1409,11 +1399,11 @@ void verify_canonical_cfg(const function_context &context) {
     }
   }
   if (discovered.size() != context.blocks.size()) {
-    fail(invalid_control_flow, "Function contains unreachable blocks.");
+    fail(reader_error_kind::invalid_control_flow, "Function contains unreachable blocks.");
   }
   for (std::size_t index = 0; index < discovered.size(); ++index) {
     if (context.value.blocks[index].id != discovered[index]) {
-      fail(invalid_control_flow,
+      fail(reader_error_kind::invalid_control_flow,
            "Function block order is not canonical entry/successor order.");
     }
   }
@@ -1442,7 +1432,7 @@ void verify_dominance(const function_context &context) {
       const auto predecessors = context.predecessors.find(id);
       if (predecessors == context.predecessors.end() ||
           predecessors->second.empty()) {
-        fail(invalid_control_flow, "Non-entry block has no predecessor.");
+        fail(reader_error_kind::invalid_control_flow, "Non-entry block has no predecessor.");
       }
       block_set intersection = dominators.at(predecessors->second.front());
       for (const auto predecessor :
@@ -1461,7 +1451,7 @@ void verify_dominance(const function_context &context) {
     }
   }
   if (changed) {
-    fail(invalid_control_flow,
+    fail(reader_error_kind::invalid_control_flow,
          "Dominance computation exceeded its bounded iteration budget.");
   }
 
@@ -1470,10 +1460,10 @@ void verify_dominance(const function_context &context) {
     if (definition.block == use.block) {
       if (definition.instruction >= use.instruction &&
           definition.instruction >= 0) {
-        fail(invalid_ssa, "SSA value is used before its definition.");
+        fail(reader_error_kind::invalid_ssa, "SSA value is used before its definition.");
       }
     } else if (!dominators.at(use.block).contains(definition.block)) {
-      fail(invalid_ssa, "SSA definition does not dominate its use.");
+      fail(reader_error_kind::invalid_ssa, "SSA definition does not dominate its use.");
     }
   }
 }
@@ -1481,8 +1471,8 @@ void verify_dominance(const function_context &context) {
 void verify_function(const ir_module &module, const function &value) {
   verify_location(value.location, module);
   if (!value.export_name.empty()) {
-    if (std::ranges::find(module.required_features, "c-interop-v1") == module.required_features.end())
-      fail(unsupported_feature, "C exports require c-interop-v1.");
+    if (std::ranges::find(module.required_features, ir_feature::CInterop) == module.required_features.end())
+      fail(reader_error_kind::unsupported_feature, "C exports require c-interop-v1.");
     if (!portable_c_identifier(value.export_name) || value.export_name == "main" ||
         value.export_name.starts_with("neri_") || value.export_name.starts_with("hk1_") ||
         value.export_name.starts_with("__") ||
@@ -1490,7 +1480,7 @@ void verify_function(const ir_module &module, const function &value) {
         !is_c_abi_type(value.result_type, true) ||
         !std::ranges::all_of(value.parameter_types,
             [](const type &parameter) { return is_c_abi_type(parameter, false); }))
-      fail(invalid_type, "C export requires a portable unreserved symbol and C-compatible top-level signature.");
+      fail(reader_error_kind::invalid_type, "C export requires a portable unreserved symbol and C-compatible top-level signature.");
   }
   const auto is_method = value.kind == NERI_IR_STATIC_METHOD_V1 ||
                          value.kind == NERI_IR_INSTANCE_METHOD_V1 ||
@@ -1498,31 +1488,31 @@ void verify_function(const ir_module &module, const function &value) {
   const auto expected_symbol = is_method ? NERI_IR_SYMBOL_METHOD_V1
                                          : NERI_IR_SYMBOL_FUNCTION_V1;
   if (value.id.module != module.id || value.id.kind != expected_symbol) {
-    fail(invalid_reference,
+    fail(reader_error_kind::invalid_reference,
          "Function symbol kind disagrees with its declared function kind.");
   }
   if (value.kind < NERI_IR_FUNCTION_V1 ||
       value.kind > NERI_IR_DEFAULT_ADAPTER_V1) {
-    fail(malformed_module, "Function has an invalid function kind.");
+    fail(reader_error_kind::malformed_module, "Function has an invalid function kind.");
   }
   if (!value.retained && value.unsafe_call != value.unsafe_root.has_value()) {
-    fail(invalid_safety,
+    fail(reader_error_kind::invalid_safety,
          "Unsafe function call contract disagrees with its capability root.");
   }
   if (is_method != value.declaring_class.has_value()) {
-    fail(malformed_module,
+    fail(reader_error_kind::malformed_module,
          "Function has inconsistent method and declaring-class metadata.");
   }
   if (value.declaring_class.has_value()) {
     if (find_class(module, *value.declaring_class) == nullptr) {
-      fail(invalid_reference, "Method references a missing declaring class.");
+      fail(reader_error_kind::invalid_reference, "Method references a missing declaring class.");
     }
     if (value.kind == NERI_IR_INSTANCE_METHOD_V1 ||
         value.kind == NERI_IR_CONSTRUCTOR_V1) {
       const type receiver{NERI_IR_TYPE_CLASS_V1, value.declaring_class, {}};
       if (value.parameter_types.empty() ||
           !same_type(value.parameter_types.front(), receiver)) {
-        fail(invalid_type,
+        fail(reader_error_kind::invalid_type,
              "Instance method or constructor requires its exact receiver as "
              "parameter zero.");
       }
@@ -1531,7 +1521,7 @@ void verify_function(const ir_module &module, const function &value) {
   if (value.dispatch_slot.has_value() &&
       (value.kind != NERI_IR_INSTANCE_METHOD_V1 ||
        value.dispatch_slot->kind != NERI_IR_SYMBOL_METHOD_V1)) {
-    fail(malformed_module,
+    fail(reader_error_kind::malformed_module,
          "Only virtual instance methods may declare a dispatch slot.");
   }
   for (const auto &parameter : value.parameter_types) {
@@ -1545,7 +1535,7 @@ void verify_function(const ir_module &module, const function &value) {
   if (value.retained) {
     if (!value.blocks.empty() || value.unsafe_root.has_value() ||
         !value.debug_scopes.empty() || !value.debug_locals.empty()) {
-      fail(malformed_module,
+      fail(reader_error_kind::malformed_module,
            "Retained function declarations cannot contain a body or debug state.");
     }
     return;
@@ -1561,28 +1551,28 @@ void verify_function(const ir_module &module, const function &value) {
         !debug_scopes.emplace(scope.id, &scope).second ||
         (scope.parent_id != 0U &&
          !debug_scopes.contains(scope.parent_id))) {
-      fail(malformed_module,
+      fail(reader_error_kind::malformed_module,
            "Debug scopes must have unique canonical IDs and known parents.");
     }
     previous_scope_id = scope.id;
   }
   if (!value.debug_scopes.empty() &&
-      std::ranges::find(module.required_features, "debug-scopes-v1") ==
+      std::ranges::find(module.required_features, ir_feature::DebugScopes) ==
           module.required_features.end()) {
-    fail(unsupported_feature,
+    fail(reader_error_kind::unsupported_feature,
          "Debug scopes require the debug-scopes-v1 feature.");
   }
   for (const auto &block : value.blocks) {
     for (const auto &instruction : block.instructions) {
       if (instruction.debug_scope_id != 0U &&
           !debug_scopes.contains(instruction.debug_scope_id)) {
-        fail(malformed_module,
+        fail(reader_error_kind::malformed_module,
              "Instruction references an unknown debug scope.");
       }
     }
     if (block.ending.debug_scope_id != 0U &&
         !debug_scopes.contains(block.ending.debug_scope_id)) {
-      fail(malformed_module,
+      fail(reader_error_kind::malformed_module,
            "Terminator references an unknown debug scope.");
     }
   }
@@ -1604,7 +1594,7 @@ void verify_function(const ir_module &module, const function &value) {
                       local.location.source, local.location.utf8_start,
                       local.location.utf8_length)
              .second) {
-      fail(invalid_safety,
+      fail(reader_error_kind::invalid_safety,
            "Debug local has an invalid name, value, type, or duplicate value.");
     }
     const auto key =
@@ -1612,7 +1602,7 @@ void verify_function(const ir_module &module, const function &value) {
                    std::string_view(local.location.source),
                    local.location.utf8_start, local.location.utf8_length);
     if (previous_debug.has_value() && !(previous_debug.value() < key)) {
-      fail(malformed_module,
+      fail(reader_error_kind::malformed_module,
            "Debug locals are not in canonical value/name order.");
     }
     previous_debug = key;
@@ -1622,7 +1612,7 @@ void verify_function(const ir_module &module, const function &value) {
 
   const auto missing_effects = context.required_effects & ~value.effects;
   if (missing_effects != 0U) {
-    fail(invalid_safety,
+    fail(reader_error_kind::invalid_safety,
          "Function effect summary omits required effects " +
              std::to_string(missing_effects) + ".");
   }
@@ -1630,10 +1620,10 @@ void verify_function(const ir_module &module, const function &value) {
     return item.ending.tag == NERI_IR_TERMINATOR_RETURN_V1;
   });
   if (!has_return && (value.effects & NERI_IR_EFFECT_NO_RETURN_V1) == 0U) {
-    fail(invalid_safety, "Function without returns omits noreturn effect.");
+    fail(reader_error_kind::invalid_safety, "Function without returns omits noreturn effect.");
   }
   if (has_return && (value.effects & NERI_IR_EFFECT_NO_RETURN_V1) != 0U) {
-    fail(invalid_safety, "Noreturn function contains a return terminator.");
+    fail(reader_error_kind::invalid_safety, "Noreturn function contains a return terminator.");
   }
 }
 
@@ -1657,7 +1647,7 @@ namespace {
 void verify_runtime_import(const import_declaration &value) {
   const auto *contract = neri_abi_runtime_import(value.link_name.c_str());
   if (contract == nullptr) {
-    fail(unsupported_feature, "Runtime import is absent from the ABI catalog: " +
+    fail(reader_error_kind::unsupported_feature, "Runtime import is absent from the ABI catalog: " +
                                   value.link_name + ".");
   }
   if (!value.minimum_runtime.has_value() ||
@@ -1665,18 +1655,18 @@ void verify_runtime_import(const import_declaration &value) {
       value.minimum_runtime->abi_minor < contract->minimum_minor ||
       (value.minimum_runtime->feature_bits & contract->feature_bits) !=
           contract->feature_bits) {
-    fail(unsupported_feature, "Runtime import weakens the catalog ABI requirements: " +
+    fail(reader_error_kind::unsupported_feature, "Runtime import weakens the catalog ABI requirements: " +
                                   value.link_name + ".");
   }
   if (value.parameter_types.size() != contract->parameter_count ||
       !matches_runtime_type(value.result_type, contract->result_type)) {
-    fail(invalid_type, "Runtime import signature differs from the ABI catalog: " +
+    fail(reader_error_kind::invalid_type, "Runtime import signature differs from the ABI catalog: " +
                            value.link_name + ".");
   }
   for (std::size_t index = 0; index < value.parameter_types.size(); ++index) {
     if (!matches_runtime_type(value.parameter_types[index],
                               contract->parameter_types[index])) {
-      fail(invalid_type, "Runtime import parameter differs from the ABI catalog: " +
+      fail(reader_error_kind::invalid_type, "Runtime import parameter differs from the ABI catalog: " +
                              value.link_name + ".");
     }
   }
@@ -1686,7 +1676,7 @@ void verify_runtime_import(const import_declaration &value) {
   if ((value.effects & required_effects) != required_effects ||
       ((value.effects & NERI_IR_EFFECT_NO_RETURN_V1) != 0U &&
        (contract->effects & NERI_IR_EFFECT_NO_RETURN_V1) == 0U)) {
-    fail(invalid_safety, "Runtime import effects contradict the ABI catalog: " +
+    fail(reader_error_kind::invalid_safety, "Runtime import effects contradict the ABI catalog: " +
                              value.link_name + ".");
   }
 }
@@ -1694,48 +1684,41 @@ void verify_runtime_import(const import_declaration &value) {
 } // namespace
 
 void verify_supported_module(const ir_module &value) {
-  if (value.semantic_version.major != 1U) {
-    fail(incompatible_major,
+  if (value.semantic_version.major != NERI_IR_SEMANTIC_MAJOR_V1) {
+    fail(reader_error_kind::incompatible_major,
          "IR major " + std::to_string(value.semantic_version.major) +
-             " is incompatible with supported major 1.");
+             " is incompatible with supported major " + std::to_string(NERI_IR_SEMANTIC_MAJOR_V1) + ".");
   }
-  if (value.semantic_version.minor > 0U) {
-    fail(unsupported_minor,
+  if (value.semantic_version.minor > NERI_IR_SEMANTIC_MINOR_V1) {
+    fail(reader_error_kind::unsupported_minor,
          "IR minor " + std::to_string(value.semantic_version.minor) +
-             " is newer than supported minor 0.");
+             " is newer than supported minor " + std::to_string(NERI_IR_SEMANTIC_MINOR_V1) + ".");
   }
 
-  if (!std::ranges::is_sorted(value.required_features) ||
+  for (const auto feature : value.required_features) {
+    if (std::ranges::none_of(ir_feature_contracts, [feature](const auto &contract) {
+          return contract.feature == feature;
+        }))
+      fail(reader_error_kind::unsupported_feature, "Unknown required semantic feature.");
+  }
+  if (!std::ranges::is_sorted(value.required_features, {}, ir_feature_name) ||
       std::adjacent_find(value.required_features.begin(),
                          value.required_features.end()) !=
           value.required_features.end()) {
-    fail(malformed_module,
+    fail(reader_error_kind::malformed_module,
          "Required features are not in unique canonical order.");
   }
-  for (const auto &feature : value.required_features) {
-    const auto valid_character = [](char character) {
-      return (character >= 'a' && character <= 'z') ||
-             (character >= '0' && character <= '9') || character == '-';
-    };
-    if (feature.empty() || feature.front() == '-' || feature.back() == '-' ||
-        !std::ranges::all_of(feature, valid_character) ||
-        feature.find("--") != std::string::npos) {
-      fail(malformed_module,
-           "Required feature '" + feature +
-               "' is not a canonical feature identifier.");
-    }
-    if (feature != "string-data-v1" && feature != "native-strings-v1" && feature != "native-libraries-v1" && feature != "extended-scalars-v1" && feature != "native-records-v1" && feature != "scoped-tasks-v1" && feature != "session-module-v1" && feature != "debug-scopes-v1" && feature != "retained-modules-v1" && feature != "c-interop-v1") {
-      fail(unsupported_feature,
-           "Unknown required semantic feature '" + feature + "'.");
-    }
-  }
 
+  const auto declares_session = std::ranges::find(value.required_features, ir_feature::SessionModule) !=
+                                value.required_features.end();
+  if (declares_session != value.session.has_value())
+    fail(reader_error_kind::unsupported_feature, "Session export requires session-module-v1 and its payload.");
   if (value.session.has_value()) {
     const auto &session = *value.session;
     const auto retained = std::ranges::find(value.required_features,
-                              "retained-modules-v1") != value.required_features.end();
+                              ir_feature::RetainedModules) != value.required_features.end();
     if (retained != !session.artifact_identity.empty())
-      fail(invalid_reference,
+      fail(reader_error_kind::invalid_reference,
            "Retained session module requires one artifact identity.");
     const auto found = std::ranges::find_if(value.functions, [&](const function &item) {
       return item.id.module == session.entry.module && item.id.kind == session.entry.kind &&
@@ -1748,27 +1731,27 @@ void verify_supported_module(const ir_module &value) {
         !same_type(found->result_type, session.target_type) ||
         session.target_type.tag != NERI_IR_TYPE_CLASS_V1 ||
         (!found->parameter_types.empty() && session.source_type.tag != NERI_IR_TYPE_CLASS_V1)) {
-      fail(invalid_reference, "Session export does not match the generated entry signature.");
+      fail(reader_error_kind::invalid_reference, "Session export does not match the generated entry signature.");
     }
     require_declared_type(value, session.target_type, "Session target frame");
     if (session.source_type.tag != NERI_IR_TYPE_VOID_V1)
       require_declared_type(value, session.source_type, "Session source frame");
   }
 
-  if (!value.native_records.empty() && std::ranges::find(value.required_features, "native-records-v1") == value.required_features.end())
-    fail(unsupported_feature, "Native records require native-records-v1.");
+  if (!value.native_records.empty() && std::ranges::find(value.required_features, ir_feature::NativeRecords) == value.required_features.end())
+    fail(reader_error_kind::unsupported_feature, "Native records require native-records-v1.");
   native_layouts layouts(value);
   std::set<std::string> native_names;
   for (const auto &record : value.native_records) {
     if (record.id.module != value.id || record.id.kind != NERI_IR_SYMBOL_NATIVE_RECORD_V1 ||
         !native_names.insert(record.id.semantic_name).second)
-      fail(invalid_reference, "Invalid or duplicate native record identity.");
+      fail(reader_error_kind::invalid_reference, "Invalid or duplicate native record identity.");
     std::set<std::string> field_names;
     for (const auto &field : record.fields) {
       if (field.id.module != value.id || field.id.kind != NERI_IR_SYMBOL_FIELD_V1 ||
           !field.id.semantic_name.starts_with(record.id.semantic_name + ".") ||
           field.access != NERI_IR_ACCESS_PUBLIC_V1 || !field_names.insert(field.id.semantic_name).second)
-        fail(invalid_reference, "Invalid or duplicate native field identity.");
+        fail(reader_error_kind::invalid_reference, "Invalid or duplicate native field identity.");
       require_declared_type(value, field.value_type, "Native field");
       verify_location(field.location, value);
     }
@@ -1776,10 +1759,10 @@ void verify_supported_module(const ir_module &value) {
   }
 
   const bool has_string_data =
-      std::ranges::find(value.required_features, "string-data-v1") !=
+      std::ranges::find(value.required_features, ir_feature::StringData) !=
       value.required_features.end();
   const bool has_native_strings =
-      std::ranges::find(value.required_features, "native-strings-v1") !=
+      std::ranges::find(value.required_features, ir_feature::NativeStrings) !=
       value.required_features.end();
 
   bool uses_native_strings = std::ranges::any_of(
@@ -1810,7 +1793,7 @@ void verify_supported_module(const ir_module &value) {
     }
   }
   if (uses_native_strings && !has_native_strings) {
-    fail(unsupported_feature,
+    fail(reader_error_kind::unsupported_feature,
          "Native string values require semantic feature 'native-strings-v1'.");
   }
 
@@ -1818,7 +1801,7 @@ void verify_supported_module(const ir_module &value) {
                        [](const source &item) { return item.id; });
   for (const auto &source : value.sources) {
     if (!strict_utf8(source.utf8)) {
-      fail(invalid_source,
+      fail(reader_error_kind::invalid_source,
            "Source '" + source.id + "' does not contain strict UTF-8.");
     }
   }
@@ -1836,7 +1819,7 @@ void verify_supported_module(const ir_module &value) {
   });
 
   std::set<decltype(symbol_key(symbol_id{}))> declarations;
-  const auto valid_access = [](std::uint8_t access) {
+  const auto valid_access = [](neri_ir_access_v1 access) {
     return access >= NERI_IR_ACCESS_PUBLIC_V1 &&
            access <= NERI_IR_ACCESS_INTERNAL_V1;
   };
@@ -1846,12 +1829,12 @@ void verify_supported_module(const ir_module &value) {
         declaration.id.kind != NERI_IR_SYMBOL_CLASS_V1 ||
         !valid_access(declaration.access) ||
         !declarations.insert(symbol_key(declaration.id)).second) {
-      fail(invalid_reference, "Class has invalid or duplicate metadata.");
+      fail(reader_error_kind::invalid_reference, "Class has invalid or duplicate metadata.");
     }
     if (declaration.base.has_value() &&
         (declaration.base->kind != NERI_IR_SYMBOL_CLASS_V1 ||
          find_class(value, *declaration.base) == nullptr)) {
-      fail(invalid_reference, "Class references a missing base class.");
+      fail(reader_error_kind::invalid_reference, "Class references a missing base class.");
     }
 
     std::set<decltype(symbol_key(symbol_id{}))> fields;
@@ -1862,7 +1845,7 @@ void verify_supported_module(const ir_module &value) {
           !valid_access(item.access) ||
           !fields.insert(symbol_key(item.id)).second ||
           !declarations.insert(symbol_key(item.id)).second) {
-        fail(invalid_reference, "Class field has invalid or duplicate metadata.");
+        fail(reader_error_kind::invalid_reference, "Class field has invalid or duplicate metadata.");
       }
       require_declared_type(value, item.value_type, "Class field");
     }
@@ -1871,12 +1854,12 @@ void verify_supported_module(const ir_module &value) {
     for (const auto &item : declaration.methods) {
       verify_location(item.location, value);
       if (!methods.insert(symbol_key(item.function_id)).second) {
-        fail(malformed_module, "Class has a duplicate method entry.");
+        fail(reader_error_kind::malformed_module, "Class has a duplicate method entry.");
       }
       const auto *target = find_function(value, item.function_id);
       if (target == nullptr || !target->declaring_class.has_value() ||
           !same_symbol(*target->declaring_class, declaration.id)) {
-        fail(invalid_reference,
+        fail(reader_error_kind::invalid_reference,
              "Class method entry disagrees with function metadata.");
       }
       const auto virtual_dispatch = item.dispatch == NERI_IR_DISPATCH_VIRTUAL_V1;
@@ -1892,7 +1875,7 @@ void verify_supported_module(const ir_module &value) {
           (direct_dispatch &&
            target->kind != NERI_IR_INSTANCE_METHOD_V1 &&
            target->kind != NERI_IR_CONSTRUCTOR_V1)) {
-        fail(invalid_reference,
+        fail(reader_error_kind::invalid_reference,
              "Class method dispatch metadata is inconsistent.");
       }
     }
@@ -1902,11 +1885,11 @@ void verify_supported_module(const ir_module &value) {
     auto remaining = value.classes.size();
     while (current->base.has_value()) {
       if (remaining-- == 0U) {
-        fail(malformed_module, "Class inheritance contains a cycle.");
+        fail(reader_error_kind::malformed_module, "Class inheritance contains a cycle.");
       }
       current = find_class(value, *current->base);
       if (current == nullptr) {
-        fail(invalid_reference, "Class inheritance references a missing class.");
+        fail(reader_error_kind::invalid_reference, "Class inheritance references a missing class.");
       }
     }
   }
@@ -1915,18 +1898,18 @@ void verify_supported_module(const ir_module &value) {
     if (global.id.module != value.id ||
         global.id.kind != NERI_IR_SYMBOL_GLOBAL_V1 ||
         !declarations.insert(symbol_key(global.id)).second) {
-      fail(invalid_reference, "Global has an invalid or duplicate symbol.");
+      fail(reader_error_kind::invalid_reference, "Global has an invalid or duplicate symbol.");
     }
     require_declared_type(value, global.value_type, "Global");
     verify_constant(global.initializer, global.value_type);
     if (global.initializer.tag == NERI_IR_CONSTANT_STRING_UTF8_V1 &&
         !has_string_data) {
-      fail(unsupported_feature,
+      fail(reader_error_kind::unsupported_feature,
            "String UTF-8 data requires semantic feature 'string-data-v1'.");
     }
     if (is_string(global.value_type) &&
         global.initializer.tag != NERI_IR_CONSTANT_STRING_UTF8_V1) {
-      fail(invalid_type,
+      fail(reader_error_kind::invalid_type,
            "String global requires a canonical string.utf8 initializer.");
     }
   }
@@ -1938,7 +1921,7 @@ void verify_supported_module(const ir_module &value) {
          import.id.kind != NERI_IR_SYMBOL_INTRINSIC_V1 &&
          import.id.kind != NERI_IR_SYMBOL_FUNCTION_V1) ||
         !declarations.insert(symbol_key(import.id)).second) {
-      fail(invalid_reference, "Import has an invalid or duplicate symbol.");
+      fail(reader_error_kind::invalid_reference, "Import has an invalid or duplicate symbol.");
     }
     for (const auto &parameter : import.parameter_types) {
       require_declared_type(value, parameter, "Import parameter");
@@ -1948,12 +1931,12 @@ void verify_supported_module(const ir_module &value) {
       require_declared_type(value, import.result_type, "Import result");
     }
     if (!printable_ascii_symbol(import.link_name)) {
-      fail(malformed_module, "Import link name is not printable ASCII.");
+      fail(reader_error_kind::malformed_module, "Import link name is not printable ASCII.");
     }
     if (!import.native_library.empty() &&
         (import.kind != NERI_IR_IMPORT_C_ABI_V1 || !native_library_name(import.native_library) ||
-         std::ranges::find(value.required_features, "native-libraries-v1") == value.required_features.end())) {
-      fail(invalid_type, "Native library requires a C ABI import, a portable library name, and native-libraries-v1.");
+         std::ranges::find(value.required_features, ir_feature::NativeLibraries) == value.required_features.end())) {
+      fail(reader_error_kind::invalid_type, "Native library requires a C ABI import, a portable library name, and native-libraries-v1.");
     }
     if (import.kind == NERI_IR_IMPORT_RUNTIME_V1) {
       verify_runtime_import(import);
@@ -1961,9 +1944,9 @@ void verify_supported_module(const ir_module &value) {
       if (import.link_name == "neri_rt_v1_foreign_enter" ||
           import.link_name == "neri_rt_v1_foreign_leave" ||
           neri_abi_runtime_import(import.link_name.c_str()) != nullptr)
-        fail(invalid_reference, "C ABI import names a compiler-controlled runtime symbol.");
+        fail(reader_error_kind::invalid_reference, "C ABI import names a compiler-controlled runtime symbol.");
       if ((import.effects & c_call_effects) != c_call_effects) {
-        fail(invalid_safety,
+        fail(reader_error_kind::invalid_safety,
              "C ABI import weakens the conservative effect contract.");
       }
       if (import.minimum_runtime.has_value() ||
@@ -1972,12 +1955,12 @@ void verify_supported_module(const ir_module &value) {
           !std::ranges::all_of(import.parameter_types, [](const auto &type) {
             return is_c_abi_type(type, false);
           })) {
-        fail(invalid_type,
+        fail(reader_error_kind::invalid_type,
              "C ABI import has a non-portable symbol, signature, or runtime "
              "requirement.");
       }
     } else {
-      fail(unsupported_feature, "Import kind is unsupported.");
+      fail(reader_error_kind::unsupported_feature, "Import kind is unsupported.");
     }
     if (const auto existing = links.find(import.link_name);
         existing != links.end()) {
@@ -1992,7 +1975,7 @@ void verify_supported_module(const ir_module &value) {
           !same_runtime_requirement(previous->minimum_runtime,
                                     import.minimum_runtime) ||
           !same_parameters) {
-        fail(malformed_module,
+        fail(reader_error_kind::malformed_module,
              "Import link name is declared with incompatible contracts.");
       }
     } else {
@@ -2002,12 +1985,12 @@ void verify_supported_module(const ir_module &value) {
   std::set<std::string> exported_links;
   for (const auto &function : value.functions) {
     if (!declarations.insert(symbol_key(function.id)).second) {
-      fail(malformed_module,
+      fail(reader_error_kind::malformed_module,
            "Function symbol duplicates another module declaration.");
     }
     if (!function.export_name.empty() &&
         (links.contains(function.export_name) || !exported_links.insert(function.export_name).second))
-      fail(invalid_reference, "C export link name conflicts with another export or import.");
+      fail(reader_error_kind::invalid_reference, "C export link name conflicts with another export or import.");
   }
   for (const auto &function : value.functions) {
     verify_function(value, function);

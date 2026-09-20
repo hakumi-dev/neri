@@ -110,7 +110,7 @@ public:
 
 private:
   [[noreturn]] static void reject(const std::string &message) {
-    throw reader_error("NIR006", message, 0U);
+    throw reader_error(reader_error_kind::invalid_type, message, 0U);
   }
 
   void validate_pointer(const type &value, unsigned depth) {

@@ -279,9 +279,19 @@ if(NOT NERI_ABI_FEATURES_DEFINE MATCHES "^#define NERI_RT_ADVERTISED_FEATURES UI
   message(FATAL_ERROR "Cannot read the runtime ABI advertised features")
 endif()
 set(NERI_ABI_FEATURES "${CMAKE_MATCH_1}")
+set(NERI_IR_PROTOCOL_HEADER "${CMAKE_CURRENT_SOURCE_DIR}/native/include/neri/ir_protocol.h")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${NERI_IR_PROTOCOL_HEADER}")
+foreach(NERI_IR_VERSION_PART MAJOR MINOR)
+  file(STRINGS "${NERI_IR_PROTOCOL_HEADER}" NERI_IR_VERSION_DEFINE
+    REGEX "^#define NERI_IR_TRANSPORT_${NERI_IR_VERSION_PART}_V1 ")
+  if(NOT NERI_IR_VERSION_DEFINE MATCHES "^#define NERI_IR_TRANSPORT_${NERI_IR_VERSION_PART}_V1 UINT16_C\\(([0-9]+)\\)$")
+    message(FATAL_ERROR "Cannot read IR transport ${NERI_IR_VERSION_PART} version")
+  endif()
+  set(NERI_IR_TRANSPORT_${NERI_IR_VERSION_PART} "${CMAKE_MATCH_1}")
+endforeach()
   file(GENERATE
     OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/${NERI_MANIFEST_NAME}"
-    CONTENT "{\n  \"schemaVersion\": 2,\n  \"toolchainVersion\": \"${NERI_MANIFEST_VERSION}\",\n  \"irTransportMajor\": 1,\n  \"irTransportMinor\": 8,\n  \"target\": \"${NERI_TARGET}\",\n  \"abiMajor\": 1,\n  \"abiMinor\": ${NERI_ABI_MINOR},\n  \"features\": ${NERI_ABI_FEATURES},\n  \"artifact\": \"$<TARGET_FILE_NAME:neri_runtime>\"\n}\n"
+    CONTENT "{\n  \"schemaVersion\": 2,\n  \"toolchainVersion\": \"${NERI_MANIFEST_VERSION}\",\n  \"irTransportMajor\": ${NERI_IR_TRANSPORT_MAJOR},\n  \"irTransportMinor\": ${NERI_IR_TRANSPORT_MINOR},\n  \"target\": \"${NERI_TARGET}\",\n  \"abiMajor\": 1,\n  \"abiMinor\": ${NERI_ABI_MINOR},\n  \"features\": ${NERI_ABI_FEATURES},\n  \"artifact\": \"$<TARGET_FILE_NAME:neri_runtime>\"\n}\n"
   )
 install(TARGETS neri_codegen_cli neri_runtime RUNTIME DESTINATION bin ARCHIVE DESTINATION lib)
 if(APPLE)

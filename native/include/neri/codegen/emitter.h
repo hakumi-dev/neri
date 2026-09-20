@@ -1,6 +1,7 @@
 #ifndef NERI_CODEGEN_EMITTER_H
 #define NERI_CODEGEN_EMITTER_H
 
+#include "neri/codegen/diagnostic.h"
 #include "neri/codegen/reader.h"
 
 #include <cstdint>
@@ -46,12 +47,12 @@ using debug_source_paths = std::vector<std::pair<std::string, std::string>>;
 
 class codegen_error final : public std::runtime_error {
 public:
-  codegen_error(std::string code, std::string message);
+  codegen_error(codegen_error_kind code, std::string message);
 
-  [[nodiscard]] const std::string &code() const noexcept;
+  [[nodiscard]] codegen_error_kind code() const noexcept;
 
 private:
-  std::string code_;
+  codegen_error_kind code_;
 };
 
 [[nodiscard]] target_platform parse_target(std::string_view value);
