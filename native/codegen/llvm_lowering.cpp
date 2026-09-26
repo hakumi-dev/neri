@@ -2057,6 +2057,8 @@ private:
     const auto &target = find_virtual_signature(slot);
     auto *callee = virtual_target(builder, adapter->getArg(0), slot);
     std::vector<llvm::Value *> arguments;
+    const auto indirect_result = is_indirect_optional(target.result_type);
+    if (indirect_result) arguments.push_back(adapter->getArg(2));
     arguments.push_back(adapter->getArg(0));
     arguments.push_back(adapter->getArg(1));
     auto *call = builder.CreateCall(physical_function_type(target.parameter_types, target.result_type),
@@ -2064,9 +2066,13 @@ private:
     call->setCallingConv(llvm::CallingConv::C);
     // The runtime roots the result array, either within a task's disjoint
     // span or in the caller-thread sequential loop. No safepoint may occur
-    // between callback return and the physical element store.
-    builder.CreateAlignedStore(call, adapter->getArg(2),
-        llvm::Align(storage_alignment(target.result_type)));
+    // between callback return and the physical element store. Optional scalar
+    // callbacks use the existing indirect-result ABI and write directly into
+    // the aligned, reference-free element slot.
+    if (!indirect_result) {
+      builder.CreateAlignedStore(call, adapter->getArg(2),
+          llvm::Align(storage_alignment(target.result_type)));
+    }
     builder.CreateRetVoid();
     return adapter;
   }
@@ -2423,6 +2429,7 @@ private:
       return found->second;
     }
     const auto scalar_kind = [&] {
+      if (is_indirect_optional(value)) return NERI_SCALAR_KIND_NONE_V1;
       switch (value.tag) {
       case NERI_IR_TYPE_BOOL_V1:
         return NERI_SCALAR_KIND_BOOL_V1;
@@ -2456,7 +2463,9 @@ private:
          llvm::ConstantInt::get(llvm::Type::getInt16Ty(context_),
                                 NERI_RUNTIME_ABI_MINOR),
          llvm::ConstantInt::get(llvm::Type::getInt32Ty(context_),
-                                NERI_TYPE_KIND_SCALAR_V1),
+                                is_indirect_optional(value)
+                                    ? NERI_TYPE_KIND_INLINE_AGGREGATE_V1
+                                    : NERI_TYPE_KIND_SCALAR_V1),
          llvm::ConstantInt::get(llvm::Type::getInt32Ty(context_), 0U),
          llvm::ConstantInt::get(llvm::Type::getInt64Ty(context_),
                                 storage_size(value)),

@@ -172,6 +172,9 @@ constexpr std::uint32_t c_call_effects = NERI_IR_EFFECT_READ_V1 |
           !value.symbol.has_value() && value.arguments.size() == 1U &&
           !is_void(value.arguments.front()) &&
           (is_scalar(value.arguments.front()) ||
+           (value.arguments.front().tag == NERI_IR_TYPE_OPTIONAL_V1 &&
+            value.arguments.front().arguments.size() == 1U &&
+            is_scalar(value.arguments.front().arguments.front())) ||
            is_managed_reference(value.arguments.front())) &&
           is_supported_value(value.arguments.front())) ||
          (value.tag == NERI_IR_TYPE_OPTIONAL_V1 &&

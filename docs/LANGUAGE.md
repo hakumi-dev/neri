@@ -87,6 +87,12 @@ Float-to-Int truncates and panics for unrepresentable values. Numeric `as String
 conversions are locale-independent. Arrays have no equality operator. Classes
 can define equality through an annotated instance method.
 
+Managed arrays accept scalar values, optional scalar values such as `Int?`, and
+managed references. Optional scalar elements retain a presence tag separately
+from their payload, so `null` remains distinct from zero or `false`. This applies
+to literals and sequential or parallel generation. Readonly generic element
+views preserve the same optional scalar values without changing their layout.
+
 For built-in numeric scalars, `Bool`, and `String`, equality and inequality
 also accept `T` and `T?` in either operand order. The underlying types must
 match exactly; this does not introduce numeric conversions. A missing optional
