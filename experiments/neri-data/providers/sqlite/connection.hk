@@ -4,6 +4,7 @@ namespace neri_data_sqlite
 ## Opens one writable SQLite handle per standalone operation and retains it only
 ## while an explicit transaction lease is active.
 class SQLiteConnection: neri_data::Provider
+  private options: SQLiteOptions
   private path: String
   private provider: SQLiteProvider?
   private closed: Bool = false
@@ -14,7 +15,8 @@ class SQLiteConnection: neri_data::Provider
   private lastState: neri_data::TransactionState = neri_data::TransactionState.Invalid()
   private windowFunctions: Bool = false
 
-  def init(path: String): Void
+  def init(path: String, options: SQLiteOptions? = null): Void
+    this.options = options != null ? options : new SQLiteOptions()
     this.path = path
     this.windowFunctions = this.probeWindowFunctions()
   end
@@ -56,44 +58,44 @@ class SQLiteConnection: neri_data::Provider
     let action: fn(SQLiteProvider): neri_data::ProviderResult = fn(provider: SQLiteProvider): neri_data::ProviderResult
       return provider.execute(plan)
     end
-    let failure: fn(String): neri_data::ProviderResult = fn(message: String): neri_data::ProviderResult
+    let failure: fn(neri_data::ProviderFailure): neri_data::ProviderResult = fn(message: neri_data::ProviderFailure): neri_data::ProviderResult
       return neri_data::ProviderResult.Failure(message)
     end
 
-    return this.perform(action, failure)
+    return this.perform(action, failure, sqliteCloseRead)
   end
 
   public override def stream(plan: readonly neri_data::StreamPlan, visit: fn(neri_data::RawRow): Bool): neri_data::StreamResult
     let action: fn(SQLiteProvider): neri_data::StreamResult = fn(provider: SQLiteProvider): neri_data::StreamResult
       return provider.stream(plan, visit)
     end
-    let failure: fn(String): neri_data::StreamResult = fn(message: String): neri_data::StreamResult
+    let failure: fn(neri_data::ProviderFailure): neri_data::StreamResult = fn(message: neri_data::ProviderFailure): neri_data::StreamResult
       return neri_data::StreamResult.Failure(neri_data::QueryFailure.Provider(message), 0)
     end
 
-    return this.perform(action, failure)
+    return this.perform(action, failure, sqliteCloseStream)
   end
 
   public override def writeBatch(batch: readonly neri_data::WriteBatch): neri_data::WriteResult
     let action: fn(SQLiteProvider): neri_data::WriteResult = fn(provider: SQLiteProvider): neri_data::WriteResult
       return provider.writeBatch(batch)
     end
-    let failure: fn(String): neri_data::WriteResult = fn(message: String): neri_data::WriteResult
+    let failure: fn(neri_data::ProviderFailure): neri_data::WriteResult = fn(message: neri_data::ProviderFailure): neri_data::WriteResult
       return neri_data::WriteResult.Failure(neri_data::WriteFailure.Provider(message))
     end
 
-    return this.perform(action, failure)
+    return this.perform(action, failure, sqliteCloseWrite)
   end
 
   public override def executeSet(plan: readonly neri_data::SetWritePlan): neri_data::WriteResult
     let action: fn(SQLiteProvider): neri_data::WriteResult = fn(provider: SQLiteProvider): neri_data::WriteResult
       return provider.executeSet(plan)
     end
-    let failure: fn(String): neri_data::WriteResult = fn(message: String): neri_data::WriteResult
+    let failure: fn(neri_data::ProviderFailure): neri_data::WriteResult = fn(message: neri_data::ProviderFailure): neri_data::WriteResult
       return neri_data::WriteResult.Failure(neri_data::WriteFailure.Provider(message))
     end
 
-    return this.perform(action, failure)
+    return this.perform(action, failure, sqliteCloseWrite)
   end
 
   public override def beginTransaction(): neri_data::TransactionOpenResult
@@ -106,17 +108,22 @@ class SQLiteConnection: neri_data::Provider
     if this.nextLease <= 0 || this.nextLease == 9223372036854775807
       return neri_data::TransactionOpenResult.Failure(neri_data::WriteFailure.Transaction("SQLite connection lease IDs exhausted"))
     end
-    if !this.closeIdleProvider()
-      return neri_data::TransactionOpenResult.Failure(neri_data::WriteFailure.Provider("SQLite connection could not close its previous operation"))
+    let idleFailure = this.closeIdleProvider()
+
+    if idleFailure != null
+      return neri_data::TransactionOpenResult.Failure(neri_data::WriteFailure.Provider(idleFailure))
     end
-    match SQLiteProvider.openWritable(this.path)
+    match SQLiteProvider.openWritable(this.path, this.options)
       case SQLiteOpenResult.Failure(message)
         return neri_data::TransactionOpenResult.Failure(neri_data::WriteFailure.Provider(message))
       case SQLiteOpenResult.Opened(provider)
         match provider.beginTransaction()
           case neri_data::TransactionOpenResult.Failure(error)
-            if !provider.close()
+            let cleanup = provider.closeFailure()
+
+            if cleanup != null
               this.provider = provider
+              return neri_data::TransactionOpenResult.Failure(neri_data::WriteFailure.Cleanup(new neri_data::WriteCleanupFailure(error, neri_data::WriteFailure.Provider(cleanup))))
             end
             return neri_data::TransactionOpenResult.Failure(error)
           case neri_data::TransactionOpenResult.Begun(innerLease)
@@ -161,14 +168,14 @@ class SQLiteConnection: neri_data::Provider
 
     let cleanupFailure = this.finishTransactionIfTerminal(provider, lease)
 
-    if cleanupFailure != ""
+    if cleanupFailure != null
       match result
         case neri_data::WriteResult.Saved(count)
-          return neri_data::WriteResult.Failure(neri_data::WriteFailure.Provider("transaction committed, but SQLite connection cleanup failed: " + cleanupFailure))
+          return neri_data::WriteResult.Failure(neri_data::WriteFailure.Provider(cleanupFailure))
         case neri_data::WriteResult.SavedWithValues(count, outputs)
-          return neri_data::WriteResult.Failure(neri_data::WriteFailure.Provider("transaction committed, but SQLite connection cleanup failed: " + cleanupFailure))
+          return neri_data::WriteResult.Failure(neri_data::WriteFailure.Provider(cleanupFailure))
         case neri_data::WriteResult.Failure(error)
-          return neri_data::WriteResult.Failure(neri_data::WriteFailure.Provider(neri_data::writeFailureMessage(error) + "; SQLite connection cleanup failed: " + cleanupFailure))
+          return neri_data::WriteResult.Failure(neri_data::WriteFailure.Cleanup(new neri_data::WriteCleanupFailure(error, neri_data::WriteFailure.Provider(cleanupFailure))))
       end
     end
     return result
@@ -184,14 +191,14 @@ class SQLiteConnection: neri_data::Provider
 
     let cleanupFailure = this.finishTransactionIfTerminal(provider, lease)
 
-    if cleanupFailure != ""
+    if cleanupFailure != null
       match result
         case neri_data::WriteResult.Saved(count)
-          return neri_data::WriteResult.Failure(neri_data::WriteFailure.Provider("transaction rolled back, but SQLite connection cleanup failed: " + cleanupFailure))
+          return neri_data::WriteResult.Failure(neri_data::WriteFailure.Provider(cleanupFailure))
         case neri_data::WriteResult.SavedWithValues(count, outputs)
-          return neri_data::WriteResult.Failure(neri_data::WriteFailure.Provider("transaction rolled back, but SQLite connection cleanup failed: " + cleanupFailure))
+          return neri_data::WriteResult.Failure(neri_data::WriteFailure.Provider(cleanupFailure))
         case neri_data::WriteResult.Failure(error)
-          return neri_data::WriteResult.Failure(neri_data::WriteFailure.Provider(neri_data::writeFailureMessage(error) + "; SQLite connection cleanup failed: " + cleanupFailure))
+          return neri_data::WriteResult.Failure(neri_data::WriteFailure.Cleanup(new neri_data::WriteCleanupFailure(error, neri_data::WriteFailure.Provider(cleanupFailure))))
       end
     end
     return result
@@ -203,7 +210,18 @@ class SQLiteConnection: neri_data::Provider
     if provider == null
       return neri_data::SavepointOpenResult.Failure(neri_data::WriteFailure.Validation("invalid SQLite connection transaction lease"))
     end
-    return provider.createSavepoint(this.activeProviderLease)
+    let result = provider.createSavepoint(this.activeProviderLease)
+    let cleanup = this.finishTransactionIfTerminal(provider, lease)
+
+    if cleanup != null
+      match result
+        case neri_data::SavepointOpenResult.Created(id)
+          return neri_data::SavepointOpenResult.Failure(neri_data::WriteFailure.Provider(cleanup))
+        case neri_data::SavepointOpenResult.Failure(error)
+          return neri_data::SavepointOpenResult.Failure(neri_data::WriteFailure.Cleanup(new neri_data::WriteCleanupFailure(error, neri_data::WriteFailure.Provider(cleanup))))
+      end
+    end
+    return result
   end
 
   public override def rollbackToSavepoint(lease: Int, id: Int): neri_data::WriteResult
@@ -212,7 +230,9 @@ class SQLiteConnection: neri_data::Provider
     if provider == null
       return neri_data::WriteResult.Failure(neri_data::WriteFailure.Validation("invalid SQLite connection transaction lease"))
     end
-    return provider.rollbackToSavepoint(this.activeProviderLease, id)
+    let result = provider.rollbackToSavepoint(this.activeProviderLease, id)
+
+    return this.finishWrite(provider, lease, result)
   end
 
   public override def releaseSavepoint(lease: Int, id: Int): neri_data::WriteResult
@@ -221,7 +241,9 @@ class SQLiteConnection: neri_data::Provider
     if provider == null
       return neri_data::WriteResult.Failure(neri_data::WriteFailure.Validation("invalid SQLite connection transaction lease"))
     end
-    return provider.releaseSavepoint(this.activeProviderLease, id)
+    let result = provider.releaseSavepoint(this.activeProviderLease, id)
+
+    return this.finishWrite(provider, lease, result)
   end
 
   public override def writeBatchInTransaction(batch: readonly neri_data::WriteBatch, lease: Int): neri_data::WriteResult
@@ -230,7 +252,9 @@ class SQLiteConnection: neri_data::Provider
     if provider == null
       return neri_data::WriteResult.Failure(neri_data::WriteFailure.Validation("invalid SQLite connection transaction lease"))
     end
-    return provider.writeBatchInTransaction(batch, this.activeProviderLease)
+    let result = provider.writeBatchInTransaction(batch, this.activeProviderLease)
+
+    return this.finishWrite(provider, lease, result)
   end
 
   public override def executeSetInTransaction(plan: readonly neri_data::SetWritePlan, lease: Int): neri_data::WriteResult
@@ -239,31 +263,37 @@ class SQLiteConnection: neri_data::Provider
     if provider == null
       return neri_data::WriteResult.Failure(neri_data::WriteFailure.Validation("invalid SQLite connection transaction lease"))
     end
-    return provider.executeSetInTransaction(plan, this.activeProviderLease)
+    let result = provider.executeSetInTransaction(plan, this.activeProviderLease)
+
+    return this.finishWrite(provider, lease, result)
   end
 
   ## Closes the logical connection and rolls back any active lease.
   public def close(): Bool
+    return this.closeFailure() == null
+  end
+
+  public def closeFailure(): neri_data::ProviderFailure?
     this.closed = true
     let provider = this.provider
 
     if provider == null
-      return true
+      return null
     end
     let lease = this.activeLease
     let innerLease = this.activeProviderLease
-    let closed = provider.close()
+    let failure = provider.closeFailure()
 
     if lease != 0
       this.lastLease = lease
       this.lastState = provider.transactionState(innerLease)
     end
-    if closed
+    if failure == null
       this.provider = null
       this.activeLease = 0
       this.activeProviderLease = 0
     end
-    return closed
+    return failure
   end
 
   private def activeTransactionProvider(lease: Int): SQLiteProvider?
@@ -278,28 +308,34 @@ class SQLiteConnection: neri_data::Provider
     return provider
   end
 
-  private def finishTransactionIfTerminal(provider: SQLiteProvider, lease: Int): String
+  private def finishWrite(provider: SQLiteProvider, lease: Int, result: neri_data::WriteResult): neri_data::WriteResult
+    let cleanup = this.finishTransactionIfTerminal(provider, lease)
+
+    return cleanup == null ? result : sqliteCloseWrite(result, cleanup)
+  end
+
+  private def finishTransactionIfTerminal(provider: SQLiteProvider, lease: Int): neri_data::ProviderFailure?
     let state = provider.transactionState(this.activeProviderLease)
 
     match state
       case neri_data::TransactionState.Active()
-        return ""
+        return null
       case neri_data::TransactionState.Invalid()
-        return ""
+        return null
       case neri_data::TransactionState.RolledBack()
       case neri_data::TransactionState.Committed()
       case neri_data::TransactionState.Failed()
-        this.lastLease = lease
-        this.lastState = state
-        this.activeLease = 0
-        this.activeProviderLease = 0
-        if provider.close()
-          this.provider = null
-          return ""
-        end
-        return "could not close SQLite handle"
     end
-    return ""
+    this.lastLease = lease
+    this.lastState = state
+    this.activeLease = 0
+    this.activeProviderLease = 0
+    let failure = provider.closeFailure()
+
+    if failure == null
+      this.provider = null
+    end
+    return failure
   end
 
   private def probeWindowFunctions(): Bool
@@ -314,46 +350,56 @@ class SQLiteConnection: neri_data::Provider
     end
   end
 
-  private def closeIdleProvider(): Bool
+  private def closeIdleProvider(): neri_data::ProviderFailure?
     let provider = this.provider
 
     if provider == null
-      return true
+      return null
     end
     if this.activeLease != 0
-      return false
+      return neri_data::ProviderFailure.State("SQLite connection still owns an active transaction")
     end
-    if !provider.close()
-      return false
+    let failure = provider.closeFailure()
+
+    if failure != null
+      return failure
     end
     this.provider = null
-    return true
+    return null
   end
 
-  private def perform<T>(action: fn(SQLiteProvider): T, failure: fn(String): T): T
+  private def perform<T>(action: fn(SQLiteProvider): T, failure: fn(neri_data::ProviderFailure): T, cleanup: fn(T, neri_data::ProviderFailure): T): T
     if this.closed
-      return failure("SQLite connection is closed")
+      return failure(neri_data::ProviderFailure.State("SQLite connection is closed"))
     end
     let retained = this.provider
 
     if this.activeLease != 0
       if retained == null
-        return failure("SQLite transaction provider is unavailable")
+        return failure(neri_data::ProviderFailure.State("SQLite transaction provider is unavailable"))
       end
-      return action(retained)
+      let lease = this.activeLease
+      let result = action(retained)
+      let closeError = this.finishTransactionIfTerminal(retained, lease)
+
+      return closeError == null ? result : cleanup(result, closeError)
     end
-    if !this.closeIdleProvider()
-      return failure("SQLite connection could not close its previous operation")
+    let idleFailure = this.closeIdleProvider()
+
+    if idleFailure != null
+      return failure(idleFailure)
     end
-    match SQLiteProvider.openWritable(this.path)
+    match SQLiteProvider.openWritable(this.path, this.options)
       case SQLiteOpenResult.Failure(message)
         return failure(message)
       case SQLiteOpenResult.Opened(provider)
         this.provider = provider
         let result = action(provider)
 
-        if !provider.close()
-          return failure("SQLite operation provider could not be closed")
+        let closeError = provider.closeFailure()
+
+        if closeError != null
+          return cleanup(result, closeError)
         end
         this.provider = null
         return result

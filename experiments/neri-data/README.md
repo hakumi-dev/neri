@@ -227,11 +227,13 @@ generated pipeline for arbitrary projects.
 Reference unit `sqlite` from `providers/sqlite/manifest.json` alongside the
 generated application data unit. The adapter uses Neri C ABI imports to link
 `sqlite3`; no C shim or SQLite CLI is required. The system must provide a
-compatible SQLite 3 library for the native linker. Local verification uses the
+SQLite 3.37.2 or newer library exporting the required C API for the native linker.
+Local verification uses the
 macOS SDK's SQLite library; other platforms require their own native validation.
 
 ```neri
 use app_data
+use neri_data
 use neri_data_sqlite
 use console
 
@@ -246,7 +248,7 @@ def example(): Void
         console::println("Could not close SQLite")
       end
     case SQLiteOpenResult.Failure(message)
-      console::println(message)
+      console::println(providerFailureMessage(message))
   end
 end
 ```

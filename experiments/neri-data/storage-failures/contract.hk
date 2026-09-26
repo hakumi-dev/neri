@@ -1,0 +1,222 @@
+use console
+use files
+use host
+use model
+use resources
+use result
+use tasks
+use test
+use app_data
+use neri_data
+use neri_data_sqlite
+use neri_data_sqlite_fixture
+use neri_data_storage_failures
+
+def providerDriver(failure: ProviderFailure): DriverError?
+  match failure
+    case ProviderFailure.Driver(error)
+      return error
+    case ProviderFailure.State(message)
+      return null
+    case ProviderFailure.Cleanup(cleanup)
+      return null
+  end
+end
+
+def assertSqliteCode(error: DriverError, primaryCode: Int): Void
+  let primary = error.primaryCode()
+  let extended = error.extendedCode()
+
+  test::assertEqual(error.provider(), "sqlite")
+  test::assertTrue(primary != null && primary == primaryCode)
+  test::assertTrue(extended != null && (extended - (extended / 256) * 256) == primaryCode)
+end
+
+def assertFull(error: ProviderFailure): Void
+  let driver = providerDriver(error)
+
+  test::assertTrue(driver != null)
+  if driver != null
+    assertSqliteCode(driver, 13)
+    match driver.kind()
+      case DriverErrorKind.StorageFull()
+      case DriverErrorKind.Contention()
+        test::assertTrue(false)
+      case DriverErrorKind.Constraint()
+        test::assertTrue(false)
+      case DriverErrorKind.Interrupted()
+        test::assertTrue(false)
+      case DriverErrorKind.ReadOnly()
+        test::assertTrue(false)
+      case DriverErrorKind.Io()
+        test::assertTrue(false)
+      case DriverErrorKind.Corrupt()
+        test::assertTrue(false)
+      case DriverErrorKind.Other()
+        test::assertTrue(false)
+    end
+  end
+end
+
+def assertReadOnly(error: ProviderFailure): Void
+  let driver = providerDriver(error)
+
+  test::assertTrue(driver != null)
+  if driver != null
+    assertSqliteCode(driver, 8)
+    match driver.kind()
+      case DriverErrorKind.ReadOnly()
+      case DriverErrorKind.Contention()
+        test::assertTrue(false)
+      case DriverErrorKind.Constraint()
+        test::assertTrue(false)
+      case DriverErrorKind.Interrupted()
+        test::assertTrue(false)
+      case DriverErrorKind.StorageFull()
+        test::assertTrue(false)
+      case DriverErrorKind.Io()
+        test::assertTrue(false)
+      case DriverErrorKind.Corrupt()
+        test::assertTrue(false)
+      case DriverErrorKind.Other()
+        test::assertTrue(false)
+    end
+  end
+end
+
+def assertCorrupt(error: ProviderFailure): Void
+  let driver = providerDriver(error)
+
+  test::assertTrue(driver != null)
+  if driver != null
+    assertSqliteCode(driver, 26)
+    match driver.kind()
+      case DriverErrorKind.Corrupt()
+      case DriverErrorKind.Contention()
+        test::assertTrue(false)
+      case DriverErrorKind.Constraint()
+        test::assertTrue(false)
+      case DriverErrorKind.Interrupted()
+        test::assertTrue(false)
+      case DriverErrorKind.ReadOnly()
+        test::assertTrue(false)
+      case DriverErrorKind.StorageFull()
+        test::assertTrue(false)
+      case DriverErrorKind.Io()
+        test::assertTrue(false)
+      case DriverErrorKind.Other()
+        test::assertTrue(false)
+    end
+  end
+end
+
+def customerCount(provider: SQLiteProvider): Int
+  match new Database(provider).customers.take(10).all()
+    case QueryResult.Rows(rows)
+      return rows.count()
+    case QueryResult.Failure(error)
+      test::assertTrue(false)
+      return -1
+  end
+end
+
+def largeName(): String
+  let bytes: Byte[] = tasks::generate(16384, 1) do |index|
+    return 120 as Byte
+  end
+  let text = host::stringFromBytes(bytes)
+
+  if text == null
+    return ""
+  end
+  return text
+end
+
+def verifyFullAndRecovery(directory: String): Void
+  let path = directory + "/full.sqlite"
+  let schema = "PRAGMA page_size=512; CREATE TABLE customers(id INTEGER PRIMARY KEY, name TEXT NOT NULL, active INTEGER NOT NULL, nickname TEXT); INSERT INTO customers VALUES(1,'committed',1,NULL);"
+
+  test::assertTrue(createSQLiteFixture(path, schema))
+  var failure: ProviderFailure? = null
+
+  unsafe
+    failure = storageFullWrite(path, largeName())
+  end
+
+  test::assertTrue(failure != null)
+  if failure != null
+    assertFull(failure)
+  end
+
+  match SQLiteProvider.openWritable(path)
+    case SQLiteOpenResult.Failure(error)
+      test::assertTrue(false)
+    case SQLiteOpenResult.Opened(provider)
+      let db = new Database(provider)
+
+      test::assertEqual(customerCount(provider), 1)
+      test::assertTrue(db.customers.add(new Customer(3, "reused after SQLITE_FULL", true)) == null)
+      match db.saveChanges()
+        case WriteResult.Saved(count)
+          test::assertEqual(count, 1)
+        case WriteResult.SavedWithValues(count, outputs)
+          test::assertTrue(false)
+        case WriteResult.Failure(error)
+          test::assertTrue(false)
+      end
+
+      test::assertEqual(customerCount(provider), 2)
+      test::assertTrue(provider.close())
+  end
+end
+
+def verifyReadOnly(directory: String): Void
+  let path = directory + "/full.sqlite"
+  var failure: ProviderFailure? = null
+
+  unsafe
+    failure = storageReadOnlyInsert(path)
+  end
+
+  test::assertTrue(failure != null)
+  if failure != null
+    assertReadOnly(failure)
+  end
+end
+
+def verifyCorrupt(directory: String): Void
+  let path = directory + "/invalid.sqlite"
+
+  test::assertTrue(host::writeText(path, "not a SQLite database"))
+  match SQLiteProvider.openWritable(path)
+    case SQLiteOpenResult.Failure(error)
+      assertCorrupt(error)
+    case SQLiteOpenResult.Opened(provider)
+      provider.close()
+
+      test::assertTrue(false)
+  end
+end
+
+def verifyStorage(): resources::Outcome<Int, result::Failure>
+  using temporary <- files::TemporaryDirectory.create("neri-data-storage-failures-")
+    verifyFullAndRecovery(temporary.path())
+    verifyReadOnly(temporary.path())
+    verifyCorrupt(temporary.path())
+    return 0
+  end
+  return 1
+end
+
+def main(): Void
+  let completed = verifyStorage()
+
+  test::assertEqual(completed.closeFailures.count(), 0)
+  match completed.completion
+    case resources::Completion.Value(value)
+      test::assertEqual(value, 0)
+    case resources::Completion.Failure(problem)
+      test::assertTrue(false)
+  end
+  console::println("SQLite storage failure contracts passed")
+end

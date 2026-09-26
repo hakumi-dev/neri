@@ -16,7 +16,7 @@ untracked query results. Typed
 operations separately from tracked entity writes. The
 context borrows its provider: the caller closes it after all operations.
 `SQLiteSession.open(path)`, `openWritable(path)`, and `createWritable(path)`
-return an owned resource for read-only, existing writable, and creatable writable
+return `result::Result<SQLiteSession, ProviderFailure>` for read-only, existing writable, and creatable writable
 databases respectively. `session.provider()` borrows the underlying
 `SQLiteProvider`. Keep the session and its aliases exclusive to one worker,
 perform operations sequentially, and create a generated context per request.
@@ -26,9 +26,10 @@ cancelled. Close the session after its contexts and operations finish.
 
 Use `using` to close the session on scope exit. Its `resources::Outcome`
 preserves the primary failure and records cleanup failures separately in
-`closeFailures`. `SQLiteSession.close()` returns a failure with operation
-`sqlite.session.close` when the provider cannot close; it retains the provider
-so an explicit close can be retried. Successful close is idempotent and rolls
+`closeFailures`. `SQLiteSession.close()` returns `result::Failure?`; native
+diagnostics remain available through `nativeError`, and combined failures retain
+both `cause` and `closeFailure`. It retains the provider when closing fails so an
+explicit close can be retried. Successful close is idempotent and rolls
 back an active transaction. A borrowed provider alias remains an ordinary
 object after successful close, but operations reject the closed state without
 accessing the released SQLite handle.
@@ -37,15 +38,87 @@ Concurrent workers require SQLite configured in multi-thread or serialized mode;
 single-thread builds are unsuitable even when every worker owns a different
 connection. This follows SQLite's [threading contract](https://sqlite.org/threadsafe.html).
 The provider starts write transactions with `BEGIN IMMEDIATE`. Another writer
-causes an immediate `WriteFailure.Transaction`; the adapter installs no busy
-handler or automatic retry. SQLite permits only one active writer. A failed
+returns a structured driver contention error when its configured lock wait is
+exhausted. The default wait is zero milliseconds. The adapter does not replay
+transactions or requests automatically. SQLite permits only one active writer. A failed
 commit triggers rollback and state reconciliation, so repeating a commit or an
 entire request blindly is unsafe. See SQLite's
 [transaction rules](https://sqlite.org/lang_transaction.html).
 
+## SQLite configuration and failures
+
+The native library must be SQLite 3.37.2 or newer and export the linked C API.
+The adapter uses `sqlite3_changes64` and `PRAGMA table_list` introduced in 3.37.0;
+3.37.2 also fixes a savepoint rollback corruption case. See SQLite's
+[release history](https://www.sqlite.org/changes.html#version_3_37_2).
+The minimum is an API requirement, not a recommendation to deploy an old patch
+level. The open operation rejects an older loaded version; missing native
+symbols can fail at link/load time before that check runs.
+
+All open methods and the lazy `SQLiteConnection` accept `SQLiteOptions`.
+`journal` selects `SQLiteJournalMode.Preserve`, `Delete`, or `Wal`;
+`synchronous` selects `SQLiteSynchronous.Normal`, `Full`, or `Extra`;
+`busyTimeoutMilliseconds` accepts 0 through 60,000. Defaults preserve the journal
+mode, select Full synchronization, and use no lock wait. `configuration()` on an
+open provider returns the values confirmed from SQLite. Invalid options and
+unavailable requested modes fail the open operation. A read-only open never
+changes the journal mode; an explicitly requested mode must already match.
+WAL is unavailable for `:memory:` databases. Journal changes on a file can persist
+even if a later initialization step fails.
+
+Synchronization settings describe SQLite's operation; durability also depends on
+the journal mode, filesystem and storage. See SQLite's
+[synchronous settings](https://sqlite.org/pragma.html#pragma_synchronous),
+[WAL contract](https://sqlite.org/wal.html), and
+[atomic commit assumptions](https://sqlite.org/atomiccommit.html).
+
+`ProviderFailure.State` reports invalid adapter state. `ProviderFailure.Driver`
+contains an immutable `DriverError` with provider, operation, category, message,
+optional primary/extended native codes and optional SQLSTATE. Categories include
+contention, constraint, interrupted, read-only, storage-full, I/O, corrupt and
+other. SQLite codes are captured before statement finalization or rollback can
+replace them. `ProviderFailure.Cleanup` retains both failures; query, write and
+migration failures also preserve their original category when cleanup fails.
+Applications inspect these values instead of parsing messages. A contention
+category alone does not establish that a write or entire transaction is safe to
+retry. See SQLite's [result codes](https://sqlite.org/rescode.html).
+
+## Backup and restoration
+
+Use SQLite's [online backup API](https://sqlite.org/backup.html) or the official
+[CLI backup command](https://sqlite.org/cli.html) to capture a live database.
+Copying only an active database's main file can omit committed WAL contents.
+Use a new destination for each snapshot, retain the last successful backup until
+its replacement has completed, and check the backup operation's exit status.
+
+```sh
+sqlite3 -readonly application.sqlite ".backup 'snapshot.sqlite'"
+sqlite3 -readonly snapshot.sqlite "PRAGMA quick_check; PRAGMA foreign_key_check;"
+```
+
+The integrity result must be `ok` and the foreign-key check must return no rows;
+a zero process exit status alone does not establish these results. Verify
+application-specific invariants and migration history with the matching release.
+To restore, stop writers, close every session and start the application against
+the verified snapshot at a fresh database path. Preserve the previous database
+and its sidecars together until recovery has been verified. Never replace a
+database file underneath live connections or mix an old WAL with a restored
+main file. Keep persistent databases and backups outside application build output.
+
+The isolated recovery contract exercises the native backup API with DELETE and
+WAL journals while another process holds an uncommitted write. It forcibly
+terminates that process and checks reopening and writing to both source and
+snapshot. This covers process termination; it does not simulate storage failure
+or prove power-loss durability.
+
+## Streaming lifetime
+
 Streaming deadlines interrupt SQLite through its
 [progress callback](https://sqlite.org/c3ref/progress_handler.html), which is
-removed before returning. Cancellation of a read does not imply cancellation of
+removed before returning. A deadline also bounds cooperative lock waits through
+a scoped [busy handler](https://sqlite.org/c3ref/busy_handler.html); the configured
+busy timeout is restored afterward. These callbacks cannot preempt an operating
+system call already blocked below SQLite. Cancellation of a read does not imply cancellation of
 prior writes in the transaction: explicitly roll back, or let a request-owned
 `SQLiteSession` leave its `using` scope. `CancellationToken` is local to a
 synchronous call; it does not provide cross-worker interruption.

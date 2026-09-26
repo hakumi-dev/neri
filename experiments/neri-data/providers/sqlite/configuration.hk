@@ -1,0 +1,221 @@
+namespace neri_data_sqlite
+
+enum SQLiteJournalMode
+  case Preserve()
+  case Delete()
+  case Wal()
+end
+
+enum SQLiteSynchronous
+  case Normal()
+  case Full()
+  case Extra()
+end
+
+## Immutable connection policy. Preserve never changes the database journal mode.
+## Busy waits are bounded to 60 seconds; zero preserves immediate contention errors.
+## FULL is the default, but no setting makes an in-memory database durable.
+class SQLiteOptions
+  private journalValue: SQLiteJournalMode
+  private synchronousValue: SQLiteSynchronous
+  private busyValue: Int
+
+  def init(journal: SQLiteJournalMode = SQLiteJournalMode.Preserve(), synchronous: SQLiteSynchronous = SQLiteSynchronous.Full(), busyTimeoutMilliseconds: Int = 0): Void
+    this.journalValue = journal
+    this.synchronousValue = synchronous
+    this.busyValue = busyTimeoutMilliseconds
+  end
+
+  public readonly def journal(): readonly SQLiteJournalMode
+    return this.journalValue
+  end
+
+  public readonly def synchronous(): readonly SQLiteSynchronous
+    return this.synchronousValue
+  end
+
+  public readonly def busyTimeoutMilliseconds(): Int
+    return this.busyValue
+  end
+
+  public readonly def validationFailure(): String?
+    if this.busyValue < 0 || this.busyValue > 60000
+      return "SQLite busy timeout must be between 0 and 60000 milliseconds"
+    end
+    return null
+  end
+end
+
+## Values confirmed from SQLite at open time, not a power-loss durability promise.
+class SQLiteConfiguration
+  private journalValue: String
+  private synchronousValue: Int
+  private busyValue: Int
+
+  def init(journal: String, synchronous: Int, busyTimeoutMilliseconds: Int): Void
+    this.journalValue = journal
+    this.synchronousValue = synchronous
+    this.busyValue = busyTimeoutMilliseconds
+  end
+
+  public readonly def journal(): String
+    return this.journalValue
+  end
+
+  public readonly def synchronous(): Int
+    return this.synchronousValue
+  end
+
+  public readonly def busyTimeoutMilliseconds(): Int
+    return this.busyValue
+  end
+end
+
+def sqliteSynchronousValue(value: readonly SQLiteSynchronous): Int
+  match value
+    case SQLiteSynchronous.Normal()
+      return 1
+    case SQLiteSynchronous.Full()
+      return 2
+    case SQLiteSynchronous.Extra()
+      return 3
+  end
+end
+
+def sqliteJournalValue(value: readonly SQLiteJournalMode): String?
+  match value
+    case SQLiteJournalMode.Preserve()
+      return null
+    case SQLiteJournalMode.Delete()
+      return "delete"
+    case SQLiteJournalMode.Wal()
+      return "wal"
+  end
+end
+
+enum SQLiteConfigurationResult
+  case Configured(value: SQLiteConfiguration)
+  case Failure(error: neri_data::ProviderFailure)
+end
+
+unsafe def sqliteConfigurationScalar(database: Void*, sql: String): result::Result<String, neri_data::ProviderFailure>
+  let length = host::stringByteLength(sql)
+  let bytes = native::alloc<Byte>(length + 1)
+  var index = 0
+
+  while index < length
+    bytes[index] = host::stringByteAt(sql, index)
+    index = index + 1
+  end
+  bytes[length] = 0 as Byte
+  let output = stackalloc Void*[1]
+  let status = sqlitePrepare(database, bytes, length as Int32, output, null)
+
+  native::free(bytes)
+  let statement: Void*? = output[0]
+
+  if status != (0 as Int32)
+    var failure = sqliteFailure(database, "configuration.prepare", status)
+
+    if statement != null
+      failure = sqliteFinalizeFailure(database, statement, failure)
+    end
+    return result::Result<String, neri_data::ProviderFailure>.Error(failure)
+  end
+  if statement == null
+    return result::Result<String, neri_data::ProviderFailure>.Error(neri_data::ProviderFailure.State("SQLite configuration has no statement"))
+  end
+  var value: String? = null
+  let step = sqliteStep(statement)
+
+  if step != (100 as Int32)
+    let failure = step == (101 as Int32) ? neri_data::ProviderFailure.State("SQLite configuration returned no value") : sqliteFailure(database, "configuration.step", step)
+
+    return result::Result<String, neri_data::ProviderFailure>.Error(sqliteFinalizeFailure(database, statement, failure))
+  end
+  let pointer = sqliteColumnText(statement, 0 as Int32)
+
+  if pointer != null
+    value = sqliteText(pointer, sqliteColumnBytes(statement, 0 as Int32) as Int)
+  end
+  let finished = sqliteStep(statement)
+
+  if finished != (101 as Int32)
+    let failure = finished == (100 as Int32) ? neri_data::ProviderFailure.State("SQLite configuration returned multiple values") : sqliteFailure(database, "configuration.step", finished)
+
+    return result::Result<String, neri_data::ProviderFailure>.Error(sqliteFinalizeFailure(database, statement, failure))
+  end
+  let finalized = sqliteFinalize(statement)
+
+  if finalized != (0 as Int32)
+    return result::Result<String, neri_data::ProviderFailure>.Error(sqliteFailure(database, "configuration.finalize", finalized))
+  end
+  if value == null
+    return result::Result<String, neri_data::ProviderFailure>.Error(neri_data::ProviderFailure.State("SQLite configuration returned invalid text"))
+  end
+  return result::Result<String, neri_data::ProviderFailure>.Ok(value)
+end
+
+unsafe def sqliteConfigure(database: Void*, options: SQLiteOptions, writable: Bool): SQLiteConfigurationResult
+  let journal = sqliteJournalValue(options.journal())
+  let synchronous = sqliteSynchronousValue(options.synchronous())
+  let busy = options.busyTimeoutMilliseconds()
+  let busyStatus = sqliteExecuteLiteral(database, "PRAGMA busy_timeout=" + (busy as String))
+
+  if busyStatus != (0 as Int32)
+    return SQLiteConfigurationResult.Failure(sqliteFailure(database, "configuration.busy_timeout", busyStatus))
+  end
+  if journal != null
+    match sqliteConfigurationScalar(database, "PRAGMA main.journal_mode")
+      case result::Result.Error(error)
+        return SQLiteConfigurationResult.Failure(error)
+      case result::Result.Ok(current)
+        if current != journal
+          if !writable
+            return SQLiteConfigurationResult.Failure(neri_data::ProviderFailure.State("Read-only SQLite journal does not match requested mode"))
+          end
+          match sqliteConfigurationScalar(database, "PRAGMA main.journal_mode=" + journal)
+            case result::Result.Error(error)
+              return SQLiteConfigurationResult.Failure(error)
+            case result::Result.Ok(actual)
+              if actual != journal
+                return SQLiteConfigurationResult.Failure(neri_data::ProviderFailure.State("SQLite did not apply requested journal mode"))
+              end
+          end
+        end
+    end
+  end
+  let syncStatus = sqliteExecuteLiteral(database, "PRAGMA main.synchronous=" + (synchronous as String))
+
+  if syncStatus != (0 as Int32)
+    return SQLiteConfigurationResult.Failure(sqliteFailure(database, "configuration.synchronous", syncStatus))
+  end
+  var effectiveJournal = ""
+
+  match sqliteConfigurationScalar(database, "PRAGMA main.journal_mode")
+    case result::Result.Error(error)
+      return SQLiteConfigurationResult.Failure(error)
+    case result::Result.Ok(actual)
+      effectiveJournal = actual
+  end
+  if journal != null && effectiveJournal != journal
+    return SQLiteConfigurationResult.Failure(neri_data::ProviderFailure.State("SQLite effective journal does not match requested mode"))
+  end
+  match sqliteConfigurationScalar(database, "PRAGMA main.synchronous")
+    case result::Result.Error(error)
+      return SQLiteConfigurationResult.Failure(error)
+    case result::Result.Ok(actual)
+      if actual != (synchronous as String)
+        return SQLiteConfigurationResult.Failure(neri_data::ProviderFailure.State("SQLite effective synchronous does not match requested mode"))
+      end
+  end
+  match sqliteConfigurationScalar(database, "PRAGMA busy_timeout")
+    case result::Result.Error(error)
+      return SQLiteConfigurationResult.Failure(error)
+    case result::Result.Ok(actual)
+      if actual != (busy as String)
+        return SQLiteConfigurationResult.Failure(neri_data::ProviderFailure.State("SQLite effective busy timeout does not match requested value"))
+      end
+  end
+  return SQLiteConfigurationResult.Configured(new SQLiteConfiguration(effectiveJournal, synchronous, busy))
+end

@@ -130,7 +130,7 @@ end
 
 enum SQLiteOpenResult
   case Opened(provider: SQLiteProvider)
-  case Failure(message: String)
+  case Failure(message: ProviderFailure)
 end
 
 class SQLiteSavepointNode
@@ -144,6 +144,7 @@ class SQLiteSavepointNode
 end
 
 class SQLiteProvider: neri_data::Provider
+  private effectiveConfiguration: SQLiteConfiguration?
   private database: Void*?
   private closed: Bool = false
   private writable: Bool = false
@@ -160,33 +161,44 @@ class SQLiteProvider: neri_data::Provider
   private def init(): Void
   end
 
-  static def open(path: String): SQLiteOpenResult
-    return SQLiteProvider.openMode(path, false, false)
+  static def open(path: String, options: SQLiteOptions? = null): SQLiteOpenResult
+    return SQLiteProvider.openMode(path, false, false, options)
   end
 
-  static def openWritable(path: String): SQLiteOpenResult
-    return SQLiteProvider.openMode(path, true, false)
+  static def openWritable(path: String, options: SQLiteOptions? = null): SQLiteOpenResult
+    return SQLiteProvider.openMode(path, true, false, options)
   end
 
-  static def createWritable(path: String): SQLiteOpenResult
-    return SQLiteProvider.openMode(path, true, true)
+  static def createWritable(path: String, options: SQLiteOptions? = null): SQLiteOpenResult
+    return SQLiteProvider.openMode(path, true, true, options)
   end
 
-  private static def openMode(path: String, writable: Bool, create: Bool): SQLiteOpenResult
+  private static def openMode(path: String, writable: Bool, create: Bool, options: SQLiteOptions?): SQLiteOpenResult
+    let policy = options != null ? options : new SQLiteOptions()
+    let invalid = policy.validationFailure()
+
+    if invalid != null
+      return SQLiteOpenResult.Failure(ProviderFailure.State(invalid))
+    end
     let length = host::stringByteLength(path)
 
     if length == 0 || length > 2147483646
-      return SQLiteOpenResult.Failure("invalid SQLite path")
+      return SQLiteOpenResult.Failure(ProviderFailure.State("invalid SQLite path"))
     end
     var index = 0
 
     while index < length
       if host::stringByteAt(path, index) == (0 as Byte)
-        return SQLiteOpenResult.Failure("SQLite path contains NUL")
+        return SQLiteOpenResult.Failure(ProviderFailure.State("SQLite path contains NUL"))
       end
       index = index + 1
     end
     unsafe
+      # This adapter uses changes64/table_list and requires the savepoint fixes
+      # in SQLite 3.37.2. The platform must also export its linked C API symbols.
+      if sqliteVersionNumber() < (3037002 as Int32)
+        return SQLiteOpenResult.Failure(ProviderFailure.State("SQLite 3.37.2 or newer is required"))
+      end
       let bytes = native::alloc<Byte>(length + 1)
 
       index = 0
@@ -201,25 +213,30 @@ class SQLiteProvider: neri_data::Provider
 
       native::free(bytes)
       if status != (0 as Int32)
-        var message = "SQLite open failed: " + ((status as Int) as String)
+        var message = ProviderFailure.Driver(new DriverError("sqlite", "open", DriverErrorKind.Other(), status as Int, status as Int, null, "SQLite open failed"))
         let database: Void*? = result[0]
 
         if database != null
-          message = sqliteMessage(database)
-          sqliteClose(database)
+          message = sqliteFailure(database, "open", status)
+          message = sqliteCloseFailure(database, message)
         end
         return SQLiteOpenResult.Failure(message)
       end
       if !sqliteRegisterCheckedScalars(result[0])
-        let message = sqliteMessage(result[0])
+        let message = sqliteFailure(result[0], "open.checked_scalars")
 
-        sqliteClose(result[0])
-        return SQLiteOpenResult.Failure("SQLite checked scalar registration failed: " + message)
+        return SQLiteOpenResult.Failure(sqliteCloseFailure(result[0], message))
       end
       let provider = new SQLiteProvider()
 
       provider.database = result[0]
-      provider.windowFunctions = sqliteVersionNumber() >= (3025000 as Int32) && sqliteExecuteLiteral(result[0], "SELECT ROW_NUMBER() OVER (PARTITION BY 1 ORDER BY 1)") == (0 as Int32)
+      match sqliteConfigure(result[0], policy, writable)
+        case SQLiteConfigurationResult.Failure(error)
+          return SQLiteOpenResult.Failure(sqliteCloseFailure(result[0], error))
+        case SQLiteConfigurationResult.Configured(configuration)
+          provider.effectiveConfiguration = configuration
+      end
+      provider.windowFunctions = sqliteExecuteLiteral(result[0], "SELECT ROW_NUMBER() OVER (PARTITION BY 1 ORDER BY 1)") == (0 as Int32)
       if writable
         let name = stackalloc Byte[5]
 
@@ -229,20 +246,19 @@ class SQLiteProvider: neri_data::Provider
         name[3] = 110 as Byte
         name[4] = 0 as Byte
         if sqliteDatabaseReadOnly(result[0], name) != (0 as Int32)
-          sqliteClose(result[0])
-          return SQLiteOpenResult.Failure("SQLite database is read-only")
+          return SQLiteOpenResult.Failure(sqliteCloseFailure(result[0], ProviderFailure.State("SQLite database is read-only")))
         end
         # SQLite foreign-key enforcement is connection-local and may default off.
         # https://sqlite.org/foreignkeys.html
         if sqliteExecuteLiteral(result[0], "PRAGMA foreign_keys=ON") != (0 as Int32)
-          let message = sqliteMessage(result[0])
+          let message = sqliteFailure(result[0], "open.foreign_keys")
 
-          sqliteClose(result[0])
-          return SQLiteOpenResult.Failure(message)
+          return SQLiteOpenResult.Failure(sqliteCloseFailure(result[0], message))
         end
-        if !sqliteForeignKeysEnabled(result[0])
-          sqliteClose(result[0])
-          return SQLiteOpenResult.Failure("SQLite foreign-key enforcement unavailable")
+        let foreignKeysFailure = sqliteForeignKeysFailure(result[0])
+
+        if foreignKeysFailure != null
+          return SQLiteOpenResult.Failure(sqliteCloseFailure(result[0], foreignKeysFailure))
         end
       end
       provider.writable = writable
@@ -250,15 +266,23 @@ class SQLiteProvider: neri_data::Provider
     end
   end
 
+  public readonly def configuration(): readonly SQLiteConfiguration?
+    return this.effectiveConfiguration
+  end
+
   public def close(): Bool
+    return this.closeFailure() == null
+  end
+
+  public def closeFailure(): ProviderFailure?
     if this.streaming
-      return false
+      return ProviderFailure.State("SQLite close could not finish")
     end
     unsafe
       let database = this.database
 
       if database == null
-        return true
+        return null
       end
       if this.activeLease != 0
         if sqliteAutoCommit(database) == (0 as Int32)
@@ -267,20 +291,22 @@ class SQLiteProvider: neri_data::Provider
           if rolledBack != (0 as Int32) || sqliteAutoCommit(database) == (0 as Int32)
             this.poisoned = true
             this.lastTransactionState = TransactionState.Failed()
-            return false
+            return rolledBack != (0 as Int32) ? sqliteFailure(database, "close.rollback", rolledBack) : ProviderFailure.State("SQLite rollback did not end transaction")
           end
         end
         this.activeLease = 0
         this.savepoints = null
         this.lastTransactionState = TransactionState.RolledBack()
       end
-      if sqliteClose(database) != (0 as Int32)
-        return false
+      let status = sqliteClose(database)
+
+      if status != (0 as Int32)
+        return sqliteFailure(database, "close", status)
       end
       this.database = null
     end
     this.closed = true
-    return true
+    return null
   end
 
   public override readonly def dialect(): SqlDialect
@@ -310,16 +336,16 @@ class SQLiteProvider: neri_data::Provider
 
   public def inspectSchema(): SQLiteSchemaResult
     if this.streaming
-      return SQLiteSchemaResult.Failure("SQLite provider is busy streaming")
+      return SQLiteSchemaResult.Failure(ProviderFailure.State("SQLite provider is busy streaming"))
     end
     if this.closed || this.poisoned
-      return SQLiteSchemaResult.Failure("SQLite provider is closed or transaction state is uncertain")
+      return SQLiteSchemaResult.Failure(ProviderFailure.State("SQLite provider is closed or transaction state is uncertain"))
     end
     unsafe
       let database = this.database
 
       if database == null
-        return SQLiteSchemaResult.Failure("SQLite database handle unavailable")
+        return SQLiteSchemaResult.Failure(ProviderFailure.State("SQLite database handle unavailable"))
       end
       return sqliteInspectSchema(database)
     end
@@ -336,7 +362,7 @@ class SQLiteProvider: neri_data::Provider
       return MigrationResult.Failure(MigrationFailure.Unsupported("SQLite provider is closed or read-only"))
     end
     if this.poisoned
-      return MigrationResult.Failure(MigrationFailure.Provider("SQLite transaction state is uncertain"))
+      return MigrationResult.Failure(MigrationFailure.Provider(ProviderFailure.State("SQLite transaction state is uncertain")))
     end
     let invalid = catalog.validate()
 
@@ -375,14 +401,16 @@ class SQLiteProvider: neri_data::Provider
       let database = this.database
 
       if database == null
-        return MigrationResult.Failure(MigrationFailure.Provider("SQLite database handle unavailable"))
+        return MigrationResult.Failure(MigrationFailure.Provider(ProviderFailure.State("SQLite database handle unavailable")))
       end
-      if !sqliteForeignKeysEnabled(database)
-        return MigrationResult.Failure(MigrationFailure.Provider("SQLite foreign-key enforcement is unavailable"))
+      let foreignKeysFailure = sqliteForeignKeysFailure(database)
+
+      if foreignKeysFailure != null
+        return MigrationResult.Failure(MigrationFailure.Provider(foreignKeysFailure))
       end
       if sqliteAutoCommit(database) == (0 as Int32)
         this.poisoned = true
-        return MigrationResult.Failure(MigrationFailure.Provider("SQLite connection already has an unowned transaction"))
+        return MigrationResult.Failure(MigrationFailure.Provider(ProviderFailure.State("SQLite connection already has an unowned transaction")))
       end
       let begun = sqliteExecuteLiteral(database, "BEGIN IMMEDIATE")
 
@@ -390,16 +418,16 @@ class SQLiteProvider: neri_data::Provider
         if sqliteAutoCommit(database) == (0 as Int32)
           this.poisoned = true
         end
-        return MigrationResult.Failure(MigrationFailure.Provider("SQLite migration begin failed: " + sqliteMessage(database)))
+        return MigrationResult.Failure(MigrationFailure.Provider(sqliteFailure(database, "migration.begin", begun)))
       end
       let historyCreated = sqliteExecuteLiteral(database, "CREATE TABLE IF NOT EXISTS __neri_migrations (ordinal INTEGER PRIMARY KEY, id TEXT NOT NULL, signature TEXT NOT NULL)")
 
       if historyCreated != (0 as Int32)
-        return this.failMigration(MigrationFailure.Provider("SQLite migration history setup failed: " + sqliteMessage(database)))
+        return this.failMigration(MigrationFailure.Provider(sqliteFailure(database, "migration.create_history", historyCreated)))
       end
       match sqliteMigrationHistory(database, catalog.count())
         case SQLiteMigrationHistory.Failure(message)
-          return this.failMigration(MigrationFailure.Drift(message))
+          return this.failMigration(message)
         case SQLiteMigrationHistory.Loaded(stamps)
           let mismatch = catalog.historyPrefix(stamps)
 
@@ -456,10 +484,10 @@ class SQLiteProvider: neri_data::Provider
           let committed = sqliteExecuteLiteral(database, "COMMIT")
 
           if committed != (0 as Int32)
-            return this.failMigration(MigrationFailure.Provider("SQLite migration commit failed: " + sqliteMessage(database)))
+            return this.failMigration(MigrationFailure.Provider(sqliteFailure(database, "migration.commit", committed)))
           end
           if sqliteAutoCommit(database) == (0 as Int32)
-            return this.failMigration(MigrationFailure.Provider("SQLite migration commit did not end the transaction"))
+            return this.failMigration(MigrationFailure.Provider(ProviderFailure.State("SQLite migration commit did not end the transaction")))
           end
           return MigrationResult.Applied(count)
       end
@@ -472,14 +500,14 @@ class SQLiteProvider: neri_data::Provider
 
       if database == null
         this.poisoned = true
-        return MigrationResult.Failure(MigrationFailure.Provider(sqliteMigrationFailureMessage(error) + "; rollback cannot access database"))
+        return MigrationResult.Failure(MigrationFailure.Cleanup(new MigrationCleanupFailure(error, ProviderFailure.State("rollback cannot access database"))))
       end
       if sqliteAutoCommit(database) == (0 as Int32)
         let rolledBack = sqliteExecuteLiteral(database, "ROLLBACK")
 
         if rolledBack != (0 as Int32) || sqliteAutoCommit(database) == (0 as Int32)
           this.poisoned = true
-          return MigrationResult.Failure(MigrationFailure.Provider(sqliteMigrationFailureMessage(error) + "; rollback failed: " + sqliteMessage(database)))
+          return MigrationResult.Failure(MigrationFailure.Cleanup(new MigrationCleanupFailure(error, rolledBack != (0 as Int32) ? sqliteFailure(database, "migration.rollback", rolledBack) : ProviderFailure.State("rollback did not end transaction"))))
         end
       end
       return MigrationResult.Failure(error)
@@ -488,25 +516,25 @@ class SQLiteProvider: neri_data::Provider
 
   public override def execute(plan: readonly SqlPlan): ProviderResult
     if this.streaming
-      return ProviderResult.Failure("SQLite provider is busy streaming")
+      return ProviderResult.Failure(ProviderFailure.State("SQLite provider is busy streaming"))
     end
     if this.closed || this.poisoned
-      return ProviderResult.Failure("SQLite provider is closed or transaction state is uncertain")
+      return ProviderResult.Failure(ProviderFailure.State("SQLite provider is closed or transaction state is uncertain"))
     end
     if plan.limit() < 1 || plan.limit() > queryRowLimit()
-      return ProviderResult.Failure("invalid SQLite row limit")
+      return ProviderResult.Failure(ProviderFailure.State("invalid SQLite row limit"))
     end
     let sql = plan.sql()
     let length = host::stringByteLength(sql)
 
     if length == 0 || length > 2147483646
-      return ProviderResult.Failure("invalid SQLite SQL length")
+      return ProviderResult.Failure(ProviderFailure.State("invalid SQLite SQL length"))
     end
     var index = 0
 
     while index < length
       if host::stringByteAt(sql, index) == (0 as Byte)
-        return ProviderResult.Failure("SQLite SQL contains NUL")
+        return ProviderResult.Failure(ProviderFailure.State("SQLite SQL contains NUL"))
       end
       index = index + 1
     end
@@ -514,7 +542,7 @@ class SQLiteProvider: neri_data::Provider
       let database = this.database
 
       if database == null
-        return ProviderResult.Failure("SQLite provider is closed")
+        return ProviderResult.Failure(ProviderFailure.State("SQLite provider is closed"))
       end
       let bytes = native::alloc<Byte>(length + 1)
 
@@ -530,11 +558,11 @@ class SQLiteProvider: neri_data::Provider
       let status = sqlitePrepare(database, bytes, length as Int32, statement, tail)
 
       if status != (0 as Int32)
-        let message = sqliteMessage(database)
+        var message = sqliteFailure(database, "read.prepare", status)
         let prepared: Void*? = statement[0]
 
         if prepared != null
-          sqliteFinalize(prepared)
+          message = sqliteFinalizeFailure(database, prepared, message)
         end
         native::free(bytes)
         return ProviderResult.Failure(message)
@@ -543,33 +571,33 @@ class SQLiteProvider: neri_data::Provider
 
       if prepared == null
         native::free(bytes)
-        return ProviderResult.Failure("SQLite plan has no statement")
+        return ProviderResult.Failure(ProviderFailure.State("SQLite plan has no statement"))
       end
       # sqlite3_prepare_v2 leaves the first unused byte in tail.
       # https://sqlite.org/c3ref/prepare.html
       let trailing = tail[0]
 
       if trailing[0] != (0 as Byte)
-        sqliteFinalize(prepared)
+        let failure = sqliteFinalizeFailure(database, prepared, ProviderFailure.State("SQLite plan contains trailing SQL"))
+
         native::free(bytes)
-        return ProviderResult.Failure("SQLite plan contains trailing SQL")
+        return ProviderResult.Failure(failure)
       end
       native::free(bytes)
       if sqliteReadOnly(prepared) == (0 as Int32)
-        sqliteFinalize(prepared)
-        return ProviderResult.Failure("SQLite plan is not read-only")
+        return ProviderResult.Failure(sqliteFinalizeFailure(database, prepared, ProviderFailure.State("SQLite plan is not read-only")))
       end
       if sqliteParameterCount(prepared) != (plan.parameters().count() as Int32)
-        sqliteFinalize(prepared)
-        return ProviderResult.Failure("SQLite parameter count mismatch")
+        return ProviderResult.Failure(sqliteFinalizeFailure(database, prepared, ProviderFailure.State("SQLite parameter count mismatch")))
       end
       let bound = bindParameters(database, prepared, plan.parameters())
 
       match bound
         case SQLiteBindResult.Failure(message, buffers)
-          sqliteFinalize(prepared)
+          let failure = sqliteFinalizeFailure(database, prepared, message)
+
           freeBuffers(buffers)
-          return ProviderResult.Failure(message)
+          return ProviderResult.Failure(failure)
         case SQLiteBindResult.Bound(buffers)
           let rows = readRows(database, prepared, plan)
           let finalizeCode = sqliteFinalize(prepared)
@@ -579,10 +607,10 @@ class SQLiteProvider: neri_data::Provider
           freeBuffers(buffers)
           match rows
             case ProviderResult.Failure(message)
-              return ProviderResult.Failure(message)
+              return ProviderResult.Failure(sqliteMergeFinalize(database, message, finalizeCode))
             case ProviderResult.Rows(values)
               if finalizeCode != (0 as Int32)
-                return ProviderResult.Failure("SQLite finalize failed: " + ((finalizeCode as Int) as String))
+                return ProviderResult.Failure(sqliteFailure(database, "finalize", finalizeCode))
               end
               return ProviderResult.Rows(values)
           end
@@ -592,10 +620,10 @@ class SQLiteProvider: neri_data::Provider
 
   public override def stream(plan: readonly StreamPlan, visit: fn(RawRow): Bool): StreamResult
     if this.streaming
-      return StreamResult.Failure(QueryFailure.Provider("SQLite provider is busy streaming"), 0)
+      return StreamResult.Failure(QueryFailure.Provider(ProviderFailure.State("SQLite provider is busy streaming")), 0)
     end
     if this.closed || this.poisoned
-      return StreamResult.Failure(QueryFailure.Provider("SQLite provider is closed or transaction state is uncertain"), 0)
+      return StreamResult.Failure(QueryFailure.Provider(ProviderFailure.State("SQLite provider is closed or transaction state is uncertain")), 0)
     end
     this.streaming = true
     unsafe
@@ -603,24 +631,64 @@ class SQLiteProvider: neri_data::Provider
 
       if database == null
         this.streaming = false
-        return StreamResult.Failure(QueryFailure.Provider("SQLite database handle unavailable"), 0)
+        return StreamResult.Failure(QueryFailure.Provider(ProviderFailure.State("SQLite database handle unavailable")), 0)
       end
       let deadline = stackalloc SQLiteStreamDeadline[1]
 
       deadline.deadline = 9223372036854775807
       deadline.expired = 0 as Int32
+      deadline.interruptedStatus = 0 as Int32
+      deadline.busyBudget = 0
+      deadline.busySlept = 0
+      let configuration = this.effectiveConfiguration
+
+      if configuration != null
+        deadline.busyBudget = configuration.busyTimeoutMilliseconds()
+      end
       let target = plan.deadlineMilliseconds()
 
       if target != null
         deadline.deadline = target
+        let installed = sqliteBusyHandler(database, sqliteStreamBusy, deadline as Void*)
+
+        if installed != (0 as Int32)
+          var failure = sqliteFailure(database, "stream.busy_handler", installed)
+          let removed = sqliteBusyHandler(database, null, null)
+
+          if removed != (0 as Int32)
+            failure = ProviderFailure.Cleanup(new ProviderCleanupFailure(failure, sqliteFailure(database, "stream.busy_handler.remove", removed)))
+            this.poisoned = true
+          end
+          let restored = sqliteBusyTimeout(database, deadline.busyBudget as Int32)
+
+          if restored != (0 as Int32)
+            failure = ProviderFailure.Cleanup(new ProviderCleanupFailure(failure, sqliteFailure(database, "stream.busy_timeout.restore", restored)))
+            this.poisoned = true
+          end
+          this.streaming = false
+          return StreamResult.Failure(QueryFailure.Provider(failure), 0)
+        end
         # SQLite may invoke this callback during prepare as well as step.
         # https://sqlite.org/c3ref/progress_handler.html
         sqliteProgressHandler(database, 1000 as Int32, sqliteStreamProgress, deadline as Void*)
       end
-      let result = sqliteStreamPrepared(database, plan, visit, deadline)
+      var result = sqliteStreamPrepared(database, plan, visit, deadline)
 
       if target != null
         sqliteProgressHandler(database, 0 as Int32, null, null)
+        # Remove the stack-backed callback before restoring the ordinary policy.
+        let removed = sqliteBusyHandler(database, null, null)
+
+        if removed != (0 as Int32)
+          result = sqliteCloseStream(result, sqliteFailure(database, "stream.busy_handler.remove", removed))
+          this.poisoned = true
+        end
+        let restored = sqliteBusyTimeout(database, deadline.busyBudget as Int32)
+
+        if restored != (0 as Int32)
+          result = sqliteCloseStream(result, sqliteFailure(database, "stream.busy_timeout.restore", restored))
+          this.poisoned = true
+        end
       end
       if this.activeLease != 0 && sqliteAutoCommit(database) != (0 as Int32)
         this.activeLease = 0
@@ -791,6 +859,19 @@ class SQLiteProvider: neri_data::Provider
     if lease == this.activeLease
       if this.poisoned
         return TransactionState.Failed()
+      end
+      unsafe
+        let database = this.database
+
+        if database == null
+          return TransactionState.Failed()
+        end
+        if sqliteAutoCommit(database) != (0 as Int32)
+          this.activeLease = 0
+          this.savepoints = null
+          this.lastTransactionState = TransactionState.RolledBack()
+          return this.lastTransactionState
+        end
       end
       return TransactionState.Active()
     end
@@ -1071,7 +1152,7 @@ class SQLiteProvider: neri_data::Provider
       if rolledBack != (0 as Int32) || sqliteAutoCommit(database) == (0 as Int32)
         this.poisoned = true
         this.lastTransactionState = TransactionState.Failed()
-        return WriteResult.Failure(WriteFailure.Transaction("SQLite rollback failed"))
+        return WriteResult.Failure(rolledBack != (0 as Int32) ? sqliteWriteFailure(database, rolledBack, "rollback") : WriteFailure.Transaction("SQLite rollback did not end transaction"))
       end
       this.activeLease = 0
       this.savepoints = null
@@ -1087,7 +1168,7 @@ class SQLiteProvider: neri_data::Provider
       if database == null
         this.poisoned = true
         this.lastTransactionState = TransactionState.Failed()
-        return WriteResult.Failure(WriteFailure.Transaction(writeFailureMessage(error) + "; database handle unavailable"))
+        return WriteResult.Failure(WriteFailure.Cleanup(new WriteCleanupFailure(error, WriteFailure.Provider(ProviderFailure.State("database handle unavailable")))))
       end
       if sqliteAutoCommit(database) != (0 as Int32)
         this.activeLease = 0
@@ -1099,7 +1180,7 @@ class SQLiteProvider: neri_data::Provider
       let released = rolledBack == (0 as Int32) ? sqliteExecuteLiteral(database, "RELEASE SAVEPOINT neri_write_batch") : rolledBack
 
       if rolledBack != (0 as Int32) || released != (0 as Int32)
-        return this.failOuterTransaction(WriteFailure.Transaction(writeFailureMessage(error) + "; batch savepoint rollback failed"))
+        return this.failOuterTransaction(WriteFailure.Cleanup(new WriteCleanupFailure(error, sqliteWriteFailure(database, released, "rollback.savepoint"))))
       end
       return WriteResult.Failure(error)
     end
@@ -1112,7 +1193,7 @@ class SQLiteProvider: neri_data::Provider
       if database == null
         this.poisoned = true
         this.lastTransactionState = TransactionState.Failed()
-        return WriteResult.Failure(WriteFailure.Transaction(writeFailureMessage(error) + "; database handle unavailable"))
+        return WriteResult.Failure(WriteFailure.Cleanup(new WriteCleanupFailure(error, WriteFailure.Provider(ProviderFailure.State("database handle unavailable")))))
       end
       if sqliteAutoCommit(database) != (0 as Int32)
         this.activeLease = 0
@@ -1125,7 +1206,7 @@ class SQLiteProvider: neri_data::Provider
       if rolledBack != (0 as Int32) || sqliteAutoCommit(database) == (0 as Int32)
         this.poisoned = true
         this.lastTransactionState = TransactionState.Failed()
-        return WriteResult.Failure(WriteFailure.Transaction(writeFailureMessage(error) + "; outer rollback failed"))
+        return WriteResult.Failure(WriteFailure.Cleanup(new WriteCleanupFailure(error, rolledBack != (0 as Int32) ? sqliteWriteFailure(database, rolledBack, "rollback") : WriteFailure.Transaction("rollback did not end transaction"))))
       end
       this.activeLease = 0
       this.savepoints = null
@@ -1142,14 +1223,14 @@ class SQLiteProvider: neri_data::Provider
 
       if database == null
         this.poisoned = true
-        return WriteResult.Failure(WriteFailure.Transaction(writeFailureMessage(error) + "; database handle unavailable"))
+        return WriteResult.Failure(WriteFailure.Cleanup(new WriteCleanupFailure(error, WriteFailure.Provider(ProviderFailure.State("database handle unavailable")))))
       end
       if sqliteAutoCommit(database) == (0 as Int32)
         let rollbackCode = sqliteExecuteLiteral(database, "ROLLBACK")
 
         if rollbackCode != (0 as Int32) || sqliteAutoCommit(database) == (0 as Int32)
           this.poisoned = true
-          return WriteResult.Failure(WriteFailure.Transaction(writeFailureMessage(error) + "; rollback failed"))
+          return WriteResult.Failure(WriteFailure.Cleanup(new WriteCleanupFailure(error, rollbackCode != (0 as Int32) ? sqliteWriteFailure(database, rollbackCode, "rollback") : WriteFailure.Transaction("rollback did not end transaction"))))
         end
       end
     end
@@ -1173,21 +1254,7 @@ enum SQLiteWriteBindResult
 end
 
 unsafe def sqliteWriteFailure(database: Void*, status: Int32, stage: String): WriteFailure
-  let code = sqliteExtendedError(database) as Int
-  let raw = status as Int
-  let primary = raw - (raw / 256) * 256
-  let message = "SQLite " + stage + " failed (code " + (code as String) + "): " + sqliteMessage(database)
-
-  if primary == 19
-    return WriteFailure.Constraint(message)
-  end
-  if primary == 5 || primary == 6
-    return WriteFailure.Transaction(message)
-  end
-  if primary == 8
-    return WriteFailure.Unsupported(message)
-  end
-  return WriteFailure.Provider(message)
+  return WriteFailure.Provider(sqliteFailure(database, stage, status))
 end
 
 unsafe def sqliteExecuteLiteral(database: Void*, sql: String): Int32
@@ -1206,33 +1273,16 @@ unsafe def sqliteExecuteLiteral(database: Void*, sql: String): Int32
   return status
 end
 
-unsafe def sqliteForeignKeysEnabled(database: Void*): Bool
-  let sql = "PRAGMA foreign_keys"
-  let length = host::stringByteLength(sql)
-  let bytes = native::alloc<Byte>(length + 1)
-  var index = 0
-
-  while index < length
-    bytes[index] = host::stringByteAt(sql, index)
-    index = index + 1
+unsafe def sqliteForeignKeysFailure(database: Void*): ProviderFailure?
+  match sqliteConfigurationScalar(database, "PRAGMA foreign_keys")
+    case result::Result.Error(error)
+      return error
+    case result::Result.Ok(value)
+      if value != "1"
+        return ProviderFailure.State("SQLite foreign-key enforcement unavailable")
+      end
   end
-  bytes[length] = 0 as Byte
-  let statement = stackalloc Void*[1]
-  let status = sqlitePrepare(database, bytes, length as Int32, statement, null)
-
-  native::free(bytes)
-  let prepared: Void*? = statement[0]
-
-  if status != (0 as Int32) || prepared == null
-    if prepared != null
-      sqliteFinalize(prepared)
-    end
-    return false
-  end
-  let enabled = sqliteStep(prepared) == (100 as Int32) && sqliteColumnInt(prepared, 0 as Int32) == 1
-  let finalized = sqliteFinalize(prepared)
-
-  return enabled && finalized == (0 as Int32)
+  return null
 end
 
 unsafe def executeSetStatement(database: Void*, plan: readonly SetWritePlan): SQLiteSetStep
@@ -1264,11 +1314,11 @@ unsafe def executeSetStatement(database: Void*, plan: readonly SetWritePlan): SQ
   let status = sqlitePrepare(database, bytes, length as Int32, statement, tail)
 
   if status != (0 as Int32)
-    let error = sqliteWriteFailure(database, status, "prepare")
+    var error = sqliteWriteFailure(database, status, "prepare")
     let partial: Void*? = statement[0]
 
     if partial != null
-      sqliteFinalize(partial)
+      error = sqliteWriteFinalizeFailure(database, partial, error)
     end
     native::free(bytes)
     return SQLiteSetStep.Failure(error)
@@ -1282,26 +1332,26 @@ unsafe def executeSetStatement(database: Void*, plan: readonly SetWritePlan): SQ
   let trailing = tail[0]
 
   if trailing[0] != (0 as Byte)
-    sqliteFinalize(prepared)
+    let failure = sqliteWriteFinalizeFailure(database, prepared, WriteFailure.Validation("SQLite set plan contains trailing SQL"))
+
     native::free(bytes)
-    return SQLiteSetStep.Failure(WriteFailure.Validation("SQLite set plan contains trailing SQL"))
+    return SQLiteSetStep.Failure(failure)
   end
   native::free(bytes)
   if sqliteReadOnly(prepared) != (0 as Int32) || sqliteColumnCount(prepared) != (0 as Int32)
-    sqliteFinalize(prepared)
-    return SQLiteSetStep.Failure(WriteFailure.Validation("SQLite set plan must be a write without result columns"))
+    return SQLiteSetStep.Failure(sqliteWriteFinalizeFailure(database, prepared, WriteFailure.Validation("SQLite set plan must be a write without result columns")))
   end
   if sqliteParameterCount(prepared) != (plan.parameters().count() as Int32)
-    sqliteFinalize(prepared)
-    return SQLiteSetStep.Failure(WriteFailure.Validation("SQLite set parameter count mismatch"))
+    return SQLiteSetStep.Failure(sqliteWriteFinalizeFailure(database, prepared, WriteFailure.Validation("SQLite set parameter count mismatch")))
   end
   let bound = bindWriteValues(database, prepared, plan.parameters())
 
   match bound
     case SQLiteWriteBindResult.Failure(error, buffers)
-      sqliteFinalize(prepared)
+      let failure = sqliteWriteFinalizeFailure(database, prepared, error)
+
       freeBuffers(buffers)
-      return SQLiteSetStep.Failure(error)
+      return SQLiteSetStep.Failure(failure)
     case SQLiteWriteBindResult.Bound(buffers)
       let stepped = sqliteStep(prepared)
       var failure: WriteFailure? = null
@@ -1314,13 +1364,13 @@ unsafe def executeSetStatement(database: Void*, plan: readonly SetWritePlan): SQ
 
       freeBuffers(buffers)
       if failure != null
-        return SQLiteSetStep.Failure(failure)
+        return SQLiteSetStep.Failure(sqliteMergeWriteFinalize(database, failure, finalized))
       end
       if finalized != (0 as Int32)
-        return SQLiteSetStep.Failure(WriteFailure.Provider("SQLite set finalize failed: " + ((finalized as Int) as String)))
+        return SQLiteSetStep.Failure(WriteFailure.Provider(sqliteFailure(database, "finalize", finalized)))
       end
       if changed < 0
-        return SQLiteSetStep.Failure(WriteFailure.Provider("SQLite set affected row count is negative"))
+        return SQLiteSetStep.Failure(WriteFailure.Provider(ProviderFailure.State("SQLite set affected row count is negative")))
       end
       return SQLiteSetStep.Success(changed)
   end
@@ -1421,11 +1471,11 @@ unsafe def executeWriteCommand(database: Void*, command: readonly WriteCommand):
   let status = sqlitePrepare(database, bytes, length as Int32, statement, tail)
 
   if status != (0 as Int32)
-    let error = sqliteWriteFailure(database, status, "prepare")
+    var error = sqliteWriteFailure(database, status, "prepare")
     let partial: Void*? = statement[0]
 
     if partial != null
-      sqliteFinalize(partial)
+      error = sqliteWriteFinalizeFailure(database, partial, error)
     end
     native::free(bytes)
     return SQLiteWriteStep.Failure(error)
@@ -1439,9 +1489,10 @@ unsafe def executeWriteCommand(database: Void*, command: readonly WriteCommand):
   let trailing = tail[0]
 
   if trailing[0] != (0 as Byte)
-    sqliteFinalize(prepared)
+    let failure = sqliteWriteFinalizeFailure(database, prepared, WriteFailure.Validation("SQLite write plan contains trailing SQL"))
+
     native::free(bytes)
-    return SQLiteWriteStep.Failure(WriteFailure.Validation("SQLite write plan contains trailing SQL"))
+    return SQLiteWriteStep.Failure(failure)
   end
   native::free(bytes)
   var expectedColumns = 0
@@ -1450,20 +1501,19 @@ unsafe def executeWriteCommand(database: Void*, command: readonly WriteCommand):
     expectedColumns = returning.count()
   end
   if sqliteReadOnly(prepared) != (0 as Int32) || sqliteColumnCount(prepared) != (expectedColumns as Int32)
-    sqliteFinalize(prepared)
-    return SQLiteWriteStep.Failure(WriteFailure.Validation("SQLite write command result columns do not match metadata"))
+    return SQLiteWriteStep.Failure(sqliteWriteFinalizeFailure(database, prepared, WriteFailure.Validation("SQLite write command result columns do not match metadata")))
   end
   if sqliteParameterCount(prepared) != (command.parameters().count() as Int32)
-    sqliteFinalize(prepared)
-    return SQLiteWriteStep.Failure(WriteFailure.Validation("SQLite write parameter count mismatch"))
+    return SQLiteWriteStep.Failure(sqliteWriteFinalizeFailure(database, prepared, WriteFailure.Validation("SQLite write parameter count mismatch")))
   end
   let bound = bindWriteValues(database, prepared, command.parameters())
 
   match bound
     case SQLiteWriteBindResult.Failure(error, buffers)
-      sqliteFinalize(prepared)
+      let failure = sqliteWriteFinalizeFailure(database, prepared, error)
+
       freeBuffers(buffers)
-      return SQLiteWriteStep.Failure(error)
+      return SQLiteWriteStep.Failure(failure)
     case SQLiteWriteBindResult.Bound(buffers)
       let stepped = sqliteStep(prepared)
       var failure: WriteFailure? = null
@@ -1480,7 +1530,7 @@ unsafe def executeWriteCommand(database: Void*, command: readonly WriteCommand):
 
           while column < returning.count()
             if !returning.at(column).nullable() && sqliteColumnType(prepared, column as Int32) == (5 as Int32)
-              failure = WriteFailure.Provider("SQLite returning required column is NULL")
+              failure = WriteFailure.Provider(ProviderFailure.State("SQLite returning required column is NULL"))
               break
             end
             column = column + 1
@@ -1488,7 +1538,7 @@ unsafe def executeWriteCommand(database: Void*, command: readonly WriteCommand):
           if failure == null
             match decodeSQLiteColumns(prepared, returning)
               case SQLiteColumnsResult.Failure(message)
-                failure = WriteFailure.Provider(message)
+                failure = WriteFailure.Provider(ProviderFailure.State(message))
               case SQLiteColumnsResult.Values(values)
                 row = new RawRow(values)
             end
@@ -1517,10 +1567,10 @@ unsafe def executeWriteCommand(database: Void*, command: readonly WriteCommand):
 
       freeBuffers(buffers)
       if failure != null
-        return SQLiteWriteStep.Failure(failure)
+        return SQLiteWriteStep.Failure(sqliteMergeWriteFinalize(database, failure, finalized))
       end
       if finalized != (0 as Int32)
-        return SQLiteWriteStep.Failure(WriteFailure.Provider("SQLite write finalize failed: " + ((finalized as Int) as String)))
+        return SQLiteWriteStep.Failure(WriteFailure.Provider(sqliteFailure(database, "finalize", finalized)))
       end
       return SQLiteWriteStep.Success(row)
   end
@@ -1586,7 +1636,7 @@ end
 
 enum SQLiteBindResult
   case Bound(buffers: SQLiteTextBufferNode?)
-  case Failure(message: String, buffers: SQLiteTextBufferNode?)
+  case Failure(message: ProviderFailure, buffers: SQLiteTextBufferNode?)
 end
 
 class SQLiteTextBufferNode
@@ -1650,14 +1700,14 @@ unsafe def bindParameters(database: Void*, statement: Void*, parameters: readonl
         status = sqliteBindInt(statement, index as Int32, value)
       case Parameter.Float(value)
         if !dataFloatFinite(value)
-          return SQLiteBindResult.Failure("SQLite float parameter must be finite", buffers)
+          return SQLiteBindResult.Failure(ProviderFailure.State("SQLite float parameter must be finite"), buffers)
         end
         status = sqliteBindDouble(statement, index as Int32, value)
       case Parameter.Text(value)
         let length = host::stringByteLength(value)
 
         if length > 2147483646
-          return SQLiteBindResult.Failure("SQLite text parameter is too long", buffers)
+          return SQLiteBindResult.Failure(ProviderFailure.State("SQLite text parameter is too long"), buffers)
         end
         var offset = 0
 
@@ -1665,7 +1715,7 @@ unsafe def bindParameters(database: Void*, statement: Void*, parameters: readonl
           if host::stringByteAt(value, offset) == (0 as Byte)
             # SQLite leaves the meaning of expressions with embedded NUL undefined.
             # https://sqlite.org/c3ref/bind_blob.html
-            return SQLiteBindResult.Failure("SQLite text parameter contains NUL", buffers)
+            return SQLiteBindResult.Failure(ProviderFailure.State("SQLite text parameter contains NUL"), buffers)
           end
           offset = offset + 1
         end
@@ -1686,7 +1736,7 @@ unsafe def bindParameters(database: Void*, statement: Void*, parameters: readonl
         status = sqliteBindText(statement, index as Int32, bytes, length as Int32, null)
     end
     if status != (0 as Int32)
-      let message = sqliteMessage(database)
+      let message = sqliteFailure(database, "read.bind", status)
 
       return SQLiteBindResult.Failure(message, buffers)
     end
@@ -1825,7 +1875,7 @@ unsafe def readRows(database: Void*, statement: Void*, plan: readonly SqlPlan): 
   let columns = plan.columns()
 
   if sqliteColumnCount(statement) as Int != columns.count()
-    return ProviderResult.Failure("SQLite result column count mismatch")
+    return ProviderResult.Failure(ProviderFailure.State("SQLite result column count mismatch"))
   end
   let rows = new SQLiteCollectedRows(plan.limit())
   var rowCount = 0
@@ -1833,11 +1883,11 @@ unsafe def readRows(database: Void*, statement: Void*, plan: readonly SqlPlan): 
 
   while step == (100 as Int32)
     if rowCount >= plan.limit()
-      return ProviderResult.Failure("SQLite result exceeds row limit")
+      return ProviderResult.Failure(ProviderFailure.State("SQLite result exceeds row limit"))
     end
     match decodeSQLiteColumns(statement, columns)
       case SQLiteColumnsResult.Failure(message)
-        return ProviderResult.Failure(message)
+        return ProviderResult.Failure(ProviderFailure.State(message))
       case SQLiteColumnsResult.Values(values)
         rows.set(rowCount, values)
     end
@@ -1845,7 +1895,7 @@ unsafe def readRows(database: Void*, statement: Void*, plan: readonly SqlPlan): 
     step = sqliteStep(statement)
   end
   if step != (101 as Int32)
-    return ProviderResult.Failure(sqliteMessage(database))
+    return ProviderResult.Failure(sqliteFailure(database, "read.step", step))
   end
   let complete: RawRow[] = tasks::generate(rowCount, 1) do |index|
     return rows.at(index)

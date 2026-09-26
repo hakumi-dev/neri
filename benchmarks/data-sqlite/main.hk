@@ -1,0 +1,251 @@
+use app_data
+use clock
+use console
+use host
+use model
+use neri_data
+use neri_data_sqlite
+
+@library("sqlite3")
+@cabiImport("sqlite3_memory_used")
+unsafe def sqliteMemoryUsed(): Int
+end
+
+@library("sqlite3")
+@cabiImport("sqlite3_memory_highwater")
+unsafe def sqliteMemoryHighwater(reset: Int32): Int
+end
+
+def elapsedSince(started: Int): Int
+  let current = clock::milliseconds()
+
+  if current == null
+    host::exit(1)
+    return 0
+  end
+  return current - started
+end
+
+def now(): Int
+  let current = clock::milliseconds()
+
+  if current == null
+    host::exit(1)
+    return 0
+  end
+  return current
+end
+
+def fail(label: String): Void
+  console::println("{\"event\":\"error\",\"operation\":\"" + label + "\"}")
+  host::exit(1)
+end
+
+def validHostLabel(value: String): Bool
+  var index = 0
+
+  while index < host::stringByteLength(value)
+    let byte = host::stringByteAt(value, index) as Int
+    let alpha = (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122)
+    let digit = byte >= 48 && byte <= 57
+
+    if !alpha && !digit && byte != 32 && byte != 45 && byte != 46 && byte != 95
+      return false
+    end
+    index = index + 1
+  end
+  return true
+end
+
+def writeOne(database: app_data::Database, id: Int): Void
+  let failure = database.customers.add(new model::Customer(id, "row-" + (id as String), true))
+
+  if failure != null
+    fail("track_write")
+    return
+  end
+end
+
+def acceptCustomer(customer: model::Customer): Bool
+  return true
+end
+
+def emit(operation: String, elapsed: Int, rows: Int, repetition: Int, hostLabel: String,
+  profiled: Bool): Void
+  var record = "{\"event\":\"sample\",\"benchmark\":\"sqlite_data\",\"operation\":\"" + operation
+
+  record = record + "\",\"elapsed_ms\":" + (elapsed as String)
+  record = record + ",\"rows\":" + (rows as String)
+  record = record + ",\"rows_per_second\":" + (elapsed > 0 ? ((rows * 1000 / elapsed) as String) : "null")
+  record = record + ",\"repetition\":" + (repetition as String)
+  record = record + ",\"host\":\"" + hostLabel
+  record = record + "\",\"neri_memory_profile\":" + (profiled ? "true" : "false") + "}"
+
+  console::println(record)
+end
+
+def main(): Void
+  let hostArgument = host::argumentAt(0)
+  let rowsArgument = host::argumentAt(1)
+  let repetitionsArgument = host::argumentAt(2)
+  let hostLabel = hostArgument != null ? hostArgument : "unspecified"
+  let rowsValue = rowsArgument != null ? host::parseInt(rowsArgument) : 250
+  let repetitionsValue = repetitionsArgument != null ? host::parseInt(repetitionsArgument) : 3
+
+  if rowsValue == null || repetitionsValue == null || rowsValue < 1 || rowsValue > 1000 || repetitionsValue < 1 || repetitionsValue > 10
+    fail("invalid_scale")
+    return
+  end
+  if !validHostLabel(hostLabel)
+    fail("invalid_host_label")
+    return
+  end
+  let rows = rowsValue
+  let repetitions = repetitionsValue
+  let totalRows = rows * repetitions
+
+  if totalRows > 10000
+    fail("scale_limit")
+    return
+  end
+  let profileValue = host::environment("NERI_MEMORY_PROFILE")
+  let profiled = profileValue != null && profileValue != "" && profileValue != "0"
+  var highwaterBefore = -1
+  var usedBefore = -1
+
+  unsafe
+    highwaterBefore = sqliteMemoryHighwater(1 as Int32)
+    usedBefore = sqliteMemoryUsed()
+  end
+  let opened = SQLiteProvider.createWritable(":memory:")
+  var provider: SQLiteProvider? = null
+
+  match opened
+    case SQLiteOpenResult.Failure(message)
+      console::println(providerFailureMessage(message))
+      fail("sqlite_open")
+    case SQLiteOpenResult.Opened(value)
+      provider = value
+  end
+  let dbProvider = provider
+
+  if dbProvider == null
+    fail("sqlite_open")
+    return
+  end
+  let migration = new neri_data::Migration("benchmark_schema", [
+      neri_data::SchemaOp.CreateTable("customers", [
+          new neri_data::SchemaColumn("id", neri_data::SchemaType.Int(), primaryKey: true),
+          new neri_data::SchemaColumn("name", neri_data::SchemaType.Text()),
+          new neri_data::SchemaColumn("active", neri_data::SchemaType.Bool()),
+          new neri_data::SchemaColumn("nickname", neri_data::SchemaType.Text(), nullable: true)
+        ])
+    ], [neri_data::SchemaOp.DropTable("customers")])
+  let migrationResult = dbProvider.migrate(new neri_data::MigrationSet([migration]))
+
+  match migrationResult
+    case neri_data::MigrationResult.Applied(count)
+      if count != 1
+        fail("schema_migration")
+      end
+    case neri_data::MigrationResult.Failure(error)
+      fail("schema_migration")
+  end
+  let database = new app_data::Database(dbProvider)
+
+  var repetition = 0
+
+  while repetition < repetitions
+    let started = now()
+    var index = 0
+
+    while index < rows
+      writeOne(database, repetition * rows + index + 1)
+      index = index + 1
+    end
+    match database.saveChanges()
+      case neri_data::WriteResult.Saved(count)
+        if count != rows
+          fail("tracked_write")
+        end
+      case neri_data::WriteResult.SavedWithValues(count, outputs)
+        if count != rows
+          fail("tracked_write")
+        end
+      case neri_data::WriteResult.Failure(error)
+        fail("tracked_write")
+    end
+    emit("write", elapsedSince(started), rows, repetition, hostLabel, profiled)
+    database.clear()
+    repetition = repetition + 1
+  end
+
+  repetition = 0
+  while repetition < repetitions
+    let started = now()
+
+    match database.customers.take(1000).all()
+      case QueryResult.Rows(resultRows)
+        let expectedRows = totalRows < 1000 ? totalRows : 1000
+
+        if resultRows.count() != expectedRows
+          fail("bounded_read_row_count")
+          return
+        end
+        emit("bounded_read", elapsedSince(started), resultRows.count(), repetition, hostLabel, profiled)
+      case QueryResult.Failure(error)
+        fail("bounded_read")
+    end
+    database.clear()
+    repetition = repetition + 1
+  end
+
+  repetition = 0
+  while repetition < repetitions
+    let started = now()
+
+    match database.customers.stream(acceptCustomer)
+      case StreamResult.Completed(count)
+        if count != totalRows
+          fail("stream_row_count")
+          return
+        end
+        emit("stream", elapsedSince(started), count, repetition, hostLabel, profiled)
+      case StreamResult.Stopped(count)
+        fail("stream_stopped")
+      case StreamResult.Cancelled(count)
+        fail("stream_cancelled")
+      case StreamResult.Failure(error, count)
+        fail("stream")
+    end
+    database.clear()
+    repetition = repetition + 1
+  end
+
+  let closeStarted = now()
+
+  if !dbProvider.close()
+    fail("close")
+  end
+  emit("close", elapsedSince(closeStarted), 0, 0, hostLabel, profiled)
+
+  var highwater = -1
+  var used = -1
+
+  unsafe
+    used = sqliteMemoryUsed()
+    highwater = sqliteMemoryHighwater(0 as Int32)
+  end
+  let memoryAvailable = highwater > 0 && highwaterBefore >= 0 && usedBefore >= 0 && used >= 0
+
+  var memoryRecord = "{\"event\":\"sqlite_memory\",\"available\":" + (memoryAvailable ? "true" : "false")
+
+  memoryRecord = memoryRecord + ",\"used_bytes\":" + (memoryAvailable ? (used as String) : "null")
+  memoryRecord = memoryRecord + ",\"used_before_bytes\":" + (memoryAvailable ? (usedBefore as String) : "null")
+  memoryRecord = memoryRecord + ",\"used_delta_bytes\":" + (memoryAvailable ? ((used - usedBefore) as String) : "null")
+  memoryRecord = memoryRecord + ",\"highwater_bytes\":" + (memoryAvailable ? (highwater as String) : "null")
+  memoryRecord = memoryRecord + ",\"scope\":\"process_global_sqlite_allocator\",\"host\":\"" + hostLabel
+  memoryRecord = memoryRecord + "\",\"neri_memory_profile\":" + (profiled ? "true" : "false") + "}"
+
+  console::println(memoryRecord)
+end

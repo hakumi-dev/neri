@@ -12,6 +12,8 @@ contains a stable identifier and explicit ordered `up` and `down` operations;
   declared order.
 
 ```neri
+use neri_data
+
 let initial = new Migration("initial", [
   SchemaOp.CreateTable("people", [
     new SchemaColumn("id", SchemaType.Int(), primaryKey: true),
@@ -26,7 +28,7 @@ match SQLiteProvider.createWritable("app.sqlite")
     # Inspect the result before using the application context.
     let closed = provider.close()
   case SQLiteOpenResult.Failure(message)
-    console::println(message)
+    console::println(providerFailureMessage(message))
 end
 ```
 

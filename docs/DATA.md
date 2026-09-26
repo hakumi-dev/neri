@@ -48,7 +48,8 @@ as their source inventory, including the owning `SQLiteSession` resource.
 
 The packaged `examples/data-consumer` project exercises installed generation and
 SQLite persistence. Its mapping and entity declarations provide a minimal
-starting point. SQLite uses the platform's native SQLite library; the provider
+starting point. SQLite requires the platform's native SQLite 3.37.2 or newer
+library and its exported C API; the provider
 checks capabilities such as window functions on the actual open connection.
 
 In a writable copy of the example and `share/neri/data`, preserving their
@@ -95,7 +96,7 @@ provider when finished. Generated source is published at stable paths such as
 
 ## Bounds and compatibility
 
-Buffered reads require an explicit limit of at most 1,000 rows. Navigation loads
+The bounded buffered path requires an explicit limit of at most 1,000 rows. Navigation loads
 have a separate explicit total bound of at most 10,000 children and batch at most
 50 parent keys per child statement. Query `skip` and `take` inside a filtered
 include apply to each parent's children. Collection loading stages publication
@@ -133,6 +134,27 @@ An explicit transaction retains one connection until commit, rollback or `close(
 Opening failures remain structured operation results. Application configuration
 and construction of generated contexts belong to the application; Sumi supplies
 the interactive frontend, while Neri sessions inspect returned values.
+
+For a request worker that reuses its connection, `SQLiteSession` owns the native
+handle and closes it through `using`. Keep its provider and each generated
+context within that worker; operations on one connection are sequential.
+`SQLiteOptions` controls journal mode, synchronization and a bounded lock wait.
+The default preserves the database journal, selects Full synchronization and
+returns immediately on lock contention. SQLite still has one active writer.
+
+`ProviderFailure.Driver` preserves the provider, operation, error category,
+message and native codes. `ProviderFailure.State` describes adapter misuse;
+cleanup failures preserve both causes. A failed transaction is never replayed
+automatically. Streaming deadlines bound cooperative execution and lock waits,
+but cannot preempt an operating-system call. Resource close reports
+`result::Failure` with native details in `nativeError`.
+
+Keep the database and its backup files outside build output. Use SQLite's online
+backup mechanism for a live database, verify the snapshot, then restore at a
+fresh path with all application connections closed. Copying only the main file
+of a live WAL database can omit committed changes. See SQLite's
+[online backup API](https://sqlite.org/backup.html) and
+[synchronization settings](https://sqlite.org/pragma.html#pragma_synchronous).
 
 This separation follows [EF Core's context and connection lifetime](https://learn.microsoft.com/en-us/ef/core/dbcontext-configuration/)
 and [query materialization](https://learn.microsoft.com/en-us/ef/core/querying/).

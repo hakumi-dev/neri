@@ -1,0 +1,217 @@
+use console
+use neri_data_sqlite
+use files
+use resources
+use result
+use neri_data
+
+class ConfigurationRow
+  public id: Int
+
+  def init(id: Int): Void
+    this.id = id
+  end
+end
+
+def decodeConfigurationRow(row: RawRow): DecodeResult<ConfigurationRow>
+  match decodeInt(row, "id")
+    case DecodeResult.Value(value)
+      return DecodeResult<ConfigurationRow>.Value(new ConfigurationRow(value))
+    case DecodeResult.Failure(error)
+      return DecodeResult<ConfigurationRow>.Failure(error)
+  end
+end
+
+def contentionDeadline(path: String): Void
+  unsafe
+    let name = sqliteMigrationText(path)
+    let handles = stackalloc Void*[1]
+    let opened = sqliteOpen(name, handles, 6 as Int32, null)
+
+    native::free(name)
+
+    test::assertEqual(opened, 0 as Int32)
+    let database = handles[0]
+
+    test::assertEqual(sqliteExecuteLiteral(database, "CREATE TABLE deadline_records(id INTEGER); INSERT INTO deadline_records VALUES(1)"), 0 as Int32)
+    match SQLiteProvider.openWritable(path, new SQLiteOptions(busyTimeoutMilliseconds: 1000))
+      case SQLiteOpenResult.Failure(error)
+        test::assertTrue(false)
+      case SQLiteOpenResult.Opened(provider)
+        let columns = new ResultColumns([new ResultColumn("id", ResultColumnKind.Int())])
+        let query = new Query<ConfigurationRow>("deadline_records", new Decoder<ConfigurationRow>(decodeConfigurationRow, columns), provider: provider)
+        let visit: fn(ConfigurationRow): Bool = fn(value: ConfigurationRow): Bool
+          return true
+        end
+
+        test::assertEqual(sqliteExecuteLiteral(database, "BEGIN EXCLUSIVE"), 0 as Int32)
+        let started = clock::nativeMilliseconds()
+
+        match query.stream(visit, new StreamOptions(timeoutMilliseconds: 40))
+          case StreamResult.Cancelled(count)
+            test::assertEqual(count, 0)
+          case StreamResult.Completed(count)
+            test::assertTrue(false)
+          case StreamResult.Stopped(count)
+            test::assertTrue(false)
+          case StreamResult.Failure(error, count)
+            console::println("Deadline stream failed: " + diagnosticQueryFailureKind(error))
+            match error
+              case QueryFailure.Provider(failure)
+                console::println(providerFailureMessage(failure))
+                match failure
+                  case ProviderFailure.Driver(driver)
+                    console::println(driver.operation())
+                  case ProviderFailure.State(message)
+                  case ProviderFailure.Cleanup(cleanup)
+                end
+              case QueryFailure.Cleanup(failure)
+                console::println(providerFailureMessage(failure.cleanup()))
+              case QueryFailure.InvalidIdentifier(name)
+                console::println(name)
+              case QueryFailure.InvalidLimit(value, maximum)
+              case QueryFailure.MissingLimit(maximum)
+              case QueryFailure.SourceMismatch(expected, actual)
+                console::println(expected + " != " + actual)
+              case QueryFailure.UnsupportedCapability(name)
+                console::println(name)
+              case QueryFailure.MissingColumn(name)
+                console::println(name)
+              case QueryFailure.TypeMismatch(column, expected, actual)
+                console::println(column + ": " + expected + " != " + actual)
+              case QueryFailure.Cardinality(expected, actual)
+            end
+
+            test::assertTrue(false)
+        end
+        let elapsed = clock::nativeMilliseconds() - started
+
+        test::assertTrue(elapsed >= 0 && elapsed < 750)
+        # A subsequent undelimited read must observe the restored busy budget.
+        let retried = clock::nativeMilliseconds()
+        var contention = false
+
+        match query.stream(visit)
+          case StreamResult.Failure(error, count)
+            match error
+              case QueryFailure.Provider(failure)
+                match failure
+                  case ProviderFailure.Driver(driver)
+                    match driver.kind()
+                      case DriverErrorKind.Contention()
+                        contention = true
+                      case DriverErrorKind.Constraint()
+                      case DriverErrorKind.Interrupted()
+                      case DriverErrorKind.ReadOnly()
+                      case DriverErrorKind.StorageFull()
+                      case DriverErrorKind.Io()
+                      case DriverErrorKind.Corrupt()
+                      case DriverErrorKind.Other()
+                    end
+
+                    test::assertTrue(driver.primaryCode() == 5)
+                  case ProviderFailure.State(message)
+                    test::assertTrue(false)
+                  case ProviderFailure.Cleanup(cleanup)
+                    test::assertTrue(false)
+                end
+              case QueryFailure.Cleanup(cleanup)
+                test::assertTrue(false)
+              case QueryFailure.InvalidIdentifier(name)
+              case QueryFailure.InvalidLimit(value, maximum)
+              case QueryFailure.MissingLimit(maximum)
+              case QueryFailure.SourceMismatch(expected, actual)
+              case QueryFailure.UnsupportedCapability(name)
+              case QueryFailure.MissingColumn(name)
+              case QueryFailure.TypeMismatch(column, expected, actual)
+              case QueryFailure.Cardinality(expected, actual)
+            end
+          case StreamResult.Cancelled(count)
+            test::assertTrue(false)
+          case StreamResult.Completed(count)
+            test::assertTrue(false)
+          case StreamResult.Stopped(count)
+            test::assertTrue(false)
+        end
+
+        test::assertTrue(contention)
+        test::assertTrue(clock::nativeMilliseconds() - retried >= 750)
+        test::assertEqual(sqliteExecuteLiteral(database, "ROLLBACK"), 0 as Int32)
+        match query.stream(visit)
+          case StreamResult.Completed(count)
+            test::assertEqual(count, 1)
+          case StreamResult.Cancelled(count)
+            test::assertTrue(false)
+          case StreamResult.Stopped(count)
+            test::assertTrue(false)
+          case StreamResult.Failure(error, count)
+            test::assertTrue(false)
+        end
+
+        test::assertTrue(provider.close())
+    end
+
+    test::assertEqual(sqliteClose(database), 0 as Int32)
+  end
+end
+
+def rejectedConfiguration(value: SQLiteOpenResult): Void
+  match value
+    case SQLiteOpenResult.Failure(message)
+      test::assertTrue(neri_data::providerFailureMessage(message) != "")
+    case SQLiteOpenResult.Opened(provider)
+      provider.close()
+
+      test::assertTrue(false)
+  end
+end
+
+def configured(value: SQLiteOpenResult, journal: String, synchronous: Int, busy: Int): Void
+  match value
+    case SQLiteOpenResult.Failure(message)
+      test::assertTrue(false)
+    case SQLiteOpenResult.Opened(provider)
+      let actual = provider.configuration()
+
+      test::assertTrue(actual != null)
+      if actual != null
+        test::assertEqual(actual.journal(), journal)
+        test::assertEqual(actual.synchronous(), synchronous)
+        test::assertEqual(actual.busyTimeoutMilliseconds(), busy)
+      end
+
+      test::assertTrue(provider.close())
+  end
+end
+
+def configurationContract(): resources::Outcome<Bool, result::Failure>
+  using temporary <- files::TemporaryDirectory.create("sqlite-configuration-")
+    let path = temporary.path() + "/configured.sqlite"
+
+    rejectedConfiguration(SQLiteProvider.createWritable(path, new SQLiteOptions(busyTimeoutMilliseconds: -1)))
+    rejectedConfiguration(SQLiteProvider.createWritable(path, new SQLiteOptions(busyTimeoutMilliseconds: 60001)))
+    configured(SQLiteProvider.createWritable(path, new SQLiteOptions(journal: SQLiteJournalMode.Wal(), synchronous: SQLiteSynchronous.Extra(), busyTimeoutMilliseconds: 25)), "wal", 3, 25)
+    # Default reopening preserves WAL but resets connection-local settings.
+    configured(SQLiteProvider.openWritable(path), "wal", 2, 0)
+    configured(SQLiteProvider.open(path, new SQLiteOptions(journal: SQLiteJournalMode.Wal())), "wal", 2, 0)
+    rejectedConfiguration(SQLiteProvider.open(path, new SQLiteOptions(journal: SQLiteJournalMode.Delete())))
+    configured(SQLiteProvider.openWritable(path, new SQLiteOptions(journal: SQLiteJournalMode.Delete(), synchronous: SQLiteSynchronous.Normal())), "delete", 1, 0)
+    configured(SQLiteProvider.createWritable(":memory:"), "memory", 2, 0)
+    rejectedConfiguration(SQLiteProvider.createWritable(":memory:", new SQLiteOptions(journal: SQLiteJournalMode.Wal())))
+    contentionDeadline(temporary.path() + "/deadline.sqlite")
+    return true
+  end
+  return false
+end
+
+def main(): Void
+  let outcome = configurationContract()
+
+  test::assertEqual(outcome.closeFailures.count(), 0)
+  match outcome.completion
+    case resources::Completion.Value(value)
+      test::assertTrue(value)
+    case resources::Completion.Failure(error)
+      test::assertTrue(false)
+  end
+end

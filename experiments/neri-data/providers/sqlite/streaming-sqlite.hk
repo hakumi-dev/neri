@@ -6,6 +6,78 @@ namespace neri_data_sqlite
 struct SQLiteStreamDeadline
   deadline: Int
   expired: Int32
+  interruptedStatus: Int32
+  busyBudget: Int
+  busySlept: Int
+end
+
+@library("sqlite3")
+@cabiImport("sqlite3_busy_handler")
+unsafe def sqliteBusyHandler(database: Void*, callback: (cabi fn(Void*, Int32): Int32)?, state: Void*?): Int32
+end
+
+@library("sqlite3")
+@cabiImport("sqlite3_busy_timeout")
+unsafe def sqliteBusyTimeout(database: Void*, milliseconds: Int32): Int32
+end
+
+@library("sqlite3")
+@cabiImport("sqlite3_sleep")
+unsafe def sqliteSleep(milliseconds: Int32): Int32
+end
+
+## Cooperative lock waits honor both budgets; callbacks cannot preempt OS calls.
+@cabiExport("app_sqlite_stream_busy")
+unsafe def sqliteStreamBusy(state: Void*, count: Int32): Int32
+  let control = state as SQLiteStreamDeadline*
+
+  if count == (0 as Int32)
+    control.busySlept = 0
+  end
+  if sqliteStreamProgress(state) != (0 as Int32)
+    return 0 as Int32
+  end
+  let remaining = control.busyBudget - control.busySlept
+  let now = clock::nativeMilliseconds()
+
+  if now < 0
+    control.expired = 1 as Int32
+    return 0 as Int32
+  end
+  let timeLeft = control.deadline - now
+
+  if remaining <= 0 || timeLeft <= 0
+    return 0 as Int32
+  end
+  var slice = remaining < 5 ? remaining : 5
+
+  if timeLeft < slice
+    slice = timeLeft
+  end
+  let slept = sqliteSleep(slice as Int32) as Int
+
+  control.busySlept = control.busySlept + (slept > 0 ? slept : slice)
+  if sqliteStreamProgress(state) != (0 as Int32)
+    return 0 as Int32
+  end
+  return 1 as Int32
+end
+
+unsafe def sqliteStreamDeadlineError(status: Int32, deadline: SQLiteStreamDeadline*): Bool
+  if deadline.deadline == 9223372036854775807
+    return false
+  end
+  let code = status as Int
+  let primary = code - (code / 256) * 256
+
+  if primary != 5 && primary != 9
+    return false
+  end
+  if sqliteStreamProgress(deadline as Void*) != (0 as Int32)
+    deadline.interruptedStatus = status
+    return true
+  end
+  return false
 end
 
 @library("sqlite3")
@@ -52,20 +124,20 @@ unsafe def sqliteStreamPrepared(database: Void*, plan: readonly StreamPlan, visi
   let length = host::stringByteLength(sql)
 
   if length == 0 || length > 2147483646
-    return StreamResult.Failure(QueryFailure.Provider("invalid SQLite streaming SQL length"), 0)
+    return StreamResult.Failure(QueryFailure.Provider(ProviderFailure.State("invalid SQLite streaming SQL length")), 0)
   end
   var index = 0
 
   while index < length
     if host::stringByteAt(sql, index) == (0 as Byte)
-      return StreamResult.Failure(QueryFailure.Provider("SQLite streaming SQL contains NUL"), 0)
+      return StreamResult.Failure(QueryFailure.Provider(ProviderFailure.State("SQLite streaming SQL contains NUL")), 0)
     end
     index = index + 1
   end
   let maximum = plan.maximumRows()
 
   if maximum != null && (maximum < 1 || maximum > queryRowLimit())
-    return StreamResult.Failure(QueryFailure.Provider("invalid SQLite streaming row limit"), 0)
+    return StreamResult.Failure(QueryFailure.Provider(ProviderFailure.State("invalid SQLite streaming row limit")), 0)
   end
   let bytes = native::alloc<Byte>(length + 1)
 
@@ -81,14 +153,20 @@ unsafe def sqliteStreamPrepared(database: Void*, plan: readonly StreamPlan, visi
   let status = sqlitePrepare(database, bytes, length as Int32, statement, tail)
 
   if status != (0 as Int32)
-    let message = sqliteMessage(database)
+    var message = sqliteFailure(database, "stream.prepare", status)
     let partial: Void*? = statement[0]
 
     if partial != null
-      sqliteFinalize(partial)
+      message = sqliteFinalizeFailure(database, partial, message)
     end
     native::free(bytes)
-    if status == (9 as Int32) && deadline.expired != (0 as Int32)
+    if sqliteStreamDeadlineError(status, deadline)
+      match message
+        case ProviderFailure.Cleanup(failure)
+          return StreamResult.Failure(QueryFailure.Cleanup(new QueryCleanupFailure(QueryFailure.Provider(failure.primary()), failure.cleanup())), 0)
+        case ProviderFailure.Driver(error)
+        case ProviderFailure.State(detail)
+      end
       return StreamResult.Cancelled(0)
     end
     return StreamResult.Failure(QueryFailure.Provider(message), 0)
@@ -97,35 +175,34 @@ unsafe def sqliteStreamPrepared(database: Void*, plan: readonly StreamPlan, visi
 
   if prepared == null
     native::free(bytes)
-    return StreamResult.Failure(QueryFailure.Provider("SQLite streaming plan has no statement"), 0)
+    return StreamResult.Failure(QueryFailure.Provider(ProviderFailure.State("SQLite streaming plan has no statement")), 0)
   end
   let trailing = tail[0]
 
   if trailing[0] != (0 as Byte)
-    sqliteFinalize(prepared)
+    let failure = sqliteFinalizeFailure(database, prepared, ProviderFailure.State("SQLite streaming plan contains trailing SQL"))
+
     native::free(bytes)
-    return StreamResult.Failure(QueryFailure.Provider("SQLite streaming plan contains trailing SQL"), 0)
+    return StreamResult.Failure(QueryFailure.Provider(failure), 0)
   end
   native::free(bytes)
   if sqliteReadOnly(prepared) == (0 as Int32)
-    sqliteFinalize(prepared)
-    return StreamResult.Failure(QueryFailure.Provider("SQLite streaming plan is not read-only"), 0)
+    return StreamResult.Failure(QueryFailure.Provider(sqliteFinalizeFailure(database, prepared, ProviderFailure.State("SQLite streaming plan is not read-only"))), 0)
   end
   if sqliteColumnCount(prepared) as Int != plan.columns().count()
-    sqliteFinalize(prepared)
-    return StreamResult.Failure(QueryFailure.Provider("SQLite streaming result column count mismatch"), 0)
+    return StreamResult.Failure(QueryFailure.Provider(sqliteFinalizeFailure(database, prepared, ProviderFailure.State("SQLite streaming result column count mismatch"))), 0)
   end
   if sqliteParameterCount(prepared) != (plan.parameters().count() as Int32)
-    sqliteFinalize(prepared)
-    return StreamResult.Failure(QueryFailure.Provider("SQLite streaming parameter count mismatch"), 0)
+    return StreamResult.Failure(QueryFailure.Provider(sqliteFinalizeFailure(database, prepared, ProviderFailure.State("SQLite streaming parameter count mismatch"))), 0)
   end
   let bound = bindParameters(database, prepared, plan.parameters())
 
   match bound
     case SQLiteBindResult.Failure(message, buffers)
-      sqliteFinalize(prepared)
+      let failure = sqliteFinalizeFailure(database, prepared, message)
+
       freeBuffers(buffers)
-      return StreamResult.Failure(QueryFailure.Provider(message), 0)
+      return StreamResult.Failure(QueryFailure.Provider(failure), 0)
     case SQLiteBindResult.Bound(buffers)
       let result = sqliteStreamRows(database, prepared, plan, visit, deadline)
       let finalized = sqliteFinalize(prepared)
@@ -136,14 +213,38 @@ unsafe def sqliteStreamPrepared(database: Void*, plan: readonly StreamPlan, visi
       match result
         case StreamResult.Completed(count)
           if finalized != (0 as Int32)
-            return StreamResult.Failure(QueryFailure.Provider("SQLite streaming finalize failed"), count)
+            return StreamResult.Failure(QueryFailure.Provider(sqliteFailure(database, "stream.finalize", finalized)), count)
           end
           return StreamResult.Completed(count)
         case StreamResult.Stopped(count)
+          if finalized != (0 as Int32)
+            return StreamResult.Failure(QueryFailure.Provider(sqliteFailure(database, "stream.finalize", finalized)), count)
+          end
           return StreamResult.Stopped(count)
         case StreamResult.Cancelled(count)
+          if finalized != (0 as Int32) && finalized != deadline.interruptedStatus
+            return StreamResult.Failure(QueryFailure.Provider(sqliteFailure(database, "stream.finalize", finalized)), count)
+          end
           return StreamResult.Cancelled(count)
         case StreamResult.Failure(error, count)
+          if finalized != (0 as Int32)
+            match error
+              case QueryFailure.Provider(primary)
+                if sqliteRepeatsFailure(primary, finalized)
+                  return StreamResult.Failure(error, count)
+                end
+              case QueryFailure.Cleanup(failure)
+              case QueryFailure.InvalidIdentifier(name)
+              case QueryFailure.InvalidLimit(value, maximum)
+              case QueryFailure.MissingLimit(maximum)
+              case QueryFailure.SourceMismatch(expected, actual)
+              case QueryFailure.UnsupportedCapability(name)
+              case QueryFailure.MissingColumn(name)
+              case QueryFailure.TypeMismatch(column, expected, actual)
+              case QueryFailure.Cardinality(expected, actual)
+            end
+            return StreamResult.Failure(QueryFailure.Cleanup(new QueryCleanupFailure(error, sqliteFailure(database, "stream.finalize", finalized))), count)
+          end
           return StreamResult.Failure(error, count)
       end
   end
@@ -164,19 +265,19 @@ unsafe def sqliteStreamRows(database: Void*, statement: Void*, plan: readonly St
       return StreamResult.Completed(count)
     end
     if step != (100 as Int32)
-      let message = sqliteMessage(database)
+      let message = sqliteFailure(database, "stream.step", step)
 
-      if step == (9 as Int32) && deadline.expired != (0 as Int32)
+      if sqliteStreamDeadlineError(step, deadline)
         return StreamResult.Cancelled(count)
       end
       return StreamResult.Failure(QueryFailure.Provider(message), count)
     end
     if maximum != null && count >= maximum
-      return StreamResult.Failure(QueryFailure.Provider("SQLite streaming result exceeds row limit"), count)
+      return StreamResult.Failure(QueryFailure.Provider(ProviderFailure.State("SQLite streaming result exceeds row limit")), count)
     end
     match decodeSQLiteColumns(statement, columns)
       case SQLiteColumnsResult.Failure(message)
-        return StreamResult.Failure(QueryFailure.Provider(message), count)
+        return StreamResult.Failure(QueryFailure.Provider(ProviderFailure.State(message)), count)
       case SQLiteColumnsResult.Values(values)
         let keepGoing = visit(new RawRow(values))
 
