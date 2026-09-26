@@ -50,24 +50,36 @@ quotation signature produce compile-time diagnostics.
 ## Expression and capture contract
 
 The body contains one `return` expression. Supported bound operations are
-parameter reads, field reads, scalar captures, `Int`, `Bool`, `String` and null
+parameter reads, field reads, scalar captures, `Int`, `Float`, `Bool`, `String` and null
 literals, primitive comparisons, Boolean conjunction and disjunction, Boolean
-negation and numeric negation. Field nodes retain the declaring field's resolved
-identity and static type. Parameter and capture nodes refer to indexed slots.
+negation, numeric negation and numeric `+`, `-`, `*` and `/` on operands of the
+same arithmetic type. `String + String` is represented as concatenation only
+for the standard `String.concat` operator. Ternary expressions require a Bool
+condition and compatible branch types, including a type with its optional
+form or null. Field nodes retain the declaring field's resolved identity and
+the static type at that occurrence. A null guard can refine an optional field
+path in its present branch, so that occurrence has the required type while
+the null-test occurrence retains its optional type. Parameter and capture nodes
+refer to indexed slots.
 
-Captures use immutable bindings and scalar `Bool`, `Int`, `String` or null values.
+Quotation bodies use the ordinary compiler's guarded member-path rules.
+Consumers still validate their own supported expression and mapping contracts;
+a narrowed node in an untyped, manually constructed Tree is not proof that a
+field or intermediate object is present.
+
+Captures use immutable bindings and scalar `Bool`, `Int`, `Float`, `String` or null values.
 Each captured binding is read once when the quotation is constructed. Repeated
-reads in the expression refer to the same capture slot. Optional `Bool?`, `Int?`
-and `String?` values use the standard `quotation::captureBool`,
-`quotation::captureInt` and `quotation::captureText` helpers, preserving either
+reads in the expression refer to the same capture slot. Optional `Bool?`, `Int?`,
+`Float?` and `String?` values use the standard `quotation::captureBool`,
+`quotation::captureInt`, `quotation::captureFloat` and `quotation::captureText` helpers, preserving either
 the scalar value or `CaptureValue.Null` without a conversion. Field packs use
 the same validated capture ABI. A different optional type is rejected.
 
-Calls, including overloaded operators represented as calls, require additional
-representation support. They currently produce `NR276`, as do unsupported
-operations such as indexing, casts, arithmetic and control-flow statements.
-Ordinary type and member errors retain their standard diagnostics. Operation
-diagnostics point to the bound operation's source span.
+Standard `String` equality, inequality and concatenation operator syntax is
+represented by dedicated nodes. Direct method calls and custom overloaded
+operators produce `NR276`, as do unsupported operations such as indexing and
+casts. Ordinary type and member errors retain their standard diagnostics.
+Operation diagnostics point to the bound operation's source span.
 
 ## Inspection
 
@@ -75,9 +87,13 @@ diagnostics point to the bound operation's source span.
 index, node and capture counts, parameter types and result type. `nodeAt`,
 `captureAt` and `parameterTypeAt` return null for an invalid index.
 
-Each `Node` exposes its closed `NodeKind`, static type, child indices, parameter
-or capture index, field identity and literal payload. `CaptureValue` has `Bool`,
-`Int`, `Text` and `Null` cases. Tree arrays remain private. A manually constructed
+Each `Node` exposes its closed `NodeKind`, static type, three child indices,
+parameter or capture index, field identity and literal payload. Binary nodes use
+`first()` and `second()`; `Conditional` uses `first()` for its condition,
+`second()` for its true branch and `third()` for its false branch. Other nodes
+leave `third()` at `-1`. `CaptureValue` has `Bool`,
+`Int`, `Float`, `Text` and `Null` cases. Float literals use `FloatLiteral` and
+`Node.floatValue()`. Tree arrays remain private. A manually constructed
 `Tree` is an untyped data value; the compiler constructs typed quotation wrappers
 from checked expressions.
 

@@ -1,0 +1,832 @@
+use neri_data
+use test
+use host
+
+class ScalarNode
+  public code: String
+  public parentCode: String?
+
+  def init(code: String, parentCode: String? = null): Void
+    this.code = code
+    this.parentCode = parentCode
+  end
+end
+
+class OptionalIntNode
+  public id: Int
+  public parentId: Int?
+
+  def init(id: Int, parentId: Int? = null): Void
+    this.id = id
+    this.parentId = parentId
+  end
+end
+
+class ScalarWriteProvider: Provider
+  private lease: Int = 0
+  private state: TransactionState = TransactionState.RolledBack()
+  public sawBoundText: Bool = false
+  public commands: Int = 0
+  public updateAt: Int = 0
+  public deleteAt: Int = 0
+  public nextGeneratedKey: Int = 50
+  public savepointEnabled: Bool = false
+  public failAtCommand: Int = -1
+  public savepointRollbacks: Int = 0
+  public savepointReleases: Int = 0
+  public rollbackFault: Int = 0
+  public releaseFault: Int = 0
+  private savepointId: Int = 0
+
+  public override readonly def supports(capability: ProviderCapability): Bool
+    match capability
+      case ProviderCapability.WindowFunctions()
+        return false
+      case ProviderCapability.CheckedScalarExpressions()
+        return false
+      case ProviderCapability.Savepoints()
+        return this.savepointEnabled
+      case ProviderCapability.BoundedTypedReads()
+        return true
+      case ProviderCapability.TrackedWrites()
+        return true
+      case ProviderCapability.SetWrites()
+        return true
+      case ProviderCapability.ExplicitTransactions()
+        return true
+      case ProviderCapability.StreamingReads()
+        return true
+    end
+  end
+
+  public override readonly def dialect(): SqlDialect
+    return SqlDialect.QuestionMark()
+  end
+
+  public override def execute(plan: readonly SqlPlan): ProviderResult
+    return ProviderResult.Rows([])
+  end
+
+  public override def beginTransaction(): TransactionOpenResult
+    this.lease = this.lease + 1
+    this.state = TransactionState.Active()
+    return TransactionOpenResult.Begun(this.lease)
+  end
+
+  public override def writeBatchInTransaction(batch: readonly WriteBatch, lease: Int): WriteResult
+    if lease != this.lease
+      return WriteResult.Failure(WriteFailure.Transaction("wrong lease"))
+    end
+    var command = batch.first()
+    let outputs = new WriteReturnedRows()
+    var generated = false
+
+    while command != null
+      this.commands = this.commands + 1
+      if this.commands == this.failAtCommand
+        return WriteResult.Failure(WriteFailure.Constraint("synthetic dependent failure"))
+      end
+      let statement = command.command().sql()
+
+      if host::stringByteLength(statement) >= 6 && host::stringSlice(statement, 0, 6) == "UPDATE"
+        this.updateAt = this.commands
+      end
+      if host::stringByteLength(statement) >= 6 && host::stringSlice(statement, 0, 6) == "DELETE"
+        this.deleteAt = this.commands
+      end
+      var parameter = command.command().parameters().first()
+
+      while parameter != null
+        match parameter.value()
+          case Cell.Text(value)
+            if this.commands >= 2 && value == "O'Reilly; -- 水"
+              this.sawBoundText = true
+            end
+          case Cell.Int(value)
+          case Cell.Float(value)
+          case Cell.Bool(value)
+          case Cell.Null()
+        end
+        parameter = parameter.next()
+      end
+      let columns = command.command().returningColumns()
+
+      if columns == null
+        outputs.add(null)
+      else
+        generated = true
+        outputs.add(new RawRow([new RawColumn(columns.at(0).name(), Cell.Int(this.nextGeneratedKey))]))
+        this.nextGeneratedKey = this.nextGeneratedKey + 1
+      end
+      command = command.next()
+    end
+    if generated
+      return WriteResult.SavedWithValues(batch.count(), outputs)
+    end
+    return WriteResult.Saved(batch.count())
+  end
+
+  public override def commitTransaction(lease: Int): WriteResult
+    if lease != this.lease
+      return WriteResult.Failure(WriteFailure.Transaction("wrong lease"))
+    end
+    this.state = TransactionState.Committed()
+    return WriteResult.Saved(0)
+  end
+
+  public override def rollbackTransaction(lease: Int): WriteResult
+    if lease != this.lease
+      return WriteResult.Failure(WriteFailure.Transaction("wrong lease"))
+    end
+    this.state = TransactionState.RolledBack()
+    return WriteResult.Saved(0)
+  end
+
+  public override def transactionState(lease: Int): TransactionState
+    if lease != this.lease
+      return TransactionState.Invalid()
+    end
+    return this.state
+  end
+
+  public override def createSavepoint(lease: Int): SavepointOpenResult
+    if lease != this.lease || !this.savepointEnabled
+      return SavepointOpenResult.Failure(WriteFailure.Transaction("savepoint unavailable"))
+    end
+    this.savepointId = this.savepointId + 1
+    return SavepointOpenResult.Created(this.savepointId)
+  end
+
+  public override def rollbackToSavepoint(lease: Int, id: Int): WriteResult
+    if lease != this.lease || id != this.savepointId
+      return WriteResult.Failure(WriteFailure.Transaction("wrong savepoint"))
+    end
+    this.savepointRollbacks = this.savepointRollbacks + 1
+    if this.rollbackFault == 1
+      return WriteResult.Failure(WriteFailure.Transaction("synthetic savepoint rollback failure"))
+    end
+    if this.rollbackFault == 2
+      return WriteResult.Saved(1)
+    end
+    return WriteResult.Saved(0)
+  end
+
+  public override def releaseSavepoint(lease: Int, id: Int): WriteResult
+    if lease != this.lease || id != this.savepointId
+      return WriteResult.Failure(WriteFailure.Transaction("wrong savepoint"))
+    end
+    this.savepointReleases = this.savepointReleases + 1
+    if this.releaseFault == 1
+      return WriteResult.Failure(WriteFailure.Transaction("synthetic savepoint release failure"))
+    end
+    if this.releaseFault == 2
+      return WriteResult.Saved(1)
+    end
+    return WriteResult.Saved(0)
+  end
+end
+
+def captureScalarNode(value: ScalarNode): RawRow
+  return new RawRow([new RawColumn("code", Cell.Text(value.code)), new RawColumn("parent_code", cellOptionalString(value.parentCode))])
+end
+
+def captureOptionalIntNode(value: OptionalIntNode): RawRow
+  return new RawRow([new RawColumn("id", Cell.Int(value.id)), new RawColumn("parent_id", cellOptionalInt(value.parentId))])
+end
+
+def readScalarKey(value: ScalarNode): Cell
+  return Cell.Text(value.code)
+end
+
+def readScalarParent(value: ScalarNode): Cell
+  return cellOptionalString(value.parentCode)
+end
+
+def writeScalarParent(value: ScalarNode, cell: Cell): Void
+  match cell
+    case Cell.Text(text)
+      value.parentCode = text
+    case Cell.Null()
+      value.parentCode = null
+    case Cell.Int(number)
+      return
+    case Cell.Float(boolean)
+      test::assertTrue(false)
+    case Cell.Bool(boolean)
+      return
+  end
+end
+
+def wrongScalarKey(value: ScalarNode): Cell
+  return Cell.Int(7)
+end
+
+def wrongScalarParent(value: ScalarNode): Cell
+  return Cell.Int(7)
+end
+
+def ignoredScalarSetter(value: ScalarNode, cell: Cell): Void
+  return
+end
+
+def writeScalarCode(value: ScalarNode, cell: Cell): Void
+  match cell
+    case Cell.Text(text)
+      value.code = text
+    case Cell.Int(number)
+    case Cell.Float(boolean)
+    case Cell.Bool(boolean)
+    case Cell.Null()
+  end
+end
+
+def readIntKey(value: OptionalIntNode): Cell
+  return Cell.Int(value.id)
+end
+
+def readIntParent(value: OptionalIntNode): Cell
+  return cellOptionalInt(value.parentId)
+end
+
+def hasParentOne(value: OptionalIntNode): Bool
+  let parent = value.parentId
+
+  return parent != null && parent == 1
+end
+
+def parentEquals(value: OptionalIntNode, expected: Int): Bool
+  let parent = value.parentId
+
+  return parent != null && parent == expected
+end
+
+def writeIntParent(value: OptionalIntNode, cell: Cell): Void
+  match cell
+    case Cell.Int(number)
+      value.parentId = number
+    case Cell.Null()
+      value.parentId = null
+    case Cell.Text(text)
+      return
+    case Cell.Float(boolean)
+      test::assertTrue(false)
+    case Cell.Bool(boolean)
+      return
+  end
+end
+
+def setGeneratedIntKey(value: OptionalIntNode, key: Int): Void
+  value.id = key
+end
+
+def expectScalarSaved(result: WriteResult, expected: Int): Void
+  match result
+    case WriteResult.Saved(count)
+      test::assertEqual(count, expected)
+    case WriteResult.SavedWithValues(count, outputs)
+      test::assertTrue(false)
+    case WriteResult.Failure(error)
+      test::assertTrue(false)
+  end
+end
+
+def expectScalarFailure(result: WriteResult): Void
+  match result
+    case WriteResult.Failure(error)
+      return
+    case WriteResult.Saved(count)
+      test::assertTrue(false)
+    case WriteResult.SavedWithValues(count, outputs)
+      test::assertTrue(false)
+  end
+end
+
+def verifySavepointFault(mode: Int): Void
+  let provider = new ScalarWriteProvider()
+
+  provider.savepointEnabled = true
+  provider.failAtCommand = 2
+  if mode == 1 || mode == 2
+    provider.rollbackFault = mode
+  else
+    provider.releaseFault = mode - 2
+  end
+  let columns = new ResultColumns([new ResultColumn("id", ResultColumnKind.Int()), new ResultColumn("parent_id", ResultColumnKind.Int(), true)])
+  let tracker = new EntityTracker<OptionalIntNode>("generated_nodes", "id", columns, captureOptionalIntNode, generatedKey: true, setGeneratedKey: setGeneratedIntKey)
+  let changes = new ChangeContext(provider)
+  let parent = new OptionalIntNode(0)
+  let child = new OptionalIntNode(0)
+  var parentHandle: TrackedHandle<OptionalIntNode>? = null
+  var childHandle: TrackedHandle<OptionalIntNode>? = null
+
+  changes.register(tracker.changeSet())
+  match tracker.addWithHandle(parent)
+    case TrackHandleResult.Tracked(handle)
+      parentHandle = handle
+    case TrackHandleResult.Failure(error)
+      test::assertTrue(false)
+  end
+  match tracker.addWithHandle(child)
+    case TrackHandleResult.Tracked(handle)
+      childHandle = handle
+    case TrackHandleResult.Failure(error)
+      test::assertTrue(false)
+  end
+  if parentHandle == null || childHandle == null
+    return
+  end
+  let temporaryParent = parent.id
+  let temporaryChild = child.id
+  let link = new ScalarRelationshipLink<OptionalIntNode, OptionalIntNode>(parentHandle, childHandle, readIntKey, readIntParent, writeIntParent, ResultColumnKind.Int(), true, "parent_id")
+
+  test::assertTrue(changes.registerRelation(link.edge()) == null)
+  expectScalarSaved(changes.beginTransaction(), 0)
+  expectScalarFailure(changes.saveChanges())
+  expectScalarFailure(changes.saveChanges())
+  expectScalarFailure(changes.commitTransaction())
+  expectScalarSaved(changes.rollbackTransaction(), 0)
+
+  test::assertEqual(parent.id, temporaryParent)
+  test::assertEqual(child.id, temporaryChild)
+  test::assertTrue(parentEquals(child, temporaryParent))
+  provider.failAtCommand = -1
+  provider.rollbackFault = 0
+  provider.releaseFault = 0
+  expectScalarSaved(changes.saveChanges(), 2)
+end
+
+def main(): Void
+  verifySavepointFault(1)
+  verifySavepointFault(2)
+  verifySavepointFault(3)
+  verifySavepointFault(4)
+  let provider = new ScalarWriteProvider()
+  let columns = new ResultColumns([new ResultColumn("code", ResultColumnKind.Text()), new ResultColumn("parent_code", ResultColumnKind.Text(), true)])
+  let tracker = new EntityTracker<ScalarNode>("nodes", "code", columns, captureScalarNode)
+  let changes = new ChangeContext(provider)
+  let parent = new ScalarNode("O'Reilly; -- 水")
+  let child = new ScalarNode("child")
+  var parentHandle: TrackedHandle<ScalarNode>? = null
+  var childHandle: TrackedHandle<ScalarNode>? = null
+
+  changes.register(tracker.changeSet())
+  match tracker.addWithHandle(parent)
+    case TrackHandleResult.Tracked(handle)
+      parentHandle = handle
+    case TrackHandleResult.Failure(error)
+      test::assertTrue(false)
+  end
+  match tracker.addWithHandle(child)
+    case TrackHandleResult.Tracked(handle)
+      childHandle = handle
+    case TrackHandleResult.Failure(error)
+      test::assertTrue(false)
+  end
+
+  test::assertTrue(parentHandle != null && childHandle != null)
+  if parentHandle == null || childHandle == null
+    return
+  end
+  let wrongKind = new ScalarRelationshipLink<ScalarNode, ScalarNode>(parentHandle, childHandle, readScalarKey, readScalarParent, writeScalarParent, ResultColumnKind.Bool(), true, "parent_code")
+
+  test::assertTrue(changes.registerRelation(wrongKind.edge()) != null)
+  test::assertTrue(child.parentCode == null)
+  let wrongPrincipal = new ScalarRelationshipLink<ScalarNode, ScalarNode>(parentHandle, childHandle, wrongScalarKey, readScalarParent, writeScalarParent, ResultColumnKind.Text(), true, "parent_code")
+
+  test::assertTrue(changes.registerRelation(wrongPrincipal.edge()) != null)
+  test::assertTrue(child.parentCode == null)
+  let wrongForeign = new ScalarRelationshipLink<ScalarNode, ScalarNode>(parentHandle, childHandle, readScalarKey, wrongScalarParent, writeScalarParent, ResultColumnKind.Text(), true, "parent_code")
+
+  test::assertTrue(changes.registerRelation(wrongForeign.edge()) != null)
+  test::assertTrue(child.parentCode == null)
+  let required = new ScalarRelationshipLink<ScalarNode, ScalarNode>(parentHandle, childHandle, readScalarKey, readScalarParent, writeScalarParent, ResultColumnKind.Text(), false, "parent_code")
+
+  test::assertTrue(changes.registerRelation(required.edge()) != null)
+  test::assertTrue(child.parentCode == null)
+  let ignoredSetter = new ScalarRelationshipLink<ScalarNode, ScalarNode>(parentHandle, childHandle, readScalarKey, readScalarParent, ignoredScalarSetter, ResultColumnKind.Text(), true, "parent_code")
+
+  test::assertTrue(changes.registerRelation(ignoredSetter.edge()) != null)
+  test::assertTrue(child.parentCode == null)
+  let valid = new ScalarRelationshipLink<ScalarNode, ScalarNode>(parentHandle, childHandle, readScalarKey, readScalarParent, writeScalarParent, ResultColumnKind.Text(), true, "parent_code")
+
+  test::assertTrue(changes.registerRelation(valid.edge()) == null)
+  let assignedText = child.parentCode
+
+  test::assertTrue(assignedText != null)
+  if assignedText != null
+    test::assertEqual(assignedText, parent.code)
+  end
+  expectScalarSaved(changes.saveChanges(), 2)
+
+  test::assertTrue(provider.sawBoundText)
+  test::assertEqual(provider.commands, 2)
+
+  ## A registered link retains its parent when a nullable FK is cleared locally.
+  child.parentCode = null
+  expectScalarSaved(changes.saveChanges(), 0)
+
+  let restoredParentCode = child.parentCode
+
+  test::assertTrue(restoredParentCode != null)
+  if restoredParentCode != null
+    test::assertEqual(restoredParentCode, parent.code)
+  end
+
+  test::assertEqual(provider.commands, 2)
+  let savedChild = tracker.original(child)
+
+  test::assertTrue(savedChild != null)
+  if savedChild != null
+    match savedChild.value("parent_code")
+      case CellLookup.Found(cell)
+        match cell
+          case Cell.Text(value)
+            test::assertEqual(value, parent.code)
+          case Cell.Null()
+            test::assertTrue(false)
+          case Cell.Int(value)
+            test::assertTrue(false)
+          case Cell.Float(value)
+            test::assertTrue(false)
+          case Cell.Bool(value)
+            test::assertTrue(false)
+        end
+      case CellLookup.Missing()
+        test::assertTrue(false)
+        test::assertTrue(false)
+    end
+  end
+
+  let intProvider = new ScalarWriteProvider()
+  let intColumns = new ResultColumns([new ResultColumn("id", ResultColumnKind.Int()), new ResultColumn("parent_id", ResultColumnKind.Int(), true)])
+  let intTracker = new EntityTracker<OptionalIntNode>("int_nodes", "id", intColumns, captureOptionalIntNode)
+  let intChanges = new ChangeContext(intProvider)
+  let intParent = new OptionalIntNode(1)
+  let intChild = new OptionalIntNode(2)
+  var intParentHandle: TrackedHandle<OptionalIntNode>? = null
+  var intChildHandle: TrackedHandle<OptionalIntNode>? = null
+
+  intChanges.register(intTracker.changeSet())
+  match intTracker.attachWithHandle(intParent)
+    case TrackHandleResult.Tracked(handle)
+      intParentHandle = handle
+    case TrackHandleResult.Failure(error)
+      test::assertTrue(false)
+  end
+  match intTracker.attachWithHandle(intChild)
+    case TrackHandleResult.Tracked(handle)
+      intChildHandle = handle
+    case TrackHandleResult.Failure(error)
+      test::assertTrue(false)
+  end
+
+  test::assertTrue(intParentHandle != null && intChildHandle != null)
+  if intParentHandle != null && intChildHandle != null
+    let optional = new ScalarRelationshipLink<OptionalIntNode, OptionalIntNode>(intParentHandle, intChildHandle, readIntKey, readIntParent, writeIntParent, ResultColumnKind.Int(), true, "parent_id")
+
+    test::assertTrue(intChanges.registerRelation(optional.edge()) == null)
+    let assignedInt = intChild.parentId
+
+    test::assertTrue(assignedInt != null)
+    if assignedInt != null
+      test::assertEqual(assignedInt, 1)
+    end
+    let alternate = new OptionalIntNode(3)
+    var alternateHandle: TrackedHandle<OptionalIntNode>? = null
+
+    match intTracker.attachWithHandle(alternate)
+      case TrackHandleResult.Tracked(handle)
+        alternateHandle = handle
+      case TrackHandleResult.Failure(error)
+        test::assertTrue(false)
+    end
+    if alternateHandle != null
+      let conflict = new ScalarRelationshipLink<OptionalIntNode, OptionalIntNode>(alternateHandle, intChildHandle, readIntKey, readIntParent, writeIntParent, ResultColumnKind.Int(), true, "parent_id")
+
+      test::assertTrue(intChanges.registerRelation(conflict.edge()) != null)
+      test::assertTrue(hasParentOne(intChild))
+    end
+    let foreignProvider = new ScalarWriteProvider()
+    let foreignTracker = new EntityTracker<OptionalIntNode>("int_nodes", "id", intColumns, captureOptionalIntNode)
+    let foreignContext = new ChangeContext(foreignProvider)
+    var foreignHandle: TrackedHandle<OptionalIntNode>? = null
+
+    foreignContext.register(foreignTracker.changeSet())
+    match foreignTracker.attachWithHandle(new OptionalIntNode(4))
+      case TrackHandleResult.Tracked(handle)
+        foreignHandle = handle
+      case TrackHandleResult.Failure(error)
+        test::assertTrue(false)
+    end
+    if foreignHandle != null
+      let wrongContext = new ScalarRelationshipLink<OptionalIntNode, OptionalIntNode>(foreignHandle, intChildHandle, readIntKey, readIntParent, writeIntParent, ResultColumnKind.Int(), true, "other_parent_id")
+
+      test::assertTrue(intChanges.registerRelation(wrongContext.edge()) != null)
+      test::assertTrue(hasParentOne(intChild))
+    end
+
+    test::assertTrue(intTracker.detach(intParent) == null)
+    let stale = new ScalarRelationshipLink<OptionalIntNode, OptionalIntNode>(intParentHandle, intChildHandle, readIntKey, readIntParent, writeIntParent, ResultColumnKind.Int(), true, "another_parent_id")
+
+    test::assertTrue(intChanges.registerRelation(stale.edge()) != null)
+    test::assertTrue(hasParentOne(intChild))
+  end
+
+  let generatedProvider = new ScalarWriteProvider()
+  let generatedTracker = new EntityTracker<OptionalIntNode>("generated_nodes", "id", intColumns, captureOptionalIntNode, generatedKey: true, setGeneratedKey: setGeneratedIntKey)
+  let generatedChanges = new ChangeContext(generatedProvider)
+  let generatedParent = new OptionalIntNode(0)
+  let generatedChild = new OptionalIntNode(0)
+  var generatedParentHandle: TrackedHandle<OptionalIntNode>? = null
+  var generatedChildHandle: TrackedHandle<OptionalIntNode>? = null
+
+  generatedChanges.register(generatedTracker.changeSet())
+  match generatedTracker.addWithHandle(generatedParent)
+    case TrackHandleResult.Tracked(handle)
+      generatedParentHandle = handle
+    case TrackHandleResult.Failure(error)
+      test::assertTrue(false)
+  end
+  match generatedTracker.addWithHandle(generatedChild)
+    case TrackHandleResult.Tracked(handle)
+      generatedChildHandle = handle
+    case TrackHandleResult.Failure(error)
+      test::assertTrue(false)
+  end
+  if generatedParentHandle != null && generatedChildHandle != null
+    let temporaryParent = generatedParent.id
+    let temporaryChild = generatedChild.id
+    let generatedLink = new ScalarRelationshipLink<OptionalIntNode, OptionalIntNode>(generatedParentHandle, generatedChildHandle, readIntKey, readIntParent, writeIntParent, ResultColumnKind.Int(), true, "parent_id")
+
+    test::assertTrue(generatedChanges.registerRelation(generatedLink.edge()) == null)
+    test::assertTrue(parentEquals(generatedChild, temporaryParent))
+    expectScalarSaved(generatedChanges.beginTransaction(), 0)
+    expectScalarSaved(generatedChanges.saveChanges(), 2)
+
+    test::assertEqual(generatedParent.id, 50)
+    test::assertTrue(parentEquals(generatedChild, 50))
+    expectScalarSaved(generatedChanges.rollbackTransaction(), 0)
+
+    test::assertEqual(generatedParent.id, temporaryParent)
+    test::assertEqual(generatedChild.id, temporaryChild)
+    test::assertTrue(parentEquals(generatedChild, temporaryParent))
+  end
+
+  let unlinkProvider = new ScalarWriteProvider()
+  let unlinkTracker = new EntityTracker<ScalarNode>("nodes", "code", columns, captureScalarNode)
+  let unlinkChanges = new ChangeContext(unlinkProvider)
+  let oldParent = new ScalarNode("old")
+  let orphan = new ScalarNode("orphan", "old")
+  var oldHandle: TrackedHandle<ScalarNode>? = null
+  var orphanHandle: TrackedHandle<ScalarNode>? = null
+
+  unlinkChanges.register(unlinkTracker.changeSet())
+  match unlinkTracker.attachWithHandle(oldParent)
+    case TrackHandleResult.Tracked(handle)
+      oldHandle = handle
+    case TrackHandleResult.Failure(error)
+      test::assertTrue(false)
+  end
+  match unlinkTracker.attachWithHandle(orphan)
+    case TrackHandleResult.Tracked(handle)
+      orphanHandle = handle
+    case TrackHandleResult.Failure(error)
+      test::assertTrue(false)
+  end
+  if oldHandle != null && orphanHandle != null
+    let oldLink = new ScalarRelationshipLink<ScalarNode, ScalarNode>(oldHandle, orphanHandle, readScalarKey, readScalarParent, writeScalarParent, ResultColumnKind.Text(), true, "parent_code")
+
+    test::assertTrue(unlinkChanges.registerRelation(oldLink.edge()) == null)
+    test::assertTrue(unlinkRelation(unlinkChanges, orphanHandle, "parent_code") == null)
+    test::assertTrue(orphan.parentCode == null)
+    expectScalarSaved(unlinkChanges.beginTransaction(), 0)
+    expectScalarSaved(unlinkChanges.commitTransaction(), 0)
+
+    test::assertTrue(unlinkTracker.remove(oldParent) == null)
+    expectScalarSaved(unlinkChanges.saveChanges(), 2)
+
+    test::assertTrue(unlinkProvider.updateAt > 0)
+    test::assertTrue(unlinkProvider.deleteAt > unlinkProvider.updateAt)
+  end
+
+  let moveProvider = new ScalarWriteProvider()
+  let moveTracker = new EntityTracker<ScalarNode>("nodes", "code", columns, captureScalarNode)
+  let moveChanges = new ChangeContext(moveProvider)
+  let moveOld = new ScalarNode("move-old")
+  let moveNew = new ScalarNode("move-new")
+  let moved = new ScalarNode("moved", "move-old")
+  var moveOldHandle: TrackedHandle<ScalarNode>? = null
+  var moveNewHandle: TrackedHandle<ScalarNode>? = null
+  var movedHandle: TrackedHandle<ScalarNode>? = null
+
+  moveChanges.register(moveTracker.changeSet())
+  match moveTracker.attachWithHandle(moveOld)
+    case TrackHandleResult.Tracked(handle)
+      moveOldHandle = handle
+    case TrackHandleResult.Failure(error)
+      test::assertTrue(false)
+  end
+  match moveTracker.attachWithHandle(moveNew)
+    case TrackHandleResult.Tracked(handle)
+      moveNewHandle = handle
+    case TrackHandleResult.Failure(error)
+      test::assertTrue(false)
+  end
+  match moveTracker.attachWithHandle(moved)
+    case TrackHandleResult.Tracked(handle)
+      movedHandle = handle
+    case TrackHandleResult.Failure(error)
+      test::assertTrue(false)
+  end
+  if moveOldHandle != null && moveNewHandle != null && movedHandle != null
+    let initial = new ScalarRelationshipLink<ScalarNode, ScalarNode>(moveOldHandle, movedHandle, readScalarKey, readScalarParent, writeScalarParent, ResultColumnKind.Text(), true, "parent_code")
+    let replacement = new ScalarRelationshipLink<ScalarNode, ScalarNode>(moveNewHandle, movedHandle, readScalarKey, readScalarParent, writeScalarParent, ResultColumnKind.Text(), true, "parent_code")
+
+    test::assertTrue(moveChanges.registerRelation(initial.edge()) == null)
+    test::assertTrue(moveChanges.reassignRelation(replacement.edge()) == null)
+    let assigned = moved.parentCode
+
+    test::assertTrue(assigned != null)
+    if assigned != null
+      test::assertEqual(assigned, moveNew.code)
+    end
+
+    test::assertTrue(moveTracker.remove(moveOld) == null)
+    expectScalarSaved(moveChanges.saveChanges(), 2)
+
+    test::assertTrue(moveProvider.updateAt > 0)
+    test::assertTrue(moveProvider.deleteAt > moveProvider.updateAt)
+  end
+
+  let churnProvider = new ScalarWriteProvider()
+  let churnTracker = new EntityTracker<ScalarNode>("nodes", "code", columns, captureScalarNode)
+  let churnChanges = new ChangeContext(churnProvider)
+  let churnA = new ScalarNode("A")
+  let churnB = new ScalarNode("B")
+  let churnChild = new ScalarNode("child")
+  var churnAHandle: TrackedHandle<ScalarNode>? = null
+  var churnBHandle: TrackedHandle<ScalarNode>? = null
+  var churnChildHandle: TrackedHandle<ScalarNode>? = null
+
+  churnChanges.register(churnTracker.changeSet())
+  match churnTracker.addWithHandle(churnA)
+    case TrackHandleResult.Tracked(handle)
+      churnAHandle = handle
+    case TrackHandleResult.Failure(error)
+      test::assertTrue(false)
+  end
+  match churnTracker.addWithHandle(churnB)
+    case TrackHandleResult.Tracked(handle)
+      churnBHandle = handle
+    case TrackHandleResult.Failure(error)
+      test::assertTrue(false)
+  end
+  match churnTracker.addWithHandle(churnChild)
+    case TrackHandleResult.Tracked(handle)
+      churnChildHandle = handle
+    case TrackHandleResult.Failure(error)
+      test::assertTrue(false)
+  end
+  if churnAHandle != null && churnBHandle != null && churnChildHandle != null
+    let linkA = new ScalarRelationshipLink<ScalarNode, ScalarNode>(churnAHandle, churnChildHandle, readScalarKey, readScalarParent, writeScalarParent, ResultColumnKind.Text(), true, "parent_code")
+    let linkB = new ScalarRelationshipLink<ScalarNode, ScalarNode>(churnBHandle, churnChildHandle, readScalarKey, readScalarParent, writeScalarParent, ResultColumnKind.Text(), true, "parent_code")
+    let backA = new ScalarRelationshipLink<ScalarNode, ScalarNode>(churnAHandle, churnChildHandle, readScalarKey, readScalarParent, writeScalarParent, ResultColumnKind.Text(), true, "parent_code")
+
+    test::assertTrue(churnChanges.registerRelation(linkA.edge()) == null)
+    test::assertTrue(churnChanges.reassignRelation(linkB.edge()) == null)
+    test::assertTrue(churnChanges.reassignRelation(backA.edge()) == null)
+    test::assertTrue(unlinkRelation(churnChanges, churnChildHandle, "parent_code") == null)
+    let relinkB = new ScalarRelationshipLink<ScalarNode, ScalarNode>(churnBHandle, churnChildHandle, readScalarKey, readScalarParent, writeScalarParent, ResultColumnKind.Text(), true, "parent_code")
+
+    test::assertTrue(churnChanges.registerRelation(relinkB.edge()) == null)
+    expectScalarSaved(churnChanges.saveChanges(), 3)
+    let chosen = churnChild.parentCode
+
+    test::assertTrue(chosen != null)
+    if chosen != null
+      test::assertEqual(chosen, "B")
+    end
+    let identifying = new ScalarRelationshipLink<ScalarNode, ScalarNode>(churnBHandle, churnBHandle, readScalarKey, readScalarKey, writeScalarCode, ResultColumnKind.Text(), false, "code")
+
+    test::assertTrue(churnChanges.registerRelation(identifying.edge()) == null)
+    let changeKey = new ScalarRelationshipLink<ScalarNode, ScalarNode>(churnAHandle, churnBHandle, readScalarKey, readScalarKey, writeScalarCode, ResultColumnKind.Text(), false, "code")
+
+    test::assertTrue(churnChanges.reassignRelation(changeKey.edge()) != null)
+    test::assertEqual(churnB.code, "B")
+  end
+
+  let selfProvider = new ScalarWriteProvider()
+  let selfTracker = new EntityTracker<ScalarNode>("nodes", "code", columns, captureScalarNode)
+  let selfChanges = new ChangeContext(selfProvider)
+  let selfNode = new ScalarNode("self", "self")
+  var selfHandle: TrackedHandle<ScalarNode>? = null
+
+  selfChanges.register(selfTracker.changeSet())
+  match selfTracker.attachWithHandle(selfNode)
+    case TrackHandleResult.Tracked(handle)
+      selfHandle = handle
+    case TrackHandleResult.Failure(error)
+      test::assertTrue(false)
+  end
+  if selfHandle != null
+    let selfLink = new ScalarRelationshipLink<ScalarNode, ScalarNode>(selfHandle, selfHandle, readScalarKey, readScalarParent, writeScalarParent, ResultColumnKind.Text(), true, "parent_code")
+
+    test::assertTrue(selfChanges.registerRelation(selfLink.edge()) == null)
+    test::assertTrue(unlinkRelation(selfChanges, selfHandle, "parent_code") == null)
+    test::assertTrue(selfTracker.remove(selfNode) == null)
+    expectScalarSaved(selfChanges.saveChanges(), 1)
+  end
+
+  let activeSelfProvider = new ScalarWriteProvider()
+  let activeSelfTracker = new EntityTracker<ScalarNode>("nodes", "code", columns, captureScalarNode)
+  let activeSelfChanges = new ChangeContext(activeSelfProvider)
+  let activeSelfNode = new ScalarNode("active-self", "active-self")
+  var activeSelfHandle: TrackedHandle<ScalarNode>? = null
+
+  activeSelfChanges.register(activeSelfTracker.changeSet())
+  match activeSelfTracker.attachWithHandle(activeSelfNode)
+    case TrackHandleResult.Tracked(handle)
+      activeSelfHandle = handle
+    case TrackHandleResult.Failure(error)
+      test::assertTrue(false)
+  end
+  if activeSelfHandle != null
+    let activeSelfLink = new ScalarRelationshipLink<ScalarNode, ScalarNode>(activeSelfHandle, activeSelfHandle, readScalarKey, readScalarParent, writeScalarParent, ResultColumnKind.Text(), true, "parent_code")
+
+    test::assertTrue(activeSelfChanges.registerRelation(activeSelfLink.edge()) == null)
+    test::assertTrue(activeSelfTracker.remove(activeSelfNode) == null)
+    expectScalarSaved(activeSelfChanges.saveChanges(), 1)
+  end
+
+  let scopedProvider = new ScalarWriteProvider()
+
+  scopedProvider.savepointEnabled = true
+  let scopedTracker = new EntityTracker<OptionalIntNode>("generated_nodes", "id", intColumns, captureOptionalIntNode, generatedKey: true, setGeneratedKey: setGeneratedIntKey)
+  let scopedChanges = new ChangeContext(scopedProvider)
+  let prior = new OptionalIntNode(0)
+
+  scopedChanges.register(scopedTracker.changeSet())
+  expectScalarSaved(scopedChanges.beginTransaction(), 0)
+
+  test::assertTrue(scopedTracker.add(prior) == null)
+  expectScalarSaved(scopedChanges.saveChanges(), 1)
+
+  test::assertEqual(prior.id, 50)
+  let scopedParent = new OptionalIntNode(0)
+  let scopedChild = new OptionalIntNode(0)
+  var scopedParentHandle: TrackedHandle<OptionalIntNode>? = null
+  var scopedChildHandle: TrackedHandle<OptionalIntNode>? = null
+
+  match scopedTracker.addWithHandle(scopedParent)
+    case TrackHandleResult.Tracked(handle)
+      scopedParentHandle = handle
+    case TrackHandleResult.Failure(error)
+      test::assertTrue(false)
+  end
+  match scopedTracker.addWithHandle(scopedChild)
+    case TrackHandleResult.Tracked(handle)
+      scopedChildHandle = handle
+    case TrackHandleResult.Failure(error)
+      test::assertTrue(false)
+  end
+  if scopedParentHandle != null && scopedChildHandle != null
+    let temporaryParent = scopedParent.id
+    let temporaryChild = scopedChild.id
+    let scopedLink = new ScalarRelationshipLink<OptionalIntNode, OptionalIntNode>(scopedParentHandle, scopedChildHandle, readIntKey, readIntParent, writeIntParent, ResultColumnKind.Int(), true, "parent_id")
+
+    test::assertTrue(scopedChanges.registerRelation(scopedLink.edge()) == null)
+    scopedProvider.failAtCommand = scopedProvider.commands + 2
+    match scopedChanges.saveChanges()
+      case WriteResult.Failure(error)
+        match error
+          case WriteFailure.Constraint(message)
+          case WriteFailure.Provider(message)
+            test::assertTrue(false)
+          case WriteFailure.Validation(message)
+            test::assertTrue(false)
+          case WriteFailure.Concurrency(message)
+            test::assertTrue(false)
+          case WriteFailure.Unsupported(message)
+            test::assertTrue(false)
+          case WriteFailure.Transaction(message)
+            test::assertTrue(false)
+        end
+      case WriteResult.Saved(count)
+        test::assertTrue(false)
+      case WriteResult.SavedWithValues(count, outputs)
+        test::assertTrue(false)
+    end
+
+    test::assertEqual(scopedProvider.savepointRollbacks, 1)
+    test::assertEqual(scopedProvider.savepointReleases, 1)
+    test::assertEqual(prior.id, 50)
+    test::assertEqual(scopedParent.id, temporaryParent)
+    test::assertEqual(scopedChild.id, temporaryChild)
+    test::assertTrue(parentEquals(scopedChild, temporaryParent))
+    scopedProvider.failAtCommand = -1
+    expectScalarSaved(scopedChanges.saveChanges(), 2)
+    expectScalarSaved(scopedChanges.commitTransaction(), 0)
+
+    test::assertEqual(scopedProvider.savepointReleases, 2)
+  end
+end

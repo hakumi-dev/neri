@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 #include "neri/runtime_abi.h"
 #include "../runtime/terminal.h"
+#include "../runtime/worker_pool.h"
 #include <errno.h>
 #include <limits.h>
 #include <poll.h>
@@ -18,9 +19,13 @@ static struct sigaction previous[5];
 static volatile sig_atomic_t interrupted;
 static int active, registered;
 static int64_t generation;
-int neri_terminal_active(void) { return active; }
+int neri_terminal_active(void) {
+  if (neri_worker_thread_active()) return 0;
+  return active;
+}
 
 void neri_terminal_restore(void) {
+  if (neri_worker_thread_active()) return;
   if (!active) return;
   (void)tcsetattr(STDIN_FILENO, TCSANOW, &saved);
   const char reset[] = "\033[0m\033[?25h\033[?1049l";
@@ -32,6 +37,7 @@ void neri_terminal_restore(void) {
 static void interrupt_session(int number) { (void)number; interrupted = 1; }
 
 int64_t neri_rt_v1_terminal_open(void) {
+  if (neri_worker_thread_active()) return 0;
   if (active || neri_interrupt_active() || generation == INT64_MAX || !isatty(0) || !isatty(1) ||
       tcgetpgrp(0) != getpgrp() || tcgetattr(0, &saved) != 0) return 0;
   if (!registered) {
@@ -68,10 +74,12 @@ int64_t neri_rt_v1_terminal_open(void) {
 }
 
 void neri_rt_v1_terminal_close(int64_t token) {
+  if (neri_worker_thread_active()) return;
   if (active && token == generation) neri_terminal_restore();
 }
 
 int64_t neri_rt_v1_terminal_read(int64_t token, int64_t timeout) {
+  if (neri_worker_thread_active()) return -2;
   if (!active || token != generation || interrupted || timeout < 0 || timeout > 60000) return -2;
   struct pollfd input = {0, POLLIN, 0};
   const int ready = poll(&input, 1, (int)timeout);
@@ -83,6 +91,7 @@ int64_t neri_rt_v1_terminal_read(int64_t token, int64_t timeout) {
 }
 
 int64_t neri_rt_v1_terminal_size(int64_t token, int64_t rows) {
+  if (neri_worker_thread_active()) return 0;
   struct winsize size;
   if (!active || token != generation || ioctl(1, TIOCGWINSZ, &size) != 0) return 0;
   return rows ? size.ws_row : size.ws_col;

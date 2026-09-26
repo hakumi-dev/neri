@@ -1,0 +1,298 @@
+use quotation
+use tasks
+namespace neri_data
+
+## Post-join operations in call order: left/right/pair filter, presence, ordering, skip, take.
+class JoinStage
+  internal kind: Int
+  internal prior: JoinStage?
+  internal tree: readonly quotation::Tree?
+  internal descending: Bool
+  internal count: Int
+
+  internal def init(kind: Int, prior: JoinStage? = null, tree: readonly quotation::Tree? = null, descending: Bool = false, count: Int = 0): Void
+    this.kind = kind
+    this.prior = prior
+    this.tree = tree
+    this.descending = descending
+    this.count = count
+  end
+end
+
+class JoinStageNode
+  internal stage: JoinStage
+  internal next: JoinStageNode?
+
+  internal def init(stage: JoinStage, next: JoinStageNode?): Void
+    this.stage = stage
+    this.next = next
+  end
+end
+
+def joinStages(last: JoinStage?): JoinStageNode?
+  var current = last
+  var head: JoinStageNode? = null
+
+  while current != null
+    head = new JoinStageNode(current, head)
+    current = current.prior
+  end
+  return head
+end
+
+def joinOnlyTakes(stage: JoinStage?): Bool
+  var current = stage
+
+  while current != null
+    if current.kind != 10
+      return false
+    end
+    current = current.prior
+  end
+  return true
+end
+
+def joinHasOrder(stage: JoinStage?): Bool
+  var current = stage
+
+  while current != null
+    if current.kind >= 5 && current.kind <= 8
+      return true
+    end
+    current = current.prior
+  end
+  return false
+end
+
+def joinStagesValid(stage: JoinStage?): Bool
+  var current = stage
+  var count = 0
+
+  while current != null
+    count = count + 1
+
+    if count > 256
+      return false
+    end
+    current = current.prior
+  end
+  return true
+end
+
+def joinOrderSql(order: OrderTerm?, source: String): String
+  if order == null
+    return ""
+  end
+  var sql = " ORDER BY "
+  var current: OrderTerm? = order
+  var first = true
+
+  while current != null
+    sql = sql + (first ? "" : ", ") + quoted(source, current.column) + (current.descending ? " DESC" : " ASC")
+    first = false
+    current = current.next
+  end
+  return sql
+end
+
+def joinStageMapping(mapping: EntityMapping, source: String): EntityMapping
+  let columns: MappingColumn[] = tasks::generate(mapping.count(), 1) do |index|
+    return new MappingColumn("unused", "Int", "unused")
+  end
+  var index = 0
+
+  while index < mapping.count()
+    let column = mapping.columnAt(index)
+
+    if column != null
+      columns[index] = new MappingColumn(column.identity(), column.typeName(), column.column(), column.path())
+    end
+    index = index + 1
+  end
+  return new EntityMapping(mapping.entityType(), source, columns, presences: mappingPresenceCopy(mapping))
+end
+
+def joinStageFilter(stage: JoinStage, left: EntityMapping, right: EntityMapping, state: CompileState, source: String, dialect: SqlDialect): ExpressionCompileResult
+  let tree = stage.tree
+
+  if tree == null
+    return ExpressionCompileResult.Failure(QueryFailure.Provider("invalid join filter stage"))
+  end
+  let translation = stage.kind == 12 ? translateOptionalJoinQuotation(left, right, tree) : (stage.kind == 11 ? translateJoinQuotation(left, right, tree) : translateQuotation(stage.kind == 1 ? left : right, tree))
+
+  match translation
+    case TranslationResult.Failure(error)
+      let scalar = stage.kind == 11 || stage.kind == 12 ? compileJoinScalarQuotation(left, right, tree, state, dialect, stage.kind == 12) : compileScalarQuotation(stage.kind == 1 ? left : right, tree, "Bool", state, dialect)
+
+      match scalar
+        case ScalarSqlResult.Failure(failure)
+          return ExpressionCompileResult.Failure(failure)
+        case ScalarSqlResult.Value(value)
+          state.requiresCheckedScalars = state.requiresCheckedScalars || value.checkedScalars
+          return ExpressionCompileResult.Sql(value.sql)
+      end
+    case TranslationResult.Expression(expression)
+      if expression == null
+        return ExpressionCompileResult.Failure(QueryFailure.UnsupportedCapability("join filter predicate is empty"))
+      end
+      return compileExpression(expression, state, source, dialect)
+  end
+end
+
+def joinStageOrder(stage: JoinStage, mapping: EntityMapping): SelectionResult
+  let tree = stage.tree
+
+  if tree == null
+    return SelectionResult.Failure(QueryFailure.Provider("invalid join order stage"))
+  end
+  return translateSelection(mapping, tree)
+end
+
+def joinOrderColumns(columns: ResultColumns, alias: String, typeName: String, absentRight: Bool): ResultColumns
+  let count = columns.count()
+  let values: ResultColumn[] = tasks::generate(count + 1, 1) do |index|
+    if index < count
+      let column = columns.at(index)
+
+      return new ResultColumn(column.name(), shapeKind(column.kind()), column.nullable())
+    end
+    let scalar = semanticTranslationInner(typeName)
+    let nullable = absentRight || translationOptional(typeName)
+
+    if scalar == "Bool"
+      return new ResultColumn(alias, ResultColumnKind.Bool(), nullable)
+    end
+    if scalar == "Float"
+      return new ResultColumn(alias, ResultColumnKind.Float(), nullable)
+    end
+    if scalar == "String"
+      return new ResultColumn(alias, ResultColumnKind.Text(), nullable)
+    end
+    return new ResultColumn(alias, ResultColumnKind.Int(), nullable)
+  end
+
+  return new ResultColumns(values)
+end
+
+def composeJoin(base: JoinSql, stages: JoinStage?, limit: Int?, outer: Bool, dialect: SqlDialect): JoinBuildResult
+  if !joinStagesValid(stages)
+    return JoinBuildResult.Failure(QueryFailure.UnsupportedCapability("join composition exceeds stage limit"))
+  end
+  if joinOnlyTakes(stages)
+    let bound = limit
+    var sql = base.text
+
+    if bound != null
+      sql = sql + " LIMIT " + (bound as String)
+    end
+    return JoinBuildResult.Plan(new JoinSql(sql, base.parameters, base.columns, base.leftMapping, base.rightMapping, base.leftColumns, base.rightColumns, base.order, base.checkedScalars))
+  end
+  let source = "__neri_join_stage"
+  let leftMapping = joinStageMapping(base.leftMapping, source)
+  let rightMapping = joinStageMapping(base.rightMapping, source)
+  var state = new CompileState()
+
+  joinParameterCopy(base.parameters, state)
+  var current = joinStages(stages)
+  var sql = base.text
+  var activeOrder: OrderTerm? = base.order
+  var columns = base.columns
+  var orderIndex = 0
+
+  while current != null
+    let stage = current.stage
+    var filter = ""
+
+    if stage.kind == 1 || stage.kind == 2 || stage.kind == 11 || stage.kind == 12
+      match joinStageFilter(stage, leftMapping, rightMapping, state, source, dialect)
+        case ExpressionCompileResult.Failure(error)
+          return JoinBuildResult.Failure(error)
+        case ExpressionCompileResult.Sql(predicate)
+          if (stage.kind == 2 || stage.kind == 11) && outer
+            filter = " WHERE (CASE WHEN " + quoted(source, "__neri_present") + " = 1 THEN " + predicate + " ELSE FALSE END)"
+          else
+            filter = " WHERE " + predicate
+          end
+      end
+    end
+    if stage.kind == 12 && !outer
+      return JoinBuildResult.Failure(QueryFailure.UnsupportedCapability("optional pair predicate requires a left join"))
+    end
+    if stage.kind == 3 || stage.kind == 4
+      if !outer
+        return JoinBuildResult.Failure(QueryFailure.UnsupportedCapability("right presence requires a left join"))
+      end
+      filter = " WHERE " + quoted(source, "__neri_present") + (stage.kind == 3 ? " = 1" : " = 0")
+    end
+    if stage.kind >= 5 && stage.kind <= 8
+      if (stage.kind == 7 || stage.kind == 8) && activeOrder == null
+        return JoinBuildResult.Failure(QueryFailure.UnsupportedCapability("thenBy requires a primary orderBy"))
+      end
+      let mapping = stage.kind == 5 || stage.kind == 7 ? leftMapping : rightMapping
+
+      match joinStageOrder(stage, mapping)
+        case SelectionResult.Failure(error)
+          let tree = stage.tree
+
+          if tree == null
+            return JoinBuildResult.Failure(error)
+          end
+          let orderState = new CompileState()
+
+          match compileScalarQuotation(mapping, tree, tree.resultType(), orderState, dialect)
+            case ScalarSqlResult.Failure(failure)
+              return JoinBuildResult.Failure(failure)
+            case ScalarSqlResult.Value(value)
+              let shifted = joinShiftSql(sql, orderState.count, dialect)
+
+              if shifted == null
+                return JoinBuildResult.Failure(QueryFailure.Provider("join parameter index exceeds supported range"))
+              end
+              joinParameterCopy(new ParameterValues(state.head, state.count), orderState)
+              orderState.requiresCheckedScalars = state.requiresCheckedScalars || value.checkedScalars
+              state = orderState
+              var alias = "__neri_order" + (orderIndex as String)
+
+              while relationColumnIndex(columns, alias) >= 0
+                orderIndex = orderIndex + 1
+                alias = "__neri_order" + (orderIndex as String)
+              end
+              let absentRight = outer && (stage.kind == 6 || stage.kind == 8)
+              let selection = absentRight ? "(CASE WHEN " + quoted(source, "__neri_present") + " = 1 THEN " + value.sql + " ELSE NULL END)" : value.sql
+
+              sql = "SELECT *, " + selection + " AS \"" + alias + "\" FROM (" + shifted + ") AS \"" + source + "\""
+              columns = joinOrderColumns(columns, alias, tree.resultType(), absentRight)
+              orderIndex = orderIndex + 1
+              if stage.kind == 5 || stage.kind == 6
+                activeOrder = new OrderTerm(alias, stage.descending)
+              else
+                activeOrder = appendOrder(activeOrder, alias, stage.descending)
+              end
+          end
+        case SelectionResult.Column(column)
+          if stage.kind == 5 || stage.kind == 6
+            activeOrder = new OrderTerm(column.column(), stage.descending)
+          else
+            activeOrder = appendOrder(activeOrder, column.column(), stage.descending)
+          end
+      end
+    end
+    var nextSql = "SELECT * FROM (" + sql + ") AS \"" + source + "\"" + filter + joinOrderSql(activeOrder, source)
+
+    if stage.kind == 9
+      match dialect
+        case SqlDialect.QuestionMark()
+          nextSql = nextSql + " LIMIT -1"
+        case SqlDialect.PostgreSql()
+          nextSql = nextSql
+      end
+      nextSql = nextSql + " OFFSET " + (stage.count as String)
+    end
+    if stage.kind == 10
+      nextSql = nextSql + " LIMIT " + (stage.count as String)
+    end
+    sql = nextSql
+    current = current.next
+  end
+  return JoinBuildResult.Plan(new JoinSql(sql, new ParameterValues(state.head, state.count), columns, base.leftMapping, base.rightMapping, base.leftColumns, base.rightColumns, activeOrder, base.checkedScalars || state.requiresCheckedScalars))
+end

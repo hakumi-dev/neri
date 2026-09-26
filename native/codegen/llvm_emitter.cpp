@@ -67,7 +67,13 @@ create_target_machine(target_platform target, optimization_mode optimization) {
         "LLVM cannot select target '" + triple.str() + "': " + lookup_error);
   }
 
-  const llvm::TargetOptions options;
+  llvm::TargetOptions options;
+  // ELF and COFF linkers can discard individual definitions only when their
+  // functions and data occupy separate sections. Mach-O uses symbol atoms.
+  if (target != target_platform::macos_arm64) {
+    options.FunctionSections = true;
+    options.DataSections = true;
+  }
   auto machine = std::unique_ptr<llvm::TargetMachine>(backend->createTargetMachine(
       triple, "generic", "", options, llvm::Reloc::PIC_,
       llvm::CodeModel::Small,
@@ -237,20 +243,24 @@ std::string_view output_kind_name(output_kind kind) noexcept {
 artifact emit_module(const verified_module &input, target_platform target,
                      optimization_mode optimization, output_kind kind,
                      emission_metrics *metrics,
-                     const debug_source_paths &debug_sources) {
+                     const debug_source_paths &debug_sources,
+                     const emission_progress &progress) {
   auto machine = create_target_machine(target, optimization);
   llvm::LLVMContext context;
   const llvm::Triple triple(std::string(target_triple(target)));
   const auto lowering_started = std::chrono::steady_clock::now();
   auto module = lower_to_llvm(input, context, triple, machine->createDataLayout(),
                               optimization == optimization_mode::debug,
-                              debug_sources);
+                              debug_sources, progress);
 
+  if (progress) progress("verify", 0, 0, "", 0);
   verify_module(*module, "before optimization");
   const auto optimization_started = std::chrono::steady_clock::now();
+  if (progress) progress("optimize", 0, 0, "", 0);
   optimize_module(*module, *machine, optimization);
   verify_module(*module, "before artifact emission");
   const auto codegen_started = std::chrono::steady_clock::now();
+  if (progress) progress("emit", 0, 0, "", 0);
 
   artifact result;
   if (kind == output_kind::llvm_ir) {

@@ -87,6 +87,13 @@ Float-to-Int truncates and panics for unrepresentable values. Numeric `as String
 conversions are locale-independent. Arrays have no equality operator. Classes
 can define equality through an annotated instance method.
 
+For built-in numeric scalars, `Bool`, and `String`, equality and inequality
+also accept `T` and `T?` in either operand order. The underlying types must
+match exactly; this does not introduce numeric conversions. A missing optional
+value compares unequal to every required value, and a present optional value
+uses the underlying value comparison. Both operators return `Bool`. This rule
+does not extend ordered comparisons or lift user-defined class operators.
+
 `String` is loaded from the core library without a `use` directive. It is a
 source-declared, sealed class whose storage remains the runtime UTF-8 string;
 it is not a wrapper around another text value. String literals and
@@ -136,6 +143,39 @@ Only `T?` accepts `null`. Proven checks such as `x != null` refine optional loca
 on the corresponding control-flow path. Access requires that refinement.
 `T?[]` and `T[]?` differ. `Void?` and repeated optional suffixes are invalid.
 
+Null guards also refine field paths rooted in a local or parameter. For example,
+`row.right != null ? row.right.total : null` accesses `total` only in the branch
+where `right` is present. Each optional intermediate field needs its own guard.
+Field-path facts are conservative: calls and mutations can invalidate them,
+including writes through another alias. Saving a field in an immutable local
+provides a stable value when a longer-lived refinement is needed.
+Loop bodies establish their field guards again for each iteration; inherited
+member-path facts are cleared at loop boundaries. Alternative branches are
+analyzed independently and retain only common incoming facts at their merge.
+An initializer uses its refined expression type for inference. A mutable cursor
+that must later accept null therefore needs an explicit optional annotation,
+such as `var cursor: Node? = container.first` inside a guard on `container.first`.
+
+A conditional expression preserves the type of matching branches. It joins
+`T` with `null` or `T` with `T?` into `T?` in either order. The underlying
+`T` must match exactly; conditional expressions do not introduce numeric or
+class conversions. Only the selected branch evaluates. A null check in the
+condition narrows an optional name or guarded field path in the branch where it is present; that
+refinement does not extend past the conditional expression. This is Neri's
+own rule; C#'s
+[conditional operator](https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/operators/conditional-operator)
+provides a related comparison, including distinct target-typed conversions.
+
+The field-path rules draw on flow-sensitive reasoning described in
+[Logical Types for Untyped Languages](https://www2.ccs.neu.edu/racket/pubs/icfp10-thf.pdf)
+(Tobin-Hochstadt and Felleisen, ICFP 2010), particularly refinement from positive
+and negative predicate outcomes and reasoning about data structure components.
+Neri implements its own bounded rules and mutation invalidation; the paper's
+formal results are not a proof of this implementation. The
+[C# nullable analysis specification](https://github.com/dotnet/csharplang/blob/main/proposals/csharp-9.0/nullable-reference-types-specification.md)
+is a related reference for tracked field expressions. These sources were checked
+on 2026-09-23.
+
 ### Readonly views
 
 `readonly T` provides a transitive read-only view of a managed object or array.
@@ -182,6 +222,16 @@ Views participate in generic specialization and inference. They are checked by
 the frontend and use the ordinary runtime representation. Native pointer fields
 and writable native borrows are unavailable through a readonly view. A readonly
 view alone is not proof of exclusive access or safe cross-thread sharing.
+
+### Reference identity
+
+`reference::same(left, right)` reports whether two managed class references
+refer to the same object. Import it with `use reference`. Equal field values in
+different objects do not make their references identical. Readonly class views
+preserve object identity. This operation accepts a common class type; scalars,
+represented native types, function values, arrays, and optional references are
+outside this contract. It does not invoke a user-defined equality operator or
+expose an address.
 
 ## Functions, modules and classes
 
@@ -277,8 +327,14 @@ use this order: access (`public`, `internal`, `protected`, or `private`),
 `abstract` or `sealed`, `override`, `static`, `readonly`, `unsafe`, `resource`,
 then `class` or `def`. Only modifiers supported by that declaration kind may
 appear. Compiler annotations such as `@cabiImport`, `@cabiExport`, `@intrinsic`,
-`@operator`, `@conversion`, `@exact`, `@operation`, and `@representation` remain
+`@operator`, `@conversion`, `@exact`, `@operation`, `@propagation`, and `@representation` remain
 annotations.
+
+`try expression` extracts an opted-in result's success payload or returns a
+compatible failure from the enclosing callable. `match` remains available for
+handling both cases locally. Result enums declare their cases with
+`@propagation("SuccessCase", "FailureCase")`; see [typed propagation](TRY.md)
+for precedence, error compatibility, and resource cleanup rules.
 
 Classes have single inheritance. Classes default to `internal`, fields to
 `private`, and methods to `public`. `internal` is module visibility, `private`
@@ -457,17 +513,22 @@ It follows the general idea of stated generic requirements in
 [Go interface method sets](https://go.dev/ref/spec#Interface_types), and
 [Rust trait bounds](https://doc.rust-lang.org/reference/trait-bounds.html).
 
-The current generic surface consists of module functions and classes with their
-own fields and methods. Static methods accept an explicitly specialized class
+The current generic surface consists of module functions, classes, and
+method-level type parameters. A method can introduce its own type parameters
+on an ordinary or specialized generic class; for example,
+`receiver.identity<String>("value")` or an inferred `receiver.identity("value")`.
+See [generic methods](GENERIC-METHODS.md) for inference, scope, and restrictions.
+Static methods accept an explicitly specialized class
 receiver, such as `Container<Int>.create(42)` or
 `library::Container<String>.create("value")`; constructor and method visibility
-still apply. Method-level type parameters, generic class inheritance,
+still apply. Generic class inheritance,
 class bounds, multiple bounds, generic contracts, and higher-kinded types are
 outside this surface. Templates are supplied as source files in the same
 compilation invocation, including across namespaces. A compiled specialization is concrete; it is not a separately
 importable generic template or a package ABI promise.
 
-Compilation permits 128 distinct generic specializations, 32 nested class
+Compilation permits 4096 distinct generic specializations in total and 128
+specializations of each generic template. It also permits 32 nested class
 instantiations, 64 levels of written type nesting, and canonical type arguments
 of at most 1024 UTF-8 bytes. Ordinary recursion reuses the same specialization;
 recursion that creates an unbounded sequence of new types reports `NR222`.
@@ -663,6 +724,27 @@ Direct calls use the ordinary callback calling convention. The type checks
 captures and effects; a direct call does not schedule a task or establish
 exclusive ownership of explicit mutable arguments.
 
+### Sequential array generation
+
+`use arrays` provides `arrays::generate(count, callback)`. Its ordinary
+`fn(Int): R` callback runs on the calling thread once per index, in increasing
+order, and returns an `R[]`. It can capture mutable local state and return
+existing mutable object references; array elements retain those identities.
+The expected array type, an explicit `arrays::generate<R>` argument, or a typed
+callback supplies `R`. Elements follow the same safe array storage contract as
+array literals. A zero count returns an empty array without calling the
+callback; a negative count panics.
+
+```neri
+use arrays
+
+def numbers(count: Int): Int[]
+  return arrays::generate(count) do |index|
+    return index * 2
+  end
+end
+```
+
 ### Scoped task generation
 
 `use tasks` provides `tasks::generate(count, callback)` and
@@ -698,6 +780,29 @@ result slot is exclusive to its index and is invisible to other callbacks.
 Execution order is unspecified; callbacks cannot rely on sibling ordering.
 Nested generation reuses the outer worker pool and makes progress with one
 participant. Each outer call includes worker startup and joining.
+
+### Isolated persistent workers
+
+`use workers` provides `workers::start(entry, config, options)`, returning a
+`Result<Pool, Failure>`. The named entry has the exact signature
+`fn(Byte[]): Void`. Each worker owns its heap and creates its application state
+from a copied configuration. Requests and responses cross the boundary as copied
+byte arrays. Closures, function variables, instance methods and C ABI entrypoints
+are rejected. Workers support I/O on exclusively owned resources; they do not
+share the parent's managed state.
+
+Acquire the pool with `using` and finish each worker's resources before its entry
+returns. Admission is bounded by both outstanding requests and reserved payload
+bytes. Cancellation is cooperative. See [Isolated workers](WORKERS.md) for the
+typed API, ownership contract, limits and executable examples.
+
+The source operation declaration names its bridge explicitly with
+`@operation("workers.start", bridge)`. Its safe empty body declares a first
+parameter `fn(Byte[]): Void`, a second parameter `Byte[]`, and any remaining
+ordinary parameters without defaults. The unsafe module bridge replaces only
+the first parameter with `cabi fn(Byte*, UInt64): Void`; remaining parameter types
+and the return type must match exactly. The operation is called directly and
+cannot itself be converted into a function value.
 
 ## Unsafe and memory boundary
 

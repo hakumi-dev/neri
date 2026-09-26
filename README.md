@@ -32,8 +32,10 @@ On native Windows x86-64, follow the [Windows build guide](docs/WINDOWS.md).
 It uses the Win32/MSVC ABI and PowerShell 7; WSL and MinGW are outside the
 supported setup.
 
-Neri is in development. This repository documents its source revision; packaged
-releases include the language reference for their compiler.
+This revision targets Neri 0.2.0. Packaged releases include the language reference
+for their compiler, the session API, and [Neri Data](docs/DATA.md) with SQLite.
+Use matching compiler, runtime and Data artifacts; each component's documentation
+defines its supported behavior and platform limits.
 
 ## Write a program
 

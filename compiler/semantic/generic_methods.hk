@@ -1,0 +1,311 @@
+use host
+
+def genericMethodTemplate(owner: BootstrapBinder, classSymbol: SemanticClass, name: String): Int
+  var index = 0
+
+  while index < classSymbol.genericMethods.size
+    let node = classSymbol.genericMethods.get(index)
+    let declaration = semanticDeclaration(owner, node)
+
+    if declaration != null
+      let function = owner.syntax.childAt(node, declaration.annotationCount)
+      let method = semanticDeclaration(owner, function)
+
+      if method != null && method.name == name
+        return node
+      end
+    end
+    index = index + 1
+  end
+  return -1
+end
+
+def genericMethodOwner(owner: BootstrapBinder, classSymbol: SemanticClass, name: String): SemanticClass?
+  var current: SemanticClass? = classSymbol
+  var steps = 0
+
+  while current != null && steps < 256
+    if genericMethodTemplate(owner, current, name) >= 0
+      return current
+    end
+    if owner.findDeclaredMethod(current, name) != null
+      return null
+    end
+    current = owner.model.findClass(current.baseName)
+    steps = steps + 1
+  end
+  return null
+end
+
+def registerGenericMethod(owner: BootstrapBinder, classSymbol: SemanticClass, methodNode: Int, functionNode: Int, declaration: readonly SyntaxDeclaration): Void
+  let source = owner.syntax.nodeAt(functionNode)
+  let names = source.typeParameters
+  var index = 0
+
+  while index < names.Length
+    if semanticReservedTypeName(names[index])
+      owner.report("NR220", functionNode, "A method type parameter cannot use a reserved type name.")
+    end
+    var other = 0
+
+    while other < index
+      if names[index] == names[other]
+        owner.report("NR220", functionNode, "Duplicate method type parameter '" + names[index] + "'.")
+      end
+      other = other + 1
+    end
+    let classTemplate = classSymbol.genericOrigin
+
+    if classTemplate >= 0
+      for className in owner.syntax.nodeAt(classTemplate).typeParameters
+        if className == names[index]
+          owner.report("NR220", functionNode, "Method type parameter '" + names[index] + "' shadows a class type parameter.")
+        end
+      end
+    end
+    index = index + 1
+  end
+  semanticGenericConstraintsValid(owner, functionNode, true, classSymbol.namespaceName)
+  if declaration.name == "init" || syntaxHasModifier(owner.syntax, functionNode, owner.syntax.modifiers.getOverride())
+    owner.report("NR220", functionNode, "Generic methods cannot be constructors or overrides.")
+  end
+  if syntaxHasModifier(owner.syntax, functionNode, owner.syntax.modifiers.getAbstract())
+    owner.report("NR220", functionNode, "Generic methods cannot be abstract.")
+  end
+  if declaration.isStatic && syntaxHasModifier(owner.syntax, functionNode, owner.syntax.modifiers.getReadonly())
+    owner.report("NR240", functionNode, "Modifier 'readonly' requires an instance method other than a constructor.")
+  end
+  if owner.syntax.childCountAt(methodNode) != 1
+    owner.report("NR220", methodNode, "Generic methods do not support annotations.")
+  end
+  var parameter = 0
+
+  while parameter < declaration.parameterCount
+    let parameterNode = owner.syntax.childAt(functionNode, declaration.annotationCount + parameter)
+
+    if owner.syntax.nodeAt(parameterNode).parameterMode.isLabels()
+      owner.report("NR220", parameterNode, "Generic methods do not support labels parameters.")
+    end
+    parameter = parameter + 1
+  end
+  classSymbol.genericMethods.add(methodNode)
+end
+
+def instantiateGenericMethod(owner: BootstrapBinder, classSymbol: SemanticClass, methodNode: Int, arguments: StringBuffer, node: Int): SemanticCallable?
+  let wrapper = semanticDeclaration(owner, methodNode)
+
+  if wrapper == null
+    return null
+  end
+  let functionNode = owner.syntax.childAt(methodNode, wrapper.annotationCount)
+  let source = owner.syntax.nodeAt(functionNode)
+  let declaration = semanticDeclaration(owner, functionNode)
+
+  if declaration == null
+    return null
+  end
+  let key = genericKey(owner, functionNode, arguments, node)
+
+  if key == "" || !semanticCheckGenericConstraints(owner, functionNode, arguments, node, classSymbol.namespaceName)
+    return null
+  end
+  let suffixStart = bootstrapFindText(key, "<")
+  let suffix = host::stringSlice(key, suffixStart, host::stringByteLength(key) - suffixStart)
+  let specializedName = declaration.name + suffix
+  let specializedFullName = classSymbol.fullName + "." + specializedName
+  var existing = owner.findDeclaredMethod(classSymbol, specializedName)
+
+  if existing == null
+    existing = owner.model.findFunction(specializedFullName)
+  end
+
+  if existing != null
+    return existing
+  end
+  if !genericReserve(owner, functionNode, node)
+    return null
+  end
+  let clone = genericClone(owner, methodNode, source.typeParameters, arguments)
+  let clonedFunction = owner.syntax.childAt(clone, wrapper.annotationCount)
+  let clonedDeclaration = semanticDeclaration(owner, clonedFunction)
+
+  if clonedDeclaration == null || owner.cancelled()
+    return null
+  end
+  owner.syntax.nodeAt(clonedFunction).typeParameters = []
+  owner.syntax.nodeAt(clonedFunction).declaration = clonedDeclaration.renamed(specializedName)
+  var callable: SemanticCallable? = null
+
+  if owner.model.ownsClass(classSymbol)
+    owner.registerMethod(classSymbol, clone, false)
+    callable = owner.findDeclaredMethod(classSymbol, specializedName)
+  else
+    # A parent class already has a compiled descriptor. Place the new method
+    # in the child model so it can be bound and emitted without changing that
+    # descriptor or the reusable parent semantic snapshot.
+    let created = owner.createCallable(clonedFunction, clonedDeclaration.renamed(specializedName), classSymbol, wrapper.access, false, functionNode)
+
+    created.isReadonly = syntaxHasModifier(owner.syntax, clonedFunction, owner.syntax.modifiers.getReadonly())
+    owner.model.addFunction(created) if !owner.cancelled()
+    callable = created if !owner.cancelled()
+  end
+
+  if callable != null
+    callable.genericOrigin = functionNode
+  end
+  return callable
+end
+
+def bindGenericMethodCall(body: BootstrapBodyBinder, node: Int, callee: Int, classSymbol: SemanticClass, methodNode: Int, receiver: Int, receiverType: String, isStatic: Bool, isSuper: Bool, expectedType: String): BoundValue
+  let owner = body.owner
+  let wrapper = semanticDeclaration(owner, methodNode)
+
+  if wrapper == null
+    return new BoundValue("Error", body.addBound(body.boundKinds().getErrorExpression(), "Error", "", node, emptyInts()))
+  end
+  let template = owner.syntax.childAt(methodNode, wrapper.annotationCount)
+  let declaration = semanticDeclaration(owner, template)
+
+  if declaration == null
+    return new BoundValue("Error", body.addBound(body.boundKinds().getErrorExpression(), "Error", "", node, emptyInts()))
+  end
+  let name = declaration.name
+  let source = owner.syntax.nodeAt(template)
+  let names = source.typeParameters
+  let explicit = owner.syntax.nodeAt(callee).typeArguments
+  let inference = new GenericInference(owner, names)
+  let arguments = inference.arguments
+  var index = 0
+
+  if explicit.Length > 0
+    if explicit.Length != names.Length
+      owner.report("NR220", callee, "Wrong number of type arguments for method '" + name + "'.")
+      return new BoundValue("Error", body.addBound(body.boundKinds().getErrorExpression(), "Error", "", node, emptyInts()))
+    end
+    while index < explicit.Length
+      arguments.set(index, owner.resolveTypeNode(explicit[index], owner.currentNamespace, ""))
+      index = index + 1
+    end
+  end
+  let count = declaration.parameterCount
+  let start = declaration.annotationCount
+  let resultNode = source.children[start + count]
+
+  inference.infer(resultNode, expectedType)
+  let actual = owner.syntax.childCountAt(node) - 1
+  let parameterNames = new StringBuffer()
+  let defaultFlags = new IntBuffer()
+  var packParameter = -1
+
+  index = 0
+  while index < count
+    let parameterNode = source.children[start + index]
+
+    parameterNames.add(owner.syntax.dataAt(parameterNode))
+    defaultFlags.add(owner.syntax.childCountAt(parameterNode) > 1 ? 1 : 0)
+    packParameter = index if owner.syntax.nodeAt(parameterNode).parameterMode.isLabels()
+    index = index + 1
+  end
+  var mapping = semanticMapArguments(owner, node, 1, parameterNames, defaultFlags, classSymbol.name + "." + name, true, false, packParameter)
+
+  if mapping.hasNamed || packParameter >= 0
+    mapping = semanticMapArguments(owner, node, 1, parameterNames, defaultFlags, classSymbol.name + "." + name, true, true, packParameter)
+  end
+  let values = new IntBuffer()
+  let types = new StringBuffer()
+
+  index = 0
+  while index < actual
+    values.add(-1)
+    types.add("")
+    index = index + 1
+  end
+  var pass = 0
+
+  while pass < 2
+    index = 0
+    while index < actual
+      let argumentNode = semanticArgumentExpression(owner.syntax, owner.syntax.childAt(node, index + 1))
+      let parameterIndex = mapping.parameterAt(index)
+      let kind = owner.syntax.kindAt(argumentNode)
+      let packed = mapping.isPackEntry(index)
+      let contextual = kind.isClosure() || kind.isQuoteExpression() || kind.isArrayLiteral() || packed
+
+      if values.get(index) < 0 && (pass == 1 || !contextual)
+        var expected = ""
+        var pattern = -1
+
+        if parameterIndex >= 0 && parameterIndex < count
+          pattern = owner.syntax.childAt(source.children[start + parameterIndex], 0)
+          if !packed && (kind.isClosure() || kind.isQuoteExpression())
+            inference.inferClosure(pattern, argumentNode, owner.currentNamespace)
+          end
+          if !inference.unresolved(pattern)
+            let clone = genericClone(owner, pattern, names, arguments)
+
+            expected = owner.resolveTypeNode(clone, classSymbol.namespaceName, "")
+          end
+        end
+        let value = body.bindExpression(argumentNode, expected)
+
+        values.set(index, value.boundNode)
+        types.set(index, value.typeName)
+        if pattern >= 0 && !packed
+          inference.infer(pattern, value.typeName)
+        end
+      end
+      index = index + 1
+    end
+    pass = pass + 1
+  end
+  let callable = instantiateGenericMethod(owner, classSymbol, methodNode, arguments, callee)
+
+  if callable == null
+    return new BoundValue("Error", body.addBound(body.boundKinds().getErrorExpression(), "Error", "", node, emptyInts()))
+  end
+  if callable.isStatic != isStatic
+    owner.report(isStatic ? "NR180" : "NR181", callee, isStatic ? "Instance method '" + name + "' must be called through an instance." : "Static method '" + name + "' must be called through its class.")
+  end
+  if semanticIsReadonly(receiverType) && !callable.isReadonly
+    owner.report("NR240", callee, "A readonly receiver requires a readonly method.")
+  end
+  if !body.memberAccessible(callable.className, callable.access)
+    owner.report("NR153", callee, "Cannot access " + callable.access.name() + " member '" + name + "' of type '" + callable.className + "'.")
+  end
+  if callable.isUnsafe && body.unsafeDepth == 0
+    owner.report("NR189", callee, "Unsafe method requires an unsafe declaration or block.")
+  end
+  owner.recordOccurrence(owner.callableSourceIdentity(callable), callee)
+  semanticValidateNamedDefaults(owner, node, callable, mapping)
+  if !mapping.hasNamed && packParameter < 0
+    body.validateCallCount(callable.fullName, callee, actual, callable)
+  end
+  var children: Int[] = []
+
+  if !isStatic
+    children = host::appendInt(children, receiver)
+  end
+  index = 0
+  while index < actual
+    let argumentNode = owner.syntax.childAt(node, index + 1)
+    let parameterIndex = mapping.parameterAt(index)
+    let parameter = callable.parameterAt(parameterIndex)
+    var value = values.get(index)
+
+    if mapping.hasNamed || packParameter >= 0
+      value = body.addBound(body.boundKinds().getArgument(), types.get(index), parameterIndex as String, argumentNode, [value])
+    end
+    children = host::appendInt(children, value)
+    if parameter != null && !semanticAssignable(owner.model, parameter.typeName, types.get(index))
+      owner.report("NR112", argumentNode, "Generic argument expects '" + parameter.typeName + "', but got '" + types.get(index) + "'.")
+    end
+    index = index + 1
+  end
+  body.recordArgumentCompletion(node, 1, callable, mapping)
+  let kind = isStatic ? body.boundKinds().getCall() : body.boundKinds().getInstanceCall()
+
+  if isSuper
+    return new BoundValue(callable.returnType, body.addBoundValue(kind, callable.returnType, callable.fullName, "direct", callee, children))
+  end
+  return new BoundValue(callable.returnType, body.addBound(kind, callable.returnType, callable.fullName, callee, children))
+end

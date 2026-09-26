@@ -7,6 +7,7 @@ class ScalarCodec<R>
   private resultKind: ResultColumnKind
   private isNullable: Bool
   private canonicalName: String
+  private sqlValuePreserved: Bool = false
 
   public def init(read: fn(Cell): DecodeResult<R>, kind: ResultColumnKind, nullable: Bool, typeName: String): Void
     this.readCell = read
@@ -15,7 +16,7 @@ class ScalarCodec<R>
     this.canonicalName = typeName
   end
 
-  ## Decodes one provider cell without performing a type conversion.
+  ## Decodes one provider cell using the configured reader.
   public def decode(cell: Cell): DecodeResult<R>
     return this.readCell(cell)
   end
@@ -33,6 +34,15 @@ class ScalarCodec<R>
   ## Reports whether NULL is a valid decoded value.
   public readonly def nullable(): Bool
     return this.isNullable
+  end
+
+  internal readonly def preservesSqlValue(): Bool
+    return this.sqlValuePreserved
+  end
+
+  internal def certifySqlValue(): ScalarCodec<R>
+    this.sqlValuePreserved = true
+    return this
   end
 
   ## Builds a one-column decoder and preserves the requested column name in errors.
@@ -56,6 +66,40 @@ class ScalarCodec<R>
   end
 end
 
+## Decodes a named provider cell through a scalar codec without coercion.
+def decodeScalarColumn<R>(row: RawRow, column: String, codec: ScalarCodec<R>): DecodeResult<R>
+  match row.value(column)
+    case CellLookup.Missing()
+      return DecodeResult<R>.Failure(QueryFailure.MissingColumn(column))
+    case CellLookup.Found(cell)
+      match codec.decode(cell)
+        case DecodeResult.Value(value)
+          return DecodeResult<R>.Value(value)
+        case DecodeResult.Failure(error)
+          return DecodeResult<R>.Failure(scalarColumnError(error, column))
+      end
+  end
+end
+
+## Builds a strict two-scalar row decoder for a materialized projection value.
+def select2Decoder<A, B, R>(first: ScalarCodec<A>, firstColumn: String, second: ScalarCodec<B>, secondColumn: String, materialize: fn(A, B): R): Decoder<R>
+  let read: fn(RawRow): DecodeResult<R> = fn(row: RawRow): DecodeResult<R>
+    match decodeScalarColumn(row, firstColumn, first)
+      case DecodeResult.Failure(error)
+        return DecodeResult<R>.Failure(error)
+      case DecodeResult.Value(firstValue)
+        match decodeScalarColumn(row, secondColumn, second)
+          case DecodeResult.Failure(error)
+            return DecodeResult<R>.Failure(error)
+          case DecodeResult.Value(secondValue)
+            return DecodeResult<R>.Value(materialize(firstValue, secondValue))
+        end
+    end
+  end
+
+  return new Decoder<R>(read, new ResultColumns([new ResultColumn(firstColumn, first.kind(), first.nullable()), new ResultColumn(secondColumn, second.kind(), second.nullable())]))
+end
+
 def scalarColumnError(error: QueryFailure, column: String): QueryFailure
   match error
     case QueryFailure.TypeMismatch(unused, expected, actual)
@@ -74,6 +118,8 @@ def scalarColumnError(error: QueryFailure, column: String): QueryFailure
       return QueryFailure.Provider(message)
     case QueryFailure.MissingColumn(name)
       return QueryFailure.MissingColumn(name)
+    case QueryFailure.Cardinality(expected, actual)
+      return QueryFailure.Cardinality(expected, actual)
   end
 end
 
@@ -85,6 +131,8 @@ def decodeScalarBool(cell: Cell): DecodeResult<Bool>
       return DecodeResult<Bool>.Failure(QueryFailure.TypeMismatch("", "Bool", "NULL"))
     case Cell.Int(value)
       return DecodeResult<Bool>.Failure(QueryFailure.TypeMismatch("", "Bool", "Int"))
+    case Cell.Float(value)
+      return DecodeResult<Bool>.Failure(QueryFailure.TypeMismatch("", "Bool", "Float"))
     case Cell.Text(value)
       return DecodeResult<Bool>.Failure(QueryFailure.TypeMismatch("", "Bool", "String"))
   end
@@ -98,6 +146,8 @@ def decodeScalarInt(cell: Cell): DecodeResult<Int>
       return DecodeResult<Int>.Failure(QueryFailure.TypeMismatch("", "Int", "NULL"))
     case Cell.Bool(value)
       return DecodeResult<Int>.Failure(QueryFailure.TypeMismatch("", "Int", "Bool"))
+    case Cell.Float(value)
+      return DecodeResult<Int>.Failure(QueryFailure.TypeMismatch("", "Int", "Float"))
     case Cell.Text(value)
       return DecodeResult<Int>.Failure(QueryFailure.TypeMismatch("", "Int", "String"))
   end
@@ -111,6 +161,8 @@ def decodeScalarText(cell: Cell): DecodeResult<String>
       return DecodeResult<String>.Failure(QueryFailure.TypeMismatch("", "String", "NULL"))
     case Cell.Bool(value)
       return DecodeResult<String>.Failure(QueryFailure.TypeMismatch("", "String", "Bool"))
+    case Cell.Float(value)
+      return DecodeResult<String>.Failure(QueryFailure.TypeMismatch("", "String", "Float"))
     case Cell.Int(value)
       return DecodeResult<String>.Failure(QueryFailure.TypeMismatch("", "String", "Int"))
   end
@@ -124,6 +176,8 @@ def decodeScalarOptionalBool(cell: Cell): DecodeResult<Bool?>
       return DecodeResult<Bool?>.Value(value)
     case Cell.Int(value)
       return DecodeResult<Bool?>.Failure(QueryFailure.TypeMismatch("", "Bool?", "Int"))
+    case Cell.Float(value)
+      return DecodeResult<Bool?>.Failure(QueryFailure.TypeMismatch("", "Bool?", "Float"))
     case Cell.Text(value)
       return DecodeResult<Bool?>.Failure(QueryFailure.TypeMismatch("", "Bool?", "String"))
   end
@@ -137,6 +191,8 @@ def decodeScalarOptionalInt(cell: Cell): DecodeResult<Int?>
       return DecodeResult<Int?>.Value(value)
     case Cell.Bool(value)
       return DecodeResult<Int?>.Failure(QueryFailure.TypeMismatch("", "Int?", "Bool"))
+    case Cell.Float(value)
+      return DecodeResult<Int?>.Failure(QueryFailure.TypeMismatch("", "Int?", "Float"))
     case Cell.Text(value)
       return DecodeResult<Int?>.Failure(QueryFailure.TypeMismatch("", "Int?", "String"))
   end
@@ -150,37 +206,85 @@ def decodeScalarOptionalText(cell: Cell): DecodeResult<String?>
       return DecodeResult<String?>.Value(value)
     case Cell.Bool(value)
       return DecodeResult<String?>.Failure(QueryFailure.TypeMismatch("", "String?", "Bool"))
+    case Cell.Float(value)
+      return DecodeResult<String?>.Failure(QueryFailure.TypeMismatch("", "String?", "Float"))
     case Cell.Int(value)
       return DecodeResult<String?>.Failure(QueryFailure.TypeMismatch("", "String?", "Int"))
   end
 end
 
+def decodeScalarFloat(cell: Cell): DecodeResult<Float>
+  match cell
+    case Cell.Float(value)
+      if !dataFloatFinite(value)
+        return DecodeResult<Float>.Failure(QueryFailure.TypeMismatch("", "finite Float", "Float"))
+      end
+      return DecodeResult<Float>.Value(value)
+    case Cell.Null()
+      return DecodeResult<Float>.Failure(QueryFailure.TypeMismatch("", "Float", "NULL"))
+    case Cell.Bool(value)
+      return DecodeResult<Float>.Failure(QueryFailure.TypeMismatch("", "Float", "Bool"))
+    case Cell.Int(value)
+      return DecodeResult<Float>.Failure(QueryFailure.TypeMismatch("", "Float", "Int"))
+    case Cell.Text(value)
+      return DecodeResult<Float>.Failure(QueryFailure.TypeMismatch("", "Float", "String"))
+  end
+end
+
+def decodeScalarOptionalFloat(cell: Cell): DecodeResult<Float?>
+  match cell
+    case Cell.Null()
+      return DecodeResult<Float?>.Value(null)
+    case Cell.Float(value)
+      if !dataFloatFinite(value)
+        return DecodeResult<Float?>.Failure(QueryFailure.TypeMismatch("", "finite Float?", "Float"))
+      end
+      return DecodeResult<Float?>.Value(value)
+    case Cell.Bool(value)
+      return DecodeResult<Float?>.Failure(QueryFailure.TypeMismatch("", "Float?", "Bool"))
+    case Cell.Int(value)
+      return DecodeResult<Float?>.Failure(QueryFailure.TypeMismatch("", "Float?", "Int"))
+    case Cell.Text(value)
+      return DecodeResult<Float?>.Failure(QueryFailure.TypeMismatch("", "Float?", "String"))
+  end
+end
+
 ## Creates a strict non-nullable boolean scalar codec.
 def boolScalar(): ScalarCodec<Bool>
-  return new ScalarCodec<Bool>(decodeScalarBool, ResultColumnKind.Bool(), false, "Bool")
+  return new ScalarCodec<Bool>(decodeScalarBool, ResultColumnKind.Bool(), false, "Bool").certifySqlValue()
 end
 
 ## Creates a strict non-nullable integer scalar codec.
 def intScalar(): ScalarCodec<Int>
-  return new ScalarCodec<Int>(decodeScalarInt, ResultColumnKind.Int(), false, "Int")
+  return new ScalarCodec<Int>(decodeScalarInt, ResultColumnKind.Int(), false, "Int").certifySqlValue()
+end
+
+## Creates a strict finite floating-point scalar codec.
+def floatScalar(): ScalarCodec<Float>
+  return new ScalarCodec<Float>(decodeScalarFloat, ResultColumnKind.Float(), false, "Float").certifySqlValue()
 end
 
 ## Creates a strict non-nullable text scalar codec.
 def textScalar(): ScalarCodec<String>
-  return new ScalarCodec<String>(decodeScalarText, ResultColumnKind.Text(), false, "String")
+  return new ScalarCodec<String>(decodeScalarText, ResultColumnKind.Text(), false, "String").certifySqlValue()
 end
 
 ## Creates a nullable boolean scalar codec.
 def optionalBoolScalar(): ScalarCodec<Bool?>
-  return new ScalarCodec<Bool?>(decodeScalarOptionalBool, ResultColumnKind.Bool(), true, "Bool?")
+  return new ScalarCodec<Bool?>(decodeScalarOptionalBool, ResultColumnKind.Bool(), true, "Bool?").certifySqlValue()
 end
 
 ## Creates a nullable integer scalar codec.
 def optionalIntScalar(): ScalarCodec<Int?>
-  return new ScalarCodec<Int?>(decodeScalarOptionalInt, ResultColumnKind.Int(), true, "Int?")
+  return new ScalarCodec<Int?>(decodeScalarOptionalInt, ResultColumnKind.Int(), true, "Int?").certifySqlValue()
+end
+
+## Creates a strict nullable finite floating-point scalar codec.
+def optionalFloatScalar(): ScalarCodec<Float?>
+  return new ScalarCodec<Float?>(decodeScalarOptionalFloat, ResultColumnKind.Float(), true, "Float?").certifySqlValue()
 end
 
 ## Creates a nullable text scalar codec.
 def optionalTextScalar(): ScalarCodec<String?>
-  return new ScalarCodec<String?>(decodeScalarOptionalText, ResultColumnKind.Text(), true, "String?")
+  return new ScalarCodec<String?>(decodeScalarOptionalText, ResultColumnKind.Text(), true, "String?").certifySqlValue()
 end

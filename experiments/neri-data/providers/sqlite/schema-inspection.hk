@@ -1,0 +1,172 @@
+use host
+use tasks
+namespace neri_data_sqlite
+
+## One column of a main-database table, in declared column order.
+class SQLiteSchemaColumn
+  private storedTable: String
+  private storedName: String
+  private storedType: String
+  private storedDefault: String?
+  private storedRequired: Bool
+  private storedKeyPosition: Int
+  private storedHidden: Int
+  private storedCreateSql: String
+
+  internal def init(table: String, name: String, declaredType: String, defaultSql: String?, required: Bool, keyPosition: Int, hidden: Int, createSql: String): Void
+    this.storedTable = table
+    this.storedName = name
+    this.storedType = declaredType
+    this.storedDefault = defaultSql
+    this.storedRequired = required
+    this.storedKeyPosition = keyPosition
+    this.storedHidden = hidden
+    this.storedCreateSql = createSql
+  end
+
+  public readonly def table(): String
+    return this.storedTable
+  end
+  public readonly def name(): String
+    return this.storedName
+  end
+  public readonly def declaredType(): String
+    return this.storedType
+  end
+  public readonly def defaultSql(): String?
+    return this.storedDefault
+  end
+  ## The declared NOT NULL flag; SQLite primary-key nullability has extra rules.
+  public readonly def required(): Bool
+    return this.storedRequired
+  end
+  public readonly def keyPosition(): Int
+    return this.storedKeyPosition
+  end
+  ## SQLite table_xinfo hidden value: 0 ordinary, 1 hidden, 2/3 generated.
+  public readonly def hidden(): Int
+    return this.storedHidden
+  end
+  public readonly def createSql(): String
+    return this.storedCreateSql
+  end
+end
+
+class SQLiteSchemaSnapshot
+  private columns: SQLiteSchemaColumn?[]
+  private size: Int = 0
+
+  internal def init(): Void
+    this.columns = tasks::generate(1000, 1) do |index|
+      return null
+    end
+  end
+
+  internal def add(column: SQLiteSchemaColumn): Void
+    this.columns[this.size] = column
+    this.size = this.size + 1
+  end
+
+  public readonly def count(): Int
+    return this.size
+  end
+
+  public readonly def at(index: Int): readonly SQLiteSchemaColumn?
+    if index < 0 || index >= this.size
+      return null
+    end
+    return this.columns[index]
+  end
+end
+
+enum SQLiteSchemaResult
+  case Snapshot(value: SQLiteSchemaSnapshot)
+  case Failure(message: String)
+end
+
+## A single statement provides a coherent schema view. No caller SQL is accepted.
+unsafe def sqliteInspectSchema(database: Void*): SQLiteSchemaResult
+  let sql = "SELECT s.name, p.name, p.type, p.dflt_value, p.\"notnull\", p.pk, p.hidden, s.sql FROM main.sqlite_schema AS s JOIN pragma_table_xinfo(s.name, 'main') AS p WHERE s.type = 'table' AND substr(lower(s.name), 1, 7) <> 'sqlite_' AND substr(lower(s.name), 1, 7) <> '__neri_' ORDER BY s.name COLLATE BINARY, p.cid"
+  let length = host::stringByteLength(sql)
+  let bytes = native::alloc<Byte>(length + 1)
+  var index = 0
+
+  while index < length
+    bytes[index] = host::stringByteAt(sql, index)
+    index = index + 1
+  end
+  bytes[length] = 0 as Byte
+  let statement = stackalloc Void*[1]
+
+  let status = sqlitePrepare(database, bytes, length as Int32, statement, null)
+
+  native::free(bytes)
+  let prepared: Void*? = statement[0]
+
+  if status != (0 as Int32) || prepared == null
+    let message = sqliteMessage(database)
+
+    if prepared != null
+      sqliteFinalize(prepared)
+    end
+    return SQLiteSchemaResult.Failure(message)
+  end
+  let result = sqliteReadSchema(database, prepared)
+  let finalized = sqliteFinalize(prepared)
+
+  if finalized != (0 as Int32)
+    return SQLiteSchemaResult.Failure(sqliteMessage(database))
+  end
+  return result
+end
+
+unsafe def sqliteSchemaText(statement: Void*, index: Int): String?
+  if sqliteColumnType(statement, index as Int32) != (3 as Int32)
+    return null
+  end
+  let pointer = sqliteColumnText(statement, index as Int32)
+
+  if pointer == null
+    return null
+  end
+  return sqliteText(pointer, sqliteColumnBytes(statement, index as Int32) as Int)
+end
+
+unsafe def sqliteReadSchema(database: Void*, statement: Void*): SQLiteSchemaResult
+  let snapshot = new SQLiteSchemaSnapshot()
+  var status = sqliteStep(statement)
+
+  while status == (100 as Int32)
+    if snapshot.count() == 1000
+      return SQLiteSchemaResult.Failure("SQLite schema exceeds the 1000-column inspection limit")
+    end
+    let table = sqliteSchemaText(statement, 0)
+    let name = sqliteSchemaText(statement, 1)
+    let declaredType = sqliteSchemaText(statement, 2)
+    let defaultSql = sqliteSchemaText(statement, 3)
+    let createSql = sqliteSchemaText(statement, 7)
+
+    if table == null || name == null || declaredType == null || createSql == null
+      return SQLiteSchemaResult.Failure("SQLite schema contains invalid text metadata")
+    end
+    if defaultSql == null && sqliteColumnType(statement, 3 as Int32) != (5 as Int32)
+      return SQLiteSchemaResult.Failure("SQLite schema contains an invalid default expression")
+    end
+    if sqliteColumnType(statement, 4 as Int32) != (1 as Int32) || sqliteColumnType(statement, 5 as Int32) != (1 as Int32) || sqliteColumnType(statement, 6 as Int32) != (1 as Int32)
+      return SQLiteSchemaResult.Failure("SQLite schema contains invalid column flags")
+    end
+    let required = sqliteColumnInt(statement, 4 as Int32)
+    let keyPosition = sqliteColumnInt(statement, 5 as Int32)
+    let hidden = sqliteColumnInt(statement, 6 as Int32)
+
+    if (required != 0 && required != 1) || keyPosition < 0 || hidden < 0 || hidden > 3
+      return SQLiteSchemaResult.Failure("SQLite schema contains unsupported column flags")
+    end
+    snapshot.add(new SQLiteSchemaColumn(table, name, declaredType, defaultSql, required == 1, keyPosition, hidden, createSql))
+    status = sqliteStep(statement)
+  end
+  if status != (101 as Int32)
+    return SQLiteSchemaResult.Failure(sqliteMessage(database))
+  end
+  return SQLiteSchemaResult.Snapshot(snapshot)
+end

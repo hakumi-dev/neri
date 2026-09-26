@@ -6,14 +6,17 @@ class BatchCompilation
   public analyzed: Int = 0
   public fallback: Int = 0
 
-  def prepare(combined: String, ids: StringBuffer, texts: StringBuffer, starts: IntBuffer, owners: StringBuffer, consumer: String, timings: Bool): BatchDependency?
+  def prepare(combined: String, ids: StringBuffer, texts: StringBuffer, starts: IntBuffer, owners: StringBuffer, consumerOwners: StringTable<Bool>, timings: Bool, diskCache: Bool = false): BatchDependency?
     var count = 0
     var bytes = 0
-    var identity = ""
+    let identityParts = new StringBuffer()
 
-    while count < ids.size && owners.get(count) != consumer
+    while count < ids.size && consumerOwners.find(owners.get(count)) == null
       bytes = bytes + host::stringByteLength(texts.get(count)) + 1
-      identity = identity + runCacheFrame(ids.get(count))
+      identityParts.add(runCacheFrame(ids.get(count)))
+      identityParts.add(runCacheFrame(owners.get(count)))
+      identityParts.add(runCacheFrame(texts.get(count)))
+      identityParts.add(runCacheFrame(starts.get(count) as String))
       count = count + 1
     end
     if count == 0 || count == ids.size
@@ -23,7 +26,7 @@ class BatchCompilation
     var index = count
 
     while index < ids.size
-      if owners.get(index) != consumer
+      if consumerOwners.find(owners.get(index)) == null
         this.fallback = this.fallback + 1
         return null
       end
@@ -51,63 +54,100 @@ class BatchCompilation
       let node = consumerParser.arena.childAt(consumerRoot, index)
 
       if consumerParser.arena.kindAt(node).isUse()
-        let name = consumerParser.arena.dataAt(node)
+        let declaration = consumerParser.arena.useAt(node)
 
-        followingUses = host::appendString(followingUses, name)
+        if declaration == null || declaration.alias != ""
+          this.fallback = this.fallback + 1
+          return null
+        end
+        followingUses = host::appendString(followingUses, declaration.namespaceName)
       end
       index = index + 1
     end
     let prefix = host::stringSlice(combined, 0, bytes)
 
-    identity = sha256FastText(runCacheFrame(identity) + runCacheFrame(prefix))
+    let identity = sha256FastText(runCacheFrame(identityParts.join()) + runCacheFrame(prefix) + runCacheFrame(offset as String))
     var dependency = this.dependency
     let reused = dependency != null && dependency.identity == identity && dependency.importScope == dependency.scopeKey(followingUses)
+    var loaded = false
 
     if !reused
-      let parseStarted = runCacheTime()
-      let lexer = new BootstrapLexer(prefix)
-      let parser = new BootstrapParser(lexer.lex())
+      let cache = new SemanticSnapshotCache()
 
-      index = 0
-      while index < count
-        parser.addSourceBoundary(starts.get(index))
-        index = index + 1
-      end
-      let root = parser.parseProgram()
+      if diskCache
+        var context = runCacheFrame("dependency-prefix-v2") + runCacheFrame(identity)
 
-      runCacheReport(timings, "dependency-parse", parseStarted)
-      if parser.diagnostics.count() != 0
-        this.fallback = this.fallback + 1
-        return null
-      end
-      let bindStarted = runCacheTime()
-      let binder = new BootstrapBinder(parser.arena, root, offset)
+        for name in followingUses
+          context = context + runCacheFrame(name)
+        end
+        let lookupStarted = runCacheTime()
 
-      binder.requireEntryPoint = false
-      binder.followingUses = followingUses
-      binder.clearSources()
-      index = 0
-      while index < count
-        binder.addSource(ids.get(index), starts.get(index))
-        binder.forbiddenEntryPointSources.add(ids.get(index))
-        index = index + 1
-      end
-      let model = binder.bind()
+        cache.prepare(context)
+        let snapshot = cache.load()
 
-      runCacheReport(timings, "dependency-bind", bindStarted)
-      if model.diagnostics.count() != 0
-        this.fallback = this.fallback + 1
-        return null
+        runCacheReport(timings, snapshot == null ? "dependency-semantic-miss" : "dependency-semantic-hit", lookupStarted)
+        if snapshot != null
+          let prefixLexer = new BootstrapLexer(prefix)
+          let prefixTokens = prefixLexer.lex()
+
+          dependency = new BatchDependency(identity, snapshot.syntax, snapshot.root, snapshot.model, bytes, offset, followingUses, prefixTokens)
+          loaded = true
+        end
       end
-      dependency = new BatchDependency(identity, parser, root, model, bytes, offset, followingUses)
-      this.dependency = dependency
-      this.analyzed = this.analyzed + 1
+      if loaded
+        this.dependency = dependency
+      else
+        let parseStarted = runCacheTime()
+        let lexer = new BootstrapLexer(prefix)
+        let parser = new BootstrapParser(lexer.lex())
+
+        index = 0
+        while index < count
+          parser.addSourceBoundary(starts.get(index))
+          index = index + 1
+        end
+        let root = parser.parseProgram()
+
+        runCacheReport(timings, "dependency-parse", parseStarted)
+        if parser.diagnostics.count() != 0
+          this.fallback = this.fallback + 1
+          return null
+        end
+        let bindStarted = runCacheTime()
+        let binder = new BootstrapBinder(parser.arena, root, offset)
+
+        binder.requireEntryPoint = false
+        binder.followingUses = followingUses
+        binder.clearSources()
+        index = 0
+        while index < count
+          binder.addSource(ids.get(index), starts.get(index))
+          binder.forbiddenEntryPointSources.add(ids.get(index))
+          index = index + 1
+        end
+        let model = binder.bind()
+
+        runCacheReport(timings, "dependency-bind", bindStarted)
+        if model.diagnostics.count() != 0
+          this.fallback = this.fallback + 1
+          return null
+        end
+        dependency = new BatchDependency(identity, parser.arena, root, model, bytes, offset, followingUses, parser.tokens)
+        this.dependency = dependency
+        this.analyzed = this.analyzed + 1
+        if diskCache
+          let storeStarted = runCacheTime()
+
+          cache.store(model, root)
+          runCacheReport(timings, "dependency-semantic-store", storeStarted)
+        end
+      end
     end
     if dependency == null || !dependency.accepts(consumerParser, consumerRoot)
       this.fallback = this.fallback + 1
       return null
     end
-    this.reused = this.reused + 1 if reused
+    this.reused = this.reused + 1 if reused || loaded
     return dependency
   end
 end

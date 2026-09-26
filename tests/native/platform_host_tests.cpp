@@ -1,7 +1,9 @@
 #include "../../native/platform/host.h"
+#include "../../native/platform/error_text.h"
 #include "neri/host_path.h"
 
 #include <chrono>
+#include <atomic>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -9,6 +11,7 @@
 #include <iterator>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 #if defined(_WIN32)
 #include "../../native/platform/windows_support.h"
@@ -115,6 +118,32 @@ void test_memory() {
   neri::platform::deallocate(nullptr);
 }
 
+void test_concurrent_error_text() {
+  std::atomic<bool> valid{true};
+  char missing_message[256];
+  char denied_message[256];
+  const std::string missing(missing_message,
+      neri_platform_error_text(ENOENT, missing_message, sizeof(missing_message)));
+  const std::string denied(denied_message,
+      neri_platform_error_text(EACCES, denied_message, sizeof(denied_message)));
+  std::vector<std::thread> workers;
+  for (int worker = 0; worker < 8; ++worker) {
+    workers.emplace_back([&valid, &missing, &denied, worker] {
+      const int code = worker % 2 == 0 ? ENOENT : EACCES;
+      const std::string &expected = worker % 2 == 0 ? missing : denied;
+      for (int iteration = 0; iteration < 1000; ++iteration) {
+        char message[256];
+        errno = EBUSY;
+        const size_t length = neri_platform_error_text(code, message, sizeof(message));
+        if (length == 0 || std::string(message, length) != expected || errno != EBUSY)
+          valid.store(false, std::memory_order_relaxed);
+      }
+    });
+  }
+  for (auto &worker : workers) worker.join();
+  require(valid.load(std::memory_order_relaxed), "concurrent error text formatting failed");
+}
+
 const std::vector<std::string> child_arguments = {
     "with spaces", "a\"quoted\"value", "trailing\\", "spaces and trailing\\",
     "\\\\server\\share\\", "slash\\\"quote", "", "$HOME", "$(echo expanded)",
@@ -162,6 +191,7 @@ int main(int argc, char **argv) {
     test_files(directory.path);
     test_environment();
     test_memory();
+    test_concurrent_error_text();
     test_process(std::filesystem::absolute(neri::host_path(argv[0])), directory.path);
 #if defined(_WIN32)
     // Model an IDE/pipe runner without opening even a temporary test console.

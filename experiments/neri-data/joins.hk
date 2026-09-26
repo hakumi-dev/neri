@@ -1,0 +1,1212 @@
+use host
+use quotation
+use reference
+use tasks
+namespace neri_data
+
+class Joined<L, R>
+  public left: L
+  public right: R
+
+  public def init(left: L, right: R): Void
+    this.left = left
+    this.right = right
+  end
+end
+
+class LeftJoined<L, R>
+  public left: L
+  public right: R?
+
+  public def init(left: L, right: R?): Void
+    this.left = left
+    this.right = right
+  end
+end
+
+class RelationPlan<T>
+  internal sql: String
+  internal parameters: ParameterValues
+  internal columns: ResultColumns
+  internal decoder: Decoder<T>
+  internal mapping: EntityMapping
+  internal checkedScalars: Bool
+  internal order: OrderTerm?
+
+  internal def init(sql: String, parameters: ParameterValues, columns: ResultColumns, decoder: Decoder<T>, mapping: EntityMapping, requiresCheckedScalars: Bool = false, order: OrderTerm? = null): Void
+    this.sql = sql
+    this.parameters = parameters
+    this.columns = columns
+    this.decoder = decoder
+    this.mapping = mapping
+    this.checkedScalars = requiresCheckedScalars
+    this.order = order
+  end
+end
+
+enum RelationBuildResult<T>
+  case Plan(value: RelationPlan<T>)
+  case Failure(error: QueryFailure)
+end
+
+def relationColumnsCopy(source: readonly ResultColumns): ResultColumns
+  let values: ResultColumn[] = tasks::generate(source.count(), 1) do |index|
+    let column = source.at(index)
+
+    return new ResultColumn(column.name(), shapeKind(column.kind()), column.nullable())
+  end
+
+  return new ResultColumns(values)
+end
+
+## A typed, deferred relational source. Joining it never materializes intermediate rows.
+class Relation<T>
+  private builder: fn(SqlDialect): RelationBuildResult<T>
+  private boundProvider: Provider?
+  private stages: JoinStage?
+  private bound: Int?
+  private stickyFailure: QueryFailure?
+
+  internal def init(builder: fn(SqlDialect): RelationBuildResult<T>, provider: Provider?, stages: JoinStage? = null, bound: Int? = null, failure: QueryFailure? = null): Void
+    this.builder = builder
+    this.boundProvider = provider
+    this.stages = stages
+    this.bound = bound
+    this.stickyFailure = failure
+  end
+
+  internal def build(dialect: SqlDialect): RelationBuildResult<T>
+    let failure = this.stickyFailure
+
+    if failure != null
+      return RelationBuildResult<T>.Failure(failure)
+    end
+    match this.builder(dialect)
+      case RelationBuildResult.Failure(error)
+        return RelationBuildResult<T>.Failure(error)
+      case RelationBuildResult.Plan(plan)
+        if this.stages == null
+          return RelationBuildResult<T>.Plan(plan)
+        end
+        var sourceSql = plan.sql
+
+        if joinOnlyTakes(this.stages)
+          sourceSql = "SELECT * FROM (" + sourceSql + ") AS \"__neri_relation_input\"" + joinOrderSql(plan.order, "__neri_relation_input")
+        end
+        let base = new JoinSql(sourceSql, plan.parameters, plan.columns, plan.mapping, plan.mapping, plan.columns, plan.columns, plan.order, plan.checkedScalars)
+
+        match composeJoin(base, this.stages, this.bound, false, dialect)
+          case JoinBuildResult.Failure(error)
+            return RelationBuildResult<T>.Failure(error)
+          case JoinBuildResult.Plan(composed)
+            return RelationBuildResult<T>.Plan(new RelationPlan<T>(composed.text, composed.parameters, composed.columns, plan.decoder, plan.mapping, composed.checkedScalars, composed.order))
+        end
+    end
+  end
+
+  internal def provider(): Provider?
+    return this.boundProvider
+  end
+
+  public def asRelation(): Relation<T>
+    return this
+  end
+
+  public def matching(predicate: quote fn(T): Bool): Relation<T>
+    return new Relation<T>(this.builder, this.boundProvider, new JoinStage(1, this.stages, predicate.tree()), this.bound, this.stickyFailure)
+  end
+
+  public def orderBy<V>(selector: quote fn(T): V, descending: Bool = false): Relation<T>
+    return new Relation<T>(this.builder, this.boundProvider, new JoinStage(5, this.stages, selector.tree(), descending), this.bound, this.stickyFailure)
+  end
+
+  public def thenBy<V>(selector: quote fn(T): V, descending: Bool = false): Relation<T>
+    return new Relation<T>(this.builder, this.boundProvider, new JoinStage(7, this.stages, selector.tree(), descending), this.bound, this.stickyFailure)
+  end
+
+  public def skip(count: Int): Relation<T>
+    if this.stickyFailure != null
+      return this
+    end
+    if count < 0 || count > 2147483647
+      return new Relation<T>(this.builder, this.boundProvider, this.stages, this.bound, QueryFailure.Provider("invalid relation offset"))
+    end
+    if count == 0
+      return this
+    end
+    return new Relation<T>(this.builder, this.boundProvider, new JoinStage(9, this.stages, count: count), this.bound, this.stickyFailure)
+  end
+
+  public def take(count: Int): Relation<T>
+    if this.stickyFailure != null
+      return this
+    end
+    if count < 1 || count > queryRowLimit()
+      return new Relation<T>(this.builder, this.boundProvider, this.stages, this.bound, QueryFailure.InvalidLimit(count, queryRowLimit()))
+    end
+    return new Relation<T>(this.builder, this.boundProvider, new JoinStage(10, this.stages, count: count), joinTakeBound(this.bound, count), this.stickyFailure)
+  end
+
+  public def compile(dialect: SqlDialect = SqlDialect.QuestionMark()): CompileResult<T>
+    let failure = this.stickyFailure
+
+    if failure != null
+      return CompileResult<T>.Failure(failure)
+    end
+    let limit = this.bound
+
+    if limit == null
+      return CompileResult<T>.Failure(QueryFailure.MissingLimit(queryRowLimit()))
+    end
+    match this.build(dialect)
+      case RelationBuildResult.Failure(error)
+        return CompileResult<T>.Failure(error)
+      case RelationBuildResult.Plan(plan)
+        return CompileResult<T>.Plan(new TypedPlan<T>(new SqlPlan(plan.sql, plan.parameters, limit, plan.columns, plan.checkedScalars), plan.decoder))
+    end
+  end
+
+  public def all(provider: Provider? = null): QueryResult<T>
+    let selected = provider != null ? provider : this.boundProvider
+
+    if selected == null
+      return QueryResult<T>.Failure(QueryFailure.UnsupportedCapability("relation requires a provider"))
+    end
+    if !selected.supports(ProviderCapability.BoundedTypedReads())
+      return QueryResult<T>.Failure(QueryFailure.UnsupportedCapability("bounded-typed-reads"))
+    end
+    return execute<T>(this.compile(selected.dialect()), selected)
+  end
+
+  public def stream(visit: fn(T): Bool, options: StreamOptions? = null): StreamResult
+    let compile: fn(SqlDialect): CompileResult<T> = fn(dialect: SqlDialect): CompileResult<T>
+      return this.streamPlan(dialect)
+    end
+
+    return streamCompiled<T>(this.boundProvider, compile, visit, options, this.bound)
+  end
+
+  public def streamWith(provider: Provider, visit: fn(T): Bool, options: StreamOptions? = null): StreamResult
+    let compile: fn(SqlDialect): CompileResult<T> = fn(dialect: SqlDialect): CompileResult<T>
+      return this.streamPlan(dialect)
+    end
+
+    return streamCompiled<T>(provider, compile, visit, options, this.bound)
+  end
+
+  private def streamPlan(dialect: SqlDialect): CompileResult<T>
+    match this.build(dialect)
+      case RelationBuildResult.Failure(error)
+        return CompileResult<T>.Failure(error)
+      case RelationBuildResult.Plan(plan)
+        var maximum = queryRowLimit()
+        let bound = this.bound
+
+        if bound != null
+          maximum = bound
+        end
+        return CompileResult<T>.Plan(new TypedPlan<T>(new SqlPlan(plan.sql, plan.parameters, maximum, plan.columns, plan.checkedScalars), plan.decoder))
+    end
+  end
+
+  public def join<U, K>(right: Relation<U>, codec: ScalarCodec<K>, leftKey: quote fn(T): K, rightKey: quote fn(U): K): JoinedQuery<T, U, K>
+    return new JoinedQuery<T, U, K>(this, right, codec, leftKey, rightKey)
+  end
+
+  public def leftJoin<U, K>(right: Relation<U>, codec: ScalarCodec<K>, leftKey: quote fn(T): K, rightKey: quote fn(U): K): LeftJoinedQuery<T, U, K>
+    return new LeftJoinedQuery<T, U, K>(this, right, codec, leftKey, rightKey)
+  end
+
+  public def aggregate<R>(shape: AggregateShape<T, R>): GlobalAggregate<T, R>
+    return new GlobalAggregate<T, R>(this, shape)
+  end
+
+  public def groupBy<K>(keys: RowShape<T, K>): Grouping<T, K>
+    return new Grouping<T, K>(this, keys)
+  end
+end
+
+class JoinSql
+  internal text: String
+  internal parameters: ParameterValues
+  internal columns: ResultColumns
+  internal leftMapping: EntityMapping
+  internal rightMapping: EntityMapping
+  internal leftColumns: ResultColumns
+  internal rightColumns: ResultColumns
+  internal order: OrderTerm?
+  internal checkedScalars: Bool
+
+  internal def init(text: String, parameters: ParameterValues, columns: ResultColumns, leftMapping: EntityMapping, rightMapping: EntityMapping, leftColumns: ResultColumns, rightColumns: ResultColumns, order: OrderTerm? = null, requiresCheckedScalars: Bool = false): Void
+    this.text = text
+    this.parameters = parameters
+    this.columns = columns
+    this.leftMapping = leftMapping
+    this.rightMapping = rightMapping
+    this.leftColumns = leftColumns
+    this.rightColumns = rightColumns
+    this.order = order
+    this.checkedScalars = requiresCheckedScalars
+  end
+
+  internal def orderSql(source: String): String
+    return joinOrderSql(this.order, source)
+  end
+end
+
+enum JoinBuildResult
+  case Plan(value: JoinSql)
+  case Failure(error: QueryFailure)
+end
+
+class JoinResolved<L, R>
+  internal joined: JoinSql
+  internal left: RelationPlan<L>
+  internal right: RelationPlan<R>
+
+  internal def init(joined: JoinSql, left: RelationPlan<L>, right: RelationPlan<R>): Void
+    this.joined = joined
+    this.left = left
+    this.right = right
+  end
+end
+
+enum JoinResolvedResult<L, R>
+  case Plan(value: JoinResolved<L, R>)
+  case Failure(error: QueryFailure)
+end
+
+def joinParameterCopy(source: readonly ParameterValues, target: CompileState): Void
+  var current = source.first()
+
+  while current != null
+    match current.value()
+      case Parameter.Bool(value)
+        target.bind(Parameter.Bool(value))
+      case Parameter.Int(value)
+        target.bind(Parameter.Int(value))
+      case Parameter.Float(value)
+        target.bind(Parameter.Float(value))
+      case Parameter.Text(value)
+        target.bind(Parameter.Text(value))
+    end
+    current = current.next()
+  end
+end
+
+def joinShiftSql(sql: String, amount: Int, dialect: SqlDialect): String?
+  match dialect
+    case SqlDialect.QuestionMark()
+      return sql
+    case SqlDialect.PostgreSql()
+  end
+  if amount == 0
+    return sql
+  end
+  var output = ""
+  var start = 0
+  var index = 0
+  let length = host::stringByteLength(sql)
+
+  while index < length
+    if host::stringByteAt(sql, index) as Int == 36
+      var stop = index + 1
+
+      while stop < length
+        let byte = host::stringByteAt(sql, stop) as Int
+
+        if byte < 48 || byte > 57
+          break
+        end
+        stop = stop + 1
+      end
+      if stop > index + 1
+        let number = host::parseInt(host::stringSlice(sql, index + 1, stop - index - 1))
+
+        if number == null || number < 1 || number > 2147483647 - amount
+          return null
+        end
+        output = output + host::stringSlice(sql, start, index - start) + "$" + ((number + amount) as String)
+        start = stop
+        index = stop
+      else
+        index = index + 1
+      end
+    else
+      index = index + 1
+    end
+  end
+  return output + host::stringSlice(sql, start, length - start)
+end
+
+def joinOutputColumns(left: ResultColumns, right: ResultColumns, outer: Bool): ResultColumns
+  let extra = outer ? 1 : 0
+  let values: ResultColumn[] = tasks::generate(left.count() + right.count() + extra, 1) do |index|
+    return new ResultColumn("unused", ResultColumnKind.Int())
+  end
+  var index = 0
+
+  while index < left.count()
+    let column = left.at(index)
+
+    values[index] = new ResultColumn("__neri_l" + (index as String), shapeKind(column.kind()), column.nullable())
+    index = index + 1
+  end
+  index = 0
+
+  while index < right.count()
+    let column = right.at(index)
+
+    values[left.count() + index] = new ResultColumn("__neri_r" + (index as String), shapeKind(column.kind()), outer || column.nullable())
+    index = index + 1
+  end
+  if outer
+    values[left.count() + right.count()] = new ResultColumn("__neri_present", ResultColumnKind.Int())
+  end
+  return new ResultColumns(values)
+end
+
+def joinSelectColumns(columns: ResultColumns, source: String, prefix: String): String
+  var selection = ""
+  var index = 0
+
+  while index < columns.count()
+    let column = columns.at(index)
+
+    selection = selection + (index == 0 ? "" : ", ") + quoted(source, column.name()) + " AS \"" + prefix + (index as String) + "\""
+    index = index + 1
+  end
+  return selection
+end
+
+def joinSelectOrdinal(columns: ResultColumns, source: String, prefix: String): String
+  var selection = ""
+  var index = 0
+
+  while index < columns.count()
+    selection = selection + (index == 0 ? "" : ", ") + quoted(source, prefix + (index as String)) + " AS \"" + prefix + (index as String) + "\""
+    index = index + 1
+  end
+  return selection
+end
+
+def relationColumnIndex(columns: ResultColumns, name: String): Int
+  var index = 0
+
+  while index < columns.count()
+    let column = columns.at(index)
+
+    if column.name() == name
+      return index
+    end
+    index = index + 1
+  end
+  return -1
+end
+
+def joinOutputMapping(mapping: EntityMapping, columns: ResultColumns, source: String, prefix: String): EntityMapping?
+  let values: MappingColumn[] = tasks::generate(mapping.count(), 1) do |index|
+    return new MappingColumn("unused", "Int", "unused")
+  end
+  var index = 0
+
+  while index < mapping.count()
+    let column = mapping.columnAt(index)
+
+    if column == null
+      return null
+    end
+    let physical = relationColumnIndex(columns, column.column())
+
+    if physical < 0
+      return null
+    end
+    values[index] = new MappingColumn(column.identity(), column.typeName(), prefix + (physical as String), column.path())
+    index = index + 1
+  end
+  let presences: MappingPresence[] = tasks::generate(mapping.presenceCount(), 1) do |position|
+    return new MappingPresence(new MappingPath("unused", "Int?"), "unused")
+  end
+
+  index = 0
+
+  while index < mapping.presenceCount()
+    let presence = mapping.presenceAt(index)
+
+    if presence == null
+      return null
+    end
+    let physical = relationColumnIndex(columns, presence.column())
+
+    if physical < 0
+      return null
+    end
+    presences[index] = new MappingPresence(presence.path(), prefix + (physical as String))
+    index = index + 1
+  end
+  return new EntityMapping(mapping.entityType(), source, values, presences: presences)
+end
+
+def joinRelationMapping(left: EntityMapping, right: EntityMapping, leftTree: readonly quotation::Tree, rightTree: readonly quotation::Tree): EntityMapping?
+  let leftRoot = leftTree.nodeAt(leftTree.root())
+  let rightRoot = rightTree.nodeAt(rightTree.root())
+  let rootType = leftTree.parameterTypeAt(0)
+
+  if leftRoot == null || rightRoot == null || rootType == null || rightTree.parameterTypeAt(0) != rootType || leftTree.parameterCount() != 1 || rightTree.parameterCount() != 1
+    return null
+  end
+  if translationNodeCode(leftRoot.kind()) != 2 || translationNodeCode(rightRoot.kind()) != 2
+    return null
+  end
+  if leftRoot.typeName() != left.entityType() || semanticTranslationInner(rightRoot.typeName()) != right.entityType()
+    return null
+  end
+  let columns: MappingColumn[] = tasks::generate(left.count() + right.count(), 1) do |index|
+    return new MappingColumn("unused", "Int", "unused")
+  end
+  var index = 0
+
+  while index < left.count()
+    let column = left.columnAt(index)
+
+    if column == null
+      return null
+    end
+    columns[index] = new MappingColumn(column.identity(), column.typeName(), column.column(), mappingPathPrefix(column.path(), leftRoot.identity(), leftRoot.typeName()))
+    index = index + 1
+  end
+  index = 0
+
+  while index < right.count()
+    let column = right.columnAt(index)
+
+    if column == null
+      return null
+    end
+    columns[left.count() + index] = new MappingColumn(column.identity(), column.typeName(), column.column(), mappingPathPrefix(column.path(), rightRoot.identity(), rightRoot.typeName()))
+    index = index + 1
+  end
+  let outer = translationOptional(rightRoot.typeName())
+  let presences: MappingPresence[] = tasks::generate(left.presenceCount() + right.presenceCount() + (outer ? 1 : 0), 1) do |position|
+    return new MappingPresence(new MappingPath("unused", "Int?"), "unused")
+  end
+
+  index = 0
+
+  while index < left.presenceCount()
+    let presence = left.presenceAt(index)
+
+    if presence == null
+      return null
+    end
+    presences[index] = new MappingPresence(mappingPathPrefix(presence.path(), leftRoot.identity(), leftRoot.typeName()), presence.column())
+    index = index + 1
+  end
+  index = 0
+
+  while index < right.presenceCount()
+    let presence = right.presenceAt(index)
+
+    if presence == null
+      return null
+    end
+    presences[left.presenceCount() + index] = new MappingPresence(mappingPathPrefix(presence.path(), rightRoot.identity(), rightRoot.typeName()), presence.column())
+    index = index + 1
+  end
+  if outer
+    presences[left.presenceCount() + right.presenceCount()] = new MappingPresence(new MappingPath(rightRoot.identity(), rightRoot.typeName()), "__neri_present")
+  end
+  return new EntityMapping(rootType, "__neri_join_stage", columns, presences: presences)
+end
+
+def buildJoin<L, R, K>(left: Relation<L>, right: Relation<R>, codec: ScalarCodec<K>, leftKey: quote fn(L): K, rightKey: quote fn(R): K, outer: Bool, dialect: SqlDialect): JoinResolvedResult<L, R>
+  match left.build(dialect)
+    case RelationBuildResult.Failure(error)
+      return JoinResolvedResult<L, R>.Failure(error)
+    case RelationBuildResult.Plan(leftPlan)
+      match right.build(dialect)
+        case RelationBuildResult.Failure(error)
+          return JoinResolvedResult<L, R>.Failure(error)
+        case RelationBuildResult.Plan(rightPlan)
+          let leftMapping = leftPlan.mapping
+          let rightMapping = rightPlan.mapping
+
+          let leftSource = "__neri_left"
+          let rightSource = "__neri_right"
+          let rightBase = "__neri_right_source"
+          let leftOutput = joinOutputMapping(leftMapping, leftPlan.columns, "__neri_join_stage", "__neri_l")
+          let rightOutput = joinOutputMapping(rightMapping, rightPlan.columns, "__neri_join_stage", "__neri_r")
+          let rightInput = joinOutputMapping(rightMapping, rightPlan.columns, rightSource, "__neri_r")
+
+          if leftOutput == null || rightOutput == null || rightInput == null
+            return JoinResolvedResult<L, R>.Failure(QueryFailure.Provider("join mapping is missing from physical columns"))
+          end
+          let shifted = joinShiftSql(rightPlan.sql, leftPlan.parameters.count(), dialect)
+
+          if shifted == null
+            return JoinResolvedResult<L, R>.Failure(QueryFailure.Provider("join parameter index exceeds supported range"))
+          end
+          let parameters = new CompileState()
+
+          joinParameterCopy(leftPlan.parameters, parameters)
+          joinParameterCopy(rightPlan.parameters, parameters)
+          let leftInput = joinStageMapping(leftMapping, leftSource)
+
+          match compileScalarQuotation(leftInput, leftKey.tree(), codec.typeName(), parameters, dialect)
+            case ScalarSqlResult.Failure(error)
+              return JoinResolvedResult<L, R>.Failure(error)
+            case ScalarSqlResult.Value(leftScalar)
+              match compileScalarQuotation(rightInput, rightKey.tree(), codec.typeName(), parameters, dialect)
+                case ScalarSqlResult.Failure(error)
+                  return JoinResolvedResult<L, R>.Failure(error)
+                case ScalarSqlResult.Value(rightScalar)
+                  var selected = joinSelectColumns(leftPlan.columns, leftSource, "__neri_l") + ", " + joinSelectOrdinal(rightPlan.columns, rightSource, "__neri_r")
+
+                  if outer
+                    selected = selected + ", COALESCE(" + quoted(rightSource, "__neri_matched") + ", 0) AS \"__neri_present\""
+                  end
+                  let wrappedRight = "SELECT " + joinSelectColumns(rightPlan.columns, rightBase, "__neri_r") + ", 1 AS \"__neri_matched\" FROM (" + shifted + ") AS \"" + rightBase + "\""
+                  let sql = "SELECT " + selected + " FROM (" + leftPlan.sql + ") AS \"" + leftSource + "\" " + (outer ? "LEFT" : "INNER") + " JOIN (" + wrappedRight + ") AS \"" + rightSource + "\" ON " + leftScalar.sql + " = " + rightScalar.sql
+
+                  let joined = new JoinSql(sql, new ParameterValues(parameters.head, parameters.count), joinOutputColumns(leftPlan.columns, rightPlan.columns, outer), leftOutput, rightOutput, leftPlan.columns, rightPlan.columns, requiresCheckedScalars: leftPlan.checkedScalars || rightPlan.checkedScalars || leftScalar.checkedScalars || rightScalar.checkedScalars)
+
+                  return JoinResolvedResult<L, R>.Plan(new JoinResolved<L, R>(joined, leftPlan, rightPlan))
+              end
+          end
+      end
+  end
+end
+
+def joinDecodeSide<T>(row: RawRow, columns: ResultColumns, decoder: Decoder<T>, prefix: String): DecodeResult<T>
+  let values: RawColumn[] = tasks::generate(columns.count(), 1) do |index|
+    return new RawColumn("unused", Cell.Null())
+  end
+  var index = 0
+
+  while index < columns.count()
+    let column = columns.at(index)
+    let alias = prefix + (index as String)
+
+    match row.value(alias)
+      case CellLookup.Missing()
+        return DecodeResult<T>.Failure(QueryFailure.MissingColumn(alias))
+      case CellLookup.Found(cell)
+        values[index] = new RawColumn(column.name(), cell)
+    end
+    index = index + 1
+  end
+  return decoder.decode(new RawRow(values))
+end
+
+def joinTakeBound(current: Int?, requested: Int): Int
+  if requested < 1 || requested > queryRowLimit()
+    return requested
+  end
+  if current != null
+    if current < 1 || current > queryRowLimit()
+      return current
+    end
+    return current < requested ? current : requested
+  end
+  return requested
+end
+
+def joinCountPlan(joined: JoinSql, selected: Provider): QueryValue<Int>
+  let alias = "__neri_join_count"
+  let sql = "SELECT COUNT(*) AS \"" + alias + "\" FROM (" + joined.text + ") AS \"__neri_join_count_source\""
+  let decoder = intScalar().decoder(alias)
+  let plan = new TypedPlan<Int>(new SqlPlan(sql, joined.parameters, 1, decoder.columns(), joined.checkedScalars), decoder)
+
+  match execute<Int>(CompileResult<Int>.Plan(plan), selected)
+    case QueryResult.Failure(error)
+      return QueryValue<Int>.Failure(error)
+    case QueryResult.Rows(rows)
+      let first = rows.first()
+
+      if first == null
+        return QueryValue<Int>.Failure(QueryFailure.Cardinality("exactly one", 0))
+      end
+      return QueryValue<Int>.Value(first.value)
+  end
+end
+
+class JoinedQuery<L, R, K>
+  private left: Relation<L>
+  private right: Relation<R>
+  private codec: ScalarCodec<K>
+  private leftKey: quote fn(L): K
+  private rightKey: quote fn(R): K
+  private bound: Int?
+  private stages: JoinStage?
+  private stickyFailure: QueryFailure?
+
+  public def init(left: Relation<L>, right: Relation<R>, codec: ScalarCodec<K>, leftKey: quote fn(L): K, rightKey: quote fn(R): K, bound: Int? = null, stages: JoinStage? = null, failure: QueryFailure? = null): Void
+    this.left = left
+    this.right = right
+    this.codec = codec
+    this.leftKey = leftKey
+    this.rightKey = rightKey
+    this.bound = bound
+    this.stages = stages
+    if stages == null && bound != null
+      this.stages = new JoinStage(10, count: bound)
+    end
+    this.stickyFailure = failure
+    if failure == null && bound != null && (bound < 1 || bound > queryRowLimit())
+      this.stickyFailure = QueryFailure.InvalidLimit(bound, queryRowLimit())
+    end
+  end
+
+  public def take(count: Int): JoinedQuery<L, R, K>
+    if this.stickyFailure != null
+      return this
+    end
+    if count < 1 || count > queryRowLimit()
+      return new JoinedQuery<L, R, K>(this.left, this.right, this.codec, this.leftKey, this.rightKey, this.bound, this.stages, QueryFailure.InvalidLimit(count, queryRowLimit()))
+    end
+    return new JoinedQuery<L, R, K>(this.left, this.right, this.codec, this.leftKey, this.rightKey, joinTakeBound(this.bound, count), new JoinStage(10, this.stages, count: count))
+  end
+
+  public def skip(count: Int): JoinedQuery<L, R, K>
+    if this.stickyFailure != null
+      return this
+    end
+    if count < 0 || count > 2147483647
+      return new JoinedQuery<L, R, K>(this.left, this.right, this.codec, this.leftKey, this.rightKey, this.bound, this.stages, QueryFailure.Provider("invalid join offset"))
+    end
+    if count == 0
+      return this
+    end
+    return new JoinedQuery<L, R, K>(this.left, this.right, this.codec, this.leftKey, this.rightKey, this.bound, new JoinStage(9, this.stages, count: count))
+  end
+
+  private def staged(kind: Int, tree: readonly quotation::Tree? = null, descending: Bool = false): JoinedQuery<L, R, K>
+    if this.stickyFailure != null
+      return this
+    end
+    return new JoinedQuery<L, R, K>(this.left, this.right, this.codec, this.leftKey, this.rightKey, this.bound, new JoinStage(kind, this.stages, tree, descending))
+  end
+
+  public def matchingLeft(predicate: quote fn(L): Bool): JoinedQuery<L, R, K>
+    return this.staged(1, predicate.tree())
+  end
+
+  public def matchingRight(predicate: quote fn(R): Bool): JoinedQuery<L, R, K>
+    return this.staged(2, predicate.tree())
+  end
+
+  public def matchingPair(predicate: quote fn(L, R): Bool): JoinedQuery<L, R, K>
+    return this.staged(11, predicate.tree())
+  end
+
+  public def orderByLeft<V>(field: quote fn(L): V, descending: Bool = false): JoinedQuery<L, R, K>
+    return this.staged(5, field.tree(), descending)
+  end
+
+  public def orderByRight<V>(field: quote fn(R): V, descending: Bool = false): JoinedQuery<L, R, K>
+    return this.staged(6, field.tree(), descending)
+  end
+
+  public def thenByLeft<V>(field: quote fn(L): V, descending: Bool = false): JoinedQuery<L, R, K>
+    if this.stickyFailure != null
+      return this
+    end
+    if !joinHasOrder(this.stages)
+      return new JoinedQuery<L, R, K>(this.left, this.right, this.codec, this.leftKey, this.rightKey, this.bound, this.stages, QueryFailure.UnsupportedCapability("thenBy requires a primary orderBy"))
+    end
+    return this.staged(7, field.tree(), descending)
+  end
+
+  public def thenByRight<V>(field: quote fn(R): V, descending: Bool = false): JoinedQuery<L, R, K>
+    if this.stickyFailure != null
+      return this
+    end
+    if !joinHasOrder(this.stages)
+      return new JoinedQuery<L, R, K>(this.left, this.right, this.codec, this.leftKey, this.rightKey, this.bound, this.stages, QueryFailure.UnsupportedCapability("thenBy requires a primary orderBy"))
+    end
+    return this.staged(8, field.tree(), descending)
+  end
+
+  internal def resolvedPlan(dialect: SqlDialect): JoinResolvedResult<L, R>
+    let failure = this.stickyFailure
+
+    if failure != null
+      return JoinResolvedResult<L, R>.Failure(failure)
+    end
+    match buildJoin<L, R, K>(this.left, this.right, this.codec, this.leftKey, this.rightKey, false, dialect)
+      case JoinResolvedResult.Failure(error)
+        return JoinResolvedResult<L, R>.Failure(error)
+      case JoinResolvedResult.Plan(base)
+        match composeJoin(base.joined, this.stages, this.bound, false, dialect)
+          case JoinBuildResult.Failure(error)
+            return JoinResolvedResult<L, R>.Failure(error)
+          case JoinBuildResult.Plan(joined)
+            return JoinResolvedResult<L, R>.Plan(new JoinResolved<L, R>(joined, base.left, base.right))
+        end
+    end
+  end
+
+  internal def compositionPlan(dialect: SqlDialect): JoinBuildResult
+    match this.resolvedPlan(dialect)
+      case JoinResolvedResult.Failure(error)
+        return JoinBuildResult.Failure(error)
+      case JoinResolvedResult.Plan(value)
+        return JoinBuildResult.Plan(value.joined)
+    end
+  end
+
+  internal def boundProvider(override: Provider? = null): Provider?
+    return joinBoundProvider(this.left.provider(), this.right.provider(), override)
+  end
+
+  internal def rowLimit(): Int?
+    return this.bound
+  end
+
+  public def compile(dialect: SqlDialect = SqlDialect.QuestionMark()): CompileResult<Joined<L, R>>
+    return this.compilePlan(dialect, false)
+  end
+
+  private def relationPlan(dialect: SqlDialect, unbounded: Bool): RelationBuildResult<Joined<L, R>>
+    let limit = this.bound
+    let failure = this.stickyFailure
+
+    if failure != null
+      return RelationBuildResult<Joined<L, R>>.Failure(failure)
+    end
+
+    if limit == null && !unbounded
+      return RelationBuildResult<Joined<L, R>>.Failure(QueryFailure.MissingLimit(queryRowLimit()))
+    end
+    if limit != null && (limit < 1 || limit > queryRowLimit())
+      return RelationBuildResult<Joined<L, R>>.Failure(QueryFailure.InvalidLimit(limit, queryRowLimit()))
+    end
+    match this.resolvedPlan(dialect)
+      case JoinResolvedResult.Failure(error)
+        return RelationBuildResult<Joined<L, R>>.Failure(error)
+      case JoinResolvedResult.Plan(resolved)
+        let joined = resolved.joined
+        let leftDecoder = resolved.left.decoder
+        let rightDecoder = resolved.right.decoder
+        let read: fn(RawRow): DecodeResult<Joined<L, R>> = fn(row: RawRow): DecodeResult<Joined<L, R>>
+          match joinDecodeSide<L>(row, joined.leftColumns, leftDecoder, "__neri_l")
+            case DecodeResult.Failure(error)
+              return DecodeResult<Joined<L, R>>.Failure(error)
+            case DecodeResult.Value(leftValue)
+              match joinDecodeSide<R>(row, joined.rightColumns, rightDecoder, "__neri_r")
+                case DecodeResult.Failure(error)
+                  return DecodeResult<Joined<L, R>>.Failure(error)
+                case DecodeResult.Value(rightValue)
+                  return DecodeResult<Joined<L, R>>.Value(new Joined<L, R>(leftValue, rightValue))
+              end
+          end
+        end
+        let leftSelector: quote fn(Joined<L, R>): L = quote do |row: Joined<L, R>|: L
+          return row.left
+        end
+        let rightSelector: quote fn(Joined<L, R>): R = quote do |row: Joined<L, R>|: R
+          return row.right
+        end
+        let mapping = joinRelationMapping(joined.leftMapping, joined.rightMapping, leftSelector.tree(), rightSelector.tree())
+
+        if mapping == null
+          return RelationBuildResult<Joined<L, R>>.Failure(QueryFailure.Provider("joined relation path metadata is invalid"))
+        end
+        return RelationBuildResult<Joined<L, R>>.Plan(new RelationPlan<Joined<L, R>>(joined.text, joined.parameters, joined.columns, new Decoder<Joined<L, R>>(read, joined.columns), mapping, joined.checkedScalars, joined.order))
+    end
+  end
+
+  private def compilePlan(dialect: SqlDialect, unbounded: Bool): CompileResult<Joined<L, R>>
+    match this.relationPlan(dialect, unbounded)
+      case RelationBuildResult.Failure(error)
+        return CompileResult<Joined<L, R>>.Failure(error)
+      case RelationBuildResult.Plan(value)
+        var limit = queryRowLimit()
+        let bound = this.bound
+
+        if bound != null
+          limit = bound
+        end
+        let plan = new SqlPlan(value.sql, value.parameters, limit, value.columns, value.checkedScalars)
+
+        return CompileResult<Joined<L, R>>.Plan(new TypedPlan<Joined<L, R>>(plan, value.decoder))
+    end
+  end
+
+  ## Keeps the complete physical row, including presence markers, for another join.
+  public def asRelation(): Relation<Joined<L, R>>
+    let build: fn(SqlDialect): RelationBuildResult<Joined<L, R>> = fn(dialect: SqlDialect): RelationBuildResult<Joined<L, R>>
+      return this.relationPlan(dialect, true)
+    end
+
+    return new Relation<Joined<L, R>>(build, this.boundProvider(), bound: this.bound)
+  end
+
+  public def stream(visit: fn(Joined<L, R>): Bool, options: StreamOptions? = null): StreamResult
+    let provider = this.boundProvider()
+
+    if provider == null
+      return StreamResult.Failure(QueryFailure.UnsupportedCapability("join requires one shared provider or explicit override"), 0)
+    end
+    let compile: fn(SqlDialect): CompileResult<Joined<L, R>> = fn(dialect: SqlDialect): CompileResult<Joined<L, R>>
+      return this.compilePlan(dialect, true)
+    end
+
+    return streamCompiled<Joined<L, R>>(provider, compile, visit, options, this.bound)
+  end
+
+  public def streamWith(provider: Provider, visit: fn(Joined<L, R>): Bool, options: StreamOptions? = null): StreamResult
+    let compile: fn(SqlDialect): CompileResult<Joined<L, R>> = fn(dialect: SqlDialect): CompileResult<Joined<L, R>>
+      return this.compilePlan(dialect, true)
+    end
+
+    return streamCompiled<Joined<L, R>>(provider, compile, visit, options, this.bound)
+  end
+
+  public def all(provider: Provider? = null): QueryResult<Joined<L, R>>
+    let selected = this.boundProvider(provider)
+
+    if selected == null
+      return QueryResult<Joined<L, R>>.Failure(QueryFailure.UnsupportedCapability("join requires one shared provider or explicit override"))
+    end
+    if !selected.supports(ProviderCapability.BoundedTypedReads())
+      return QueryResult<Joined<L, R>>.Failure(QueryFailure.UnsupportedCapability("bounded-typed-reads"))
+    end
+    return execute<Joined<L, R>>(this.compile(selected.dialect()), selected)
+  end
+
+  public def count(provider: Provider? = null): QueryValue<Int>
+    let selected = this.boundProvider(provider)
+
+    if selected == null
+      return QueryValue<Int>.Failure(QueryFailure.UnsupportedCapability("join requires one shared provider or explicit override"))
+    end
+    if !selected.supports(ProviderCapability.BoundedTypedReads())
+      return QueryValue<Int>.Failure(QueryFailure.UnsupportedCapability("bounded-typed-reads"))
+    end
+    match this.compositionPlan(selected.dialect())
+      case JoinBuildResult.Failure(error)
+        return QueryValue<Int>.Failure(error)
+      case JoinBuildResult.Plan(joined)
+        return joinCountPlan(joined, selected)
+    end
+  end
+end
+
+class LeftJoinedQuery<L, R, K>
+  private left: Relation<L>
+  private right: Relation<R>
+  private codec: ScalarCodec<K>
+  private leftKey: quote fn(L): K
+  private rightKey: quote fn(R): K
+  private bound: Int?
+  private stages: JoinStage?
+  private stickyFailure: QueryFailure?
+
+  public def init(left: Relation<L>, right: Relation<R>, codec: ScalarCodec<K>, leftKey: quote fn(L): K, rightKey: quote fn(R): K, bound: Int? = null, stages: JoinStage? = null, failure: QueryFailure? = null): Void
+    this.left = left
+    this.right = right
+    this.codec = codec
+    this.leftKey = leftKey
+    this.rightKey = rightKey
+    this.bound = bound
+    this.stages = stages
+    if stages == null && bound != null
+      this.stages = new JoinStage(10, count: bound)
+    end
+    this.stickyFailure = failure
+    if failure == null && bound != null && (bound < 1 || bound > queryRowLimit())
+      this.stickyFailure = QueryFailure.InvalidLimit(bound, queryRowLimit())
+    end
+  end
+
+  public def take(count: Int): LeftJoinedQuery<L, R, K>
+    if this.stickyFailure != null
+      return this
+    end
+    if count < 1 || count > queryRowLimit()
+      return new LeftJoinedQuery<L, R, K>(this.left, this.right, this.codec, this.leftKey, this.rightKey, this.bound, this.stages, QueryFailure.InvalidLimit(count, queryRowLimit()))
+    end
+    return new LeftJoinedQuery<L, R, K>(this.left, this.right, this.codec, this.leftKey, this.rightKey, joinTakeBound(this.bound, count), new JoinStage(10, this.stages, count: count))
+  end
+
+  public def skip(count: Int): LeftJoinedQuery<L, R, K>
+    if this.stickyFailure != null
+      return this
+    end
+    if count < 0 || count > 2147483647
+      return new LeftJoinedQuery<L, R, K>(this.left, this.right, this.codec, this.leftKey, this.rightKey, this.bound, this.stages, QueryFailure.Provider("invalid join offset"))
+    end
+    if count == 0
+      return this
+    end
+    return new LeftJoinedQuery<L, R, K>(this.left, this.right, this.codec, this.leftKey, this.rightKey, this.bound, new JoinStage(9, this.stages, count: count))
+  end
+
+  private def staged(kind: Int, tree: readonly quotation::Tree? = null, descending: Bool = false): LeftJoinedQuery<L, R, K>
+    if this.stickyFailure != null
+      return this
+    end
+    return new LeftJoinedQuery<L, R, K>(this.left, this.right, this.codec, this.leftKey, this.rightKey, this.bound, new JoinStage(kind, this.stages, tree, descending))
+  end
+
+  public def matchingLeft(predicate: quote fn(L): Bool): LeftJoinedQuery<L, R, K>
+    return this.staged(1, predicate.tree())
+  end
+
+  ## Matches only rows with a present right entity satisfying the predicate.
+  public def matchingRight(predicate: quote fn(R): Bool): LeftJoinedQuery<L, R, K>
+    return this.staged(2, predicate.tree())
+  end
+
+  ## Matches only present right rows satisfying a predicate over both entities.
+  public def matchingPair(predicate: quote fn(L, R): Bool): LeftJoinedQuery<L, R, K>
+    return this.staged(11, predicate.tree())
+  end
+
+  ## Evaluates a predicate over the left row and an optional right row.
+  public def matchingOptionalPair(predicate: quote fn(L, R?): Bool): LeftJoinedQuery<L, R, K>
+    return this.staged(12, predicate.tree())
+  end
+
+  public def withRight(): LeftJoinedQuery<L, R, K>
+    return this.staged(3)
+  end
+
+  public def withoutRight(): LeftJoinedQuery<L, R, K>
+    return this.staged(4)
+  end
+
+  public def orderByLeft<V>(field: quote fn(L): V, descending: Bool = false): LeftJoinedQuery<L, R, K>
+    return this.staged(5, field.tree(), descending)
+  end
+
+  public def orderByRight<V>(field: quote fn(R): V, descending: Bool = false): LeftJoinedQuery<L, R, K>
+    return this.staged(6, field.tree(), descending)
+  end
+
+  public def thenByLeft<V>(field: quote fn(L): V, descending: Bool = false): LeftJoinedQuery<L, R, K>
+    if this.stickyFailure != null
+      return this
+    end
+    if !joinHasOrder(this.stages)
+      return new LeftJoinedQuery<L, R, K>(this.left, this.right, this.codec, this.leftKey, this.rightKey, this.bound, this.stages, QueryFailure.UnsupportedCapability("thenBy requires a primary orderBy"))
+    end
+    return this.staged(7, field.tree(), descending)
+  end
+
+  public def thenByRight<V>(field: quote fn(R): V, descending: Bool = false): LeftJoinedQuery<L, R, K>
+    if this.stickyFailure != null
+      return this
+    end
+    if !joinHasOrder(this.stages)
+      return new LeftJoinedQuery<L, R, K>(this.left, this.right, this.codec, this.leftKey, this.rightKey, this.bound, this.stages, QueryFailure.UnsupportedCapability("thenBy requires a primary orderBy"))
+    end
+    return this.staged(8, field.tree(), descending)
+  end
+
+  internal def resolvedPlan(dialect: SqlDialect): JoinResolvedResult<L, R>
+    let failure = this.stickyFailure
+
+    if failure != null
+      return JoinResolvedResult<L, R>.Failure(failure)
+    end
+    match buildJoin<L, R, K>(this.left, this.right, this.codec, this.leftKey, this.rightKey, true, dialect)
+      case JoinResolvedResult.Failure(error)
+        return JoinResolvedResult<L, R>.Failure(error)
+      case JoinResolvedResult.Plan(base)
+        match composeJoin(base.joined, this.stages, this.bound, true, dialect)
+          case JoinBuildResult.Failure(error)
+            return JoinResolvedResult<L, R>.Failure(error)
+          case JoinBuildResult.Plan(joined)
+            return JoinResolvedResult<L, R>.Plan(new JoinResolved<L, R>(joined, base.left, base.right))
+        end
+    end
+  end
+
+  internal def compositionPlan(dialect: SqlDialect): JoinBuildResult
+    match this.resolvedPlan(dialect)
+      case JoinResolvedResult.Failure(error)
+        return JoinBuildResult.Failure(error)
+      case JoinResolvedResult.Plan(value)
+        return JoinBuildResult.Plan(value.joined)
+    end
+  end
+
+  internal def boundProvider(override: Provider? = null): Provider?
+    return joinBoundProvider(this.left.provider(), this.right.provider(), override)
+  end
+
+  internal def rowLimit(): Int?
+    return this.bound
+  end
+
+  public def compile(dialect: SqlDialect = SqlDialect.QuestionMark()): CompileResult<LeftJoined<L, R>>
+    return this.compilePlan(dialect, false)
+  end
+
+  private def relationPlan(dialect: SqlDialect, unbounded: Bool): RelationBuildResult<LeftJoined<L, R>>
+    let limit = this.bound
+    let failure = this.stickyFailure
+
+    if failure != null
+      return RelationBuildResult<LeftJoined<L, R>>.Failure(failure)
+    end
+
+    if limit == null && !unbounded
+      return RelationBuildResult<LeftJoined<L, R>>.Failure(QueryFailure.MissingLimit(queryRowLimit()))
+    end
+    if limit != null && (limit < 1 || limit > queryRowLimit())
+      return RelationBuildResult<LeftJoined<L, R>>.Failure(QueryFailure.InvalidLimit(limit, queryRowLimit()))
+    end
+    match this.resolvedPlan(dialect)
+      case JoinResolvedResult.Failure(error)
+        return RelationBuildResult<LeftJoined<L, R>>.Failure(error)
+      case JoinResolvedResult.Plan(resolved)
+        let joined = resolved.joined
+        let leftDecoder = resolved.left.decoder
+        let rightDecoder = resolved.right.decoder
+        let read: fn(RawRow): DecodeResult<LeftJoined<L, R>> = fn(row: RawRow): DecodeResult<LeftJoined<L, R>>
+          match joinDecodeSide<L>(row, joined.leftColumns, leftDecoder, "__neri_l")
+            case DecodeResult.Failure(error)
+              return DecodeResult<LeftJoined<L, R>>.Failure(error)
+            case DecodeResult.Value(leftValue)
+              match row.value("__neri_present")
+                case CellLookup.Missing()
+                  return DecodeResult<LeftJoined<L, R>>.Failure(QueryFailure.MissingColumn("__neri_present"))
+                case CellLookup.Found(cell)
+                  match cell
+                    case Cell.Int(value)
+                      if value == 0
+                        return DecodeResult<LeftJoined<L, R>>.Value(new LeftJoined<L, R>(leftValue, null))
+                      end
+                      if value != 1
+                        return DecodeResult<LeftJoined<L, R>>.Failure(QueryFailure.Provider("invalid left join presence marker"))
+                      end
+                    case Cell.Null()
+                      return DecodeResult<LeftJoined<L, R>>.Failure(QueryFailure.TypeMismatch("__neri_present", "Int", "NULL"))
+                    case Cell.Bool(value)
+                      return DecodeResult<LeftJoined<L, R>>.Failure(QueryFailure.TypeMismatch("__neri_present", "Int", "Bool"))
+                    case Cell.Float(value)
+                      return DecodeResult<LeftJoined<L, R>>.Failure(QueryFailure.TypeMismatch("__neri_present", "Int", "Float"))
+                    case Cell.Text(value)
+                      return DecodeResult<LeftJoined<L, R>>.Failure(QueryFailure.TypeMismatch("__neri_present", "Int", "String"))
+                  end
+              end
+              match joinDecodeSide<R>(row, joined.rightColumns, rightDecoder, "__neri_r")
+                case DecodeResult.Failure(error)
+                  return DecodeResult<LeftJoined<L, R>>.Failure(error)
+                case DecodeResult.Value(rightValue)
+                  return DecodeResult<LeftJoined<L, R>>.Value(new LeftJoined<L, R>(leftValue, rightValue))
+              end
+          end
+        end
+        let leftSelector: quote fn(LeftJoined<L, R>): L = quote do |row: LeftJoined<L, R>|: L
+          return row.left
+        end
+        let rightSelector: quote fn(LeftJoined<L, R>): R? = quote do |row: LeftJoined<L, R>|: R?
+          return row.right
+        end
+        let mapping = joinRelationMapping(joined.leftMapping, joined.rightMapping, leftSelector.tree(), rightSelector.tree())
+
+        if mapping == null
+          return RelationBuildResult<LeftJoined<L, R>>.Failure(QueryFailure.Provider("joined relation path metadata is invalid"))
+        end
+        return RelationBuildResult<LeftJoined<L, R>>.Plan(new RelationPlan<LeftJoined<L, R>>(joined.text, joined.parameters, joined.columns, new Decoder<LeftJoined<L, R>>(read, joined.columns), mapping, joined.checkedScalars, joined.order))
+    end
+  end
+
+  private def compilePlan(dialect: SqlDialect, unbounded: Bool): CompileResult<LeftJoined<L, R>>
+    match this.relationPlan(dialect, unbounded)
+      case RelationBuildResult.Failure(error)
+        return CompileResult<LeftJoined<L, R>>.Failure(error)
+      case RelationBuildResult.Plan(value)
+        var limit = queryRowLimit()
+        let bound = this.bound
+
+        if bound != null
+          limit = bound
+        end
+        let plan = new SqlPlan(value.sql, value.parameters, limit, value.columns, value.checkedScalars)
+
+        return CompileResult<LeftJoined<L, R>>.Plan(new TypedPlan<LeftJoined<L, R>>(plan, value.decoder))
+    end
+  end
+
+  ## Keeps the complete physical row, including presence markers, for another join.
+  public def asRelation(): Relation<LeftJoined<L, R>>
+    let build: fn(SqlDialect): RelationBuildResult<LeftJoined<L, R>> = fn(dialect: SqlDialect): RelationBuildResult<LeftJoined<L, R>>
+      return this.relationPlan(dialect, true)
+    end
+
+    return new Relation<LeftJoined<L, R>>(build, this.boundProvider(), bound: this.bound)
+  end
+
+  public def stream(visit: fn(LeftJoined<L, R>): Bool, options: StreamOptions? = null): StreamResult
+    let provider = this.boundProvider()
+
+    if provider == null
+      return StreamResult.Failure(QueryFailure.UnsupportedCapability("join requires one shared provider or explicit override"), 0)
+    end
+    let compile: fn(SqlDialect): CompileResult<LeftJoined<L, R>> = fn(dialect: SqlDialect): CompileResult<LeftJoined<L, R>>
+      return this.compilePlan(dialect, true)
+    end
+
+    return streamCompiled<LeftJoined<L, R>>(provider, compile, visit, options, this.bound)
+  end
+
+  public def streamWith(provider: Provider, visit: fn(LeftJoined<L, R>): Bool, options: StreamOptions? = null): StreamResult
+    let compile: fn(SqlDialect): CompileResult<LeftJoined<L, R>> = fn(dialect: SqlDialect): CompileResult<LeftJoined<L, R>>
+      return this.compilePlan(dialect, true)
+    end
+
+    return streamCompiled<LeftJoined<L, R>>(provider, compile, visit, options, this.bound)
+  end
+
+  public def all(provider: Provider? = null): QueryResult<LeftJoined<L, R>>
+    let selected = this.boundProvider(provider)
+
+    if selected == null
+      return QueryResult<LeftJoined<L, R>>.Failure(QueryFailure.UnsupportedCapability("join requires one shared provider or explicit override"))
+    end
+    if !selected.supports(ProviderCapability.BoundedTypedReads())
+      return QueryResult<LeftJoined<L, R>>.Failure(QueryFailure.UnsupportedCapability("bounded-typed-reads"))
+    end
+    return execute<LeftJoined<L, R>>(this.compile(selected.dialect()), selected)
+  end
+
+  public def count(provider: Provider? = null): QueryValue<Int>
+    let selected = this.boundProvider(provider)
+
+    if selected == null
+      return QueryValue<Int>.Failure(QueryFailure.UnsupportedCapability("join requires one shared provider or explicit override"))
+    end
+    if !selected.supports(ProviderCapability.BoundedTypedReads())
+      return QueryValue<Int>.Failure(QueryFailure.UnsupportedCapability("bounded-typed-reads"))
+    end
+    match this.compositionPlan(selected.dialect())
+      case JoinBuildResult.Failure(error)
+        return QueryValue<Int>.Failure(error)
+      case JoinBuildResult.Plan(joined)
+        return joinCountPlan(joined, selected)
+    end
+  end
+end
+
+def joinBoundProvider(left: Provider?, right: Provider?, override: Provider?): Provider?
+  if override != null
+    return override
+  end
+  if left == null || right == null || !reference::same(left, right)
+    return null
+  end
+  return left
+end
+
+def join<L, R, K>(left: Query<L>, right: Query<R>, codec: ScalarCodec<K>, leftKey: quote fn(L): K, rightKey: quote fn(R): K): JoinedQuery<L, R, K>
+  return new JoinedQuery<L, R, K>(left.asRelation(), right.asRelation(), codec, leftKey, rightKey)
+end
+
+def leftJoin<L, R, K>(left: Query<L>, right: Query<R>, codec: ScalarCodec<K>, leftKey: quote fn(L): K, rightKey: quote fn(R): K): LeftJoinedQuery<L, R, K>
+  return new LeftJoinedQuery<L, R, K>(left.asRelation(), right.asRelation(), codec, leftKey, rightKey)
+end

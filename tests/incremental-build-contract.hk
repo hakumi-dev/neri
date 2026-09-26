@@ -1,0 +1,322 @@
+use host
+use process
+use test
+use console
+
+@cabiImport("neri_rt_v1_cache_supported")
+unsafe def cacheSupported(): Int
+end
+
+def containsText(text: String, part: String): Bool
+  var offset = 0
+
+  while offset + host::stringByteLength(part) <= host::stringByteLength(text)
+    var equal = true
+    var index = 0
+
+    while index < host::stringByteLength(part)
+      if host::stringByteAt(text, offset + index) != host::stringByteAt(part, index)
+        equal = false
+      end
+      index = index + 1
+    end
+    if equal
+      return true
+    end
+    offset = offset + 1
+  end
+  return false
+end
+
+def countText(text: String, part: String): Int
+  var count = 0
+  var offset = 0
+
+  while offset + host::stringByteLength(part) <= host::stringByteLength(text)
+    var equal = true
+    var index = 0
+
+    while index < host::stringByteLength(part)
+      if host::stringByteAt(text, offset + index) != host::stringByteAt(part, index)
+        equal = false
+      end
+      index = index + 1
+    end
+    if equal
+      count = count + 1
+      offset = offset + host::stringByteLength(part)
+    else
+      offset = offset + 1
+    end
+  end
+  return count
+end
+
+def write(path: String, value: String): Void
+  test::assertTrue(host::writeText(path, value))
+end
+
+def directory(path: String): Void
+  let status = host::run("mkdir", ["-p", path])
+
+  test::assertTrue(status != null && status == 0)
+end
+
+def invoke(executable: String, arguments: String[], cache: String, libraryPath: String = ""): process::PollResult
+  let options = new process::SpawnOptions(executable)
+
+  options.arguments = arguments
+  if libraryPath != ""
+    options.environment = [new process::EnvironmentEntry("NERI_CACHE_DIR", cache),
+      new process::EnvironmentEntry("NERI_LIBRARY_PATH", libraryPath)]
+  else
+    options.environment = [new process::EnvironmentEntry("NERI_CACHE_DIR", cache)]
+  end
+  let started = process::spawn(options)
+
+  test::assertTrue(started.failure() == null)
+  let child = started.child()
+
+  test::assertTrue(child != null)
+  if child == null
+    return new process::PollResult()
+  end
+  let completed = child.wait(60000)
+
+  test::assertTrue(completed.failure == null && !completed.running)
+  test::assertTrue(child.dispose())
+  return completed
+end
+
+def text(bytes: Byte[]): String
+  let decoded = host::stringFromBytes(bytes)
+
+  test::assertTrue(decoded != null)
+  if decoded != null
+    return decoded
+  end
+  return ""
+end
+
+def exited(result: process::PollResult, expected: Int): Void
+  let status = result.exit
+
+  if status == null || !status.isExited() || status.value() != expected
+    console::println("Unexpected process result. stdout: " + text(result.stdout) + " stderr: " + text(result.stderr))
+  end
+
+  test::assertTrue(status != null)
+  if status != null
+    test::assertTrue(status.isExited())
+    test::assertEqual(status.value(), expected)
+  end
+end
+
+def build(compiler: String, manifest: String, output: String, cache: String, release: Bool = true, noCache: Bool = false): process::PollResult
+  var arguments = ["build", "--project", manifest, "--unit", "app", "--timings", "--output", output]
+
+  if release
+    arguments = host::appendString(arguments, "--release")
+  end
+  if noCache
+    arguments = host::appendString(arguments, "--no-cache")
+  end
+  return invoke(compiler, arguments, cache)
+end
+
+def buildNativeApp(compiler: String, manifest: String, output: String, cache: String, libraryPath: String): process::PollResult
+  return invoke(compiler, ["build", "--project", manifest, "--unit", "app", "--release", "--timings", "--output", output], cache, libraryPath)
+end
+
+def createNativeExport(compiler: String, manifest: String, object: String, cache: String): process::PollResult
+  return invoke(compiler, ["build", "--project", manifest, "--unit", "library", "--emit=obj", "--release", "--output", object], cache)
+end
+
+def run(path: String): process::PollResult
+  return invoke(path, [], "")
+end
+
+def assertBuildOutput(result: process::PollResult, expected: Int): Void
+  exited(result, 0)
+  let timings = text(result.stderr)
+
+  test::assertTrue(containsText(timings, expected == 1 ? "incremental-hit" : "incremental-miss"))
+  if expected == 1
+    test::assertTrue(!containsText(timings, "bind") && !containsText(timings, "codegen") && !containsText(timings, "link"))
+  end
+end
+
+def assertRuns(path: String, expected: String): Void
+  let result = run(path)
+
+  exited(result, 0)
+
+  test::assertEqual(text(result.stdout), expected)
+end
+
+def main(): Void
+  unsafe
+    if cacheSupported() != 1
+      console::println("Incremental artifact cache contracts require macOS ARM64")
+      return
+    end
+  end
+  let project = host::argumentAt(0)
+  let compiler = host::argumentAt(1)
+  let work = host::argumentAt(2)
+
+  test::assertTrue(project != null && compiler != null && work != null)
+  if project == null || compiler == null || work == null
+    return
+  end
+  let root = work + "/incremental-build-contract"
+  let cache = root + "/cache"
+  let manifest = root + "/manifest.json"
+  let appSources = root + "/app"
+  let librarySources = root + "/lib"
+  let app = appSources + "/main.hk"
+  let provider = librarySources + "/provider.hk"
+  let output = root + "/app-bin"
+
+  directory(root)
+  let cleared = host::run("rm", ["-rf", cache])
+
+  test::assertTrue(cleared != null && cleared == 0)
+  directory(cache)
+  let protectedCache = host::run("chmod", ["700", cache])
+
+  test::assertTrue(protectedCache != null && protectedCache == 0)
+  directory(appSources)
+  directory(librarySources)
+  write(provider, "namespace support\n\nclass Box<T>\n  public value: T\n\n  def init(value: T): Void\n    this.value = value\n  end\n\n  def item(): T\n    return this.value\n  end\nend\n\ndef amount(): Int\n  return 2\nend\n")
+  write(app, "use console\nuse support\n\ndef main(): Void\n  let box = new Box<Int>(amount())\n  console::println((box.item() + 1) as String)\nend\n")
+  write(manifest, "{\"version\":2,\"defaultUnit\":\"app\",\"units\":{\"app\":{\"kind\":\"executable\",\"sources\":[\"app\"],\"references\":[\"library\"]},\"library\":{\"kind\":\"library\",\"sources\":[\"lib\"]}}}\n")
+  let cold = build(compiler, manifest, output, cache)
+
+  assertBuildOutput(cold, 0)
+  let coldObjectMisses = countText(text(cold.stderr), "object-cache-miss")
+
+  test::assertTrue(coldObjectMisses > 0)
+  assertBuildOutput(build(compiler, manifest, output, cache), 1)
+  let originalManifest = host::readText(manifest)
+
+  test::assertTrue(originalManifest != null)
+  if originalManifest != null
+    write(manifest, originalManifest + "\n")
+    let manifestRotation = build(compiler, manifest, output, cache)
+    let rotatedTimings = text(manifestRotation.stderr)
+
+    exited(manifestRotation, 0)
+
+    test::assertTrue(containsText(rotatedTimings, "incremental-miss"))
+    test::assertEqual(countText(rotatedTimings, "object-cache-hit"), coldObjectMisses)
+    test::assertEqual(countText(rotatedTimings, "object-cache-miss"), 0)
+  end
+
+  assertRuns(output, "3\n")
+  write(app, "use console\nuse support\n\ndef main(): Void\n  let box = new Box<Int>(amount())\n  console::println((box.item() + 4) as String)\nend\n")
+  assertBuildOutput(build(compiler, manifest, output, cache), 0)
+  assertRuns(output, "6\n")
+  write(appSources + "/extra.hk", "def extra(): Int\n  return 0\nend\n")
+  assertBuildOutput(build(compiler, manifest, output, cache), 0)
+  write(app, "use console\nuse support\n\ndef main(): Void\n  let box = new Box<Int>(amount())\n  console::println((box.item() + 5) as String)\nend\n")
+  assertBuildOutput(build(compiler, manifest, output, cache), 0)
+  assertRuns(output, "7\n")
+  let removed = host::run("rm", [appSources + "/extra.hk"])
+
+  test::assertTrue(removed != null && removed == 0)
+  assertBuildOutput(build(compiler, manifest, output, cache), 0)
+  write(provider, "namespace support\n\nclass Box<T>\n  public value: T\n\n  def init(value: T): Void\n    this.value = value\n  end\n\n  def item(): T\n    return this.value\n  end\nend\n\ndef amount(): Int\n  return 8\nend\n")
+  assertBuildOutput(build(compiler, manifest, output, cache), 0)
+  assertRuns(output, "13\n")
+  write(provider, "namespace support\n\nclass Box<T>\n  public value: T\n\n  def init(value: T): Void\n    this.value = value\n  end\n\n  def item(): T\n    return this.value\n  end\nend\n\ndef amount(value: Int): Int\n  return value\nend\n")
+  let apiChange = build(compiler, manifest, output, cache)
+
+  exited(apiChange, 1)
+
+  test::assertTrue(containsText(text(apiChange.stdout) + text(apiChange.stderr), "amount"))
+  write(provider, "namespace support\n\nclass Box<T>\n  public value: T\n\n  def init(value: T): Void\n    this.value = value\n  end\n\n  def item(): T\n    return this.value\n  end\nend\n\ndef amount(): Int\n  return 8\nend\n")
+  assertBuildOutput(build(compiler, manifest, output, cache), 1)
+  let deletedOutput = host::run("rm", [output])
+
+  test::assertTrue(deletedOutput != null && deletedOutput == 0)
+  assertBuildOutput(build(compiler, manifest, output, cache), 1)
+  assertRuns(output, "13\n")
+  let removedExecuteMode = host::run("chmod", ["-x", output])
+
+  test::assertTrue(removedExecuteMode != null && removedExecuteMode == 0)
+  assertBuildOutput(build(compiler, manifest, output, cache), 1)
+  assertRuns(output, "13\n")
+  write(output, "tampered artifact")
+  assertBuildOutput(build(compiler, manifest, output, cache), 1)
+  assertRuns(output, "13\n")
+  write(app, "use console\nuse support\n\ndef main(): Void\n  let box = new Box<Int>(amount())\n  console::println((box.item() + 9) as String)\nend\n")
+  let bypass = build(compiler, manifest, output, cache, true, true)
+
+  exited(bypass, 0)
+
+  test::assertTrue(containsText(text(bypass.stderr), "incremental-miss"))
+  assertRuns(output, "17\n")
+  let nativeLibraryPath = root + "/native-libraries"
+  let nativeProject = root + "/native-app"
+  let nativeSources = nativeProject + "/src"
+  let nativeSource = nativeSources + "/main.hk"
+  let nativeManifest = nativeProject + "/manifest.json"
+  let nativeOutput = root + "/native-app-bin"
+  let exportProject = root + "/native-export-project"
+  let exportedSource = exportProject + "/native-export.hk"
+  let exportManifest = exportProject + "/manifest.json"
+  let exportedObject = root + "/native-export.o"
+  let nativeArchive = nativeLibraryPath + "/libneri-incremental.a"
+
+  directory(nativeLibraryPath)
+  directory(nativeSources)
+  directory(exportProject)
+  write(exportedSource, "@cabiExport(\"incremental_dependency_value\")\nunsafe def dependencyValue(): Int32\n  return 4 as Int32\nend\n")
+  write(exportManifest, "{\"version\":2,\"defaultUnit\":\"library\",\"units\":{\"library\":{\"kind\":\"library\",\"sources\":[\"native-export.hk\"]}}}\n")
+  exited(createNativeExport(compiler, exportManifest, exportedObject, cache), 0)
+  let firstArchive = host::run("ar", ["rcs", nativeArchive, exportedObject])
+
+  test::assertTrue(firstArchive != null && firstArchive == 0)
+  write(nativeSource, "use console\n\n@library(\"neri-incremental\")\n@cabiImport(\"incremental_dependency_value\")\nunsafe def dependencyValue(): Int32\nend\n\ndef main(): Void\n  unsafe\n    console::println((dependencyValue() as Int) as String)\n  end\nend\n")
+  write(nativeManifest, "{\"version\":2,\"defaultUnit\":\"app\",\"units\":{\"app\":{\"kind\":\"executable\",\"sources\":[\"src\"]}}}\n")
+  assertBuildOutput(buildNativeApp(compiler, nativeManifest, nativeOutput, cache, nativeLibraryPath), 0)
+  assertRuns(nativeOutput, "4\n")
+  assertBuildOutput(buildNativeApp(compiler, nativeManifest, nativeOutput, cache, nativeLibraryPath), 1)
+  write(exportedSource, "@cabiExport(\"incremental_dependency_value\")\nunsafe def dependencyValue(): Int32\n  return 8 as Int32\nend\n")
+  exited(createNativeExport(compiler, exportManifest, exportedObject, cache), 0)
+  let replacedArchive = host::run("ar", ["rcs", nativeArchive, exportedObject])
+
+  test::assertTrue(replacedArchive != null && replacedArchive == 0)
+  assertBuildOutput(buildNativeApp(compiler, nativeManifest, nativeOutput, cache, nativeLibraryPath), 0)
+  assertRuns(nativeOutput, "8\n")
+  assertBuildOutput(buildNativeApp(compiler, nativeManifest, nativeOutput, cache, nativeLibraryPath), 1)
+  let shadowLibrary = nativeLibraryPath + "/libneri-incremental.dylib"
+
+  write(shadowLibrary, "invalid shadow library\n")
+  let shadowed = buildNativeApp(compiler, nativeManifest, nativeOutput, cache, nativeLibraryPath)
+
+  exited(shadowed, 2)
+
+  test::assertTrue(containsText(text(shadowed.stderr), "incremental-miss"))
+  let removedShadow = host::run("rm", [shadowLibrary])
+
+  test::assertTrue(removedShadow != null && removedShadow == 0)
+  assertBuildOutput(build(compiler, manifest, output, cache, false), 0)
+  assertBuildOutput(build(compiler, manifest, output, cache, false), 1)
+  let debugSymbols = output + ".dSYM"
+  let existingDebugSymbols = host::run("test", ["-d", debugSymbols])
+
+  test::assertTrue(existingDebugSymbols != null && existingDebugSymbols == 0)
+  if existingDebugSymbols != null && existingDebugSymbols == 0
+    let removedDebugSymbols = host::run("rm", ["-rf", debugSymbols])
+
+    test::assertTrue(removedDebugSymbols != null && removedDebugSymbols == 0)
+    assertBuildOutput(build(compiler, manifest, output, cache, false), 1)
+    let restoredDebugSymbols = host::run("test", ["-d", debugSymbols])
+
+    test::assertTrue(restoredDebugSymbols != null && restoredDebugSymbols == 0)
+  end
+  assertBuildOutput(build(compiler, manifest, output, cache, true), 0)
+  assertBuildOutput(build(compiler, manifest, output, cache, true), 1)
+end

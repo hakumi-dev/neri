@@ -8,8 +8,10 @@
 #include <llvm/Support/MemoryBuffer.h>
 
 #include <cstring>
+#include <filesystem>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <utility>
 
@@ -18,6 +20,7 @@ struct neri_session_linker_v1 final {
   std::unique_ptr<llvm::orc::ObjectLinkingLayer> objects;
   llvm::orc::JITDylib *process{};
   char global_prefix{};
+  std::set<std::string> native_libraries;
   std::mutex mutex;
 
   ~neri_session_linker_v1() {
@@ -85,6 +88,78 @@ neri_session_linker_create_v1(char *error, size_t error_size) {
 
 extern "C" void neri_session_linker_destroy_v1(neri_session_linker_v1 *linker) {
   delete linker;
+}
+
+extern "C" int neri_session_linker_add_library_v1(
+    neri_session_linker_v1 *linker, const char *name, const char *directory,
+    char *error, size_t error_size) {
+  if (linker == nullptr || name == nullptr || directory == nullptr) {
+    copy_error(error, error_size, "invalid native library arguments");
+    return 0;
+  }
+  std::lock_guard lock(linker->mutex);
+  const std::string library(name);
+  const auto alpha_numeric = [](unsigned char character) {
+    return (character >= 'A' && character <= 'Z') ||
+           (character >= 'a' && character <= 'z') ||
+           (character >= '0' && character <= '9');
+  };
+  if (library.empty() || library.size() > 128 ||
+      !alpha_numeric(static_cast<unsigned char>(library.front()))) {
+    copy_error(error, error_size, "invalid native library name");
+    return 0;
+  }
+  for (size_t index = 1; index < library.size(); ++index) {
+    const auto character = static_cast<unsigned char>(library[index]);
+    if (!alpha_numeric(character) && character != '_' && character != '-' &&
+        character != '.') {
+      copy_error(error, error_size, "invalid native library name");
+      return 0;
+    }
+  }
+  if (linker->native_libraries.contains(library))
+    return 1;
+  const auto suffix = linker->session->getTargetTriple().isOSBinFormatMachO()
+                          ? ".dylib"
+                          : ".so";
+  const auto file = "lib" + library + suffix;
+  std::string path = file;
+  if (directory[0] != '\0') {
+    const std::filesystem::path root(directory);
+    if (!root.is_absolute()) {
+      copy_error(error, error_size, "native library directory must be absolute");
+      return 0;
+    }
+    const auto candidate = root / file;
+    std::error_code inspection_error;
+    const auto present = std::filesystem::exists(candidate, inspection_error);
+    if (inspection_error) {
+      copy_error(error, error_size, inspection_error.message());
+      return 0;
+    }
+    if (present) {
+      path = candidate.string();
+    } else {
+      const auto archive = root / ("lib" + library + ".a");
+      const auto static_only = std::filesystem::exists(archive, inspection_error);
+      if (inspection_error) {
+        copy_error(error, error_size, inspection_error.message());
+        return 0;
+      }
+      if (static_only) {
+        copy_error(error, error_size,
+                   "static-only native libraries are unsupported in object sessions");
+        return 0;
+      }
+    }
+  }
+  auto generator = llvm::orc::DynamicLibrarySearchGenerator::Load(
+      path.c_str(), linker->global_prefix);
+  if (!generator)
+    return fail(error, error_size, generator.takeError(), 0);
+  linker->process->addGenerator(std::move(*generator));
+  linker->native_libraries.insert(library);
+  return 1;
 }
 
 extern "C" neri_session_generation_v1 *neri_session_linker_add_object_v1(

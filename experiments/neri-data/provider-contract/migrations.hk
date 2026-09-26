@@ -1,0 +1,215 @@
+use app_data
+use console
+use files
+use model
+use neri_data
+use neri_data_sqlite
+use neri_data_sqlite_fixture
+use resources
+use result
+use test
+
+def migrationCatalog(): MigrationSet
+  let note = new SchemaColumn("note", SchemaType.Text(), nullable: true)
+  let extend = new Migration("customer_note", [SchemaOp.AddColumn("customers", note), SchemaOp.CreateIndex("customers_name", "customers", ["name"], false)], [SchemaOp.DropIndex("customers_name"), SchemaOp.DropColumn("customers", "note")])
+
+  match diffSchema("initial", new SchemaModel([]), schema_Database())
+    case SchemaDiffResult.Plan(plan)
+      return new MigrationSet([plan.migration(), extend])
+    case SchemaDiffResult.Unchanged()
+      test::assertTrue(false)
+    case SchemaDiffResult.Failure(error)
+      migrationApplied(MigrationResult.Failure(error), 1)
+  end
+  return new MigrationSet([])
+end
+
+def migrationApplied(result: MigrationResult, expected: Int): Void
+  match result
+    case MigrationResult.Applied(count)
+      test::assertEqual(count, expected)
+    case MigrationResult.Failure(error)
+      match error
+        case MigrationFailure.Validation(message)
+          console::println(message)
+        case MigrationFailure.Drift(message)
+          console::println(message)
+        case MigrationFailure.Unsupported(message)
+          console::println(message)
+        case MigrationFailure.Provider(message)
+          console::println(message)
+      end
+
+      test::assertTrue(false)
+  end
+end
+
+def migrationSaved(result: WriteResult, expected: Int): Void
+  match result
+    case WriteResult.Saved(count)
+      test::assertEqual(count, expected)
+    case WriteResult.Failure(error)
+      console::println(writeFailureMessage(error))
+
+      test::assertTrue(false)
+    case WriteResult.SavedWithValues(count, outputs)
+      test::assertTrue(false)
+  end
+end
+
+def migrationColumn(provider: SQLiteProvider, name: String): readonly SQLiteSchemaColumn?
+  match provider.inspectSchema()
+    case SQLiteSchemaResult.Failure(message)
+      console::println(message)
+
+      test::assertTrue(false)
+      return null
+    case SQLiteSchemaResult.Snapshot(snapshot)
+      var index = 0
+
+      while index < snapshot.count()
+        let column = snapshot.at(index)
+
+        if column != null && column.table() == "customers" && column.name() == name
+          return column
+        end
+        index = index + 1
+      end
+      return null
+  end
+end
+
+def migrationCustomer(db: Database): Void
+  match db.customers.where(id: 7).first()
+    case QueryValue.Value(customer)
+      test::assertTrue(customer != null)
+      if customer != null
+        test::assertEqual(customer.name, "Ada")
+        test::assertTrue(customer.active)
+        test::assertTrue(customer.nickname == null)
+      end
+    case QueryValue.Failure(error)
+      test::assertTrue(false)
+  end
+end
+
+def migrationDefaults(db: Database): Void
+  match db.customers.where(id: 8).first()
+    case QueryValue.Value(customer)
+      test::assertTrue(customer != null)
+      if customer != null
+        test::assertEqual(customer.name, "O'Brien\n\"Neri\"\\café")
+        test::assertTrue(customer.active)
+        test::assertTrue(customer.nickname == null)
+      end
+    case QueryValue.Failure(error)
+      test::assertTrue(false)
+  end
+  match db.customers.where(id: 9).first()
+    case QueryValue.Value(customer)
+      test::assertTrue(customer != null)
+      if customer != null
+        test::assertFalse(customer.active)
+      end
+    case QueryValue.Failure(error)
+      test::assertTrue(false)
+  end
+end
+
+def migrationVerify(path: String): Void
+  let catalog = migrationCatalog()
+
+  test::assertTrue(catalog.validate() == null)
+  match SQLiteProvider.createWritable(path)
+    case SQLiteOpenResult.Failure(message)
+      console::println(message)
+
+      test::assertTrue(false)
+    case SQLiteOpenResult.Opened(provider)
+      migrationApplied(provider.migrate(catalog, "initial"), 1)
+      let id = migrationColumn(provider, "id")
+
+      test::assertTrue(id != null)
+      if id != null
+        test::assertEqual(id.keyPosition(), 1)
+        test::assertEqual(id.declaredType(), "INTEGER")
+      end
+      let db = new Database(provider)
+
+      test::assertTrue(db.customers.add(new Customer(7, "Ada", true)) == null)
+      migrationSaved(db.saveChanges(), 1)
+      migrationCustomer(db)
+
+      # Omitted columns use database defaults; explicit false stays false.
+
+      test::assertTrue(createSQLiteFixture(path, "INSERT INTO customers (id) VALUES (8)"))
+      test::assertTrue(db.customers.add(new Customer(9, "O'Brien\n\"Neri\"\\café", false)) == null)
+      migrationSaved(db.saveChanges(), 1)
+      migrationDefaults(db)
+
+      test::assertFalse(createSQLiteFixture(path, "INSERT INTO customers (id) VALUES (10)"))
+      test::assertTrue(createSQLiteFixture(path, "INSERT INTO orders (id, customer_id) VALUES (1, 8)"))
+      match db.orders.where(id: 1).first()
+        case QueryValue.Value(order)
+          test::assertTrue(order != null)
+          if order != null
+            test::assertEqual(order.total, 0)
+          end
+        case QueryValue.Failure(error)
+          test::assertTrue(false)
+      end
+      let nickname = migrationColumn(provider, "nickname")
+
+      test::assertTrue(nickname != null)
+      if nickname != null
+        test::assertTrue(nickname.defaultSql() == "NULL")
+      end
+      migrationApplied(provider.migrate(catalog), 1)
+      let note = migrationColumn(provider, "note")
+
+      test::assertTrue(note != null)
+      if note != null
+        test::assertFalse(note.required())
+        test::assertEqual(note.declaredType(), "TEXT")
+      end
+      migrationCustomer(db)
+
+      test::assertTrue(provider.close())
+  end
+  match SQLiteProvider.openWritable(path)
+    case SQLiteOpenResult.Failure(message)
+      console::println(message)
+
+      test::assertTrue(false)
+    case SQLiteOpenResult.Opened(provider)
+      migrationApplied(provider.migrate(catalog), 0)
+      migrationApplied(provider.migrate(catalog, "initial"), 1)
+
+      test::assertTrue(migrationColumn(provider, "note") == null)
+      migrationCustomer(new Database(provider))
+      migrationDefaults(new Database(provider))
+      migrationApplied(provider.migrate(catalog), 1)
+
+      test::assertTrue(provider.close())
+  end
+end
+
+def verifyMigrationFile(): resources::Outcome<Int, result::Failure>
+  using temporary <- files::TemporaryDirectory.create("neri-data-migration-")
+    migrationVerify(temporary.path() + "/data.sqlite")
+    return 0
+  end
+  return 1
+end
+
+def main(): Void
+  let outcome = verifyMigrationFile()
+
+  test::assertEqual(outcome.closeFailures.count(), 0)
+  match outcome.completion
+    case resources::Completion.Value(value)
+      test::assertEqual(value, 0)
+    case resources::Completion.Failure(problem)
+      test::assertTrue(false)
+  end
+end

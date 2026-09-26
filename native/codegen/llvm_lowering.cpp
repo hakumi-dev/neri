@@ -27,17 +27,20 @@
 
 #include <array>
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <map>
 #include <memory>
 #include <optional>
+#include <ranges>
 #include <set>
 #include <span>
 #include <string>
 #include <string_view>
 #include <tuple>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -214,7 +217,8 @@ public:
                  const llvm::Triple &triple, const llvm::DataLayout &layout,
                  bool emit_debug_information,
                  const std::vector<std::pair<std::string, std::string>>
-                     &debug_sources)
+                     &debug_sources,
+                 const emission_progress &progress)
       : input_(input), context_(context),
         output_(std::make_unique<llvm::Module>(input.id, context)),
         retained_modules_(std::ranges::find(input.required_features,
@@ -223,9 +227,39 @@ public:
         c_library_module_(!retained_modules_ && !input.session.has_value() &&
                           has_c_export_definitions(input) && !owns_program_entry(input)),
         emit_debug_information_(emit_debug_information),
-        debug_sources_(debug_sources) {
+        debug_sources_(debug_sources), progress_(progress) {
     output_->setTargetTriple(triple);
     output_->setDataLayout(layout);
+    for (const auto &source : input_.sources) {
+      const auto [source_entry, inserted] =
+          sources_by_id_.try_emplace(source.id, &source);
+      static_cast<void>(source_entry);
+      if (inserted && emit_debug_information_) {
+        auto &line_starts = source_line_starts_[source.id];
+        line_starts.push_back(0U);
+        for (std::size_t index = 0; index < source.utf8.size(); ++index) {
+          if (source.utf8[index] == static_cast<std::uint8_t>('\n')) {
+            line_starts.push_back(index + 1U);
+          }
+        }
+      }
+    }
+    for (const auto &[id, path] : debug_sources_) {
+      debug_paths_by_id_.try_emplace(id, debug_path(path));
+    }
+    for (const auto &declaration : input_.classes) {
+      input_classes_by_id_.emplace(symbol_key(declaration.id), &declaration);
+    }
+    for (const auto &declaration : input_.imports) {
+      input_imports_by_id_.emplace(symbol_key(declaration.id), &declaration);
+    }
+    for (const auto &declaration : input_.functions) {
+      input_functions_by_id_.emplace(symbol_key(declaration.id), &declaration);
+      if (declaration.dispatch_slot.has_value()) {
+        input_virtual_functions_by_slot_[symbol_key(*declaration.dispatch_slot)]
+            .push_back(&declaration);
+      }
+    }
   }
 
   [[nodiscard]] std::unique_ptr<llvm::Module> lower() {
@@ -264,14 +298,12 @@ private:
   }
 
   [[nodiscard]] const source &find_source(std::string_view id) const {
-    const auto found = std::ranges::find_if(
-        input_.sources,
-        [id](const auto &candidate) { return candidate.id == id; });
-    if (found == input_.sources.end()) {
+    const auto found = sources_by_id_.find(id);
+    if (found == sources_by_id_.end()) {
       throw codegen_error(codegen_error_kind::lowering,
                           "Verified debug source disappeared.");
     }
-    return *found;
+    return *found->second;
   }
 
   [[nodiscard]] static std::pair<std::string, std::string>
@@ -297,14 +329,11 @@ private:
     const auto &source = find_source(source_id);
     const auto text = std::string(
         reinterpret_cast<const char *>(source.utf8.data()), source.utf8.size());
-    const auto mapped = std::ranges::find_if(
-        debug_sources_, [source_id](const auto &item) {
-          return item.first == source_id;
-        });
-    const auto [directory, filename] = mapped == debug_sources_.end()
-                                           ? std::pair{std::string("."),
-                                                       std::string(source_id)}
-                                           : debug_path(mapped->second);
+    const auto mapped = debug_paths_by_id_.find(source_id);
+    const auto [directory, filename] =
+        mapped == debug_paths_by_id_.end()
+            ? std::pair{std::string("."), std::string(source_id)}
+            : mapped->second;
     auto *file = debug_builder_->createFile(filename, directory,
                                             std::nullopt, text);
     debug_files_.emplace(source.id, file);
@@ -314,19 +343,20 @@ private:
   [[nodiscard]] std::pair<unsigned, unsigned>
   source_coordinates(const source_location &location) const {
     const auto &source = find_source(location.source);
-    unsigned line = 1U;
-    unsigned column = 1U;
     const auto limit = std::min<std::size_t>(location.utf8_start,
                                              source.utf8.size());
-    for (std::size_t index = 0; index < limit; ++index) {
-      if (source.utf8[index] == static_cast<std::uint8_t>('\n')) {
-        ++line;
-        column = 1U;
-      } else {
-        ++column;
-      }
+    const auto found = source_line_starts_.find(location.source);
+    if (found == source_line_starts_.end() || found->second.empty()) {
+      throw codegen_error(codegen_error_kind::lowering,
+                          "Verified debug source line index disappeared.");
     }
-    return {line, column};
+    const auto &line_starts = found->second;
+    const auto line_start = std::upper_bound(line_starts.begin(),
+                                             line_starts.end(), limit);
+    const auto line_index = static_cast<std::size_t>(
+        std::distance(line_starts.begin(), line_start) - 1);
+    return {static_cast<unsigned>(line_index + 1U),
+            static_cast<unsigned>(limit - line_starts[line_index] + 1U)};
   }
 
   [[nodiscard]] llvm::DebugLoc
@@ -573,7 +603,28 @@ private:
     function_lowerer(module_lowerer &module, const function &input,
                      llvm::Function &output)
         : module_(module), input_(input), output_(output),
-          builder_(module.context_) {}
+          builder_(module.context_) {
+      if (input_.unsafe_root.has_value()) {
+        value_types_.try_emplace(input_.unsafe_root->id,
+                                 &input_.unsafe_root->value_type);
+      }
+      for (const auto &block : input_.blocks) {
+        for (const auto &parameter : block.parameters) {
+          value_types_.try_emplace(parameter.id, &parameter.value_type);
+        }
+        for (const auto &instruction : block.instructions) {
+          for (const auto &result : instruction.results) {
+            value_types_.try_emplace(result.id, &result.value_type);
+          }
+        }
+      }
+      for (const auto &local : input_.debug_locals) {
+        debug_locals_by_value_[local.value].push_back(&local);
+      }
+      for (const auto &block : input_.blocks) {
+        input_blocks_by_id_.emplace(block.id, &block);
+      }
+    }
 
     void lower() {
       create_blocks_and_parameters();
@@ -595,12 +646,20 @@ private:
   private:
     [[nodiscard]] llvm::Value *value(std::uint32_t id) {
       if (const auto rooted = root_slots_.find(id); rooted != root_slots_.end()) {
-        return builder_.CreateLoad(module_.semantic_type(
-                                       module_.value_type(input_, id)),
+        return builder_.CreateLoad(module_.semantic_type(value_type(id)),
                                    rooted->second,
                                    "v" + std::to_string(id) + ".rooted");
       }
       return values_.at(id);
+    }
+
+    [[nodiscard]] const type &value_type(std::uint32_t id) const {
+      const auto found = value_types_.find(id);
+      if (found == value_types_.end()) {
+        throw codegen_error(codegen_error_kind::lowering,
+                            "Verified SSA type disappeared.");
+      }
+      return *found->second;
     }
 
     [[nodiscard]] llvm::AllocaInst *create_entry_alloca(llvm::Type *value_type,
@@ -782,10 +841,10 @@ private:
           value == nullptr) {
         return;
       }
-      for (const auto &local : input_.debug_locals) {
-        if (local.value != id) {
-          continue;
-        }
+      const auto locals = debug_locals_by_value_.find(id);
+      if (locals == debug_locals_by_value_.end()) return;
+      for (const auto *local_pointer : locals->second) {
+        const auto &local = *local_pointer;
         const auto coordinates = module_.source_coordinates(local.location);
         const auto key = std::tuple(local.name, local.scope_id,
                                     local.location.source,
@@ -801,13 +860,13 @@ private:
             found->second = module_.debug_builder_->createParameterVariable(
                 scope, local.name, *parameter,
                 module_.debug_file(local.location.source), coordinates.first,
-                module_.debug_type(module_.value_type(input_, local.value)),
+                module_.debug_type(value_type(local.value)),
                 true);
           } else {
             found->second = module_.debug_builder_->createAutoVariable(
                 scope, local.name, module_.debug_file(local.location.source),
                 coordinates.first,
-                module_.debug_type(module_.value_type(input_, local.value)),
+                module_.debug_type(value_type(local.value)),
                 true);
           }
         }
@@ -873,6 +932,16 @@ private:
                                               llvm::Value *right,
                                               const type &operand_type,
                                               neri_ir_comparison_v1 predicate) {
+      if (is_managed_reference(operand_type)) {
+        if (predicate == NERI_IR_COMPARISON_EQUAL_V1) {
+          return builder_.CreateICmpEQ(left, right, "reference.eq");
+        }
+        if (predicate == NERI_IR_COMPARISON_NOT_EQUAL_V1) {
+          return builder_.CreateICmpNE(left, right, "reference.ne");
+        }
+        throw codegen_error(codegen_error_kind::lowering,
+                            "Managed references support only equality comparisons.");
+      }
       if (floating_scalar(operand_type.tag)) {
         if (predicate == NERI_IR_COMPARISON_EQUAL_V1 ||
             predicate == NERI_IR_COMPARISON_NOT_EQUAL_V1) {
@@ -1047,12 +1116,14 @@ private:
     [[nodiscard]] llvm::Value *lower_virtual_call(
         const instruction &instruction) {
       const auto &target = module_.find_virtual_signature(*instruction.symbol);
-      auto *receiver = value(instruction.operands.front());
+      const auto operand_offset = target.unsafe_call ? 1U : 0U;
+      auto *receiver = value(instruction.operands.at(operand_offset));
       auto *callee = module_.virtual_target(builder_, receiver, *instruction.symbol);
       auto *function_type = module_.physical_function_type(
           target.parameter_types, target.result_type);
       return lower_call_target(instruction, target.parameter_types,
-                               target.result_type, callee, function_type);
+                               target.result_type, callee, function_type,
+                               target.unsafe_call ? 1U : 0U);
     }
 
     [[nodiscard]] llvm::Value *array_length(llvm::Value *array) {
@@ -1275,7 +1346,7 @@ private:
         break;
       case NERI_IR_OPCODE_COMPARE_V1: {
         const auto &operand_type =
-            module_.value_type(input_, instruction.operands[0]);
+            value_type(instruction.operands[0]);
         result = is_optional(operand_type)
                      ? compare_optional(value(instruction.operands[0]),
                                         value(instruction.operands[1]),
@@ -1290,7 +1361,7 @@ private:
                                        builder_.getDoubleTy(), "int.to.float");
         break;
       case NERI_IR_OPCODE_NUMERIC_CAST_CHECKED_V1: {
-        const auto &source_type = module_.value_type(input_, instruction.operands.front());
+        const auto &source_type = value_type(instruction.operands.front());
         const auto &target_type = instruction.results.front().value_type;
         result = numeric_cast(builder_, value(instruction.operands.front()), source_type.tag, target_type.tag,
             module_.semantic_type(target_type), [&](llvm::Value *valid) {
@@ -1369,7 +1440,7 @@ private:
       }
       case NERI_IR_OPCODE_OPTIONAL_IS_SOME_V1: {
         const auto &operand_type =
-            module_.value_type(input_, instruction.operands[0]);
+            value_type(instruction.operands[0]);
         if (uses_null_representation(operand_type)) {
           result = builder_.CreateICmpNE(
               value(instruction.operands[0]),
@@ -1386,7 +1457,7 @@ private:
       case NERI_IR_OPCODE_OPTIONAL_GET_CHECKED_V1: {
         auto *optional = value(instruction.operands[0]);
         const auto &result_type = instruction.results.front().value_type;
-        if (uses_null_representation(module_.value_type(input_, instruction.operands[0]))) {
+        if (uses_null_representation(value_type(instruction.operands[0]))) {
           emit_guard(
               builder_.CreateICmpNE(
                   optional,
@@ -1483,8 +1554,11 @@ private:
         else result = module_.c_exports_.at(key);
         break;
       }
+      case NERI_IR_OPCODE_WORKER_ENTRY_V1:
+        result = module_.worker_entry_adapter(*instruction.symbol);
+        break;
       case NERI_IR_OPCODE_CALL_C_INDIRECT_V1: {
-        const auto &signature = module_.value_type(input_, instruction.operands[1]);
+        const auto &signature = value_type(instruction.operands[1]);
         const auto &return_type = signature.arguments.front();
         const std::vector<type> parameters(signature.arguments.begin() + 1, signature.arguments.end());
         result = lower_call_target(instruction, parameters, return_type,
@@ -1533,7 +1607,7 @@ private:
       case NERI_IR_OPCODE_ARRAY_STORE_CHECKED_V1: {
         auto *array = value(instruction.operands[0]);
         auto *index = value(instruction.operands[1]);
-        const auto &array_type = module_.value_type(input_, instruction.operands[0]);
+        const auto &array_type = value_type(instruction.operands[0]);
         const auto &element = array_type.arguments.front();
         guard_array_index(array_length(array), index, instruction.location);
         store_array_element(array, array_element_slot(array, index, element),
@@ -1583,6 +1657,16 @@ private:
         result = call;
         break;
       }
+      case NERI_IR_OPCODE_ARRAY_GENERATE_V1: {
+        const auto &element = instruction.type_arguments.front();
+        auto *call = builder_.CreateCall(module_.array_generate_function(),
+            {value(instruction.operands[0]), module_.array_descriptor(element),
+             value(instruction.operands[1]),
+             module_.task_adapter(*instruction.symbol)}, "array.generated");
+        call->setCallingConv(llvm::CallingConv::C);
+        result = call;
+        break;
+      }
       case NERI_IR_OPCODE_STACK_ALLOC_V1: {
         const auto &element = instruction.type_arguments.front();
         auto *count = value(instruction.operands[1]);
@@ -1603,7 +1687,7 @@ private:
         break;
       }
       case NERI_IR_OPCODE_NATIVE_FIELD_ADDRESS_V1: {
-        const auto &pointer = module_.value_type(input_, instruction.operands[1]);
+        const auto &pointer = value_type(instruction.operands[1]);
         native_layouts layouts(module_.input_);
         const auto &record = layouts.declaration(pointer.arguments.front());
         const auto layout = layouts.layout(pointer.arguments.front());
@@ -1614,7 +1698,7 @@ private:
         break;
       }
       case NERI_IR_OPCODE_NATIVE_INDEX_ADDRESS_CHECKED_V1: {
-        const auto &pointer = module_.value_type(input_, instruction.operands[1]);
+        const auto &pointer = value_type(instruction.operands[1]);
         const auto &array = pointer.arguments.front();
         auto *index = value(instruction.operands[2]);
         emit_guard(builder_.CreateICmpULT(index, builder_.getInt64(array.element_count)),
@@ -1738,7 +1822,12 @@ private:
     }
 
     void add_edge_arguments(const edge &edge, llvm::BasicBlock *predecessor) {
-      const auto &target = module_.find_block(input_, edge.target);
+      const auto found = input_blocks_by_id_.find(edge.target);
+      if (found == input_blocks_by_id_.end()) {
+        throw codegen_error(codegen_error_kind::lowering,
+                            "Verified branch target disappeared.");
+      }
+      const auto &target = *found->second;
       for (std::size_t index = 0; index < edge.arguments.size(); ++index) {
         phis_.at(target.parameters[index].id)
             ->addIncoming(value(edge.arguments[index]), predecessor);
@@ -1816,6 +1905,10 @@ private:
     std::map<std::uint32_t, llvm::Value *> values_;
     std::map<std::uint32_t, llvm::PHINode *> phis_;
     std::map<std::uint32_t, llvm::Value *> root_slots_;
+    std::unordered_map<std::uint32_t, const type *> value_types_;
+    std::unordered_map<std::uint32_t, std::vector<const debug_local *>>
+        debug_locals_by_value_;
+    std::unordered_map<std::uint32_t, const block *> input_blocks_by_id_;
     std::map<std::tuple<std::string, std::uint32_t, std::string, std::uint32_t,
                         std::uint32_t>,
              llvm::DILocalVariable *>
@@ -1844,10 +1937,9 @@ private:
   }
 
   [[nodiscard]] const class_declaration &find_class(const symbol_id &id) const {
-    for (const auto &candidate : input_.classes) {
-      if (symbol_key(candidate.id) == symbol_key(id)) {
-        return candidate;
-      }
+    if (const auto found = input_classes_by_id_.find(symbol_key(id));
+        found != input_classes_by_id_.end()) {
+      return *found->second;
     }
     throw codegen_error(codegen_error_kind::lowering,
                         "Verified class declaration disappeared.");
@@ -1970,31 +2062,100 @@ private:
     auto *call = builder.CreateCall(physical_function_type(target.parameter_types, target.result_type),
         callee, arguments);
     call->setCallingConv(llvm::CallingConv::C);
-    // The runtime roots this child's disjoint result span. No safepoint may
-    // occur between the callback return and the physical element store.
+    // The runtime roots the result array, either within a task's disjoint
+    // span or in the caller-thread sequential loop. No safepoint may occur
+    // between callback return and the physical element store.
     builder.CreateAlignedStore(call, adapter->getArg(2),
         llvm::Align(storage_alignment(target.result_type)));
     builder.CreateRetVoid();
     return adapter;
   }
 
+  [[nodiscard]] llvm::Function *worker_entry_adapter(const symbol_id &symbol) {
+    const auto name = ".hk.worker.entry." + qualified_name(symbol);
+    if (auto *existing = output_->getFunction(name)) return existing;
+    const auto &target = find_function(symbol);
+    auto *pointer = llvm::PointerType::getUnqual(context_);
+    auto *integer = llvm::Type::getInt64Ty(context_);
+    auto *adapter = llvm::Function::Create(llvm::FunctionType::get(
+        llvm::Type::getVoidTy(context_), {pointer, integer}, false),
+        llvm::GlobalValue::PrivateLinkage, name, output_.get());
+    adapter->setCallingConv(llvm::CallingConv::C);
+    llvm::IRBuilder<> builder(llvm::BasicBlock::Create(context_, "entry", adapter));
+    const type byte{NERI_IR_TYPE_BYTE_V1, std::nullopt, {}};
+    const auto prefix = array_payload_element_offset(byte);
+    const auto maximum = std::min<std::uint64_t>(
+        std::numeric_limits<std::int64_t>::max(),
+        std::numeric_limits<std::size_t>::max() - sizeof(neri_object_header_v1) - prefix);
+    auto *length = adapter->getArg(1);
+    auto *invalid_length = builder.CreateICmpUGT(length, builder.getInt64(maximum));
+    auto *invalid_pointer = builder.CreateAnd(
+        builder.CreateICmpNE(length, builder.getInt64(0)),
+        builder.CreateIsNull(adapter->getArg(0)));
+    auto *invalid = llvm::BasicBlock::Create(context_, "invalid.config", adapter);
+    auto *copy = llvm::BasicBlock::Create(context_, "copy.config", adapter);
+    builder.CreateCondBr(builder.CreateOr(invalid_length, invalid_pointer), invalid, copy);
+    builder.SetInsertPoint(invalid);
+    emit_panic(builder, NERI_PANIC_RUNTIME_CONTRACT_V1,
+               "Invalid worker configuration buffer.", std::nullopt);
+    builder.SetInsertPoint(copy);
+
+    // The runtime enters once per worker. This frame belongs exclusively to
+    // that worker's heap and protects config throughout arbitrary entry I/O.
+    auto *root = builder.CreateAlloca(pointer, nullptr, "worker.config.root");
+    builder.CreateStore(llvm::ConstantPointerNull::get(pointer), root);
+    auto *frame_type = llvm::StructType::get(context_, {pointer, pointer, integer, integer});
+    auto *frame = builder.CreateAlloca(frame_type, nullptr, "worker.config.frame");
+    builder.CreateStore(llvm::ConstantAggregateZero::get(frame_type), frame);
+    builder.CreateStore(root, builder.CreateStructGEP(frame_type, frame, 1U));
+    builder.CreateStore(builder.getInt64(1), builder.CreateStructGEP(frame_type, frame, 2U));
+    builder.CreateCall(root_frame_enter_function(), {frame});
+    auto *config = builder.CreateCall(gc_alloc_function(),
+        {array_descriptor(byte), builder.CreateAdd(length, builder.getInt64(prefix)),
+         builder.getInt64(array_payload_alignment(byte))}, "worker.config");
+    builder.CreateStore(config, root);
+    auto *length_slot = builder.CreateInBoundsGEP(builder.getInt8Ty(), config,
+        builder.getInt64(sizeof(neri_object_header_v1)));
+    builder.CreateAlignedStore(length, length_slot, llvm::Align(alignof(std::uint64_t)));
+    auto *data = builder.CreateInBoundsGEP(builder.getInt8Ty(), config,
+        builder.getInt64(array_elements_offset(byte)));
+    // A zero-length config may have a null source; do not pass it to memcpy.
+    auto *invoke = llvm::BasicBlock::Create(context_, "invoke", adapter);
+    auto *nonempty = llvm::BasicBlock::Create(context_, "copy.bytes", adapter);
+    builder.CreateCondBr(builder.CreateICmpEQ(length, builder.getInt64(0)), invoke, nonempty);
+    builder.SetInsertPoint(nonempty);
+    builder.CreateMemCpy(data, llvm::MaybeAlign(1), adapter->getArg(0), llvm::MaybeAlign(1), length);
+    builder.CreateBr(invoke);
+    builder.SetInsertPoint(invoke);
+    auto *call = builder.CreateCall(functions_.at(symbol_key(symbol)), {config});
+    call->setCallingConv(llvm::CallingConv::C);
+    if ((target.effects & NERI_IR_EFFECT_NO_RETURN_V1) != 0U) {
+      builder.CreateUnreachable();
+    } else {
+      builder.CreateCall(root_frame_leave_function(), {frame});
+      builder.CreateRetVoid();
+    }
+    return adapter;
+  }
+
   [[nodiscard]] const function &find_virtual_signature(
       const symbol_id &slot) const {
     const function *signature = nullptr;
-    for (const auto &candidate : input_.functions) {
-      if (!candidate.dispatch_slot.has_value() ||
-          symbol_key(*candidate.dispatch_slot) != symbol_key(slot)) {
-        continue;
-      }
+    const auto candidates = input_virtual_functions_by_slot_.find(symbol_key(slot));
+    if (candidates == input_virtual_functions_by_slot_.end()) {
+      throw codegen_error(codegen_error_kind::lowering,
+                          "Verified virtual dispatch slot disappeared.");
+    }
+    for (const auto *candidate : candidates->second) {
       if (signature == nullptr) {
-        signature = &candidate;
+        signature = candidate;
         continue;
       }
       const auto &current_class = find_class(*signature->declaring_class);
       auto base = current_class.base;
       while (base.has_value()) {
-        if (symbol_key(*base) == symbol_key(*candidate.declaring_class)) {
-          signature = &candidate;
+        if (symbol_key(*base) == symbol_key(*candidate->declaring_class)) {
+          signature = candidate;
           break;
         }
         base = find_class(*base).base;
@@ -2643,6 +2804,11 @@ private:
     auto *block = llvm::BasicBlock::Create(context_, "entry", trampoline);
     llvm::IRBuilder<> builder(block);
     auto *typed_entry = functions_.at(symbol_key(session.entry));
+    const auto declared_entry = std::ranges::find_if(input_.functions, [&](const function &value) {
+      return symbol_key(value.id) == symbol_key(session.entry);
+    });
+    const bool nullable_entry = declared_entry != input_.functions.end() &&
+                                declared_entry->result_type.tag == NERI_IR_TYPE_OPTIONAL_V1;
     auto *call = session.source_type.tag == NERI_IR_TYPE_VOID_V1
                      ? builder.CreateCall(typed_entry, {})
                      : builder.CreateCall(typed_entry, {trampoline->getArg(0)});
@@ -2704,22 +2870,28 @@ private:
     auto *source_name = session_text(source_id, "source");
     auto *target_name = session_text(target_id, "target");
     auto *i16 = llvm::Type::getInt16Ty(context_);
+    const std::uint16_t metadata_minor = nullable_entry ? 2U :
+                                         (session.artifact_identity.empty() ? 0U : 1U);
     std::vector<llvm::Type *> metadata_fields{
         i32, i16, i16, pointer, pointer, pointer, pointer, pointer, i64};
-    if (!session.artifact_identity.empty()) metadata_fields.push_back(i64);
+    if (metadata_minor >= 1U) metadata_fields.push_back(i64);
+    if (metadata_minor >= 2U) metadata_fields.push_back(i64);
     auto *metadata_type = llvm::StructType::get(context_, metadata_fields);
     std::vector<llvm::Constant *> metadata_values{
         llvm::ConstantInt::get(
             i32, session.artifact_identity.empty()
-                     ? offsetof(neri_session_module_metadata_v1, display_offset)
-                     : sizeof(neri_session_module_metadata_v1)),
+                     ? (nullable_entry ? sizeof(neri_session_module_metadata_v1)
+                                       : offsetof(neri_session_module_metadata_v1, display_offset))
+                     : (nullable_entry ? sizeof(neri_session_module_metadata_v1)
+                                       : offsetof(neri_session_module_metadata_v1, flags))),
         llvm::ConstantInt::get(i16, 1),
-        llvm::ConstantInt::get(i16,
-                               session.artifact_identity.empty() ? 0 : 1),
+        llvm::ConstantInt::get(i16, metadata_minor),
         entry_name, trampoline, source_name, target_name, layouts,
         llvm::ConstantInt::get(i64, values.size())};
-    if (!session.artifact_identity.empty())
+    if (metadata_minor >= 1U)
       metadata_values.push_back(llvm::ConstantInt::get(i64, display_offset));
+    if (metadata_minor >= 2U)
+      metadata_values.push_back(llvm::ConstantInt::get(i64, NERI_SESSION_MODULE_NULLABLE_ENTRY_V1));
     auto *metadata = new llvm::GlobalVariable(*output_, metadata_type, true,
         llvm::GlobalValue::PrivateLinkage,
         llvm::ConstantStruct::get(metadata_type, metadata_values),
@@ -2965,18 +3137,30 @@ private:
   }
 
   void lower_functions() {
+    const auto total = static_cast<std::size_t>(std::ranges::count_if(
+        input_.functions, [](const auto &function) { return !function.retained; }));
+    std::size_t completed = 0;
+    auto last_report = std::chrono::steady_clock::time_point{};
     for (const auto &function : input_.functions) {
       if (function.retained) continue;
+      if (progress_ && (completed == 0 || std::chrono::steady_clock::now() - last_report >= std::chrono::milliseconds(75))) {
+        progress_("lower", completed, total, function.id.semantic_name,
+                  function.location ? function.location->utf8_start : 1073741823U);
+        last_report = std::chrono::steady_clock::now();
+      }
       function_lowerer(*this, function, *functions_.at(symbol_key(function.id)))
           .lower();
+      ++completed;
+      if (progress_ && completed == total)
+        progress_("lower", completed, total, function.id.semantic_name,
+                  function.location ? function.location->utf8_start : 1073741823U);
     }
   }
 
   [[nodiscard]] const function &find_function(const symbol_id &id) const {
-    for (const auto &candidate : input_.functions) {
-      if (symbol_key(candidate.id) == symbol_key(id)) {
-        return candidate;
-      }
+    if (const auto found = input_functions_by_id_.find(symbol_key(id));
+        found != input_functions_by_id_.end()) {
+      return *found->second;
     }
     throw codegen_error(codegen_error_kind::lowering,
                         "Verified direct-call target disappeared.");
@@ -2984,47 +3168,12 @@ private:
 
   [[nodiscard]] const import_declaration &
   find_import(const symbol_id &id) const {
-    for (const auto &candidate : input_.imports) {
-      if (symbol_key(candidate.id) == symbol_key(id)) {
-        return candidate;
-      }
+    if (const auto found = input_imports_by_id_.find(symbol_key(id));
+        found != input_imports_by_id_.end()) {
+      return *found->second;
     }
     throw codegen_error(codegen_error_kind::lowering,
                         "Verified import target disappeared.");
-  }
-
-  [[nodiscard]] const block &find_block(const function &function,
-                                        std::uint32_t id) const {
-    for (const auto &candidate : function.blocks) {
-      if (candidate.id == id) {
-        return candidate;
-      }
-    }
-    throw codegen_error(codegen_error_kind::lowering,
-                        "Verified branch target disappeared.");
-  }
-
-  [[nodiscard]] const type &value_type(const function &function,
-                                       std::uint32_t id) const {
-    if (function.unsafe_root.has_value() && function.unsafe_root->id == id) {
-      return function.unsafe_root->value_type;
-    }
-    for (const auto &block : function.blocks) {
-      for (const auto &parameter : block.parameters) {
-        if (parameter.id == id) {
-          return parameter.value_type;
-        }
-      }
-      for (const auto &instruction : block.instructions) {
-        for (const auto &result : instruction.results) {
-          if (result.id == id) {
-            return result.value_type;
-          }
-        }
-      }
-    }
-    throw codegen_error(codegen_error_kind::lowering,
-                        "Verified SSA type disappeared.");
   }
 
   [[nodiscard]] llvm::Function *runtime_function(
@@ -3058,6 +3207,13 @@ private:
     auto *integer = llvm::Type::getInt64Ty(context_);
     return runtime_function("neri_rt_v1_task_generate", pointer,
         {integer, integer, pointer, pointer, pointer});
+  }
+
+  [[nodiscard]] llvm::Function *array_generate_function() {
+    auto *pointer = llvm::PointerType::getUnqual(context_);
+    auto *integer = llvm::Type::getInt64Ty(context_);
+    return runtime_function("neri_rt_v1_array_generate", pointer,
+        {integer, pointer, pointer, pointer});
   }
 
   [[nodiscard]] llvm::Function *root_frame_leave_function() {
@@ -3274,10 +3430,24 @@ private:
   bool c_library_module_{};
   bool emit_debug_information_{};
   const std::vector<std::pair<std::string, std::string>> &debug_sources_;
+  const emission_progress &progress_;
+  std::map<std::string, const source *, std::less<>> sources_by_id_;
+  std::map<std::string, std::vector<std::size_t>, std::less<>>
+      source_line_starts_;
+  std::map<std::string, std::pair<std::string, std::string>, std::less<>>
+      debug_paths_by_id_;
   std::unique_ptr<llvm::DIBuilder> debug_builder_;
   std::map<std::string, llvm::DIFile *> debug_files_;
   std::map<std::string, llvm::DIType *> debug_types_;
   std::set<std::string> debug_types_in_progress_;
+  std::map<decltype(symbol_key(symbol_id{})), const class_declaration *>
+      input_classes_by_id_;
+  std::map<decltype(symbol_key(symbol_id{})), const import_declaration *>
+      input_imports_by_id_;
+  std::map<decltype(symbol_key(symbol_id{})), const function *>
+      input_functions_by_id_;
+  std::map<decltype(symbol_key(symbol_id{})), std::vector<const function *>>
+      input_virtual_functions_by_slot_;
   std::map<decltype(symbol_key(symbol_id{})), llvm::GlobalVariable *> globals_;
   std::map<decltype(symbol_key(symbol_id{})), llvm::Function *> imports_;
   std::map<decltype(symbol_key(symbol_id{})), llvm::Function *> functions_;
@@ -3311,9 +3481,10 @@ lower_to_llvm(const verified_module &input, llvm::LLVMContext &context,
               const llvm::Triple &triple, const llvm::DataLayout &layout,
               bool emit_debug_information,
               const std::vector<std::pair<std::string, std::string>>
-                  &debug_sources) {
+                  &debug_sources,
+              const emission_progress &progress) {
   return module_lowerer(input.value(), context, triple, layout,
-                        emit_debug_information, debug_sources)
+                        emit_debug_information, debug_sources, progress)
       .lower();
 }
 

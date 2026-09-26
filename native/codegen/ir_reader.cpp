@@ -648,9 +648,10 @@ private:
     instruction result;
     const auto opcode_offset = input_.offset();
     result.opcode = decode_contiguous_tag(input_.u16(), NERI_IR_OPCODE_CONSTANT_V1,
-                                        NERI_IR_OPCODE_CALL_C_INDIRECT_V1,
+                                        NERI_IR_OPCODE_WORKER_ENTRY_V1,
                                         "opcode", opcode_offset);
-    if (result.opcode >= NERI_IR_OPCODE_C_FUNCTION_ADDRESS_V1 && !c_interop_)
+    if (result.opcode >= NERI_IR_OPCODE_C_FUNCTION_ADDRESS_V1 &&
+        result.opcode <= NERI_IR_OPCODE_CALL_C_INDIRECT_V1 && !c_interop_)
       fail(reader_error_kind::unsupported_feature, "C function instructions require c-interop-v1.", opcode_offset);
     result.results = read_vector<value_definition>(
         input_, "instruction results",

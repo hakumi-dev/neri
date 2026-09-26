@@ -14,11 +14,13 @@ enum class ir_feature : std::uint8_t {
   CInterop,
   DebugScopes,
   ExtendedScalars,
+  IsolatedWorkers,
   NativeLibraries,
   NativeRecords,
   NativeStrings,
   RetainedModules,
   ScopedTasks,
+  SequentialArrays,
   SessionModule,
   StringData,
 };
@@ -32,15 +34,17 @@ struct ir_feature_contract final {
   std::string_view transport_diagnostic;
 };
 
-inline constexpr std::array<ir_feature_contract, 10> ir_feature_contracts{{
+inline constexpr std::array<ir_feature_contract, 12> ir_feature_contracts{{
   {ir_feature::CInterop, "c-interop-v1", 8, 27, UINT64_C(0), "C interoperability requires IR transport 1.8."},
   {ir_feature::DebugScopes, "debug-scopes-v1", 6, 1, UINT64_C(0), "Debug scopes require IR transport 1.6."},
   {ir_feature::ExtendedScalars, "extended-scalars-v1", 2, 9, UINT64_C(512), "Extended scalars require transport 1.2."},
+  {ir_feature::IsolatedWorkers, "isolated-workers-v1", 9, 32, UINT64_C(1073741824), "Isolated workers require IR transport 1.9."},
   {ir_feature::NativeLibraries, "native-libraries-v1", 2, 1, UINT64_C(0), "Native libraries require IR transport 1.2."},
   {ir_feature::NativeRecords, "native-records-v1", 3, 1, UINT64_C(0), "Native records require transport 1.3."},
   {ir_feature::NativeStrings, "native-strings-v1", 1, 2, UINT64_C(64), "Native strings require IR transport 1.1."},
   {ir_feature::RetainedModules, "retained-modules-v1", 7, 1, UINT64_C(0), "Retained modules require IR transport 1.7."},
   {ir_feature::ScopedTasks, "scoped-tasks-v1", 4, 10, UINT64_C(16384), "Scoped tasks require IR transport 1.4."},
+  {ir_feature::SequentialArrays, "sequential-arrays-v1", 8, 29, UINT64_C(536870912), "Sequential array generation requires IR transport 1.8."},
   {ir_feature::SessionModule, "session-module-v1", 5, 19, UINT64_C(8388608), "Session modules require transport 1.5."},
   {ir_feature::StringData, "string-data-v1", 1, 1, UINT64_C(0), "String data require IR transport 1.1."},
 }};
@@ -57,13 +61,15 @@ inline constexpr const ir_feature_contract &ir_feature_metadata(ir_feature featu
   case ir_feature::CInterop: return ir_feature_contracts[0];
   case ir_feature::DebugScopes: return ir_feature_contracts[1];
   case ir_feature::ExtendedScalars: return ir_feature_contracts[2];
-  case ir_feature::NativeLibraries: return ir_feature_contracts[3];
-  case ir_feature::NativeRecords: return ir_feature_contracts[4];
-  case ir_feature::NativeStrings: return ir_feature_contracts[5];
-  case ir_feature::RetainedModules: return ir_feature_contracts[6];
-  case ir_feature::ScopedTasks: return ir_feature_contracts[7];
-  case ir_feature::SessionModule: return ir_feature_contracts[8];
-  case ir_feature::StringData: return ir_feature_contracts[9];
+  case ir_feature::IsolatedWorkers: return ir_feature_contracts[3];
+  case ir_feature::NativeLibraries: return ir_feature_contracts[4];
+  case ir_feature::NativeRecords: return ir_feature_contracts[5];
+  case ir_feature::NativeStrings: return ir_feature_contracts[6];
+  case ir_feature::RetainedModules: return ir_feature_contracts[7];
+  case ir_feature::ScopedTasks: return ir_feature_contracts[8];
+  case ir_feature::SequentialArrays: return ir_feature_contracts[9];
+  case ir_feature::SessionModule: return ir_feature_contracts[10];
+  case ir_feature::StringData: return ir_feature_contracts[11];
   }
   throw std::invalid_argument("Unknown IR feature.");
 }

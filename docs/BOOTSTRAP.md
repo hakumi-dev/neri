@@ -58,6 +58,23 @@ The seed IR, native backend, runtime and host toolchain form the trust
 root. Content hashes detect mismatched artifacts; fixed-point checks establish
 reproducibility for the checked sources and toolchain.
 
+## Toolchain version transitions
+
+The compiler checks the runtime's exact toolchain version in addition to its
+IR transport, target, ABI version and required features. A canonical seed with
+the previous version pin cannot compile against a runtime bearing a new version.
+
+Before changing `VERSION`, generate a validated bridge seed whose runtime check
+accepts exactly the previous and next versions. Keep the current version in
+`VERSION` and the CLI during that refresh. Then update those values and restore
+the compiler's strict check to the new version, and run `refresh-seed` again.
+Both refreshes use the ordinary fixed-point and contract gates. The final
+package gate materializes the final seed and validates the delivered toolchain;
+run that gate instead of adding another standalone full test invocation.
+
+Keep the ABI, feature, target and IR checks in place throughout this transition.
+Seed artifacts and their provenance are published by the refresh command.
+
 ## Fixed point
 
 The Unix flow is implemented by [the launcher](../scripts/build.sh) and

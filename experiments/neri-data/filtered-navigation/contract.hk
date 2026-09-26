@@ -1,0 +1,444 @@
+use console
+use files
+use reference
+use resources
+use result
+use test
+use filtered_navigation_data
+use filtered_navigation_model
+use neri_data
+use neri_data_sqlite
+use neri_data_sqlite_fixture
+
+class NavigationProbe: Provider
+  private inner: Provider
+  private denyWindows: Bool
+  private denyScalars: Bool
+  private postgresDialect: Bool
+  public reads: Int = 0
+  public streams: Int = 0
+
+  def init(inner: Provider, denyWindows: Bool = false, denyScalars: Bool = false, postgresDialect: Bool = false): Void
+    this.inner = inner
+    this.denyWindows = denyWindows
+    this.denyScalars = denyScalars
+    this.postgresDialect = postgresDialect
+  end
+
+  public override readonly def dialect(): SqlDialect
+    return this.postgresDialect ? SqlDialect.PostgreSql() : this.inner.dialect()
+  end
+
+  public override readonly def supports(capability: ProviderCapability): Bool
+    match capability
+      case ProviderCapability.WindowFunctions()
+        if this.denyWindows
+          return false
+        end
+      case ProviderCapability.CheckedScalarExpressions()
+        if this.denyScalars
+          return false
+        end
+      case ProviderCapability.BoundedTypedReads()
+      case ProviderCapability.StreamingReads()
+      case ProviderCapability.SetWrites()
+      case ProviderCapability.TrackedWrites()
+      case ProviderCapability.ExplicitTransactions()
+      case ProviderCapability.Savepoints()
+    end
+    return this.inner.supports(capability)
+  end
+
+  public override def execute(plan: readonly SqlPlan): ProviderResult
+    this.reads = this.reads + 1
+    return this.inner.execute(plan)
+  end
+
+  public override def stream(plan: readonly StreamPlan, visit: fn(RawRow): Bool): StreamResult
+    this.streams = this.streams + 1
+    return this.inner.stream(plan, visit)
+  end
+end
+
+def loaded(result: QueryResult<Account>, stage: String = "query"): TypedRows<Account>?
+  match result
+    case QueryResult.Rows(rows)
+      return rows
+    case QueryResult.Failure(error)
+      console::println("unexpected filtered navigation failure: " + stage)
+      match error
+        case QueryFailure.Provider(message)
+          console::println(message)
+        case QueryFailure.UnsupportedCapability(name)
+          console::println(name)
+        case QueryFailure.InvalidIdentifier(name)
+          console::println("invalid identifier: " + name)
+        case QueryFailure.InvalidLimit(value, maximum)
+          console::println("invalid limit: " + (value as String))
+        case QueryFailure.MissingLimit(maximum)
+          console::println("missing limit")
+        case QueryFailure.SourceMismatch(expected, actual)
+          console::println("source mismatch: " + expected + " / " + actual)
+        case QueryFailure.MissingColumn(name)
+          console::println("missing column: " + name)
+        case QueryFailure.TypeMismatch(column, expected, actual)
+          console::println("type mismatch: " + column + " / " + expected + " / " + actual)
+        case QueryFailure.Cardinality(expected, actual)
+          console::println("cardinality: " + expected + " / " + (actual as String))
+      end
+
+      test::assertTrue(false)
+      return null
+  end
+end
+
+def failed(result: QueryResult<Account>): Void
+  match result
+    case QueryResult.Failure(error)
+      return
+    case QueryResult.Rows(rows)
+      test::assertTrue(false)
+  end
+end
+
+def accountAt(rows: TypedRows<Account>, code: String): Account?
+  var current = rows.first()
+
+  while current != null
+    if current.value.code == code
+      return current.value
+    end
+    current = current.next
+  end
+  return null
+end
+
+def entryAt(account: Account, id: Int): filtered_navigation_model::Entry?
+  for entry in account.entries
+    if entry.id == id
+      return entry
+    end
+  end
+  return null
+end
+
+def hasEntry(account: Account, id: Int): Bool
+  return entryAt(account, id) != null
+end
+
+def rankOrder(): quote fn(filtered_navigation_model::Entry): Int
+  return quote do |entry: filtered_navigation_model::Entry|: Int
+    return entry.rank
+  end
+end
+
+def accountCodeOrder(): quote fn(Account): String
+  return quote do |account: Account|: String
+    return account.code
+  end
+end
+
+def firstTwoAccounts(): quote fn(Account): Bool
+  return quote do |account: Account|: Bool
+    return account.code == "p1" || account.code == "p2"
+  end
+end
+
+def exactRank(value: Int): quote fn(filtered_navigation_model::Entry): Bool
+  return quote do |entry: filtered_navigation_model::Entry|: Bool
+    return entry.rank == value
+  end
+end
+
+def rankPlus(bias: Int): quote fn(filtered_navigation_model::Entry): Int
+  return quote do |entry: filtered_navigation_model::Entry|: Int
+    return entry.rank + bias
+  end
+end
+
+def sameEntryArrayStorage(alias: filtered_navigation_model::Entry[], current: filtered_navigation_model::Entry[], first: filtered_navigation_model::Entry, replacement: filtered_navigation_model::Entry): Bool
+  alias[0] = replacement
+  let shared = reference::same(current[0], replacement)
+
+  alias[0] = first
+  return shared
+end
+
+def seed(path: String): Bool
+  let sql = "CREATE TABLE accounts(code TEXT PRIMARY KEY,name TEXT NOT NULL); CREATE TABLE entries(id INTEGER PRIMARY KEY,account_code TEXT REFERENCES accounts(code),rank INTEGER NOT NULL,__NERI_NAVIGATION_RANK INTEGER NOT NULL,label TEXT NOT NULL); CREATE TABLE notes(id INTEGER PRIMARY KEY,entry_id INTEGER NOT NULL REFERENCES entries(id),body TEXT NOT NULL); INSERT INTO accounts VALUES('p1','parent1'),('p2','parent2'); INSERT INTO entries VALUES(11,'p1',0,777,'one'),(12,'p1',1,777,'two'),(13,'p1',2,777,'three'),(14,'p1',2,777,'four'),(15,'p1',3,777,'five'),(21,'p2',2,777,'six'),(22,'p2',2,777,'seven'),(23,'p2',3,777,'eight'),(24,'p2',4,777,'nine'),(99,NULL,2,777,'unparented'); WITH RECURSIVE n(i) AS (VALUES(3) UNION ALL SELECT i + 1 FROM n WHERE i < 52) INSERT INTO accounts SELECT 'p' || i,'parent' || i FROM n;"
+
+  let fillers = "WITH RECURSIVE f(n) AS (VALUES(0) UNION ALL SELECT n + 1 FROM f WHERE n < 15) INSERT INTO entries SELECT 100000 + n,'p1',10 + n,777,'p1_fill' || n FROM f; WITH RECURSIVE f(n) AS (VALUES(0) UNION ALL SELECT n + 1 FROM f WHERE n < 16) INSERT INTO entries SELECT 200000 + n,'p2',10 + n,777,'p2_fill' || n FROM f; "
+  let manyRanks = "WITH RECURSIVE n(i) AS (VALUES(3) UNION ALL SELECT i + 1 FROM n WHERE i < 52), ranks(slot,rank) AS (VALUES(0,0),(1,2),(2,2),(3,3),(4,4),(5,5),(6,6),(7,7),(8,8),(9,9),(10,10),(11,11),(12,12),(13,13),(14,14),(15,15),(16,16),(17,17),(18,18),(19,19),(20,20)) INSERT INTO entries SELECT i * 100 + slot,'p' || i,rank,777,'entry' || i || '_' || slot FROM n CROSS JOIN ranks; INSERT INTO notes SELECT id,id,'note' || id FROM entries;"
+
+  return createSQLiteFixture(path, sql + fillers + manyRanks)
+end
+
+def verifyFilteredWindows(provider: SQLiteProvider): Void
+  console::println("filtered navigation: filter, deterministic per-parent window, text nullable FK, nested include")
+  let probe = new NavigationProbe(provider)
+  let db = new FilteredNavigationDatabase(probe)
+  let roots = loaded(db.accounts.orderByString(accountCodeOrder()).take(52).all())
+
+  test::assertTrue(roots != null)
+  if roots == null
+    return
+  end
+
+  test::assertEqual(roots.count(), 52)
+  let first = accountAt(roots, "p1")
+  let second = accountAt(roots, "p2")
+  let third = accountAt(roots, "p3")
+
+  test::assertTrue(first != null && second != null && third != null)
+  if first == null || second == null || third == null
+    return
+  end
+
+  let broad = db.include_entriesFor_Account_by_accountCode(db.accounts.orderByString(accountCodeOrder()).take(52)).children(db.entries.orderBy(rankOrder())).maxChildren(2000)
+  let broadlyLoaded = loaded(broad.load(roots), "unpaged broad")
+
+  test::assertTrue(broadlyLoaded != null)
+  test::assertEqual(first.entries.Length, 21)
+  test::assertEqual(second.entries.Length, 21)
+  var broadTotal = 0
+  var rootCursor = roots.first()
+
+  while rootCursor != null
+    broadTotal = broadTotal + rootCursor.value.entries.Length
+    rootCursor = rootCursor.next
+  end
+
+  test::assertEqual(broadTotal, 1092)
+  let windowedBroad = db.include_entriesFor_Account_by_accountCode(db.accounts.orderByString(accountCodeOrder()).take(52)).children(db.entries.orderBy(rankOrder()).take(30)).maxChildren(2000)
+  let windowedBroadRows = loaded(windowedBroad.load(roots), "windowed broad")
+
+  test::assertTrue(windowedBroadRows != null)
+  var windowedTotal = 0
+
+  rootCursor = roots.first()
+
+  while rootCursor != null
+    windowedTotal = windowedTotal + rootCursor.value.entries.Length
+    rootCursor = rootCursor.next
+  end
+
+  test::assertEqual(windowedTotal, 1092)
+  let oldEntry = entryAt(first, 12)
+  let tieReplacement = entryAt(first, 13)
+
+  test::assertTrue(oldEntry != null && tieReplacement != null)
+  if oldEntry == null || tieReplacement == null
+    return
+  end
+  let oldParent = oldEntry.account
+
+  test::assertTrue(oldParent != null)
+  if oldParent != null
+    test::assertTrue(reference::same(oldParent, first))
+  end
+  let selectedBeforeReload = entryAt(first, 14)
+
+  test::assertTrue(selectedBeforeReload != null)
+  if selectedBeforeReload == null
+    return
+  end
+  selectedBeforeReload.label = "local child edit"
+  selectedBeforeReload.rank = 77
+  first.name = "local edit survives navigation reload"
+  let filter = exactRank(2)
+  let sortBias = 5
+  let selectedChildren = db.entries.matching(filter).orderBy(rankPlus(sortBias)).skip(1).take(1)
+  let childStep = db.collectionStep_entriesFor_Account_by_accountCode(maximum: 10000, children: selectedChildren)
+  let noteStep = db.collectionStep_notesFor_Entry_by_entryId()
+  let selectedPath = includePath(db.accounts.orderByString(accountCodeOrder()).take(52), childStep).thenInclude(noteStep)
+  let streamsBefore = probe.streams
+  let filtered = loaded(selectedPath.load(roots), "filtered nested path")
+
+  test::assertTrue(filtered != null)
+  test::assertEqual(probe.streams - streamsBefore, 4)
+  test::assertEqual(first.name, "local edit survives navigation reload")
+  test::assertEqual(first.entries.Length, 1)
+  test::assertEqual(second.entries.Length, 1)
+  test::assertEqual(third.entries.Length, 1)
+  test::assertTrue(hasEntry(first, 14))
+  test::assertTrue(hasEntry(second, 22))
+  test::assertTrue(hasEntry(third, 302))
+  test::assertFalse(hasEntry(first, 12))
+  test::assertTrue(oldEntry.account == null)
+  test::assertTrue(reference::same(first.entries[0], selectedBeforeReload))
+  test::assertEqual(first.entries[0].label, "local child edit")
+  test::assertEqual(first.entries[0].rank, 77)
+  test::assertEqual(first.entries[0].sentinel, 777)
+  test::assertEqual(first.entries[0].notes.Length, 1)
+  test::assertEqual(first.entries[0].notes[0].body, "note14")
+  let selectedParent = first.entries[0].account
+
+  test::assertTrue(selectedParent != null)
+  if selectedParent != null
+    test::assertTrue(reference::same(selectedParent, first))
+  end
+
+  test::assertTrue(accountAt(roots, "p52") != null)
+  test::assertFalse(hasEntry(first, 99))
+
+  let skipTake = db.include_entriesFor_Account_by_accountCode(db.accounts.matching(firstTwoAccounts()).take(2)).children(db.entries.orderBy(rankOrder()).skip(1).take(2)).maxChildren(10)
+  let pagedRows = loaded(skipTake.all())
+
+  test::assertTrue(pagedRows != null)
+  if pagedRows != null
+    let pageOne = accountAt(pagedRows, "p1")
+    let pageTwo = accountAt(pagedRows, "p2")
+
+    test::assertTrue(pageOne != null && pageTwo != null)
+    if pageOne != null && pageTwo != null
+      test::assertEqual(pageOne.entries.Length, 2)
+      test::assertTrue(hasEntry(pageOne, 12) && hasEntry(pageOne, 13))
+      test::assertEqual(pageTwo.entries.Length, 2)
+      test::assertTrue(hasEntry(pageTwo, 22) && hasEntry(pageTwo, 23))
+    end
+  end
+end
+
+def verifyOverflowAndPreflight(provider: SQLiteProvider): Void
+  console::println("filtered navigation: overflow rollback and query preflight")
+  let counted = new NavigationProbe(provider)
+  let db = new FilteredNavigationDatabase(counted)
+  let roots = loaded(db.accounts.matching(firstTwoAccounts()).take(2).all())
+
+  test::assertTrue(roots != null)
+  if roots == null
+    return
+  end
+  let included = db.include_entriesFor_Account_by_accountCode(db.accounts.matching(firstTwoAccounts()).take(2)).children(db.entries.orderBy(rankOrder()).skip(1).take(1)).all()
+  let rows = loaded(included)
+
+  test::assertTrue(rows != null)
+  if rows == null
+    return
+  end
+  let first = accountAt(rows, "p1")
+  let second = accountAt(rows, "p2")
+
+  test::assertTrue(first != null && second != null)
+  if first == null || second == null
+    return
+  end
+  let selected = first.entries[0]
+  let replacement = new filtered_navigation_model::Entry(-1, null, 0, 777, "replacement")
+  let originalArray = first.entries
+  let originalSecondArray = second.entries
+  let rejected = db.include_entriesFor_Account_by_accountCode(db.accounts.matching(firstTwoAccounts()).take(2)).children(db.entries.orderBy(rankOrder()).take(3)).maxChildren(1)
+
+  failed(rejected.load(rows))
+
+  test::assertTrue(sameEntryArrayStorage(originalArray, first.entries, selected, replacement))
+  test::assertTrue(reference::same(first.entries[0], selected))
+  test::assertEqual(second.entries.Length, 1)
+  test::assertTrue(reference::same(originalSecondArray[0], second.entries[0]))
+  let retainedParent = first.entries[0].account
+
+  test::assertTrue(retainedParent != null)
+  if retainedParent != null
+    test::assertTrue(reference::same(retainedParent, first))
+  end
+
+  let beforeReads = counted.reads
+  let beforeStreams = counted.streams
+  let foreign = new FilteredNavigationDatabase(counted)
+  let foreignStep = foreign.collectionStep_entriesFor_Account_by_accountCode(children: foreign.entries.where(rank: 2).take(1))
+  let invalidContext = includePath(db.accounts.take(2), foreignStep)
+
+  failed(invalidContext.all())
+
+  test::assertEqual(counted.reads, beforeReads)
+  test::assertEqual(counted.streams, beforeStreams)
+
+  let noWindows = new NavigationProbe(provider, denyWindows: true)
+  let limitedDb = new FilteredNavigationDatabase(noWindows)
+  let unpaged = loaded(limitedDb.include_entriesFor_Account_by_accountCode(limitedDb.accounts.matching(firstTwoAccounts()).take(2)).children(limitedDb.entries.orderBy(rankOrder())).maxChildren(100).all())
+
+  test::assertTrue(unpaged != null)
+  test::assertTrue(noWindows.streams > 0)
+  let readsBeforeRejectedWindow = noWindows.reads
+  let streamsBeforeRejectedWindow = noWindows.streams
+  let limitedStep = limitedDb.collectionStep_entriesFor_Account_by_accountCode(children: limitedDb.entries.take(1))
+
+  failed(includePath(limitedDb.accounts.take(2), limitedStep).all())
+
+  test::assertEqual(noWindows.reads, readsBeforeRejectedWindow)
+  test::assertEqual(noWindows.streams, streamsBeforeRejectedWindow)
+
+  let distinctChildren = limitedDb.entries.distinct()
+
+  failed(limitedDb.include_entriesFor_Account_by_accountCode(limitedDb.accounts.take(2)).children(distinctChildren).all())
+  let priorChildren = limitedDb.entries.take(2).matching(exactRank(2))
+
+  failed(limitedDb.include_entriesFor_Account_by_accountCode(limitedDb.accounts.take(2)).children(priorChildren).all())
+
+  test::assertEqual(noWindows.reads, readsBeforeRejectedWindow)
+  test::assertEqual(noWindows.streams, streamsBeforeRejectedWindow)
+
+  let invalidLimit = new Query<filtered_navigation_model::Entry>(db.entries.sourceName(), db.entries.rowDecoder(), limit: 1001, mapping: db.entries.entityMapping(), provider: db.entries.provider(), tracker: db.entries.rowTracker(), changes: db.entries.changeOwner())
+
+  failed(db.include_entriesFor_Account_by_accountCode(db.accounts.take(2)).children(invalidLimit).all())
+  let invalidOffset = new Query<filtered_navigation_model::Entry>(db.entries.sourceName(), db.entries.rowDecoder(), offset: -1, mapping: db.entries.entityMapping(), provider: db.entries.provider(), tracker: db.entries.rowTracker(), changes: db.entries.changeOwner())
+
+  failed(db.include_entriesFor_Account_by_accountCode(db.accounts.take(2)).children(invalidOffset).all())
+
+  test::assertEqual(counted.reads, beforeReads)
+  test::assertEqual(counted.streams, beforeStreams)
+
+  let noScalars = new NavigationProbe(provider, denyScalars: true)
+  let scalarDb = new FilteredNavigationDatabase(noScalars)
+  let computedStep = scalarDb.collectionStep_entriesFor_Account_by_accountCode(children: scalarDb.entries.orderBy(rankPlus(1)).skip(1).take(1))
+
+  failed(includePath(scalarDb.accounts.take(2), computedStep).all())
+
+  test::assertEqual(noScalars.reads, 0)
+  test::assertEqual(noScalars.streams, 0)
+
+
+end
+
+def verifyFilteredNavigation(): resources::Outcome<Int, result::Failure>
+  using temporary <- files::TemporaryDirectory.create("neri-filtered-navigation-")
+    let databasePath = temporary.path() + "/filtered.sqlite"
+
+    test::assertTrue(seed(databasePath))
+    match SQLiteProvider.openWritable(databasePath)
+      case SQLiteOpenResult.Failure(message)
+        console::println(message)
+
+        test::assertTrue(false)
+      case SQLiteOpenResult.Opened(provider)
+        verifyFilteredWindows(provider)
+
+        test::assertTrue(provider.close())
+    end
+    match SQLiteProvider.openWritable(databasePath)
+      case SQLiteOpenResult.Failure(message)
+        console::println(message)
+
+        test::assertTrue(false)
+      case SQLiteOpenResult.Opened(provider)
+        verifyOverflowAndPreflight(provider)
+
+        test::assertTrue(provider.close())
+    end
+    return 0
+  end
+  return 1
+end
+
+def main(): Void
+  verifyFilteredDialectContracts()
+  let outcome = verifyFilteredNavigation()
+
+  test::assertEqual(outcome.closeFailures.count(), 0)
+  match outcome.completion
+    case resources::Completion.Value(value)
+      test::assertEqual(value, 0)
+    case resources::Completion.Failure(problem)
+      test::assertTrue(false)
+  end
+end

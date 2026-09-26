@@ -1,0 +1,622 @@
+use quotation
+use tasks
+namespace neri_data
+
+class GroupMetricPlan
+  internal selection: String
+  internal column: readonly ResultColumn
+  internal typeName: String
+
+  internal def init(selection: String, column: readonly ResultColumn, typeName: String): Void
+    this.selection = selection
+    this.column = column
+    this.typeName = typeName
+  end
+end
+
+enum GroupMetricCompileResult
+  case Plan(value: GroupMetricPlan)
+  case Failure(error: QueryFailure)
+end
+
+def groupScalarType(column: readonly ResultColumn): String
+  var base = ""
+
+  match column.kind()
+    case ResultColumnKind.Int()
+      base = "Int"
+    case ResultColumnKind.Bool()
+      base = "Bool"
+    case ResultColumnKind.Float()
+      base = "Float"
+    case ResultColumnKind.Text()
+      base = "String"
+  end
+  return base + (column.nullable() ? "?" : "")
+end
+
+class GroupMetricSpec<T>
+  private compileFn: fn(EntityMapping, Int, SqlDialect, CompileState): GroupMetricCompileResult
+
+  internal def init(compile: fn(EntityMapping, Int, SqlDialect, CompileState): GroupMetricCompileResult): Void
+    this.compileFn = compile
+  end
+
+  internal def compile(mapping: EntityMapping, offset: Int, dialect: SqlDialect, state: CompileState): GroupMetricCompileResult
+    return this.compileFn(mapping, offset, dialect, state)
+  end
+end
+
+## A reusable scalar aggregate selected for grouped filtering or ordering.
+class GroupMetric<T, V>
+  private shape: AggregateShape<T, V>
+
+  public def init(shape: AggregateShape<T, V>): Void
+    this.shape = shape
+  end
+
+  internal def spec(): GroupMetricSpec<T>
+    let shape = this.shape
+    let compile: fn(EntityMapping, Int, SqlDialect, CompileState): GroupMetricCompileResult = fn(mapping: EntityMapping, offset: Int, dialect: SqlDialect, state: CompileState): GroupMetricCompileResult
+      let typeName = shape.scalarTypeName()
+
+      if typeName == null
+        return GroupMetricCompileResult.Failure(QueryFailure.UnsupportedCapability("group metric requires one scalar aggregate"))
+      end
+      match shape.compile(mapping, offset, dialect, state)
+        case ShapeCompileResult.Failure(error)
+          return GroupMetricCompileResult.Failure(error)
+        case ShapeCompileResult.Plan(plan)
+          if plan.count() != 1
+            return GroupMetricCompileResult.Failure(QueryFailure.UnsupportedCapability("group metric requires one scalar aggregate"))
+          end
+          let column = plan.columns().at(0)
+
+          if groupScalarType(column) != typeName
+            return GroupMetricCompileResult.Failure(QueryFailure.UnsupportedCapability("group metric scalar type is incompatible with aggregate output"))
+          end
+          state.requiresCheckedScalars = state.requiresCheckedScalars || plan.requiresCheckedScalars()
+          return GroupMetricCompileResult.Plan(new GroupMetricPlan(plan.sql(), column, typeName))
+      end
+    end
+
+    return new GroupMetricSpec<T>(compile)
+  end
+
+  public def where(predicate: quote fn(V): Bool): GroupHaving<T>
+    return new GroupHaving<T>(this.spec(), predicate.tree())
+  end
+
+  public def equalTo(other: GroupMetric<T, V>): GroupHaving<T>
+    return new GroupHaving<T>(this.spec(), kind: 2, rightMetric: other.spec())
+  end
+
+  public def notEqualTo(other: GroupMetric<T, V>): GroupHaving<T>
+    return new GroupHaving<T>(this.spec(), kind: 3, rightMetric: other.spec())
+  end
+
+  public def lessThan(other: GroupMetric<T, V>): GroupHaving<T>
+    return new GroupHaving<T>(this.spec(), kind: 4, rightMetric: other.spec())
+  end
+
+  public def lessOrEqual(other: GroupMetric<T, V>): GroupHaving<T>
+    return new GroupHaving<T>(this.spec(), kind: 5, rightMetric: other.spec())
+  end
+
+  public def greaterThan(other: GroupMetric<T, V>): GroupHaving<T>
+    return new GroupHaving<T>(this.spec(), kind: 6, rightMetric: other.spec())
+  end
+
+  public def greaterOrEqual(other: GroupMetric<T, V>): GroupHaving<T>
+    return new GroupHaving<T>(this.spec(), kind: 7, rightMetric: other.spec())
+  end
+
+  public def ascending(): GroupOrder<T>
+    return new GroupOrder<T>(this.spec(), false)
+  end
+
+  public def descending(): GroupOrder<T>
+    return new GroupOrder<T>(this.spec(), true)
+  end
+end
+
+def groupMetric<T, V>(shape: AggregateShape<T, V>): GroupMetric<T, V>
+  return new GroupMetric<T, V>(shape)
+end
+
+class GroupHaving<T>
+  internal kind: Int
+  internal metric: GroupMetricSpec<T>?
+  internal rightMetric: GroupMetricSpec<T>?
+  internal predicate: readonly quotation::Tree?
+  internal left: GroupHaving<T>?
+  internal right: GroupHaving<T>?
+
+  internal def init(metric: GroupMetricSpec<T>? = null, predicate: readonly quotation::Tree? = null, kind: Int = 1, rightMetric: GroupMetricSpec<T>? = null, left: GroupHaving<T>? = null, right: GroupHaving<T>? = null): Void
+    this.kind = kind
+    this.metric = metric
+    this.rightMetric = rightMetric
+    this.predicate = predicate
+    this.left = left
+    this.right = right
+  end
+
+  public def and(other: GroupHaving<T>): GroupHaving<T>
+    return new GroupHaving<T>(kind: 8, left: this, right: other)
+  end
+
+  public def or(other: GroupHaving<T>): GroupHaving<T>
+    return new GroupHaving<T>(kind: 9, left: this, right: other)
+  end
+
+  public def not(): GroupHaving<T>
+    return new GroupHaving<T>(kind: 10, left: this)
+  end
+end
+
+class GroupSelectionState
+  internal offset: Int
+  internal hidden: String = ""
+  internal conditionNodes: Int = 0
+  internal firstColumn: GroupMetricColumnNode?
+  internal lastColumn: GroupMetricColumnNode?
+
+  internal def init(offset: Int): Void
+    this.offset = offset
+  end
+
+  internal def append(plan: GroupMetricPlan): Void
+    this.hidden = this.hidden + ", " + plan.selection
+    this.offset = this.offset + 1
+    let node = new GroupMetricColumnNode(plan.column)
+
+    if this.firstColumn == null
+      this.firstColumn = node
+    else
+      let last = this.lastColumn
+
+      if last != null
+        last.next = node
+      end
+    end
+    this.lastColumn = node
+  end
+
+  internal readonly def columnAt(index: Int): readonly ResultColumn?
+    var current = this.firstColumn
+    var position = 0
+
+    while current != null
+      if position == index
+        return current.column
+      end
+      current = current.next
+      position = position + 1
+    end
+    return null
+  end
+end
+
+class GroupMetricColumnNode
+  internal column: readonly ResultColumn
+  internal next: GroupMetricColumnNode?
+
+  internal def init(column: readonly ResultColumn): Void
+    this.column = column
+  end
+end
+
+class GroupRelationOutput
+  internal order: OrderTerm?
+  internal layout: EntityMapping?
+end
+
+class GroupConditionNode<T>
+  internal source: GroupHaving<T>
+  internal metric: GroupMetricPlan?
+  internal rightMetric: GroupMetricPlan?
+  internal left: GroupConditionNode<T>?
+  internal right: GroupConditionNode<T>?
+
+  internal def init(source: GroupHaving<T>, metric: GroupMetricPlan? = null, rightMetric: GroupMetricPlan? = null, left: GroupConditionNode<T>? = null, right: GroupConditionNode<T>? = null): Void
+    this.source = source
+    this.metric = metric
+    this.rightMetric = rightMetric
+    this.left = left
+    this.right = right
+  end
+end
+
+enum GroupConditionCompileResult<T>
+  case Plan(value: GroupConditionNode<T>)
+  case Failure(error: QueryFailure)
+end
+
+def compileGroupCondition<T>(condition: GroupHaving<T>, mapping: EntityMapping, dialect: SqlDialect, state: CompileState, selections: GroupSelectionState, depth: Int = 1): GroupConditionCompileResult<T>
+  if depth > 64 || selections.conditionNodes >= 256
+    return GroupConditionCompileResult<T>.Failure(QueryFailure.UnsupportedCapability("grouped condition exceeds complexity limit"))
+  end
+  selections.conditionNodes = selections.conditionNodes + 1
+  if condition.kind == 8 || condition.kind == 9 || condition.kind == 10
+    let left = condition.left
+
+    if left == null
+      return GroupConditionCompileResult<T>.Failure(QueryFailure.Provider("invalid grouped condition"))
+    end
+    match compileGroupCondition<T>(left, mapping, dialect, state, selections, depth + 1)
+      case GroupConditionCompileResult.Failure(error)
+        return GroupConditionCompileResult<T>.Failure(error)
+      case GroupConditionCompileResult.Plan(leftPlan)
+        if condition.kind == 10
+          return GroupConditionCompileResult<T>.Plan(new GroupConditionNode<T>(condition, left: leftPlan))
+        end
+        let right = condition.right
+
+        if right == null
+          return GroupConditionCompileResult<T>.Failure(QueryFailure.Provider("invalid grouped condition"))
+        end
+        match compileGroupCondition<T>(right, mapping, dialect, state, selections, depth + 1)
+          case GroupConditionCompileResult.Failure(error)
+            return GroupConditionCompileResult<T>.Failure(error)
+          case GroupConditionCompileResult.Plan(rightPlan)
+            return GroupConditionCompileResult<T>.Plan(new GroupConditionNode<T>(condition, left: leftPlan, right: rightPlan))
+        end
+    end
+  end
+  let metric = condition.metric
+
+  if metric == null || condition.kind < 1 || condition.kind > 7
+    return GroupConditionCompileResult<T>.Failure(QueryFailure.Provider("invalid grouped condition"))
+  end
+  match metric.compile(mapping, selections.offset, dialect, state)
+    case GroupMetricCompileResult.Failure(error)
+      return GroupConditionCompileResult<T>.Failure(error)
+    case GroupMetricCompileResult.Plan(plan)
+      selections.append(plan)
+      if condition.kind == 1
+        return GroupConditionCompileResult<T>.Plan(new GroupConditionNode<T>(condition, metric: plan))
+      end
+      let rightMetric = condition.rightMetric
+
+      if rightMetric == null
+        return GroupConditionCompileResult<T>.Failure(QueryFailure.Provider("invalid grouped metric comparison"))
+      end
+      match rightMetric.compile(mapping, selections.offset, dialect, state)
+        case GroupMetricCompileResult.Failure(error)
+          return GroupConditionCompileResult<T>.Failure(error)
+        case GroupMetricCompileResult.Plan(rightPlan)
+          selections.append(rightPlan)
+          if plan.typeName != rightPlan.typeName
+            return GroupConditionCompileResult<T>.Failure(QueryFailure.UnsupportedCapability("group metric comparison requires matching scalar output types"))
+          end
+          if condition.kind >= 4 && plan.typeName != "Int" && plan.typeName != "Float"
+            return GroupConditionCompileResult<T>.Failure(QueryFailure.UnsupportedCapability("ordered group metric comparison requires Int or Float output"))
+          end
+          return GroupConditionCompileResult<T>.Plan(new GroupConditionNode<T>(condition, metric: plan, rightMetric: rightPlan))
+      end
+  end
+end
+
+def groupConditionExpression<T>(condition: GroupConditionNode<T>, alias: String): TranslationResult
+  let kind = condition.source.kind
+
+  if kind == 8 || kind == 9 || kind == 10
+    let left = condition.left
+
+    if left == null
+      return TranslationResult.Failure(QueryFailure.Provider("invalid grouped condition"))
+    end
+    match groupConditionExpression<T>(left, alias)
+      case TranslationResult.Failure(error)
+        return TranslationResult.Failure(error)
+      case TranslationResult.Expression(leftExpression)
+        if leftExpression == null
+          return TranslationResult.Failure(QueryFailure.Provider("invalid grouped condition"))
+        end
+        if kind == 10
+          return TranslationResult.Expression(new Expression(ExpressionKind.Not(), left: leftExpression))
+        end
+        let right = condition.right
+
+        if right == null
+          return TranslationResult.Failure(QueryFailure.Provider("invalid grouped condition"))
+        end
+        match groupConditionExpression<T>(right, alias)
+          case TranslationResult.Failure(error)
+            return TranslationResult.Failure(error)
+          case TranslationResult.Expression(rightExpression)
+            if rightExpression == null
+              return TranslationResult.Failure(QueryFailure.Provider("invalid grouped condition"))
+            end
+            return TranslationResult.Expression(new Expression(kind == 8 ? ExpressionKind.And() : ExpressionKind.Or(), left: leftExpression, right: rightExpression))
+        end
+    end
+  end
+  let metric = condition.metric
+
+  if metric == null
+    return TranslationResult.Failure(QueryFailure.Provider("invalid grouped condition"))
+  end
+  if kind == 1
+    let predicate = condition.source.predicate
+
+    if predicate == null
+      return TranslationResult.Failure(QueryFailure.Provider("invalid grouped condition"))
+    end
+    return translateScalarQuotation(predicate, metric.typeName, alias, metric.column.name())
+  end
+  let rightMetric = condition.rightMetric
+
+  if rightMetric == null
+    return TranslationResult.Failure(QueryFailure.Provider("invalid grouped metric comparison"))
+  end
+  let first = new MappingColumn("group.left", metric.typeName, metric.column.name())
+  let second = new MappingColumn("group.right", rightMetric.typeName, rightMetric.column.name())
+  let mapping = new EntityMapping("GroupedMetric", alias, [first, second])
+
+  if kind == 2 || kind == 3
+    let equal = translationColumnEqual(mapping, first, second)
+
+    return TranslationResult.Expression(kind == 2 ? equal : new Expression(ExpressionKind.Not(), left: equal))
+  end
+  let comparisonKind = kind == 4 ? ExpressionKind.Less() : kind == 5 ? ExpressionKind.LessOrEqual() : kind == 6 ? ExpressionKind.Greater() : ExpressionKind.GreaterOrEqual()
+
+  return TranslationResult.Expression(new Expression(comparisonKind, alias, first.column(), rightTable: alias, rightColumn: second.column()))
+end
+
+class GroupOrder<T>
+  internal metric: GroupMetricSpec<T>
+  internal descending: Bool
+
+  internal def init(metric: GroupMetricSpec<T>, descending: Bool): Void
+    this.metric = metric
+    this.descending = descending
+  end
+end
+
+## Kind: having, order aggregate, then aggregate, order key, then key, skip, take.
+class GroupStage<T>
+  internal kind: Int
+  internal prior: GroupStage<T>?
+  internal having: GroupHaving<T>?
+  internal order: GroupOrder<T>?
+  internal count: Int
+  internal descending: Bool
+
+  internal def init(kind: Int, prior: GroupStage<T>? = null, having: GroupHaving<T>? = null, order: GroupOrder<T>? = null, count: Int = 0, descending: Bool = false): Void
+    this.kind = kind
+    this.prior = prior
+    this.having = having
+    this.order = order
+    this.count = count
+    this.descending = descending
+  end
+end
+
+class GroupStageNode<T>
+  internal stage: GroupStage<T>
+  internal next: GroupStageNode<T>?
+  internal metric: GroupMetricPlan?
+  internal condition: GroupConditionNode<T>?
+
+  internal def init(stage: GroupStage<T>, next: GroupStageNode<T>?): Void
+    this.stage = stage
+    this.next = next
+  end
+end
+
+def groupOnlyTakes<T>(stage: GroupStage<T>?): Bool
+  var current = stage
+
+  while current != null
+    if current.kind != 7
+      return false
+    end
+    current = current.prior
+  end
+  return true
+end
+
+def groupStages<T>(last: GroupStage<T>?): GroupStageNode<T>?
+  var current = last
+  var head: GroupStageNode<T>? = null
+
+  while current != null
+    head = new GroupStageNode<T>(current, head)
+    current = current.prior
+  end
+  return head
+end
+
+def groupKeySort<K>(keys: ShapePlan<K>, descending: Bool, existing: OrderTerm? = null): OrderTerm?
+  var result = existing
+  var index = 0
+
+  while index < keys.count()
+    result = appendOrder(result, keys.columns().at(index).name(), descending)
+    index = index + 1
+  end
+  return result
+end
+
+def groupSortSql(order: OrderTerm?, source: String): String
+  var sql = ""
+  var current = order
+
+  while current != null
+    sql = sql + (sql == "" ? "" : ", ") + quoted(source, current.column) + (current.descending ? " DESC" : " ASC")
+    current = current.next
+  end
+  return sql
+end
+
+def groupVisibleColumns(columns: readonly ResultColumns, source: String): String
+  var sql = ""
+  var index = 0
+
+  while index < columns.count()
+    sql = sql + (index == 0 ? "" : ", ") + quoted(source, columns.at(index).name())
+    index = index + 1
+  end
+  return sql
+end
+
+def groupOrdinals(count: Int): String
+  var sql = ""
+  var index = 1
+
+  while index <= count
+    sql = sql + (index == 1 ? "" : ", ") + (index as String)
+    index = index + 1
+  end
+  return sql
+end
+
+def compileComposedGroups<T, K, A, R>(sourcePlan: RelationPlan<T>, keys: RowShape<T, K>, aggregates: AggregateShape<T, A>, combine: fn(ShapePlan<K>, ShapePlan<A>): ShapePlan<R>, stages: GroupStage<T>?, limit: Int, dialect: SqlDialect, preserveHidden: Bool = false, relationOutput: GroupRelationOutput? = null): CompileResult<R>
+  let mapping = sourcePlan.mapping
+  let state = new CompileState()
+
+  match keys.compile(mapping, 0, state, dialect)
+    case ShapeCompileResult.Failure(error)
+      return CompileResult<R>.Failure(error)
+    case ShapeCompileResult.Plan(keyPlan)
+      match aggregates.compile(mapping, keyPlan.count(), dialect, state)
+        case ShapeCompileResult.Failure(error)
+          return CompileResult<R>.Failure(error)
+        case ShapeCompileResult.Plan(aggregatePlan)
+          let combined = combine(keyPlan, aggregatePlan)
+
+          if preserveHidden && combined.layout() == null
+            return CompileResult<R>.Failure(QueryFailure.UnsupportedCapability("deferred grouping requires a certified structural pair"))
+          end
+          let operations = groupStages<T>(stages)
+          var current = operations
+          let selections = new GroupSelectionState(keyPlan.count() + aggregatePlan.count())
+
+          while current != null
+            let having = current.stage.having
+            let order = current.stage.order
+
+            if having != null
+              match compileGroupCondition<T>(having, mapping, dialect, state, selections)
+                case GroupConditionCompileResult.Failure(error)
+                  return CompileResult<R>.Failure(error)
+                case GroupConditionCompileResult.Plan(condition)
+                  current.condition = condition
+              end
+            else if order != null
+              match order.metric.compile(mapping, selections.offset, dialect, state)
+                case GroupMetricCompileResult.Failure(error)
+                  return CompileResult<R>.Failure(error)
+                case GroupMetricCompileResult.Plan(plan)
+                  current.metric = plan
+                  selections.append(plan)
+              end
+            end
+            current = current.next
+          end
+          let shifted = joinShiftSql(sourcePlan.sql, state.count, dialect)
+
+          if shifted == null
+            return CompileResult<R>.Failure(QueryFailure.Provider("aggregate source parameters cannot be rebased"))
+          end
+          joinParameterCopy(sourcePlan.parameters, state)
+          let alias = "__neri_group_stage"
+          let ordinals = groupOrdinals(keyPlan.count())
+          var sql = "SELECT " + combined.sql() + selections.hidden + " FROM (" + shifted + ") AS \"" + mapping.table() + "\" GROUP BY " + ordinals + " ORDER BY " + ordinals
+          var activeOrder = groupKeySort<K>(keyPlan, false)
+
+          current = operations
+          while current != null
+            let stage = current.stage
+            let metric = current.metric
+            var whereSql = ""
+
+            if stage.kind == 1
+              let condition = current.condition
+
+              if condition == null
+                return CompileResult<R>.Failure(QueryFailure.Provider("invalid grouped having stage"))
+              end
+              match groupConditionExpression<T>(condition, alias)
+                case TranslationResult.Failure(error)
+                  return CompileResult<R>.Failure(error)
+                case TranslationResult.Expression(expression)
+                  if expression == null
+                    return CompileResult<R>.Failure(QueryFailure.UnsupportedCapability("grouped having predicate is empty"))
+                  end
+                  match compileExpression(expression, state, alias, dialect)
+                    case ExpressionCompileResult.Failure(error)
+                      return CompileResult<R>.Failure(error)
+                    case ExpressionCompileResult.Sql(text)
+                      whereSql = " WHERE " + text
+                  end
+              end
+            end
+            if stage.kind == 2 || stage.kind == 3
+              let order = stage.order
+
+              if order == null || metric == null
+                return CompileResult<R>.Failure(QueryFailure.Provider("invalid grouped ordering stage"))
+              end
+              if stage.kind == 2
+                activeOrder = new OrderTerm(metric.column.name(), order.descending)
+              else
+                activeOrder = appendOrder(activeOrder, metric.column.name(), order.descending)
+              end
+            end
+            if stage.kind == 4
+              activeOrder = groupKeySort<K>(keyPlan, stage.descending)
+            end
+            if stage.kind == 5
+              activeOrder = groupKeySort<K>(keyPlan, stage.descending, activeOrder)
+            end
+            var stageSql = "SELECT * FROM (" + sql + ") AS \"" + alias + "\"" + whereSql + " ORDER BY " + groupSortSql(activeOrder, alias)
+
+            if stage.kind == 7
+              stageSql = stageSql + " LIMIT " + (stage.count as String)
+            end
+            if stage.kind == 6
+              match dialect
+                case SqlDialect.QuestionMark()
+                  stageSql = stageSql + " LIMIT -1"
+                case SqlDialect.PostgreSql()
+                  stageSql = stageSql
+              end
+              stageSql = stageSql + " OFFSET " + (stage.count as String)
+            end
+            sql = stageSql
+            current = current.next
+          end
+          let decoder = combined.decoder()
+          var columns: readonly ResultColumns = decoder.columns()
+
+          if preserveHidden
+            let values: ResultColumn[] = tasks::generate(selections.offset, 1) do |index|
+              if index < combined.count()
+                let column = combined.columns().at(index)
+
+                return new ResultColumn(column.name(), shapeKind(column.kind()), column.nullable())
+              end
+              let current = selections.columnAt(index - combined.count())
+
+              if current == null
+                return new ResultColumn("unused", ResultColumnKind.Int())
+              end
+              return new ResultColumn(current.name(), shapeKind(current.kind()), current.nullable())
+            end
+
+            columns = new ResultColumns(values)
+          end
+          let selection = preserveHidden ? "*" : groupVisibleColumns(decoder.columns(), alias)
+          let finalSql = "SELECT " + selection + " FROM (" + sql + ") AS \"" + alias + "\" ORDER BY " + groupSortSql(activeOrder, alias)
+
+          if relationOutput != null
+            relationOutput.order = activeOrder
+            relationOutput.layout = combined.layout()
+          end
+
+          return CompileResult<R>.Plan(new TypedPlan<R>(new SqlPlan(finalSql, new ParameterValues(state.head, state.count), limit, columns, sourcePlan.checkedScalars || combined.requiresCheckedScalars() || state.requiresCheckedScalars), decoder))
+      end
+  end
+end

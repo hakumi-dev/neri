@@ -1,0 +1,296 @@
+def referenceDeclarations(artifact: ReferenceArtifact, domains: IrDomainCatalog): IrModule
+  let module = new IrModule(artifact.moduleName, "", domains)
+  let runtimeFeatures = referenceRuntimeFeatures(artifact)
+  var entry = artifact.firstFunction
+
+  while entry != null
+    let callable = entry.callable
+    let function = new IrFunction(irSymbol(module.id, domains.symbolKind.getFunction(), callable.fullName), irType(callable.returnType), domains.functionKind.getFunction(), false, irNoLocation())
+
+    # Reference metadata does not promise effect summaries. Treat every call as
+    # potentially effectful and unsafe until the artifact carries that contract.
+    function.effects = irCAbiEffects()
+    function.localEffects = function.effects
+    function.parallelUnsafe = true
+    # Scalar references own closed implementation objects. Their artifact
+    # records runtime requirements, and no native-library imports are allowed.
+    function.linkReferences = new StringBuffer()
+    function.linkRuntimeFeatures = runtimeFeatures
+    var parameter = callable.firstParameter
+
+    while parameter != null
+      function.parameterTypes.add(irType(parameter.typeName))
+      parameter = parameter.nextParameter
+    end
+    module.addFunction(function)
+    entry = entry.next
+  end
+  return module
+end
+
+def referenceImplementationOwns(sourceId: String, ownedIds: StringBuffer): Bool
+  var index = 0
+
+  while index < ownedIds.size
+    if ownedIds.get(index) == sourceId
+      return true
+    end
+    index = index + 1
+  end
+  return false
+end
+
+def referenceImplementationFunctionOwned(function: IrFunction, semantic: SemanticModel, ownedIds: StringBuffer): Bool
+  if !function.kind.isFunction() || function.symbol.name == "main" || !referenceImplementationOwns(function.location.sourceId, ownedIds)
+    return false
+  end
+  let callable = semantic.findFunction(function.symbol.name)
+
+  return callable == null || callable.genericOrigin < 0
+end
+
+def referenceImplementationHasName(names: StringBuffer, name: String): Bool
+  var index = 0
+
+  while index < names.size
+    if names.get(index) == name
+      return true
+    end
+    index = index + 1
+  end
+  return false
+end
+
+def referenceImplementationDependencies(module: IrModule, semantic: SemanticModel, ownedIds: StringBuffer): StringBuffer
+  let names = new StringBuffer()
+  var function = module.firstFunction
+
+  while function != null
+    if referenceImplementationFunctionOwned(function, semantic, ownedIds)
+      var callee = 0
+
+      while callee < function.callees.size
+        let name = function.callees.get(callee)
+
+        names.add(name) if !referenceImplementationHasName(names, name)
+        callee = callee + 1
+      end
+      var block = function.firstBlock
+
+      while block != null
+        var instruction = block.firstInstruction
+
+        while instruction != null
+          let symbol = instruction.symbol
+
+          let constantKind = instruction.constantKind
+
+          if constantKind != null && constantKind.isStringGlobal() && !referenceImplementationHasName(names, instruction.constantValue)
+            names.add(instruction.constantValue)
+          end
+          if symbol != null && symbol.kind.isGlobal() && !referenceImplementationHasName(names, symbol.name)
+            names.add(symbol.name)
+          end
+          # Runtime and C ABI calls are represented by function-kind symbols,
+          # so dependency collection must inspect instruction symbols as well
+          # as the function's local call graph.
+          if symbol != null && !symbol.kind.isGlobal() && !referenceImplementationHasName(names, symbol.name)
+            names.add(symbol.name)
+          end
+          instruction = instruction.nextInstruction
+        end
+        block = block.nextBlock
+      end
+    end
+    function = function.nextFunction
+  end
+  return names
+end
+
+def referenceImplementationError(module: IrModule, semantic: SemanticModel, ownedIds: StringBuffer): String
+  var selected = false
+  var function = module.firstFunction
+
+  while function != null
+    if referenceImplementationFunctionOwned(function, semantic, ownedIds)
+      selected = true
+    end
+    function = function.nextFunction
+  end
+  if !selected
+    return "Reference v1 requires at least one owned module function."
+  end
+  let dependencies = referenceImplementationDependencies(module, semantic, ownedIds)
+  # Reference v1 transports declarations for scalar module functions only.
+  # Keep the provider object self-contained with respect to Neri-owned code;
+  # runtime imports are the only external calls currently represented here.
+  var importValue = module.firstImport
+
+  while importValue != null
+    if referenceImplementationHasName(dependencies, importValue.symbol.name) && !importValue.kind.isRuntime()
+      return "Reference v1 cannot preserve external ABI import '" + importValue.symbol.name + "'."
+    end
+    if referenceImplementationHasName(dependencies, importValue.symbol.name) && importValue.nativeLibrary != ""
+      return "Reference v1 cannot preserve native library import '" + importValue.symbol.name + "'."
+    end
+    importValue = importValue.nextImport
+  end
+  let result = new IrModule(module.id, "", module.domains)
+
+  result.clearSources()
+  let retainedLowerer = new IrLowerer(new SemanticModel(), new SyntaxArena(), "", module.id)
+
+  function = module.firstFunction
+  while function != null
+    if referenceImplementationFunctionOwned(function, semantic, ownedIds)
+      result.addFunction(irPartitionFunction(function))
+    end
+    function = function.nextFunction
+  end
+  # Keep location maps available for native debug locations and deterministic
+  # object emission. The implementation artifact itself only includes selected
+  # functions and the globals/imports they may use.
+  var source = module.firstSource
+
+  while source != null
+    result.addSource(new IrSource(source.id, source.text, source.globalStart, source.map))
+    source = source.nextSource
+  end
+  var global = module.firstGlobal
+
+  while global != null
+    if referenceImplementationHasName(dependencies, global.symbol.name)
+      result.addGlobal(new IrGlobal(irPartitionSymbol(global.symbol), global.value, irPartitionLocation(global.location)))
+    end
+    global = global.nextGlobal
+  end
+  importValue = module.firstImport
+  while importValue != null
+    if referenceImplementationHasName(dependencies, importValue.symbol.name)
+      result.addImport(irPartitionImport(importValue))
+    end
+    importValue = importValue.nextImport
+  end
+  result.requiredFeatures.merge(module.requiredFeatures)
+  result.requiredFeatures.requireRetainedModules()
+  retainedLowerer.retainDeclarations(result, module)
+
+  var retainedFunction = result.firstFunction
+
+  while retainedFunction != null
+    if retainedFunction.retained
+      return "Reference v1 function body depends on a function outside its owned source unit: '" + retainedFunction.symbol.name + "'."
+    end
+    retainedFunction = retainedFunction.nextFunction
+  end
+  var classValue = result.firstClass
+
+  while classValue != null
+    if classValue.retained
+      return "Reference v1 function body depends on unsupported type '" + classValue.symbol.name + "'."
+    end
+    classValue = classValue.nextClass
+  end
+  return ""
+end
+
+def referenceAddIrFeature(artifact: ReferenceArtifact, features: IrFeatureSet, name: String): Bool
+  if name == "c-interop-v1"
+    features.requireCInterop()
+  else if name == "debug-scopes-v1"
+    features.requireDebugScopes()
+  else if name == "extended-scalars-v1"
+    features.requireExtendedScalars()
+  else if name == "native-libraries-v1"
+    features.requireNativeLibraries()
+  else if name == "native-records-v1"
+    features.requireNativeRecords()
+  else if name == "native-strings-v1"
+    features.requireNativeStrings()
+  else if name == "retained-modules-v1"
+    features.requireRetainedModules()
+  else if name == "scoped-tasks-v1"
+    features.requireScopedTasks()
+  else if name == "sequential-arrays-v1"
+    features.requireSequentialArrays()
+  else if name == "session-module-v1"
+    features.requireSessionModule()
+  else if name == "string-data-v1"
+    features.requireStringData()
+  else
+    artifact.error = "Reference artifact has an unknown IR feature: " + name
+    return false
+  end
+  return true
+end
+
+def referenceIrFeatures(artifact: ReferenceArtifact): IrFeatureSet
+  let result = new IrFeatureSet()
+  var index = 0
+
+  while index < artifact.runtimeFeatureNames.size
+    if !referenceAddIrFeature(artifact, result, artifact.runtimeFeatureNames.get(index))
+      return result
+    end
+    index = index + 1
+  end
+  return result
+end
+
+def referenceRuntimeFeatures(artifact: ReferenceArtifact): RuntimeFeatures
+  var result = new RuntimeFeatures()
+  var index = 0
+
+  while index < artifact.runtimeSymbols.size
+    result = result.mergedWith(abiRuntimeSymbolFeatures(artifact.runtimeSymbols.get(index)))
+    index = index + 1
+  end
+  let required = referenceIrFeatures(artifact)
+
+  return result.mergedWith(required.runtimeFeatures())
+end
+
+def referenceImplementation(module: IrModule, semantic: SemanticModel, ownedIds: StringBuffer): IrModule?
+  if referenceImplementationError(module, semantic, ownedIds) != ""
+    return null
+  end
+  let result = new IrModule(module.id, "", module.domains)
+
+  result.clearSources()
+  let retainedLowerer = new IrLowerer(new SemanticModel(), new SyntaxArena(), "", module.id)
+  let dependencies = referenceImplementationDependencies(module, semantic, ownedIds)
+  var function = module.firstFunction
+
+  while function != null
+    if referenceImplementationFunctionOwned(function, semantic, ownedIds)
+      result.addFunction(irPartitionFunction(function))
+    end
+    function = function.nextFunction
+  end
+  var source = module.firstSource
+
+  while source != null
+    result.addSource(new IrSource(source.id, source.text, source.globalStart, source.map))
+    source = source.nextSource
+  end
+  var global = module.firstGlobal
+
+  while global != null
+    if referenceImplementationHasName(dependencies, global.symbol.name)
+      result.addGlobal(new IrGlobal(irPartitionSymbol(global.symbol), global.value, irPartitionLocation(global.location)))
+    end
+    global = global.nextGlobal
+  end
+  var importValue = module.firstImport
+
+  while importValue != null
+    if referenceImplementationHasName(dependencies, importValue.symbol.name)
+      result.addImport(irPartitionImport(importValue))
+    end
+    importValue = importValue.nextImport
+  end
+  result.requiredFeatures.merge(module.requiredFeatures)
+  result.requiredFeatures.requireRetainedModules()
+  retainedLowerer.retainDeclarations(result, module)
+  return result
+end

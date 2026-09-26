@@ -95,10 +95,48 @@ generation manifest contents, alongside ordinary source and project inputs.
 Editing a generated output in an open buffer also reports `NR_GENERATED` and
 suppresses consumer semantics until the buffer matches the published artifact.
 
-Generation manifests define preparation-time content checks. Their atomic
-publication selects a complete set of immutable output paths. A publisher may
-remove obsolete outputs after selecting a new manifest; readers holding the old
-manifest can then fail preparation and retry against the new generation.
+Generation manifests define preparation-time content checks. A publisher selects
+a complete generation by atomically switching a manifest over immutable paths,
+or by replacing the directory containing the manifest and all its outputs.
+Readers holding an older manifest can fail content validation during a switch
+and retry against the new generation. They do not accept a mixture of generations.
+
+## Neri Data publication
+
+Neri Data writes stable, readable paths such as `generated/Account.entity.hk`,
+alongside `context.hk`, `graph.hk`, `schema.hk` and `manifest.json`. Entity filenames
+derive from mapped type names and remain unchanged when mappings are reordered
+or other entities are added. Case-insensitive filename collisions are rejected.
+Content hashes belong to the manifest; public paths contain no revision hashes.
+
+The publisher prepares and verifies the complete generation in a private sibling
+directory, checks that its inputs are unchanged, and atomically exchanges it with
+the existing output directory. An absent destination uses a directory rename;
+an existing empty destination can receive its first generation through exchange.
+Only an empty or recognized, current-version generator-owned output tree may be
+replaced. Unowned entries cause rejection before publication. Obsolete
+revision-directory manifests are rejected without changing the existing tree;
+remove or back up that tree before generating a new version. Cleanup of the old
+current-version tree follows the successful switch and does not undo the new
+generation.
+
+A private sibling lock serializes publishers targeting the same output root.
+An existing lock causes rejection without changing the current generation.
+Normal completion releases the lock. If a process is interrupted, inspect its
+lock and staging directory before removing a stale lock and retrying; the
+publisher does not infer ownership from elapsed time or remove another writer's
+lock automatically.
+An error releasing the lock after a successful switch explicitly reports that
+the new generation was already published. It does not imply a rollback.
+
+Directory exchange uses `renamex_np` with `RENAME_SWAP` on macOS and `renameat2`
+with `RENAME_EXCHANGE` on Linux. The filesystem must support the operation;
+unsupported hosts or filesystems report failure while preserving the previous
+generation. There is no sequence of individual file replacements as a fallback.
+This is an atomic visibility contract, not a power-loss durability guarantee.
+See the [Linux rename contract](https://man7.org/linux/man-pages/man2/rename.2.html)
+and [Apple's swap-renaming capability](https://developer.apple.com/documentation/foundation/urlresourcekey/volumesupportsswaprenamingkey),
+checked on 2026-09-23.
 
 ## Basis and verification
 

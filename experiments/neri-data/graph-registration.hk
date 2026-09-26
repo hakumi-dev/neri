@@ -1,0 +1,351 @@
+use reference
+namespace neri_data
+
+## One reversible in-memory graph enrollment, separate from database transaction checkpoints.
+class GraphUndo
+  public undo: fn(): Void
+  public next: GraphUndo?
+
+  internal def init(undo: fn(): Void, next: GraphUndo?): Void
+    this.undo = undo
+    this.next = next
+  end
+end
+
+class GraphJournal
+  private first: GraphUndo?
+  private finalizers: GraphUndo?
+
+  internal def record(undo: fn(): Void): Void
+    this.first = new GraphUndo(undo, this.first)
+  end
+
+  internal def finallyDo(action: fn(): Void): Void
+    this.finalizers = new GraphUndo(action, this.finalizers)
+  end
+
+  private def finish(): Void
+    var current = this.finalizers
+
+    while current != null
+      current.undo()
+      current = current.next
+    end
+    this.finalizers = null
+  end
+
+  internal def rollback(): Void
+    var current = this.first
+
+    while current != null
+      current.undo()
+      current = current.next
+    end
+    this.first = null
+    this.finish()
+  end
+
+  internal def discard(): Void
+    this.first = null
+    this.finish()
+  end
+end
+
+class GraphSlot<T>
+  private graph: GraphRegistration
+  private value: T
+  private tracked: TrackedHandle<T>?
+  private staged: Bool = false
+
+  internal def init(graph: GraphRegistration, value: T): Void
+    this.graph = graph
+    this.value = value
+  end
+
+  public def entity(): T
+    return this.value
+  end
+
+  internal def setHandle(handle: TrackedHandle<T>): Void
+    this.tracked = handle
+  end
+
+  internal def handle(): TrackedHandle<T>?
+    return this.tracked
+  end
+
+  internal def belongsTo(graph: GraphRegistration): Bool
+    return reference::same(this.graph, graph)
+  end
+
+  internal def claim(): Bool
+    if this.staged
+      return false
+    end
+    this.staged = true
+    return true
+  end
+end
+
+enum GraphVisitResult<T>
+  case New(slot: GraphSlot<T>)
+  case Existing(slot: GraphSlot<T>)
+  case Failure(error: QueryFailure)
+end
+
+class GraphVisitNode<T>
+  public slot: GraphSlot<T>
+  public next: GraphVisitNode<T>?
+
+  internal def init(slot: GraphSlot<T>): Void
+    this.slot = slot
+  end
+end
+
+## A typed reference-identity set used by generated graph walkers.
+class GraphVisitList<T>
+  private graph: GraphRegistration
+  private first: GraphVisitNode<T>?
+
+  public def init(graph: GraphRegistration): Void
+    this.graph = graph
+  end
+
+  public def visit(entity: T): GraphVisitResult<T>
+    var current = this.first
+
+    while current != null
+      if reference::same(current.slot.entity(), entity)
+        return GraphVisitResult<T>.Existing(current.slot)
+      end
+      current = current.next
+    end
+    let failure = this.graph.reserveNode()
+
+    if failure != null
+      return GraphVisitResult<T>.Failure(failure)
+    end
+    let slot = new GraphSlot<T>(this.graph, entity)
+    let node = new GraphVisitNode<T>(slot)
+
+    node.next = this.first
+    this.first = node
+    return GraphVisitResult<T>.New(slot)
+  end
+end
+
+class GraphRegistrationAction
+  public run: fn(GraphJournal): QueryFailure?
+  public next: GraphRegistrationAction?
+
+  internal def init(run: fn(GraphJournal): QueryFailure?): Void
+    this.run = run
+  end
+end
+
+class GraphDiscoveryAction
+  public run: fn(): QueryFailure?
+  public next: GraphDiscoveryAction?
+
+  internal def init(run: fn(): QueryFailure?): Void
+    this.run = run
+  end
+end
+
+## Stages typed graph nodes and links, then enrolls them atomically in one context.
+class GraphRegistration
+  private context: ChangeContext
+  private maximum: Int
+  private nodes: Int = 0
+  private links: Int = 0
+  private scans: Int = 0
+  private firstNode: GraphRegistrationAction?
+  private lastNode: GraphRegistrationAction?
+  private firstLink: GraphRegistrationAction?
+  private lastLink: GraphRegistrationAction?
+  private firstDiscovery: GraphDiscoveryAction?
+  private lastDiscovery: GraphDiscoveryAction?
+  private used: Bool = false
+  private enrolling: Bool = false
+
+  public def init(context: ChangeContext, maximum: Int = 10000): Void
+    this.context = context
+    this.maximum = maximum
+  end
+
+  internal def reserveNode(): QueryFailure?
+    if this.used && !this.enrolling
+      return QueryFailure.Provider("graph registration was already consumed")
+    end
+    if this.maximum < 1 || this.maximum > 10000 || this.nodes >= this.maximum
+      return QueryFailure.Provider("graph enrollment node limit exceeded")
+    end
+    this.nodes = this.nodes + 1
+    return null
+  end
+
+  ## Queues one navigation scan. Enrollment drains scans iteratively before mutating trackers.
+  public def enqueue(task: fn(): QueryFailure?): QueryFailure?
+    if this.used && !this.enrolling
+      return QueryFailure.Provider("graph registration was already consumed")
+    end
+    if this.maximum < 1 || this.maximum > 10000
+      return QueryFailure.Provider("graph enrollment limit must be between 1 and 10000")
+    end
+    if this.scans >= this.maximum
+      return QueryFailure.Provider("graph enrollment navigation scan limit exceeded")
+    end
+    this.scans = this.scans + 1
+    let action = new GraphDiscoveryAction(task)
+    let tail = this.lastDiscovery
+
+    if tail == null
+      this.firstDiscovery = action
+    else
+      tail.next = action
+    end
+    this.lastDiscovery = action
+    return null
+  end
+
+  public def stageNode<T>(slot: GraphSlot<T>, tracker: EntityTracker<T>): QueryFailure?
+    if this.used && !this.enrolling
+      return QueryFailure.Provider("graph registration was already consumed")
+    end
+    if !slot.belongsTo(this)
+      return QueryFailure.Provider("graph node belongs to another registration")
+    end
+    if !this.context.ownsGraphSet(tracker.changeSet())
+      return QueryFailure.Provider("graph tracker belongs to another context")
+    end
+    if !slot.claim()
+      return QueryFailure.Provider("graph node is already staged")
+    end
+    let run: fn(GraphJournal): QueryFailure? = fn(journal: GraphJournal): QueryFailure?
+      match tracker.graphAddWithHandle(slot.entity(), journal)
+        case TrackHandleResult.Tracked(handle)
+          slot.setHandle(handle)
+          return null
+        case TrackHandleResult.Failure(error)
+          return error
+      end
+    end
+    let action = new GraphRegistrationAction(run)
+    let tail = this.lastNode
+
+    if tail == null
+      this.firstNode = action
+    else
+      tail.next = action
+    end
+    this.lastNode = action
+    return null
+  end
+
+  public def stageLink<P, D>(principal: GraphSlot<P>, dependent: GraphSlot<D>, makeEdge: fn(TrackedHandle<P>, TrackedHandle<D>): RelationshipEdge, restoreForeign: fn(): Void): QueryFailure?
+    if this.used && !this.enrolling
+      return QueryFailure.Provider("graph registration was already consumed")
+    end
+    if !principal.belongsTo(this) || !dependent.belongsTo(this)
+      return QueryFailure.Provider("graph relationship belongs to another registration")
+    end
+    if this.maximum < 1 || this.maximum > 10000 || this.links >= this.maximum
+      return QueryFailure.Provider("graph enrollment relationship limit exceeded")
+    end
+    this.links = this.links + 1
+    let context = this.context
+    let run: fn(GraphJournal): QueryFailure? = fn(journal: GraphJournal): QueryFailure?
+      let principalHandle = principal.handle()
+      let dependentHandle = dependent.handle()
+
+      if principalHandle == null || dependentHandle == null
+        return QueryFailure.Provider("graph relationship endpoint was not enrolled")
+      end
+      journal.record(restoreForeign)
+      return context.registerGraphRelation(makeEdge(principalHandle, dependentHandle))
+    end
+    let action = new GraphRegistrationAction(run)
+    let tail = this.lastLink
+
+    if tail == null
+      this.firstLink = action
+    else
+      tail.next = action
+    end
+    this.lastLink = action
+    return null
+  end
+
+  public def enroll<T>(root: GraphSlot<T>): TrackHandleResult<T>
+    if this.used
+      return TrackHandleResult<T>.Failure(QueryFailure.Provider("graph registration was already consumed"))
+    end
+    this.used = true
+    if !root.belongsTo(this)
+      return TrackHandleResult<T>.Failure(QueryFailure.Provider("graph root belongs to another registration"))
+    end
+    if this.maximum < 1 || this.maximum > 10000
+      return TrackHandleResult<T>.Failure(QueryFailure.Provider("graph enrollment limit must be between 1 and 10000"))
+    end
+    this.enrolling = true
+    var discovery = this.firstDiscovery
+
+    while discovery != null
+      let error = discovery.run()
+
+      if error != null
+        this.enrolling = false
+        return TrackHandleResult<T>.Failure(error)
+      end
+      discovery = discovery.next
+    end
+    this.enrolling = false
+    let journal = new GraphJournal()
+    let beginError = this.context.beginGraphRegistration(journal)
+
+    if beginError != null
+      return TrackHandleResult<T>.Failure(beginError)
+    end
+    var action = this.firstNode
+
+    while action != null
+      let error = action.run(journal)
+
+      if error != null
+        journal.rollback()
+        this.context.endGraphRegistration()
+        return TrackHandleResult<T>.Failure(error)
+      end
+      action = action.next
+    end
+    action = this.firstLink
+
+    while action != null
+      let error = action.run(journal)
+
+      if error != null
+        journal.rollback()
+        this.context.endGraphRegistration()
+        return TrackHandleResult<T>.Failure(error)
+      end
+      action = action.next
+    end
+    let error = this.context.graphPreflight()
+
+    if error != null
+      journal.rollback()
+      this.context.endGraphRegistration()
+      return TrackHandleResult<T>.Failure(error)
+    end
+    let handle = root.handle()
+
+    if handle == null
+      journal.rollback()
+      this.context.endGraphRegistration()
+      return TrackHandleResult<T>.Failure(QueryFailure.Provider("graph root was not enrolled"))
+    end
+    journal.discard()
+    this.context.endGraphRegistration()
+    return TrackHandleResult<T>.Tracked(handle)
+  end
+end

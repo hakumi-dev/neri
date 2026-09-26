@@ -1,0 +1,867 @@
+use test
+use reference
+use neri_data
+
+class PersistenceItem
+  public id: Int
+  public name: String
+
+  def init(id: Int, name: String): Void
+    this.id = id
+    this.name = name
+  end
+end
+
+class GraphItem
+  public id: Int
+  public parentId: Int
+
+  def init(id: Int, parentId: Int): Void
+    this.id = id
+    this.parentId = parentId
+  end
+end
+
+class PersistenceProvider: Provider
+  private lease: Int = 0
+  private state: TransactionState = TransactionState.RolledBack()
+  public autoRollbackNextBatch: Bool = false
+  public nextGeneratedKey: Int = 1
+  public omitGeneratedValue: Bool = false
+  public beginCount: Int = 0
+  public deleteCount: Int = 0
+  public firstDeletedId: Int = -1
+  public secondDeletedId: Int = -1
+
+  public override readonly def dialect(): SqlDialect
+    return SqlDialect.QuestionMark()
+  end
+
+  public override readonly def supports(capability: ProviderCapability): Bool
+    match capability
+      case ProviderCapability.WindowFunctions()
+        return false
+      case ProviderCapability.CheckedScalarExpressions()
+        return false
+      case ProviderCapability.Savepoints()
+        return false
+      case ProviderCapability.BoundedTypedReads()
+        return true
+      case ProviderCapability.StreamingReads()
+        return true
+      case ProviderCapability.SetWrites()
+        return true
+      case ProviderCapability.TrackedWrites()
+        return true
+      case ProviderCapability.ExplicitTransactions()
+        return true
+    end
+  end
+
+  public override def execute(plan: readonly SqlPlan): ProviderResult
+    return ProviderResult.Rows([])
+  end
+
+  public override def writeBatch(batch: readonly WriteBatch): WriteResult
+    match this.state
+      case TransactionState.Active()
+        return WriteResult.Failure(WriteFailure.Transaction("unleased write"))
+      case TransactionState.RolledBack()
+      case TransactionState.Committed()
+      case TransactionState.Invalid()
+      case TransactionState.Failed()
+    end
+    return WriteResult.Saved(batch.count())
+  end
+
+  public override def beginTransaction(): TransactionOpenResult
+    match this.state
+      case TransactionState.Active()
+        return TransactionOpenResult.Failure(WriteFailure.Validation("already active"))
+      case TransactionState.RolledBack()
+      case TransactionState.Committed()
+      case TransactionState.Invalid()
+      case TransactionState.Failed()
+    end
+    this.lease = this.lease + 1
+    this.beginCount = this.beginCount + 1
+    this.state = TransactionState.Active()
+    return TransactionOpenResult.Begun(this.lease)
+  end
+
+  public override def writeBatchInTransaction(batch: readonly WriteBatch, lease: Int): WriteResult
+    if lease != this.lease
+      return WriteResult.Failure(WriteFailure.Transaction("invalid lease"))
+    end
+    match this.state
+      case TransactionState.Active()
+        if this.autoRollbackNextBatch
+          this.autoRollbackNextBatch = false
+          this.state = TransactionState.RolledBack()
+          return WriteResult.Failure(WriteFailure.Transaction("automatic rollback"))
+        end
+        let outputs = new WriteReturnedRows()
+        var command = batch.first()
+        var generated = false
+
+        while command != null
+          if command.command().sql() == "DELETE FROM \"nodes\" WHERE \"id\" = ? AND \"parent_id\" = ?"
+            let first = command.command().parameters().first()
+
+            if first != null
+              match first.value()
+                case Cell.Int(value)
+                  if this.deleteCount == 0
+                    this.firstDeletedId = value
+                  else
+                    this.secondDeletedId = value
+                  end
+                  this.deleteCount = this.deleteCount + 1
+                case Cell.Null()
+                case Cell.Float(value)
+                case Cell.Bool(value)
+                case Cell.Text(value)
+              end
+            end
+          end
+          let columns = command.command().returningColumns()
+
+          if columns == null
+            outputs.add(null)
+          else
+            generated = true
+            if this.omitGeneratedValue
+              outputs.add(null)
+            else
+              outputs.add(new RawRow([new RawColumn(columns.at(0).name(), Cell.Int(this.nextGeneratedKey))]))
+              this.nextGeneratedKey = this.nextGeneratedKey + 1
+            end
+          end
+          command = command.next()
+        end
+        if generated
+          return WriteResult.SavedWithValues(batch.count(), outputs)
+        end
+        return WriteResult.Saved(batch.count())
+      case TransactionState.RolledBack()
+        return WriteResult.Failure(WriteFailure.Transaction("rolled back"))
+      case TransactionState.Committed()
+        return WriteResult.Failure(WriteFailure.Transaction("committed"))
+      case TransactionState.Invalid()
+        return WriteResult.Failure(WriteFailure.Transaction("invalid"))
+      case TransactionState.Failed()
+        return WriteResult.Failure(WriteFailure.Transaction("failed"))
+    end
+  end
+
+  public override def commitTransaction(lease: Int): WriteResult
+    if lease != this.lease
+      return WriteResult.Failure(WriteFailure.Transaction("invalid lease"))
+    end
+    this.state = TransactionState.Committed()
+    return WriteResult.Saved(0)
+  end
+
+  public override def rollbackTransaction(lease: Int): WriteResult
+    if lease != this.lease
+      return WriteResult.Failure(WriteFailure.Transaction("invalid lease"))
+    end
+    this.state = TransactionState.RolledBack()
+    return WriteResult.Saved(0)
+  end
+
+  public override def transactionState(lease: Int): TransactionState
+    if lease != this.lease
+      return TransactionState.Invalid()
+    end
+    return this.state
+  end
+end
+
+def capturePersistenceItem(item: PersistenceItem): RawRow
+  return new RawRow([new RawColumn("id", Cell.Int(item.id)), new RawColumn("name", Cell.Text(item.name))])
+end
+
+def applyPersistenceItem(target: PersistenceItem, source: PersistenceItem): Void
+  target.id = source.id
+  target.name = source.name
+end
+
+def setGeneratedPersistenceKey(target: PersistenceItem, value: Int): Void
+  target.id = value
+end
+
+def captureGraphItem(item: GraphItem): RawRow
+  return new RawRow([new RawColumn("id", Cell.Int(item.id)), new RawColumn("parent_id", Cell.Int(item.parentId))])
+end
+
+def applyGraphItem(target: GraphItem, source: GraphItem): Void
+  target.id = source.id
+  target.parentId = source.parentId
+end
+
+def setGraphKey(target: GraphItem, value: Int): Void
+  target.id = value
+end
+
+def readGraphKey(item: GraphItem): Int
+  return item.id
+end
+
+def readGraphParent(item: GraphItem): Int
+  return item.parentId
+end
+
+def setGraphParent(item: GraphItem, value: Int): Void
+  item.parentId = value
+end
+
+def expectedValidation(result: WriteResult): Void
+  match result
+    case WriteResult.Saved(count)
+      test::assertTrue(false)
+    case WriteResult.SavedWithValues(count, outputs)
+      test::assertTrue(false)
+    case WriteResult.Failure(error)
+      test::assertTrue(writeFailureMessage(error) != "")
+      match error
+        case WriteFailure.Validation(message)
+          test::assertTrue(true)
+        case WriteFailure.Concurrency(message)
+          test::assertTrue(false)
+        case WriteFailure.Constraint(message)
+          test::assertTrue(false)
+        case WriteFailure.Provider(message)
+          test::assertTrue(false)
+        case WriteFailure.Unsupported(message)
+          test::assertTrue(false)
+        case WriteFailure.Transaction(message)
+          test::assertTrue(false)
+      end
+  end
+end
+
+def expectedSaved(result: WriteResult, expected: Int): Void
+  match result
+    case WriteResult.Saved(count)
+      test::assertEqual(count, expected)
+    case WriteResult.SavedWithValues(count, outputs)
+      test::assertTrue(false)
+    case WriteResult.Failure(error)
+      test::assertTrue(false)
+  end
+end
+
+def expectedProviderFailure(result: WriteResult): Void
+  match result
+    case WriteResult.Saved(count)
+      test::assertTrue(false)
+    case WriteResult.SavedWithValues(count, outputs)
+      test::assertTrue(false)
+    case WriteResult.Failure(error)
+      match error
+        case WriteFailure.Provider(message)
+          test::assertTrue(message != "")
+        case WriteFailure.Validation(message)
+          test::assertTrue(false)
+        case WriteFailure.Concurrency(message)
+          test::assertTrue(false)
+        case WriteFailure.Constraint(message)
+          test::assertTrue(false)
+        case WriteFailure.Unsupported(message)
+          test::assertTrue(false)
+        case WriteFailure.Transaction(message)
+          test::assertTrue(false)
+      end
+  end
+end
+
+def expectName(row: RawRow?, name: String): Void
+  test::assertTrue(row != null)
+  if row == null
+    return
+  end
+  match row.value("name")
+    case CellLookup.Found(cell)
+      match cell
+        case Cell.Text(value)
+          test::assertEqual(value, name)
+        case Cell.Null()
+          test::assertTrue(false)
+        case Cell.Float(value)
+          test::assertTrue(false)
+        case Cell.Bool(value)
+          test::assertTrue(false)
+        case Cell.Int(value)
+          test::assertTrue(false)
+      end
+    case CellLookup.Missing()
+      test::assertTrue(false)
+  end
+end
+
+def main(): Void
+  let badColumns = new ResultColumns([new ResultColumn("id", ResultColumnKind.Int()), new ResultColumn("name\"; DELETE FROM items;--", ResultColumnKind.Text())])
+  let malformed = new EntityTracker<PersistenceItem>("items", "id", badColumns, capturePersistenceItem)
+  let malformedContext = new ChangeContext(new PersistenceProvider())
+
+  malformedContext.register(malformed.changeSet())
+
+  test::assertTrue(malformed.attach(new PersistenceItem(1, "kept")) == null)
+  expectedValidation(malformedContext.saveChanges())
+  let columns = new ResultColumns([new ResultColumn("id", ResultColumnKind.Int()), new ResultColumn("name", ResultColumnKind.Text())])
+  let tracker = new EntityTracker<PersistenceItem>("items", "id", columns, capturePersistenceItem)
+  let context = new ChangeContext(new PersistenceProvider())
+  let item = new PersistenceItem(2, "deleted")
+
+  context.register(tracker.changeSet())
+  context.register(tracker.changeSet())
+
+  test::assertTrue(tracker.attach(item) == null)
+  test::assertTrue(tracker.remove(item) == null)
+  item.id = 3
+  expectedValidation(context.saveChanges())
+  item.id = 2
+  match context.saveChanges()
+    case WriteResult.Saved(count)
+      test::assertEqual(count, 1)
+    case WriteResult.SavedWithValues(count, outputs)
+      test::assertTrue(false)
+    case WriteResult.Failure(error)
+      test::assertTrue(false)
+  end
+  let conflicted = new PersistenceItem(4, "baseline")
+  let recovery = new EntityTracker<PersistenceItem>("items", "id", columns, capturePersistenceItem, applyPersistenceItem)
+  let recoveryContext = new ChangeContext(new PersistenceProvider())
+
+  recoveryContext.register(recovery.changeSet())
+
+  test::assertTrue(recovery.attach(conflicted) == null)
+  let originalState = recovery.stateOf(conflicted)
+
+  test::assertTrue(originalState != null)
+  if originalState != null
+    match originalState
+      case TrackingState.Unchanged()
+        test::assertTrue(true)
+      case TrackingState.Added()
+        test::assertTrue(false)
+      case TrackingState.Modified()
+        test::assertTrue(false)
+      case TrackingState.Deleted()
+        test::assertTrue(false)
+      case TrackingState.Detached()
+        test::assertTrue(false)
+    end
+  end
+  conflicted.name = "local edit"
+
+  let modifiedState = recovery.stateOf(conflicted)
+
+  test::assertTrue(modifiedState != null)
+  if modifiedState != null
+    match modifiedState
+      case TrackingState.Modified()
+        test::assertTrue(true)
+      case TrackingState.Added()
+        test::assertTrue(false)
+      case TrackingState.Unchanged()
+        test::assertTrue(false)
+      case TrackingState.Deleted()
+        test::assertTrue(false)
+      case TrackingState.Detached()
+        test::assertTrue(false)
+    end
+  end
+
+  test::assertTrue(recovery.rebase(conflicted, new PersistenceItem(4, "remote edit")) == null)
+  let baseline = recovery.original(conflicted)
+  let current = recovery.current(conflicted)
+
+  test::assertTrue(baseline != null && current != null)
+  if baseline != null && current != null
+    match baseline.value("name")
+      case CellLookup.Found(cell)
+        match cell
+          case Cell.Text(value)
+            test::assertEqual(value, "remote edit")
+          case Cell.Null()
+            test::assertTrue(false)
+          case Cell.Float(value)
+            test::assertTrue(false)
+          case Cell.Bool(value)
+            test::assertTrue(false)
+          case Cell.Int(value)
+            test::assertTrue(false)
+        end
+      case CellLookup.Missing()
+        test::assertTrue(false)
+    end
+    match current.value("name")
+      case CellLookup.Found(cell)
+        match cell
+          case Cell.Text(value)
+            test::assertEqual(value, "local edit")
+          case Cell.Null()
+            test::assertTrue(false)
+          case Cell.Float(value)
+            test::assertTrue(false)
+          case Cell.Bool(value)
+            test::assertTrue(false)
+          case Cell.Int(value)
+            test::assertTrue(false)
+        end
+      case CellLookup.Missing()
+        test::assertTrue(false)
+    end
+  end
+  match recoveryContext.saveChanges()
+    case WriteResult.Saved(count)
+      test::assertEqual(count, 1)
+    case WriteResult.SavedWithValues(count, outputs)
+      test::assertTrue(false)
+    case WriteResult.Failure(error)
+      test::assertTrue(false)
+  end
+  conflicted.name = "unsaved local value"
+
+  test::assertTrue(recovery.remove(conflicted) == null)
+  test::assertTrue(recovery.refreshFrom(conflicted, new PersistenceItem(44, "wrong key")) != null)
+  test::assertEqual(conflicted.name, "unsaved local value")
+  let stillDeleted = recovery.stateOf(conflicted)
+
+  test::assertTrue(stillDeleted != null)
+  if stillDeleted != null
+    match stillDeleted
+      case TrackingState.Deleted()
+        test::assertTrue(true)
+      case TrackingState.Added()
+        test::assertTrue(false)
+      case TrackingState.Unchanged()
+        test::assertTrue(false)
+      case TrackingState.Modified()
+        test::assertTrue(false)
+      case TrackingState.Detached()
+        test::assertTrue(false)
+    end
+  end
+
+  test::assertTrue(recovery.refreshFrom(conflicted, new PersistenceItem(4, "store value")) == null)
+  test::assertEqual(conflicted.name, "store value")
+  expectName(recovery.original(conflicted), "store value")
+  expectedSaved(recoveryContext.saveChanges(), 0)
+
+  test::assertTrue(recovery.detach(conflicted) == null)
+  recoveryContext.clear()
+
+  test::assertTrue(recovery.stateOf(conflicted) == null)
+  let transactionProvider = new PersistenceProvider()
+  let transactionTracker = new EntityTracker<PersistenceItem>("items", "id", columns, capturePersistenceItem, applyPersistenceItem)
+  let transactionContext = new ChangeContext(transactionProvider)
+  let existing = new PersistenceItem(7, "before")
+
+  transactionContext.register(transactionTracker.changeSet())
+
+  test::assertTrue(transactionTracker.attach(existing) == null)
+  expectedSaved(transactionContext.beginTransaction(), 0)
+  expectedValidation(transactionContext.beginTransaction())
+  existing.name = "first"
+  expectedSaved(transactionContext.saveChanges(), 1)
+
+  test::assertTrue(transactionTracker.refreshFrom(existing, new PersistenceItem(7, "remote")) != null)
+  test::assertEqual(existing.name, "first")
+  existing.name = "second"
+  expectedSaved(transactionContext.saveChanges(), 1)
+  let inserted = new PersistenceItem(8, "inserted")
+
+  test::assertTrue(transactionTracker.add(inserted) == null)
+  expectedSaved(transactionContext.saveChanges(), 1)
+  expectedSaved(transactionContext.rollbackTransaction(), 0)
+  expectName(transactionTracker.original(existing), "before")
+  expectName(transactionTracker.current(existing), "second")
+  let addedState = transactionTracker.stateOf(inserted)
+
+  test::assertTrue(addedState != null)
+  if addedState != null
+    match addedState
+      case TrackingState.Added()
+        test::assertTrue(true)
+      case TrackingState.Unchanged()
+        test::assertTrue(false)
+      case TrackingState.Modified()
+        test::assertTrue(false)
+      case TrackingState.Deleted()
+        test::assertTrue(false)
+      case TrackingState.Detached()
+        test::assertTrue(false)
+    end
+  end
+  expectedSaved(transactionContext.saveChanges(), 2)
+  expectedSaved(transactionContext.beginTransaction(), 0)
+  existing.name = "committed"
+  expectedSaved(transactionContext.saveChanges(), 1)
+  expectedSaved(transactionContext.commitTransaction(), 0)
+  expectedSaved(transactionContext.saveChanges(), 0)
+  expectName(transactionTracker.original(existing), "committed")
+  expectedSaved(transactionContext.beginTransaction(), 0)
+  existing.name = "will auto rollback"
+  transactionProvider.autoRollbackNextBatch = true
+
+  match transactionContext.saveChanges()
+    case WriteResult.Saved(count)
+      test::assertTrue(false)
+    case WriteResult.SavedWithValues(count, outputs)
+      test::assertTrue(false)
+    case WriteResult.Failure(error)
+      test::assertTrue(writeFailureMessage(error) != "")
+  end
+  expectName(transactionTracker.original(existing), "committed")
+  expectedSaved(transactionContext.saveChanges(), 1)
+  let removed = new PersistenceItem(9, "to delete")
+
+  test::assertTrue(transactionTracker.attach(removed) == null)
+  expectedSaved(transactionContext.beginTransaction(), 0)
+
+  test::assertTrue(transactionTracker.remove(removed) == null)
+  expectedSaved(transactionContext.saveChanges(), 1)
+  expectedSaved(transactionContext.rollbackTransaction(), 0)
+  let deletedState = transactionTracker.stateOf(removed)
+
+  test::assertTrue(deletedState != null)
+  if deletedState != null
+    match deletedState
+      case TrackingState.Deleted()
+        test::assertTrue(true)
+      case TrackingState.Added()
+        test::assertTrue(false)
+      case TrackingState.Unchanged()
+        test::assertTrue(false)
+      case TrackingState.Modified()
+        test::assertTrue(false)
+      case TrackingState.Detached()
+        test::assertTrue(false)
+    end
+  end
+  expectedSaved(transactionContext.saveChanges(), 1)
+  let prior = new PersistenceItem(10, "old detached")
+  let replacement = new PersistenceItem(10, "new added")
+
+  test::assertTrue(transactionTracker.attach(prior) == null)
+  test::assertTrue(transactionTracker.detach(prior) == null)
+  expectedSaved(transactionContext.beginTransaction(), 0)
+
+  test::assertTrue(transactionTracker.add(replacement) == null)
+  expectedSaved(transactionContext.saveChanges(), 1)
+  expectedSaved(transactionContext.rollbackTransaction(), 0)
+  expectName(transactionTracker.current(replacement), "new added")
+  expectedSaved(transactionContext.saveChanges(), 1)
+  let preexistingAdded = new PersistenceItem(11, "pending before begin")
+
+  test::assertTrue(transactionTracker.add(preexistingAdded) == null)
+  expectedSaved(transactionContext.beginTransaction(), 0)
+  expectedSaved(transactionContext.saveChanges(), 1)
+
+  ## A local add-then-remove cancellation remains cancelled after outer rollback.
+  test::assertTrue(transactionTracker.remove(preexistingAdded) == null)
+  expectedSaved(transactionContext.saveChanges(), 1)
+  expectedSaved(transactionContext.rollbackTransaction(), 0)
+  let restoredAdd = transactionTracker.stateOf(preexistingAdded)
+
+  test::assertTrue(restoredAdd != null)
+  if restoredAdd != null
+    match restoredAdd
+      case TrackingState.Added()
+        test::assertTrue(false)
+      case TrackingState.Unchanged()
+        test::assertTrue(false)
+      case TrackingState.Modified()
+        test::assertTrue(false)
+      case TrackingState.Deleted()
+        test::assertTrue(false)
+      case TrackingState.Detached()
+        test::assertTrue(true)
+    end
+  end
+  expectedSaved(transactionContext.saveChanges(), 0)
+  let generatedProvider = new PersistenceProvider()
+  let generatedTracker = new EntityTracker<PersistenceItem>("items", "id", columns, capturePersistenceItem, applyPersistenceItem, true, setGeneratedPersistenceKey)
+  let generatedContext = new ChangeContext(generatedProvider)
+  let generatedFirst = new PersistenceItem(0, "first generated")
+  let generatedSecond = new PersistenceItem(0, "second generated")
+
+  generatedContext.register(generatedTracker.changeSet())
+
+  test::assertTrue(generatedTracker.add(new PersistenceItem(42, "explicit generated key")) != null)
+  test::assertTrue(generatedTracker.add(generatedFirst) == null)
+  test::assertTrue(generatedTracker.add(generatedSecond) == null)
+  test::assertTrue(generatedFirst.id < 0)
+  test::assertTrue(generatedSecond.id < 0)
+  test::assertTrue(generatedFirst.id != generatedSecond.id)
+  expectedSaved(generatedContext.saveChanges(), 2)
+
+  test::assertEqual(generatedFirst.id, 1)
+  test::assertEqual(generatedSecond.id, 2)
+  let generatedThird = new PersistenceItem(0, "rollback generated")
+
+  test::assertTrue(generatedTracker.add(generatedThird) == null)
+  let temporaryThird = generatedThird.id
+
+  expectedSaved(generatedContext.beginTransaction(), 0)
+  expectedSaved(generatedContext.saveChanges(), 1)
+
+  test::assertEqual(generatedThird.id, 3)
+  expectedSaved(generatedContext.rollbackTransaction(), 0)
+
+  test::assertEqual(generatedThird.id, temporaryThird)
+  expectedSaved(generatedContext.saveChanges(), 1)
+
+  test::assertEqual(generatedThird.id, 4)
+  let phantom = new PersistenceItem(10, "phantom")
+  let collision = new PersistenceItem(0, "collision")
+
+  test::assertTrue(generatedTracker.attach(phantom) == null)
+  test::assertTrue(generatedTracker.add(collision) == null)
+  let temporaryCollision = collision.id
+
+  generatedProvider.nextGeneratedKey = 10
+  expectedProviderFailure(generatedContext.saveChanges())
+
+  test::assertEqual(collision.id, temporaryCollision)
+  test::assertTrue(generatedTracker.detach(phantom) == null)
+  generatedProvider.nextGeneratedKey = 10
+  expectedSaved(generatedContext.saveChanges(), 1)
+
+  test::assertEqual(collision.id, 10)
+  let graphProvider = new PersistenceProvider()
+  let graphColumns = new ResultColumns([new ResultColumn("id", ResultColumnKind.Int()), new ResultColumn("parent_id", ResultColumnKind.Int())])
+  let graphTracker = new EntityTracker<GraphItem>("nodes", "id", graphColumns, captureGraphItem, applyGraphItem, true, setGraphKey)
+  let graphContext = new ChangeContext(graphProvider)
+  let graphA = new GraphItem(0, 0)
+  let graphB = new GraphItem(0, 0)
+  var handleA: TrackedHandle<GraphItem>? = null
+  var handleB: TrackedHandle<GraphItem>? = null
+
+  graphContext.register(graphTracker.changeSet())
+  match graphTracker.addWithHandle(graphA)
+    case TrackHandleResult.Tracked(handle)
+      handleA = handle
+    case TrackHandleResult.Failure(error)
+      test::assertTrue(false)
+  end
+  match graphTracker.addWithHandle(graphB)
+    case TrackHandleResult.Tracked(handle)
+      handleB = handle
+    case TrackHandleResult.Failure(error)
+      test::assertTrue(false)
+  end
+
+  test::assertTrue(handleA != null)
+  test::assertTrue(handleB != null)
+  if handleA != null && handleB != null
+    let aToB = new RelationshipLink<GraphItem, GraphItem>(handleA, handleB, readGraphKey, readGraphParent, setGraphParent)
+    let bToA = new RelationshipLink<GraphItem, GraphItem>(handleB, handleA, readGraphKey, readGraphParent, setGraphParent)
+
+    test::assertTrue(graphContext.registerRelation(aToB.edge()) == null)
+    test::assertTrue(graphContext.registerRelation(bToA.edge()) == null)
+    test::assertEqual(graphB.parentId, graphA.id)
+    test::assertEqual(graphA.parentId, graphB.id)
+    expectedValidation(graphContext.saveChanges())
+
+    test::assertEqual(graphProvider.beginCount, 0)
+  end
+  let localTracker = new EntityTracker<GraphItem>("nodes", "id", graphColumns, captureGraphItem, applyGraphItem, true, setGraphKey)
+  let foreignTracker = new EntityTracker<GraphItem>("nodes", "id", graphColumns, captureGraphItem, applyGraphItem, true, setGraphKey)
+  let localContext = new ChangeContext(new PersistenceProvider())
+  let foreignContext = new ChangeContext(new PersistenceProvider())
+  let localChild = new GraphItem(0, 0)
+  let foreignParent = new GraphItem(0, 0)
+  var childHandle: TrackedHandle<GraphItem>? = null
+  var foreignHandle: TrackedHandle<GraphItem>? = null
+
+  localContext.register(localTracker.changeSet())
+  foreignContext.register(foreignTracker.changeSet())
+  match localTracker.addWithHandle(localChild)
+    case TrackHandleResult.Tracked(handle)
+      childHandle = handle
+    case TrackHandleResult.Failure(error)
+      test::assertTrue(false)
+  end
+  match foreignTracker.addWithHandle(foreignParent)
+    case TrackHandleResult.Tracked(handle)
+      foreignHandle = handle
+    case TrackHandleResult.Failure(error)
+      test::assertTrue(false)
+  end
+
+  test::assertTrue(childHandle != null)
+  test::assertTrue(foreignHandle != null)
+  if childHandle != null && foreignHandle != null
+    let wrongContext = new RelationshipLink<GraphItem, GraphItem>(foreignHandle, childHandle, readGraphKey, readGraphParent, setGraphParent, "parent_id")
+
+    test::assertTrue(localContext.registerRelation(wrongContext.edge()) != null)
+    test::assertEqual(localChild.parentId, 0)
+  end
+  let assignedTracker = new EntityTracker<GraphItem>("nodes", "id", graphColumns, captureGraphItem, applyGraphItem)
+  let assignedContext = new ChangeContext(new PersistenceProvider())
+  let assignedParent = new GraphItem(1, 0)
+  let assignedChild = new GraphItem(2, 0)
+  let replacementChild = new GraphItem(2, 0)
+  let alternateParent = new GraphItem(3, 0)
+  var parentHandle: TrackedHandle<GraphItem>? = null
+  var oldChildHandle: TrackedHandle<GraphItem>? = null
+  var replacementHandle: TrackedHandle<GraphItem>? = null
+  var alternateHandle: TrackedHandle<GraphItem>? = null
+
+  assignedContext.register(assignedTracker.changeSet())
+  match assignedTracker.attachWithHandle(assignedParent)
+    case TrackHandleResult.Tracked(handle)
+      parentHandle = handle
+    case TrackHandleResult.Failure(error)
+      test::assertTrue(false)
+  end
+  match assignedTracker.attachWithHandle(assignedChild)
+    case TrackHandleResult.Tracked(handle)
+      oldChildHandle = handle
+    case TrackHandleResult.Failure(error)
+      test::assertTrue(false)
+  end
+
+  test::assertTrue(parentHandle != null)
+  test::assertTrue(oldChildHandle != null)
+  if parentHandle != null && oldChildHandle != null
+    let initialLink = new RelationshipLink<GraphItem, GraphItem>(parentHandle, oldChildHandle, readGraphKey, readGraphParent, setGraphParent, "parent_id")
+
+    test::assertTrue(assignedContext.registerRelation(initialLink.edge()) == null)
+    test::assertTrue(assignedTracker.detach(assignedChild) == null)
+    test::assertTrue(assignedContext.registerRelation(initialLink.edge()) != null)
+  end
+  match assignedTracker.attachWithHandle(replacementChild)
+    case TrackHandleResult.Tracked(handle)
+      replacementHandle = handle
+    case TrackHandleResult.Failure(error)
+      test::assertTrue(false)
+  end
+  match assignedTracker.attachWithHandle(alternateParent)
+    case TrackHandleResult.Tracked(handle)
+      alternateHandle = handle
+    case TrackHandleResult.Failure(error)
+      test::assertTrue(false)
+  end
+
+  test::assertTrue(replacementHandle != null)
+  test::assertTrue(alternateHandle != null)
+  if oldChildHandle != null
+    test::assertTrue(reference::same(oldChildHandle.entity(), assignedChild))
+    test::assertFalse(reference::same(oldChildHandle.entity(), replacementChild))
+  end
+  if parentHandle != null && replacementHandle != null && alternateHandle != null
+    let replacementLink = new RelationshipLink<GraphItem, GraphItem>(parentHandle, replacementHandle, readGraphKey, readGraphParent, setGraphParent, "parent_id")
+    let conflictingLink = new RelationshipLink<GraphItem, GraphItem>(alternateHandle, replacementHandle, readGraphKey, readGraphParent, setGraphParent, "parent_id")
+
+    test::assertTrue(assignedContext.registerRelation(replacementLink.edge()) == null)
+    test::assertEqual(replacementChild.parentId, 1)
+    test::assertTrue(assignedContext.registerRelation(conflictingLink.edge()) != null)
+    test::assertEqual(replacementChild.parentId, 1)
+  end
+  let deleteProvider = new PersistenceProvider()
+  let deleteTracker = new EntityTracker<GraphItem>("nodes", "id", graphColumns, captureGraphItem, applyGraphItem)
+  let deleteContext = new ChangeContext(deleteProvider)
+  let deleteParent = new GraphItem(21, 0)
+  let deleteChild = new GraphItem(22, 21)
+  var deleteParentHandle: TrackedHandle<GraphItem>? = null
+  var deleteChildHandle: TrackedHandle<GraphItem>? = null
+
+  deleteContext.register(deleteTracker.changeSet())
+  match deleteTracker.attachWithHandle(deleteParent)
+    case TrackHandleResult.Tracked(handle)
+      deleteParentHandle = handle
+    case TrackHandleResult.Failure(error)
+      test::assertTrue(false)
+  end
+  match deleteTracker.attachWithHandle(deleteChild)
+    case TrackHandleResult.Tracked(handle)
+      deleteChildHandle = handle
+    case TrackHandleResult.Failure(error)
+      test::assertTrue(false)
+  end
+
+  test::assertTrue(deleteParentHandle != null)
+  test::assertTrue(deleteChildHandle != null)
+  if deleteParentHandle != null && deleteChildHandle != null
+    let deleteLink = new RelationshipLink<GraphItem, GraphItem>(deleteParentHandle, deleteChildHandle, readGraphKey, readGraphParent, setGraphParent, "parent_id")
+
+    test::assertTrue(deleteContext.registerRelation(deleteLink.edge()) == null)
+    test::assertTrue(deleteTracker.remove(deleteParent) == null)
+    test::assertTrue(deleteTracker.remove(deleteChild) == null)
+    expectedSaved(deleteContext.saveChanges(), 2)
+
+    test::assertEqual(deleteProvider.firstDeletedId, 22)
+    test::assertEqual(deleteProvider.secondDeletedId, 21)
+  end
+  let journalTracker = new EntityTracker<GraphItem>("nodes", "id", graphColumns, captureGraphItem, applyGraphItem)
+  let journalContext = new ChangeContext(new PersistenceProvider())
+  let journalOriginal = new GraphItem(31, 0)
+  let journalReplacement = new GraphItem(31, 0)
+  let journalChild = new GraphItem(32, 777)
+  var originalHandle: TrackedHandle<GraphItem>? = null
+  var reusedHandle: TrackedHandle<GraphItem>? = null
+  var journalChildHandle: TrackedHandle<GraphItem>? = null
+
+  journalContext.register(journalTracker.changeSet())
+  match journalTracker.attachWithHandle(journalOriginal)
+    case TrackHandleResult.Tracked(handle)
+      originalHandle = handle
+    case TrackHandleResult.Failure(error)
+      test::assertTrue(false)
+  end
+  match journalTracker.attachWithHandle(journalChild)
+    case TrackHandleResult.Tracked(handle)
+      journalChildHandle = handle
+    case TrackHandleResult.Failure(error)
+      test::assertTrue(false)
+  end
+  expectedSaved(journalContext.beginTransaction(), 0)
+
+  test::assertTrue(journalTracker.detach(journalOriginal) == null)
+  match journalTracker.attachWithHandle(journalReplacement)
+    case TrackHandleResult.Tracked(handle)
+      reusedHandle = handle
+    case TrackHandleResult.Failure(error)
+      test::assertTrue(false)
+  end
+  expectedSaved(journalContext.rollbackTransaction(), 0)
+
+  test::assertTrue(originalHandle != null)
+  test::assertTrue(reusedHandle != null)
+  test::assertTrue(journalChildHandle != null)
+  if originalHandle != null && reusedHandle != null && journalChildHandle != null
+    let staleLink = new RelationshipLink<GraphItem, GraphItem>(reusedHandle, journalChildHandle, readGraphKey, readGraphParent, setGraphParent, "parent_id")
+
+    test::assertTrue(journalContext.registerRelation(staleLink.edge()) != null)
+    test::assertEqual(journalChild.parentId, 777)
+    test::assertTrue(reference::same(originalHandle.entity(), journalOriginal))
+    test::assertTrue(reference::same(reusedHandle.entity(), journalReplacement))
+    test::assertTrue(journalTracker.detach(journalOriginal) == null)
+    let journalThird = new GraphItem(31, 0)
+    var thirdHandle: TrackedHandle<GraphItem>? = null
+
+    match journalTracker.attachWithHandle(journalThird)
+      case TrackHandleResult.Tracked(handle)
+        thirdHandle = handle
+      case TrackHandleResult.Failure(error)
+        test::assertTrue(false)
+    end
+
+    test::assertTrue(thirdHandle != null)
+    let abaLink = new RelationshipLink<GraphItem, GraphItem>(reusedHandle, journalChildHandle, readGraphKey, readGraphParent, setGraphParent, "parent_id")
+
+    test::assertTrue(journalContext.registerRelation(abaLink.edge()) != null)
+    test::assertEqual(journalChild.parentId, 777)
+    if thirdHandle != null
+      let freshLink = new RelationshipLink<GraphItem, GraphItem>(thirdHandle, journalChildHandle, readGraphKey, readGraphParent, setGraphParent, "parent_id")
+
+      test::assertTrue(journalContext.registerRelation(freshLink.edge()) == null)
+      test::assertEqual(journalChild.parentId, 31)
+    end
+  end
+end

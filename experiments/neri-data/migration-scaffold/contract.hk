@@ -1,0 +1,134 @@
+use console
+use files
+use resources
+use result
+use test
+use neri_data
+use neri_data_sqlite
+use neri_data_sqlite_fixture
+use migration_scaffold_data::migrations
+use contract_namespace::migrations
+
+def expectApplied(result: MigrationResult, expected: Int): Void
+  match result
+    case MigrationResult.Applied(count)
+      test::assertEqual(count, expected)
+    case MigrationResult.Failure(error)
+      console::println("Expected migration to apply")
+
+      test::assertTrue(false)
+  end
+end
+
+def expectPlan(before: SchemaModel, after: SchemaModel, migration: Migration): Void
+  match diffSchema(migration.id(), before, after)
+    case SchemaDiffResult.Unchanged()
+      test::assertTrue(false)
+    case SchemaDiffResult.Failure(error)
+      console::println("Generated migration did not match schema snapshots")
+
+      test::assertTrue(false)
+    case SchemaDiffResult.Plan(plan)
+      test::assertEqual(plan.migration().signature(), migration.signature())
+  end
+end
+
+def assertSql(path: String, predicate: String): Void
+  let sql = "CREATE TABLE __migration_scaffold_assert(value INTEGER NOT NULL CHECK(value = 1)); INSERT INTO __migration_scaffold_assert VALUES(" + predicate + "); DROP TABLE __migration_scaffold_assert;"
+
+  test::assertTrue(createSQLiteFixture(path, sql))
+end
+
+def verifyAllOpsSource(): Void
+  test::assertEqual(snapshot_all_ops().signature(), expected_all_ops_model())
+  test::assertEqual(migration_all_ops().signature(), expected_all_ops_signature())
+end
+
+def verifyGeneratedMigrations(path: String): Void
+  console::println("migration scaffold: generated snapshot fidelity and native upgrade/downgrade")
+  verifyAllOpsSource()
+  let initial = migration_initial()
+  let evolved = migration_evolved()
+  let initialModel = snapshot_initial()
+  let evolvedModel = snapshot_evolved()
+
+  expectPlan(new SchemaModel([]), initialModel, initial)
+  expectPlan(initialModel, evolvedModel, evolved)
+
+  match SQLiteProvider.createWritable(path)
+    case SQLiteOpenResult.Failure(message)
+      console::println(message)
+
+      test::assertTrue(false)
+    case SQLiteOpenResult.Opened(provider)
+      expectApplied(provider.migrate(new MigrationSet([initial])), 1)
+
+      test::assertTrue(provider.close())
+  end
+
+  test::assertTrue(createSQLiteFixture(path, "INSERT INTO items(id,label) VALUES(1,'Mina'); INSERT INTO items(id,label,amount) VALUES(2,'Noor',8.5);"))
+
+  match SQLiteProvider.openWritable(path)
+    case SQLiteOpenResult.Failure(message)
+      console::println(message)
+
+      test::assertTrue(false)
+    case SQLiteOpenResult.Opened(provider)
+      expectApplied(provider.migrate(new MigrationSet([initial, evolved])), 1)
+
+      test::assertTrue(provider.close())
+  end
+
+  assertSql(path, "(SELECT COUNT(*) = 1 FROM pragma_index_list('items') WHERE name = 'items_amount_caption' AND \"unique\" = 1)")
+  assertSql(path, "(SELECT COUNT(*) = 2 AND SUM(seqno = 0 AND name = 'amount') = 1 AND SUM(seqno = 1 AND name = 'caption') = 1 FROM pragma_index_info('items_amount_caption'))")
+  assertSql(path, "(SELECT COUNT(*) = 2 AND SUM(caption IN ('Mina','Noor')) = 2 AND SUM(amount IN (1.25,8.5)) = 2 FROM items)")
+
+  test::assertTrue(createSQLiteFixture(path, "INSERT INTO items(id,caption) VALUES(3,'Paz');"))
+  assertSql(path, "(SELECT COUNT(*) = 1 AND amount = 2.5 FROM items WHERE id = 3)")
+
+  match SQLiteProvider.openWritable(path)
+    case SQLiteOpenResult.Failure(message)
+      console::println(message)
+
+      test::assertTrue(false)
+    case SQLiteOpenResult.Opened(provider)
+      expectApplied(provider.migrate(new MigrationSet([initial, evolved]), "initial"), 1)
+
+      test::assertTrue(provider.close())
+  end
+
+  assertSql(path, "(SELECT COUNT(*) = 2 AND SUM(seqno = 0 AND name = 'label') = 1 AND SUM(seqno = 1 AND name = 'amount') = 1 FROM pragma_index_info('items_label_amount'))")
+  assertSql(path, "(SELECT COUNT(*) = 3 AND SUM(label IN ('Mina','Noor','Paz')) = 3 AND SUM(amount IN (1.25,2.5,8.5)) = 3 FROM items)")
+
+  match SQLiteProvider.openWritable(path)
+    case SQLiteOpenResult.Failure(message)
+      console::println(message)
+
+      test::assertTrue(false)
+    case SQLiteOpenResult.Opened(provider)
+      expectApplied(provider.migrate(new MigrationSet([initial, evolved]), ""), 1)
+
+      test::assertTrue(provider.close())
+  end
+  assertSql(path, "(SELECT COUNT(*) = 0 FROM sqlite_schema WHERE type = 'table' AND name = 'items')")
+end
+
+def verifyMigrationScaffoldContract(): resources::Outcome<Int, result::Failure>
+  using temporary <- files::TemporaryDirectory.create("neri-migration-scaffold-")
+    verifyGeneratedMigrations(temporary.path() + "/items.sqlite")
+    return 0
+  end
+  return 1
+end
+
+def main(): Void
+  let outcome = verifyMigrationScaffoldContract()
+
+  test::assertEqual(outcome.closeFailures.count(), 0)
+  match outcome.completion
+    case resources::Completion.Value(value)
+      test::assertEqual(value, 0)
+    case resources::Completion.Failure(problem)
+      test::assertTrue(false)
+  end
+end

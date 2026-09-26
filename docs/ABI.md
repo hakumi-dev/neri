@@ -1,7 +1,7 @@
 # Runtime and IR boundary
 
 The canonical exported declarations and layouts are in
-[`runtime_abi.h`](../native/include/neri/runtime_abi.h). Runtime ABI 1.28 uses a
+[`runtime_abi.h`](../native/include/neri/runtime_abi.h). Runtime ABI 1.33 uses a
 C calling convention on macOS ARM64, Linux x86-64 and Windows x86-64. Generated programs negotiate
 major version, minimum minor version and required feature bits before execution.
 
@@ -113,7 +113,45 @@ artifact-specific exports, and validates the existing frame and layout contract
 before invocation. Each coordinator owns its linked generations and releases
 them after clearing its state root and collecting during reset.
 
+ABI 1.30 adds `neri_rt_v1_session_load_execute_object_libraries` with a fifth
+managed string containing newline-separated `@library` names. Before object
+materialization, the session linker loads each shared library and exposes its
+symbols to ORC. A missing or invalid library fails the submission before it
+executes, while earlier session generations remain available. The existing
+four-argument entry point remains supported. Session object linking requires
+dynamic libraries; static-only native archives are not supported. Loaded native
+libraries remain available for the host process lifetime; restart the host to
+replace a native dependency.
+
+`MULTIPLEXED_IO` (2147483648), introduced in ABI 1.33, adds
+`neri_rt_v1_net_poll_many(descriptors, interests, events, count, timeout_ms)` and
+`neri_rt_v1_worker_pool_readiness(pool, out_descriptor)`. Polling accepts 0–4096
+descriptors in one OS wait and a timeout of -1 or 0–60000 milliseconds. Interests
+use bits 1 for read and 2 for write; output bits are 1 read, 2 write, 4 error,
+8 hangup and 16 invalid. Zero interest observes exceptional conditions only.
+The return is a count of nonzero event slots, zero on timeout/interruption, or
+-1 on failure. Valid output spans are cleared before input validation; invalid
+counts provide no output guarantee. Output storage must not overlap inputs.
+Failures retain the OS error through cleanup; success and interruption preserve
+the caller's previous error value. POSIX accepts pipes and sockets. Windows uses
+`WSAPoll` and may fail if all sockets are invalid; an empty set is a timed wait.
+
+Worker readiness returns the existing worker status codes and a borrowed,
+poll-only descriptor. Readability indicates pending completions or a stopped
+pool with no outstanding jobs, but is advisory: callers must consult
+`worker_pool_poll` without blocking. The runtime
+maintains the signal as completions are consumed. Callers must never read, write
+or close the descriptor, and its lifetime ends when the owning pool closes.
+The Neri wrappers are [`http::PollSet`](HTTP.md#waiting-for-multiple-descriptors)
+and [`workers::Pool.readinessHandle`](WORKERS.md#admission-and-results).
+
 ## Representation
+
+`ISOLATED_WORKERS` (1073741824), introduced in ABI 1.32, provides persistent
+workers with independent heaps and bounded byte mailboxes. Pool handles remain
+in their creating thread and heap. [Isolated workers](WORKERS.md) specifies the
+native entry, admission, cancellation and cleanup contracts. This feature does
+not enable shared-heap `MULTIPLE_MUTATORS` or change joined task capture rules.
 
 The `EXTENDED_SCALARS` feature (512) defines `Int32`, `UInt32`, and `Float32`, which
 occupy four bytes with four-byte alignment; `UInt64` occupies eight bytes with
@@ -213,13 +251,21 @@ Runtime contract failures panic; no exception unwinds into Neri code.
 The compiler emits canonical Neri IR with transport 1.1, 1.2 for extended
 scalars or external library metadata, 1.3 for native records and fixed arrays,
 1.4 for `scoped-tasks-v1`, 1.5 for `session-module-v1`, 1.6 for
-`debug-scopes-v1`, 1.7 for `retained-modules-v1`, and 1.8 for `c-interop-v1`.
+`debug-scopes-v1`, 1.7 for `retained-modules-v1`, 1.8 for `c-interop-v1`,
+and 1.9 for `isolated-workers-v1`.
 The `native-libraries-v1` feature carries a library
 name after each import's source location; empty names retain platform-default
 symbol resolution. Only C ABI imports may declare a library. The transport header
 includes versions, flags, payload size and a SHA-256 digest. The native reader
 validates the envelope and the typed program before constructing LLVM objects.
 Malformed, unsupported and incompatible inputs produce stable NIR diagnostics.
+
+`call.virtual` (30) uses `[receiver, arguments...]` for a safe dispatch slot and
+`[unsafe capability, receiver, arguments...]` for an unsafe slot. Every
+implementation of a slot must agree on its unsafe contract. Unsafe calls require
+the `UNSAFE` effect. The capability is verifier metadata; LLVM dispatch tables
+and physical function signatures contain only the receiver and arguments.
+Default-argument adapters preserve this contract at both call boundaries.
 
 `c-interop-v1` carries each function's C export name after its retained flag
 when present and before its entry block. Type tag 22 carries a C function
@@ -229,6 +275,14 @@ C import or export; `call.cabi.indirect` (63) consumes an unsafe capability,
 a typed function pointer, and exactly matching arguments. C calls conservatively
 carry every may-effect, including collection and native allocation, and exclude
 the unconditional no-return effect. Exports use checked runtime entry wrappers.
+
+`isolated-workers-v1` adds `worker.entry` (65), with no operands and one direct
+function symbol. The target is a safe managed module function taking exactly
+`Byte[]` and returning `Void`. The result is a C function pointer taking
+`Byte*` and `UInt64` and returning `Void`. Its private adapter copies native
+configuration bytes into the current worker heap, roots that array for the
+entry invocation, and returns normally. Runtime worker initialization and
+shutdown surround the adapter call; no parent managed reference is captured.
 
 `retained-modules-v1` marks class shapes and function signatures whose storage
 and bodies are owned by an earlier immutable session module. Retained functions

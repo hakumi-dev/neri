@@ -4,7 +4,14 @@ Use the documentation bundled with an installed compiler for that compiler's
 syntax and APIs. This checkout documents its own source revision; a published
 archive can contain a different language surface.
 
-The package includes the public language, ABI, library and session references.
+Integrations can ask the selected launcher for `--print-runtime-manifest` to
+obtain its canonical `NERI_RUNTIME_MANIFEST` path without compiling or running
+application code. The command fails when the manifest is unavailable. A
+development compiler may use a runtime from a separate installed package;
+derive runtime paths from this response instead of the compiler's directory.
+Consumers still validate the package layout and ABI compatibility they require.
+
+The package includes the public language, ABI, library, Data and session references.
 The package driver owns that explicit document selection and verifies each
 selected source plus inline links to relative `.md` targets in that selection
 before it builds the archive.
@@ -38,6 +45,15 @@ source recursively under `stdlib/`, discovered in sorted order. Relative paths
 are preserved. The manifest declares module membership through library units;
 compilation, editor analysis, sessions and documentation share its resolution.
 
+Neri Data is distributed as source projects under `share/neri/data`, with its
+SQLite adapter in `share/neri/data/sqlite`. The native `neri-data-generate` and
+`neri-data-migration` commands use the matching installed standard library.
+`examples/data-consumer` provides a mapped SQLite application for the installed
+generator and migration commands. The package gate copies this example and the
+installed Data sources into a writable relocated directory, generates and compiles
+the consumer, and checks migration, persistence and filtered navigation behavior.
+See [Neri Data](DATA.md) for the supported API and bounds.
+
 The driver creates two separate trees, normalizes permissions and timestamps,
 writes sorted USTAR members with fixed owner/group metadata, and compresses with
 gzip's filename/timestamp metadata disabled. The archives must match byte for byte.
@@ -47,6 +63,8 @@ program from the extracted examples without an explicit subcommand or target.
 The installed launcher also builds its default executable and runs the documented
 arguments example. The archive is then renamed onto the same build filesystem
 under `build/packages/`, with its content SHA-256 in the filename.
+The installed `neri-session` launcher also evaluates a submitted expression and
+exits on EOF; this complements the compiled session-library consumer check.
 
 The launcher requires LLVM 22.1.8 and the platform SDK/linker environment. On macOS,
 it locates Homebrew LLVM and the active Xcode SDK; `LLVM_PREFIX` can select an
@@ -74,7 +92,7 @@ supports Apple silicon on macOS 15 or newer with LLVM 22.1.8.
 ### Standalone installer
 
 Install LLVM 22.1.8 and zstd, download an
-[installable release](https://github.com/hakumi-dev/neri/releases/tag/v0.2.0-dev),
+[installable release](https://github.com/hakumi-dev/neri/releases),
 and extract its archive. On macOS, the Xcode Command Line Tools provide the SDK.
 From the extracted directory:
 

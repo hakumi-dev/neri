@@ -1,0 +1,432 @@
+use fields
+use host
+use quotation
+namespace neri_data
+
+## SQL and bound values produced only by the typed bulk compiler.
+class SetWritePlan
+  private statement: String
+  private bound: WriteValues
+  private checkedScalars: Bool
+
+  internal def init(sql: String, parameters: WriteValues, requiresCheckedScalars: Bool = false): Void
+    this.statement = sql
+    this.bound = parameters
+    this.checkedScalars = requiresCheckedScalars
+  end
+
+  public readonly def sql(): String
+    return this.statement
+  end
+
+  public readonly def parameters(): readonly WriteValues
+    return this.bound
+  end
+
+  public readonly def requiresCheckedScalars(): Bool
+    return this.checkedScalars
+  end
+end
+
+class UpdateAssignment
+  private targetTree: readonly quotation::Tree
+  private valueTree: readonly quotation::Tree
+  private resultType: String
+  private previousEntry: readonly UpdateAssignment?
+
+  internal def init(target: readonly quotation::Tree, value: readonly quotation::Tree, typeName: String, previous: readonly UpdateAssignment?): Void
+    this.targetTree = target
+    this.valueTree = value
+    this.resultType = typeName
+    this.previousEntry = previous
+  end
+
+  internal readonly def target(): readonly quotation::Tree
+    return this.targetTree
+  end
+
+  internal readonly def value(): readonly quotation::Tree
+    return this.valueTree
+  end
+
+  internal readonly def typeName(): String
+    return this.resultType
+  end
+
+  internal readonly def previous(): readonly UpdateAssignment?
+    return this.previousEntry
+  end
+end
+
+## Persistent, typed assignments for one set-based update.
+class UpdateSet<T>
+  private latest: readonly UpdateAssignment?
+  private size: Int
+
+  internal def init(last: readonly UpdateAssignment? = null, count: Int = 0): Void
+    this.latest = last
+    this.size = count
+  end
+
+  public readonly def count(): Int
+    return this.size
+  end
+
+  internal readonly def entryAt(index: Int): readonly UpdateAssignment?
+    if index < 0 || index >= this.size
+      return null
+    end
+    var current = this.latest
+    var steps = this.size - index - 1
+
+    while steps > 0 && current != null
+      current = current.previous()
+      steps = steps - 1
+    end
+    return current
+  end
+
+  public readonly def set<V>(target: quote fn(T): V, value: quote fn(T): V): UpdateSet<T>
+    let entry = new UpdateAssignment(target.tree(), value.tree(), target.tree().resultType(), this.latest)
+
+    return new UpdateSet<T>(entry, this.size + 1)
+  end
+end
+
+def updateSet<T>(): UpdateSet<T>
+  return new UpdateSet<T>()
+end
+
+enum SetPlanResult
+  case Plan(value: SetWritePlan)
+  case Failure(error: WriteFailure)
+end
+
+def normalizeSetWrite(result: WriteResult): WriteResult
+  match result
+    case WriteResult.Saved(count)
+      if count < 0
+        return WriteResult.Failure(WriteFailure.Provider("set write returned a negative row count"))
+      end
+      return WriteResult.Saved(count)
+    case WriteResult.Failure(error)
+      return WriteResult.Failure(error)
+    case WriteResult.SavedWithValues(count, outputs)
+      return WriteResult.Failure(WriteFailure.Provider("set write returned row values"))
+  end
+end
+
+def bulkParameters(source: readonly ParameterValues, target: WriteValues): Void
+  var current = source.first()
+
+  while current != null
+    match current.value()
+      case Parameter.Bool(value)
+        target.add(Cell.Bool(value))
+      case Parameter.Int(value)
+        target.add(Cell.Int(value))
+      case Parameter.Float(value)
+        target.add(Cell.Float(value))
+      case Parameter.Text(value)
+        target.add(Cell.Text(value))
+    end
+    current = current.next()
+  end
+end
+
+def bulkKeySelection<T>(query: Query<T>, mapping: EntityMapping, key: String, dialect: SqlDialect): CompileResult<T>
+  match compilePipeline<T, T>(query, query.rowDecoder(), mappedSelection(mapping), query.rowLimit(), dialect, inner: true)
+    case CompileResult.Failure(error)
+      return CompileResult<T>.Failure(error)
+    case CompileResult.Plan(full)
+      let source = query.sourceName()
+      let sql = "SELECT " + quoted(source, key) + " FROM (" + full.sql().sql() + ") AS \"" + source + "\""
+      let plan = new SqlPlan(sql, full.parameterValues(), full.sql().limit(), full.sql().columns(), full.sql().requiresCheckedScalars())
+
+      return CompileResult<T>.Plan(new TypedPlan<T>(plan, query.rowDecoder()))
+  end
+end
+
+def bulkTargetAlias(table: String): String
+  let first = "__neri_target_keys"
+
+  if host::stringByteLength(table) != host::stringByteLength(first)
+    return first
+  end
+  var same = true
+  var index = 0
+
+  while index < host::stringByteLength(first)
+    var byte = host::stringByteAt(table, index) as Int
+
+    if byte >= 65 && byte <= 90
+      byte = byte + 32
+    end
+    if byte != host::stringByteAt(first, index) as Int
+      same = false
+    end
+    index = index + 1
+  end
+  return same ? "__neri_target_keys_alt" : first
+end
+
+def compileSetDelete<T>(query: Query<T>, dialect: SqlDialect): SetPlanResult
+  let mapping = query.entityMapping()
+
+  if mapping == null
+    return SetPlanResult.Failure(WriteFailure.Validation("bulk delete requires entity mapping"))
+  end
+  let key = mapping.keyColumn()
+
+  if key == null
+    return SetPlanResult.Failure(WriteFailure.Validation("bulk delete requires mapped primary key"))
+  end
+  let invalid = mapping.failure()
+
+  if invalid != null
+    return SetPlanResult.Failure(WriteFailure.Validation("invalid bulk entity mapping"))
+  end
+  match bulkKeySelection<T>(query, mapping, key, dialect)
+    case CompileResult.Failure(error)
+      return SetPlanResult.Failure(WriteFailure.Validation("invalid bulk query"))
+    case CompileResult.Plan(selection)
+      let parameters = new WriteValues()
+
+      bulkParameters(selection.sql().parameters(), parameters)
+      let alias = bulkTargetAlias(mapping.table())
+      let sql = "WITH \"" + alias + "\" AS MATERIALIZED (" + selection.sql().sql() + ") DELETE FROM \"" + mapping.table() + "\" WHERE \"" + key + "\" IN (SELECT \"" + key + "\" FROM \"" + alias + "\")"
+
+      return SetPlanResult.Plan(new SetWritePlan(sql, parameters, selection.sql().requiresCheckedScalars()))
+  end
+end
+
+def compileSetUpdate<T>(query: Query<T>, changes: readonly fields::Pack, dialect: SqlDialect): SetPlanResult
+  let mapping = query.entityMapping()
+
+  if mapping == null
+    return SetPlanResult.Failure(WriteFailure.Validation("bulk update requires entity mapping"))
+  end
+  let key = mapping.keyColumn()
+
+  if key == null
+    return SetPlanResult.Failure(WriteFailure.Validation("bulk update requires mapped primary key"))
+  end
+  let invalid = mapping.failure()
+
+  if invalid != null
+    return SetPlanResult.Failure(WriteFailure.Validation("invalid bulk entity mapping"))
+  end
+  if changes.entityType() != mapping.entityType() || changes.count() == 0
+    return SetPlanResult.Failure(WriteFailure.Validation("bulk update requires mapped fields"))
+  end
+  match bulkKeySelection<T>(query, mapping, key, dialect)
+    case CompileResult.Failure(error)
+      return SetPlanResult.Failure(WriteFailure.Validation("invalid bulk query"))
+    case CompileResult.Plan(selection)
+      let values = new WriteValues()
+
+      bulkParameters(selection.sql().parameters(), values)
+      var assignments = ""
+      var index = 0
+
+      while index < changes.count()
+        let entry = changes.entryAt(index)
+
+        if entry == null
+          return SetPlanResult.Failure(WriteFailure.Validation("bulk update contains a missing field"))
+        end
+        let column = mapping.find(entry.identity())
+
+        if column == null || column.typeName() != entry.typeName()
+          return SetPlanResult.Failure(WriteFailure.Validation("bulk update field does not match mapping"))
+        end
+        if column.column() == key
+          return SetPlanResult.Failure(WriteFailure.Validation("bulk update cannot change the primary key"))
+        end
+        var prior = 0
+
+        while prior < index
+          let earlier = changes.entryAt(prior)
+
+          if earlier != null && earlier.identity() == entry.identity()
+            return SetPlanResult.Failure(WriteFailure.Validation("bulk update field is repeated"))
+          end
+          prior = prior + 1
+        end
+        let value = entry.value()
+        let actual = translationValueType(value)
+
+        if actual == "Null"
+          if !translationOptional(column.typeName())
+            return SetPlanResult.Failure(WriteFailure.Validation("bulk null requires an optional field"))
+          end
+          values.add(Cell.Null())
+        else
+          if actual != semanticTranslationInner(column.typeName())
+            return SetPlanResult.Failure(WriteFailure.Validation("bulk value type does not match mapping"))
+          end
+          match value
+            case quotation::CaptureValue.Bool(item)
+              values.add(Cell.Bool(item))
+            case quotation::CaptureValue.Int(item)
+              values.add(Cell.Int(item))
+            case quotation::CaptureValue.Float(item)
+              if !dataFloatFinite(item)
+                return SetPlanResult.Failure(WriteFailure.Validation("bulk Float value must be finite"))
+              end
+              values.add(Cell.Float(item))
+            case quotation::CaptureValue.Text(item)
+              values.add(Cell.Text(item))
+            case quotation::CaptureValue.Null()
+              return SetPlanResult.Failure(WriteFailure.Validation("bulk value is not representable"))
+          end
+        end
+        assignments = assignments + (index == 0 ? "" : ", ") + "\"" + column.column() + "\" = " + dialectPlaceholder(dialect, values.count())
+        index = index + 1
+      end
+      let alias = bulkTargetAlias(mapping.table())
+      let sql = "WITH \"" + alias + "\" AS MATERIALIZED (" + selection.sql().sql() + ") UPDATE \"" + mapping.table() + "\" SET " + assignments + " WHERE \"" + key + "\" IN (SELECT \"" + key + "\" FROM \"" + alias + "\")"
+
+      return SetPlanResult.Plan(new SetWritePlan(sql, values, selection.sql().requiresCheckedScalars()))
+  end
+end
+
+def bulkScalarFailure(error: QueryFailure): WriteFailure
+  match error
+    case QueryFailure.UnsupportedCapability(message)
+      return WriteFailure.Validation(message)
+    case QueryFailure.InvalidIdentifier(name)
+      return WriteFailure.Validation("computed bulk update has an invalid identifier")
+    case QueryFailure.InvalidLimit(value, maximum)
+      return WriteFailure.Validation("computed bulk update has an invalid limit")
+    case QueryFailure.MissingLimit(maximum)
+      return WriteFailure.Validation("computed bulk update requires a query limit")
+    case QueryFailure.SourceMismatch(expected, actual)
+      return WriteFailure.Validation("computed bulk update source does not match mapping")
+    case QueryFailure.Provider(message)
+      return WriteFailure.Validation(message)
+    case QueryFailure.MissingColumn(name)
+      return WriteFailure.Validation("computed bulk update has an unmapped column")
+    case QueryFailure.TypeMismatch(column, expected, actual)
+      return WriteFailure.Validation("computed bulk update type does not match mapping")
+    case QueryFailure.Cardinality(expected, actual)
+      return WriteFailure.Validation("computed bulk update has invalid cardinality")
+  end
+end
+
+def bulkResultValidator(typeName: String): String
+  let base = semanticTranslationInner(typeName)
+
+  if base == "Int"
+    return "__neri_value_int"
+  end
+  if base == "Float"
+    return "__neri_value_float"
+  end
+  if base == "Bool"
+    return "__neri_value_bool"
+  end
+  return "__neri_value_text"
+end
+
+def compileSetUpdateExpressions<T>(query: Query<T>, setters: readonly UpdateSet<T>, dialect: SqlDialect): SetPlanResult
+  let mapping = query.entityMapping()
+
+  if mapping == null
+    return SetPlanResult.Failure(WriteFailure.Validation("computed bulk update requires entity mapping"))
+  end
+  let key = mapping.keyColumn()
+
+  if key == null
+    return SetPlanResult.Failure(WriteFailure.Validation("computed bulk update requires mapped primary key"))
+  end
+  if mapping.failure() != null
+    return SetPlanResult.Failure(WriteFailure.Validation("invalid bulk entity mapping"))
+  end
+  if setters.count() == 0 || setters.count() > mapping.count()
+    return SetPlanResult.Failure(WriteFailure.Validation("computed bulk update requires distinct mapped fields"))
+  end
+  match dialect
+    case SqlDialect.PostgreSql()
+      return SetPlanResult.Failure(WriteFailure.Unsupported("checked scalar updates are unavailable for PostgreSQL"))
+    case SqlDialect.QuestionMark()
+  end
+  match bulkKeySelection<T>(query, mapping, key, dialect)
+    case CompileResult.Failure(error)
+      return SetPlanResult.Failure(WriteFailure.Validation("invalid bulk query"))
+    case CompileResult.Plan(selection)
+      let prefix = selection.sql().parameters()
+      let state = new CompileState()
+
+      state.count = prefix.count()
+      var assignments = ""
+      var index = 0
+
+      while index < setters.count()
+        let entry = setters.entryAt(index)
+
+        if entry == null
+          return SetPlanResult.Failure(WriteFailure.Validation("computed bulk update contains a missing assignment"))
+        end
+        let targetTree = entry.target()
+        let targetRoot = targetTree.nodeAt(targetTree.root())
+
+        if targetRoot == null || translationNodeCode(targetRoot.kind()) != 2
+          return SetPlanResult.Failure(WriteFailure.Validation("computed bulk update target must be a direct mapped member"))
+        end
+        let receiver = targetTree.nodeAt(targetRoot.first())
+
+        if receiver == null || translationNodeCode(receiver.kind()) != 0
+          return SetPlanResult.Failure(WriteFailure.Validation("computed bulk update target must be a direct mapped member"))
+        end
+
+        match translateSelection(mapping, targetTree)
+          case SelectionResult.Failure(error)
+            return SetPlanResult.Failure(WriteFailure.Validation("computed bulk update target must be a mapped scalar member"))
+          case SelectionResult.Column(column)
+            if column.typeName() != entry.typeName() || entry.value().resultType() != entry.typeName()
+              return SetPlanResult.Failure(WriteFailure.Validation("computed bulk update target and value types must match mapping"))
+            end
+            if column.column() == key
+              return SetPlanResult.Failure(WriteFailure.Validation("computed bulk update cannot change the primary key"))
+            end
+            var prior = 0
+
+            while prior < index
+              let previous = setters.entryAt(prior)
+
+              if previous == null
+                return SetPlanResult.Failure(WriteFailure.Validation("computed bulk update contains a missing assignment"))
+              end
+              match translateSelection(mapping, previous.target())
+                case SelectionResult.Failure(error)
+                  return SetPlanResult.Failure(WriteFailure.Validation("computed bulk update target must be a mapped scalar member"))
+                case SelectionResult.Column(earlier)
+                  if earlier.column() == column.column()
+                    return SetPlanResult.Failure(WriteFailure.Validation("computed bulk update field is repeated"))
+                  end
+              end
+              prior = prior + 1
+            end
+            match compileScalarQuotation(mapping, entry.value(), column.typeName(), state, dialect)
+              case ScalarSqlResult.Failure(error)
+                return SetPlanResult.Failure(bulkScalarFailure(error))
+              case ScalarSqlResult.Value(value)
+                let allowNull = translationOptional(column.typeName()) ? "1" : "0"
+                let guarded = bulkResultValidator(column.typeName()) + "(" + value.sql + ", " + allowNull + ")"
+
+                assignments = assignments + (index == 0 ? "" : ", ") + "\"" + column.column() + "\" = " + guarded
+            end
+        end
+        index = index + 1
+      end
+      let values = new WriteValues()
+
+      bulkParameters(prefix, values)
+      bulkParameters(new ParameterValues(state.head, state.count - prefix.count()), values)
+      let alias = bulkTargetAlias(mapping.table())
+      let sql = "WITH \"" + alias + "\" AS MATERIALIZED (" + selection.sql().sql() + ") UPDATE \"" + mapping.table() + "\" SET " + assignments + " WHERE \"" + key + "\" IN (SELECT \"" + key + "\" FROM \"" + alias + "\")"
+
+      return SetPlanResult.Plan(new SetWritePlan(sql, values, true))
+  end
+end

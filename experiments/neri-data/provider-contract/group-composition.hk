@@ -1,0 +1,251 @@
+use files
+use resources
+use result
+use test
+use neri_data
+use neri_data_sqlite
+use neri_data_sqlite_fixture
+
+class GroupRecord
+  public id: Int = 0
+  public category: String? = null
+  public amount: Int? = null
+end
+
+class GroupResult
+  public category: String?
+  public count: Int
+
+  def init(category: String?, count: Int): Void
+    this.category = category
+    this.count = count
+  end
+end
+
+class CompositeGroupKey
+  public category: String?
+  public amount: Int?
+
+  def init(category: String?, amount: Int?): Void
+    this.category = category
+    this.amount = amount
+  end
+end
+
+def rejectGroupRecord(row: RawRow): DecodeResult<GroupRecord>
+  return DecodeResult<GroupRecord>.Failure(QueryFailure.Provider("group composition must not decode entities"))
+end
+
+def records(provider: SQLiteProvider): Query<GroupRecord>
+  let mapping = new EntityMapping("GroupRecord", "group_records", [
+      new MappingColumn("GroupRecord.id", "Int", "id"),
+      new MappingColumn("GroupRecord.category", "String?", "category"),
+      new MappingColumn("GroupRecord.amount", "Int?", "amount")
+    ], "id")
+  let decoder = new Decoder<GroupRecord>(rejectGroupRecord, new ResultColumns([new ResultColumn("id", ResultColumnKind.Int())]))
+
+  return new Query<GroupRecord>("group_records", decoder, mapping: mapping, provider: provider)
+end
+
+def categoryField(): quote fn(GroupRecord): String?
+  return quote do |row: GroupRecord|: String?
+    return row.category
+  end
+end
+
+def amountField(): quote fn(GroupRecord): Int?
+  return quote do |row: GroupRecord|: Int?
+    return row.amount
+  end
+end
+
+def idField(): quote fn(GroupRecord): Int
+  return quote do |row: GroupRecord|: Int
+    return row.id
+  end
+end
+
+def groups(source: Query<GroupRecord>): GroupedAggregate<GroupRecord, String?, Int, GroupResult>
+  return groupsWithCount(source, countRows<GroupRecord>())
+end
+
+def groupsWithCount(source: Query<GroupRecord>, count: AggregateShape<GroupRecord, Int>): GroupedAggregate<GroupRecord, String?, Int, GroupResult>
+  return selectGroups(groupBy(source, fieldShape(optionalTextScalar(), categoryField())), count) do |category: String?, count: Int|: GroupResult
+    return new GroupResult(category, count)
+  end
+end
+
+def checkGroups(query: GroupedAggregate<GroupRecord, String?, Int, GroupResult>, expected: String): Void
+  checkGroupRows(query.all(), expected)
+end
+
+def checkGroupRows(result: QueryResult<GroupResult>, expected: String): Void
+  match result
+    case QueryResult.Failure(error)
+      test::assertTrue(false)
+    case QueryResult.Rows(rows)
+      var current = rows.first()
+      var actual = ""
+
+      while current != null
+        let key = current.value.category
+        var label = "NULL"
+
+        if key != null
+          label = key
+        end
+        actual = actual + label + ":" + (current.value.count as String) + ","
+        current = current.next
+      end
+
+      test::assertEqual(actual, expected)
+  end
+end
+
+def verifyGroups(provider: SQLiteProvider): Void
+  let grouped = groups(records(provider))
+  let counts = groupMetric(countRows<GroupRecord>())
+  let sums = groupMetric(sumInt(optionalIntScalar(), amountField()))
+  let totals = groupMetric(sumIntOrZero(optionalIntScalar(), amountField()))
+  let moreThanOne = quote do |count: Int|: Bool
+    return count > 1
+  end
+  let twoRows = quote do |count: Int|: Bool
+    return count == 2
+  end
+  let overTwentyFive = quote do |total: Int|: Bool
+    return total > 25
+  end
+  let missing = quote do |total: Int?|: Bool
+    return total == null
+  end
+  let present = quote do |total: Int?|: Bool
+    return !(total == null)
+  end
+
+  checkGroups(grouped.take(20), "NULL:2,A:3,B:2,C:1,D:2,E:1,")
+  checkGroups(grouped.having(counts.where(moreThanOne)).take(20), "NULL:2,A:3,B:2,D:2,")
+  checkGroups(grouped.having(counts.where(moreThanOne)).having(totals.where(overTwentyFive)).take(20), "A:3,B:2,")
+  checkGroups(grouped.having(sums.where(missing)).take(20), "C:1,")
+  checkGroups(grouped.having(sums.where(present)).take(20), "NULL:2,A:3,B:2,D:2,E:1,")
+  checkGroups(grouped.orderByAggregate(counts.descending()).thenByKey().take(20), "A:3,NULL:2,B:2,D:2,C:1,E:1,")
+  checkGroups(grouped.orderByAggregate(counts.ascending()).thenByKey(true).take(20), "E:1,C:1,D:2,B:2,NULL:2,A:3,")
+  checkGroups(grouped.orderByKey(true).take(20), "E:1,D:2,C:1,B:2,A:3,NULL:2,")
+  checkGroups(grouped.take(2).having(counts.where(twoRows)), "NULL:2,")
+  checkGroups(grouped.having(counts.where(twoRows)).take(2), "NULL:2,B:2,")
+  checkGroups(grouped.take(2).orderByKey(true), "A:3,NULL:2,")
+  checkGroups(grouped.orderByKey(true).take(2), "E:1,D:2,")
+  checkGroups(grouped.skip(1).take(2), "A:3,B:2,")
+  checkGroups(grouped.take(2).skip(1).take(5), "A:3,")
+  checkGroups(grouped.take(2).skip(10).take(5), "")
+
+  let materialize: fn(String?, Int): GroupResult = fn(category: String?, count: Int): GroupResult
+    return new GroupResult(category, count)
+  end
+  let bounded = new GroupedAggregate<GroupRecord, String?, Int, GroupResult>(records(provider).asRelation(), fieldShape(optionalTextScalar(), categoryField()), countRows<GroupRecord>(), materialize, limit: 2)
+
+  checkGroups(bounded.having(counts.where(twoRows)), "NULL:2,")
+  checkGroups(bounded.orderByKey(true), "A:3,NULL:2,")
+
+  let valueTen: Int? = 10
+  let valueTwenty: Int? = 20
+  let valueFifteen: Int? = 15
+  let valueFifty: Int? = 50
+  let ten = quote do |row: GroupRecord|: Bool
+    return row.amount == valueTen
+  end
+  let positive = quote do |value: Int|: Bool
+    return value > 0
+  end
+  let tens = groupMetric(countRows<GroupRecord>().where(ten))
+  let distinctAmounts = groupMetric(countNonNull(optionalIntScalar(), amountField()).distinct())
+
+  checkGroups(grouped.having(tens.where(positive)).take(20), "A:3,")
+  checkGroups(grouped.orderByAggregate(tens.descending()).thenByKey().take(20), "A:3,NULL:2,B:2,C:1,D:2,E:1,")
+  checkGroups(grouped.having(distinctAmounts.where(moreThanOne)).take(20), "D:2,")
+  checkGroups(groups(records(provider).orderBy(idField()).take(4)).having(counts.where(twoRows)).take(20), "")
+  checkGroups(groups(records(provider).where(id: -1)).having(counts.where(positive)).take(20), "")
+
+  let afterFirst = quote do |row: GroupRecord|: Bool
+    return row.id > 1
+  end
+  let selectedAmounts = quote do |row: GroupRecord|: Bool
+    return row.amount == valueTen || row.amount == valueTwenty || row.amount == valueFifteen || row.amount == valueFifty
+  end
+  let notMissing = quote do |row: GroupRecord|: Bool
+    return row.amount != null
+  end
+  let twenty = quote do |row: GroupRecord|: Bool
+    return row.amount == valueTwenty
+  end
+  let projected = countRows<GroupRecord>().where(selectedAmounts)
+  let known = groupMetric(countRows<GroupRecord>().where(notMissing))
+  let twenties = groupMetric(countRows<GroupRecord>().where(twenty))
+  let mixed = groupsWithCount(records(provider).matching(afterFirst), projected)
+
+  checkGroups(mixed.having(known.where(moreThanOne)).orderByAggregate(twenties.descending()).thenByKey().take(20), "B:2,A:2,D:1,")
+
+  let names = groupMetric(minString(optionalTextScalar(), categoryField()))
+  let expectedName: String? = "B"
+  let nameIsB = quote do |name: String?|: Bool
+    return name == expectedName
+  end
+
+  checkGroups(grouped.having(names.where(nameIsB)).take(20), "B:2,")
+
+  checkGroups(grouped.orderByAggregate(counts.descending()).orderByKey(true).take(20), "E:1,D:2,C:1,B:2,A:3,NULL:2,")
+  checkGroups(grouped.orderByKey(true).orderByAggregate(totals.descending()).take(20), "E:1,B:2,A:3,D:2,NULL:2,C:1,")
+  checkGroups(grouped.orderByAggregate(counts.descending()).thenByAggregate(totals.ascending()).thenByKey().take(20), "A:3,NULL:2,D:2,B:2,C:1,E:1,")
+
+  let keys = combineShapes(fieldShape(optionalTextScalar(), categoryField()), fieldShape(optionalIntScalar(), amountField())) do |category: String?, amount: Int?|: CompositeGroupKey
+    return new CompositeGroupKey(category, amount)
+  end
+  let composite = selectGroups(groupBy(records(provider), keys), countRows<GroupRecord>()) do |key: CompositeGroupKey, count: Int|: GroupResult
+    let category = key.category
+    let amount = key.amount
+    var label = "NULL"
+    var number = "NULL"
+
+    if category != null
+      label = category
+    end
+    if amount != null
+      number = amount as String
+    end
+    return new GroupResult(label + "/" + number, count)
+  end
+
+  checkGroupRows(composite.orderByKey(true).take(20).all(), "E/50:1,D/15:1,D/5:1,C/NULL:1,B/20:2,A/10:3,NULL/5:1,NULL/NULL:1,")
+  checkGroupRows(composite.orderByAggregate(counts.descending()).thenByKey(true).take(20).all(), "A/10:3,B/20:2,E/50:1,D/15:1,D/5:1,C/NULL:1,NULL/5:1,NULL/NULL:1,")
+end
+
+def verifyFile(): resources::Outcome<Int, result::Failure>
+  using temporary <- files::TemporaryDirectory.create("neri-group-composition-")
+    let path = temporary.path() + "/data.sqlite"
+    let sql = "CREATE TABLE group_records(id INTEGER PRIMARY KEY, category TEXT, amount INTEGER); INSERT INTO group_records VALUES (1,'A',10),(2,'A',10),(3,'A',10),(4,'B',20),(5,'B',20),(6,'C',NULL),(7,'D',5),(8,'D',15),(9,'E',50),(10,NULL,5),(11,NULL,NULL);"
+
+    test::assertTrue(createSQLiteFixture(path, sql))
+    match SQLiteProvider.openWritable(path)
+      case SQLiteOpenResult.Failure(message)
+        test::assertTrue(false)
+      case SQLiteOpenResult.Opened(provider)
+        verifyGroups(provider)
+
+        test::assertTrue(provider.close())
+    end
+    return 0
+  end
+  return 1
+end
+
+def main(): Void
+  let result = verifyFile()
+
+  test::assertEqual(result.closeFailures.count(), 0)
+  match result.completion
+    case resources::Completion.Value(value)
+      test::assertEqual(value, 0)
+    case resources::Completion.Failure(problem)
+      test::assertTrue(false)
+  end
+end

@@ -1,0 +1,209 @@
+use host
+use process
+use test
+use console
+
+def referenceContractWrite(path: String, value: String): Void
+  test::assertTrue(host::writeText(path, value))
+end
+
+def referenceContractRun(executable: String, arguments: String[]): readonly AgentProcessResult
+  let options = new process::SpawnOptions(executable)
+
+  options.arguments = arguments
+  return AgentProcessResult.run(options, 120000)
+end
+
+def referenceContractExit(result: readonly AgentProcessResult, success: Bool): Void
+  if !result.outcome.isCompleted() || result.exitedWith(0) != success
+    console::println("Reference command failed unexpectedly. stdout: " + result.stdout + " stderr: " + result.stderr + " process: " + result.message)
+  end
+
+  test::assertTrue(result.outcome.isCompleted())
+  test::assertTrue(success ? result.exitedWith(0) : !result.exitedWith(0))
+end
+
+def referenceContractContains(text: String, part: String): Bool
+  var index = 0
+
+  while index + host::stringByteLength(part) <= host::stringByteLength(text)
+    if host::stringSlice(text, index, host::stringByteLength(part)) == part
+      return true
+    end
+    index = index + 1
+  end
+  return false
+end
+
+def referenceContractUnsupported(result: readonly AgentProcessResult): Void
+  referenceContractExit(result, false)
+
+  test::assertTrue(referenceContractContains(result.stdout + result.stderr, "Reference v1"))
+end
+
+def referenceContractEmit(compiler: String, manifest: String, artifact: String, unit: String = "provider"): readonly AgentProcessResult
+  return referenceContractRun(compiler, ["build", "--project", manifest, "--unit", unit, "--emit=reference", "--output", artifact])
+end
+
+def referenceContractConsumer(compiler: String, artifact: String, source: String, output: String, check: Bool = false): readonly AgentProcessResult
+  if check
+    return referenceContractRun(compiler, ["check", "--reference", artifact, source])
+  end
+  return referenceContractRun(compiler, ["build", "--reference", artifact, "--output", output, source])
+end
+
+def referenceContractTwo(compiler: String, first: String, second: String, source: String, output: String, check: Bool = false): readonly AgentProcessResult
+  if check
+    return referenceContractRun(compiler, ["check", "--reference", first, "--reference", second, source])
+  end
+  return referenceContractRun(compiler, ["build", "--reference", first, "--reference", second, "--output", output, source])
+end
+
+def referenceContractMetadata(path: String): LspJson
+  let text = host::readText(path)
+
+  test::assertTrue(text != null)
+  if text == null
+    return new LspJson()
+  end
+  let parser = new LspJsonParser(text)
+  let result = parser.parse()
+
+  parser.spaces()
+
+  test::assertTrue(!parser.failed && parser.position == host::stringByteLength(text))
+  return result
+end
+
+def referenceContractEditMetadata(root: LspJson, key: String, value: String, path: String): Void
+  root.get(key).replace(LspJsonValue.String(value))
+  referenceContractWrite(path, lspJsonStringify(root))
+end
+
+def referenceContractProvider(value: Int): String
+  return "namespace sums\n\ndef add(left: Int, right: Int): Int\n  return left + right + " + (value as String) + "\nend\n\ndef greet(name: String): String\n  return \"hello\"\nend\n\ndef echo(name: String): String\n  return name\nend\n"
+end
+
+def main(): Void
+  let compiler = host::argumentAt(1)
+  let work = host::argumentAt(2)
+
+  test::assertTrue(compiler != null && work != null)
+  if compiler == null || work == null
+    return
+  end
+  let root = bootstrapTemporaryDirectory(work, "reference-assembly")
+
+  test::assertTrue(root != null)
+  if root == null
+    return
+  end
+  let manifest = root + "/manifest.json"
+  let provider = root + "/provider.hk"
+  let source = root + "/consumer.hk"
+  let artifact = root + "/provider.nref"
+  let output = root + "/app"
+
+  referenceContractWrite(manifest, "{\"version\":2,\"units\":{\"provider\":{\"kind\":\"library\",\"sources\":[\"provider.hk\"]}}}\n")
+  referenceContractWrite(provider, referenceContractProvider(1))
+  referenceContractWrite(source, "use console\nuse sums\n\ndef main(): Void\n  console::println(add(2, 3) as String)\n  console::println(greet(\"Neri\"))\n  console::println(echo(\"Neri\"))\nend\n")
+  referenceContractExit(referenceContractEmit(compiler, manifest, artifact), true)
+  let first = referenceContractMetadata(artifact)
+  let firstContract = first.get("contractDigest").scalarText()
+  let firstObject = first.get("objectDigest").scalarText()
+
+  test::assertEqual(host::stringByteLength(firstContract), 64)
+  test::assertEqual(host::stringByteLength(firstObject), 64)
+  var removed = host::run("rm", [provider])
+
+  test::assertTrue(removed != null && removed == 0)
+  referenceContractExit(referenceContractConsumer(compiler, artifact, source, output, true), true)
+
+  test::assertEqual((new RunCacheFile(output, true)).kind, 0)
+  referenceContractExit(referenceContractConsumer(compiler, artifact, source, output), true)
+  let executed = referenceContractRun(output, [])
+
+  referenceContractExit(executed, true)
+
+  test::assertEqual(executed.stdout, "6\nhello\nNeri\n")
+  let compilerRun = referenceContractRun(compiler, ["run", "--reference", artifact, source])
+
+  referenceContractExit(compilerRun, true)
+
+  test::assertEqual(compilerRun.stdout, "6\nhello\nNeri\n")
+  referenceContractWrite(provider, referenceContractProvider(2))
+  referenceContractExit(referenceContractEmit(compiler, manifest, artifact), true)
+  let changed = referenceContractMetadata(artifact)
+
+  test::assertEqual(changed.get("contractDigest").scalarText(), firstContract)
+  test::assertTrue(changed.get("objectDigest").scalarText() != firstObject)
+  removed = host::run("rm", [provider])
+
+  test::assertTrue(removed != null && removed == 0)
+  referenceContractExit(referenceContractConsumer(compiler, artifact, source, output), true)
+  let changedRun = referenceContractRun(output, [])
+
+  referenceContractExit(changedRun, true)
+
+  test::assertEqual(changedRun.stdout, "7\nhello\nNeri\n")
+  let targetMismatch = root + "/target-mismatch.nref"
+  let compilerMismatch = root + "/compiler-mismatch.nref"
+  let malformed = root + "/malformed.nref"
+
+  referenceContractEditMetadata(referenceContractMetadata(artifact), "target", "unsupported-target", targetMismatch)
+  referenceContractEditMetadata(referenceContractMetadata(artifact), "compilerIdentity", "unsupported-compiler", compilerMismatch)
+  referenceContractWrite(malformed, "{\"schemaVersion\":1} trailing")
+  referenceContractExit(referenceContractConsumer(compiler, targetMismatch, source, output, true), false)
+  referenceContractExit(referenceContractConsumer(compiler, compilerMismatch, source, output, true), false)
+  referenceContractExit(referenceContractConsumer(compiler, malformed, source, output, true), false)
+  let objectPath = changed.get("objectPath").scalarText()
+  let savedObject = root + "/saved-object"
+  var moved = host::run("mv", [objectPath, savedObject])
+
+  test::assertTrue(moved != null && moved == 0)
+  referenceContractExit(referenceContractConsumer(compiler, artifact, source, output, true), false)
+  moved = host::run("mv", [savedObject, objectPath])
+
+  test::assertTrue(moved != null && moved == 0)
+  moved = host::run("cp", [objectPath, savedObject])
+
+  test::assertTrue(moved != null && moved == 0)
+  referenceContractWrite(objectPath, "corrupt object")
+  referenceContractExit(referenceContractConsumer(compiler, artifact, source, output, true), false)
+  moved = host::run("mv", [savedObject, objectPath])
+
+  test::assertTrue(moved != null && moved == 0)
+  let collision = root + "/collision.hk"
+
+  referenceContractWrite(collision, "namespace sums\n\ndef add(left: Int, right: Int): Int\n  return left + right\nend\n\ndef main(): Void\nend\n")
+  referenceContractExit(referenceContractConsumer(compiler, artifact, collision, output, true), false)
+  let secondManifest = root + "/second-manifest.json"
+  let secondProvider = root + "/second-provider.hk"
+  let secondArtifact = root + "/second.nref"
+  let twoSources = root + "/two.hk"
+
+  referenceContractWrite(secondManifest, "{\"version\":2,\"units\":{\"extra\":{\"kind\":\"library\",\"sources\":[\"second-provider.hk\"]}}}\n")
+  referenceContractWrite(secondProvider, "namespace extras\n\ndef triple(value: Int): Int\n  return value * 3\nend\n")
+  referenceContractWrite(twoSources, "use console\nuse sums\nuse extras\n\ndef main(): Void\n  console::println((add(2, 3) + triple(2)) as String)\nend\n")
+  referenceContractExit(referenceContractEmit(compiler, secondManifest, secondArtifact, "extra"), true)
+  removed = host::run("rm", [secondProvider])
+
+  test::assertTrue(removed != null && removed == 0)
+  referenceContractExit(referenceContractTwo(compiler, artifact, secondArtifact, twoSources, output), true)
+  let twoRun = referenceContractRun(output, [])
+
+  referenceContractExit(twoRun, true)
+
+  test::assertEqual(twoRun.stdout, "13\n")
+  referenceContractExit(referenceContractTwo(compiler, artifact, artifact, source, output, true), false)
+  referenceContractWrite(provider, "namespace sums\n\ndef add(left: String, right: Int): Int\n  return right\nend\n\ndef greet(name: String): String\n  return \"hello\"\nend\n\ndef echo(name: String): String\n  return name\nend\n")
+  referenceContractExit(referenceContractEmit(compiler, manifest, artifact), true)
+  let signature = referenceContractMetadata(artifact)
+
+  test::assertTrue(signature.get("contractDigest").scalarText() != firstContract)
+  referenceContractExit(referenceContractConsumer(compiler, artifact, source, output, true), false)
+  for unsupported in ["class Box\nend\n", "def identity<T>(value: T): T\n  return value\nend\n", "def value(number: Int = 1): Int\n  return number\nend\n", "def value(number: Int[]): Int\n  return 1\nend\n", "def greet(name: String): String\n  return \"hello \" + name\nend\n"]
+    referenceContractWrite(provider, unsupported)
+    referenceContractUnsupported(referenceContractEmit(compiler, manifest, artifact))
+  end
+end

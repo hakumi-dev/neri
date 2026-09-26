@@ -3,6 +3,7 @@
 This document describes workloads, measurement boundaries and enforced contracts.
 Store and publish per-run evidence according to the
 [benchmark source and result policy](../benchmarks/README.md#source-and-result-policy).
+For managed allocation and GC diagnostics, see [runtime memory profiling](MEMORY-PROFILING.md).
 
 ## UTF-8 construction
 
@@ -44,13 +45,23 @@ statistical regressions or application profiles.
 
 `neri source.hk --timings` separates frontend, cache lookup, code generation,
 linking and program execution. `--no-cache` provides an uncached comparison with
-the same compiler, runtime and safety checks. A cache hit still parses, type-checks,
-lowers and verifies the program; it skips native code generation and linking.
+the same compiler, runtime and safety checks. A source-file build cache hit still
+parses, type-checks, lowers and verifies the program; it skips native code
+generation and linking. Project builds have a separate artifact cache described
+below; its exact hit can bypass frontend compilation after loading and validating
+the project inputs.
 
 Frontend timings distinguish `source-load`, `parse`, `bind`, `lower` and
 `ir-verify`. They use the same JSONL sink consumed by project profiling. The
 `frontend` phase measures their enclosing compilation interval; phase durations
 overlap and must not be added to their enclosing total.
+
+`source-assemble` measures combined text construction and UTF-16 boundaries.
+Early project artifact hits skip this work. `dependency-semantic-store`
+measures checked-analysis serialization and publication. `dependency-codegen`
+includes transport serialization, native verification, LLVM lowering, optimization
+and target emission; its `dependency-serialize` and `dependency-native-*` subphases
+separate these costs and overlap with the enclosing duration.
 
 ## Batch builds
 
@@ -63,6 +74,10 @@ returns a nonzero status; artifacts from preceding successful units remain.
 
 The batch retains one dependency analysis in memory. Its identity includes exact
 source contents, ordered source identities and the effective import context.
+For mapped project sources, identities and debug paths use the manifest's
+`sourceMap`; content and ownership still come from the declared physical files.
+Project cache inputs include the manifest configuration and verified source bytes,
+so changing a mapping or copied file invalidates the relevant cache entry.
 Each unit loads its current sources before reuse is considered. An eligible
 dependency prefix is parsed and bound once; child syntax and bound arenas retain
 that analysis while binding each consumer separately. IR lowering, verification,
@@ -72,8 +87,16 @@ Sharing applies when dependencies precede consumer sources in the compiler's
 source order and resolve independently. Consumer declarations that could change
 dependency name resolution, interleaved ownership and dependency diagnostics
 select ordinary whole-program analysis. Changes to dependency contents or import
-resolution establish a new retained analysis. `--no-cache` disables native object
-reuse; the batch still shares eligible in-memory semantic analysis.
+resolution establish a new retained analysis. `--no-cache` disables persistent
+semantic and native object reuse; the batch still shares eligible in-memory
+semantic analysis.
+
+For ordinary builds, all units in the selected root manifest form the consumer analysis group.
+External manifests and the standard library can form the retained prefix. Editing
+a root library therefore preserves eligible external dependency analysis and native
+objects. Batch builds retain stable sibling libraries with the dependency prefix
+to share their analysis across executable units. Native partition ownership remains
+per declared unit.
 
 Timings report `dependency-parse` and `dependency-bind` when establishing an
 analysis. The final batch summary reports analyzed and reused dependency contexts
@@ -83,10 +106,28 @@ and deadline.
 
 Dependency-aware reuse follows the model described in the
 [Rust compiler's incremental compilation guide](https://rustc-dev-guide.rust-lang.org/queries/incremental-compilation.html).
-Neri's batch cache is process-local and retains a whole eligible dependency
-context; it does not persist a fine-grained semantic query graph.
+Neri also persists eligible dependency contexts and exact session initializer
+analysis through the [checked-analysis cache](SEMANTIC-CACHE.md). It retains a
+whole eligible dependency context, without a fine-grained semantic query graph.
 
 ## Compiler data structures and native caching
+
+Project source membership and ownership use a load-local hash index, updated with
+the ordered source lists through one registration operation. Generic name lookup
+constructs imported qualified names once per lookup, then scans templates in their
+declaration order. For `T` templates and `U` imports this requires `O(T + U)` expected
+name-table operations; namespace precedence and the conflicting declaration used
+in ambiguity diagnostics are preserved.
+
+Native lowering indexes verified function, import and class symbols in ordered
+maps, with `O(log N)` lookup for `N` declarations. Function-local block IDs use a
+hash index, and virtual-slot candidates preserve declaration order. Indexes borrow
+the immutable verified IR and do not change emission order or validation. These
+choices follow the lookup and ordering tradeoffs in the
+[LLVM Programmer's Manual](https://llvm.org/docs/ProgrammersManual.html#picking-the-right-data-structure-for-a-task).
+The native verifier also indexes sources and declarations after checking canonical
+order. Source-location, field, call and inheritance checks reuse those indexes;
+pre-canonical validation retains the same diagnostic order.
 
 Deterministic IR lowering and transport use one stable, typed merge sort to order
 compiler collections. Ordering takes `O(N log N)` comparisons and preserves
@@ -153,12 +194,53 @@ This is the application of [Amdahl's law](https://www.cs.cmu.edu/~18742/papers/A
 
 ## Project object builds
 
-Executable projects partition verified IR by manifest unit. Automatically loaded
-standard-library sources form another unit. The compiler gives each class and
-its methods one owner; generic specializations and synthetic classes belong to
-the executable consumer. Other units carry the external declarations and layouts
-needed to call them. Each object uses the same logical module identity, with
-strong, executable-local function and class-descriptor symbols.
+For eligible single-unit project `build` and `run` commands, an exact project
+artifact cache lookup happens after project loading and before parsing or binding.
+A hit therefore skips frontend analysis, IR lowering, object generation and
+linking. A `build` hit restores the cached executable to the requested output;
+a `run` hit executes the cached executable. The key includes the command and
+normalized output identity, target and build mode, compiler executable digest,
+source identities and content digests, source ownership, relevant project and
+generated manifests/files, runtime toolchain fingerprints and library-path
+configuration. Project sources and manifest inputs are still loaded and verified
+before this decision. `--no-cache`, batch builds, sessions, reference-consuming
+builds and non-executable emissions do not use this early artifact path.
+
+On macOS ARM64, the project artifact cache also records the actual native link
+inputs reported by the linker, their content digests, and library-search
+candidates that were absent. A hit rechecks both sets, so a changed linked file
+or newly created candidate invalidates the entry. It also checks the compiler,
+linker, runtime, SDK and related toolchain identities described in the run-cache
+section. If linker input capture is unavailable or incomplete, Neri builds
+normally and does not publish a project artifact hit. Debug artifacts include a
+validated dSYM sidecar. Custom compiler/linker search or injection environments,
+unsupported targets, or missing toolchain/dependency receipts remain on the
+normal path. The supported system-library link set and configured
+`NERI_LIBRARY_PATH` are part of the cache identity or native dependency receipt.
+
+On a miss, an initial link discovers dependencies. A second link is bracketed
+by content snapshots of those inputs and absence checks of unsuccessful search
+candidates. Publication retains the pre-link digests and checks them again;
+a changing graph disables publication. This adds one link to a cacheable miss.
+Debug reuse tracks the resolved default `dsymutil` and is disabled for a custom
+`NERI_DSYMUTIL`. Toolchain installations retain the immutability assumption
+described above.
+
+Executable projects partition verified IR by manifest owner and stable source
+groups. Each owner, including the automatically loaded standard library, has at
+most two groups. Source IDs determine group membership independently of source
+contents and enumeration order; only nonempty groups produce objects. This bounds
+native compiler startup and link overhead while allowing reuse within a manifest
+unit. The compiler keeps each class and its methods together. The entry source,
+generic specializations and synthetic classes belong to the consumer's entry
+group. Other groups carry the external declarations and layouts needed to call
+them. Each object uses the same logical module identity, with strong,
+executable-local function and class-descriptor symbols.
+
+Source groups also apply to consumers of precompiled dependency libraries. Those
+groups contain consumer bodies and required retained declarations; provider
+bodies stay in the dependency object. The final link verifies that object's
+receipt and includes its runtime and native-library requirements.
 
 An object contains its owned function bodies, referenced private string literals,
 native imports, and required external declarations. Partition views share immutable
@@ -170,16 +252,20 @@ capabilities can raise that minimum. Session modules retain their own ABI contra
 
 On macOS ARM64, object reuse uses the private cache and dependency receipts
 described above, with a separate object-cache key domain. The key includes the
-unit's canonical transport, manifest contents, owner, target, optimization mode,
-runtime manifest, and native tool identities. Native library binaries are resolved
-at the final link, which runs on every project build. `--no-cache` compiles every
-object. Other supported targets use the same partitioned link without this cache.
-Cache lookup hashes the packed canonical payload. A hit skips hexadecimal
-transport encoding; a miss reuses that payload and digest to construct the
-unchanged transport envelope for the native backend.
+unit's canonical transport, owner and group identity, target, optimization mode, runtime package
+manifest and native tool identities. It deliberately excludes the project
+manifest: the serialized unit is the complete code-generation input, and unrelated
+manifest edits should not invalidate its object. Native library binaries are
+resolved at the final link, which runs on every full project build. `--no-cache`
+compiles every object. Other supported targets use the same partitioned link
+without this object cache. Cache lookup hashes the packed canonical payload. A
+hit skips hexadecimal transport encoding; a miss reuses that payload and digest
+to construct the unchanged transport envelope for the native backend.
 
-The frontend still reads, checks, and lowers the complete project before selecting
-objects. This is native-object reuse, not persisted semantic-analysis reuse.
+When the project artifact cache misses, the frontend still reads, checks, and
+lowers the complete project before selecting reusable objects. This is
+native-object reuse, not persisted semantic-analysis reuse. A no-op project
+artifact hit is the separate earlier path described above.
 Source tables are tracked per file: a consumer specializing a generic template
 depends on that template's source file as well as its generated IR. Splitting
 stable definitions from consumer specializations follows the
@@ -196,6 +282,14 @@ is described in
 [Constructing Hybrid Incremental Compilers](https://arxiv.org/pdf/2002.06183),
 section 4.1. End-to-end measurements include these costs; cache-hit counts alone
 do not establish a latency improvement.
+
+A body edit rebuilds its group and any other groups whose recorded inputs change.
+Signatures, class layouts and embedded debug sources remain part of those inputs.
+Changing one function in a file can therefore invalidate other functions from that
+file. Debug source contents and locations are preserved on both hits and misses.
+The bound on groups follows the same compilation-granularity tradeoff documented
+for [Rust codegen units](https://doc.rust-lang.org/rustc/codegen-options/index.html#codegen-units);
+it does not introduce a persisted function-level semantic query graph.
 
 ## Session completion
 

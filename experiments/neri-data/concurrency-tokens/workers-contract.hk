@@ -1,0 +1,376 @@
+use test
+use files
+use resources
+use result
+use workers
+use text
+use host
+use clock
+use concurrency_tokens_data
+use concurrency_tokens_model
+use neri_data
+use neri_data_sqlite
+use neri_data_sqlite_fixture
+
+def saved(value: WriteResult, expected: Int): Void
+  match value
+    case WriteResult.Saved(count)
+      test::assertEqual(count, expected)
+    case WriteResult.SavedWithValues(count, outputs)
+      test::assertTrue(false)
+    case WriteResult.Failure(error)
+      test::assertTrue(false)
+  end
+end
+
+def record(db: ConcurrencyDatabase): Record?
+  match db.records.where(id: 1).first()
+    case QueryValue.Value(value)
+      return value
+    case QueryValue.Failure(error)
+      test::assertTrue(false)
+  end
+  return null
+end
+
+def visible(provider: SQLiteProvider, name: String, version: Int): Void
+  let value = record(new ConcurrencyDatabase(provider))
+
+  test::assertTrue(value != null)
+  if value != null
+    test::assertEqual(value.name, name)
+    test::assertEqual(value.version, version)
+  end
+end
+
+def rejected(value: WriteResult, concurrency: Bool, constraint: Bool = false): Void
+  match value
+    case WriteResult.Saved(count)
+      test::assertTrue(false)
+    case WriteResult.SavedWithValues(count, outputs)
+      test::assertTrue(false)
+    case WriteResult.Failure(error)
+      match error
+        case WriteFailure.Concurrency(message)
+          test::assertTrue(concurrency)
+        case WriteFailure.Transaction(message)
+          test::assertTrue(!concurrency && !constraint)
+        case WriteFailure.Validation(message)
+          test::assertTrue(false)
+        case WriteFailure.Constraint(message)
+          test::assertTrue(constraint)
+        case WriteFailure.Provider(message)
+          test::assertTrue(false)
+        case WriteFailure.Unsupported(message)
+          test::assertTrue(false)
+      end
+  end
+end
+
+def earlyReturn(path: String, fail: Bool = false): resources::Outcome<Bool, result::Failure>
+  using session <- SQLiteSession.openWritable(path)
+    let db = new ConcurrencyDatabase(session.provider())
+
+    saved(db.beginTransaction(), 0)
+    saved(db.records.where(id: 1).executeUpdate(name: "abandoned"), 1)
+    if fail
+      return new result::Failure("request_failed", "request")
+    end
+    return true
+  end
+  return false
+end
+
+def completed(value: resources::Outcome<Bool, result::Failure>): Void
+  test::assertEqual(value.closeFailures.count(), 0)
+  match value.completion
+    case resources::Completion.Value(success)
+      test::assertTrue(success)
+    case resources::Completion.Failure(error)
+      test::assertTrue(false)
+  end
+end
+
+def timeoutRollback(provider: SQLiteProvider): Void
+  let db = new ConcurrencyDatabase(provider)
+  let columns = new ResultColumns([new ResultColumn("id", ResultColumnKind.Int()), new ResultColumn("name", ResultColumnKind.Text()), new ResultColumn("note", ResultColumnKind.Text(), true), new ResultColumn("revision", ResultColumnKind.Int())])
+  let heavy = new Query<Record>("heavy_records", new Decoder<Record>(decodeEntity_6_Record, columns), provider: provider)
+  let consume: fn(Record): Bool = fn(value: Record): Bool
+    return true
+  end
+
+  saved(db.beginTransaction(), 0)
+  saved(db.records.where(id: 1).executeUpdate(name: "timeout pending"), 1)
+  let started = clock::milliseconds()
+
+  test::assertTrue(started != null)
+  match heavy.stream(consume, new StreamOptions(timeoutMilliseconds: 50))
+    case StreamResult.Cancelled(count)
+      test::assertEqual(count, 0)
+    case StreamResult.Completed(count)
+      test::assertTrue(false)
+    case StreamResult.Stopped(count)
+      test::assertTrue(false)
+    case StreamResult.Failure(error, count)
+      test::assertTrue(false)
+  end
+  let finished = clock::milliseconds()
+
+  test::assertTrue(finished != null)
+  if started != null && finished != null
+    test::assertTrue(finished - started < 5000)
+  end
+  # Streaming cancellation does not commit or discard the enclosing transaction.
+  saved(db.rollbackTransaction(), 0)
+  visible(provider, "winner", 2)
+  db.clear()
+
+  test::assertTrue(db.records.add(new Record(1, "duplicate", null, 1)) == null)
+  rejected(db.saveChanges(), false, true)
+  visible(provider, "winner", 2)
+  saved(db.beginTransaction(), 0)
+  saved(db.commitTransaction(), 0)
+end
+
+def waitSignal(path: String, cancellation: Bool): Bool
+  let started = clock::milliseconds()
+  let polling = http::PollSet.create(0)
+
+  if started == null || polling == null
+    return false
+  end
+  while true
+    if cancellation
+      if workers::cancelled()
+        return true
+      end
+    else if host::readText(path) == "ready"
+      return true
+    end
+    let now = clock::milliseconds()
+
+    if now == null || now - started >= 5000
+      return false
+    end
+    unsafe
+      match polling.wait(10)
+        case result::Result.Ok(ready)
+        case result::Result.Error(error)
+          return false
+      end
+    end
+  end
+  return false
+end
+
+def cancelledRequest(path: String): resources::Outcome<Bool, result::Failure>
+  using session <- SQLiteSession.openWritable(path)
+    let db = new ConcurrencyDatabase(session.provider())
+
+    saved(db.beginTransaction(), 0)
+    saved(db.records.where(id: 1).executeUpdate(name: "cancel pending"), 1)
+
+    test::assertTrue(host::writeText(path + ".cancel-ready", "ready"))
+    # The worker observes cancellation cooperatively between database operations.
+    return waitSignal(path, true)
+  end
+  return false
+end
+
+# Each entry owns its connection, context, and tracked entities in a private heap.
+def runWorker(path: String): resources::Outcome<Bool, result::Failure>
+  using session <- SQLiteSession.openWritable(path)
+    let provider = session.provider()
+    let db = new ConcurrencyDatabase(provider)
+    var retained: Record? = null
+    let ready = try workers::ready()
+
+    test::assertTrue(ready)
+    while true
+      let input = try workers::receive()
+
+      if input == null
+        return true
+      end
+
+      test::assertEqual(input.Length, 1)
+      let command = input[0] as Int
+
+      if command == 1
+        saved(db.beginTransaction(), 0)
+        saved(db.records.where(id: 1).executeUpdate(name: "pending"), 1)
+      else if command == 2
+        visible(provider, "initial", 1)
+        rejected(db.beginTransaction(), false)
+      else if command == 3
+        saved(db.commitTransaction(), 0)
+      else if command == 4
+        visible(provider, "pending", 1)
+        saved(db.beginTransaction(), 0)
+        saved(db.commitTransaction(), 0)
+      else if command == 5 || command == 6
+        db.clear()
+        retained = record(db)
+
+        test::assertTrue(retained != null)
+        if retained != null
+          test::assertEqual(retained.version, 1)
+        end
+      else if command == 7 || command == 8
+        test::assertTrue(retained != null)
+        if retained != null
+          retained.name = command == 7 ? "winner" : "stale"
+          retained.version = retained.version + 1
+          if command == 7
+            saved(db.saveChanges(), 1)
+          else
+            rejected(db.saveChanges(), true)
+            visible(provider, "winner", 2)
+          end
+        end
+      else if command == 9
+        completed(earlyReturn(path))
+        visible(provider, "winner", 2)
+        let failed = earlyReturn(path, true)
+
+        test::assertEqual(failed.closeFailures.count(), 0)
+        match failed.completion
+          case resources::Completion.Failure(error)
+            test::assertTrue(error != null)
+            if error != null
+              test::assertEqual(error.code, "request_failed")
+            end
+          case resources::Completion.Value(value)
+            test::assertTrue(false)
+        end
+        visible(provider, "winner", 2)
+      else if command == 10
+        timeoutRollback(provider)
+      else if command == 11
+        completed(cancelledRequest(path))
+        # Both sessions close before entry returns its cancelled completion.
+        return true
+      else if command == 12
+        visible(provider, "winner", 2)
+        saved(db.beginTransaction(), 0)
+        saved(db.commitTransaction(), 0)
+      end
+      let replied = try workers::reply([input[0]])
+
+      test::assertTrue(replied)
+    end
+  end
+  return false
+end
+
+def entry(config: Byte[]): Void
+  let path = host::stringFromBytes(config)
+
+  test::assertTrue(path != null)
+  if path != null
+    completed(runWorker(path))
+  end
+end
+
+def verify(path: String): resources::Outcome<Bool, result::Failure>
+  let options = new workers::Options()
+
+  options.workers = 1
+  options.maxOutstanding = 1
+  options.maxInputBytes = 1
+  options.maxOutputBytes = 1
+  options.maxReservedBytes = 2
+  # Separate pools give commands stable worker affinity without sharing heap objects.
+  using first <- workers::start(entry, text::bytes(path), options)
+    using second <- workers::start(entry, text::bytes(path), options)
+      var command = 1
+
+      while command <= 12
+        let bytes: Byte[] = [command as Byte]
+        var ticket: workers::Ticket? = null
+
+        if command == 11
+          test::assertTrue(host::readText(path + ".cancel-ready") == null)
+        end
+        if command == 1 || command == 3 || command == 5 || command == 7 || command == 9 || command == 11
+          ticket = try first.submit(bytes)
+        else
+          ticket = try second.submit(bytes)
+        end
+        if command == 11
+          if !waitSignal(path + ".cancel-ready", false) || ticket == null
+            return false
+          end
+          let cancelled = try first.cancel(ticket)
+
+          test::assertTrue(cancelled)
+        end
+        let start = clock::milliseconds()
+
+        test::assertTrue(start != null)
+        if start == null
+          return false
+        end
+        var received = false
+
+        while !received
+          let now = clock::milliseconds()
+
+          test::assertTrue(now != null)
+          if now == null || now - start >= 5000
+            return false
+          end
+          var polled = workers::Poll.Empty()
+
+          if command == 1 || command == 3 || command == 5 || command == 7 || command == 9 || command == 11
+            polled = try first.poll(25)
+          else
+            polled = try second.poll(25)
+          end
+
+          match polled
+            case workers::Poll.Empty()
+            case workers::Poll.Stopped()
+              return false
+            case workers::Poll.Completed(value)
+              test::assertTrue(ticket != null)
+              if ticket != null
+                test::assertEqual(value.ticket.id(), ticket.id())
+              end
+              match value.outcome
+                case workers::Outcome.Success(payload)
+                  test::assertTrue(command != 11)
+                  test::assertEqual(payload.Length, 1)
+                  test::assertEqual(payload[0] as Int, command)
+                  received = true
+                case workers::Outcome.Failed()
+                  return false
+                case workers::Outcome.Cancelled()
+                  test::assertEqual(command, 11)
+                  received = true
+              end
+          end
+        end
+        command = command + 1
+      end
+      return true
+    end
+  end
+  return false
+end
+
+def fixture(): resources::Outcome<Bool, result::Failure>
+  using temporary <- files::TemporaryDirectory.create("neri-data-workers-")
+    let path = temporary.path() + "/workers.sqlite"
+    let schema = "CREATE TABLE records(id INTEGER PRIMARY KEY, name TEXT NOT NULL, note TEXT, revision INTEGER NOT NULL); INSERT INTO records VALUES(1,'initial',NULL,1); CREATE VIEW heavy_records AS WITH RECURSIVE n(value) AS (VALUES(1) UNION ALL SELECT value + 1 FROM n WHERE value < 100000000) SELECT MAX(value) AS id, 'heavy' AS name, NULL AS note, 1 AS revision FROM n;"
+
+    test::assertTrue(createSQLiteFixture(path, schema))
+    completed(verify(path))
+    return true
+  end
+  return false
+end
+
+def main(): Void
+  completed(fixture())
+end

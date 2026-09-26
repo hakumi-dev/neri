@@ -5,7 +5,11 @@
 operating-system code, primary cause, and secondary close failure. Adapters preserve the existing
 optional and Boolean APIs and expose additive `*Outcome` functions.
 
-Use exhaustive `match` to propagate outcomes explicitly. `map`, `flatMap`, and
+Use exhaustive `match` to handle each outcome, or `try expression` to extract a
+success value and return a compatible error from the enclosing function. The
+function's return type continues to describe its possible failure. See
+[typed propagation](TRY.md) for the language contract and library opt-in.
+`map`, `flatMap`, and
 `mapError` transform success, chain dependent operations, and transform errors.
 
 Adapters cover file reads, HTTP request parsing/header reads/writes/listeners,

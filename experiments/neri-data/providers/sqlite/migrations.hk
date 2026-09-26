@@ -1,0 +1,747 @@
+use host
+use tasks
+use neri_data
+namespace neri_data_sqlite
+
+enum SQLiteMigrationHistory
+  case Loaded(stamps: MigrationStamp[])
+  case Failure(message: String)
+end
+
+def sqliteMigrationFailureMessage(error: MigrationFailure): String
+  match error
+    case MigrationFailure.Validation(message)
+      return message
+    case MigrationFailure.Drift(message)
+      return message
+    case MigrationFailure.Unsupported(message)
+      return message
+    case MigrationFailure.Provider(message)
+      return message
+  end
+end
+
+unsafe def sqlitePrepareMigration(database: Void*, sql: String, statement: Void**): Int32
+  let length = host::stringByteLength(sql)
+  let bytes = native::alloc<Byte>(length + 1)
+  var index = 0
+
+  while index < length
+    bytes[index] = host::stringByteAt(sql, index)
+    index = index + 1
+  end
+  bytes[length] = 0 as Byte
+  let status = sqlitePrepare(database, bytes, length as Int32, statement, null)
+
+  native::free(bytes)
+  return status
+end
+
+unsafe def sqliteMigrationHistory(database: Void*, maximum: Int): SQLiteMigrationHistory
+  let statement = stackalloc Void*[1]
+  let status = sqlitePrepareMigration(database, "SELECT ordinal, id, signature FROM __neri_migrations ORDER BY ordinal", statement)
+
+  if status != (0 as Int32)
+    let message = sqliteMessage(database)
+
+    let partial: Void*? = statement[0]
+
+    if partial != null
+      sqliteFinalize(partial)
+    end
+    return SQLiteMigrationHistory.Failure(message)
+  end
+  let prepared: Void*? = statement[0]
+
+  if prepared == null
+    return SQLiteMigrationHistory.Failure("SQLite migration history query has no statement")
+  end
+  let capacity = maximum + 1
+  let stored: MigrationStamp[] = tasks::generate(capacity, 1) do |index|
+    return new MigrationStamp("", "")
+  end
+  var count = 0
+  var failure: String? = null
+  var step = sqliteStep(prepared)
+
+  while step == (100 as Int32) && failure == null
+    if count >= capacity
+      failure = "SQLite migration history exceeds catalog"
+    else if sqliteColumnType(prepared, 0 as Int32) != (1 as Int32) || sqliteColumnType(prepared, 1 as Int32) != (3 as Int32) || sqliteColumnType(prepared, 2 as Int32) != (3 as Int32)
+      failure = "SQLite migration history has invalid storage types"
+    else if sqliteColumnInt(prepared, 0 as Int32) != count + 1
+      failure = "SQLite migration history has a missing or duplicate ordinal"
+    else
+      let idPointer = sqliteColumnText(prepared, 1 as Int32)
+      let signaturePointer = sqliteColumnText(prepared, 2 as Int32)
+
+      if idPointer == null || signaturePointer == null
+        failure = "SQLite migration history text is unavailable"
+      else
+        let id = sqliteText(idPointer, sqliteColumnBytes(prepared, 1 as Int32) as Int)
+        let signature = sqliteText(signaturePointer, sqliteColumnBytes(prepared, 2 as Int32) as Int)
+
+        if id == null || signature == null
+          failure = "SQLite migration history is invalid UTF-8"
+        else
+          stored[count] = new MigrationStamp(id, signature)
+          count = count + 1
+        end
+      end
+    end
+    if failure == null
+      step = sqliteStep(prepared)
+    end
+  end
+  if failure == null && step != (101 as Int32)
+    failure = sqliteMessage(database)
+  end
+  let finalized = sqliteFinalize(prepared)
+
+  if failure != null
+    return SQLiteMigrationHistory.Failure(failure)
+  end
+  if finalized != (0 as Int32)
+    return SQLiteMigrationHistory.Failure("SQLite migration history finalize failed")
+  end
+  let exact: MigrationStamp[] = tasks::generate(count, 1) do |index|
+    let stamp = stored[index]
+
+    return new MigrationStamp(stamp.id(), stamp.signature())
+  end
+
+  return SQLiteMigrationHistory.Loaded(exact)
+end
+
+unsafe def sqliteMigrationText(value: String): Byte*
+  let length = host::stringByteLength(value)
+  let bytes = native::alloc<Byte>(length + 1)
+  var index = 0
+
+  while index < length
+    bytes[index] = host::stringByteAt(value, index)
+    index = index + 1
+  end
+  bytes[length] = 0 as Byte
+  return bytes
+end
+
+unsafe def sqliteMigrationRecord(database: Void*, ordinal: Int, stamp: readonly MigrationStamp): String?
+  let id = stamp.id()
+  let signature = stamp.signature()
+  let idLength = host::stringByteLength(id)
+  let signatureLength = host::stringByteLength(signature)
+
+  if idLength > 2147483646 || signatureLength > 2147483646
+    return "SQLite migration stamp exceeds text limit"
+  end
+  let statement = stackalloc Void*[1]
+  let status = sqlitePrepareMigration(database, "INSERT INTO __neri_migrations(ordinal, id, signature) VALUES(?, ?, ?)", statement)
+
+  if status != (0 as Int32)
+    let message = sqliteMessage(database)
+
+    let partial: Void*? = statement[0]
+
+    if partial != null
+      sqliteFinalize(partial)
+    end
+    return message
+  end
+  let prepared: Void*? = statement[0]
+
+  if prepared == null
+    return "SQLite migration history insert has no statement"
+  end
+  let idBytes = sqliteMigrationText(id)
+  let signatureBytes = sqliteMigrationText(signature)
+  var failure: String? = null
+
+  if sqliteBindInt(prepared, 1 as Int32, ordinal) != (0 as Int32) || sqliteBindText(prepared, 2 as Int32, idBytes, idLength as Int32, null) != (0 as Int32) || sqliteBindText(prepared, 3 as Int32, signatureBytes, signatureLength as Int32, null) != (0 as Int32)
+    failure = sqliteMessage(database)
+  else if sqliteStep(prepared) != (101 as Int32)
+    failure = sqliteMessage(database)
+  else if sqliteChanges(database) != 1
+    failure = "SQLite migration history insert affected an unexpected row count"
+  end
+  let finalized = sqliteFinalize(prepared)
+
+  # SQLITE_STATIC: both bound text buffers remain live through finalize.
+  # https://sqlite.org/c3ref/bind_blob.html
+  native::free(idBytes)
+  native::free(signatureBytes)
+  if failure != null
+    return failure
+  end
+  if finalized != (0 as Int32)
+    return "SQLite migration history insert finalize failed"
+  end
+  return null
+end
+
+unsafe def sqliteMigrationForget(database: Void*, ordinal: Int): String?
+  let statement = stackalloc Void*[1]
+  let status = sqlitePrepareMigration(database, "DELETE FROM __neri_migrations WHERE ordinal = ?", statement)
+
+  if status != (0 as Int32)
+    let message = sqliteMessage(database)
+
+    let partial: Void*? = statement[0]
+
+    if partial != null
+      sqliteFinalize(partial)
+    end
+    return message
+  end
+  let prepared: Void*? = statement[0]
+
+  if prepared == null
+    return "SQLite migration history delete has no statement"
+  end
+  var failure: String? = null
+
+  if sqliteBindInt(prepared, 1 as Int32, ordinal) != (0 as Int32)
+    failure = sqliteMessage(database)
+  else if sqliteStep(prepared) != (101 as Int32)
+    failure = sqliteMessage(database)
+  else if sqliteChanges(database) != 1
+    failure = "SQLite migration history delete affected an unexpected row count"
+  end
+  let finalized = sqliteFinalize(prepared)
+
+  if failure != null
+    return failure
+  end
+  if finalized != (0 as Int32)
+    return "SQLite migration history delete finalize failed"
+  end
+  return null
+end
+
+def sqliteRebuildForbidden(word: String): Bool
+  return schemaSameIdentifier(word, "CHECK") || schemaSameIdentifier(word, "CONSTRAINT") || schemaSameIdentifier(word, "COLLATE") || schemaSameIdentifier(word, "REFERENCES") || schemaSameIdentifier(word, "FOREIGN") || schemaSameIdentifier(word, "GENERATED") || schemaSameIdentifier(word, "AUTOINCREMENT") || schemaSameIdentifier(word, "UNIQUE") || schemaSameIdentifier(word, "WITHOUT") || schemaSameIdentifier(word, "STRICT") || schemaSameIdentifier(word, "VIRTUAL") || schemaSameIdentifier(word, "CONFLICT") || schemaSameIdentifier(word, "DESC")
+end
+
+## Ignore quoted identifiers and literal defaults while screening table options.
+def sqliteRebuildUnsupportedSql(sql: String): Bool
+  var quote = 0
+  var start = -1
+  var index = 0
+  let length = host::stringByteLength(sql)
+
+  while index < length
+    let byte = host::stringByteAt(sql, index) as Int
+
+    if quote != 0
+      let close = quote == 91 ? 93 : quote
+
+      if byte == close
+        if quote != 91 && index + 1 < length && host::stringByteAt(sql, index + 1) as Int == close
+          index = index + 1
+        else
+          quote = 0
+        end
+      end
+    else if byte == 45 && index + 1 < length && host::stringByteAt(sql, index + 1) as Int == 45
+      if start >= 0 && sqliteRebuildForbidden(host::stringSlice(sql, start, index - start))
+        return true
+      end
+      start = -1
+      index = index + 2
+      while index < length && host::stringByteAt(sql, index) as Int != 10 && host::stringByteAt(sql, index) as Int != 13
+        index = index + 1
+      end
+    else if byte == 47 && index + 1 < length && host::stringByteAt(sql, index + 1) as Int == 42
+      if start >= 0 && sqliteRebuildForbidden(host::stringSlice(sql, start, index - start))
+        return true
+      end
+      start = -1
+      index = index + 2
+      var closed = false
+
+      while index + 1 < length && !closed
+        if host::stringByteAt(sql, index) as Int == 42 && host::stringByteAt(sql, index + 1) as Int == 47
+          closed = true
+        else
+          index = index + 1
+        end
+      end
+      if !closed
+        return true
+      end
+      index = index + 1
+    else if byte == 39 || byte == 34 || byte == 96 || byte == 91
+      if start >= 0 && sqliteRebuildForbidden(host::stringSlice(sql, start, index - start))
+        return true
+      end
+      start = -1
+      quote = byte
+    else if (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) || (byte >= 48 && byte <= 57) || byte == 95
+      start = index if start < 0
+    else if start >= 0
+      if sqliteRebuildForbidden(host::stringSlice(sql, start, index - start))
+        return true
+      end
+      start = -1
+    end
+    index = index + 1
+  end
+  return start >= 0 && sqliteRebuildForbidden(host::stringSlice(sql, start, length - start))
+end
+
+def sqliteRebuildDefault(column: readonly SchemaColumn): String?
+  let value = column.defaultValue()
+
+  if value == null
+    return null
+  end
+  match value
+    case SchemaDefault.Null()
+      return "NULL"
+    case SchemaDefault.Bool(item)
+      return item ? "1" : "0"
+    case SchemaDefault.Int(item)
+      return item as String
+    case SchemaDefault.Float(item)
+      return item as String
+    case SchemaDefault.Text(item)
+      return schemaTextLiteral(item)
+  end
+end
+
+def sqliteRebuildType(column: readonly SchemaColumn): String
+  match column.type()
+    case SchemaType.Bool()
+      return "INTEGER"
+    case SchemaType.Int()
+      return "INTEGER"
+    case SchemaType.Float()
+      return "REAL"
+    case SchemaType.Text()
+      return "TEXT"
+  end
+end
+
+unsafe def sqliteRebuildAny(database: Void*, sql: String): Int
+  let statement = stackalloc Void*[1]
+  let status = sqlitePrepareMigration(database, sql, statement)
+  let prepared: Void*? = statement[0]
+
+  if status != (0 as Int32) || prepared == null
+    if prepared != null
+      sqliteFinalize(prepared)
+    end
+    return -1
+  end
+  let stepped = sqliteStep(prepared)
+  let finalized = sqliteFinalize(prepared)
+
+  if finalized != (0 as Int32) || (stepped != (100 as Int32) && stepped != (101 as Int32))
+    return -1
+  end
+  return stepped == (100 as Int32) ? 1 : 0
+end
+
+unsafe def sqliteRebuildInspect(database: Void*, before: readonly SchemaTable, after: readonly SchemaTable): MigrationFailure?
+  if before.identity() != after.identity() || before.count() == 0 || after.count() == 0
+    return MigrationFailure.Validation("rebuild requires the same logical table and columns")
+  end
+  let oldName = schemaTextLiteral(before.name())
+  let newName = schemaTextLiteral(after.name())
+  let temporary = schemaTextLiteral("__neri_rebuild")
+
+  if sqliteRebuildAny(database, "SELECT 1 FROM main.sqlite_schema WHERE lower(name) = lower(" + temporary + ") LIMIT 1") != 0 || sqliteRebuildAny(database, "SELECT 1 FROM temp.sqlite_schema WHERE lower(name) = lower(" + temporary + ") LIMIT 1") != 0
+    return MigrationFailure.Drift("SQLite rebuild staging name is unavailable")
+  end
+  if sqliteRebuildAny(database, "SELECT 1 FROM temp.sqlite_schema WHERE lower(name) = lower(" + oldName + ") OR lower(name) = lower(" + newName + ") LIMIT 1") != 0
+    return MigrationFailure.Drift("SQLite rebuild target is shadowed by a temporary object")
+  end
+  var indexName = 0
+
+  while indexName < after.indexCount()
+    let definition = after.indexAt(indexName)
+
+    if definition != null && sqliteRebuildAny(database, "SELECT 1 FROM temp.sqlite_schema WHERE lower(name) = lower(" + schemaTextLiteral(definition.name()) + ") LIMIT 1") != 0
+      return MigrationFailure.Drift("SQLite rebuild index is shadowed by a temporary object")
+    end
+    indexName = indexName + 1
+  end
+  if !schemaSameIdentifier(before.name(), after.name()) && sqliteRebuildAny(database, "SELECT 1 FROM main.sqlite_schema WHERE lower(name) = lower(" + newName + ") LIMIT 1") != 0
+    return MigrationFailure.Drift("SQLite rebuild destination already exists")
+  end
+  let foreignKeys = sqliteRebuildAny(database, "SELECT 1 FROM main.sqlite_schema AS s JOIN pragma_foreign_key_list(s.name, 'main') AS f WHERE s.type = 'table' AND (lower(s.name) = lower(" + oldName + ") OR lower(f.\"table\") = lower(" + oldName + ")) LIMIT 1")
+
+  if foreignKeys != 0
+    return foreignKeys < 0 ? MigrationFailure.Provider(sqliteMessage(database)) : MigrationFailure.Unsupported("SQLite rebuild cannot preserve foreign keys referencing or owned by the table")
+  end
+  let dependencies = sqliteRebuildAny(database, "SELECT 1 FROM main.sqlite_schema WHERE type IN ('trigger', 'view') AND (lower(tbl_name) = lower(" + oldName + ") OR lower(sql) LIKE '%' || lower(" + oldName + ") || '%') LIMIT 1")
+
+  if dependencies != 0
+    return dependencies < 0 ? MigrationFailure.Provider(sqliteMessage(database)) : MigrationFailure.Unsupported("SQLite rebuild cannot preserve triggers or views referencing the table")
+  end
+  let temporaryDependencies = sqliteRebuildAny(database, "SELECT 1 FROM temp.sqlite_schema WHERE type IN ('trigger', 'view') AND (lower(tbl_name) = lower(" + oldName + ") OR lower(sql) LIKE '%' || lower(" + oldName + ") || '%') LIMIT 1")
+
+  if temporaryDependencies != 0
+    return temporaryDependencies < 0 ? MigrationFailure.Provider(sqliteMessage(database)) : MigrationFailure.Unsupported("SQLite rebuild cannot preserve temporary triggers or views referencing the table")
+  end
+  match sqliteInspectSchema(database)
+    case SQLiteSchemaResult.Failure(message)
+      return MigrationFailure.Provider(message)
+    case SQLiteSchemaResult.Snapshot(snapshot)
+      var actualCount = 0
+      var position = 0
+      var createSql: String? = null
+
+      while position < snapshot.count()
+        let actual = snapshot.at(position)
+
+        if actual != null && schemaSameIdentifier(actual.table(), before.name())
+          actualCount = actualCount + 1
+          createSql = actual.createSql()
+          var expected: readonly SchemaColumn? = null
+          var field = 0
+
+          while field < before.count()
+            let candidate = before.at(field)
+
+            if candidate != null && schemaSameIdentifier(candidate.column().name(), actual.name())
+              expected = candidate.column()
+            end
+            field = field + 1
+          end
+          if expected == null || actual.hidden() != 0 || actual.declaredType() != sqliteRebuildType(expected) || actual.required() != (!expected.nullable() && (!expected.primaryKey() || sqliteRebuildType(expected) == "TEXT")) || actual.keyPosition() != (expected.primaryKey() ? 1 : 0) || actual.defaultSql() != sqliteRebuildDefault(expected)
+            return MigrationFailure.Drift("SQLite rebuild source column differs from declared schema")
+          end
+        end
+        position = position + 1
+      end
+      if actualCount != before.count() || createSql == null || sqliteRebuildUnsupportedSql(createSql)
+        return MigrationFailure.Drift("SQLite rebuild source has missing columns or unsupported table constraints")
+      end
+  end
+  return sqliteRebuildInspectIndexes(database, before)
+end
+
+unsafe def sqliteRebuildInspectIndexes(database: Void*, before: readonly SchemaTable): MigrationFailure?
+  let sql = "SELECT l.name, l.\"unique\", l.origin, l.partial, x.seqno, x.cid, x.name, x.\"desc\", x.coll FROM pragma_index_list(" + schemaTextLiteral(before.name()) + ", 'main') AS l JOIN pragma_index_xinfo(l.name, 'main') AS x WHERE x.\"key\" = 1 ORDER BY l.seq, x.seqno"
+  let statement = stackalloc Void*[1]
+  let status = sqlitePrepareMigration(database, sql, statement)
+  let prepared: Void*? = statement[0]
+
+  if status != (0 as Int32) || prepared == null
+    if prepared != null
+      sqliteFinalize(prepared)
+    end
+    return MigrationFailure.Provider(sqliteMessage(database))
+  end
+  var seen = 0
+  var keys = 0
+  var seenTextPrimaryKey = false
+  var failure: MigrationFailure? = null
+  var step = sqliteStep(prepared)
+
+  while step == (100 as Int32) && failure == null
+    let name = sqliteSchemaText(prepared, 0)
+    let origin = sqliteSchemaText(prepared, 2)
+    let column = sqliteSchemaText(prepared, 6)
+    let collation = sqliteSchemaText(prepared, 8)
+
+    if name == null || origin == null || column == null || collation == null || sqliteColumnType(prepared, 1 as Int32) != (1 as Int32) || sqliteColumnType(prepared, 3 as Int32) != (1 as Int32) || sqliteColumnType(prepared, 4 as Int32) != (1 as Int32) || sqliteColumnType(prepared, 5 as Int32) != (1 as Int32) || sqliteColumnType(prepared, 7 as Int32) != (1 as Int32)
+      failure = MigrationFailure.Drift("SQLite rebuild source index metadata is invalid")
+    else
+      let index = before.findIndex(name)
+      let ordinal = sqliteColumnInt(prepared, 4 as Int32)
+      let identity = index == null ? null : index.at(ordinal)
+      let field = identity == null ? null : before.find(identity)
+
+      if origin == "pk"
+        var primary: readonly SchemaColumn? = null
+        var fieldIndex = 0
+
+        while fieldIndex < before.count()
+          let candidate = before.at(fieldIndex)
+
+          if candidate != null && candidate.column().primaryKey()
+            primary = candidate.column()
+          end
+          fieldIndex = fieldIndex + 1
+        end
+        if primary == null || sqliteRebuildType(primary) != "TEXT" || !schemaSameIdentifier(column, primary.name()) || seenTextPrimaryKey || ordinal != 0 || sqliteColumnInt(prepared, 1 as Int32) != 1 || sqliteColumnInt(prepared, 3 as Int32) != 0 || sqliteColumnInt(prepared, 5 as Int32) < 0 || sqliteColumnInt(prepared, 7 as Int32) != 0 || !schemaSameIdentifier(collation, "BINARY")
+          failure = MigrationFailure.Drift("SQLite rebuild source primary-key index differs from declared schema")
+        else
+          seenTextPrimaryKey = true
+        end
+      else
+        if index == null || field == null || origin != "c" || sqliteColumnInt(prepared, 3 as Int32) != 0 || sqliteColumnInt(prepared, 5 as Int32) < 0 || sqliteColumnInt(prepared, 7 as Int32) != 0 || !schemaSameIdentifier(collation, "BINARY") || !schemaSameIdentifier(column, field.column().name()) || (sqliteColumnInt(prepared, 1 as Int32) != 0) != index.unique()
+          failure = MigrationFailure.Drift("SQLite rebuild source has an unmanaged or changed index")
+        else
+          seen = seen + 1 if ordinal == 0
+          keys = keys + 1
+        end
+      end
+    end
+    if failure == null
+      step = sqliteStep(prepared)
+    end
+  end
+  if failure == null && step != (101 as Int32)
+    failure = MigrationFailure.Provider(sqliteMessage(database))
+  end
+  let finalized = sqliteFinalize(prepared)
+
+  if failure != null
+    return failure
+  end
+  if finalized != (0 as Int32)
+    return MigrationFailure.Provider("SQLite rebuild index inspection finalize failed")
+  end
+  var expectedKeys = 0
+
+  var ordinal = 0
+
+  while ordinal < before.indexCount()
+    let index = before.indexAt(ordinal)
+
+    if index != null
+      expectedKeys = expectedKeys + index.count()
+    end
+    ordinal = ordinal + 1
+  end
+  var needsTextPrimaryKey = false
+
+  ordinal = 0
+
+  while ordinal < before.count()
+    let field = before.at(ordinal)
+
+    if field != null && field.column().primaryKey() && sqliteRebuildType(field.column()) == "TEXT"
+      needsTextPrimaryKey = true
+    end
+    ordinal = ordinal + 1
+  end
+  if seen != before.indexCount() || keys != expectedKeys || seenTextPrimaryKey != needsTextPrimaryKey
+    return MigrationFailure.Drift("SQLite rebuild source index count differs from declared schema")
+  end
+  return null
+end
+
+unsafe def sqliteRebuildValidateRows(database: Void*, after: readonly SchemaTable): MigrationFailure?
+  var columns = ""
+  var index = 0
+
+  while index < after.count()
+    let field = after.at(index)
+
+    if field == null
+      return MigrationFailure.Validation("SQLite rebuild target field is missing")
+    end
+    columns = columns + (index == 0 ? "" : ", ") + schemaQuote(field.column().name())
+    index = index + 1
+  end
+  let statement = stackalloc Void*[1]
+  let status = sqlitePrepareMigration(database, "SELECT " + columns + " FROM main.\"__neri_rebuild\"", statement)
+  let prepared: Void*? = statement[0]
+
+  if status != (0 as Int32) || prepared == null
+    if prepared != null
+      sqliteFinalize(prepared)
+    end
+    return MigrationFailure.Provider(sqliteMessage(database))
+  end
+  var failure: MigrationFailure? = null
+  var step = sqliteStep(prepared)
+
+  while step == (100 as Int32) && failure == null
+    index = 0
+    while index < after.count() && failure == null
+      let field = after.at(index)
+
+      if field == null
+        failure = MigrationFailure.Validation("SQLite rebuild target field is missing")
+      else
+        let column = field.column()
+        let stored = sqliteColumnType(prepared, index as Int32)
+
+        if stored == (5 as Int32)
+          if !column.nullable()
+            failure = MigrationFailure.Validation("SQLite rebuild target has a null required value: " + column.name())
+          end
+        else
+          match column.type()
+            case SchemaType.Bool()
+              if stored != (1 as Int32) || (sqliteColumnInt(prepared, index as Int32) != 0 && sqliteColumnInt(prepared, index as Int32) != 1)
+                failure = MigrationFailure.Validation("SQLite rebuild target has an invalid Bool value: " + column.name())
+              end
+            case SchemaType.Int()
+              if stored != (1 as Int32)
+                failure = MigrationFailure.Validation("SQLite rebuild target has an invalid Int value: " + column.name())
+              end
+            case SchemaType.Float()
+              if stored != (2 as Int32) || !dataFloatFinite(sqliteColumnDouble(prepared, index as Int32))
+                failure = MigrationFailure.Validation("SQLite rebuild target has an invalid Float value: " + column.name())
+              end
+            case SchemaType.Text()
+              if stored != (3 as Int32)
+                failure = MigrationFailure.Validation("SQLite rebuild target has an invalid Text value: " + column.name())
+              else
+                let pointer = sqliteColumnText(prepared, index as Int32)
+
+                if pointer == null || sqliteText(pointer, sqliteColumnBytes(prepared, index as Int32) as Int) == null
+                  failure = MigrationFailure.Validation("SQLite rebuild target has invalid UTF-8: " + column.name())
+                end
+              end
+          end
+        end
+      end
+      index = index + 1
+    end
+    if failure == null
+      step = sqliteStep(prepared)
+    end
+  end
+  if failure == null && step != (101 as Int32)
+    failure = MigrationFailure.Provider(sqliteMessage(database))
+  end
+  let finalized = sqliteFinalize(prepared)
+
+  if failure != null
+    return failure
+  end
+  if finalized != (0 as Int32)
+    return MigrationFailure.Provider("SQLite rebuild row validation finalize failed")
+  end
+  return null
+end
+
+unsafe def sqliteRebuildTable(database: Void*, before: readonly SchemaTable, after: readonly SchemaTable): MigrationFailure?
+  let drift = sqliteRebuildInspect(database, before, after)
+
+  if drift != null
+    return drift
+  end
+  match compileSchema(schemaTableCreate(after), SqlDialect.QuestionMark())
+    case SchemaCompileResult.Failure(message)
+      return MigrationFailure.Validation(message)
+    case SchemaCompileResult.Statement(sql)
+  end
+  var definitions = ""
+  var index = 0
+
+  while index < after.count()
+    let field = after.at(index)
+
+    if field == null
+      return MigrationFailure.Validation("SQLite rebuild target field is missing")
+    end
+    match schemaColumnSql(field.column())
+      case SchemaCompileResult.Failure(message)
+        return MigrationFailure.Validation(message)
+      case SchemaCompileResult.Statement(sql)
+        definitions = definitions + (index == 0 ? "" : ", ") + sql
+    end
+    index = index + 1
+  end
+  if sqliteExecuteLiteral(database, "CREATE TABLE main.\"__neri_rebuild\" (" + definitions + ")") != (0 as Int32)
+    return MigrationFailure.Provider("SQLite rebuild create failed: " + sqliteMessage(database))
+  end
+  var targets = ""
+  var sources = ""
+
+  index = 0
+
+  while index < after.count()
+    let field = after.at(index)
+
+    if field == null
+      return MigrationFailure.Validation("SQLite rebuild target field is missing")
+    end
+    let original = before.find(field.identity())
+
+    if original != null
+      let separator = targets == "" ? "" : ", "
+
+      targets = targets + separator + schemaQuote(field.column().name())
+      sources = sources + separator + schemaQuote(original.column().name())
+    end
+    index = index + 1
+  end
+  if targets == "" || sqliteExecuteLiteral(database, "INSERT INTO main.\"__neri_rebuild\" (" + targets + ") SELECT " + sources + " FROM main." + schemaQuote(before.name())) != (0 as Int32)
+    return MigrationFailure.Provider("SQLite rebuild copy failed: " + sqliteMessage(database))
+  end
+  let invalid = sqliteRebuildValidateRows(database, after)
+
+  if invalid != null
+    return invalid
+  end
+  if sqliteExecuteLiteral(database, "DROP TABLE main." + schemaQuote(before.name())) != (0 as Int32)
+    return MigrationFailure.Provider("SQLite rebuild source drop failed: " + sqliteMessage(database))
+  end
+  if sqliteExecuteLiteral(database, "ALTER TABLE main.\"__neri_rebuild\" RENAME TO " + schemaQuote(after.name())) != (0 as Int32)
+    return MigrationFailure.Provider("SQLite rebuild rename failed: " + sqliteMessage(database))
+  end
+  index = 0
+
+  while index < after.indexCount()
+    let definition = after.indexAt(index)
+
+    if definition == null
+      return MigrationFailure.Validation("SQLite rebuild target index is missing")
+    end
+    match compileSchema(schemaIndexCreate(after, definition), SqlDialect.QuestionMark())
+      case SchemaCompileResult.Failure(message)
+        return MigrationFailure.Validation(message)
+      case SchemaCompileResult.Statement(sql)
+        if sqliteExecuteLiteral(database, sql) != (0 as Int32)
+          return MigrationFailure.Provider("SQLite rebuild index create failed: " + sqliteMessage(database))
+        end
+    end
+    index = index + 1
+  end
+  return null
+end
+
+unsafe def sqliteMigrationOperations(database: Void*, migration: readonly Migration, forward: Bool): MigrationFailure?
+  let count = forward ? migration.upCount() : migration.downCount()
+  var index = 0
+
+  while index < count
+    let operation = forward ? migration.upAt(index) : migration.downAt(index)
+
+    if operation == null
+      return MigrationFailure.Validation("migration has a missing schema operation")
+    end
+    var rebuilt = false
+
+    match operation
+      case SchemaOp.RebuildTable(before, after)
+        let failure = sqliteRebuildTable(database, before, after)
+
+        if failure != null
+          return failure
+        end
+        rebuilt = true
+      case SchemaOp.CreateTable(table, columns)
+      case SchemaOp.DropTable(table)
+      case SchemaOp.AddColumn(table, column)
+      case SchemaOp.DropColumn(table, column)
+      case SchemaOp.RenameTable(from, to)
+      case SchemaOp.RenameColumn(table, from, to)
+      case SchemaOp.CreateIndex(name, table, columns, unique)
+      case SchemaOp.DropIndex(name)
+    end
+    if !rebuilt
+      match compileSchema(operation, SqlDialect.QuestionMark())
+        case SchemaCompileResult.Failure(message)
+          return MigrationFailure.Validation(message)
+        case SchemaCompileResult.Statement(sql)
+          let status = sqliteExecuteLiteral(database, sql)
+
+          if status != (0 as Int32)
+            return MigrationFailure.Provider("SQLite schema change failed (code " + ((sqliteExtendedError(database) as Int) as String) + "): " + sqliteMessage(database))
+          end
+      end
+    end
+    index = index + 1
+  end
+  return null
+end

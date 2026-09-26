@@ -1,5 +1,97 @@
 use console
 use host
+use process
+
+def bootstrapCodegenProgress(path: String, consumed: Int, progress: fn(String, Int, Int, String, Int): Void): Int
+  let content = host::readText(path)
+
+  if content == null
+    return consumed
+  end
+  let length = host::stringByteLength(content)
+
+  if length > 1048576 || consumed > length
+    return consumed
+  end
+  var start = consumed
+  var index = consumed
+
+  while index < length
+    if (host::stringByteAt(content, index) as Int) == 10
+      let line = host::stringSlice(content, start, index - start)
+      let parser = new LspJsonParser(line)
+      let value = parser.parse()
+
+      parser.spaces()
+      let phase = value.get("phase").scalarText()
+      let completed = host::parseInt(value.get("completed").scalarText())
+      let total = host::parseInt(value.get("total").scalarText())
+      let sourceOffset = host::parseInt(value.get("sourceOffset").scalarText())
+      let detail = value.get("detail").scalarText()
+
+      if !parser.failed && parser.position == host::stringByteLength(line) && value.get("schemaVersion").scalarText() == "1" && (phase == "lower" || phase == "verify" || phase == "optimize" || phase == "emit") && completed != null && total != null && sourceOffset != null && completed >= 0 && total >= 0 && completed <= total && sourceOffset >= 0 && host::stringByteLength(detail) <= 160
+        progress(phase, completed, total, detail, sourceOffset)
+      end
+      start = index + 1
+    end
+    index = index + 1
+  end
+  return start
+end
+
+def bootstrapRunCodegenWithProgress(executable: String, arguments: String[], path: String, progress: fn(String, Int, Int, String, Int): Void): Bool
+  let options = new process::SpawnOptions(executable)
+
+  options.arguments = arguments
+  let started = process::spawn(options)
+  let child = started.child()
+
+  if child == null
+    progress("end", 0, 0, "", 0)
+    console::println("could not execute '" + executable + "': " + host::errorMessage())
+    return false
+  end
+  var consumed = 0
+  var completed = child.wait(100)
+
+  while completed.running && completed.failure == null
+    consumed = bootstrapCodegenProgress(path, consumed, progress)
+    completed = child.wait(100)
+  end
+  consumed = bootstrapCodegenProgress(path, consumed, progress)
+  progress("end", 0, 0, "", 0)
+  if completed.stderr.Length > 0
+    unsafe
+      borrow completed.stderr as pointer
+        runCacheWrite(pointer, completed.stderr.Length)
+      end
+    end
+  end
+  if completed.stdout.Length > 0
+    let output = host::stringFromBytes(completed.stdout)
+
+    console::print(output) if output != null
+  end
+  let failure = completed.failure
+  let exit = completed.exit
+
+  if failure != null
+    console::println("'" + executable + "' failed while waiting: " + failure.code())
+    child.cancel()
+    child.dispose()
+    return false
+  end
+  child.dispose()
+  if completed.stdoutTruncated || completed.stderrTruncated
+    console::println("'" + executable + "' output exceeded the capture limit")
+    return false
+  end
+  if exit == null || !exit.isExited() || exit.value() != 0
+    console::println("'" + executable + "' failed with status " + (exit == null ? "unknown" : (exit.value() as String)))
+    return false
+  end
+  return true
+end
 
 def bootstrapFindText(text: String, pattern: String): Int
   let textLength = host::stringByteLength(text)
@@ -163,16 +255,47 @@ def bootstrapRun(executable: String, arguments: String[]): Bool
   return true
 end
 
-def bootstrapInvokeCodegen(module: IrModule, emit: readonly EmissionKind, output: String, target: readonly TargetPlatform, release: Bool, debugSources: BootstrapSourceInput? = null, metricsPath: String = "", serializedInput: String = ""): Bool
+def bootstrapReportCodegenMetrics(path: String, prefix: String): Void
+  let text = host::readText(path)
+
+  if text == null
+    return
+  end
+  let parser = new LspJsonParser(text)
+  let record = parser.parse()
+
+  parser.spaces()
+  if parser.failed || parser.position != host::stringByteLength(text) || record.get("schemaVersion").scalarText() != "1"
+    return
+  end
+  let serialized = agentInputInteger(record.get("serializeMs"))
+
+  runCacheReportDuration(true, prefix + "serialize", serialized) if serialized != null && serialized >= 0
+  let nativeMetrics = record.get("native")
+  let keys = ["inputNs", "readerVerifierNs", "loweringAndPreverifyNs", "llvmOptimizationAndPostverifyNs", "targetCodegenNs"]
+  let phases = ["native-input", "native-read-verify", "native-lower-verify", "native-optimize-verify", "native-emit"]
+  var index = 0
+
+  while index < keys.Length
+    let duration = agentInputInteger(nativeMetrics.get(keys[index]))
+
+    runCacheReportDuration(true, prefix + phases[index], duration / 1000000) if duration != null && duration >= 0
+    index = index + 1
+  end
+end
+
+def bootstrapInvokeCodegen(module: IrModule, emit: readonly EmissionKind, output: String, target: readonly TargetPlatform, release: Bool, debugSources: BootstrapSourceInput? = null, metricsPath: String = "", serializedInput: String = "", progress: (fn(String, Int, Int, String, Int): Void)? = null): Bool
   let codegenEmit = emit.codegenName()
 
   if codegenEmit == null
+    progress("end", 0, 0, "", 0) if progress != null
     console::println("native code generation does not support emit kind: " + emit.name())
     return false
   end
   let optionalCodegen = host::environment("NERI_CODEGEN")
 
   if optionalCodegen == null || optionalCodegen == ""
+    progress("end", 0, 0, "", 0) if progress != null
     console::println("NERI_CODEGEN must name the native neri-codegen executable")
     return false
   end
@@ -190,6 +313,7 @@ def bootstrapInvokeCodegen(module: IrModule, emit: readonly EmissionKind, output
   writeStarted = runCacheTime() if metricsPath != ""
 
   if !host::writeText(transport, serialized)
+    progress("end", 0, 0, "", 0) if progress != null
     console::println("could not write Neri IR transport: " + host::errorMessage())
     return false
   end
@@ -210,23 +334,37 @@ def bootstrapInvokeCodegen(module: IrModule, emit: readonly EmissionKind, output
     arguments = host::appendString(arguments, "--metrics")
     arguments = host::appendString(arguments, nativeMetrics)
   end
+  let progressPath = output + ".native-progress.jsonl"
+
+  if progress != null
+    host::removeFile(progressPath)
+    arguments = host::appendString(arguments, "--progress")
+    arguments = host::appendString(arguments, progressPath)
+  end
   var source = debugSources
 
   while source != null && !release
     arguments = host::appendString(arguments, "--debug-source")
     arguments = host::appendString(arguments, source.id)
-    arguments = host::appendString(arguments, source.path)
+    arguments = host::appendString(arguments, source.identityPath)
     source = source.nextInput
   end
   var codegenStarted = 0
 
   codegenStarted = runCacheTime() if metricsPath != ""
-  let succeeded = bootstrapRun(codegen, arguments)
+  var succeeded = false
+
+  if progress == null
+    succeeded = bootstrapRun(codegen, arguments)
+  else
+    succeeded = bootstrapRunCodegenWithProgress(codegen, arguments, progressPath, progress)
+  end
   var codegenMilliseconds = 0
 
   codegenMilliseconds = runCacheTime() - codegenStarted if metricsPath != ""
 
   host::removeFile(transport)
+  host::removeFile(progressPath) if progress != null
   if metricsPath != ""
     let measured = host::readText(nativeMetrics)
     var nativeMetricsText = "null"
@@ -246,7 +384,7 @@ def bootstrapLinkExecutable(module: IrModule, objectPath: String, output: String
   return bootstrapLinkObjects(module, objects, output, target)
 end
 
-def bootstrapLinkObjects(module: IrModule, objects: StringBuffer, output: String, target: readonly TargetPlatform): Bool
+def bootstrapLinkObjects(module: IrModule, objects: StringBuffer, output: String, target: readonly TargetPlatform, references: ReferenceInputs? = null, linkInputs: NativeLinkInputs? = null): Bool
   let optionalManifest = host::environment("NERI_RUNTIME_MANIFEST")
 
   if optionalManifest == null || optionalManifest == ""
@@ -267,15 +405,30 @@ def bootstrapLinkObjects(module: IrModule, objects: StringBuffer, output: String
   let abiMajor = bootstrapManifestRequiredInt(manifestText, "abiMajor")
   let abiMinor = bootstrapManifestRequiredInt(manifestText, "abiMinor")
   let features = bootstrapManifestRequiredInt(manifestText, "features")
-  let requiredMinor = bootstrapRequiredRuntimeMinor(module)
-  let requiredFeatures = bootstrapRequiredRuntimeFeatures(module)
+  var requiredMinor = bootstrapRequiredRuntimeMinor(module)
+  var requiredFeatures = bootstrapRequiredRuntimeFeatures(module)
+
+  if references != null
+    if !references.verifyObjects()
+      console::println(references.error)
+      return false
+    end
+    requiredMinor = references.runtimeMinor if references.runtimeMinor > requiredMinor
+    requiredFeatures = requiredFeatures.mergedWith(references.runtimeFeatures)
+    var object = references.objects.first.nextNode
+
+    while object != null
+      objects.add(object.value)
+      object = object.nextNode
+    end
+  end
 
   if schemaVersion < 0 || transportMajor < 0 || transportMinor < 0 || abiMajor < 0 || abiMinor < 0 || features < 0
     console::println("runtime manifest is missing a required field")
     return false
   end
-  if schemaVersion != 2 || bootstrapManifestString(manifestText, "toolchainVersion") != "0.2.0-dev" || transportMajor != irTransportMajor() || transportMinor != irTransportMinor() || bootstrapManifestString(manifestText, "target") != target.name() || abiMajor != 1
-    console::println("runtime manifest does not match Neri 0.2.0-dev, IR transport 1.8, target '" + target.name() + "', and ABI v1")
+  if schemaVersion != 2 || bootstrapManifestString(manifestText, "toolchainVersion") != "0.2.0" || transportMajor != irTransportMajor() || transportMinor != irTransportMinor() || bootstrapManifestString(manifestText, "target") != target.name() || abiMajor != 1
+    console::println("runtime manifest does not match Neri 0.2.0, IR transport 1.8, target '" + target.name() + "', and ABI v1")
     return false
   end
   if abiMinor < requiredMinor
@@ -284,6 +437,10 @@ def bootstrapLinkObjects(module: IrModule, objects: StringBuffer, output: String
   end
   if !requiredFeatures.isSatisfiedByBits(features)
     console::println("runtime manifest does not provide the required ABI features")
+    return false
+  end
+  if references != null && !referenceBitsSatisfied(references.runtimeFeatureBits, features)
+    console::println("runtime manifest does not provide the reference implementation features")
     return false
   end
   let artifact = bootstrapManifestString(manifestText, "artifact")
@@ -304,12 +461,21 @@ def bootstrapLinkObjects(module: IrModule, objects: StringBuffer, output: String
   if configuredLinker != null && configuredLinker != ""
     linker = configuredLinker
   end
-  let sessionRuntime = requiredFeatures.hasSessionModules()
-  var arguments = platformLinkObjectsArguments(target, objects, optionalRuntime, output, sessionRuntime)
+  let reachable = new IrLinkReachability()
+
+  reachable.analyze(module)
+  if reachable.error != ""
+    console::println(reachable.error)
+    return false
+  end
+  let sessionRuntime = reachable.runtimeFeatures.hasSessionModules() || module.sessionEntry != null
+  var arguments = platformLinkObjectsArguments(target, objects, optionalRuntime, output, sessionRuntime, reachable.exportedSymbols)
 
   # Session-loaded code can use crypto even when the host object has no direct
   # crypto call, so Linux must link libcrypto for a session host as well.
-  if target.isLinux() && (requiredFeatures.hasCrypto() || sessionRuntime)
+  let requiresCrypto = reachable.runtimeFeatures.hasCrypto()
+
+  if target.isLinux() && (requiresCrypto || sessionRuntime)
     arguments = host::appendString(arguments, "-lcrypto")
   end
   if module.requiredFeatures.hasNativeLibraries()
@@ -332,7 +498,7 @@ def bootstrapLinkObjects(module: IrModule, objects: StringBuffer, output: String
     while imported != null
       let library = imported.nativeLibrary
 
-      if library != ""
+      if library != "" && reachable.nativeLibraries.find(library) != null
         if !semanticNativeLibraryName(library)
           console::println("invalid native library name")
           return false
@@ -354,22 +520,63 @@ def bootstrapLinkObjects(module: IrModule, objects: StringBuffer, output: String
       imported = imported.nextImport
     end
   end
-  return bootstrapRun(linker, arguments)
+  var dependencyDirectory: String? = null
+  var dependencyPath = ""
+
+  if linkInputs != null && target.isMacOS()
+    dependencyDirectory = bootstrapRunDirectory()
+    if dependencyDirectory != null
+      dependencyPath = dependencyDirectory + "/link-inputs"
+      arguments = host::appendString(arguments, "-Xlinker")
+      arguments = host::appendString(arguments, "-dependency_info")
+      arguments = host::appendString(arguments, "-Xlinker")
+      arguments = host::appendString(arguments, dependencyPath)
+    end
+  end
+  var succeeded = bootstrapRun(linker, arguments)
+
+  if succeeded && linkInputs != null && dependencyPath != ""
+    if linkInputs.load(dependencyPath, objects, output)
+      # Discover the linker graph, then bracket the published link with exact
+      # input snapshots. Hashing only after linking could certify stale bytes.
+      let before = linkInputs.snapshot()
+
+      linkInputs.valid = false
+      if before != ""
+        succeeded = bootstrapRun(linker, arguments)
+        if succeeded
+          let observed = new NativeLinkInputs()
+
+          if observed.load(dependencyPath, objects, output)
+            linkInputs.valid = observed.snapshot() == before
+          end
+        end
+      end
+    end
+  end
+  if dependencyDirectory != null
+    bootstrapRemoveRunDirectory(dependencyDirectory)
+  end
+  return succeeded
 end
 
-def bootstrapEmitNative(module: IrModule, emit: readonly EmissionKind, output: String, target: readonly TargetPlatform, release: Bool, timings: Bool = false, debugSources: BootstrapSourceInput? = null): Bool
+def bootstrapEmitNative(module: IrModule, emit: readonly EmissionKind, output: String, target: readonly TargetPlatform, release: Bool, timings: Bool = false, debugSources: BootstrapSourceInput? = null, references: ReferenceInputs? = null, linkInputs: NativeLinkInputs? = null, progress: (fn(String, Int, Int): Void)? = null, nativeProgress: (fn(String, Int, Int, String, Int): Void)? = null): Bool
   if !emit.isExecutable()
-    return bootstrapInvokeCodegen(module, emit, output, target, release)
+    return bootstrapInvokeCodegen(module, emit, output, target, release, null, "", "", nativeProgress)
   end
   let objectPath = output + ".o"
   let codegenStarted = runCacheTime()
 
-  if !bootstrapInvokeCodegen(module, emit, objectPath, target, release, debugSources)
+  if !bootstrapInvokeCodegen(module, emit, objectPath, target, release, debugSources, "", "", nativeProgress)
     return false
   end
   runCacheReport(timings, "codegen", codegenStarted)
   let linkStarted = runCacheTime()
-  let linked = bootstrapLinkExecutable(module, objectPath, output, target)
+  let objects = new StringBuffer()
+
+  objects.add(objectPath)
+  progress("link", 0, 0) if progress != null
+  let linked = bootstrapLinkObjects(module, objects, output, target, references, linkInputs)
 
   runCacheReport(timings, "link", linkStarted)
   let symbols = !linked || bootstrapExecutableSymbols(output, target, release)
@@ -408,6 +615,8 @@ def bootstrapUnitSources(module: IrModule, sources: BootstrapSourceInput?): Boot
     end
     if declared != null
       let copy = new BootstrapSourceInput(source.path, source.id, source.text)
+
+      copy.identityPath = source.identityPath
       let tail = last
 
       if tail == null
@@ -422,36 +631,7 @@ def bootstrapUnitSources(module: IrModule, sources: BootstrapSourceInput?): Boot
   return first
 end
 
-def bootstrapAotConfiguration(owners: StringBuffer): String?
-  let manifests = new StringBuffer()
-  var result = ""
-  var owner = owners.first.nextNode
-
-  while owner != null
-    var separator = host::stringByteLength(owner.value) - 1
-
-    while separator >= 0 && host::stringByteAt(owner.value, separator) != (35 as Byte)
-      separator = separator - 1
-    end
-    if separator > 0
-      let path = host::stringSlice(owner.value, 0, separator)
-
-      if !neriProjectListed(manifests, path)
-        let contents = host::readText(path)
-
-        if contents == null
-          return null
-        end
-        manifests.add(path)
-        result = result + runCacheFrame(path) + runCacheFrame(contents)
-      end
-    end
-    owner = owner.nextNode
-  end
-  return result
-end
-
-def bootstrapCompileUnit(unit: IrCompilationUnit, target: readonly TargetPlatform, release: Bool, timings: Bool, noCache: Bool, sources: BootstrapSourceInput?, configuration: String, temporaryDirectories: StringBuffer): String?
+def bootstrapCompileUnit(unit: IrCompilationUnit, target: readonly TargetPlatform, release: Bool, timings: Bool, noCache: Bool, sources: BootstrapSourceInput?, temporaryDirectories: StringBuffer, progress: (fn(String, Int, Int): Void)? = null, nativeProgress: (fn(String, Int, Int, String, Int): Void)? = null): String?
   let started = runCacheTime()
   let payload = irSerializePayload(unit.module)
   let payloadDigest = sha256FastWire(payload.bytes)
@@ -459,12 +639,15 @@ def bootstrapCompileUnit(unit: IrCompilationUnit, target: readonly TargetPlatfor
   let unitSources = bootstrapUnitSources(unit.module, sources)
 
   if !noCache
-    cache.prepare(unit.module, target, release, unitSources, "neri-aot-object-cache-v2",
-      runCacheFrame(unit.owner) + runCacheFrame(configuration), [], payloadDigest, true)
+    # The serialized unit is the complete codegen input, including retained
+    # contracts. Unrelated project manifests must not invalidate its object.
+    cache.prepare(unit.module, target, release, unitSources, "neri-aot-object-cache-v3",
+      runCacheFrame(unit.key), [], payloadDigest, true)
   end
   let hit = cache.hit()
 
   runCacheReport(timings, hit ? "object-cache-hit" : "object-cache-miss", started)
+  progress("cache-hit", 0, 0) if hit && progress != null
   if hit
     return cache.executable
   end
@@ -476,6 +659,7 @@ def bootstrapCompileUnit(unit: IrCompilationUnit, target: readonly TargetPlatfor
   directory = bootstrapRunDirectory() if directory == null
 
   if directory == null
+    progress("load", 0, 0) if progress != null
     console::println("could not create temporary object directory")
     return null
   end
@@ -483,7 +667,7 @@ def bootstrapCompileUnit(unit: IrCompilationUnit, target: readonly TargetPlatfor
   let codegenStarted = runCacheTime()
   let serialized = irSerializeEnvelopePayloadHex(unit.module, payload, payloadDigest)
 
-  if !bootstrapInvokeCodegen(unit.module, EmissionKind.object(), path, target, release, unitSources, "", serialized)
+  if !bootstrapInvokeCodegen(unit.module, EmissionKind.object(), path, target, release, unitSources, "", serialized, nativeProgress)
     bootstrapRemoveRunDirectory(directory)
     return null
   end
@@ -499,14 +683,14 @@ def bootstrapCompileUnit(unit: IrCompilationUnit, target: readonly TargetPlatfor
   return path
 end
 
-def bootstrapEmitCompilationUnits(module: IrModule, units: IrCompilationUnit, output: String, target: readonly TargetPlatform, release: Bool, timings: Bool, noCache: Bool, sources: BootstrapSourceInput?, configuration: String): Bool
+def bootstrapEmitCompilationUnits(module: IrModule, units: IrCompilationUnit, output: String, target: readonly TargetPlatform, release: Bool, timings: Bool, noCache: Bool, sources: BootstrapSourceInput?, linkInputs: NativeLinkInputs? = null, progress: (fn(String, Int, Int): Void)? = null, nativeProgress: (fn(String, Int, Int, String, Int): Void)? = null, references: ReferenceInputs? = null): Bool
   let objects = new StringBuffer()
   let temporaryDirectories = new StringBuffer()
   var unit: IrCompilationUnit? = units
   var succeeded = true
 
   while unit != null && succeeded
-    let object = bootstrapCompileUnit(unit, target, release, timings, noCache, sources, configuration, temporaryDirectories)
+    let object = bootstrapCompileUnit(unit, target, release, timings, noCache, sources, temporaryDirectories, progress, nativeProgress)
 
     if object == null
       succeeded = false
@@ -518,7 +702,8 @@ def bootstrapEmitCompilationUnits(module: IrModule, units: IrCompilationUnit, ou
   if succeeded
     let started = runCacheTime()
 
-    succeeded = bootstrapLinkObjects(module, objects, output, target)
+    progress("link", 0, 0) if progress != null
+    succeeded = bootstrapLinkObjects(module, objects, output, target, references, linkInputs)
     runCacheReport(timings, "link", started)
     succeeded = bootstrapExecutableSymbols(output, target, release) if succeeded
   end

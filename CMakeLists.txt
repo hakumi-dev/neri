@@ -148,17 +148,22 @@ add_library(neri_runtime STATIC
   native/platform/host.cpp
   native/platform/posix_launch.cpp
   native/platform/process.cpp
+  native/platform/readiness_channel.cpp
   native/platform/session_loader.cpp
   native/runtime/entry.cpp
   native/runtime/math.cpp
   native/runtime/runtime.cpp
   native/runtime/task_executor.cpp
+  native/runtime/worker_pool.cpp
   ${NERI_PLATFORM_SOURCES}
   native/runtime/test_support.cpp
 )
 set_target_properties(neri_runtime PROPERTIES OUTPUT_NAME "neri-runtime")
 target_compile_definitions(neri_runtime PRIVATE NERI_RUNTIME_BUILD=1)
 target_compile_definitions(neri_runtime PUBLIC NERI_RUNTIME_STATIC=1)
+if(NOT APPLE)
+  target_compile_options(neri_runtime PRIVATE -ffunction-sections -fdata-sections)
+endif()
 if(WIN32)
   target_link_libraries(neri_runtime PUBLIC ws2_32 bcrypt shell32)
 elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
@@ -198,7 +203,10 @@ if(BUILD_TESTING)
   target_link_libraries(neri_process_test PRIVATE neri_build_options)
 
   add_executable(neri_platform_host_tests tests/native/platform_host_tests.cpp)
-  target_link_libraries(neri_platform_host_tests PRIVATE neri_build_options neri_runtime)
+  target_link_libraries(neri_platform_host_tests PRIVATE neri_build_options neri_runtime Threads::Threads)
+  if(NERI_THREAD_SANITIZER)
+    target_compile_options(neri_platform_host_tests PRIVATE -fsanitize=thread -fno-omit-frame-pointer)
+  endif()
   add_test(NAME native_platform_host COMMAND neri_platform_host_tests)
   set_tests_properties(native_platform_host PROPERTIES TIMEOUT 20)
   if(WIN32)
@@ -245,6 +253,10 @@ if(BUILD_TESTING)
   add_executable(neri_gc_pressure tests/native/gc_pressure.cpp)
   target_link_libraries(neri_gc_pressure PRIVATE neri_build_options neri_runtime)
   add_test(NAME native_gc_pressure COMMAND neri_gc_pressure)
+  add_test(NAME native_memory_profile COMMAND neri_gc_pressure)
+  set_tests_properties(native_memory_profile PROPERTIES
+    ENVIRONMENT "NERI_MEMORY_PROFILE=1"
+    PASS_REGULAR_EXPRESSION "\\\"event\\\":\\\"neri_memory_profile\\\".*\\\"gc_collections\\\":[1-9].*\\\"types\\\":\\{\\\"gc-pressure-block\\\"")
 
   if(NOT WIN32)
   add_executable(neri_worker_heaps tests/native/worker_heaps.c)
@@ -253,9 +265,25 @@ if(BUILD_TESTING)
   if(NERI_THREAD_SANITIZER)
     target_compile_options(neri_worker_heaps PRIVATE -fsanitize=thread -fno-omit-frame-pointer)
   endif()
+  add_executable(neri_worker_pool tests/native/worker_pool.c)
+  target_include_directories(neri_worker_pool PRIVATE native/runtime)
+  target_link_libraries(neri_worker_pool PRIVATE neri_build_options neri_runtime Threads::Threads)
+  if(NERI_THREAD_SANITIZER)
+    target_compile_options(neri_worker_pool PRIVATE -fsanitize=thread -fno-omit-frame-pointer)
+  endif()
+  add_test(NAME native_worker_pool COMMAND neri_worker_pool)
+  set_tests_properties(native_worker_pool PROPERTIES TIMEOUT 30)
   add_test(NAME native_worker_heaps COMMAND neri_worker_heaps)
   set_tests_properties(native_worker_heaps PROPERTIES TIMEOUT 30)
   endif()
+
+  add_executable(neri_net_poll_many tests/native/net_poll_many.c)
+  target_link_libraries(neri_net_poll_many PRIVATE neri_build_options neri_runtime Threads::Threads)
+  if(NERI_THREAD_SANITIZER)
+    target_compile_options(neri_net_poll_many PRIVATE -fsanitize=thread -fno-omit-frame-pointer)
+  endif()
+  add_test(NAME native_net_poll_many COMMAND neri_net_poll_many)
+  set_tests_properties(native_net_poll_many PROPERTIES TIMEOUT 20)
 
   add_executable(neri_codegen_tests tests/native/codegen_tests.cpp)
   target_include_directories(neri_codegen_tests SYSTEM PRIVATE ${LLVM_INCLUDE_DIRS})

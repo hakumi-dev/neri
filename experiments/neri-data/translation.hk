@@ -1,18 +1,107 @@
 use fields
 use host
 use quotation
+use tasks
 
 namespace neri_data
+
+class MappingPath
+  internal identity: String
+  internal typeName: String
+  internal parent: readonly MappingPath?
+
+  internal def init(identity: String, typeName: String, parent: readonly MappingPath? = null): Void
+    this.identity = identity
+    this.typeName = typeName
+    this.parent = parent
+  end
+end
+
+def mappingPathPrefix(path: readonly MappingPath, identity: String, typeName: String): MappingPath
+  let parent = path.parent
+
+  if parent == null
+    return new MappingPath(path.identity, path.typeName, new MappingPath(identity, typeName))
+  end
+  return new MappingPath(path.identity, path.typeName, mappingPathPrefix(parent, identity, typeName))
+end
+
+def mappingPathEqual(left: readonly MappingPath, right: readonly MappingPath): Bool
+  if left.identity != right.identity || left.typeName != right.typeName
+    return false
+  end
+  let leftParent = left.parent
+  let rightParent = right.parent
+
+  if leftParent == null || rightParent == null
+    return leftParent == null && rightParent == null
+  end
+  return mappingPathEqual(leftParent, rightParent)
+end
+
+def mappingPathMatches(path: readonly MappingPath, tree: readonly quotation::Tree, index: Int, rootType: String, parameter: Int, depth: Int = 0): Bool
+  if depth > tree.count()
+    return false
+  end
+  let node = tree.nodeAt(index)
+
+  if node == null
+    return false
+  end
+  if translationNodeCode(node.kind()) != 2 || node.identity() != path.identity || node.typeName() != path.typeName
+    return false
+  end
+  let parent = path.parent
+
+  if parent != null
+    if translationOptional(parent.typeName)
+      return false
+    end
+    return mappingPathMatches(parent, tree, node.first(), rootType, parameter, depth + 1)
+  end
+  let receiver = tree.nodeAt(node.first())
+
+  return receiver != null && translationNodeCode(receiver.kind()) == 0 && receiver.index() == parameter && receiver.typeName() == rootType
+end
+
+def mappingPathMatchesGuarded(path: readonly MappingPath, tree: readonly quotation::Tree, index: Int, rootType: String, parameter: Int, optionalRoot: Bool = false, depth: Int = 0): Bool
+  if depth > tree.count()
+    return false
+  end
+  let node = tree.nodeAt(index)
+
+  if node == null || translationNodeCode(node.kind()) != 2 || node.identity() != path.identity
+    return false
+  end
+  if node.typeName() != path.typeName && !(translationOptional(path.typeName) && node.typeName() == semanticTranslationInner(path.typeName))
+    return false
+  end
+  let parent = path.parent
+
+  if parent != null
+    return mappingPathMatchesGuarded(parent, tree, node.first(), rootType, parameter, optionalRoot, depth + 1)
+  end
+  let receiver = tree.nodeAt(node.first())
+
+  return receiver != null && translationNodeCode(receiver.kind()) == 0 && receiver.index() == parameter && (receiver.typeName() == rootType || (optionalRoot && receiver.typeName() == rootType + "?"))
+end
 
 class MappingColumn
   private storedIdentity: String
   private storedTypeName: String
   private storedColumn: String
+  private storedPath: readonly MappingPath
 
-  def init(identity: String, typeName: String, column: String): Void
+  def init(identity: String, typeName: String, column: String, path: readonly MappingPath? = null): Void
     this.storedIdentity = identity
     this.storedTypeName = typeName
     this.storedColumn = column
+
+    if path == null
+      this.storedPath = new MappingPath(identity, typeName)
+    else
+      this.storedPath = path
+    end
   end
 
   public readonly def identity(): String
@@ -26,6 +115,10 @@ class MappingColumn
   public readonly def column(): String
     return this.storedColumn
   end
+
+  internal readonly def path(): readonly MappingPath
+    return this.storedPath
+  end
 end
 
 class MappingColumnNode
@@ -37,15 +130,46 @@ class MappingColumnNode
   end
 end
 
+class MappingPresence
+  private storedPath: readonly MappingPath
+  private storedColumn: String
+
+  internal def init(path: readonly MappingPath, column: String): Void
+    this.storedPath = path
+    this.storedColumn = column
+  end
+
+  internal readonly def path(): readonly MappingPath
+    return this.storedPath
+  end
+
+  internal readonly def column(): String
+    return this.storedColumn
+  end
+end
+
+class MappingPresenceNode
+  internal value: MappingPresence
+  internal next: MappingPresenceNode?
+
+  internal def init(value: MappingPresence): Void
+    this.value = value
+  end
+end
+
 class EntityMapping
   private storedEntityType: String
   private storedTable: String
+  private storedKeyColumn: String?
   private firstColumn: MappingColumnNode?
   private columnCount: Int = 0
+  private firstPresence: MappingPresenceNode?
+  private storedPresenceCount: Int = 0
 
-  def init(entityType: String, table: String, columns: MappingColumn[]): Void
+  def init(entityType: String, table: String, columns: MappingColumn[], keyColumn: String? = null, presences: MappingPresence[]? = null): Void
     this.storedEntityType = entityType
     this.storedTable = table
+    this.storedKeyColumn = keyColumn
     var tail: MappingColumnNode? = null
 
     for value in columns
@@ -59,6 +183,21 @@ class EntityMapping
       tail = node
       this.columnCount = this.columnCount + 1
     end
+    if presences != null
+      var presenceTail: MappingPresenceNode? = null
+
+      for value in presences
+        let node = new MappingPresenceNode(value)
+
+        if presenceTail == null
+          this.firstPresence = node
+        else
+          presenceTail.next = node
+        end
+        presenceTail = node
+        this.storedPresenceCount = this.storedPresenceCount + 1
+      end
+    end
   end
 
   public readonly def entityType(): String
@@ -69,8 +208,45 @@ class EntityMapping
     return this.storedTable
   end
 
+  public readonly def keyColumn(): String?
+    return this.storedKeyColumn
+  end
+
   public readonly def count(): Int
     return this.columnCount
+  end
+
+  internal readonly def presenceCount(): Int
+    return this.storedPresenceCount
+  end
+
+  internal readonly def presenceAt(index: Int): readonly MappingPresence?
+    var current = this.firstPresence
+    var position = 0
+
+    while current != null
+      if position == index
+        return current.value
+      end
+      current = current.next
+      position = position + 1
+    end
+    return null
+  end
+
+  ## Returns a mapped column in declaration order for typed relational stages.
+  public readonly def columnAt(index: Int): readonly MappingColumn?
+    var current = this.firstColumn
+    var position = 0
+
+    while current != null
+      if position == index
+        return current.value
+      end
+      current = current.next
+      position = position + 1
+    end
+    return null
   end
 
   public readonly def find(identity: String): readonly MappingColumn?
@@ -85,12 +261,84 @@ class EntityMapping
     return null
   end
 
+  public readonly def findMember(tree: readonly quotation::Tree, index: Int, parameter: Int = 0): readonly MappingColumn?
+    var current = this.firstColumn
+
+    while current != null
+      if mappingPathMatches(current.value.path(), tree, index, this.storedEntityType, parameter)
+        return current.value
+      end
+      current = current.next
+    end
+    return null
+  end
+
+  internal readonly def findGuardedMember(tree: readonly quotation::Tree, index: Int, parameter: Int = 0, optionalRoot: Bool = false): readonly MappingColumn?
+    var current = this.firstColumn
+
+    while current != null
+      if mappingPathMatchesGuarded(current.value.path(), tree, index, this.storedEntityType, parameter, optionalRoot)
+        return current.value
+      end
+      current = current.next
+    end
+    return null
+  end
+
+  internal readonly def findGuardedPresence(tree: readonly quotation::Tree, index: Int, parameter: Int = 0, optionalRoot: Bool = false): readonly MappingPresence?
+    var current = this.firstPresence
+
+    while current != null
+      if mappingPathMatchesGuarded(current.value.path(), tree, index, this.storedEntityType, parameter, optionalRoot)
+        return current.value
+      end
+      current = current.next
+    end
+    return null
+  end
+
+  internal readonly def presenceForPath(path: readonly MappingPath): readonly MappingPresence?
+    var current = this.firstPresence
+
+    while current != null
+      if mappingPathEqual(current.value.path(), path)
+        return current.value
+      end
+      current = current.next
+    end
+    return null
+  end
+
   readonly def failure(): QueryFailure?
     if this.storedEntityType == ""
       return QueryFailure.Provider("entity mapping requires a canonical entity identity")
     end
     if !identifierValid(this.storedTable)
       return QueryFailure.InvalidIdentifier(this.storedTable)
+    end
+    let key = this.storedKeyColumn
+
+    if key != null
+      if !identifierValid(key)
+        return QueryFailure.InvalidIdentifier(key)
+      end
+      var found = false
+      var keyColumn = this.firstColumn
+
+      while keyColumn != null
+        if keyColumn.value.column() == key
+          let typeName = semanticTranslationInner(keyColumn.value.typeName())
+
+          if translationOptional(keyColumn.value.typeName()) || (typeName != "Int" && typeName != "String")
+            return QueryFailure.Provider("bulk key must be a required Int or String")
+          end
+          found = true
+        end
+        keyColumn = keyColumn.next
+      end
+      if !found
+        return QueryFailure.Provider("bulk key is missing from entity mapping")
+      end
     end
     var index = 0
 
@@ -109,7 +357,7 @@ class EntityMapping
       var previousIndex = 0
 
       while previous != null && previousIndex < index
-        if previous.value.identity() == value.identity() || previous.value.column() == value.column()
+        if mappingPathEqual(previous.value.path(), value.path()) || previous.value.column() == value.column()
           return QueryFailure.Provider("entity mapping field identities and columns must be unique")
         end
         previous = previous.next
@@ -118,8 +366,47 @@ class EntityMapping
       index = index + 1
       current = current.next
     end
+    var presence = this.firstPresence
+    var presenceIndex = 0
+
+    while presence != null
+      let value = presence.value
+
+      if !translationOptional(value.path().typeName) || !identifierValid(value.column())
+        return QueryFailure.Provider("entity mapping contains invalid presence metadata")
+      end
+      var earlier = this.firstPresence
+      var earlierIndex = 0
+
+      while earlier != null && earlierIndex < presenceIndex
+        if mappingPathEqual(earlier.value.path(), value.path())
+          return QueryFailure.Provider("entity mapping presence paths must be unique")
+        end
+        earlier = earlier.next
+        earlierIndex = earlierIndex + 1
+      end
+      presence = presence.next
+      presenceIndex = presenceIndex + 1
+    end
     return null
   end
+end
+
+def mappingPresenceCopy(mapping: EntityMapping): MappingPresence[]
+  let values: MappingPresence[] = tasks::generate(mapping.presenceCount(), 1) do |index|
+    return new MappingPresence(new MappingPath("unused", "Int?"), "unused")
+  end
+  var index = 0
+
+  while index < mapping.presenceCount()
+    let value = mapping.presenceAt(index)
+
+    if value != null
+      values[index] = new MappingPresence(value.path(), value.column())
+    end
+    index = index + 1
+  end
+  return values
 end
 
 enum TranslationResult
@@ -139,7 +426,7 @@ end
 def translationScalar(typeName: String): Bool
   let value = semanticTranslationInner(typeName)
 
-  return value == "Bool" || value == "Int" || value == "String"
+  return value == "Bool" || value == "Int" || value == "Float" || value == "String"
 end
 
 def semanticTranslationInner(typeName: String): String
@@ -159,6 +446,8 @@ def translationParameter(value: readonly quotation::CaptureValue): Parameter?
       return Parameter.Bool(item)
     case quotation::CaptureValue.Int(item)
       return Parameter.Int(item)
+    case quotation::CaptureValue.Float(item)
+      return Parameter.Float(item)
     case quotation::CaptureValue.Text(item)
       return Parameter.Text(item)
     case quotation::CaptureValue.Null()
@@ -172,6 +461,8 @@ def translationValueType(value: readonly quotation::CaptureValue): String
       return "Bool"
     case quotation::CaptureValue.Int(item)
       return "Int"
+    case quotation::CaptureValue.Float(item)
+      return "Float"
     case quotation::CaptureValue.Text(item)
       return "String"
     case quotation::CaptureValue.Null()
@@ -188,6 +479,31 @@ def translationEqual(mapping: EntityMapping, column: readonly MappingColumn, par
     return new Expression(ExpressionKind.And(), left: present, right: equal)
   end
   return equal
+end
+
+def translationColumnEqual(mapping: EntityMapping, first: readonly MappingColumn, second: readonly MappingColumn): Expression
+  let table = mapping.table()
+  let equal = new Expression(ExpressionKind.Equal(), table, first.column(), rightTable: table, rightColumn: second.column())
+
+  let firstOptional = translationOptional(first.typeName())
+  let secondOptional = translationOptional(second.typeName())
+
+  if !firstOptional && !secondOptional
+    return equal
+  end
+  let firstPresent = new Expression(ExpressionKind.IsNotNull(), table, first.column())
+  let secondPresent = new Expression(ExpressionKind.IsNotNull(), table, second.column())
+  let bothPresent = new Expression(ExpressionKind.And(), left: firstPresent, right: secondPresent)
+  let presentEqual = new Expression(ExpressionKind.And(), left: bothPresent, right: equal)
+
+  if !firstOptional || !secondOptional
+    return presentEqual
+  end
+  let firstNull = new Expression(ExpressionKind.IsNull(), table, first.column())
+  let secondNull = new Expression(ExpressionKind.IsNull(), table, second.column())
+  let bothNull = new Expression(ExpressionKind.And(), left: firstNull, right: secondNull)
+
+  return new Expression(ExpressionKind.Or(), left: presentEqual, right: bothNull)
 end
 
 def translationConjoin(left: Expression?, right: Expression): Expression
@@ -223,6 +539,17 @@ def translateFields(mapping: EntityMapping, pack: readonly fields::Pack): Transl
     let value = entry.value()
     let actual = translationValueType(value)
     var expression: Expression? = null
+
+    match value
+      case quotation::CaptureValue.Float(number)
+        if !dataFloatFinite(number)
+          return translationFailure("Float field filter must be finite")
+        end
+      case quotation::CaptureValue.Bool(number)
+      case quotation::CaptureValue.Int(number)
+      case quotation::CaptureValue.Text(number)
+      case quotation::CaptureValue.Null()
+    end
 
     if actual == "Null"
       if !translationOptional(column.typeName())
@@ -277,6 +604,8 @@ def translationNodeCode(kind: readonly quotation::NodeKind): Int
       return 2
     case quotation::NodeKind.IntLiteral()
       return 3
+    case quotation::NodeKind.FloatLiteral()
+      return 17
     case quotation::NodeKind.BoolLiteral()
       return 4
     case quotation::NodeKind.TextLiteral()
@@ -303,16 +632,366 @@ def translationNodeCode(kind: readonly quotation::NodeKind): Int
       return 15
     case quotation::NodeKind.Negate()
       return 16
+    case quotation::NodeKind.Add()
+      return 18
+    case quotation::NodeKind.Subtract()
+      return 19
+    case quotation::NodeKind.Multiply()
+      return 20
+    case quotation::NodeKind.Divide()
+      return 21
+    case quotation::NodeKind.Concat()
+      return 22
+    case quotation::NodeKind.Conditional()
+      return 23
   end
+end
+
+def optionalJoinPresenceOperands(tree: readonly quotation::Tree, kind: readonly quotation::NodeKind, firstIndex: Int, secondIndex: Int, rightType: String): Int
+  let code = translationNodeCode(kind)
+
+  if code != 7 && code != 8
+    return 0
+  end
+  let first = tree.nodeAt(firstIndex)
+  let second = tree.nodeAt(secondIndex)
+
+  if first == null || second == null
+    return 0
+  end
+  let firstRight = translationNodeCode(first.kind()) == 0 && first.index() == 1 && first.typeName() == rightType + "?"
+  let secondRight = translationNodeCode(second.kind()) == 0 && second.index() == 1 && second.typeName() == rightType + "?"
+  let firstNull = translationNodeCode(first.kind()) == 6 && first.typeName() == "Null"
+  let secondNull = translationNodeCode(second.kind()) == 6 && second.typeName() == "Null"
+
+  return code if (firstRight && secondNull) || (secondRight && firstNull)
+  return 0
+end
+
+def optionalJoinPresenceKind(tree: readonly quotation::Tree, index: Int, rightType: String): Int
+  let node = tree.nodeAt(index)
+
+  if node == null
+    return 0
+  end
+  return optionalJoinPresenceOperands(tree, node.kind(), node.first(), node.second(), rightType)
+end
+
+def optionalJoinProvesPresent(tree: readonly quotation::Tree, index: Int, whenTrue: Bool, rightType: String, depth: Int = 0): Bool
+  if depth > tree.count()
+    return false
+  end
+  let node = tree.nodeAt(index)
+
+  if node == null
+    return false
+  end
+  let presence = optionalJoinPresenceKind(tree, index, rightType)
+
+  if presence != 0
+    return (presence == 8 && whenTrue) || (presence == 7 && !whenTrue)
+  end
+  let kind = translationNodeCode(node.kind())
+
+  if kind == 15
+    return optionalJoinProvesPresent(tree, node.first(), !whenTrue, rightType, depth + 1)
+  end
+  if kind == 13 && whenTrue
+    return optionalJoinProvesPresent(tree, node.first(), true, rightType, depth + 1) || optionalJoinProvesPresent(tree, node.second(), true, rightType, depth + 1)
+  end
+  if kind == 14 && !whenTrue
+    return optionalJoinProvesPresent(tree, node.first(), false, rightType, depth + 1) || optionalJoinProvesPresent(tree, node.second(), false, rightType, depth + 1)
+  end
+  return false
+end
+
+def optionalJoinTreeSafe(tree: readonly quotation::Tree, index: Int, rightPresent: Bool, rightType: String, depth: Int = 0): Bool
+  if depth > tree.count()
+    return false
+  end
+  let node = tree.nodeAt(index)
+
+  if node == null
+    return false
+  end
+  let kind = translationNodeCode(node.kind())
+
+  if kind == 2
+    let receiver = tree.nodeAt(node.first())
+
+    if receiver == null || (translationNodeCode(receiver.kind()) == 0 && receiver.index() == 1 && !rightPresent)
+      return false
+    end
+    return optionalJoinTreeSafe(tree, node.first(), rightPresent, rightType, depth + 1)
+  end
+  if kind == 13 || kind == 14
+    let leftSafe = optionalJoinTreeSafe(tree, node.first(), rightPresent, rightType, depth + 1)
+    let proof = optionalJoinProvesPresent(tree, node.first(), kind == 13, rightType, depth + 1)
+
+    return leftSafe && optionalJoinTreeSafe(tree, node.second(), rightPresent || proof, rightType, depth + 1)
+  end
+  if kind == 15 || kind == 16
+    return optionalJoinTreeSafe(tree, node.first(), rightPresent, rightType, depth + 1)
+  end
+  if (kind >= 7 && kind <= 12) || (kind >= 18 && kind <= 22)
+    return optionalJoinTreeSafe(tree, node.first(), rightPresent, rightType, depth + 1) && optionalJoinTreeSafe(tree, node.second(), rightPresent, rightType, depth + 1)
+  end
+  if kind == 23
+    let conditionSafe = optionalJoinTreeSafe(tree, node.first(), rightPresent, rightType, depth + 1)
+    let thenPresent = rightPresent || optionalJoinProvesPresent(tree, node.first(), true, rightType, depth + 1)
+    let elsePresent = rightPresent || optionalJoinProvesPresent(tree, node.first(), false, rightType, depth + 1)
+
+    return conditionSafe && optionalJoinTreeSafe(tree, node.second(), thenPresent, rightType, depth + 1) && optionalJoinTreeSafe(tree, node.third(), elsePresent, rightType, depth + 1)
+  end
+  return true
+end
+
+class GuardedPathProof
+  internal path: readonly MappingPath?
+  internal parameter: Int
+  internal next: GuardedPathProof?
+
+  internal def init(path: readonly MappingPath?, parameter: Int, next: GuardedPathProof?): Void
+    this.path = path
+    this.parameter = parameter
+    this.next = next
+  end
+end
+
+def guardedProofContains(proofs: GuardedPathProof?, path: readonly MappingPath?, parameter: Int): Bool
+  var current = proofs
+
+  while current != null
+    if current.parameter == parameter
+      if path == null || current.path == null
+        if path == null && current.path == null
+          return true
+        end
+      else if mappingPathEqual(current.path, path)
+        return true
+      end
+    end
+    current = current.next
+  end
+  return false
+end
+
+def guardedMemberParameter(tree: readonly quotation::Tree, index: Int, depth: Int = 0): Int
+  if depth > tree.count()
+    return -1
+  end
+  let node = tree.nodeAt(index)
+
+  if node == null
+    return -1
+  end
+  let kind = translationNodeCode(node.kind())
+
+  if kind == 0
+    return node.index()
+  end
+  if kind == 2
+    return guardedMemberParameter(tree, node.first(), depth + 1)
+  end
+  return -1
+end
+
+def guardedMemberMapping(left: EntityMapping, right: EntityMapping?, parameter: Int): EntityMapping?
+  if parameter == 0
+    return left
+  end
+  if parameter == 1
+    return right
+  end
+  return null
+end
+
+def guardedParentsSafe(mapping: EntityMapping, path: readonly MappingPath, parameter: Int, proofs: GuardedPathProof?, optionalRight: Bool): Bool
+  if parameter == 1 && optionalRight && !guardedProofContains(proofs, null, 1)
+    return false
+  end
+  var parent = path.parent
+  var depth = 0
+
+  while parent != null
+    if depth > 256
+      return false
+    end
+    if translationOptional(parent.typeName)
+      if mapping.presenceForPath(parent) == null || !guardedProofContains(proofs, parent, parameter)
+        return false
+      end
+    end
+    parent = parent.parent
+    depth = depth + 1
+  end
+  return true
+end
+
+def guardedMemberSafe(left: EntityMapping, right: EntityMapping?, tree: readonly quotation::Tree, index: Int, proofs: GuardedPathProof?, optionalRight: Bool): Bool
+  let parameter = guardedMemberParameter(tree, index)
+  let mapping = guardedMemberMapping(left, right, parameter)
+
+  if mapping == null
+    return false
+  end
+  let optionalRoot = parameter == 1 && optionalRight
+  let node = tree.nodeAt(index)
+
+  if node == null
+    return false
+  end
+  let column = mapping.findGuardedMember(tree, index, parameter, optionalRoot)
+
+  if column != null
+    let path = column.path()
+
+    if !guardedParentsSafe(mapping, path, parameter, proofs, optionalRight)
+      return false
+    end
+    if node.typeName() == column.typeName()
+      return true
+    end
+    return translationOptional(column.typeName()) && node.typeName() == semanticTranslationInner(column.typeName()) && guardedProofContains(proofs, path, parameter)
+  end
+  let presence = mapping.findGuardedPresence(tree, index, parameter, optionalRoot)
+
+  if presence == null || !guardedParentsSafe(mapping, presence.path(), parameter, proofs, optionalRight)
+    return false
+  end
+  if node.typeName() == presence.path().typeName
+    return true
+  end
+  return node.typeName() == semanticTranslationInner(presence.path().typeName) && guardedProofContains(proofs, presence.path(), parameter)
+end
+
+def guardedConditionProofs(left: EntityMapping, right: EntityMapping?, tree: readonly quotation::Tree, index: Int, whenTrue: Bool, proofs: GuardedPathProof?, optionalRight: Bool, depth: Int = 0): GuardedPathProof?
+  if depth > tree.count()
+    return proofs
+  end
+  let node = tree.nodeAt(index)
+
+  if node == null
+    return proofs
+  end
+  let kind = translationNodeCode(node.kind())
+
+  if kind == 15
+    return guardedConditionProofs(left, right, tree, node.first(), !whenTrue, proofs, optionalRight, depth + 1)
+  end
+  if (kind == 13 && whenTrue) || (kind == 14 && !whenTrue)
+    let first = guardedConditionProofs(left, right, tree, node.first(), whenTrue, proofs, optionalRight, depth + 1)
+
+    return guardedConditionProofs(left, right, tree, node.second(), whenTrue, first, optionalRight, depth + 1)
+  end
+  if kind != 7 && kind != 8
+    return proofs
+  end
+  if (kind == 8 && !whenTrue) || (kind == 7 && whenTrue)
+    return proofs
+  end
+  let first = tree.nodeAt(node.first())
+  let second = tree.nodeAt(node.second())
+
+  if first == null || second == null
+    return proofs
+  end
+  var memberIndex = -1
+
+  if translationNodeCode(first.kind()) == 6 && first.typeName() == "Null"
+    memberIndex = node.second()
+  else if translationNodeCode(second.kind()) == 6 && second.typeName() == "Null"
+    memberIndex = node.first()
+  end
+  if memberIndex < 0
+    return proofs
+  end
+  let member = tree.nodeAt(memberIndex)
+
+  if member == null
+    return proofs
+  end
+  if optionalRight && translationNodeCode(member.kind()) == 0 && member.index() == 1 && right != null && member.typeName() == right.entityType() + "?"
+    return new GuardedPathProof(null, 1, proofs)
+  end
+  if translationNodeCode(member.kind()) != 2
+    return proofs
+  end
+  let parameter = guardedMemberParameter(tree, memberIndex)
+  let mapping = guardedMemberMapping(left, right, parameter)
+
+  if mapping == null
+    return proofs
+  end
+  let optionalRoot = optionalRight && parameter == 1
+  let presence = mapping.findGuardedPresence(tree, memberIndex, parameter, optionalRoot)
+
+  if presence != null && member.typeName() == presence.path().typeName
+    return new GuardedPathProof(presence.path(), parameter, proofs)
+  end
+  let column = mapping.findGuardedMember(tree, memberIndex, parameter, optionalRoot)
+
+  if column != null && translationOptional(column.typeName()) && member.typeName() == column.typeName()
+    return new GuardedPathProof(column.path(), parameter, proofs)
+  end
+  return proofs
+end
+
+def guardedTreeSafe(left: EntityMapping, right: EntityMapping?, tree: readonly quotation::Tree, index: Int, proofs: GuardedPathProof?, optionalRight: Bool, depth: Int = 0): Bool
+  if depth > tree.count()
+    return false
+  end
+  let node = tree.nodeAt(index)
+
+  if node == null
+    return false
+  end
+  let kind = translationNodeCode(node.kind())
+
+  if kind == 2
+    return guardedMemberSafe(left, right, tree, index, proofs, optionalRight)
+  end
+  if kind == 13 || kind == 14
+    if !guardedTreeSafe(left, right, tree, node.first(), proofs, optionalRight, depth + 1)
+      return false
+    end
+    let next = guardedConditionProofs(left, right, tree, node.first(), kind == 13, proofs, optionalRight)
+
+    return guardedTreeSafe(left, right, tree, node.second(), next, optionalRight, depth + 1)
+  end
+  if kind == 23
+    if !guardedTreeSafe(left, right, tree, node.first(), proofs, optionalRight, depth + 1)
+      return false
+    end
+    let thenProofs = guardedConditionProofs(left, right, tree, node.first(), true, proofs, optionalRight)
+    let elseProofs = guardedConditionProofs(left, right, tree, node.first(), false, proofs, optionalRight)
+
+    return guardedTreeSafe(left, right, tree, node.second(), thenProofs, optionalRight, depth + 1) && guardedTreeSafe(left, right, tree, node.third(), elseProofs, optionalRight, depth + 1)
+  end
+  if kind == 15 || kind == 16
+    return guardedTreeSafe(left, right, tree, node.first(), proofs, optionalRight, depth + 1)
+  end
+  if (kind >= 7 && kind <= 12) || (kind >= 18 && kind <= 22)
+    return guardedTreeSafe(left, right, tree, node.first(), proofs, optionalRight, depth + 1) && guardedTreeSafe(left, right, tree, node.second(), proofs, optionalRight, depth + 1)
+  end
+  return kind == 0 || kind == 1 || (kind >= 3 && kind <= 6) || kind == 17
 end
 
 class QuotationTranslator
   public mapping: EntityMapping
   public tree: readonly quotation::Tree
+  private scalarColumn: readonly MappingColumn?
+  private rightMapping: EntityMapping?
+  private optionalRight: Bool
+  private guardedMembers: Bool
 
-  def init(mapping: EntityMapping, tree: readonly quotation::Tree): Void
+  def init(mapping: EntityMapping, tree: readonly quotation::Tree, scalarColumn: readonly MappingColumn? = null, rightMapping: EntityMapping? = null, optionalRight: Bool = false, guardedMembers: Bool = false): Void
     this.mapping = mapping
     this.tree = tree
+    this.scalarColumn = scalarColumn
+    this.rightMapping = rightMapping
+    this.optionalRight = optionalRight
+    this.guardedMembers = guardedMembers
   end
 
   def operand(index: Int): OperandResult
@@ -323,57 +1002,53 @@ class QuotationTranslator
     end
     match node.kind()
       case quotation::NodeKind.Member()
-        let receiver = this.tree.nodeAt(node.first())
+        var selected = this.mapping
+        var parameter = 0
+        var ancestor = node
+        var depth = 0
 
-        if receiver == null
-          return OperandResult.Failure("quotation member receiver is missing")
-        end
-        match receiver.kind()
-          case quotation::NodeKind.Parameter()
-            if receiver.index() != 0
-              return OperandResult.Failure("quotation member must read parameter zero")
-            end
-          case quotation::NodeKind.Capture()
-            return OperandResult.Failure("quotation member must be a direct parameter member")
-          case quotation::NodeKind.Member()
-            return OperandResult.Failure("quotation member must be a direct parameter member")
-          case quotation::NodeKind.IntLiteral()
-            return OperandResult.Failure("quotation member must be a direct parameter member")
-          case quotation::NodeKind.BoolLiteral()
-            return OperandResult.Failure("quotation member must be a direct parameter member")
-          case quotation::NodeKind.TextLiteral()
-            return OperandResult.Failure("quotation member must be a direct parameter member")
-          case quotation::NodeKind.NullLiteral()
-            return OperandResult.Failure("quotation member must be a direct parameter member")
-          case quotation::NodeKind.Equal()
-            return OperandResult.Failure("quotation member must be a direct parameter member")
-          case quotation::NodeKind.NotEqual()
-            return OperandResult.Failure("quotation member must be a direct parameter member")
-          case quotation::NodeKind.Less()
-            return OperandResult.Failure("quotation member must be a direct parameter member")
-          case quotation::NodeKind.LessEqual()
-            return OperandResult.Failure("quotation member must be a direct parameter member")
-          case quotation::NodeKind.Greater()
-            return OperandResult.Failure("quotation member must be a direct parameter member")
-          case quotation::NodeKind.GreaterEqual()
-            return OperandResult.Failure("quotation member must be a direct parameter member")
-          case quotation::NodeKind.And()
-            return OperandResult.Failure("quotation member must be a direct parameter member")
-          case quotation::NodeKind.Or()
-            return OperandResult.Failure("quotation member must be a direct parameter member")
-          case quotation::NodeKind.Not()
-            return OperandResult.Failure("quotation member must be a direct parameter member")
-          case quotation::NodeKind.Negate()
-            return OperandResult.Failure("quotation member must be a direct parameter member")
-        end
-        let column = this.mapping.find(node.identity())
+        while depth < this.tree.count()
+          let parent = this.tree.nodeAt(ancestor.first())
 
-        if column == null || column.typeName() != node.typeName()
+          if parent == null
+            return OperandResult.Failure("quotation member receiver is missing")
+          end
+          let kind = translationNodeCode(parent.kind())
+
+          if kind == 2
+            ancestor = parent
+          else if kind == 0
+            parameter = parent.index()
+            depth = this.tree.count()
+          else
+            return OperandResult.Failure("quotation member must read a mapped parameter")
+          end
+          depth = depth + 1
+        end
+        if parameter == 1 && this.rightMapping != null
+          let right = this.rightMapping
+
+          if right != null
+            selected = right
+          end
+        else if parameter != 0
+          return OperandResult.Failure("quotation member must read a mapped parameter")
+        end
+        let column = this.guardedMembers ? selected.findGuardedMember(this.tree, index, parameter, this.optionalRight && parameter == 1) : selected.findMember(this.tree, index, parameter)
+
+        if column == null || (column.typeName() != node.typeName() && !(this.guardedMembers && translationOptional(column.typeName()) && node.typeName() == semanticTranslationInner(column.typeName())))
           return OperandResult.Failure("quotation member identity or type does not match mapping")
         end
         return OperandResult.Value(new TranslationOperand(column: column, typeName: node.typeName()))
       case quotation::NodeKind.IntLiteral()
         return OperandResult.Value(new TranslationOperand(parameter: Parameter.Int(node.intValue()), typeName: "Int"))
+      case quotation::NodeKind.FloatLiteral()
+        let value = node.floatValue()
+
+        if !dataFloatFinite(value)
+          return OperandResult.Failure("Float literal must be finite")
+        end
+        return OperandResult.Value(new TranslationOperand(parameter: Parameter.Float(value), typeName: "Float"))
       case quotation::NodeKind.BoolLiteral()
         return OperandResult.Value(new TranslationOperand(parameter: Parameter.Bool(node.boolValue()), typeName: "Bool"))
       case quotation::NodeKind.TextLiteral()
@@ -388,6 +1063,17 @@ class QuotationTranslator
         end
         let typeName = translationValueType(capture)
 
+        match capture
+          case quotation::CaptureValue.Float(value)
+            if !dataFloatFinite(value)
+              return OperandResult.Failure("Float capture must be finite")
+            end
+          case quotation::CaptureValue.Bool(value)
+          case quotation::CaptureValue.Int(value)
+          case quotation::CaptureValue.Text(value)
+          case quotation::CaptureValue.Null()
+        end
+
         if typeName == "Null"
           return OperandResult.Value(new TranslationOperand(isNull: true, typeName: "Null"))
         end
@@ -396,6 +1082,11 @@ class QuotationTranslator
         end
         return OperandResult.Value(new TranslationOperand(parameter: translationParameter(capture), typeName: typeName))
       case quotation::NodeKind.Parameter()
+        let scalar = this.scalarColumn
+
+        if scalar != null && node.index() == 0 && node.typeName() == scalar.typeName()
+          return OperandResult.Value(new TranslationOperand(column: scalar, typeName: node.typeName()))
+        end
         return OperandResult.Failure("quotation comparison operand is unsupported")
       case quotation::NodeKind.Equal()
         return OperandResult.Failure("quotation comparison operand is unsupported")
@@ -417,11 +1108,34 @@ class QuotationTranslator
         return OperandResult.Failure("quotation comparison operand is unsupported")
       case quotation::NodeKind.Negate()
         return OperandResult.Failure("quotation comparison operand is unsupported")
+      case quotation::NodeKind.Add()
+        return OperandResult.Failure("quotation comparison operand is unsupported")
+      case quotation::NodeKind.Subtract()
+        return OperandResult.Failure("quotation comparison operand is unsupported")
+      case quotation::NodeKind.Multiply()
+        return OperandResult.Failure("quotation comparison operand is unsupported")
+      case quotation::NodeKind.Divide()
+        return OperandResult.Failure("quotation comparison operand is unsupported")
+      case quotation::NodeKind.Concat()
+        return OperandResult.Failure("quotation comparison operand is unsupported")
+      case quotation::NodeKind.Conditional()
+        return OperandResult.Failure("quotation comparison operand is unsupported")
     end
     return OperandResult.Failure("quotation comparison operand is unsupported")
   end
 
   def comparison(kind: readonly quotation::NodeKind, first: Int, second: Int): TranslationResult
+    if this.optionalRight
+      let rightMapping = this.rightMapping
+
+      if rightMapping != null
+        let presence = optionalJoinPresenceOperands(this.tree, kind, first, second, rightMapping.entityType())
+
+        if presence != 0
+          return TranslationResult.Expression(new Expression(ExpressionKind.Equal(), this.mapping.table(), "__neri_present", Parameter.Int(presence == 7 ? 0 : 1)))
+        end
+      end
+    end
     let leftResult = this.operand(first)
     let rightResult = this.operand(second)
     var left: TranslationOperand? = null
@@ -442,6 +1156,39 @@ class QuotationTranslator
     if left == null || right == null
       return translationFailure("quotation comparison operands are missing")
     end
+    let code = translationNodeCode(kind)
+    let equal = code == 7 || code == 8
+    let firstColumn = left.column
+    let secondColumn = right.column
+
+    if firstColumn != null && secondColumn != null
+      if semanticTranslationInner(firstColumn.typeName()) != semanticTranslationInner(secondColumn.typeName()) || !translationScalar(firstColumn.typeName())
+        return translationFailure("quotation comparison mapped member types do not match")
+      end
+      if equal
+        var expression = translationColumnEqual(this.mapping, firstColumn, secondColumn)
+
+        if code == 8
+          expression = new Expression(ExpressionKind.Not(), left: expression)
+        end
+        return TranslationResult.Expression(expression)
+      end
+      if (firstColumn.typeName() != "Int" && firstColumn.typeName() != "Float") || firstColumn.typeName() != secondColumn.typeName()
+        return translationFailure("ordered comparison requires required Int or Float mapped members")
+      end
+      var comparisonKind = ExpressionKind.Less()
+
+      if code == 10
+        comparisonKind = ExpressionKind.LessOrEqual()
+      end
+      if code == 11
+        comparisonKind = ExpressionKind.Greater()
+      end
+      if code == 12
+        comparisonKind = ExpressionKind.GreaterOrEqual()
+      end
+      return TranslationResult.Expression(new Expression(comparisonKind, this.mapping.table(), firstColumn.column(), rightTable: this.mapping.table(), rightColumn: secondColumn.column()))
+    end
     var column = left.column
     var value = right
     var reversed = false
@@ -454,9 +1201,6 @@ class QuotationTranslator
     if column == null || value.column != null
       return translationFailure("quotation comparison requires one mapped member")
     end
-    let code = translationNodeCode(kind)
-    let equal = code == 7 || code == 8
-
     if value.isNull
       if !equal || !translationOptional(column.typeName())
         return translationFailure("null comparison requires equality on an optional member")
@@ -557,10 +1301,17 @@ class QuotationTranslator
       case quotation::NodeKind.Or()
         return this.combine(node, false, depth)
       case quotation::NodeKind.Parameter()
+        let scalar = this.scalarColumn
+
+        if scalar != null && node.index() == 0 && node.typeName() == "Bool" && scalar.typeName() == "Bool"
+          return TranslationResult.Expression(translationEqual(this.mapping, scalar, Parameter.Bool(true)))
+        end
         return translationFailure("quotation expression node is unsupported")
       case quotation::NodeKind.Capture()
         return translationFailure("quotation expression node is unsupported")
       case quotation::NodeKind.IntLiteral()
+        return translationFailure("quotation expression node is unsupported")
+      case quotation::NodeKind.FloatLiteral()
         return translationFailure("quotation expression node is unsupported")
       case quotation::NodeKind.BoolLiteral()
         return translationFailure("quotation expression node is unsupported")
@@ -569,6 +1320,18 @@ class QuotationTranslator
       case quotation::NodeKind.NullLiteral()
         return translationFailure("quotation expression node is unsupported")
       case quotation::NodeKind.Negate()
+        return translationFailure("quotation expression node is unsupported")
+      case quotation::NodeKind.Add()
+        return translationFailure("quotation expression node is unsupported")
+      case quotation::NodeKind.Subtract()
+        return translationFailure("quotation expression node is unsupported")
+      case quotation::NodeKind.Multiply()
+        return translationFailure("quotation expression node is unsupported")
+      case quotation::NodeKind.Divide()
+        return translationFailure("quotation expression node is unsupported")
+      case quotation::NodeKind.Concat()
+        return translationFailure("quotation expression node is unsupported")
+      case quotation::NodeKind.Conditional()
         return translationFailure("quotation expression node is unsupported")
     end
     return translationFailure("quotation expression node is unsupported")
@@ -618,6 +1381,80 @@ def translateQuotation(mapping: EntityMapping, tree: readonly quotation::Tree): 
   return (new QuotationTranslator(mapping, tree)).expression(tree.root())
 end
 
+def translateJoinQuotation(left: EntityMapping, right: EntityMapping, tree: readonly quotation::Tree): TranslationResult
+  let leftFailure = left.failure()
+
+  if leftFailure != null
+    return TranslationResult.Failure(leftFailure)
+  end
+  let rightFailure = right.failure()
+
+  if rightFailure != null
+    return TranslationResult.Failure(rightFailure)
+  end
+  if left.table() != right.table()
+    return translationFailure("joined predicate mappings must share one SQL source")
+  end
+  if tree.parameterCount() != 2 || tree.resultType() != "Bool"
+    return translationFailure("joined predicate requires two mapped entity parameters and a Bool result")
+  end
+  let leftType = tree.parameterTypeAt(0)
+  let rightType = tree.parameterTypeAt(1)
+
+  if leftType == null || rightType == null || leftType != left.entityType() || rightType != right.entityType()
+    return translationFailure("joined predicate parameter types do not match mapped entities")
+  end
+  return (new QuotationTranslator(left, tree, rightMapping: right)).expression(tree.root())
+end
+
+def translateOptionalJoinQuotation(left: EntityMapping, right: EntityMapping, tree: readonly quotation::Tree): TranslationResult
+  let leftFailure = left.failure()
+
+  if leftFailure != null
+    return TranslationResult.Failure(leftFailure)
+  end
+  let rightFailure = right.failure()
+
+  if rightFailure != null
+    return TranslationResult.Failure(rightFailure)
+  end
+  if left.table() != right.table()
+    return translationFailure("joined predicate mappings must share one SQL source")
+  end
+  if tree.parameterCount() != 2 || tree.resultType() != "Bool"
+    return translationFailure("optional joined predicate requires two mapped entity parameters and a Bool result")
+  end
+  let leftType = tree.parameterTypeAt(0)
+  let rightType = tree.parameterTypeAt(1)
+
+  if leftType == null || rightType == null || leftType != left.entityType() || rightType != right.entityType() + "?"
+    return translationFailure("optional joined predicate parameters must match the left entity and optional right entity")
+  end
+  if tree.count() < 1 || tree.count() > 256 || !scalarTreeWithinBudget(tree, tree.root(), new ScalarSqlBudget())
+    return translationFailure("optional joined predicate exceeds traversal limit or is malformed")
+  end
+  if !optionalJoinTreeSafe(tree, tree.root(), false, right.entityType())
+    return translationFailure("right member access requires a right presence guard")
+  end
+  return (new QuotationTranslator(left, tree, rightMapping: right, optionalRight: true)).expression(tree.root())
+end
+
+def translateScalarQuotation(tree: readonly quotation::Tree, typeName: String, table: String, column: String): TranslationResult
+  let parameterType = tree.parameterTypeAt(0)
+
+  if !translationScalar(typeName) || tree.parameterCount() != 1 || parameterType == null || parameterType != typeName || tree.resultType() != "Bool"
+    return translationFailure("scalar quotation signature does not match grouped metric")
+  end
+  let scalar = new MappingColumn(typeName + ".value", typeName, column)
+  let mapping = new EntityMapping(typeName, table, [scalar])
+  let invalid = mapping.failure()
+
+  if invalid != null
+    return TranslationResult.Failure(invalid)
+  end
+  return (new QuotationTranslator(mapping, tree, scalar)).expression(tree.root())
+end
+
 def translateSelection(mapping: EntityMapping, tree: readonly quotation::Tree): SelectionResult
   let invalid = mapping.failure()
 
@@ -639,50 +1476,7 @@ def translateSelection(mapping: EntityMapping, tree: readonly quotation::Tree): 
   end
   match node.kind()
     case quotation::NodeKind.Member()
-      let receiver = tree.nodeAt(node.first())
-
-      if receiver == null
-        return SelectionResult.Failure(QueryFailure.UnsupportedCapability("selection member receiver is missing"))
-      end
-      match receiver.kind()
-        case quotation::NodeKind.Parameter()
-          if receiver.index() != 0
-            return SelectionResult.Failure(QueryFailure.UnsupportedCapability("selection member must read parameter zero"))
-          end
-        case quotation::NodeKind.Capture()
-          return SelectionResult.Failure(QueryFailure.UnsupportedCapability("selection must be a direct entity member"))
-        case quotation::NodeKind.Member()
-          return SelectionResult.Failure(QueryFailure.UnsupportedCapability("selection must be a direct entity member"))
-        case quotation::NodeKind.IntLiteral()
-          return SelectionResult.Failure(QueryFailure.UnsupportedCapability("selection must be a direct entity member"))
-        case quotation::NodeKind.BoolLiteral()
-          return SelectionResult.Failure(QueryFailure.UnsupportedCapability("selection must be a direct entity member"))
-        case quotation::NodeKind.TextLiteral()
-          return SelectionResult.Failure(QueryFailure.UnsupportedCapability("selection must be a direct entity member"))
-        case quotation::NodeKind.NullLiteral()
-          return SelectionResult.Failure(QueryFailure.UnsupportedCapability("selection must be a direct entity member"))
-        case quotation::NodeKind.Equal()
-          return SelectionResult.Failure(QueryFailure.UnsupportedCapability("selection must be a direct entity member"))
-        case quotation::NodeKind.NotEqual()
-          return SelectionResult.Failure(QueryFailure.UnsupportedCapability("selection must be a direct entity member"))
-        case quotation::NodeKind.Less()
-          return SelectionResult.Failure(QueryFailure.UnsupportedCapability("selection must be a direct entity member"))
-        case quotation::NodeKind.LessEqual()
-          return SelectionResult.Failure(QueryFailure.UnsupportedCapability("selection must be a direct entity member"))
-        case quotation::NodeKind.Greater()
-          return SelectionResult.Failure(QueryFailure.UnsupportedCapability("selection must be a direct entity member"))
-        case quotation::NodeKind.GreaterEqual()
-          return SelectionResult.Failure(QueryFailure.UnsupportedCapability("selection must be a direct entity member"))
-        case quotation::NodeKind.And()
-          return SelectionResult.Failure(QueryFailure.UnsupportedCapability("selection must be a direct entity member"))
-        case quotation::NodeKind.Or()
-          return SelectionResult.Failure(QueryFailure.UnsupportedCapability("selection must be a direct entity member"))
-        case quotation::NodeKind.Not()
-          return SelectionResult.Failure(QueryFailure.UnsupportedCapability("selection must be a direct entity member"))
-        case quotation::NodeKind.Negate()
-          return SelectionResult.Failure(QueryFailure.UnsupportedCapability("selection must be a direct entity member"))
-      end
-      let column = mapping.find(node.identity())
+      let column = mapping.findMember(tree, tree.root())
 
       if column == null || column.typeName() != node.typeName() || tree.resultType() != node.typeName()
         return SelectionResult.Failure(QueryFailure.UnsupportedCapability("selection member identity or type does not match mapping"))
@@ -693,6 +1487,8 @@ def translateSelection(mapping: EntityMapping, tree: readonly quotation::Tree): 
     case quotation::NodeKind.Capture()
       return SelectionResult.Failure(QueryFailure.UnsupportedCapability("selection must be a direct entity member"))
     case quotation::NodeKind.IntLiteral()
+      return SelectionResult.Failure(QueryFailure.UnsupportedCapability("selection must be a direct entity member"))
+    case quotation::NodeKind.FloatLiteral()
       return SelectionResult.Failure(QueryFailure.UnsupportedCapability("selection must be a direct entity member"))
     case quotation::NodeKind.BoolLiteral()
       return SelectionResult.Failure(QueryFailure.UnsupportedCapability("selection must be a direct entity member"))
@@ -720,5 +1516,430 @@ def translateSelection(mapping: EntityMapping, tree: readonly quotation::Tree): 
       return SelectionResult.Failure(QueryFailure.UnsupportedCapability("selection must be a direct entity member"))
     case quotation::NodeKind.Negate()
       return SelectionResult.Failure(QueryFailure.UnsupportedCapability("selection must be a direct entity member"))
+    case quotation::NodeKind.Add()
+      return SelectionResult.Failure(QueryFailure.UnsupportedCapability("selection must be a direct entity member"))
+    case quotation::NodeKind.Subtract()
+      return SelectionResult.Failure(QueryFailure.UnsupportedCapability("selection must be a direct entity member"))
+    case quotation::NodeKind.Multiply()
+      return SelectionResult.Failure(QueryFailure.UnsupportedCapability("selection must be a direct entity member"))
+    case quotation::NodeKind.Divide()
+      return SelectionResult.Failure(QueryFailure.UnsupportedCapability("selection must be a direct entity member"))
+    case quotation::NodeKind.Concat()
+      return SelectionResult.Failure(QueryFailure.UnsupportedCapability("selection must be a direct entity member"))
+    case quotation::NodeKind.Conditional()
+      return SelectionResult.Failure(QueryFailure.UnsupportedCapability("selection must be a direct entity member"))
   end
+end
+
+class ScalarSql
+  internal sql: String
+  internal checkedScalars: Bool
+
+  internal def init(sql: String, checkedScalars: Bool = false): Void
+    this.sql = sql
+    this.checkedScalars = checkedScalars
+  end
+end
+
+enum ScalarSqlResult
+  case Value(value: ScalarSql)
+  case Failure(error: QueryFailure)
+end
+
+class ScalarSqlBudget
+  internal visits: Int = 0
+end
+
+def scalarTreeWithinBudget(tree: readonly quotation::Tree, index: Int, budget: ScalarSqlBudget, depth: Int = 0): Bool
+  budget.visits = budget.visits + 1
+
+  if depth > tree.count() || budget.visits > 512
+    return false
+  end
+  let node = tree.nodeAt(index)
+
+  if node == null
+    return false
+  end
+  let code = translationNodeCode(node.kind())
+
+  if code == 2 || code == 15 || code == 16
+    return scalarTreeWithinBudget(tree, node.first(), budget, depth + 1)
+  end
+  if (code >= 7 && code <= 14) || (code >= 18 && code <= 22)
+    return scalarTreeWithinBudget(tree, node.first(), budget, depth + 1) && scalarTreeWithinBudget(tree, node.second(), budget, depth + 1)
+  end
+  if code == 23
+    return scalarTreeWithinBudget(tree, node.first(), budget, depth + 1) && scalarTreeWithinBudget(tree, node.second(), budget, depth + 1) && scalarTreeWithinBudget(tree, node.third(), budget, depth + 1)
+  end
+  return code == 0 || code == 1 || (code >= 3 && code <= 6) || code == 17
+end
+
+def scalarSqlFailure(reason: String): ScalarSqlResult
+  return ScalarSqlResult.Failure(QueryFailure.UnsupportedCapability(reason))
+end
+
+def scalarResultTypeCompatible(actual: String, expected: String): Bool
+  return actual == expected || (translationOptional(expected) && (actual == semanticTranslationInner(expected) || actual == "Null"))
+end
+
+def scalarSqlValue(sql: String, checkedScalars: Bool = false): ScalarSqlResult
+  if host::stringByteLength(sql) > 65536
+    return scalarSqlFailure("computed expression exceeds SQL size limit")
+  end
+  return ScalarSqlResult.Value(new ScalarSql(sql, checkedScalars))
+end
+
+def scalarSqlFunction(code: Int, typeName: String): String
+  var prefix = "__neri_int_"
+
+  if typeName == "Float"
+    prefix = "__neri_float_"
+  end
+  if code == 16
+    return prefix + "negate"
+  end
+  if code == 18
+    return prefix + "add"
+  end
+  if code == 19
+    return prefix + "subtract"
+  end
+  if code == 20
+    return prefix + "multiply"
+  end
+  if code == 21
+    return prefix + "divide"
+  end
+  return "__neri_text_concat"
+end
+
+def guardedPresenceColumn(left: EntityMapping, right: EntityMapping?, tree: readonly quotation::Tree, firstIndex: Int, secondIndex: Int, optionalRight: Bool): String?
+  let first = tree.nodeAt(firstIndex)
+  let second = tree.nodeAt(secondIndex)
+
+  if first == null || second == null
+    return null
+  end
+  var memberIndex = -1
+
+  if translationNodeCode(first.kind()) == 6 && first.typeName() == "Null"
+    memberIndex = secondIndex
+  else if translationNodeCode(second.kind()) == 6 && second.typeName() == "Null"
+    memberIndex = firstIndex
+  end
+  if memberIndex < 0
+    return null
+  end
+  let member = tree.nodeAt(memberIndex)
+
+  if member == null
+    return null
+  end
+  if optionalRight && translationNodeCode(member.kind()) == 0 && member.index() == 1 && right != null && member.typeName() == right.entityType() + "?"
+    return "__neri_present"
+  end
+  if translationNodeCode(member.kind()) != 2
+    return null
+  end
+  let parameter = guardedMemberParameter(tree, memberIndex)
+  let mapping = guardedMemberMapping(left, right, parameter)
+
+  if mapping == null
+    return null
+  end
+  let presence = mapping.findGuardedPresence(tree, memberIndex, parameter, optionalRight && parameter == 1)
+
+  if presence == null || member.typeName() != presence.path().typeName
+    return null
+  end
+  return presence.column()
+end
+
+def compileScalarNode(mapping: EntityMapping, tree: readonly quotation::Tree, index: Int, state: CompileState, dialect: SqlDialect, budget: ScalarSqlBudget, depth: Int = 0, rightMapping: EntityMapping? = null, optionalRight: Bool = false): ScalarSqlResult
+  budget.visits = budget.visits + 1
+
+  if depth > tree.count() || budget.visits > 512
+    return scalarSqlFailure("computed expression exceeds traversal limit")
+  end
+  let node = tree.nodeAt(index)
+
+  if node == null
+    return scalarSqlFailure("computed expression node index is invalid")
+  end
+  let code = translationNodeCode(node.kind())
+
+  if code >= 1 && code <= 6 || code == 17
+    if (code == 3 && node.typeName() != "Int") || (code == 17 && node.typeName() != "Float") || (code == 4 && node.typeName() != "Bool") || (code == 5 && node.typeName() != "String") || (code == 6 && node.typeName() != "Null")
+      return scalarSqlFailure("computed literal type is invalid")
+    end
+    match (new QuotationTranslator(mapping, tree, rightMapping: rightMapping, optionalRight: optionalRight, guardedMembers: true)).operand(index)
+      case OperandResult.Failure(reason)
+        return scalarSqlFailure(reason)
+      case OperandResult.Value(value)
+        let column = value.column
+
+        if column != null
+          return scalarSqlValue(quoted(mapping.table(), column.column()))
+        end
+        if value.isNull
+          if node.typeName() != "Null" && !translationOptional(node.typeName())
+            return scalarSqlFailure("computed null value requires an optional type")
+          end
+          return scalarSqlValue("NULL")
+        end
+        if value.typeName != semanticTranslationInner(node.typeName())
+          return scalarSqlFailure("computed scalar value type does not match quotation node")
+        end
+        let parameter = value.parameter
+
+        if parameter == null
+          return scalarSqlFailure("computed expression scalar value is missing")
+        end
+        state.bind(parameter)
+        return scalarSqlValue(dialectPlaceholder(dialect, state.count))
+    end
+  end
+  if code >= 7 && code <= 12
+    if node.typeName() != "Bool"
+      return scalarSqlFailure("computed comparison must return Bool")
+    end
+    let firstNode = tree.nodeAt(node.first())
+    let secondNode = tree.nodeAt(node.second())
+
+    if firstNode == null || secondNode == null
+      return scalarSqlFailure("computed comparison operand is missing")
+    end
+    let firstType = firstNode.typeName()
+    let secondType = secondNode.typeName()
+
+    if code == 7 || code == 8
+      let presence = guardedPresenceColumn(mapping, rightMapping, tree, node.first(), node.second(), optionalRight)
+
+      if presence != null
+        return scalarSqlValue("(" + quoted(mapping.table(), presence) + " = " + (code == 7 ? "0" : "1") + ")")
+      end
+    end
+    if code == 7 || code == 8
+      if firstType == "Null"
+        if !translationOptional(secondType)
+          return scalarSqlFailure("null equality requires an optional operand")
+        end
+      else if secondType == "Null"
+        if !translationOptional(firstType)
+          return scalarSqlFailure("null equality requires an optional operand")
+        end
+      else if !translationScalar(firstType) || !translationScalar(secondType) || semanticTranslationInner(firstType) != semanticTranslationInner(secondType)
+        return scalarSqlFailure("computed equality operand types do not match")
+      end
+    else if firstType != secondType || (firstType != "Int" && firstType != "Float")
+      return scalarSqlFailure("computed ordered comparison requires matching required Int or Float operands")
+    end
+    match compileScalarNode(mapping, tree, node.first(), state, dialect, budget, depth + 1, rightMapping, optionalRight)
+      case ScalarSqlResult.Failure(error)
+        return ScalarSqlResult.Failure(error)
+      case ScalarSqlResult.Value(first)
+        match compileScalarNode(mapping, tree, node.second(), state, dialect, budget, depth + 1, rightMapping, optionalRight)
+          case ScalarSqlResult.Failure(error)
+            return ScalarSqlResult.Failure(error)
+          case ScalarSqlResult.Value(second)
+            var operation = "="
+
+            if code == 7 || code == 8
+              match dialect
+                case SqlDialect.QuestionMark()
+                  operation = code == 7 ? "IS" : "IS NOT"
+                case SqlDialect.PostgreSql()
+                  operation = code == 7 ? "IS NOT DISTINCT FROM" : "IS DISTINCT FROM"
+              end
+            else if code == 9
+              operation = "<"
+            else if code == 10
+              operation = "<="
+            else if code == 11
+              operation = ">"
+            else
+              operation = ">="
+            end
+            return scalarSqlValue("(" + first.sql + " " + operation + " " + second.sql + ")", first.checkedScalars || second.checkedScalars)
+        end
+    end
+  end
+  if code == 13 || code == 14
+    let firstNode = tree.nodeAt(node.first())
+    let secondNode = tree.nodeAt(node.second())
+
+    if node.typeName() != "Bool" || firstNode == null || secondNode == null || firstNode.typeName() != "Bool" || secondNode.typeName() != "Bool"
+      return scalarSqlFailure("computed logical expression requires Bool operands")
+    end
+    match compileScalarNode(mapping, tree, node.first(), state, dialect, budget, depth + 1, rightMapping, optionalRight)
+      case ScalarSqlResult.Failure(error)
+        return ScalarSqlResult.Failure(error)
+      case ScalarSqlResult.Value(first)
+        match compileScalarNode(mapping, tree, node.second(), state, dialect, budget, depth + 1, rightMapping, optionalRight)
+          case ScalarSqlResult.Failure(error)
+            return ScalarSqlResult.Failure(error)
+          case ScalarSqlResult.Value(second)
+            let rightBool = "(CASE WHEN " + second.sql + " THEN TRUE ELSE FALSE END)"
+            let trueSql = code == 13 ? rightBool : "TRUE"
+            let falseSql = code == 13 ? "FALSE" : rightBool
+
+            return scalarSqlValue("(CASE WHEN " + first.sql + " THEN " + trueSql + " ELSE " + falseSql + " END)", first.checkedScalars || second.checkedScalars)
+        end
+    end
+  end
+  if code == 15
+    let child = tree.nodeAt(node.first())
+
+    if node.typeName() != "Bool" || child == null || child.typeName() != "Bool"
+      return scalarSqlFailure("computed negation requires a Bool operand")
+    end
+    match compileScalarNode(mapping, tree, node.first(), state, dialect, budget, depth + 1, rightMapping, optionalRight)
+      case ScalarSqlResult.Failure(error)
+        return ScalarSqlResult.Failure(error)
+      case ScalarSqlResult.Value(value)
+        return scalarSqlValue("(CASE WHEN " + value.sql + " THEN FALSE ELSE TRUE END)", value.checkedScalars)
+    end
+  end
+  if code == 16 || (code >= 18 && code <= 22)
+    match dialect
+      case SqlDialect.PostgreSql()
+        return scalarSqlFailure("checked scalar expressions are unavailable for PostgreSQL")
+      case SqlDialect.QuestionMark()
+    end
+    let typeName = node.typeName()
+
+    if code == 22
+      if typeName != "String"
+        return scalarSqlFailure("text concatenation requires String operands")
+      end
+    else if typeName != "Int" && typeName != "Float"
+      return scalarSqlFailure("computed arithmetic requires required Int or Float operands")
+    end
+    let firstNode = tree.nodeAt(node.first())
+
+    if firstNode == null || firstNode.typeName() != typeName
+      return scalarSqlFailure("computed operator first operand type does not match")
+    end
+    match compileScalarNode(mapping, tree, node.first(), state, dialect, budget, depth + 1, rightMapping, optionalRight)
+      case ScalarSqlResult.Failure(error)
+        return ScalarSqlResult.Failure(error)
+      case ScalarSqlResult.Value(first)
+        let functionName = scalarSqlFunction(code, typeName)
+
+        if code == 16
+          return scalarSqlValue(functionName + "(" + first.sql + ")", true)
+        end
+        let secondNode = tree.nodeAt(node.second())
+
+        if secondNode == null || secondNode.typeName() != typeName
+          return scalarSqlFailure("computed operator second operand type does not match")
+        end
+        match compileScalarNode(mapping, tree, node.second(), state, dialect, budget, depth + 1, rightMapping, optionalRight)
+          case ScalarSqlResult.Failure(error)
+            return ScalarSqlResult.Failure(error)
+          case ScalarSqlResult.Value(second)
+            return scalarSqlValue(functionName + "(" + first.sql + ", " + second.sql + ")", true)
+        end
+    end
+  end
+  if code == 23
+    let condition = tree.nodeAt(node.first())
+    let thenNode = tree.nodeAt(node.second())
+    let elseNode = tree.nodeAt(node.third())
+
+    if condition == null || thenNode == null || elseNode == null || condition.typeName() != "Bool"
+      return scalarSqlFailure("computed conditional has invalid children")
+    end
+    let expected = node.typeName()
+    let thenType = thenNode.typeName()
+    let elseType = elseNode.typeName()
+
+    if !scalarResultTypeCompatible(thenType, expected) || !scalarResultTypeCompatible(elseType, expected)
+      return scalarSqlFailure("computed conditional branch types do not match")
+    end
+    match compileScalarNode(mapping, tree, node.first(), state, dialect, budget, depth + 1, rightMapping, optionalRight)
+      case ScalarSqlResult.Failure(error)
+        return ScalarSqlResult.Failure(error)
+      case ScalarSqlResult.Value(test)
+        match compileScalarNode(mapping, tree, node.second(), state, dialect, budget, depth + 1, rightMapping, optionalRight)
+          case ScalarSqlResult.Failure(error)
+            return ScalarSqlResult.Failure(error)
+          case ScalarSqlResult.Value(thenValue)
+            match compileScalarNode(mapping, tree, node.third(), state, dialect, budget, depth + 1, rightMapping, optionalRight)
+              case ScalarSqlResult.Failure(error)
+                return ScalarSqlResult.Failure(error)
+              case ScalarSqlResult.Value(elseValue)
+                return scalarSqlValue("(CASE WHEN " + test.sql + " THEN " + thenValue.sql + " ELSE " + elseValue.sql + " END)", test.checkedScalars || thenValue.checkedScalars || elseValue.checkedScalars)
+            end
+        end
+    end
+  end
+  return scalarSqlFailure("computed expression node is unsupported")
+end
+
+def compileScalarQuotation(mapping: EntityMapping, tree: readonly quotation::Tree, typeName: String, state: CompileState, dialect: SqlDialect): ScalarSqlResult
+  let invalid = mapping.failure()
+
+  if invalid != null
+    return ScalarSqlResult.Failure(invalid)
+  end
+  if !translationScalar(typeName) || tree.parameterCount() != 1 || tree.parameterTypeAt(0) != mapping.entityType() || tree.resultType() != typeName || tree.count() < 1 || tree.count() > 256
+    return scalarSqlFailure("computed quotation signature or size is invalid")
+  end
+  let root = tree.nodeAt(tree.root())
+
+  if root == null
+    return scalarSqlFailure("computed quotation result type is invalid")
+  end
+  let rootType = root.typeName()
+
+  if !scalarResultTypeCompatible(rootType, typeName)
+    return scalarSqlFailure("computed quotation result type is invalid")
+  end
+  if !scalarTreeWithinBudget(tree, tree.root(), new ScalarSqlBudget())
+    return scalarSqlFailure("computed expression exceeds traversal limit or is malformed")
+  end
+  if !guardedTreeSafe(mapping, null, tree, tree.root(), null, false)
+    return scalarSqlFailure("optional member access requires a presence guard")
+  end
+  return compileScalarNode(mapping, tree, tree.root(), state, dialect, new ScalarSqlBudget())
+end
+
+def compileJoinScalarQuotation(left: EntityMapping, right: EntityMapping, tree: readonly quotation::Tree, state: CompileState, dialect: SqlDialect, optionalRight: Bool = false): ScalarSqlResult
+  let leftFailure = left.failure()
+
+  if leftFailure != null
+    return ScalarSqlResult.Failure(leftFailure)
+  end
+  let rightFailure = right.failure()
+
+  if rightFailure != null
+    return ScalarSqlResult.Failure(rightFailure)
+  end
+  if left.table() != right.table()
+    return scalarSqlFailure("joined predicate mappings must share one SQL source")
+  end
+  if tree.parameterCount() != 2 || tree.resultType() != "Bool" || tree.count() < 1 || tree.count() > 256
+    return scalarSqlFailure("computed joined predicate signature or size is invalid")
+  end
+  let leftType = tree.parameterTypeAt(0)
+  let rightType = tree.parameterTypeAt(1)
+  let expectedRight = optionalRight ? right.entityType() + "?" : right.entityType()
+
+  if leftType == null || rightType == null || leftType != left.entityType() || rightType != expectedRight
+    return scalarSqlFailure("computed joined predicate parameter types do not match mapped entities")
+  end
+  let root = tree.nodeAt(tree.root())
+
+  if root == null || root.typeName() != "Bool"
+    return scalarSqlFailure("computed joined predicate result type is invalid")
+  end
+  if !scalarTreeWithinBudget(tree, tree.root(), new ScalarSqlBudget())
+    return scalarSqlFailure("computed joined predicate exceeds traversal limit or is malformed")
+  end
+  if !guardedTreeSafe(left, right, tree, tree.root(), null, optionalRight)
+    return scalarSqlFailure("optional member access requires a presence guard")
+  end
+  return compileScalarNode(left, tree, tree.root(), state, dialect, new ScalarSqlBudget(), rightMapping: right, optionalRight: optionalRight)
 end

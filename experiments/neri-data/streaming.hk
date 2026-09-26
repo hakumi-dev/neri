@@ -1,0 +1,302 @@
+use clock
+namespace neri_data
+
+## Cooperative cancellation for a single synchronous call. It is not thread-safe.
+class CancellationToken
+  private stopped: Bool = false
+
+  public def cancel(): Void
+    this.stopped = true
+  end
+
+  public readonly def cancelled(): Bool
+    return this.stopped
+  end
+end
+
+class StreamOptions
+  private storedToken: CancellationToken?
+  private storedTimeout: Int?
+
+  public def init(token: CancellationToken? = null, timeoutMilliseconds: Int? = null): Void
+    this.storedToken = token
+    this.storedTimeout = timeoutMilliseconds
+  end
+
+  public def token(): CancellationToken?
+    return this.storedToken
+  end
+
+  public readonly def timeoutMilliseconds(): Int?
+    return this.storedTimeout
+  end
+end
+
+## A validated, internally compiled streaming read; no buffered row cap applies.
+class StreamPlan
+  private statement: String
+  private bound: ParameterValues
+  private resultColumns: readonly ResultColumns
+  private maximum: Int?
+  private deadline: Int?
+  private cancellation: CancellationToken?
+
+  internal def init(sql: String, parameters: ParameterValues, columns: readonly ResultColumns, maximumRows: Int?, deadlineMilliseconds: Int?, token: CancellationToken?): Void
+    this.statement = sql
+    this.bound = parameters
+    this.resultColumns = columns
+    this.maximum = maximumRows
+    this.deadline = deadlineMilliseconds
+    this.cancellation = token
+  end
+
+  public readonly def sql(): String
+    return this.statement
+  end
+
+  public readonly def parameters(): readonly ParameterValues
+    return this.bound
+  end
+
+  public readonly def columns(): readonly ResultColumns
+    return this.resultColumns
+  end
+
+  public readonly def maximumRows(): Int?
+    return this.maximum
+  end
+
+  public readonly def deadlineMilliseconds(): Int?
+    return this.deadline
+  end
+
+  public readonly def token(): readonly CancellationToken?
+    return this.cancellation
+  end
+end
+
+## Query.stream returns successfully decoded visitor deliveries; provider counts
+## raw rows it handed to the sink before decoding.
+enum StreamResult
+  case Completed(count: Int)
+  case Stopped(count: Int)
+  case Cancelled(count: Int)
+  case Failure(error: QueryFailure, count: Int)
+end
+
+def streamTimedOut(deadline: Int?): Bool
+  if deadline == null
+    return false
+  end
+  let now = clock::milliseconds()
+
+  return now == null || now >= deadline
+end
+
+def streamMaximum<T>(query: Query<T>): Int?
+  var maximum: Int? = null
+  var stage: Query<T>? = query
+
+  while stage != null
+    let bound = stage.rowLimit()
+
+    if bound != null && (maximum == null || bound < maximum)
+      maximum = bound
+    end
+    stage = stage.prior()
+  end
+  return maximum
+end
+
+class StreamSink<T>
+  private compiled: TypedPlan<T>
+  private visitor: fn(T): Bool
+  private tokenValue: CancellationToken?
+  private deadlineValue: Int?
+  private maximum: Int?
+  private deliveredCount: Int = 0
+  private visitorStopped: Bool = false
+  private wasCancelled: Bool = false
+  private decodeError: QueryFailure? = null
+  private exceededLimit: Bool = false
+
+  internal def init(compiled: TypedPlan<T>, visitor: fn(T): Bool, token: CancellationToken?, deadline: Int?, maximum: Int?): Void
+    this.compiled = compiled
+    this.visitor = visitor
+    this.tokenValue = token
+    this.deadlineValue = deadline
+    this.maximum = maximum
+  end
+
+  internal def accept(raw: RawRow): Bool
+    if this.visitorStopped || this.wasCancelled || this.decodeError != null || this.exceededLimit
+      return false
+    end
+    let token = this.tokenValue
+
+    if (token != null && token.cancelled()) || streamTimedOut(this.deadlineValue)
+      this.wasCancelled = true
+      return false
+    end
+    let maximum = this.maximum
+
+    if maximum != null && this.deliveredCount >= maximum
+      this.exceededLimit = true
+      return false
+    end
+    match this.compiled.decode(raw)
+      case DecodeResult.Failure(error)
+        this.decodeError = error
+        return false
+      case DecodeResult.Value(value)
+        this.deliveredCount = this.deliveredCount + 1
+        if !this.visitor(value)
+          this.visitorStopped = true
+          return false
+        end
+        if (token != null && token.cancelled()) || streamTimedOut(this.deadlineValue)
+          this.wasCancelled = true
+          return false
+        end
+        return true
+    end
+  end
+
+  internal readonly def delivered(): Int
+    return this.deliveredCount
+  end
+
+  internal readonly def stopped(): Bool
+    return this.visitorStopped
+  end
+
+  internal readonly def cancelled(): Bool
+    return this.wasCancelled
+  end
+
+  internal def failure(): QueryFailure?
+    return this.decodeError
+  end
+
+  internal readonly def exceeded(): Bool
+    return this.exceededLimit
+  end
+end
+
+def streamTyped<T>(query: Query<T>, visit: fn(T): Bool, options: StreamOptions?): StreamResult
+  let compile: fn(SqlDialect): CompileResult<T> = fn(dialect: SqlDialect): CompileResult<T>
+    return compilePipeline<T, T>(query, query.rowDecoder(), null, query.rowLimit(), dialect, unbounded: true)
+  end
+
+  return streamCompiled<T>(query.provider(), compile, visit, options, streamMaximum<T>(query))
+end
+
+def streamTypedWith<T>(query: Query<T>, provider: Provider, visit: fn(T): Bool, options: StreamOptions?): StreamResult
+  let compile: fn(SqlDialect): CompileResult<T> = fn(dialect: SqlDialect): CompileResult<T>
+    return compilePipeline<T, T>(query, query.rowDecoder(), null, query.rowLimit(), dialect, unbounded: true)
+  end
+
+  return streamCompiled<T>(provider, compile, visit, options, streamMaximum<T>(query))
+end
+
+## Collects an unbounded typed stream without exposing a partial result on failure.
+def materializeStream<T>(provider: Provider, compile: fn(SqlDialect): CompileResult<T>): QueryResult<T>
+  let rows = new TypedRows<T>()
+  let visit: fn(T): Bool = fn(value: T): Bool
+    rows.add(value)
+    return true
+  end
+
+  match streamCompiled<T>(provider, compile, visit, null, null)
+    case StreamResult.Completed(count)
+      return QueryResult<T>.Rows(rows)
+    case StreamResult.Failure(error, count)
+      return QueryResult<T>.Failure(error)
+    case StreamResult.Cancelled(count)
+      return QueryResult<T>.Failure(QueryFailure.Provider("materialization was cancelled"))
+    case StreamResult.Stopped(count)
+      return QueryResult<T>.Failure(QueryFailure.Provider("materialization stopped before completion"))
+  end
+end
+
+def streamCompiled<T>(provider: Provider?, compile: fn(SqlDialect): CompileResult<T>, visit: fn(T): Bool, options: StreamOptions?, maximum: Int?): StreamResult
+
+  if provider == null
+    return StreamResult.Failure(QueryFailure.UnsupportedCapability("stream requires a provider"), 0)
+  end
+  if !provider.supports(ProviderCapability.StreamingReads())
+    return StreamResult.Failure(QueryFailure.UnsupportedCapability("streaming-reads"), 0)
+  end
+  var token: CancellationToken? = null
+  var timeout: Int? = null
+
+  if options != null
+    token = options.token()
+    timeout = options.timeoutMilliseconds()
+  end
+  if timeout != null && (timeout < 1 || timeout > 86400000)
+    return StreamResult.Failure(QueryFailure.Provider("stream timeout must be between 1 and 86400000 milliseconds"), 0)
+  end
+  if token != null && token.cancelled()
+    return StreamResult.Cancelled(0)
+  end
+  var deadline: Int? = null
+
+  if timeout != null
+    let now = clock::milliseconds()
+
+    if now == null || now > 9223372036854775807 - timeout
+      return StreamResult.Failure(QueryFailure.Provider("monotonic deadline is unavailable"), 0)
+    end
+    deadline = now + timeout
+  end
+  match compile(provider.dialect())
+    case CompileResult.Failure(error)
+      return StreamResult.Failure(error, 0)
+    case CompileResult.Plan(compiled)
+      if compiled.sql().requiresCheckedScalars() && !provider.supports(ProviderCapability.CheckedScalarExpressions())
+        return StreamResult.Failure(QueryFailure.UnsupportedCapability("checked-scalar-expressions"), 0)
+      end
+      if streamTimedOut(deadline)
+        return StreamResult.Cancelled(0)
+      end
+      let plan = new StreamPlan(compiled.sql().sql(), compiled.parameterValues(), compiled.sql().columns(), maximum, deadline, token)
+      let state = new StreamSink<T>(compiled, visit, token, deadline, maximum)
+      let sink: fn(RawRow): Bool = fn(raw: RawRow): Bool
+        return state.accept(raw)
+      end
+      let result = provider.stream(plan, sink)
+      let delivered = state.delivered()
+
+      let decodeFailure = state.failure()
+
+      if decodeFailure != null
+        return StreamResult.Failure(decodeFailure, delivered)
+      end
+      if state.exceeded()
+        return StreamResult.Failure(QueryFailure.Provider("provider exceeded streaming row limit"), delivered)
+      end
+      match result
+        case StreamResult.Completed(count)
+          if state.stopped() || state.cancelled() || count != delivered
+            return StreamResult.Failure(QueryFailure.Provider("provider ignored streaming stop or returned an invalid count"), delivered)
+          end
+          return StreamResult.Completed(delivered)
+        case StreamResult.Stopped(count)
+          if state.stopped() && count == delivered
+            return StreamResult.Stopped(delivered)
+          end
+          if state.cancelled()
+            return StreamResult.Cancelled(delivered)
+          end
+          return StreamResult.Failure(QueryFailure.Provider("provider stopped without visitor request or returned an invalid count"), delivered)
+        case StreamResult.Cancelled(count)
+          if state.stopped()
+            return StreamResult.Stopped(delivered)
+          end
+          return StreamResult.Cancelled(delivered)
+        case StreamResult.Failure(error, count)
+          return StreamResult.Failure(error, delivered)
+      end
+  end
+end

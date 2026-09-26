@@ -5,6 +5,7 @@
 #endif
 #include "neri/codegen/reader.h"
 
+#include <algorithm>
 #include <cctype>
 #include <chrono>
 #include <cstddef>
@@ -39,6 +40,7 @@ struct arguments final {
   neri::codegen::output_kind kind{};
   std::filesystem::path output;
   std::filesystem::path metrics;
+  std::filesystem::path progress;
   neri::codegen::debug_source_paths debug_sources;
 };
 
@@ -51,7 +53,7 @@ void print_usage(std::ostream &stream) {
             "<binary|hex> --target <macos-arm64|linux-x86_64|windows-x86_64> "
             "--optimization <debug|release> "
             "--emit <llvm-ir|assembly|object> --output <path|-> "
-            "[--metrics <path>] [--debug-source <id> <path>]\n";
+            "[--metrics <path>] [--progress <path>] [--debug-source <id> <path>]\n";
 }
 
 arguments parse_arguments(int argc, char **argv) {
@@ -67,6 +69,7 @@ arguments parse_arguments(int argc, char **argv) {
   std::string emit;
   std::string output;
   std::string metrics;
+  std::string progress;
   neri::codegen::debug_source_paths debug_sources;
   for (int index = 1; index < argc; index += 2) {
     const std::string_view option(argv[index]);
@@ -106,6 +109,9 @@ arguments parse_arguments(int argc, char **argv) {
       if (option == "--metrics") {
         return metrics;
       }
+      if (option == "--progress") {
+        return progress;
+      }
       usage_error("Unknown option '" + std::string(option) + "'.");
     }();
     if (!destination.empty()) {
@@ -140,7 +146,30 @@ arguments parse_arguments(int argc, char **argv) {
           kind,
           neri::host_path(output),
           neri::host_path(metrics),
+          neri::host_path(progress),
           std::move(debug_sources)};
+}
+
+std::string progress_json_string(std::string_view value) {
+  std::string result = "\"";
+  auto limit = std::min<std::size_t>(value.size(), 160U);
+  if (limit < value.size()) {
+    while (limit > 0 && (static_cast<unsigned char>(value[limit]) & 0xC0U) == 0x80U)
+      --limit;
+  }
+  for (const auto character : value.substr(0, limit)) {
+    const auto byte = static_cast<unsigned char>(character);
+    if (character == '"' || character == '\\') {
+      result += '\\';
+      result += character;
+    } else if (byte < 32U || byte == 127U) {
+      result += '?';
+    } else {
+      result += character;
+    }
+  }
+  result += '"';
+  return result;
 }
 
 std::vector<std::uint8_t> read_file(const std::filesystem::path &path,
@@ -274,11 +303,30 @@ int main(int argc, char **argv) {
     const auto module = neri::codegen::read_verified_module(bytes);
     const auto emission_started = std::chrono::steady_clock::now();
     neri::codegen::emission_metrics metrics;
+    std::ofstream progress_file;
+    std::size_t progress_bytes = 0;
+    if (!options.progress.empty())
+      progress_file.open(options.progress, std::ios::binary | std::ios::trunc);
+    const neri::codegen::emission_progress progress =
+        [&](std::string_view phase, std::size_t completed, std::size_t total,
+            std::string_view detail, std::size_t source_offset) {
+          if (!progress_file || progress_bytes >= 1048576U) return;
+          const auto line = "{\"schemaVersion\":1,\"phase\":" +
+                            progress_json_string(phase) +
+                            ",\"completed\":" + std::to_string(completed) +
+                            ",\"total\":" + std::to_string(total) +
+                            ",\"detail\":" + progress_json_string(detail) +
+                            ",\"sourceOffset\":" + std::to_string(source_offset) + "}\n";
+          if (progress_bytes + line.size() > 1048576U) return;
+          progress_file << line << std::flush;
+          progress_bytes += line.size();
+        };
     write_output(options.output,
                  neri::codegen::emit_module(module, options.target,
                                               options.optimization,
                                               options.kind, &metrics,
-                                              options.debug_sources));
+                                              options.debug_sources,
+                                              options.progress.empty() ? neri::codegen::emission_progress{} : progress));
     write_metrics(
         options.metrics,
         static_cast<std::uint64_t>(

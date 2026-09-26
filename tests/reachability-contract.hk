@@ -1,0 +1,312 @@
+use console
+use files
+use host
+use process
+use resources
+use result
+use test
+
+def reachabilityText(bytes: Byte[]): String
+  let decoded = host::stringFromBytes(bytes)
+
+  test::assertTrue(decoded != null)
+  if decoded != null
+    return decoded
+  end
+  return ""
+end
+
+def reachabilityInvoke(executable: String, arguments: String[], cache: String): process::PollResult
+  let options = new process::SpawnOptions(executable)
+
+  options.arguments = arguments
+  options.environment = [new process::EnvironmentEntry("NERI_CACHE_DIR", cache)]
+  let started = process::spawn(options)
+  let spawnFailure = started.failure()
+
+  if spawnFailure != null
+    console::println("Could not start " + executable + " " + (arguments.Length == 0 ? "" : arguments[0]) + ": " + spawnFailure.code())
+  end
+
+  test::assertTrue(spawnFailure == null)
+  let child = started.child()
+
+  test::assertTrue(child != null)
+  if child == null
+    return new process::PollResult()
+  end
+  let completed = child.wait(60000)
+  let waitFailure = completed.failure
+
+  if waitFailure != null || completed.running
+    console::println("Process did not finish: " + executable + "; wait failure: " + (waitFailure == null ? "none" : waitFailure.code() + " (" + waitFailure.operation + ", OS " + (waitFailure.osCode as String) + ")") + "; stdout: " + reachabilityText(completed.stdout) + "; stderr: " + reachabilityText(completed.stderr))
+  end
+
+  test::assertTrue(waitFailure == null && !completed.running)
+  test::assertTrue(child.dispose())
+  return completed
+end
+
+def reachabilityExited(result: process::PollResult, expected: Int): Void
+  let status = result.exit
+
+  if status == null || !status.isExited() || status.value() != expected
+    console::println("Unexpected child result; stdout: " + reachabilityText(result.stdout) + "; stderr: " + reachabilityText(result.stderr))
+  end
+
+  test::assertTrue(status != null)
+  if status != null
+    test::assertTrue(status.isExited())
+    test::assertEqual(status.value(), expected)
+  end
+end
+
+def reachabilityAssertCachePhase(result: process::PollResult, phase: String): Void
+  let stderr = reachabilityText(result.stderr)
+  let expected = "dependency-native-" + phase
+  let other = "dependency-native-" + (phase == "hit" ? "miss" : "hit")
+
+  if !reachabilityContains(stderr, expected) || reachabilityContains(stderr, other)
+    console::println("Unexpected dependency cache phase; expected " + expected + "; stderr: " + stderr)
+  end
+
+  test::assertTrue(reachabilityContains(stderr, expected))
+  test::assertTrue(!reachabilityContains(stderr, other))
+end
+
+def reachabilityWrite(path: String, value: String): Void
+  test::assertTrue(host::writeText(path, value))
+end
+
+def reachabilityBuild(compiler: String, manifest: String, unit: String, output: String, cache: String, release: Bool, noCache: Bool = false): process::PollResult
+  var arguments = ["build", "--project", manifest, "--unit", unit, "--timings", "--output", output]
+
+  if release
+    arguments = host::appendString(arguments, "--release")
+  end
+  if noCache
+    arguments = host::appendString(arguments, "--no-cache")
+  end
+  return reachabilityInvoke(compiler, arguments, cache)
+end
+
+def reachabilityRun(executable: String, cache: String, expected: String): Void
+  let result = reachabilityInvoke(executable, [], cache)
+
+  reachabilityExited(result, 0)
+
+  if reachabilityText(result.stdout) != expected
+    console::println("Unexpected executable output: expected " + expected + "; received " + reachabilityText(result.stdout))
+  end
+
+  test::assertEqual(reachabilityText(result.stdout), expected)
+end
+
+def reachabilityContains(value: String, part: String): Bool
+  var offset = 0
+
+  while offset + host::stringByteLength(part) <= host::stringByteLength(value)
+    var equal = true
+    var index = 0
+
+    while index < host::stringByteLength(part)
+      if host::stringByteAt(value, offset + index) != host::stringByteAt(part, index)
+        equal = false
+      end
+      index = index + 1
+    end
+    if equal
+      return true
+    end
+    offset = offset + 1
+  end
+  return false
+end
+
+def reachabilityHexByte(value: Int): String
+  let digits = "0123456789abcdef"
+  let remainder = value - (value / 16) * 16
+
+  return host::stringSlice(digits, value / 16, 1) + host::stringSlice(digits, remainder, 1)
+end
+
+def reachabilityHex(value: String): String
+  var result = ""
+  var index = 0
+
+  while index < host::stringByteLength(value)
+    result = result + reachabilityHexByte(host::stringByteAt(value, index) as Int)
+    index = index + 1
+  end
+  return result
+end
+
+def reachabilitySymbols(executable: String, cache: String): String?
+  let operatingSystem = host::environment("OS")
+
+  if operatingSystem != null && operatingSystem == "Windows_NT"
+    console::println("Reachability symbol assertions are skipped on Windows; runtime assertions still run.")
+    return null
+  end
+  let result = reachabilityInvoke("nm", ["-a", executable], cache)
+  let status = result.exit
+
+  if status == null || !status.isExited() || status.value() != 0
+    console::println("Could not inspect executable symbols; stdout: " + reachabilityText(result.stdout) + "; stderr: " + reachabilityText(result.stderr))
+  end
+
+  test::assertTrue(status != null && status.isExited() && status.value() == 0)
+  return reachabilityText(result.stdout)
+end
+
+def reachabilityAssertAbsent(symbols: String?, symbol: String): Void
+  if symbols != null
+    if reachabilityContains(symbols, symbol)
+      console::println("Unexpected executable symbol substring: " + symbol)
+    end
+
+    test::assertTrue(!reachabilityContains(symbols, symbol))
+  end
+end
+
+def reachabilityAssertPresent(symbols: String?, symbol: String): Void
+  if symbols != null
+    if !reachabilityContains(symbols, symbol)
+      console::println("Expected executable symbol substring was absent: " + symbol)
+    end
+
+    test::assertTrue(reachabilityContains(symbols, symbol))
+  end
+end
+
+def reachabilityRunContracts(project: String, compiler: String, root: String): Void
+  let cache = root + "/cache"
+  let manifest = root + "/manifest.json"
+  let library = root + "/library.hk"
+  let absentOutput = root + "/absent-release"
+  let unusedOutput = root + "/unused-release"
+  let debugOutput = root + "/unused-debug"
+  let fallbackOutput = root + "/unused-no-cache"
+  let liveOutput = root + "/live-release"
+  let created = files::createDirectory(cache)
+
+  test::assertTrue(created.failure == null)
+  let operatingSystem = host::environment("OS")
+
+  if operatingSystem == null || operatingSystem != "Windows_NT"
+    let protectedCache = host::run("chmod", ["700", cache])
+
+    test::assertTrue(protectedCache != null && protectedCache == 0)
+  end
+  let librarySource = host::readText(project + "/tests/fixtures/reachability/library.hk")
+  let absentSource = host::readText(project + "/tests/fixtures/reachability/absent.hk")
+  let unusedSource = host::readText(project + "/tests/fixtures/reachability/unused.hk")
+  let liveSource = host::readText(project + "/tests/fixtures/reachability/live.hk")
+
+  test::assertTrue(librarySource != null && absentSource != null && unusedSource != null && liveSource != null)
+  if librarySource == null || absentSource == null || unusedSource == null || liveSource == null
+    return
+  end
+  reachabilityWrite(library, librarySource)
+  reachabilityWrite(root + "/absent.hk", absentSource)
+  reachabilityWrite(root + "/unused.hk", unusedSource)
+  reachabilityWrite(root + "/live.hk", liveSource)
+  reachabilityWrite(manifest, "{\"version\":2,\"defaultUnit\":\"absent\",\"units\":{\"library\":{\"kind\":\"library\",\"sources\":[\"library.hk\"]},\"absent\":{\"kind\":\"executable\",\"sources\":[\"absent.hk\"],\"references\":[\"library\"]},\"unused\":{\"kind\":\"executable\",\"sources\":[\"unused.hk\"],\"references\":[\"library\"]},\"live\":{\"kind\":\"executable\",\"sources\":[\"live.hk\"],\"references\":[\"library\"]}}}\n")
+
+  let absent = reachabilityBuild(compiler, manifest, "absent", absentOutput, cache, true)
+
+  reachabilityExited(absent, 0)
+  reachabilityRun(absentOutput, cache, "")
+  let absentSymbols = reachabilitySymbols(absentOutput, cache)
+
+  reachabilityAssertAbsent(absentSymbols, reachabilityHex("neverCalled"))
+  reachabilityAssertAbsent(absentSymbols, reachabilityHex("unreachableNative"))
+  reachabilityAssertAbsent(absentSymbols, "_n14_" + reachabilityHex("DeadDescriptor") + "e")
+  reachabilityAssertPresent(absentSymbols, "reachability_contract_export_root")
+
+  let unused = reachabilityBuild(compiler, manifest, "unused", unusedOutput, cache, true)
+
+  reachabilityExited(unused, 0)
+  reachabilityAssertCachePhase(unused, "miss")
+  reachabilityRun(unusedOutput, cache, "")
+  let unusedSymbols = reachabilitySymbols(unusedOutput, cache)
+
+  reachabilityAssertAbsent(unusedSymbols, reachabilityHex("neverCalled"))
+  reachabilityAssertAbsent(unusedSymbols, reachabilityHex("unreachableNative"))
+  reachabilityAssertAbsent(unusedSymbols, "_n14_" + reachabilityHex("DeadDescriptor") + "e")
+  reachabilityAssertPresent(unusedSymbols, "reachability_contract_export_root")
+
+  let unusedHit = reachabilityBuild(compiler, manifest, "unused", root + "/unused-release-hit", cache, true)
+
+  reachabilityExited(unusedHit, 0)
+  reachabilityAssertCachePhase(unusedHit, "hit")
+  reachabilityRun(root + "/unused-release-hit", cache, "")
+
+  let debug = reachabilityBuild(compiler, manifest, "unused", debugOutput, cache, false)
+
+  reachabilityExited(debug, 0)
+  reachabilityAssertCachePhase(debug, "miss")
+  reachabilityRun(debugOutput, cache, "")
+  let debugSymbols = reachabilitySymbols(debugOutput, cache)
+
+  reachabilityAssertAbsent(debugSymbols, reachabilityHex("neverCalled"))
+  reachabilityAssertAbsent(debugSymbols, reachabilityHex("unreachableNative"))
+  reachabilityAssertAbsent(debugSymbols, "_n14_" + reachabilityHex("DeadDescriptor") + "e")
+
+  let fallback = reachabilityBuild(compiler, manifest, "unused", fallbackOutput, cache, true, true)
+
+  reachabilityExited(fallback, 0)
+
+  test::assertTrue(!reachabilityContains(reachabilityText(fallback.stderr), "dependency-native-hit"))
+  reachabilityRun(fallbackOutput, cache, "")
+  let fallbackSymbols = reachabilitySymbols(fallbackOutput, cache)
+
+  reachabilityAssertAbsent(fallbackSymbols, reachabilityHex("neverCalled"))
+  reachabilityAssertAbsent(fallbackSymbols, reachabilityHex("unreachableNative"))
+  reachabilityAssertAbsent(fallbackSymbols, "_n14_" + reachabilityHex("DeadDescriptor") + "e")
+
+  let live = reachabilityBuild(compiler, manifest, "live", liveOutput, cache, true)
+
+  reachabilityExited(live, 0)
+  reachabilityRun(liveOutput, cache, "42:43:generic:40\n")
+  let liveSymbols = reachabilitySymbols(liveOutput, cache)
+
+  reachabilityAssertAbsent(liveSymbols, reachabilityHex("neverCalled"))
+  reachabilityAssertAbsent(liveSymbols, reachabilityHex("unreachableNative"))
+  reachabilityAssertAbsent(liveSymbols, "_n14_" + reachabilityHex("DeadDescriptor") + "e")
+  reachabilityAssertPresent(liveSymbols, "_n5_" + reachabilityHex("Child") + "e")
+  reachabilityAssertPresent(liveSymbols, "reachability_contract_export_root")
+  console::println("Reachability contracts passed")
+end
+
+def reachabilityWithTemporary(project: String, compiler: String): resources::Outcome<Int, result::Failure>
+  using temporary <- files::TemporaryDirectory.create("neri-reachability-")
+    reachabilityRunContracts(project, compiler, temporary.path())
+    return resources::success(0)
+  end
+  return resources::failure(new result::Failure("unexpected_exit", "reachability"))
+end
+
+def main(): Void
+  let project = host::argumentAt(0)
+  let compiler = host::argumentAt(1)
+  let work = host::argumentAt(2)
+
+  test::assertTrue(project != null && compiler != null && work != null)
+  if project == null || compiler == null || work == null
+    return
+  end
+  let outcome = reachabilityWithTemporary(project, compiler)
+
+  test::assertEqual(outcome.closeFailures.count(), 0)
+  match outcome.completion
+    case resources::Completion.Value(value)
+      test::assertEqual(value, 0)
+    case resources::Completion.Failure(primary)
+      if primary != null
+        console::println("Reachability contract setup failed: " + primary.code + " (" + primary.operation + ", OS " + (primary.osCode as String) + "): " + primary.detail)
+      end
+
+      test::assertTrue(false)
+  end
+end

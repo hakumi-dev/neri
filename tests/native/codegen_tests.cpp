@@ -100,6 +100,10 @@ void test_unsafe_call_boundary() {
   module.functions.push_back(caller);
   verify_supported_module(module);
 
+  auto adapter = module;
+  adapter.functions[0].kind = NERI_IR_DEFAULT_ADAPTER_V1;
+  verify_supported_module(adapter);
+
   auto rejected = [](const ir_module &candidate) {
     try {
       verify_supported_module(candidate);
@@ -117,6 +121,171 @@ void test_unsafe_call_boundary() {
   rejected(malformed);
   malformed = module;
   malformed.functions[0].unsafe_root.reset();
+  rejected(malformed);
+}
+
+void test_unsafe_virtual_call_boundary() {
+  using namespace neri::codegen;
+  ir_module module;
+  module.semantic_version = {1, 0};
+  module.id = "unsafe-virtual-contract";
+  module.sources.push_back({"unsafe-virtual.hk", {'c', 'a', 'l', 'l'}});
+  const source_location call_location{"unsafe-virtual.hk", 0U, 4U};
+  const type capability{NERI_IR_TYPE_UNSAFE_CAPABILITY_V1, std::nullopt, {}};
+  const type integer{NERI_IR_TYPE_INT_V1, std::nullopt, {}};
+  class_declaration base;
+  base.id = {module.id, NERI_IR_SYMBOL_CLASS_V1, "Base"};
+  base.access = NERI_IR_ACCESS_INTERNAL_V1;
+  const type receiver{NERI_IR_TYPE_CLASS_V1, base.id, {}};
+  function target;
+  target.id = {module.id, NERI_IR_SYMBOL_METHOD_V1, "Base.invoke"};
+  target.kind = NERI_IR_INSTANCE_METHOD_V1;
+  target.declaring_class = base.id;
+  target.dispatch_slot = target.id;
+  target.parameter_types = {receiver, integer};
+  target.result_type = integer;
+  target.unsafe_call = true;
+  target.unsafe_root = value_definition{2U, capability};
+  block implementation;
+  implementation.parameters = {{0U, receiver, std::nullopt},
+                               {1U, integer, std::nullopt}};
+  implementation.ending.tag = NERI_IR_TERMINATOR_RETURN_V1;
+  implementation.ending.return_value = 1U;
+  target.blocks.push_back(implementation);
+  base.methods.push_back({target.id, NERI_IR_DISPATCH_VIRTUAL_V1,
+                          target.dispatch_slot, std::nullopt});
+  module.classes.push_back(base);
+  module.functions.push_back(target);
+
+  class_declaration derived;
+  derived.id = {module.id, NERI_IR_SYMBOL_CLASS_V1, "Derived"};
+  derived.base = base.id;
+  derived.access = NERI_IR_ACCESS_INTERNAL_V1;
+  auto override = target;
+  override.id.semantic_name = "Derived.invoke";
+  override.declaring_class = derived.id;
+  override.parameter_types[0].symbol = derived.id;
+  override.blocks[0].parameters[0].value_type.symbol = derived.id;
+  derived.methods.push_back({override.id, NERI_IR_DISPATCH_VIRTUAL_V1,
+                             override.dispatch_slot, std::nullopt});
+  module.classes.push_back(derived);
+  module.functions.push_back(override);
+
+  function caller;
+  caller.id = {module.id, NERI_IR_SYMBOL_FUNCTION_V1, "caller"};
+  caller.kind = NERI_IR_FUNCTION_V1;
+  caller.parameter_types = {receiver, integer};
+  caller.result_type = integer;
+  caller.effects = NERI_IR_EFFECT_UNSAFE_V1;
+  instruction begin;
+  begin.opcode = NERI_IR_OPCODE_UNSAFE_BEGIN_V1;
+  begin.results = {{2U, capability}};
+  instruction call;
+  call.opcode = NERI_IR_OPCODE_CALL_VIRTUAL_V1;
+  call.location = call_location;
+  call.symbol = target.dispatch_slot;
+  call.operands = {2U, 0U, 1U}; // Capability precedes the physical receiver.
+  call.results = {{3U, integer}};
+  instruction end;
+  end.opcode = NERI_IR_OPCODE_UNSAFE_END_V1;
+  end.operands = {2U};
+  block body;
+  body.parameters = implementation.parameters;
+  body.instructions = {begin, call, end};
+  body.ending.tag = NERI_IR_TERMINATOR_RETURN_V1;
+  body.ending.return_value = 3U;
+  caller.blocks.push_back(body);
+  module.functions.push_back(caller);
+
+  verify_supported_module(module);
+
+  const auto rejected = [](const ir_module &candidate) {
+    try {
+      verify_supported_module(candidate);
+    } catch (const reader_error &) {
+      return;
+    }
+    throw std::runtime_error("unsafe virtual call escaped capability validation");
+  };
+  auto malformed = module;
+  malformed.functions[2].blocks[0].instructions[1].operands = {0U, 1U};
+  rejected(malformed);
+  malformed = module;
+  malformed.functions[2].blocks[0].instructions[1].operands[0] = 1U;
+  rejected(malformed);
+  malformed = module;
+  malformed.functions[1].unsafe_call = false;
+  malformed.functions[1].unsafe_root.reset();
+  rejected(malformed);
+}
+
+void test_worker_entry_validation() {
+  using namespace neri::codegen;
+  ir_module module;
+  module.semantic_version = {1, 0};
+  module.id = "worker-entry-contract";
+  module.required_features = {ir_feature::CInterop, ir_feature::ExtendedScalars,
+                              ir_feature::IsolatedWorkers, ir_feature::RetainedModules};
+  const type byte{NERI_IR_TYPE_BYTE_V1, std::nullopt, {}};
+  const type bytes{NERI_IR_TYPE_ARRAY_V1, std::nullopt, {byte}};
+  const type signature{NERI_IR_TYPE_C_FUNCTION_V1, std::nullopt,
+      {{NERI_IR_TYPE_VOID_V1, std::nullopt, {}},
+       {NERI_IR_TYPE_POINTER_V1, std::nullopt, {byte}},
+       {NERI_IR_TYPE_UINT64_V1, std::nullopt, {}}}};
+  function target;
+  target.id = {module.id, NERI_IR_SYMBOL_FUNCTION_V1, "aaa_entry"};
+  target.kind = NERI_IR_FUNCTION_V1;
+  target.parameter_types = {bytes};
+  target.result_type.tag = NERI_IR_TYPE_VOID_V1;
+  // An entry in a separately compiled module need not have a body here.
+  target.retained = true;
+  module.functions.push_back(target);
+
+  function caller;
+  caller.id = {module.id, NERI_IR_SYMBOL_FUNCTION_V1, "bbb_adapter"};
+  caller.kind = NERI_IR_FUNCTION_V1;
+  caller.result_type = signature;
+  instruction address;
+  address.opcode = NERI_IR_OPCODE_WORKER_ENTRY_V1;
+  address.symbol = target.id;
+  address.results = {{0U, signature}};
+  block body;
+  body.instructions = {address};
+  body.ending.tag = NERI_IR_TERMINATOR_RETURN_V1;
+  body.ending.return_value = 0U;
+  caller.blocks.push_back(body);
+  module.functions.push_back(caller);
+
+  verify_supported_module(module);
+
+  const auto rejected = [](const ir_module &candidate) {
+    try {
+      verify_supported_module(candidate);
+    } catch (const reader_error &) {
+      return;
+    }
+    throw std::runtime_error("invalid worker entry escaped native validation");
+  };
+  auto malformed = module;
+  malformed.functions[0].unsafe_call = true;
+  rejected(malformed);
+  malformed = module;
+  malformed.functions[0].parameter_types[0] = byte;
+  rejected(malformed);
+  malformed = module;
+  malformed.functions[0].export_name = "worker_export";
+  rejected(malformed);
+  malformed = module;
+  malformed.functions[1].blocks[0].instructions[0].symbol->semantic_name = "missing_entry";
+  rejected(malformed);
+  malformed = module;
+  malformed.functions[1].blocks[0].instructions[0].operands = {0U};
+  rejected(malformed);
+  malformed = module;
+  malformed.functions[1].blocks[0].instructions[0].results[0].value_type.arguments[2].tag = NERI_IR_TYPE_INT_V1;
+  rejected(malformed);
+  malformed = module;
+  malformed.required_features.erase(malformed.required_features.begin() + 2);
   rejected(malformed);
 }
 
@@ -166,6 +335,102 @@ void test_debug_scope_validation() {
   malformed = module;
   malformed.functions[0].debug_locals[0].scope_id = 2U;
   rejected(malformed);
+  malformed = module;
+  malformed.functions[0].debug_scopes[0].location.source = "missing.hk";
+  rejected(malformed);
+}
+
+void test_managed_reference_comparison() {
+  using namespace neri::codegen;
+  ir_module module;
+  module.semantic_version = {1, 0};
+  module.id = "reference-comparison-contract";
+  class_declaration box;
+  box.id = {module.id, NERI_IR_SYMBOL_CLASS_V1, "Box"};
+  box.access = NERI_IR_ACCESS_INTERNAL_V1;
+  module.classes.push_back(box);
+  const type reference{NERI_IR_TYPE_CLASS_V1, box.id, {}};
+  const type boolean{NERI_IR_TYPE_BOOL_V1, std::nullopt, {}};
+  function compare;
+  compare.id = {module.id, NERI_IR_SYMBOL_FUNCTION_V1, "same"};
+  compare.kind = NERI_IR_FUNCTION_V1;
+  compare.result_type = boolean;
+  compare.parameter_types = {reference, reference};
+  block entry;
+  entry.parameters = {{0U, reference, std::nullopt},
+                      {1U, reference, std::nullopt}};
+  instruction equality;
+  equality.opcode = NERI_IR_OPCODE_COMPARE_V1;
+  equality.operands = {0U, 1U};
+  equality.results = {{2U, boolean}};
+  equality.predicate = NERI_IR_COMPARISON_EQUAL_V1;
+  entry.instructions.push_back(equality);
+  entry.ending.tag = NERI_IR_TERMINATOR_RETURN_V1;
+  entry.ending.return_value = 2U;
+  compare.blocks.push_back(entry);
+  module.functions.push_back(compare);
+  verify_supported_module(module);
+
+  module.functions[0].blocks[0].instructions[0].predicate =
+      NERI_IR_COMPARISON_NOT_EQUAL_V1;
+  verify_supported_module(module);
+  module.functions[0].blocks[0].instructions[0].predicate =
+      NERI_IR_COMPARISON_LESS_V1;
+  try {
+    verify_supported_module(module);
+  } catch (const reader_error &error) {
+    require(diagnostic_code(error.code()) == "NIR006",
+            "ordered reference comparison returned a non-canonical diagnostic");
+    return;
+  }
+  throw std::runtime_error("ordered reference comparison escaped validation");
+}
+
+void test_field_lookup_validation() {
+  using namespace neri::codegen;
+  ir_module module;
+  module.semantic_version = {1, 0};
+  module.id = "field-lookup-contract";
+  const type integer{NERI_IR_TYPE_INT_V1, std::nullopt, {}};
+  class_declaration box;
+  box.id = {module.id, NERI_IR_SYMBOL_CLASS_V1, "Box"};
+  box.access = NERI_IR_ACCESS_INTERNAL_V1;
+  field value;
+  value.id = {module.id, NERI_IR_SYMBOL_FIELD_V1, "Box.value"};
+  value.access = NERI_IR_ACCESS_INTERNAL_V1;
+  value.value_type = integer;
+  box.fields.push_back(value);
+  module.classes.push_back(box);
+
+  const type reference{NERI_IR_TYPE_CLASS_V1, box.id, {}};
+  function read;
+  read.id = {module.id, NERI_IR_SYMBOL_FUNCTION_V1, "read"};
+  read.kind = NERI_IR_FUNCTION_V1;
+  read.result_type.tag = NERI_IR_TYPE_VOID_V1;
+  read.parameter_types = {reference};
+  read.effects = NERI_IR_EFFECT_READ_V1;
+  block entry;
+  entry.parameters = {{0U, reference, std::nullopt}};
+  instruction load;
+  load.opcode = NERI_IR_OPCODE_FIELD_LOAD_V1;
+  load.operands = {0U};
+  load.results = {{1U, integer}};
+  load.symbol = value.id;
+  entry.instructions.push_back(load);
+  entry.ending.tag = NERI_IR_TERMINATOR_RETURN_V1;
+  read.blocks.push_back(entry);
+  module.functions.push_back(read);
+  verify_supported_module(module);
+
+  auto malformed = module;
+  malformed.functions[0].blocks[0].instructions[0].symbol =
+      symbol_id{module.id, NERI_IR_SYMBOL_FIELD_V1, "Box.missing"};
+  try {
+    verify_supported_module(malformed);
+  } catch (const reader_error &) {
+    return;
+  }
+  throw std::runtime_error("missing field escaped verification");
 }
 
 void test_retained_module_lowering() {
@@ -389,7 +654,11 @@ int main(int argc, char **argv) {
     test_envelope_rejections(bytes);
     test_payload_rejections(bytes);
     test_unsafe_call_boundary();
+    test_unsafe_virtual_call_boundary();
+    test_worker_entry_validation();
     test_debug_scope_validation();
+    test_managed_reference_comparison();
+    test_field_lookup_validation();
     test_retained_module_lowering();
     test_primitive_codegen(read_hex(argv[2]));
     return 0;

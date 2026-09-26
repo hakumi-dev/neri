@@ -1,0 +1,359 @@
+use console
+use files
+use resources
+use result
+use test
+use neri_data
+use neri_data_sqlite
+use neri_data_sqlite_fixture
+
+def expectApplied(result: MigrationResult, expected: Int): Void
+  match result
+    case MigrationResult.Applied(count)
+      test::assertEqual(count, expected)
+    case MigrationResult.Failure(error)
+      console::println("Expected migration to apply")
+
+      test::assertTrue(false)
+  end
+end
+
+def expectRejected(result: MigrationResult): Void
+  match result
+    case MigrationResult.Applied(count)
+      test::assertTrue(false)
+    case MigrationResult.Failure(error)
+      match error
+        case MigrationFailure.Validation(message)
+          console::println(message)
+
+          test::assertTrue(message != "")
+        case MigrationFailure.Drift(message)
+          console::println(message)
+
+          test::assertTrue(message != "")
+        case MigrationFailure.Unsupported(message)
+          console::println(message)
+
+          test::assertTrue(message != "")
+        case MigrationFailure.Provider(message)
+          console::println(message)
+
+          test::assertTrue(message != "")
+      end
+  end
+end
+
+def printMigrationFailure(error: MigrationFailure): Void
+  match error
+    case MigrationFailure.Validation(message)
+      console::println(message)
+    case MigrationFailure.Drift(message)
+      console::println(message)
+    case MigrationFailure.Unsupported(message)
+      console::println(message)
+    case MigrationFailure.Provider(message)
+      console::println(message)
+  end
+end
+
+def hasColumn(provider: SQLiteProvider, table: String, column: String): Bool
+  match provider.inspectSchema()
+    case SQLiteSchemaResult.Failure(message)
+      console::println(message)
+
+      test::assertTrue(false)
+      return false
+    case SQLiteSchemaResult.Snapshot(snapshot)
+      var index = 0
+
+      while index < snapshot.count()
+        let entry = snapshot.at(index)
+
+        if entry != null && entry.table() == table && entry.name() == column
+          return true
+        end
+        index = index + 1
+      end
+      return false
+  end
+end
+
+def baseModel(): SchemaModel
+  let id = new SchemaField("customer-id", new SchemaColumn("id", SchemaType.Text(), primaryKey: true))
+  let name = new SchemaField("customer-name", new SchemaColumn("name", SchemaType.Text()))
+
+  return new SchemaModel([new SchemaTable("customers", "customers", [name, id])])
+end
+
+def evolvedModel(): SchemaModel
+  let id = new SchemaField("customer-id", new SchemaColumn("id", SchemaType.Text(), primaryKey: true))
+  let name = new SchemaField("customer-name", new SchemaColumn("display", SchemaType.Text()))
+  let tier = new SchemaField("customer-tier", new SchemaColumn("tier", SchemaType.Text(), defaultValue: SchemaDefault.Text("member")))
+  let note = new SchemaField("customer-note", new SchemaColumn("note", SchemaType.Text(), nullable: true))
+  let index = new SchemaIndex("people_display", ["customer-name"])
+
+  return new SchemaModel([new SchemaTable("customers", "people", [note, name, id, tier], [index])])
+end
+
+def assertSql(path: String, predicate: String): Void
+  let sql = "CREATE TABLE __schema_diff_assert(value INTEGER CHECK(value = 1)); INSERT INTO __schema_diff_assert VALUES(" + predicate + "); DROP TABLE __schema_diff_assert;"
+
+  test::assertTrue(createSQLiteFixture(path, sql))
+end
+
+def verifyCanonicalModels(): Void
+  console::println("schema diff: canonical models and loss flags")
+  let first = baseModel()
+  let reordered = new SchemaModel([new SchemaTable("customers", "customers", [new SchemaField("customer-id", new SchemaColumn("id", SchemaType.Text(), primaryKey: true)), new SchemaField("customer-name", new SchemaColumn("name", SchemaType.Text()))])])
+
+  test::assertEqual(first.signature(), reordered.signature())
+
+  let sourceFields: SchemaField[] = [new SchemaField("customer-name", new SchemaColumn("name", SchemaType.Text())), new SchemaField("customer-id", new SchemaColumn("id", SchemaType.Text(), primaryKey: true))]
+  let copiedModel = new SchemaModel([new SchemaTable("customers", "customers", sourceFields)])
+  let copiedSignature = copiedModel.signature()
+
+  sourceFields[0] = new SchemaField("customer-name", new SchemaColumn("changed", SchemaType.Text()))
+
+  test::assertEqual(copiedModel.signature(), copiedSignature)
+  match diffSchema("unchanged", first, reordered)
+    case SchemaDiffResult.Unchanged()
+    case SchemaDiffResult.Plan(value)
+      test::assertTrue(false)
+    case SchemaDiffResult.Failure(error)
+      printMigrationFailure(error)
+
+      test::assertTrue(false)
+  end
+
+  let newField = new SchemaField("customer-note", new SchemaColumn("note", SchemaType.Text(), nullable: true))
+  let added = new SchemaModel([new SchemaTable("customers", "customers", [newField, new SchemaField("customer-name", new SchemaColumn("name", SchemaType.Text())), new SchemaField("customer-id", new SchemaColumn("id", SchemaType.Text(), primaryKey: true))])])
+
+  match diffSchema("add_note", first, added)
+    case SchemaDiffResult.Unchanged()
+      test::assertTrue(false)
+    case SchemaDiffResult.Plan(value)
+      test::assertFalse(value.upDataLoss())
+      test::assertTrue(value.downDataLoss())
+    case SchemaDiffResult.Failure(error)
+      printMigrationFailure(error)
+
+      test::assertTrue(false)
+  end
+
+  match diffSchema("drop_table", first, new SchemaModel([]))
+    case SchemaDiffResult.Unchanged()
+      test::assertTrue(false)
+    case SchemaDiffResult.Plan(value)
+      test::assertTrue(value.upDataLoss())
+      test::assertFalse(value.downDataLoss())
+    case SchemaDiffResult.Failure(error)
+      printMigrationFailure(error)
+
+      test::assertTrue(false)
+  end
+
+  let withNullable = new SchemaModel([new SchemaTable("customers", "customers", [new SchemaField("customer-note", new SchemaColumn("note", SchemaType.Text(), nullable: true)), new SchemaField("customer-name", new SchemaColumn("name", SchemaType.Text())), new SchemaField("customer-id", new SchemaColumn("id", SchemaType.Text(), primaryKey: true))])])
+
+  match diffSchema("drop_column", withNullable, first)
+    case SchemaDiffResult.Unchanged()
+      test::assertTrue(false)
+    case SchemaDiffResult.Plan(value)
+      test::assertTrue(value.upDataLoss())
+      test::assertFalse(value.downDataLoss())
+    case SchemaDiffResult.Failure(error)
+      printMigrationFailure(error)
+
+      test::assertTrue(false)
+  end
+
+  let altered = new SchemaModel([new SchemaTable("customers", "customers", [new SchemaField("customer-id", new SchemaColumn("id", SchemaType.Int(), primaryKey: true)), new SchemaField("customer-name", new SchemaColumn("name", SchemaType.Text()))])])
+
+  match diffSchema("unsupported_type", first, altered)
+    case SchemaDiffResult.Unchanged()
+      test::assertTrue(false)
+    case SchemaDiffResult.Plan(value)
+      test::assertTrue(false)
+    case SchemaDiffResult.Failure(error)
+      match error
+        case MigrationFailure.Unsupported(message)
+          console::println(message)
+
+          test::assertTrue(message != "")
+        case MigrationFailure.Validation(message)
+          console::println(message)
+
+          test::assertTrue(false)
+        case MigrationFailure.Drift(message)
+          console::println(message)
+
+          test::assertTrue(false)
+        case MigrationFailure.Provider(message)
+          console::println(message)
+
+          test::assertTrue(false)
+      end
+  end
+end
+
+def verifyApplyAndRollback(path: String): Void
+  console::println("schema diff: initial Text primary key")
+  let empty = new SchemaModel([])
+  let initialResult = diffSchema("initial", empty, baseModel())
+
+  match initialResult
+    case SchemaDiffResult.Unchanged()
+      test::assertTrue(false)
+    case SchemaDiffResult.Failure(error)
+      printMigrationFailure(error)
+
+      test::assertTrue(false)
+    case SchemaDiffResult.Plan(initial)
+      test::assertFalse(initial.upDataLoss())
+      test::assertTrue(initial.downDataLoss())
+      match SQLiteProvider.createWritable(path)
+        case SQLiteOpenResult.Failure(message)
+          console::println(message)
+
+          test::assertTrue(false)
+        case SQLiteOpenResult.Opened(provider)
+          expectApplied(provider.migrate(new MigrationSet([initial.migration()])), 1)
+
+          let id = provider.inspectSchema()
+
+          match id
+            case SQLiteSchemaResult.Failure(message)
+              console::println(message)
+
+              test::assertTrue(false)
+            case SQLiteSchemaResult.Snapshot(snapshot)
+              var foundTextKey = false
+              var index = 0
+
+              while index < snapshot.count()
+                let column = snapshot.at(index)
+
+                if column != null && column.table() == "customers" && column.name() == "id"
+                  foundTextKey = true
+
+                  test::assertEqual(column.declaredType(), "TEXT")
+                  test::assertTrue(column.required())
+                  test::assertEqual(column.keyPosition(), 1)
+                end
+                index = index + 1
+              end
+
+              test::assertTrue(foundTextKey)
+          end
+
+          test::assertTrue(provider.close())
+      end
+
+      test::assertTrue(createSQLiteFixture(path, "INSERT INTO customers(id,name) VALUES('a','Ada'); INSERT INTO customers(id,name) VALUES('b','Ada');"))
+
+      let failedTable = new SchemaTable("customers", "people", [new SchemaField("customer-id", new SchemaColumn("id", SchemaType.Text(), primaryKey: true)), new SchemaField("customer-name", new SchemaColumn("display", SchemaType.Text())), new SchemaField("customer-tier", new SchemaColumn("tier", SchemaType.Text(), defaultValue: SchemaDefault.Text("member")))], [new SchemaIndex("people_display_unique", ["customer-name"], true)])
+      let failedModel = new SchemaModel([failedTable])
+
+      match diffSchema("unique_failure", baseModel(), failedModel)
+        case SchemaDiffResult.Unchanged()
+          test::assertTrue(false)
+        case SchemaDiffResult.Failure(error)
+          printMigrationFailure(error)
+
+          test::assertTrue(false)
+        case SchemaDiffResult.Plan(failingPlan)
+          console::println("schema diff: unique-index rollback")
+          match SQLiteProvider.openWritable(path)
+            case SQLiteOpenResult.Failure(message)
+              console::println(message)
+
+              test::assertTrue(false)
+            case SQLiteOpenResult.Opened(provider)
+              expectRejected(provider.migrate(new MigrationSet([initial.migration(), failingPlan.migration()])))
+
+              test::assertTrue(hasColumn(provider, "customers", "name"))
+              test::assertFalse(hasColumn(provider, "customers", "display"))
+              test::assertFalse(hasColumn(provider, "customers", "tier"))
+
+              test::assertTrue(provider.close())
+          end
+
+          assertSql(path, "(SELECT COUNT(*) = 2 AND SUM(name = 'Ada') = 2 FROM customers)")
+          assertSql(path, "(SELECT COUNT(*) = 1 FROM __neri_migrations WHERE id = 'initial')")
+          assertSql(path, "(SELECT COUNT(*) = 0 FROM __neri_migrations WHERE id = 'unique_failure')")
+      end
+
+      match diffSchema("evolve", baseModel(), evolvedModel())
+        case SchemaDiffResult.Unchanged()
+          test::assertTrue(false)
+        case SchemaDiffResult.Failure(error)
+          printMigrationFailure(error)
+
+          test::assertTrue(false)
+        case SchemaDiffResult.Plan(evolution)
+          console::println("schema diff: rename, add, index, and downgrade")
+
+          test::assertFalse(evolution.upDataLoss())
+          test::assertTrue(evolution.downDataLoss())
+
+          let originalMigrations = new MigrationSet([initial.migration(), evolution.migration()])
+
+          match SQLiteProvider.openWritable(path)
+            case SQLiteOpenResult.Failure(message)
+              console::println(message)
+
+              test::assertTrue(false)
+            case SQLiteOpenResult.Opened(provider)
+              expectApplied(provider.migrate(originalMigrations), 1)
+
+              test::assertTrue(hasColumn(provider, "people", "display"))
+              test::assertTrue(hasColumn(provider, "people", "tier"))
+              test::assertTrue(hasColumn(provider, "people", "note"))
+
+              test::assertTrue(provider.close())
+          end
+
+          assertSql(path, "(SELECT COUNT(*) = 1 FROM sqlite_schema WHERE type = 'index' AND name = 'people_display')")
+          assertSql(path, "(SELECT COUNT(*) = 2 AND SUM(display = 'Ada') = 2 AND SUM(tier = 'member') = 2 AND SUM(note IS NULL) = 2 FROM people)")
+
+          match SQLiteProvider.openWritable(path)
+            case SQLiteOpenResult.Failure(message)
+              console::println(message)
+
+              test::assertTrue(false)
+            case SQLiteOpenResult.Opened(provider)
+              expectApplied(provider.migrate(originalMigrations, "initial"), 1)
+
+              test::assertTrue(hasColumn(provider, "customers", "name"))
+              test::assertFalse(hasColumn(provider, "customers", "tier"))
+              test::assertFalse(hasColumn(provider, "customers", "note"))
+
+              test::assertTrue(provider.close())
+          end
+
+          assertSql(path, "(SELECT COUNT(*) = 0 FROM sqlite_schema WHERE type = 'index' AND name = 'people_display')")
+          assertSql(path, "(SELECT COUNT(*) = 2 AND SUM(name = 'Ada') = 2 FROM customers)")
+      end
+  end
+end
+
+def verifySchemaDiffContract(): resources::Outcome<Int, result::Failure>
+  using temporary <- files::TemporaryDirectory.create("neri-schema-diff-")
+    verifyCanonicalModels()
+    verifyApplyAndRollback(temporary.path() + "/schema.sqlite")
+    return 0
+  end
+  return 1
+end
+
+def main(): Void
+  let outcome = verifySchemaDiffContract()
+
+  test::assertEqual(outcome.closeFailures.count(), 0)
+  match outcome.completion
+    case resources::Completion.Value(value)
+      test::assertEqual(value, 0)
+    case resources::Completion.Failure(problem)
+      test::assertTrue(false)
+  end
+end

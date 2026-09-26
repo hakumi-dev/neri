@@ -1,0 +1,443 @@
+use files
+use host
+
+class IncrementalProjectCache
+  public cache: RunCache = new RunCache()
+  public target: readonly TargetPlatform?
+  public release: Bool = false
+  public toolchainDigest: String = ""
+  public contentDigest: String = ""
+  public ownerManifestDigest: String = ""
+  public owners: StringBuffer = new StringBuffer()
+  public project: NeriProject?
+  public symbolTool: String = ""
+  public enabled: Bool = false
+  private checkedHit: Bool = false
+
+  def prepare(firstSource: BootstrapSourceInput?, sourceIds: StringBuffer, sourceOwners: StringBuffer, target: readonly TargetPlatform, release: Bool, configurationInputs: String, noCache: Bool, project: NeriProject): Void
+    if noCache || firstSource == null
+      return
+    end
+    let customSymbols = host::environment("NERI_DSYMUTIL")
+
+    if !release && customSymbols != null && customSymbols != ""
+      return
+    end
+    var extraDependencies: String[] = []
+
+    if !release && target.isMacOS()
+      let symbolTool = incrementalDefaultSymbolTool()
+
+      if symbolTool == null
+        return
+      end
+      this.symbolTool = symbolTool
+      extraDependencies = host::appendString(extraDependencies, symbolTool)
+    end
+    this.target = target
+    this.release = release
+    let libraryPath = host::environment("NERI_LIBRARY_PATH")
+    var configuration = configurationInputs
+
+    configuration = configuration + runCacheFrame(libraryPath) if libraryPath != null
+    var identity = runCacheFrame("neri-project-artifact-v1") + runCacheFrame(configuration)
+    var index = 0
+
+    while index < sourceIds.size
+      if index >= sourceOwners.size
+        return
+      end
+      let source = incrementalSourceById(firstSource, sourceIds.get(index))
+
+      if source == null
+        return
+      end
+      identity = identity + runCacheFrame(source.id) + runCacheFrame(source.identityPath) + runCacheFrame(sourceOwners.get(index)) + runCacheFrame(sha256FastText(source.text))
+      index = index + 1
+    end
+    if index == 0 || index != sourceOwners.size
+      return
+    end
+    let manifests = incrementalOwnerManifests(sourceOwners, project)
+
+    if manifests == null
+      return
+    end
+    this.ownerManifestDigest = sha256FastText(manifests)
+    this.owners = sourceOwners
+    this.project = project
+    identity = identity + manifests
+    let compiler = host::executablePath()
+
+    if compiler == null
+      return
+    end
+    let compilerDigest = referenceFileDigest(compiler)
+
+    if compilerDigest == ""
+      return
+    end
+    identity = identity + runCacheFrame(compiler) + runCacheFrame(compilerDigest)
+    let sourceDigest = sha256FastText(identity)
+    let probe = new RunCache()
+    let module = new IrModule("incremental-probe", "")
+
+    probe.prepare(module, target, release, firstSource, "neri-project-artifact-v1", configuration, extraDependencies, sourceDigest)
+    if probe.directory == ""
+      return
+    end
+    let dependencies = incrementalToolchainDigest(probe.dependencies)
+
+    if dependencies == ""
+      return
+    end
+    this.toolchainDigest = dependencies
+    this.contentDigest = sha256FastText(runCacheFrame(sourceDigest) + runCacheFrame(dependencies))
+    this.cache.prepare(module, target, release, firstSource, "neri-project-artifact-v1", configuration, extraDependencies, this.contentDigest)
+    this.enabled = this.cache.directory != ""
+  end
+
+  def hit(): Bool
+    this.checkedHit = false
+    if !this.enabled || !this.symbolToolMatch() || !this.cache.hit() || incrementalToolchainDigest(this.cache.dependencies) != this.toolchainDigest || !this.manifestsMatch()
+      return false
+    end
+    let receipt = host::readText(this.cache.directory + "/incremental.json")
+
+    if receipt == null
+      return false
+    end
+    let parser = new LspJsonParser(receipt)
+    let record = parser.parse()
+
+    parser.spaces()
+    if parser.failed || parser.position != host::stringByteLength(receipt) || !record.isObject() || !record.get("schemaVersion").isNumber() || record.get("schemaVersion").scalarText() != "1"
+      return false
+    end
+    let content = record.get("contentDigest")
+    let executable = record.get("executableDigest")
+    let nativeFiles = record.get("nativeFiles")
+    let missingFiles = record.get("missingFiles")
+
+    if !content.isString() || content.scalarText() != this.contentDigest || !executable.isString() || !nativeFiles.isArray() || !missingFiles.isArray()
+      return false
+    end
+    if referenceFileDigest(this.cache.executable) != executable.scalarText()
+      return false
+    end
+    if !incrementalNativeInputsMatch(nativeFiles, missingFiles)
+      return false
+    end
+    let target = this.target
+
+    if target != null && !this.release && target.isMacOS() && !incrementalSymbolsValid(this.cache.directory)
+      return false
+    end
+    this.checkedHit = true
+    return true
+  end
+
+  def restore(output: String): Bool
+    if !this.checkedHit && !this.hit()
+      return false
+    end
+    let original = referenceFileDigest(this.cache.executable)
+    let existing = files::status(output)
+    let existingStatus = existing.status
+
+    if existing.failure == null && existingStatus != null && existingStatus.executable && referenceFileDigest(output) == original
+      let target = this.target
+
+      if target == null || this.release || !target.isMacOS() || incrementalSymbolsEquivalent(this.cache.directory, output)
+        return true
+      end
+    end
+    let directory = bootstrapTemporaryDirectory(bootstrapDirectory(output), "incremental-restore")
+
+    if directory == null
+      return false
+    end
+    let staged = directory + "/program"
+    var succeeded = files::copyFile(this.cache.executable, staged).failure == null
+
+    if succeeded
+      let status = files::status(staged)
+      let fileStatus = status.status
+
+      succeeded = status.failure == null && fileStatus != null && fileStatus.executable && referenceFileDigest(staged) == original
+    end
+    let target = this.target
+
+    if succeeded && target != null && !this.release && target.isMacOS()
+      succeeded = incrementalSymbolsRestore(this.cache.directory, output)
+    end
+    if succeeded
+      succeeded = files::move(staged, output).failure == null
+    end
+    bootstrapRemoveRunDirectory(directory)
+    return succeeded
+  end
+
+  def publish(output: String, nativeDepPaths: StringBuffer, missingPaths: StringBuffer, nativeDigests: StringBuffer): Bool
+    if !this.enabled || !this.symbolToolMatch() || this.cache.inputs != this.cache.snapshot() || incrementalToolchainDigest(this.cache.dependencies) != this.toolchainDigest || !this.manifestsMatch()
+      return false
+    end
+    let executableDigest = referenceFileDigest(output)
+
+    if executableDigest == ""
+      return false
+    end
+    let receipt = incrementalNativeReceipt(nativeDepPaths, missingPaths, nativeDigests, this.contentDigest, executableDigest)
+
+    if receipt == null
+      return false
+    end
+    let directory = bootstrapTemporaryDirectory(bootstrapDirectory(this.cache.directory), "incremental-artifact")
+
+    if directory == null
+      return false
+    end
+    let staged = directory + "/program"
+    var succeeded = files::copyFile(output, staged).failure == null
+
+    if succeeded
+      let status = files::status(staged)
+      let fileStatus = status.status
+
+      succeeded = status.failure == null && fileStatus != null && fileStatus.executable && referenceFileDigest(staged) == executableDigest
+    end
+    let target = this.target
+
+    if succeeded && target != null && !this.release && target.isMacOS()
+      succeeded = incrementalSymbolsPublish(output, directory)
+    end
+    if succeeded
+      succeeded = host::writeText(directory + "/incremental.json", receipt)
+    end
+    if succeeded && this.cache.privateDirectory(this.cache.directory) && !this.hit()
+      files::removeTree(this.cache.directory)
+    end
+    if succeeded
+      succeeded = this.cache.publish(directory)
+    end
+    if !succeeded
+      bootstrapRemoveRunDirectory(directory)
+    end
+    return succeeded || this.hit()
+  end
+
+  def manifestsMatch(): Bool
+    let project = this.project
+
+    if project == null
+      return false
+    end
+    let current = incrementalOwnerManifests(this.owners, project)
+
+    return current != null && sha256FastText(current) == this.ownerManifestDigest
+  end
+
+  def symbolToolMatch(): Bool
+    return this.symbolTool == "" || incrementalDefaultSymbolTool() == this.symbolTool
+  end
+end
+
+def incrementalDefaultSymbolTool(): String?
+  let path = host::environment("PATH")
+
+  if path == null
+    return null
+  end
+  var start = 0
+  var index = 0
+  let length = host::stringByteLength(path)
+
+  while index <= length
+    if index == length || host::stringByteAt(path, index) == (58 as Byte)
+      let entry = host::stringSlice(path, start, index - start)
+
+      if !bootstrapStartsWith(entry, "/")
+        return null
+      end
+      let candidate = entry + "/dsymutil"
+      let status = files::status(candidate)
+      let candidateStatus = status.status
+
+      if status.failure != null || candidateStatus == null
+        return null
+      end
+      if candidateStatus.exists
+        let canonical = neriCanonicalPath(candidate)
+
+        if canonical == null
+          return null
+        end
+        let resolved = files::status(canonical)
+        let resolvedStatus = resolved.status
+
+        if resolved.failure != null || resolvedStatus == null || !resolvedStatus.kind.isFile() || !resolvedStatus.executable
+          return null
+        end
+        return candidate
+      end
+      start = index + 1
+    end
+    index = index + 1
+  end
+  return null
+end
+
+def incrementalSourceById(first: BootstrapSourceInput?, id: String): BootstrapSourceInput?
+  var source = first
+
+  while source != null
+    if source.id == id
+      return source
+    end
+    source = source.nextInput
+  end
+  return null
+end
+
+def incrementalOwnerManifests(owners: StringBuffer, project: NeriProject): String?
+  let seen = new StringTable<Bool>()
+  var result = ""
+  var index = 0
+
+  while index < owners.size
+    let owner = owners.get(index)
+
+    if owner != "@stdlib"
+      var separator = host::stringByteLength(owner) - 1
+
+      while separator >= 0 && host::stringByteAt(owner, separator) as Int != 35
+        separator = separator - 1
+      end
+      if separator <= 0
+        return null
+      end
+      let path = host::stringSlice(owner, 0, separator)
+
+      if seen.add(path, true)
+        let observed = project.manifestTexts.find(path)
+
+        if observed != null
+          if host::readText(path) != observed.value
+            return null
+          end
+          result = result + runCacheFrame(path) + runCacheFrame(sha256FastText(observed.value))
+        else
+          let status = files::status(path)
+          let fileStatus = status.status
+
+          if status.failure != null || fileStatus == null || !fileStatus.kind.isDirectory()
+            return null
+          end
+          result = result + runCacheFrame(path) + runCacheFrame("implicit-directory")
+        end
+      end
+    end
+    index = index + 1
+  end
+  if project.generationManifests.size != project.generationManifestTexts.size || project.generatedInputs.size != project.generatedDigests.size
+    return null
+  end
+  index = 0
+  while index < project.generationManifests.size
+    let path = project.generationManifests.get(index)
+    let observed = project.generationManifestTexts.get(index)
+
+    if host::readText(path) != observed
+      return null
+    end
+    result = result + runCacheFrame(path) + runCacheFrame(sha256FastText(observed))
+    index = index + 1
+  end
+  index = 0
+  while index < project.generatedInputs.size
+    let path = project.generatedInputs.get(index)
+    let observedDigest = project.generatedDigests.get(index)
+
+    if referenceFileDigest(path) != observedDigest
+      return null
+    end
+    result = result + runCacheFrame(path) + runCacheFrame(observedDigest)
+    index = index + 1
+  end
+  return result
+end
+
+def incrementalToolchainDigest(paths: String[]): String
+  var identity = ""
+
+  for path in paths
+    let metadata = new RunCacheFile(path, true)
+
+    if metadata.kind != 0 && metadata.kind != 1 && metadata.kind != 2
+      return ""
+    end
+    identity = identity + runCacheFrame(path) + runCacheFrame(metadata.kind as String) + runCacheFrame(metadata.fingerprint)
+  end
+  return sha256FastText(identity)
+end
+
+def incrementalNativeReceipt(nativeDepPaths: StringBuffer, missingPaths: StringBuffer, nativeDigests: StringBuffer, contentDigest: String, executableDigest: String): String?
+  if nativeDepPaths.size != nativeDigests.size
+    return null
+  end
+  var result = "{\"schemaVersion\":1,\"contentDigest\":" + lspQuote(contentDigest) + ",\"executableDigest\":" + lspQuote(executableDigest) + ",\"nativeFiles\":["
+  var index = 0
+
+  while index < nativeDepPaths.size
+    let path = nativeDepPaths.get(index)
+    let digest = nativeDigests.get(index)
+
+    if digest == "" || referenceFileDigest(path) != digest
+      return null
+    end
+    result = result + (index == 0 ? "" : ",") + "{\"path\":" + lspQuote(path) + ",\"digest\":" + lspQuote(digest) + "}"
+    index = index + 1
+  end
+  result = result + "],\"missingFiles\":["
+  index = 0
+  while index < missingPaths.size
+    let path = missingPaths.get(index)
+    let status = files::status(path)
+    let fileStatus = status.status
+
+    if status.failure != null || fileStatus == null || fileStatus.exists
+      return null
+    end
+    result = result + (index == 0 ? "" : ",") + lspQuote(path)
+    index = index + 1
+  end
+  return result + "]}\n"
+end
+
+def incrementalNativeInputsMatch(nativeFiles: LspJson, missingFiles: LspJson): Bool
+  var item = nativeFiles.first
+
+  while item != null
+    let path = item.get("path")
+    let digest = item.get("digest")
+
+    if !item.isObject() || !path.isString() || !digest.isString() || path.scalarText() == "" || referenceFileDigest(path.scalarText()) != digest.scalarText()
+      return false
+    end
+    item = item.next
+  end
+  item = missingFiles.first
+  while item != null
+    if !item.isString() || item.scalarText() == ""
+      return false
+    end
+    let status = files::status(item.scalarText())
+    let fileStatus = status.status
+
+    if status.failure != null || fileStatus == null || fileStatus.exists
+      return false
+    end
+    item = item.next
+  end
+  return true
+end

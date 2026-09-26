@@ -181,6 +181,17 @@ not an arbitrary executable consumer. Source folders and namespaces are
 independent: references are explicit, and `use` or `namespace` never infer one.
 Open dependencies use their unsaved contents and invalidate open consumers.
 
+Ito applications use the dependency graph prepared by `ito install`, `ito build`
+or `ito test` in `.neri/ito/manifest.json`. The server maps app-owned snapshot
+paths back to the package's live files, preserving unsaved editor contents and
+navigation to the original sources. Dependency packages retain their locked
+snapshot paths. This owning Ito graph takes precedence over nested generation
+metadata such as `data/generated/manifest.json`. Run Ito again after changing
+package metadata or dependency declarations so the editor sees the updated graph.
+Files opened directly from `.neri/ito/sources/` receive an informational
+`NR_PROJECT_CONTEXT` pointing to the original source; the server does not infer
+another project by recursively scanning those build copies.
+
 Units can declare [generated sources](GENERATED-SOURCES.md). Their verified
 content snapshots participate in ordinary semantic analysis. Changed open
 generation inputs or outputs suppress the consumer API with `NR_GENERATED`.
@@ -233,8 +244,6 @@ Semantic tokens are not advertised or implemented. Built-in types
 and intrinsic operations without source declarations have no definition location.
 Completion and signature repairs do not
 provide general error-tolerant analysis.
-Language-service improvements and acceptance requirements are tracked in the
-[Kanban](https://github.com/hakumi-dev/neri/issues/55).
 
 Protocol reference: [LSP 3.17 cancellation and message ordering](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/).
 Query architecture references: [rust-analyzer architecture](https://rust-analyzer.github.io/book/contributing/architecture.html)

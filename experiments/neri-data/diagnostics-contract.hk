@@ -1,0 +1,414 @@
+use test
+use neri_data
+
+class DiagnosticFakeProvider: Provider
+  public calls: Int = 0
+  public failWrites: Bool = false
+  public returnValues: Bool = false
+  public streamMode: Int = 0
+  public savepointLease: Int = 0
+  public savepointId: Int = 0
+
+  public override readonly def dialect(): SqlDialect
+    return SqlDialect.QuestionMark()
+  end
+
+  public override readonly def supports(capability: ProviderCapability): Bool
+    return true
+  end
+
+  public override def execute(plan: readonly SqlPlan): ProviderResult
+    this.calls = this.calls + 1
+    return ProviderResult.Rows([])
+  end
+
+  public override def stream(plan: readonly StreamPlan, visit: fn(RawRow): Bool): StreamResult
+    this.calls = this.calls + 1
+    if this.streamMode == 2
+      return StreamResult.Cancelled(0)
+    end
+    if this.streamMode == 3
+      return StreamResult.Failure(QueryFailure.Provider("private-value"), 0)
+    end
+    let keepGoing = visit(new RawRow([new RawColumn("id", Cell.Int(42))]))
+
+    if !keepGoing || this.streamMode == 1
+      return StreamResult.Stopped(1)
+    end
+    return StreamResult.Completed(1)
+  end
+
+  public override def writeBatch(batch: readonly WriteBatch): WriteResult
+    this.calls = this.calls + 1
+    if this.failWrites
+      return WriteResult.Failure(WriteFailure.Provider("private-value"))
+    end
+    if this.returnValues
+      let outputs = new WriteReturnedRows()
+
+      outputs.add(null)
+      outputs.add(new RawRow([new RawColumn("id", Cell.Int(42))]))
+      return WriteResult.SavedWithValues(2, outputs)
+    end
+    return WriteResult.Saved(2)
+  end
+
+  public override def beginTransaction(): TransactionOpenResult
+    this.calls = this.calls + 1
+    return TransactionOpenResult.Begun(17)
+  end
+
+  public override def commitTransaction(lease: Int): WriteResult
+    this.calls = this.calls + 1
+    return WriteResult.Saved(0)
+  end
+
+  public override def rollbackTransaction(lease: Int): WriteResult
+    this.calls = this.calls + 1
+    return WriteResult.Saved(0)
+  end
+
+  public override def writeBatchInTransaction(batch: readonly WriteBatch, lease: Int): WriteResult
+    this.calls = this.calls + 1
+    return WriteResult.Saved(3)
+  end
+
+  public override def createSavepoint(lease: Int): SavepointOpenResult
+    this.calls = this.calls + 1
+    this.savepointLease = lease
+    if this.failWrites
+      return SavepointOpenResult.Failure(WriteFailure.Provider("private-value"))
+    end
+    return SavepointOpenResult.Created(23)
+  end
+
+  public override def rollbackToSavepoint(lease: Int, id: Int): WriteResult
+    this.calls = this.calls + 1
+    this.savepointLease = lease
+    this.savepointId = id
+    return WriteResult.Saved(0)
+  end
+
+  public override def releaseSavepoint(lease: Int, id: Int): WriteResult
+    this.calls = this.calls + 1
+    this.savepointLease = lease
+    this.savepointId = id
+    return WriteResult.Saved(0)
+  end
+end
+
+class DiagnosticRecorder
+  public provider: DiagnosedProvider?
+  public operation: String = ""
+  public sql: String = ""
+  public parameterCount: Int = -1
+  public statementCount: Int = -1
+  public affectedCount: Int = -1
+  public returnedCount: Int = -1
+  public duration: Int = -1
+  public failureKind: String = ""
+  public failureMessage: String = ""
+  public reentrant: WriteResult?
+  public reentrantStream: StreamResult?
+
+  public def observe(value: readonly ProviderDiagnostic): Void
+    this.operation = value.operation()
+    this.sql = value.sql()
+    this.parameterCount = value.parameterCount()
+    this.statementCount = value.statementCount()
+    this.affectedCount = value.affectedCount()
+    this.returnedCount = value.returnedCount()
+    this.duration = value.durationMilliseconds()
+    this.failureKind = value.failureKind()
+    this.failureMessage = value.failureMessage()
+    let provider = this.provider
+
+    if provider != null
+      this.reentrant = provider.rollbackTransaction(17)
+      if value.operation() == "createSavepoint"
+        provider.createSavepoint(17)
+        provider.rollbackToSavepoint(17, 23)
+        provider.releaseSavepoint(17, 23)
+      end
+      if value.operation() == "stream"
+        let plan = new StreamPlan("SELECT id FROM records", new ParameterValues(), new ResultColumns([new ResultColumn("id", ResultColumnKind.Int())]), null, null, null)
+
+        this.reentrantStream = provider.stream(plan, acceptDiagnosticRow)
+      end
+    end
+  end
+end
+
+def acceptDiagnosticRow(row: RawRow): Bool
+  return true
+end
+
+class DiagnosticStreamVisitor
+  public provider: DiagnosedProvider
+  public calls: Int = 0
+  public reentrant: WriteResult?
+
+  def init(provider: DiagnosedProvider): Void
+    this.provider = provider
+  end
+
+  public def visit(row: RawRow): Bool
+    this.calls = this.calls + 1
+    this.reentrant = this.provider.rollbackTransaction(17)
+    return true
+  end
+end
+
+def main(): Void
+  let fake = new DiagnosticFakeProvider()
+  let recorder = new DiagnosticRecorder()
+  let observe: fn(readonly ProviderDiagnostic): Void = fn(value: readonly ProviderDiagnostic): Void
+    recorder.observe(value)
+  end
+  let decorated = new DiagnosedProvider(fake, observe)
+
+  recorder.provider = decorated
+  let batch = new WriteBatch()
+  let values = new WriteValues()
+
+  values.add(Cell.Text("private-value"))
+  values.add(Cell.Int(42))
+  batch.add("UPDATE records SET name = ? WHERE id = ?", values, 1)
+  batch.add("DELETE FROM records WHERE id = ?", values, 1)
+  let result = decorated.writeBatch(batch)
+
+  match result
+    case WriteResult.Saved(count)
+      test::assertEqual(count, 2)
+    case WriteResult.SavedWithValues(count, outputs)
+      test::assertTrue(false)
+    case WriteResult.Failure(error)
+      test::assertTrue(false)
+  end
+
+  test::assertEqual(fake.calls, 1)
+  test::assertEqual(recorder.operation, "writeBatch")
+  test::assertEqual(recorder.sql, "UPDATE records SET name = ? WHERE id = ?\nDELETE FROM records WHERE id = ?")
+  test::assertEqual(recorder.parameterCount, 4)
+  test::assertEqual(recorder.statementCount, 2)
+  test::assertEqual(recorder.affectedCount, 2)
+  test::assertTrue(recorder.duration >= 0)
+  let reentrant = recorder.reentrant
+
+  test::assertTrue(reentrant != null)
+  if reentrant != null
+    match reentrant
+      case WriteResult.Failure(error)
+        test::assertEqual(writeFailureMessage(error), "diagnostic observer cannot reenter its provider")
+      case WriteResult.Saved(count)
+        test::assertTrue(false)
+      case WriteResult.SavedWithValues(count, outputs)
+        test::assertTrue(false)
+    end
+  end
+
+  fake.failWrites = true
+  let failure = decorated.writeBatch(batch)
+
+  match failure
+    case WriteResult.Failure(error)
+      test::assertEqual(writeFailureMessage(error), "private-value")
+    case WriteResult.Saved(count)
+      test::assertTrue(false)
+    case WriteResult.SavedWithValues(count, outputs)
+      test::assertTrue(false)
+  end
+
+  test::assertEqual(recorder.failureKind, "provider")
+  test::assertEqual(recorder.failureMessage, "")
+  test::assertEqual(recorder.sql, "UPDATE records SET name = ? WHERE id = ?\nDELETE FROM records WHERE id = ?")
+  test::assertEqual(fake.calls, 2)
+
+  fake.failWrites = false
+  fake.returnValues = true
+  let withValues = decorated.writeBatch(batch)
+
+  match withValues
+    case WriteResult.SavedWithValues(count, outputs)
+      test::assertEqual(count, 2)
+      test::assertEqual(outputs.count(), 2)
+    case WriteResult.Saved(count)
+      test::assertTrue(false)
+    case WriteResult.Failure(error)
+      test::assertTrue(false)
+  end
+
+  test::assertEqual(recorder.returnedCount, 1)
+  test::assertEqual(fake.calls, 3)
+
+  let plan = new StreamPlan("SELECT id FROM records", new ParameterValues(), new ResultColumns([new ResultColumn("id", ResultColumnKind.Int())]), null, null, null)
+  let visitor = new DiagnosticStreamVisitor(decorated)
+  let streamVisit: fn(RawRow): Bool = fn(row: RawRow): Bool
+    return visitor.visit(row)
+  end
+
+  match decorated.stream(plan, streamVisit)
+    case StreamResult.Completed(count)
+      test::assertEqual(count, 1)
+    case StreamResult.Stopped(count)
+      test::assertTrue(false)
+    case StreamResult.Cancelled(count)
+      test::assertTrue(false)
+    case StreamResult.Failure(error, count)
+      test::assertTrue(false)
+  end
+
+  test::assertEqual(visitor.calls, 1)
+  test::assertEqual(fake.calls, 4)
+  test::assertEqual(recorder.operation, "stream")
+  test::assertEqual(recorder.sql, "SELECT id FROM records")
+  test::assertEqual(recorder.statementCount, 1)
+  test::assertEqual(recorder.returnedCount, 1)
+  test::assertEqual(recorder.failureKind, "")
+  let observerStream = recorder.reentrantStream
+
+  test::assertTrue(observerStream != null)
+  if observerStream != null
+    match observerStream
+      case StreamResult.Failure(error, count)
+        test::assertEqual(count, 0)
+      case StreamResult.Completed(count)
+        test::assertTrue(false)
+      case StreamResult.Stopped(count)
+        test::assertTrue(false)
+      case StreamResult.Cancelled(count)
+        test::assertTrue(false)
+    end
+  end
+  let streamReentrant = visitor.reentrant
+
+  test::assertTrue(streamReentrant != null)
+  if streamReentrant != null
+    match streamReentrant
+      case WriteResult.Failure(error)
+        test::assertEqual(writeFailureMessage(error), "diagnostic observer cannot reenter its provider")
+      case WriteResult.Saved(count)
+        test::assertTrue(false)
+      case WriteResult.SavedWithValues(count, outputs)
+        test::assertTrue(false)
+    end
+  end
+
+  fake.streamMode = 1
+  match decorated.stream(plan, streamVisit)
+    case StreamResult.Stopped(count)
+      test::assertEqual(count, 1)
+    case StreamResult.Completed(count)
+      test::assertTrue(false)
+    case StreamResult.Cancelled(count)
+      test::assertTrue(false)
+    case StreamResult.Failure(error, count)
+      test::assertTrue(false)
+  end
+
+  test::assertEqual(recorder.failureKind, "stopped")
+  test::assertEqual(recorder.returnedCount, 1)
+
+  fake.streamMode = 2
+  match decorated.stream(plan, streamVisit)
+    case StreamResult.Cancelled(count)
+      test::assertEqual(count, 0)
+    case StreamResult.Completed(count)
+      test::assertTrue(false)
+    case StreamResult.Stopped(count)
+      test::assertTrue(false)
+    case StreamResult.Failure(error, count)
+      test::assertTrue(false)
+  end
+
+  test::assertEqual(recorder.failureKind, "cancelled")
+  test::assertEqual(recorder.returnedCount, 0)
+
+  fake.streamMode = 3
+  match decorated.stream(plan, streamVisit)
+    case StreamResult.Failure(error, count)
+      test::assertEqual(count, 0)
+    case StreamResult.Completed(count)
+      test::assertTrue(false)
+    case StreamResult.Stopped(count)
+      test::assertTrue(false)
+    case StreamResult.Cancelled(count)
+      test::assertTrue(false)
+  end
+
+  test::assertEqual(recorder.failureKind, "provider")
+  test::assertEqual(recorder.failureMessage, "")
+  let beforeSavepoint = fake.calls
+
+  fake.failWrites = false
+  match decorated.createSavepoint(17)
+    case SavepointOpenResult.Created(id)
+      test::assertEqual(id, 23)
+    case SavepointOpenResult.Failure(error)
+      test::assertTrue(false)
+  end
+
+  test::assertEqual(fake.calls, beforeSavepoint + 1)
+  test::assertEqual(fake.savepointLease, 17)
+  test::assertEqual(recorder.operation, "createSavepoint")
+  test::assertEqual(recorder.failureKind, "")
+  match decorated.rollbackToSavepoint(17, 23)
+    case WriteResult.Saved(count)
+      test::assertEqual(count, 0)
+    case WriteResult.SavedWithValues(count, outputs)
+      test::assertTrue(false)
+    case WriteResult.Failure(error)
+      test::assertTrue(false)
+  end
+
+  test::assertEqual(fake.calls, beforeSavepoint + 2)
+  test::assertEqual(fake.savepointId, 23)
+  test::assertEqual(recorder.operation, "rollbackToSavepoint")
+  match decorated.releaseSavepoint(17, 23)
+    case WriteResult.Saved(count)
+      test::assertEqual(count, 0)
+    case WriteResult.SavedWithValues(count, outputs)
+      test::assertTrue(false)
+    case WriteResult.Failure(error)
+      test::assertTrue(false)
+  end
+
+  test::assertEqual(fake.calls, beforeSavepoint + 3)
+  test::assertEqual(recorder.operation, "releaseSavepoint")
+  fake.failWrites = true
+  match decorated.createSavepoint(17)
+    case SavepointOpenResult.Created(id)
+      test::assertTrue(false)
+    case SavepointOpenResult.Failure(error)
+      test::assertEqual(writeFailureMessage(error), "private-value")
+  end
+
+  test::assertEqual(fake.calls, beforeSavepoint + 4)
+  test::assertEqual(recorder.failureKind, "provider")
+  test::assertEqual(recorder.failureMessage, "")
+
+  let insertValues = new WriteValues()
+
+  insertValues.add(Cell.Text("private-insert-value"))
+  let insertBatch = new WriteBatch()
+
+  insertBatch.add("INSERT INTO records (name) VALUES (?)", insertValues, 1)
+  insertBatch.add("UPDATE records SET name = ? WHERE id = ?", values, 1)
+  insertBatch.add("DELETE FROM records WHERE id = ?", values, 1)
+  match decorated.writeBatchInTransaction(insertBatch, 17)
+    case WriteResult.Saved(count)
+      test::assertEqual(count, 3)
+    case WriteResult.SavedWithValues(count, outputs)
+      test::assertTrue(false)
+    case WriteResult.Failure(error)
+      test::assertTrue(false)
+  end
+
+  test::assertEqual(recorder.operation, "writeBatchInTransaction")
+  test::assertEqual(recorder.sql, "INSERT INTO records (name) VALUES (?)\nUPDATE records SET name = ? WHERE id = ?\nDELETE FROM records WHERE id = ?")
+  test::assertEqual(recorder.parameterCount, 5)
+  test::assertEqual(recorder.statementCount, 3)
+  test::assertEqual(recorder.affectedCount, 3)
+  test::assertEqual(recorder.failureKind, "")
+  test::assertTrue(recorder.duration >= 0)
+end

@@ -1,0 +1,193 @@
+use workers
+use http
+use worker_fixture
+use resources
+use result
+use test
+
+def roundTrip(): resources::Outcome<Bool, result::Failure>
+  let options = new workers::Options()
+
+  options.workers = 2
+  options.maxOutstanding = 2
+  options.maxInputBytes = 1
+  options.maxOutputBytes = 2
+  options.maxReservedBytes = 6
+  let config: Byte[] = [42 as Byte]
+  let input: Byte[] = [7 as Byte]
+
+  using pool <- workers::start(entry: worker_fixture::echo, config: config, options: options)
+    let polling = http::PollSet.create(1)
+
+    test::assertTrue(polling != null)
+    if polling == null
+      return false
+    end
+    var slot = -1
+
+    unsafe
+      let descriptor = try pool.readinessHandle()
+      let added = polling.add(descriptor)
+
+      test::assertTrue(added != null)
+      if added == null
+        return false
+      end
+      slot = added
+      let initial = try polling.wait(0)
+
+      test::assertEqual(initial, 0)
+      test::assertTrue(!polling.readable(slot))
+    end
+    config[0] = 99 as Byte
+    let first = try pool.submit(input)
+
+    input[0] = 8 as Byte
+    let second = try pool.submit(input)
+
+    input[0] = 9 as Byte
+    match pool.submit(input)
+      case result::Result.Ok(ticket)
+        test::assertTrue(false)
+      case result::Result.Error(failure)
+        test::assertEqual(failure.code, "full")
+    end
+    var completed = 0
+    var attempts = 0
+    var firstSeen = false
+    var secondSeen = false
+
+    while completed < 2 && attempts < 10
+      var ready = 0
+
+      unsafe
+        ready = try polling.wait(500)
+
+        test::assertTrue(!polling.failed(slot) && !polling.hungUp(slot) && !polling.invalid(slot))
+        test::assertTrue(ready == 0 || polling.readable(slot))
+      end
+      if ready == 0
+        attempts = attempts + 1
+        continue
+      end
+      # Notifications are advisory; the authoritative operation never blocks.
+      let polled = try pool.poll(0)
+
+      match polled
+        case workers::Poll.Completed(value)
+          match value.outcome
+            case workers::Outcome.Success(payload)
+              test::assertEqual(payload.Length, 2)
+              test::assertEqual(payload[0] as Int, 42)
+              if value.ticket.id() == first.id()
+                test::assertTrue(!firstSeen)
+                test::assertEqual(payload[1] as Int, 7)
+                firstSeen = true
+              else
+                test::assertTrue(value.ticket.id() == second.id() && !secondSeen)
+                test::assertEqual(payload[1] as Int, 8)
+                secondSeen = true
+              end
+            case workers::Outcome.Failed()
+              test::assertTrue(false)
+            case workers::Outcome.Cancelled()
+              test::assertTrue(false)
+          end
+          completed = completed + 1
+        case workers::Poll.Empty()
+        case workers::Poll.Stopped()
+          test::assertTrue(false)
+      end
+      attempts = attempts + 1
+    end
+
+    test::assertTrue(firstSeen && secondSeen)
+    unsafe
+      # Every completion was taken after its notification became observable.
+      let drained = try polling.wait(0)
+
+      test::assertEqual(drained, 0)
+      test::assertTrue(!polling.readable(slot))
+    end
+    using other <- workers::start(worker_fixture::echo, [42 as Byte], new workers::Options())
+      match other.cancel(first)
+        case result::Result.Ok(value)
+          test::assertTrue(false)
+        case result::Result.Error(failure)
+          test::assertEqual(failure.code, "foreign_ticket")
+      end
+    end
+    let stopped = try pool.stop()
+
+    test::assertTrue(stopped)
+    unsafe
+      let notified = try polling.wait(500)
+
+      test::assertEqual(notified, 1)
+      test::assertTrue(polling.readable(slot))
+    end
+    match try pool.poll()
+      case workers::Poll.Stopped()
+      case workers::Poll.Empty()
+        test::assertTrue(false)
+      case workers::Poll.Completed(value)
+        test::assertTrue(false)
+    end
+
+    # Remove the borrowed descriptor before its owning resource closes.
+    polling.clear()
+
+    test::assertEqual(polling.count(), 0)
+    test::assertTrue(pool.close() == null)
+    test::assertTrue(pool.close() == null)
+    return true
+  end
+  return false
+end
+
+def failedStartup(): resources::Outcome<Bool, result::Failure>
+  using pool <- workers::start(worker_fixture::startupFailure, [], new workers::Options())
+    test::assertTrue(false)
+  end
+  return false
+end
+
+def failedCleanup(): resources::Outcome<Bool, result::Failure>
+  using pool <- workers::start(worker_fixture::cleanupFailure, [], new workers::Options())
+    return true
+  end
+  return false
+end
+
+def main(): Void
+  let round = roundTrip()
+
+  test::assertEqual(round.closeFailures.count(), 0)
+  match round.completion
+    case resources::Completion.Value(value)
+      test::assertTrue(value)
+    case resources::Completion.Failure(failure)
+      test::assertTrue(false)
+  end
+  let startup = failedStartup()
+
+  test::assertEqual(startup.closeFailures.count(), 0)
+  match startup.completion
+    case resources::Completion.Value(value)
+      test::assertTrue(false)
+    case resources::Completion.Failure(failure)
+      test::assertTrue(failure != null)
+      if failure != null
+        test::assertEqual(failure.detail, "worker failures=1; entry initialization failed")
+      end
+  end
+  let cleanup = failedCleanup()
+
+  test::assertEqual(cleanup.closeFailures.count(), 1)
+  match cleanup.completion
+    case resources::Completion.Value(value)
+      test::assertTrue(value)
+    case resources::Completion.Failure(failure)
+      test::assertTrue(false)
+  end
+end

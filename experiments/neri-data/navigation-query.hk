@@ -1,0 +1,155 @@
+use reference
+namespace neri_data
+
+## An immutable typed path of deferred navigation loads rooted at one query.
+class NavigationQuery<R, T>
+  private root: Query<R>
+  private runPath: fn(TypedRows<R>, NavigationJournal): QueryResult<T>
+  private checkPath: fn(): QueryFailure?
+  private depth: Int
+  private currentTracker: EntityTracker<T>?
+
+  internal def init(root: Query<R>, runPath: fn(TypedRows<R>, NavigationJournal): QueryResult<T>, checkPath: fn(): QueryFailure?, depth: Int, currentTracker: EntityTracker<T>?): Void
+    this.root = root
+    this.runPath = runPath
+    this.checkPath = checkPath
+    this.depth = depth
+    this.currentTracker = currentTracker
+  end
+
+  ## Continues from the entities selected by the current path.
+  public def thenInclude<N>(step: NavigationStep<T, N>): NavigationQuery<R, N>
+    let previousRun = this.runPath
+    let previousCheck = this.checkPath
+    let root = this.root
+    let depth = this.depth + 1
+    let currentTracker = this.currentTracker
+    let run: fn(TypedRows<R>, NavigationJournal): QueryResult<N> = fn(rows: TypedRows<R>, journal: NavigationJournal): QueryResult<N>
+      match previousRun(rows, journal)
+        case QueryResult.Failure(error)
+          return QueryResult<N>.Failure(error)
+        case QueryResult.Rows(current)
+          return step.run(current, journal)
+      end
+    end
+    let check: fn(): QueryFailure? = fn(): QueryFailure?
+      let prior = previousCheck()
+
+      if prior != null
+        return prior
+      end
+      return navigationStepValid(root.provider(), root.changeOwner(), currentTracker, step)
+    end
+
+    return new NavigationQuery<R, N>(root, run, check, depth, step.targetTracker())
+  end
+
+  ## Adds another branch from the original root entities.
+  public def include<N>(step: NavigationStep<R, N>): NavigationQuery<R, N>
+    let previousRun = this.runPath
+    let previousCheck = this.checkPath
+    let root = this.root
+    let depth = this.depth + 1
+    let run: fn(TypedRows<R>, NavigationJournal): QueryResult<N> = fn(rows: TypedRows<R>, journal: NavigationJournal): QueryResult<N>
+      match previousRun(rows, journal)
+        case QueryResult.Failure(error)
+          return QueryResult<N>.Failure(error)
+        case QueryResult.Rows(current)
+          return step.run(rows, journal)
+      end
+    end
+    let check: fn(): QueryFailure? = fn(): QueryFailure?
+      let prior = previousCheck()
+
+      if prior != null
+        return prior
+      end
+      return navigationStepValid(root.provider(), root.changeOwner(), root.rowTracker(), step)
+    end
+
+    return new NavigationQuery<R, N>(root, run, check, depth, step.targetTracker())
+  end
+
+  ## Executes the root query and all navigation steps as one mutation unit.
+  public def all(): QueryResult<R>
+    let invalid = this.validate()
+
+    if invalid != null
+      return QueryResult<R>.Failure(invalid)
+    end
+    match this.root.all()
+      case QueryResult.Failure(error)
+        return QueryResult<R>.Failure(error)
+      case QueryResult.Rows(rows)
+        return this.load(rows)
+    end
+  end
+
+  ## Loads the path for previously materialized tracked root rows.
+  public def load(rows: TypedRows<R>): QueryResult<R>
+    let invalid = this.validate()
+
+    if invalid != null
+      return QueryResult<R>.Failure(invalid)
+    end
+    if rows.count() > 10000
+      return QueryResult<R>.Failure(QueryFailure.Provider("navigation root exceeds 10000 rows"))
+    end
+    let journal = new NavigationJournal()
+
+    match this.runPath(rows, journal)
+      case QueryResult.Failure(error)
+        journal.rollback()
+        return QueryResult<R>.Failure(error)
+      case QueryResult.Rows(current)
+        journal.discard()
+        return QueryResult<R>.Rows(rows)
+    end
+  end
+
+  private def validate(): QueryFailure?
+    if this.depth > 32
+      return QueryFailure.UnsupportedCapability("navigation path exceeds 32 steps")
+    end
+    let rootFailure = this.root.queryFailure()
+
+    if rootFailure != null
+      return rootFailure
+    end
+    return this.checkPath()
+  end
+end
+
+def navigationStepValid<A, B>(rootProvider: Provider?, rootOwner: ChangeContext?, expectedTracker: EntityTracker<A>?, step: NavigationStep<A, B>): QueryFailure?
+  let invalid = step.validate()
+
+  if invalid != null
+    return invalid
+  end
+  let stepProvider = step.provider()
+  let stepOwner = step.owner()
+  let sourceTracker = step.sourceTracker()
+  let targetTracker = step.targetTracker()
+
+  if rootProvider == null || stepProvider == null || !reference::same(rootProvider, stepProvider)
+    return QueryFailure.Provider("navigation steps require the same provider")
+  end
+  if rootOwner == null || stepOwner == null || !reference::same(rootOwner, stepOwner) || !rootOwner.matchesProvider(rootProvider)
+    return QueryFailure.Provider("navigation steps require the same change context and provider")
+  end
+  if expectedTracker == null || sourceTracker == null || targetTracker == null || !reference::same(expectedTracker, sourceTracker)
+    return QueryFailure.UnsupportedCapability("navigation step requires the current tracked entity set")
+  end
+  return null
+end
+
+def includePath<R, T>(root: Query<R>, step: NavigationStep<R, T>): NavigationQuery<R, T>
+  let run: fn(TypedRows<R>, NavigationJournal): QueryResult<T> = fn(rows: TypedRows<R>, journal: NavigationJournal): QueryResult<T>
+    return step.run(rows, journal)
+  end
+  let check: fn(): QueryFailure? = fn(): QueryFailure?
+    return navigationStepValid(root.provider(), root.changeOwner(), root.rowTracker(), step)
+  end
+
+  return new NavigationQuery<R, T>(root, run, check, 1, step.targetTracker())
+end

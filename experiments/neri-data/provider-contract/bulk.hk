@@ -1,0 +1,482 @@
+use test
+use console
+use files
+use resources
+use result
+use app_data
+use model
+use neri_data
+use neri_data_sqlite
+use neri_data_sqlite_fixture
+
+class BulkDiagnosticProbe
+  public setCalls: Int = 0
+  public parameters: Int = 0
+  public affected: Int = 0
+  public failure: String = ""
+
+  def observe(event: readonly ProviderDiagnostic): Void
+    if event.operation() == "executeSet" || event.operation() == "executeSetInTransaction"
+      this.setCalls = this.setCalls + 1
+      this.parameters = event.parameterCount()
+      this.affected = event.affectedCount()
+      this.failure = event.failureKind()
+    end
+
+    test::assertEqual(event.failureMessage(), "")
+  end
+end
+
+def diagnosed(provider: Provider, probe: BulkDiagnosticProbe): DiagnosedProvider
+  let observer: fn(readonly ProviderDiagnostic): Void = fn(event: readonly ProviderDiagnostic): Void
+    probe.observe(event)
+  end
+
+  return new DiagnosedProvider(provider, observer)
+end
+
+def saved(result: WriteResult, expected: Int): Void
+  match result
+    case WriteResult.Saved(count)
+      test::assertEqual(count, expected)
+    case WriteResult.SavedWithValues(count, outputs)
+      test::assertTrue(false)
+    case WriteResult.Failure(error)
+      console::println(writeFailureMessage(error))
+
+      test::assertTrue(false)
+  end
+end
+
+def failed(result: WriteResult): Void
+  match result
+    case WriteResult.Saved(count)
+      test::assertTrue(false)
+    case WriteResult.SavedWithValues(count, outputs)
+      test::assertTrue(false)
+    case WriteResult.Failure(error)
+      test::assertTrue(writeFailureMessage(error) != "")
+  end
+end
+
+def total(query: Query<Customer>, expected: Int): Void
+  match query.count()
+    case QueryValue.Value(count)
+      test::assertEqual(count, expected)
+    case QueryValue.Failure(error)
+      test::assertTrue(false)
+  end
+end
+
+def customer(provider: Provider, id: Int): Customer?
+  let db = new Database(provider)
+
+  match db.customers.where(id: id).single()
+    case QueryValue.Value(value)
+      return value
+    case QueryValue.Failure(error)
+      test::assertTrue(false)
+      return null
+  end
+end
+
+def name(provider: Provider, id: Int, expected: String): Void
+  let value = customer(provider, id)
+
+  if value != null
+    test::assertEqual(value.name, expected)
+  end
+end
+
+def bulkCustomerId(): quote fn(Customer): Int
+  return quote do |value: Customer|: Int
+    return value.id
+  end
+end
+
+def bulkCustomerName(): quote fn(Customer): String
+  return quote do |value: Customer|: String
+    return value.name
+  end
+end
+
+def bulkCustomerActive(): quote fn(Customer): Bool
+  return quote do |value: Customer|: Bool
+    return value.active
+  end
+end
+
+def bulkCustomerNickname(): quote fn(Customer): String?
+  return quote do |value: Customer|: String?
+    return value.nickname
+  end
+end
+
+def customerNameWhen(threshold: Int): quote fn(Customer): String?
+  return quote do |value: Customer|: String?
+    return value.id > threshold ? value.name : null
+  end
+end
+
+def bulkNullNickname(): quote fn(Customer): String?
+  return quote do |value: Customer|: String?
+    return null
+  end
+end
+
+def customerAbove(threshold: Int): quote fn(Customer): Bool
+  return quote do |value: Customer|: Bool
+    return value.id > threshold
+  end
+end
+
+def customerActiveFromId(threshold: Int): quote fn(Customer): Bool
+  return quote do |value: Customer|: Bool
+    return value.id > threshold
+  end
+end
+
+def customerNameWith(suffix: String): quote fn(Customer): String
+  return quote do |value: Customer|: String
+    return value.name + suffix
+  end
+end
+
+def orderCustomerId(): quote fn(Order): Int
+  return quote do |value: Order|: Int
+    return value.customerId
+  end
+end
+
+def orderTotal(): quote fn(Order): Int
+  return quote do |value: Order|: Int
+    return value.total
+  end
+end
+
+def orderTotalPlus(increment: Int): quote fn(Order): Int
+  return quote do |value: Order|: Int
+    return value.total + increment
+  end
+end
+
+def verifyOrderSwap(provider: SQLiteProvider): Void
+  let db = new Database(provider)
+  let swapFirst = updateSet<Order>().set(orderCustomerId(), orderTotal())
+  let swap = swapFirst.set(orderTotal(), orderCustomerId())
+
+  saved(db.orders.executeUpdateSet(swap), 2)
+  match db.orders.where(id: 1).single()
+    case QueryValue.Value(value)
+      test::assertEqual(value.customerId, 2)
+      test::assertEqual(value.total, 1)
+    case QueryValue.Failure(error)
+      test::assertTrue(false)
+  end
+  match db.orders.where(id: 2).single()
+    case QueryValue.Value(value)
+      test::assertEqual(value.customerId, 1)
+      test::assertEqual(value.total, 2)
+    case QueryValue.Failure(error)
+      test::assertTrue(false)
+  end
+end
+
+def verifyComputedAssignments(provider: SQLiteProvider): Void
+  let db = new Database(provider)
+  var tracked: Customer? = null
+
+  match db.customers.where(id: 3).single()
+    case QueryValue.Value(value)
+      tracked = value
+    case QueryValue.Failure(error)
+      test::assertTrue(false)
+  end
+  let computedFirst = updateSet<Customer>().set(bulkCustomerActive(), customerActiveFromId(2))
+  let computedSecond = computedFirst.set(bulkCustomerName(), customerNameWith("!"))
+  let computed = computedSecond.set(bulkCustomerNickname(), customerNameWhen(2))
+  let byId = bulkCustomerId()
+  let afterTwo = customerAbove(2)
+
+  saved(db.customers.orderBy(byId).skip(1).take(2).matching(afterTwo).executeUpdateSet(computed), 1)
+
+  test::assertTrue(tracked != null)
+  if tracked != null
+    test::assertEqual(tracked.name, "three")
+    test::assertTrue(!tracked.active)
+  end
+  let updated = customer(provider, 3)
+
+  test::assertTrue(updated != null)
+  if updated != null
+    test::assertEqual(updated.name, "three!")
+    test::assertTrue(updated.active)
+    let nickname = updated.nickname
+
+    test::assertTrue(nickname != null)
+    if nickname != null
+      test::assertEqual(nickname, "three")
+    end
+  end
+  let clearNickname = updateSet<Customer>().set(bulkCustomerNickname(), bulkNullNickname())
+
+  saved(db.customers.where(id: 3).executeUpdateSet(clearNickname), 1)
+  let cleared = customer(provider, 3)
+
+  test::assertTrue(cleared != null)
+  if cleared != null
+    test::assertTrue(cleared.nickname == null)
+  end
+end
+
+def verifyWrongStorageCopy(provider: SQLiteProvider): Void
+  let db = new Database(provider)
+  let copyTotal = updateSet<Order>().set(orderTotal(), orderTotal())
+
+  failed(db.orders.executeUpdateSet(copyTotal))
+  saved(db.orders.where(id: 1).executeUpdate(total: 7), 1)
+  match db.orders.where(id: 1).single()
+    case QueryValue.Value(value)
+      test::assertEqual(value.total, 7)
+    case QueryValue.Failure(error)
+      test::assertTrue(false)
+  end
+end
+
+def verifyExpressionOverflow(provider: SQLiteProvider): Void
+  let db = new Database(provider)
+  let increment = updateSet<Order>().set(orderTotal(), orderTotalPlus(1))
+
+  failed(db.orders.executeUpdateSet(increment))
+  match db.orders.where(id: 1).single()
+    case QueryValue.Value(value)
+      test::assertEqual(value.total, 5)
+    case QueryValue.Failure(error)
+      test::assertTrue(false)
+  end
+  match db.orders.where(id: 2).single()
+    case QueryValue.Value(value)
+      test::assertEqual(value.total, 9223372036854775807)
+    case QueryValue.Failure(error)
+      test::assertTrue(false)
+  end
+  saved(db.beginTransaction(), 0)
+  saved(db.customers.where(id: 1).executeUpdate(name: "prior transaction write"), 1)
+  failed(db.orders.executeUpdateSet(increment))
+  name(provider, 1, "prior transaction write")
+  match db.orders.where(id: 1).single()
+    case QueryValue.Value(value)
+      test::assertEqual(value.total, 5)
+    case QueryValue.Failure(error)
+      test::assertTrue(false)
+  end
+  match db.orders.where(id: 2).single()
+    case QueryValue.Value(value)
+      test::assertEqual(value.total, 9223372036854775807)
+    case QueryValue.Failure(error)
+      test::assertTrue(false)
+  end
+  saved(db.commitTransaction(), 0)
+  name(provider, 1, "prior transaction write")
+end
+
+def verifySelection(provider: SQLiteProvider): Void
+  let probe = new BulkDiagnosticProbe()
+  let db = new Database(diagnosed(provider, probe))
+  let byId: quote fn(Customer): Int = quote do |value: Customer|: Int
+    return value.id
+  end
+  let aboveThree: quote fn(Customer): Bool = quote do |value: Customer|: Bool
+    return value.id > 3
+  end
+  let payload = "O'Reilly'); DELETE FROM customers; -- ñ"
+
+  saved(db.customers.executeUpdate(active: true), 1505)
+
+  test::assertEqual(probe.setCalls, 1)
+  test::assertEqual(probe.parameters, 1)
+  test::assertEqual(probe.affected, 1505)
+  saved(db.customers.orderBy(byId).skip(1498).take(4).where(active: true).executeUpdate(nickname: null, name: payload), 4)
+  total(db.customers.where(nickname: null), 4)
+  name(provider, 1498, "seed")
+  name(provider, 1499, payload)
+  name(provider, 1502, payload)
+  name(provider, 1503, "seed")
+  let byName: quote fn(Customer): String = quote do |value: Customer|: String
+    return value.name
+  end
+
+  saved(db.customers.distinct().orderByString(byName).thenBy(byId).take(2).executeUpdate(active: false), 2)
+  total(db.customers.where(active: false), 2)
+  saved(db.customers.orderBy(byId).take(5).matching(aboveThree).distinct().executeDelete(), 2)
+  total(db.customers, 1503)
+  saved(db.customers.where(id: -1).executeDelete(), 0)
+  saved(db.customers.where(id: -1).executeUpdate(active: false), 0)
+  failed(db.customers.where(id: 1).executeUpdate(id: 9999))
+  failed(db.customers.executeUpdate())
+  failed(db.customers.take(0).executeDelete())
+  name(provider, 1, "seed")
+end
+
+def verifyAtomicFailure(provider: SQLiteProvider): Void
+  let probe = new BulkDiagnosticProbe()
+  let db = new Database(diagnosed(provider, probe))
+
+  failed(db.customers.executeUpdate(name: "collision"))
+
+  test::assertEqual(probe.failure, "constraint")
+  test::assertEqual(probe.affected, 0)
+  name(provider, 1, "one")
+  name(provider, 2, "two")
+  saved(db.beginTransaction(), 0)
+  saved(db.customers.where(id: 1).executeUpdate(nickname: "earlier operation"), 1)
+  failed(db.customers.executeUpdate(name: "collision"))
+  name(provider, 1, "one")
+  name(provider, 2, "two")
+  saved(db.commitTransaction(), 0)
+  let first = customer(provider, 1)
+
+  if first != null
+    let nickname = first.nickname
+
+    test::assertTrue(nickname != null)
+    if nickname != null
+      test::assertEqual(nickname, "earlier operation")
+    end
+  end
+end
+
+def verifyTrackingAndTransactions(provider: SQLiteProvider): Void
+  let db = new Database(provider)
+  var tracked: Customer? = null
+
+  match db.customers.where(id: 1).single()
+    case QueryValue.Value(value)
+      tracked = value
+    case QueryValue.Failure(error)
+      test::assertTrue(false)
+  end
+  if tracked == null
+    return
+  end
+  saved(db.customers.where(id: 1).executeUpdate(name: "bulk"), 1)
+
+  test::assertEqual(tracked.name, "one")
+  tracked.name = "local edit"
+  failed(db.saveChanges())
+  name(provider, 1, "bulk")
+  db.clear()
+  saved(db.beginTransaction(), 0)
+  saved(db.customers.where(id: 1).executeUpdate(name: "provisional"), 1)
+  saved(db.customers.where(id: 2).executeDelete(), 1)
+  let foreign = new Database(provider)
+
+  failed(foreign.customers.where(id: 1).executeUpdate(name: "foreign lease"))
+  saved(db.rollbackTransaction(), 0)
+  name(provider, 1, "bulk")
+  name(provider, 2, "two")
+  saved(db.beginTransaction(), 0)
+  saved(db.customers.where(id: 1).executeUpdate(name: "committed"), 1)
+  saved(db.commitTransaction(), 0)
+  name(provider, 1, "committed")
+end
+
+def verifyAutomaticRollback(provider: SQLiteProvider): Void
+  let db = new Database(provider)
+  var tracked: Customer? = null
+
+  match db.customers.where(id: 1).single()
+    case QueryValue.Value(value)
+      tracked = value
+    case QueryValue.Failure(error)
+      test::assertTrue(false)
+  end
+  if tracked == null
+    return
+  end
+  saved(db.beginTransaction(), 0)
+  tracked.name = "retry after rollback"
+  saved(db.saveChanges(), 1)
+  failed(db.customers.where(id: 2).executeUpdate(name: "rollback"))
+  name(provider, 1, "one")
+  failed(db.commitTransaction())
+  saved(db.saveChanges(), 1)
+  name(provider, 1, "retry after rollback")
+end
+
+def bulkDecoder(row: RawRow): DecodeResult<Customer>
+  test::assertTrue(false)
+  return DecodeResult<Customer>.Failure(QueryFailure.Provider("set writes must not decode rows"))
+end
+
+def verifyAliasCollision(provider: SQLiteProvider): Void
+  let mapping = new EntityMapping("model.Customer", "__NERI_TARGET_KEYS", [new MappingColumn("model.Customer.id", "Int", "id"), new MappingColumn("model.Customer.name", "String", "name")], "id")
+  let decoder = new Decoder<Customer>(bulkDecoder, new ResultColumns([new ResultColumn("id", ResultColumnKind.Int())]))
+  let query = new Query<Customer>("__NERI_TARGET_KEYS", decoder, mapping: mapping, provider: provider)
+
+  saved(query.where(id: 1).executeUpdate(name: "renamed"), 1)
+  saved(query.where(name: "renamed").executeDelete(), 1)
+  saved(query.executeDelete(), 1)
+end
+
+def runFixture(path: String, schema: String, verify: fn(SQLiteProvider): Void): Void
+  test::assertTrue(createSQLiteFixture(path, schema))
+  match SQLiteProvider.openWritable(path)
+    case SQLiteOpenResult.Opened(provider)
+      verify(provider)
+
+      test::assertTrue(provider.close())
+    case SQLiteOpenResult.Failure(message)
+      console::println(message)
+
+      test::assertTrue(false)
+  end
+end
+
+def verifyFiles(): resources::Outcome<Int, result::Failure>
+  using temporary <- files::TemporaryDirectory.create("neri-bulk-")
+    let base = "CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT NOT NULL, active INTEGER NOT NULL, nickname TEXT);"
+    let small = "INSERT INTO customers VALUES (1, 'one', 0, NULL), (2, 'two', 1, NULL);"
+    let three = "INSERT INTO customers VALUES (1, 'one', 0, NULL), (2, 'two', 0, NULL), (3, 'three', 0, NULL);"
+    let many = "WITH RECURSIVE n(id) AS (VALUES(1) UNION ALL SELECT id + 1 FROM n WHERE id < 1505) INSERT INTO customers SELECT id, 'seed', 0, 'keep' FROM n;"
+    let unique = "CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE ON CONFLICT FAIL, active INTEGER NOT NULL, nickname TEXT);"
+    let rollback = "CREATE TRIGGER stop_bulk BEFORE UPDATE OF name ON customers WHEN new.name = 'rollback' BEGIN SELECT RAISE(ROLLBACK, 'requested rollback'); END;"
+    let swapOrders = "CREATE TABLE orders (id INTEGER PRIMARY KEY, customer_id INTEGER NOT NULL REFERENCES customers(id), total INTEGER NOT NULL); INSERT INTO orders VALUES (1, 1, 2), (2, 2, 1);"
+    let overflowOrders = "CREATE TABLE orders (id INTEGER PRIMARY KEY, customer_id INTEGER NOT NULL REFERENCES customers(id), total INTEGER NOT NULL); INSERT INTO orders VALUES (1, 1, 5), (2, 2, 9223372036854775807);"
+    let wrongStorageOrder = "CREATE TABLE orders (id INTEGER PRIMARY KEY, customer_id INTEGER NOT NULL, total INTEGER NOT NULL); INSERT INTO orders VALUES (1, 1, 'not an integer');"
+
+    console::println("Verifying bulk selection, parameters, and unbounded affected rows")
+    runFixture(temporary.path() + "/selection.sqlite", base + many, verifySelection)
+    console::println("Verifying computed assignments, composed targets, and tracked-state isolation")
+    runFixture(temporary.path() + "/computed.sqlite", base + three, verifyComputedAssignments)
+    console::println("Verifying multi-assignment swaps read old-row values")
+    runFixture(temporary.path() + "/swap.sqlite", base + "INSERT INTO customers VALUES (1, 'one', 0, NULL), (2, 'two', 0, NULL);" + swapOrders, verifyOrderSwap)
+    console::println("Verifying expression overflow rollback and transaction savepoint recovery")
+    runFixture(temporary.path() + "/overflow.sqlite", base + small + overflowOrders, verifyExpressionOverflow)
+    console::println("Verifying direct-copy storage validation and recovery")
+    runFixture(temporary.path() + "/wrong-storage.sqlite", base + small + wrongStorageOrder, verifyWrongStorageCopy)
+    console::println("Verifying multi-row FAIL rollback and savepoint recovery")
+    runFixture(temporary.path() + "/constraint.sqlite", unique + small, verifyAtomicFailure)
+    console::println("Verifying tracked-state and transaction boundaries")
+    runFixture(temporary.path() + "/transactions.sqlite", base + small, verifyTrackingAndTransactions)
+    console::println("Verifying automatic rollback reconciles earlier tracked writes")
+    runFixture(temporary.path() + "/rollback.sqlite", base + small + rollback, verifyAutomaticRollback)
+    console::println("Verifying target alias cannot shadow a mapped table")
+    runFixture(temporary.path() + "/alias.sqlite", "CREATE TABLE __NERI_TARGET_KEYS (id INTEGER PRIMARY KEY, name TEXT NOT NULL); INSERT INTO __NERI_TARGET_KEYS VALUES (1, 'one'), (2, 'two');", verifyAliasCollision)
+    return 0
+  end
+  return 1
+end
+
+def main(): Void
+  let completed = verifyFiles()
+
+  test::assertEqual(completed.closeFailures.count(), 0)
+  match completed.completion
+    case resources::Completion.Value(value)
+      test::assertEqual(value, 0)
+    case resources::Completion.Failure(problem)
+      test::assertTrue(false)
+  end
+  console::println("SQLite bulk integration contracts passed")
+end

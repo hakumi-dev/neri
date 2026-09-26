@@ -1,0 +1,321 @@
+use host
+use console
+use files
+use resources
+use result
+use test
+use neri_data
+use neri_data_sqlite
+use neri_data_sqlite_fixture
+
+def applied(result: MigrationResult, expected: Int): Void
+  match result
+    case MigrationResult.Applied(count)
+      test::assertEqual(count, expected)
+    case MigrationResult.Failure(error)
+      test::assertTrue(false)
+  end
+end
+
+def rejected(result: MigrationResult): Void
+  match result
+    case MigrationResult.Applied(count)
+      test::assertTrue(false)
+    case MigrationResult.Failure(error)
+      match error
+        case MigrationFailure.Validation(message)
+          test::assertTrue(message != "")
+        case MigrationFailure.Drift(message)
+          test::assertTrue(message != "")
+        case MigrationFailure.Unsupported(message)
+          test::assertTrue(message != "")
+        case MigrationFailure.Provider(message)
+          test::assertTrue(message != "")
+      end
+  end
+end
+
+def drift(result: MigrationResult): Void
+  match result
+    case MigrationResult.Applied(count)
+      test::assertTrue(false)
+    case MigrationResult.Failure(error)
+      match error
+        case MigrationFailure.Drift(message)
+          test::assertTrue(message != "")
+        case MigrationFailure.Validation(message)
+          test::assertTrue(false)
+        case MigrationFailure.Unsupported(message)
+          test::assertTrue(false)
+        case MigrationFailure.Provider(message)
+          test::assertTrue(false)
+      end
+  end
+end
+
+def commitFailed(result: MigrationResult): Void
+  match result
+    case MigrationResult.Applied(count)
+      test::assertTrue(false)
+    case MigrationResult.Failure(error)
+      match error
+        case MigrationFailure.Provider(message)
+          let prefix = "SQLite migration commit failed:"
+
+          test::assertTrue(host::stringByteLength(message) >= host::stringByteLength(prefix))
+          test::assertEqual(host::stringSlice(message, 0, host::stringByteLength(prefix)), prefix)
+        case MigrationFailure.Validation(message)
+          test::assertTrue(false)
+        case MigrationFailure.Drift(message)
+          test::assertTrue(false)
+        case MigrationFailure.Unsupported(message)
+          test::assertTrue(false)
+      end
+  end
+end
+
+def transactionSaved(result: WriteResult): Void
+  match result
+    case WriteResult.Saved(count)
+      test::assertEqual(count, 0)
+    case WriteResult.SavedWithValues(count, outputs)
+      test::assertTrue(false)
+    case WriteResult.Failure(error)
+      test::assertTrue(false)
+  end
+end
+
+def hasColumn(provider: SQLiteProvider, table: String, column: String): Bool
+  match provider.inspectSchema()
+    case SQLiteSchemaResult.Failure(message)
+      test::assertTrue(false)
+      return false
+    case SQLiteSchemaResult.Snapshot(snapshot)
+      var index = 0
+
+      while index < snapshot.count()
+        let entry = snapshot.at(index)
+
+        if entry != null && entry.table() == table && entry.name() == column
+          return true
+        end
+        index = index + 1
+      end
+      return false
+  end
+end
+
+def firstMigration(): Migration
+  let id = new SchemaColumn("id", SchemaType.Int(), primaryKey: true)
+  let name = new SchemaColumn("name", SchemaType.Text())
+
+  return new Migration("m1", [SchemaOp.CreateTable("widgets", [id, name])], [SchemaOp.DropTable("widgets")])
+end
+
+def secondMigration(): Migration
+  let note = new SchemaColumn("note", SchemaType.Text(), nullable: true)
+
+  return new Migration("m2", [SchemaOp.AddColumn("widgets", note), SchemaOp.CreateIndex("idx_widgets_name", "widgets", ["name"], false)], [SchemaOp.DropIndex("idx_widgets_name"), SchemaOp.DropColumn("widgets", "note")])
+end
+
+def catalog(): MigrationSet
+  return new MigrationSet([firstMigration(), secondMigration()])
+end
+
+def brokenUpgrade(): MigrationSet
+  let broken = new Migration("m3", [SchemaOp.CreateTable("temporary_widget", [new SchemaColumn("id", SchemaType.Int(), primaryKey: true)]), SchemaOp.DropTable("absent_widget")], [SchemaOp.DropTable("temporary_widget")])
+
+  return new MigrationSet([firstMigration(), secondMigration(), broken])
+end
+
+def verifyFile(path: String): Void
+  let migrations = catalog()
+
+  match SQLiteProvider.createWritable(path)
+    case SQLiteOpenResult.Failure(message)
+      test::assertTrue(false)
+    case SQLiteOpenResult.Opened(provider)
+      applied(provider.migrate(migrations), 2)
+
+      test::assertTrue(hasColumn(provider, "widgets", "note"))
+      applied(provider.migrate(migrations), 0)
+      rejected(provider.migrate(migrations, "missing"))
+      rejected(provider.migrate(brokenUpgrade()))
+
+      test::assertFalse(hasColumn(provider, "temporary_widget", "id"))
+      test::assertTrue(hasColumn(provider, "widgets", "note"))
+      applied(provider.migrate(migrations), 0)
+      applied(provider.migrate(migrations, "m1"), 1)
+
+      test::assertFalse(hasColumn(provider, "widgets", "note"))
+      applied(provider.migrate(migrations), 1)
+
+      test::assertTrue(provider.close())
+  end
+  match SQLiteProvider.openWritable(path)
+    case SQLiteOpenResult.Failure(message)
+      test::assertTrue(false)
+    case SQLiteOpenResult.Opened(provider)
+      applied(provider.migrate(migrations), 0)
+
+      test::assertTrue(hasColumn(provider, "widgets", "note"))
+      match provider.beginTransaction()
+        case TransactionOpenResult.Failure(error)
+          test::assertTrue(false)
+        case TransactionOpenResult.Begun(lease)
+          rejected(provider.migrate(migrations, ""))
+          transactionSaved(provider.rollbackTransaction(lease))
+      end
+
+      test::assertTrue(provider.close())
+  end
+  match SQLiteProvider.open(path)
+    case SQLiteOpenResult.Failure(message)
+      test::assertTrue(false)
+    case SQLiteOpenResult.Opened(provider)
+      rejected(provider.migrate(migrations))
+
+      test::assertTrue(provider.close())
+  end
+end
+
+def verifyWholeRunRollback(path: String): Void
+  let id = new SchemaColumn("id", SchemaType.Int(), primaryKey: true)
+  let first = new Migration("first", [SchemaOp.CreateTable("first_table", [id])], [SchemaOp.DropTable("first_table")])
+  let second = new Migration("second", [SchemaOp.CreateTable("second_table", [id]), SchemaOp.DropTable("absent_table")], [SchemaOp.DropTable("second_table")])
+
+  match SQLiteProvider.createWritable(path)
+    case SQLiteOpenResult.Failure(message)
+      test::assertTrue(false)
+    case SQLiteOpenResult.Opened(provider)
+      rejected(provider.migrate(new MigrationSet([first, second])))
+
+      test::assertFalse(hasColumn(provider, "first_table", "id"))
+      test::assertFalse(hasColumn(provider, "second_table", "id"))
+      applied(provider.migrate(new MigrationSet([first])), 1)
+
+      test::assertTrue(hasColumn(provider, "first_table", "id"))
+      test::assertTrue(provider.close())
+  end
+end
+
+def verifyFailedDown(path: String): Void
+  let id = new SchemaColumn("id", SchemaType.Int(), primaryKey: true)
+  let first = new Migration("first", [SchemaOp.CreateTable("base_table", [id])], [SchemaOp.DropTable("base_table")])
+  let second = new Migration("second", [SchemaOp.CreateTable("extra_table", [id])], [SchemaOp.DropTable("extra_table"), SchemaOp.DropTable("absent_table")])
+  let migrations = new MigrationSet([first, second])
+
+  match SQLiteProvider.createWritable(path)
+    case SQLiteOpenResult.Failure(message)
+      test::assertTrue(false)
+    case SQLiteOpenResult.Opened(provider)
+      applied(provider.migrate(migrations), 2)
+      rejected(provider.migrate(migrations, "first"))
+
+      test::assertTrue(hasColumn(provider, "extra_table", "id"))
+      applied(provider.migrate(migrations), 0)
+
+      test::assertTrue(provider.close())
+  end
+end
+
+def verifyHistoryDrift(path: String): Void
+  let base = firstMigration()
+  let expanded = new MigrationSet([base, secondMigration()])
+
+  match SQLiteProvider.createWritable(path)
+    case SQLiteOpenResult.Failure(message)
+      test::assertTrue(false)
+    case SQLiteOpenResult.Opened(provider)
+      applied(provider.migrate(new MigrationSet([base])), 1)
+      let altered = new Migration("m1", [SchemaOp.CreateTable("widgets", [new SchemaColumn("id", SchemaType.Int(), primaryKey: true), new SchemaColumn("title", SchemaType.Text())])], [SchemaOp.DropTable("widgets")])
+
+      drift(provider.migrate(new MigrationSet([altered, secondMigration()])))
+
+      test::assertFalse(hasColumn(provider, "widgets", "note"))
+      test::assertTrue(provider.close())
+  end
+
+  test::assertTrue(createSQLiteFixture(path, "UPDATE __neri_migrations SET ordinal = 7 WHERE ordinal = 1"))
+  match SQLiteProvider.openWritable(path)
+    case SQLiteOpenResult.Failure(message)
+      test::assertTrue(false)
+    case SQLiteOpenResult.Opened(provider)
+      drift(provider.migrate(expanded))
+
+      test::assertFalse(hasColumn(provider, "widgets", "note"))
+      test::assertTrue(provider.close())
+  end
+end
+
+def verifyForeignKeyProtection(path: String): Void
+  test::assertTrue(createSQLiteFixture(path, "CREATE TABLE parent(id INTEGER PRIMARY KEY); CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id INTEGER NOT NULL REFERENCES parent(id)); INSERT INTO parent VALUES(1); INSERT INTO child VALUES(1,1);"))
+  let id = new SchemaColumn("id", SchemaType.Int(), primaryKey: true)
+  let migration = new Migration("drop_parent", [SchemaOp.CreateTable("before_drop", [id]), SchemaOp.DropTable("parent")], [SchemaOp.DropTable("before_drop")])
+  let migrations = new MigrationSet([migration])
+
+  match SQLiteProvider.openWritable(path)
+    case SQLiteOpenResult.Failure(message)
+      test::assertTrue(false)
+    case SQLiteOpenResult.Opened(provider)
+      rejected(provider.migrate(migrations))
+
+      test::assertTrue(hasColumn(provider, "parent", "id"))
+      test::assertFalse(hasColumn(provider, "before_drop", "id"))
+      applied(provider.migrate(new MigrationSet([])), 0)
+
+      test::assertTrue(provider.close())
+  end
+end
+
+def verifyDeferredCommitFailure(path: String): Void
+  test::assertTrue(createSQLiteFixture(path, "CREATE TABLE parent(id INTEGER PRIMARY KEY); CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id INTEGER NOT NULL REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED); INSERT INTO parent VALUES(1); INSERT INTO child VALUES(1,1);"))
+  let id = new SchemaColumn("id", SchemaType.Int(), primaryKey: true)
+  let migration = new Migration("drop_parent", [SchemaOp.CreateTable("before_drop", [id]), SchemaOp.DropTable("parent")], [SchemaOp.DropTable("before_drop")])
+  let migrations = new MigrationSet([migration])
+
+  match SQLiteProvider.openWritable(path)
+    case SQLiteOpenResult.Failure(message)
+      test::assertTrue(false)
+    case SQLiteOpenResult.Opened(provider)
+      commitFailed(provider.migrate(migrations))
+
+      test::assertTrue(hasColumn(provider, "parent", "id"))
+      test::assertFalse(hasColumn(provider, "before_drop", "id"))
+      applied(provider.migrate(new MigrationSet([])), 0)
+      let retry = new Migration("retry", [SchemaOp.CreateTable("retry_table", [id])], [SchemaOp.DropTable("retry_table")])
+
+      applied(provider.migrate(new MigrationSet([retry])), 1)
+
+      test::assertTrue(hasColumn(provider, "retry_table", "id"))
+      test::assertTrue(provider.close())
+  end
+
+  test::assertTrue(createSQLiteFixture(path, "CREATE TEMP TABLE check_count(n INTEGER CHECK(n = 1)); INSERT INTO check_count SELECT COUNT(*) FROM parent; INSERT INTO check_count SELECT COUNT(*) FROM child;"))
+end
+
+def verifyFiles(): resources::Outcome<Int, result::Failure>
+  using temporary <- files::TemporaryDirectory.create("neri-migrations-")
+    verifyFile(temporary.path() + "/new.sqlite")
+    verifyWholeRunRollback(temporary.path() + "/whole-run.sqlite")
+    verifyFailedDown(temporary.path() + "/failed-down.sqlite")
+    verifyHistoryDrift(temporary.path() + "/history.sqlite")
+    verifyForeignKeyProtection(temporary.path() + "/foreign-key.sqlite")
+    verifyDeferredCommitFailure(temporary.path() + "/deferred-commit.sqlite")
+    return 0
+  end
+  return 1
+end
+
+def main(): Void
+  let completed = verifyFiles()
+
+  test::assertEqual(completed.closeFailures.count(), 0)
+  match completed.completion
+    case resources::Completion.Value(value)
+      test::assertEqual(value, 0)
+    case resources::Completion.Failure(problem)
+      test::assertTrue(false)
+  end
+  console::println("SQLite migration contracts passed")
+end

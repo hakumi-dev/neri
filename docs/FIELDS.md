@@ -35,7 +35,7 @@ the callable body. Calls supply its entries by field name.
 
 Duplicate labels, inaccessible or unknown fields, incompatible values and
 positional pack arguments produce compile-time diagnostics. Current entries
-support `Bool`, `Int`, `String` and their optional types. Other fields can remain
+support `Bool`, `Int`, `Float`, `String` and their optional types. Other fields can remain
 on the entity; supplying one as an entry requires additional representation
 support.
 

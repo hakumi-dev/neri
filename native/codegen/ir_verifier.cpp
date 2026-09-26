@@ -210,32 +210,6 @@ void require_value_type(const type &value, std::string_view description) {
   }
 }
 
-void verify_location(const std::optional<source_location> &location,
-                     const ir_module &module) {
-  if (!location.has_value()) {
-    return;
-  }
-  const auto source = std::ranges::find_if(
-      module.sources, [&location](const auto &candidate) {
-        return candidate.id == location->source;
-      });
-  if (source == module.sources.end()) {
-    fail(reader_error_kind::invalid_source,
-         "Source location references missing source '" + location->source +
-             "'.");
-  }
-  const auto start = static_cast<std::size_t>(location->utf8_start);
-  const auto length = static_cast<std::size_t>(location->utf8_length);
-  const auto contents = std::span(source->utf8);
-  if (start > contents.size() || length > contents.size() - start ||
-      !utf8_boundary(contents, start) ||
-      !utf8_boundary(contents, start + length)) {
-    fail(reader_error_kind::invalid_source,
-         "Source location is outside UTF-8 scalar boundaries for source '" +
-             location->source + "'.");
-  }
-}
-
 void verify_constant(const constant &value, const type &expected,
                      std::uint32_t depth = 0U) {
   if (depth > 64U) {
@@ -353,22 +327,6 @@ void require_unique_order(const std::vector<T> &values,
   }
 }
 
-[[nodiscard]] const function *find_function(const ir_module &module,
-                                            const symbol_id &id) {
-  const auto match = std::ranges::find_if(module.functions, [&id](const auto &item) {
-    return same_symbol(item.id, id);
-  });
-  return match == module.functions.end() ? nullptr : &*match;
-}
-
-[[nodiscard]] const import_declaration *
-find_import(const ir_module &module, const symbol_id &id) {
-  const auto match = std::ranges::find_if(module.imports, [&id](const auto &item) {
-    return same_symbol(item.id, id);
-  });
-  return match == module.imports.end() ? nullptr : &*match;
-}
-
 [[nodiscard]] const class_declaration *find_class(const ir_module &module,
                                                   const symbol_id &id) {
   const auto match = std::ranges::find_if(module.classes, [&id](const auto &item) {
@@ -382,29 +340,120 @@ struct found_field final {
   const field *value;
 };
 
-[[nodiscard]] std::optional<found_field> find_field(const ir_module &module,
-                                                    const symbol_id &id) {
-  for (const auto &owner : module.classes) {
-    const auto match = std::ranges::find_if(owner.fields, [&id](const auto &item) {
-      return same_symbol(item.id, id);
-    });
-    if (match != owner.fields.end()) {
-      return found_field{&owner, &*match};
+struct module_verification_index final {
+  explicit module_verification_index(const ir_module &input) : module(input) {
+    for (const auto &source : module.sources) {
+      sources.try_emplace(source.id, &source);
+    }
+    for (const auto &declaration : module.classes) {
+      classes.try_emplace(symbol_key(declaration.id), &declaration);
+      for (const auto &item : declaration.fields) {
+        fields.try_emplace(symbol_key(item.id), found_field{&declaration, &item});
+      }
+    }
+    for (const auto &declaration : module.globals) {
+      globals.try_emplace(symbol_key(declaration.id), &declaration);
+    }
+    for (const auto &declaration : module.imports) {
+      imports.try_emplace(symbol_key(declaration.id), &declaration);
+    }
+    for (const auto &declaration : module.functions) {
+      functions.try_emplace(symbol_key(declaration.id), &declaration);
     }
   }
-  return std::nullopt;
+
+  const ir_module &module;
+  std::map<std::string, const source *, std::less<>> sources;
+  std::map<decltype(symbol_key(symbol_id{})), const class_declaration *> classes;
+  std::map<decltype(symbol_key(symbol_id{})), found_field> fields;
+  std::map<decltype(symbol_key(symbol_id{})), const global_declaration *> globals;
+  std::map<decltype(symbol_key(symbol_id{})), const import_declaration *> imports;
+  std::map<decltype(symbol_key(symbol_id{})), const function *> functions;
+};
+
+[[nodiscard]] const function *find_function(const module_verification_index &index,
+                                            const symbol_id &id) {
+  const auto found = index.functions.find(symbol_key(id));
+  return found == index.functions.end() ? nullptr : found->second;
 }
 
-[[nodiscard]] bool is_same_or_base(const ir_module &module,
+[[nodiscard]] const import_declaration *
+find_import(const module_verification_index &index, const symbol_id &id) {
+  const auto found = index.imports.find(symbol_key(id));
+  return found == index.imports.end() ? nullptr : found->second;
+}
+
+[[nodiscard]] const class_declaration *find_class(
+    const module_verification_index &index, const symbol_id &id) {
+  const auto found = index.classes.find(symbol_key(id));
+  return found == index.classes.end() ? nullptr : found->second;
+}
+
+[[nodiscard]] std::optional<found_field> find_field(
+    const module_verification_index &index, const symbol_id &id) {
+  const auto found = index.fields.find(symbol_key(id));
+  if (found == index.fields.end()) {
+    return std::nullopt;
+  }
+  return found->second;
+}
+
+[[nodiscard]] const ir_module &verification_module(const ir_module &module) {
+  return module;
+}
+
+[[nodiscard]] const ir_module &
+verification_module(const module_verification_index &index) {
+  return index.module;
+}
+
+[[nodiscard]] const source *find_source(const ir_module &module,
+                                         std::string_view id) {
+  const auto found = std::ranges::find(module.sources, id, &source::id);
+  return found == module.sources.end() ? nullptr : &*found;
+}
+
+[[nodiscard]] const source *find_source(const module_verification_index &index,
+                                         std::string_view id) {
+  const auto found = index.sources.find(id);
+  return found == index.sources.end() ? nullptr : found->second;
+}
+
+template <typename VerificationContext>
+void verify_location(const std::optional<source_location> &location,
+                     const VerificationContext &context) {
+  if (!location.has_value()) {
+    return;
+  }
+  const auto *source = find_source(context, location->source);
+  if (source == nullptr) {
+    fail(reader_error_kind::invalid_source,
+         "Source location references missing source '" + location->source +
+             "'.");
+  }
+  const auto start = static_cast<std::size_t>(location->utf8_start);
+  const auto length = static_cast<std::size_t>(location->utf8_length);
+  const auto contents = std::span(source->utf8);
+  if (start > contents.size() || length > contents.size() - start ||
+      !utf8_boundary(contents, start) ||
+      !utf8_boundary(contents, start + length)) {
+    fail(reader_error_kind::invalid_source,
+         "Source location is outside UTF-8 scalar boundaries for source '" +
+             location->source + "'.");
+  }
+}
+
+template <typename VerificationContext>
+[[nodiscard]] bool is_same_or_base(const VerificationContext &context,
                                    const symbol_id &derived,
                                    const symbol_id &possible_base) {
   const symbol_id *current = &derived;
-  auto remaining = module.classes.size() + 1U;
+  auto remaining = verification_module(context).classes.size() + 1U;
   while (remaining-- != 0U) {
     if (same_symbol(*current, possible_base)) {
       return true;
     }
-    const auto *declaration = find_class(module, *current);
+    const auto *declaration = find_class(context, *current);
     if (declaration == nullptr || !declaration->base.has_value()) {
       return false;
     }
@@ -413,8 +462,10 @@ struct found_field final {
   return false;
 }
 
-void require_declared_type(const ir_module &module, const type &value,
+template <typename VerificationContext>
+void require_declared_type(const VerificationContext &context, const type &value,
                            std::string_view description) {
+  const auto &module = verification_module(context);
   if (value.tag != NERI_IR_TYPE_FIXED_ARRAY_V1 && value.element_count != 0U)
     fail(reader_error_kind::invalid_type, "Only fixed arrays carry an element count.");
   require_value_type(value, description);
@@ -429,14 +480,14 @@ void require_declared_type(const ir_module &module, const type &value,
   if (extended_scalar(value.tag) &&
       std::ranges::find(module.required_features, ir_feature::ExtendedScalars) == module.required_features.end())
     fail(reader_error_kind::unsupported_feature, "Extended scalar types require extended-scalars-v1.");
-  if (is_class(value) && find_class(module, *value.symbol) == nullptr) {
+  if (is_class(value) && find_class(context, *value.symbol) == nullptr) {
     fail(reader_error_kind::invalid_reference,
          std::string(description) + " references a missing class.");
   }
   for (std::size_t index = 0; index < value.arguments.size(); ++index) {
     const auto &argument = value.arguments[index];
     if (!((is_pointer(value) || (is_c_function(value) && index == 0U)) && is_void(argument)))
-      require_declared_type(module, argument, description);
+      require_declared_type(context, argument, description);
   }
 }
 
@@ -453,10 +504,11 @@ struct use_site final {
 };
 
 struct function_context final {
-  function_context(const ir_module &input_module,
+  function_context(const module_verification_index &input_index,
                    const function &input_function)
-      : module(input_module), value(input_function) {}
+      : index(input_index), module(input_index.module), value(input_function) {}
 
+  const module_verification_index &index;
   const ir_module &module;
   const function &value;
   std::map<std::uint32_t, const block *> blocks;
@@ -504,7 +556,17 @@ void require_result_type(const instruction &value, std::size_t index,
                          const type &expected) {
   if (index >= value.results.size() ||
       !same_type(value.results[index].value_type, expected)) {
-    fail(reader_error_kind::invalid_type, "Instruction result has the wrong semantic type.");
+    std::string detail = "Instruction result has the wrong semantic type (opcode " +
+        std::to_string(value.opcode) + ", expected tag " + std::to_string(expected.tag);
+    if (index < value.results.size()) {
+      const auto &actual = value.results[index].value_type;
+      detail += ", actual tag " + std::to_string(actual.tag);
+      if (expected.symbol) detail += ", expected symbol " + expected.symbol->semantic_name;
+      if (actual.symbol) detail += ", actual symbol " + actual.symbol->semantic_name;
+    }
+    if (value.location) detail += " at " + value.location->source +
+        ":" + std::to_string(value.location->utf8_start);
+    fail(reader_error_kind::invalid_type, detail + ").");
   }
 }
 
@@ -540,7 +602,7 @@ void require_binary(const function_context &context, const instruction &value,
   const type *result = nullptr;
   std::uint32_t effects = 0U;
   if (imported) {
-    const auto *target = find_import(context.module, *value.symbol);
+    const auto *target = find_import(context.index, *value.symbol);
     const auto expected_kind = c_abi ? NERI_IR_IMPORT_C_ABI_V1
                                      : NERI_IR_IMPORT_RUNTIME_V1;
     if (target == nullptr || target->kind != expected_kind) {
@@ -551,12 +613,13 @@ void require_binary(const function_context &context, const instruction &value,
     result = &target->result_type;
     effects = target->effects;
   } else {
-    const auto *target = find_function(context.module, *value.symbol);
+    const auto *target = find_function(context.index, *value.symbol);
     const auto valid_kind = target != nullptr &&
                             (unsafe_call
                                  ? target->kind == NERI_IR_FUNCTION_V1 ||
                                        target->kind == NERI_IR_STATIC_METHOD_V1 ||
-                                       target->kind == NERI_IR_INSTANCE_METHOD_V1
+                                       target->kind == NERI_IR_INSTANCE_METHOD_V1 ||
+                                       target->kind == NERI_IR_DEFAULT_ADAPTER_V1
                                  : require_method
                                  ? target->kind == NERI_IR_INSTANCE_METHOD_V1 ||
                                        target->kind == NERI_IR_CONSTRUCTOR_V1
@@ -603,12 +666,12 @@ void require_binary(const function_context &context, const instruction &value,
     verify_instruction_shape(value, 1U, 0U, 0U, true, false, false);
     const std::vector<type> *parameters = nullptr;
     const type *result = nullptr;
-    if (const auto *target = find_import(context.module, *value.symbol)) {
+    if (const auto *target = find_import(context.index, *value.symbol)) {
       if (target->kind != NERI_IR_IMPORT_C_ABI_V1)
         fail(reader_error_kind::invalid_reference, "C function address requires a C ABI import.");
       parameters = &target->parameter_types;
       result = &target->result_type;
-    } else if (const auto *target = find_function(context.module, *value.symbol)) {
+    } else if (const auto *target = find_function(context.index, *value.symbol)) {
       if (target->export_name.empty())
         fail(reader_error_kind::invalid_reference, "C function address requires an exported function.");
       parameters = &target->parameter_types;
@@ -658,9 +721,13 @@ void require_binary(const function_context &context, const instruction &value,
   }
 
   const function *signature = candidates.front();
+  // Unsafe virtual calls carry the capability in the IR, just like unsafe
+  // direct calls. The capability is verifier-only and is not part of the
+  // physical dispatch-table ABI.
+  const bool unsafe_call = signature->unsafe_call;
   std::uint32_t effects = 0U;
   for (const auto *candidate : candidates) {
-    if (candidate->unsafe_call ||
+    if (candidate->unsafe_call != unsafe_call ||
         candidate->kind != NERI_IR_INSTANCE_METHOD_V1 ||
         candidate->parameter_types.empty() ||
         !is_class(candidate->parameter_types.front()) ||
@@ -677,7 +744,7 @@ void require_binary(const function_context &context, const instruction &value,
              "Virtual dispatch slot has incompatible parameter types.");
       }
     }
-    if (is_same_or_base(context.module,
+    if (is_same_or_base(context.index,
                         *signature->parameter_types.front().symbol,
                         *candidate->parameter_types.front().symbol)) {
       signature = candidate;
@@ -686,18 +753,25 @@ void require_binary(const function_context &context, const instruction &value,
   }
 
   const auto result_count = is_void(signature->result_type) ? 0U : 1U;
+  const auto operand_offset = unsafe_call ? 1U : 0U;
   verify_instruction_shape(value, result_count,
-                           signature->parameter_types.size(), 0U, true, false,
-                           false);
+                           signature->parameter_types.size() + operand_offset,
+                           0U, true, false, false);
+  if (unsafe_call) {
+    require_operand_type(context, value, 0U,
+                         type{NERI_IR_TYPE_UNSAFE_CAPABILITY_V1, std::nullopt,
+                              {}});
+  }
   for (std::size_t index = 0; index < signature->parameter_types.size(); ++index) {
-    require_operand_type(context, value, index,
+    require_operand_type(context, value, index + operand_offset,
                          signature->parameter_types[index]);
   }
   if (result_count == 1U) {
     require_result_type(value, 0U, signature->result_type);
   }
   // One non-returning implementation does not make the dispatch slot noreturn.
-  return effects & ~NERI_IR_EFFECT_NO_RETURN_V1;
+  return (effects & ~NERI_IR_EFFECT_NO_RETURN_V1) |
+         (unsafe_call ? NERI_IR_EFFECT_UNSAFE_V1 : 0U);
 }
 
 [[nodiscard]] std::uint32_t verify_instruction(function_context &context,
@@ -710,6 +784,23 @@ void require_binary(const function_context &context, const instruction &value,
     fail(reader_error_kind::invalid_type, "Numeric arithmetic requires one result.");
 
   switch (value.opcode) {
+  case NERI_IR_OPCODE_ARRAY_GENERATE_V1: {
+    verify_instruction_shape(value, 1U, 2U, 1U, true, false, false);
+    if (std::ranges::find(context.module.required_features, ir_feature::SequentialArrays) == context.module.required_features.end())
+      fail(reader_error_kind::unsupported_feature, "Sequential array generation requires sequential-arrays-v1.");
+    const type integer{NERI_IR_TYPE_INT_V1, std::nullopt, {}};
+    require_operand_type(context, value, 0U, integer);
+    require_result_type(value, 0U, type{NERI_IR_TYPE_ARRAY_V1, std::nullopt, {value.type_arguments.front()}});
+    auto callback = value;
+    callback.opcode = NERI_IR_OPCODE_CALL_VIRTUAL_V1;
+    callback.operands = {value.operands[1], value.operands[0]};
+    callback.type_arguments.clear();
+    callback.results.front().value_type = value.type_arguments.front();
+    return verify_virtual_call(context, callback) |
+        NERI_IR_EFFECT_READ_V1 | NERI_IR_EFFECT_WRITE_V1 |
+        NERI_IR_EFFECT_MAY_PANIC_V1 | NERI_IR_EFFECT_MANAGED_ALLOCATE_V1 |
+        NERI_IR_EFFECT_SAFEPOINT_V1;
+  }
   case NERI_IR_OPCODE_TASK_GENERATE_V1: {
     verify_instruction_shape(value, 1U, 4U, 1U, true, false, false);
     if (std::ranges::find(context.module.required_features, ir_feature::ScopedTasks) == context.module.required_features.end())
@@ -736,13 +827,12 @@ void require_binary(const function_context &context, const instruction &value,
     verify_instruction_shape(value, 1U, 0U, 0U, false, true, false);
     verify_constant(*value.constant_value, value.results.front().value_type);
     if (value.constant_value->tag == NERI_IR_CONSTANT_STRING_GLOBAL_V1) {
-      const auto match = std::ranges::find_if(
-          context.module.globals, [&value](const auto &global) {
-            return same_symbol(global.id, *value.constant_value->symbol) &&
-                   is_string(global.value_type) &&
-                   global.initializer.tag == NERI_IR_CONSTANT_STRING_UTF8_V1;
-          });
-      if (match == context.module.globals.end()) {
+      const auto global = context.index.globals.find(
+          symbol_key(*value.constant_value->symbol));
+      if (global == context.index.globals.end() ||
+          !is_string(global->second->value_type) ||
+          global->second->initializer.tag !=
+              NERI_IR_CONSTANT_STRING_UTF8_V1) {
         fail(reader_error_kind::invalid_reference,
              "string.global references a missing or non-string global.");
       }
@@ -795,9 +885,11 @@ void require_binary(const function_context &context, const instruction &value,
     }
     const auto equality = *value.predicate == NERI_IR_COMPARISON_EQUAL_V1 ||
                           *value.predicate == NERI_IR_COMPARISON_NOT_EQUAL_V1;
-    if ((!is_scalar(left) && left.tag != NERI_IR_TYPE_OPTIONAL_V1) ||
+    if ((!is_scalar(left) && left.tag != NERI_IR_TYPE_OPTIONAL_V1 &&
+         !is_managed_reference(left)) ||
         ((left.tag == NERI_IR_TYPE_BOOL_V1 ||
-          left.tag == NERI_IR_TYPE_OPTIONAL_V1) &&
+          left.tag == NERI_IR_TYPE_OPTIONAL_V1 ||
+          is_managed_reference(left)) &&
          !equality)) {
       fail(reader_error_kind::invalid_type, "Comparison predicate is invalid for its operand type.");
     }
@@ -834,7 +926,7 @@ void require_binary(const function_context &context, const instruction &value,
     const auto &target = value.results.front().value_type;
     if (!is_class(source) || !is_class(target) ||
         same_symbol(*source.symbol, *target.symbol) ||
-        !is_same_or_base(context.module, *source.symbol, *target.symbol)) {
+        !is_same_or_base(context.index, *source.symbol, *target.symbol)) {
       fail(reader_error_kind::invalid_type,
            "class.upcast requires a strict declared base-class conversion.");
     }
@@ -917,6 +1009,30 @@ void require_binary(const function_context &context, const instruction &value,
   case NERI_IR_OPCODE_C_FUNCTION_ADDRESS_V1:
   case NERI_IR_OPCODE_CALL_C_INDIRECT_V1:
     return verify_c_function_instruction(context, value);
+  case NERI_IR_OPCODE_WORKER_ENTRY_V1: {
+    verify_instruction_shape(value, 1U, 0U, 0U, true, false, false);
+    if (std::ranges::find(context.module.required_features, ir_feature::IsolatedWorkers) ==
+        context.module.required_features.end())
+      fail(reader_error_kind::unsupported_feature, "Worker entries require isolated-workers-v1.");
+    const auto *target = find_function(context.index, *value.symbol);
+    if (value.symbol->kind != NERI_IR_SYMBOL_FUNCTION_V1 || target == nullptr ||
+        target->kind != NERI_IR_FUNCTION_V1 || target->unsafe_call ||
+        target->declaring_class.has_value() || target->dispatch_slot.has_value() ||
+        !target->export_name.empty())
+      fail(reader_error_kind::invalid_reference, "Worker entry requires a safe managed module function.");
+    const type byte{NERI_IR_TYPE_BYTE_V1, std::nullopt, {}};
+    const type bytes{NERI_IR_TYPE_ARRAY_V1, std::nullopt, {byte}};
+    if (target->parameter_types.size() != 1U ||
+        !same_type(target->parameter_types.front(), bytes) || !is_void(target->result_type))
+      fail(reader_error_kind::invalid_type, "Worker entry requires exactly Byte[] to Void.");
+    const type signature{NERI_IR_TYPE_C_FUNCTION_V1, std::nullopt,
+        {{NERI_IR_TYPE_VOID_V1, std::nullopt, {}},
+         {NERI_IR_TYPE_POINTER_V1, std::nullopt, {byte}},
+         {NERI_IR_TYPE_UINT64_V1, std::nullopt, {}}}};
+    require_result_type(value, 0U, signature);
+    // Producing the private adapter address does not execute its entry.
+    return 0U;
+  }
   case NERI_IR_OPCODE_CALL_UNSAFE_V1:
     return verify_call(context, value, false, false, false, true);
   case NERI_IR_OPCODE_ARRAY_NEW_V1: {
@@ -970,7 +1086,7 @@ void require_binary(const function_context &context, const instruction &value,
     verify_instruction_shape(value, 1U, 0U, 0U, true, false, false);
     if (!value.symbol.has_value() ||
         value.symbol->kind != NERI_IR_SYMBOL_CLASS_V1 ||
-        find_class(context.module, *value.symbol) == nullptr) {
+        find_class(context.index, *value.symbol) == nullptr) {
       fail(reader_error_kind::invalid_reference,
            "object.alloc references a missing or wrong-kind class.");
     }
@@ -987,14 +1103,14 @@ void require_binary(const function_context &context, const instruction &value,
     if (!value.symbol.has_value()) {
       fail(reader_error_kind::invalid_reference, "Field access has no field symbol.");
     }
-    const auto match = find_field(context.module, *value.symbol);
+    const auto match = find_field(context.index, *value.symbol);
     if (!match.has_value()) {
       fail(reader_error_kind::invalid_reference,
            "Field access references a missing or wrong-kind field.");
     }
     const auto &receiver = definition_type(context, value.operands.front());
     if (!is_class(receiver) ||
-        !is_same_or_base(context.module, *receiver.symbol, match->owner->id)) {
+        !is_same_or_base(context.index, *receiver.symbol, match->owner->id)) {
       fail(reader_error_kind::invalid_type,
            "Field access receiver is incompatible with its declaring class.");
     }
@@ -1200,7 +1316,7 @@ void register_definitions(function_context &context) {
   for (const auto &block : context.value.blocks) {
     for (const auto &parameter : block.parameters) {
       require_value_type(parameter.value_type, "Block parameter");
-      verify_location(parameter.location, context.module);
+      verify_location(parameter.location, context.index);
       if (!context.definitions
                .emplace(parameter.id,
                         definition{&parameter.value_type, block.id, -1})
@@ -1210,7 +1326,7 @@ void register_definitions(function_context &context) {
     }
     for (std::size_t index = 0; index < block.instructions.size(); ++index) {
       const auto &instruction = block.instructions[index];
-      verify_location(instruction.location, context.module);
+      verify_location(instruction.location, context.index);
       for (const auto &result : instruction.results) {
         require_value_type(result.value_type, "Instruction result");
         if (!context.definitions
@@ -1313,7 +1429,7 @@ void verify_blocks_and_uses(function_context &context) {
 
     const auto instruction_index =
         static_cast<std::int64_t>(block.instructions.size());
-    verify_location(block.ending.location, context.module);
+    verify_location(block.ending.location, context.index);
     switch (block.ending.tag) {
     case NERI_IR_TERMINATOR_BRANCH_V1:
       if (block.ending.edges.size() != 1U ||
@@ -1468,8 +1584,10 @@ void verify_dominance(const function_context &context) {
   }
 }
 
-void verify_function(const ir_module &module, const function &value) {
-  verify_location(value.location, module);
+void verify_function(const module_verification_index &index,
+                     const function &value) {
+  const auto &module = index.module;
+  verify_location(value.location, index);
   if (!value.export_name.empty()) {
     if (std::ranges::find(module.required_features, ir_feature::CInterop) == module.required_features.end())
       fail(reader_error_kind::unsupported_feature, "C exports require c-interop-v1.");
@@ -1504,7 +1622,7 @@ void verify_function(const ir_module &module, const function &value) {
          "Function has inconsistent method and declaring-class metadata.");
   }
   if (value.declaring_class.has_value()) {
-    if (find_class(module, *value.declaring_class) == nullptr) {
+    if (find_class(index, *value.declaring_class) == nullptr) {
       fail(reader_error_kind::invalid_reference, "Method references a missing declaring class.");
     }
     if (value.kind == NERI_IR_INSTANCE_METHOD_V1 ||
@@ -1525,11 +1643,11 @@ void verify_function(const ir_module &module, const function &value) {
          "Only virtual instance methods may declare a dispatch slot.");
   }
   for (const auto &parameter : value.parameter_types) {
-    require_declared_type(module, parameter, "Function parameter");
+    require_declared_type(index, parameter, "Function parameter");
   }
   require_result_type(value.result_type, "Function result");
   if (!is_void(value.result_type)) {
-    require_declared_type(module, value.result_type, "Function result");
+    require_declared_type(index, value.result_type, "Function result");
   }
 
   if (value.retained) {
@@ -1541,12 +1659,12 @@ void verify_function(const ir_module &module, const function &value) {
     return;
   }
 
-  function_context context{module, value};
+  function_context context{index, value};
   verify_blocks_and_uses(context);
   std::map<std::uint32_t, const debug_scope *> debug_scopes;
   std::uint32_t previous_scope_id = 0U;
   for (const auto &scope : value.debug_scopes) {
-    verify_location(scope.location, module);
+    verify_location(scope.location, index);
     if (scope.id == 0U || scope.id <= previous_scope_id ||
         !debug_scopes.emplace(scope.id, &scope).second ||
         (scope.parent_id != 0U &&
@@ -1583,7 +1701,7 @@ void verify_function(const ir_module &module, const function &value) {
                            std::string_view, std::uint32_t, std::uint32_t>>
       previous_debug;
   for (const auto &local : value.debug_locals) {
-    verify_location(local.location, module);
+    verify_location(local.location, index);
     const auto definition = context.definitions.find(local.value);
     if (local.name.empty() || definition == context.definitions.end() ||
         (local.scope_id != 0U && !debug_scopes.contains(local.scope_id)) ||
@@ -1728,7 +1846,10 @@ void verify_supported_module(const ir_module &value) {
         found->parameter_types.size() > 1U ||
         (found->parameter_types.empty() ? session.source_type.tag != NERI_IR_TYPE_VOID_V1
                                         : !same_type(found->parameter_types.front(), session.source_type)) ||
-        !same_type(found->result_type, session.target_type) ||
+        !(same_type(found->result_type, session.target_type) ||
+          (found->result_type.tag == NERI_IR_TYPE_OPTIONAL_V1 &&
+           found->result_type.arguments.size() == 1U &&
+           same_type(found->result_type.arguments.front(), session.target_type))) ||
         session.target_type.tag != NERI_IR_TYPE_CLASS_V1 ||
         (!found->parameter_types.empty() && session.source_type.tag != NERI_IR_TYPE_CLASS_V1)) {
       fail(reader_error_kind::invalid_reference, "Session export does not match the generated entry signature.");
@@ -1818,13 +1939,15 @@ void verify_supported_module(const ir_module &value) {
     return symbol_key(item.id);
   });
 
+  const module_verification_index index(value);
+
   std::set<decltype(symbol_key(symbol_id{}))> declarations;
   const auto valid_access = [](neri_ir_access_v1 access) {
     return access >= NERI_IR_ACCESS_PUBLIC_V1 &&
            access <= NERI_IR_ACCESS_INTERNAL_V1;
   };
   for (const auto &declaration : value.classes) {
-    verify_location(declaration.location, value);
+    verify_location(declaration.location, index);
     if (declaration.id.module != value.id ||
         declaration.id.kind != NERI_IR_SYMBOL_CLASS_V1 ||
         !valid_access(declaration.access) ||
@@ -1833,13 +1956,13 @@ void verify_supported_module(const ir_module &value) {
     }
     if (declaration.base.has_value() &&
         (declaration.base->kind != NERI_IR_SYMBOL_CLASS_V1 ||
-         find_class(value, *declaration.base) == nullptr)) {
+         find_class(index, *declaration.base) == nullptr)) {
       fail(reader_error_kind::invalid_reference, "Class references a missing base class.");
     }
 
     std::set<decltype(symbol_key(symbol_id{}))> fields;
     for (const auto &item : declaration.fields) {
-      verify_location(item.location, value);
+      verify_location(item.location, index);
       if (item.id.module != value.id ||
           item.id.kind != NERI_IR_SYMBOL_FIELD_V1 ||
           !valid_access(item.access) ||
@@ -1847,16 +1970,16 @@ void verify_supported_module(const ir_module &value) {
           !declarations.insert(symbol_key(item.id)).second) {
         fail(reader_error_kind::invalid_reference, "Class field has invalid or duplicate metadata.");
       }
-      require_declared_type(value, item.value_type, "Class field");
+      require_declared_type(index, item.value_type, "Class field");
     }
 
     std::set<decltype(symbol_key(symbol_id{}))> methods;
     for (const auto &item : declaration.methods) {
-      verify_location(item.location, value);
+      verify_location(item.location, index);
       if (!methods.insert(symbol_key(item.function_id)).second) {
         fail(reader_error_kind::malformed_module, "Class has a duplicate method entry.");
       }
-      const auto *target = find_function(value, item.function_id);
+      const auto *target = find_function(index, item.function_id);
       if (target == nullptr || !target->declaring_class.has_value() ||
           !same_symbol(*target->declaring_class, declaration.id)) {
         fail(reader_error_kind::invalid_reference,
@@ -1887,20 +2010,20 @@ void verify_supported_module(const ir_module &value) {
       if (remaining-- == 0U) {
         fail(reader_error_kind::malformed_module, "Class inheritance contains a cycle.");
       }
-      current = find_class(value, *current->base);
+      current = find_class(index, *current->base);
       if (current == nullptr) {
         fail(reader_error_kind::invalid_reference, "Class inheritance references a missing class.");
       }
     }
   }
   for (const auto &global : value.globals) {
-    verify_location(global.location, value);
+    verify_location(global.location, index);
     if (global.id.module != value.id ||
         global.id.kind != NERI_IR_SYMBOL_GLOBAL_V1 ||
         !declarations.insert(symbol_key(global.id)).second) {
       fail(reader_error_kind::invalid_reference, "Global has an invalid or duplicate symbol.");
     }
-    require_declared_type(value, global.value_type, "Global");
+    require_declared_type(index, global.value_type, "Global");
     verify_constant(global.initializer, global.value_type);
     if (global.initializer.tag == NERI_IR_CONSTANT_STRING_UTF8_V1 &&
         !has_string_data) {
@@ -1915,7 +2038,7 @@ void verify_supported_module(const ir_module &value) {
   }
   std::map<std::string, const import_declaration *> links;
   for (const auto &import : value.imports) {
-    verify_location(import.location, value);
+    verify_location(import.location, index);
     if (import.id.module != value.id ||
         (import.id.kind != NERI_IR_SYMBOL_LIBRARY_FUNCTION_V1 &&
          import.id.kind != NERI_IR_SYMBOL_INTRINSIC_V1 &&
@@ -1924,11 +2047,11 @@ void verify_supported_module(const ir_module &value) {
       fail(reader_error_kind::invalid_reference, "Import has an invalid or duplicate symbol.");
     }
     for (const auto &parameter : import.parameter_types) {
-      require_declared_type(value, parameter, "Import parameter");
+      require_declared_type(index, parameter, "Import parameter");
     }
     require_result_type(import.result_type, "Import result");
     if (!is_void(import.result_type)) {
-      require_declared_type(value, import.result_type, "Import result");
+      require_declared_type(index, import.result_type, "Import result");
     }
     if (!printable_ascii_symbol(import.link_name)) {
       fail(reader_error_kind::malformed_module, "Import link name is not printable ASCII.");
@@ -1993,7 +2116,7 @@ void verify_supported_module(const ir_module &value) {
       fail(reader_error_kind::invalid_reference, "C export link name conflicts with another export or import.");
   }
   for (const auto &function : value.functions) {
-    verify_function(value, function);
+    verify_function(index, function);
   }
 }
 

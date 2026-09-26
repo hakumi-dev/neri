@@ -30,6 +30,42 @@ def partitionUnit(first: IrCompilationUnit?, owner: String): IrCompilationUnit?
   return null
 end
 
+def partitionUnitByKey(first: IrCompilationUnit?, key: String): IrCompilationUnit?
+  var unit = first
+
+  while unit != null
+    if unit.key == key
+      return unit
+    end
+    unit = unit.next
+  end
+  return null
+end
+
+def partitionOwnedFunctionUnit(first: IrCompilationUnit?, name: String): IrCompilationUnit?
+  var unit = first
+
+  while unit != null
+    if partitionFunctionState(unit, name) == "owned"
+      return unit
+    end
+    unit = unit.next
+  end
+  return null
+end
+
+def partitionClassUnit(first: IrCompilationUnit?, name: String): IrCompilationUnit?
+  var unit = first
+
+  while unit != null
+    if partitionClassSource(unit, name) != ""
+      return unit
+    end
+    unit = unit.next
+  end
+  return null
+end
+
 def partitionFunctionState(unit: IrCompilationUnit?, name: String): String
   if unit == null
     return "missing"
@@ -116,6 +152,35 @@ def partitionClassSource(unit: IrCompilationUnit?, name: String): String
   return ""
 end
 
+def partitionClassState(unit: IrCompilationUnit?, name: String): String
+  if unit == null
+    return "missing"
+  end
+  var classValue = unit.module.firstClass
+
+  while classValue != null
+    if classValue.symbol.name == name
+      return classValue.retained ? "retained" : "owned"
+    end
+    classValue = classValue.nextClass
+  end
+  return "missing"
+end
+
+def partitionFunctionCount(unit: IrCompilationUnit?, name: String): Int
+  if unit == null
+    return 0
+  end
+  var count = 0
+  var function = unit.module.firstFunction
+
+  while function != null
+    count = count + 1 if function.symbol.name == name
+    function = function.nextFunction
+  end
+  return count
+end
+
 def partitionSourceCount(unit: IrCompilationUnit?): Int
   if unit == null
     return -1
@@ -164,6 +229,129 @@ def partitionSample(consumerLiteral: String, consumerTasks: Bool = true): IrComp
   return irPartitionModule(module, semantic, ids, owners, "consumer-owner")
 end
 
+def partitionShardedSample(changedSource: String): IrCompilationUnit?
+  let module = new IrModule("partition-shards", "")
+  let ids = new StringBuffer()
+  let owners = new StringBuffer()
+
+  module.clearSources()
+  module.addSource(new IrSource("entry", "entry source", 0))
+  module.addFunction(partitionFunction(module, "main", "entry", ""))
+  ids.add("entry")
+  owners.add("consumer-owner")
+  var index = 0
+
+  while index < 24
+    let sourceId = "source-" + (index as String)
+    let sourceText = sourceId == changedSource ? "changed source" : "stable source"
+
+    module.addSource(new IrSource(sourceId, sourceText, 0))
+    module.addFunction(partitionFunction(module, "work" + (index as String), sourceId, ""))
+    ids.add(sourceId)
+    owners.add("library-owner")
+    index = index + 1
+  end
+  let classValue = new IrClass(irSymbol(module.id, module.domains.symbolKind.getClass(), "ShardedClass"), null, module.domains.access.getInternal(), partitionLocation("source-3"))
+
+  classValue.declarationSourceId = "source-3"
+  module.addClass(classValue)
+  let method = partitionFunction(module, "ShardedClass.method", "source-4", "")
+
+  method.declaringClass = irSymbol(module.id, module.domains.symbolKind.getClass(), "ShardedClass")
+  module.addFunction(method)
+  let semantic = new SemanticModel()
+
+  semantic.addClass(new SemanticClass("ShardedClass", "ShardedClass", "", semantic.accesses.getInternal(), 0))
+  return irPartitionModule(module, semantic, ids, owners, "consumer-owner")
+end
+
+def partitionShardContracts(): Void
+  let first = partitionShardedSample("")
+  let second = partitionShardedSample("source-3")
+  let entry = partitionUnit(first, "consumer-owner")
+  let classUnit = partitionClassUnit(first, "ShardedClass")
+  let methodUnit = partitionOwnedFunctionUnit(first, "ShardedClass.method")
+  var libraryUnits = 0
+  var changedUnits = 0
+  var unchangedUnits = 0
+  var unit = first
+
+  while unit != null
+    if unit.owner == "library-owner"
+      libraryUnits = libraryUnits + 1
+      let matching = partitionUnitByKey(second, unit.key)
+
+      if matching != null
+        if irSerializeEnvelopeHex(unit.module) == irSerializeEnvelopeHex(matching.module)
+          unchangedUnits = unchangedUnits + 1
+        else
+          changedUnits = changedUnits + 1
+        end
+      end
+    end
+    unit = unit.next
+  end
+
+  test::assertTrue(entry != null && entry.entry)
+  test::assertEqual(partitionFunctionState(entry, "main"), "owned")
+  test::assertTrue(libraryUnits > 1 && libraryUnits <= irPartitionBucketCount())
+  test::assertEqual(changedUnits, 1)
+  test::assertEqual(unchangedUnits, libraryUnits - 1)
+  test::assertTrue(classUnit != null && methodUnit != null && classUnit.key == methodUnit.key)
+end
+
+def partitionRetainedDependencyContracts(): Void
+  let module = new IrModule("partition-retained", "")
+  let kinds = module.domains.symbolKind
+  let providerClass = new IrClass(irSymbol(module.id, kinds.getClass(), "Provider"), null, module.domains.access.getPublic(), irNoLocation())
+  let providerMethodSymbol = irSymbol(module.id, kinds.getMethod(), "Provider.value")
+
+  providerClass.retained = true
+  providerClass.addMethod(new IrMethod(providerMethodSymbol, module.domains.dispatchKind.getVirtual(), providerMethodSymbol, irNoLocation()))
+  module.addClass(providerClass)
+  let providerMethod = new IrFunction(providerMethodSymbol, "int", module.domains.functionKind.getInstanceMethod(), false, irNoLocation())
+
+  providerMethod.retained = true
+  providerMethod.linkReferences = new StringBuffer()
+  providerMethod.declaringClass = providerClass.symbol
+  providerMethod.parameterTypes.add("class|Provider")
+  module.addFunction(providerMethod)
+  let providerWork = new IrFunction(irSymbol(module.id, kinds.getFunction(), "providerWork"), "class|Provider", module.domains.functionKind.getFunction(), false, irNoLocation())
+
+  providerWork.retained = true
+  providerWork.linkReferences = new StringBuffer()
+  module.addFunction(providerWork)
+  module.clearSources()
+  module.addSource(new IrSource("entry", "entry source", 0))
+  module.addSource(new IrSource("source-3", "worker source", 12))
+  let main = partitionFunction(module, "main", "entry", "")
+
+  main.callees.add("consumerWork")
+  module.addFunction(main)
+  let consumerWork = partitionFunction(module, "consumerWork", "source-3", "")
+
+  consumerWork.callees.add("providerWork")
+  module.addFunction(consumerWork)
+  let ids = new StringBuffer()
+  let owners = new StringBuffer()
+
+  ids.add("entry")
+  owners.add("consumer-owner")
+  ids.add("source-3")
+  owners.add("consumer-owner")
+  let units = irPartitionModule(module, new SemanticModel(), ids, owners, "consumer-owner")
+  let entry = partitionUnit(units, "consumer-owner")
+  let worker = partitionOwnedFunctionUnit(units, "consumerWork")
+
+  test::assertTrue(entry != null && worker != null && entry.key != worker.key)
+  test::assertEqual(partitionFunctionState(entry, "main"), "owned")
+  test::assertEqual(partitionFunctionState(worker, "consumerWork"), "owned")
+  test::assertEqual(partitionFunctionState(worker, "providerWork"), "retained")
+  test::assertEqual(partitionFunctionState(worker, "Provider.value"), "retained")
+  test::assertEqual(partitionClassState(worker, "Provider"), "retained")
+  test::assertEqual(partitionFunctionCount(worker, "providerWork"), 1)
+end
+
 def parserSourceBoundaryCase(user: String): Void
   let library = "sealed class LibraryType\nend\n"
   let boundary = utf16Length(user)
@@ -205,6 +393,8 @@ end
 
 def partitionContracts(): Void
   parserSourceBoundaryContracts()
+  partitionShardContracts()
+  partitionRetainedDependencyContracts()
   let first = partitionSample("literal.consumer.one")
   let library = partitionUnit(first, "library-owner")
   let consumer = partitionUnit(first, "consumer-owner")

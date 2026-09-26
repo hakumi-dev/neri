@@ -1,5 +1,6 @@
 #include "neri/runtime_abi.h"
 #include "../runtime/terminal.h"
+#include "../runtime/worker_pool.h"
 #include <windows.h>
 #include <limits.h>
 #include <stdlib.h>
@@ -10,7 +11,10 @@ static DWORD saved_input, saved_output;
 static int active, registered;
 static volatile LONG interrupted;
 static int64_t generation;
-int neri_terminal_active(void) { return active; }
+int neri_terminal_active(void) {
+  if (neri_worker_thread_active()) return 0;
+  return active;
+}
 static unsigned char pending[16];
 static size_t pending_count;
 static BOOL WINAPI interrupt_session(DWORD event) {
@@ -19,6 +23,7 @@ static BOOL WINAPI interrupt_session(DWORD event) {
   return TRUE;
 }
 void neri_terminal_restore(void) {
+  if (neri_worker_thread_active()) return;
   if (!active) return;
   const char reset[] = "\033[0m\033[?25h\033[?1049l";
   DWORD written;
@@ -30,6 +35,7 @@ void neri_terminal_restore(void) {
   active = 0;
 }
 int64_t neri_rt_v1_terminal_open(void) {
+  if (neri_worker_thread_active()) return 0;
   if (active || neri_interrupt_active() || generation == INT64_MAX) return 0;
   input = GetStdHandle(STD_INPUT_HANDLE);
   output = GetStdHandle(STD_OUTPUT_HANDLE);
@@ -56,9 +62,11 @@ int64_t neri_rt_v1_terminal_open(void) {
   return generation;
 }
 void neri_rt_v1_terminal_close(int64_t token) {
+  if (neri_worker_thread_active()) return;
   if (active && token == generation) neri_terminal_restore();
 }
 int64_t neri_rt_v1_terminal_read(int64_t token, int64_t timeout) {
+  if (neri_worker_thread_active()) return -2;
   if (!active || token != generation || interrupted || timeout < 0 || timeout > 60000) return -2;
   if (pending_count) {
     const int64_t result = pending[0];
@@ -103,6 +111,7 @@ int64_t neri_rt_v1_terminal_read(int64_t token, int64_t timeout) {
   return -1;
 }
 int64_t neri_rt_v1_terminal_size(int64_t token, int64_t rows) {
+  if (neri_worker_thread_active()) return 0;
   CONSOLE_SCREEN_BUFFER_INFO info;
   if (!active || token != generation || !GetConsoleScreenBufferInfo(output, &info)) return 0;
   return rows ? info.srWindow.Bottom - info.srWindow.Top + 1 : info.srWindow.Right - info.srWindow.Left + 1;

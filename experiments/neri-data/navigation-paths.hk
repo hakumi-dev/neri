@@ -1,0 +1,206 @@
+use reference
+namespace neri_data
+
+class NavigationUndo
+  public action: fn(): Void
+  public next: NavigationUndo?
+
+  internal def init(action: fn(): Void, next: NavigationUndo?): Void
+    this.action = action
+    this.next = next
+  end
+end
+
+## Reverses navigation publication across every completed path stage.
+class NavigationJournal
+  private first: NavigationUndo?
+
+  internal def init(): Void
+  end
+
+  internal def record(undo: fn(): Void): Void
+    this.first = new NavigationUndo(undo, this.first)
+  end
+
+  internal def rollback(): Void
+    var current = this.first
+
+    while current != null
+      this.first = current.next
+      current.action()
+      current = this.first
+    end
+  end
+
+  internal def discard(): Void
+    this.first = null
+  end
+end
+
+## One checked relationship traversal, retaining its source query identity.
+class NavigationStep<A, B>
+  private execute: fn(TypedRows<A>, NavigationJournal): QueryResult<B>
+  private check: fn(): QueryFailure?
+  private sourceProvider: Provider?
+  private sourceOwner: ChangeContext?
+  private inputTracker: EntityTracker<A>?
+  private outputTracker: EntityTracker<B>?
+
+  internal def init(execute: fn(TypedRows<A>, NavigationJournal): QueryResult<B>, check: fn(): QueryFailure?, provider: Provider?, owner: ChangeContext?, inputTracker: EntityTracker<A>?, outputTracker: EntityTracker<B>?): Void
+    this.execute = execute
+    this.check = check
+    this.sourceProvider = provider
+    this.sourceOwner = owner
+    this.inputTracker = inputTracker
+    this.outputTracker = outputTracker
+  end
+
+  internal def run(rows: TypedRows<A>, journal: NavigationJournal): QueryResult<B>
+    return this.execute(rows, journal)
+  end
+
+  internal def validate(): QueryFailure?
+    return this.check()
+  end
+
+  internal def provider(): Provider?
+    return this.sourceProvider
+  end
+
+  internal def owner(): ChangeContext?
+    return this.sourceOwner
+  end
+
+  internal def sourceTracker(): EntityTracker<A>?
+    return this.inputTracker
+  end
+
+  internal def targetTracker(): EntityTracker<B>?
+    return this.outputTracker
+  end
+end
+
+def navigationDistinct<T>(rows: TypedRows<T>, value: T): Void
+  var current = rows.first()
+
+  while current != null
+    if reference::same(current.value, value)
+      return
+    end
+    current = current.next
+  end
+  rows.add(value)
+end
+
+def navigationJournalled<P, D>(relation: CollectionNavigation<P, D>, journal: NavigationJournal): CollectionNavigation<P, D>
+  let principalKey: fn(P): Cell = fn(entity: P): Cell
+    return relation.principalKey(entity)
+  end
+  let dependentKey: fn(D): Cell = fn(entity: D): Cell
+    return relation.dependentKey(entity)
+  end
+  let foreignKey: fn(D): Cell = fn(entity: D): Cell
+    return relation.foreignKey(entity)
+  end
+  let getCollection: fn(P): D[] = fn(entity: P): D[]
+    return relation.collection(entity)
+  end
+  let setCollection: fn(P, D[]): Void = fn(entity: P, children: D[]): Void
+    let previous = relation.collection(entity)
+    let undo: fn(): Void = fn(): Void
+      relation.setCollection(entity, previous)
+    end
+
+    journal.record(undo)
+    relation.setCollection(entity, children)
+  end
+  let getReference: fn(D): P? = fn(entity: D): P?
+    return relation.reference(entity)
+  end
+  let setReference: fn(D, P?): Void = fn(entity: D, principal: P?): Void
+    let previous = relation.reference(entity)
+    let undo: fn(): Void = fn(): Void
+      relation.setReference(entity, previous)
+    end
+
+    journal.record(undo)
+    relation.setReference(entity, principal)
+  end
+
+  return new CollectionNavigation<P, D>(principalKey, dependentKey, foreignKey, relation.column(), getCollection, setCollection, getReference, setReference)
+end
+
+def collectionStep<P, D>(principals: Query<P>, dependents: Query<D>, relation: CollectionNavigation<P, D>, maximum: Int = 10000, children: Query<D>? = null): NavigationStep<P, D>
+  let check: fn(): QueryFailure? = fn(): QueryFailure?
+    if maximum < 1 || maximum > 10000
+      return QueryFailure.Provider("navigation child limit must be between 1 and 10000")
+    end
+    var selected = include(principals, dependents, relation)
+
+    if children != null
+      selected = selected.children(children)
+    end
+    return selected.maxChildren(maximum).validateQueries()
+  end
+  let execute: fn(TypedRows<P>, NavigationJournal): QueryResult<D> = fn(rows: TypedRows<P>, journal: NavigationJournal): QueryResult<D>
+    if rows.count() > 10000
+      return QueryResult<D>.Failure(QueryFailure.Provider("navigation path stage exceeds 10000 rows"))
+    end
+    let wrapped = navigationJournalled(relation, journal)
+    var selected = include(principals, dependents, wrapped)
+
+    if children != null
+      selected = selected.children(children)
+    end
+
+    match selected.maxChildren(maximum).load(rows)
+      case QueryResult.Failure(error)
+        return QueryResult<D>.Failure(error)
+      case QueryResult.Rows(loaded)
+        let next = new TypedRows<D>()
+        var current = loaded.first()
+
+        while current != null
+          for child in relation.collection(current.value)
+            navigationDistinct(next, child)
+          end
+          current = current.next
+        end
+        return QueryResult<D>.Rows(next)
+    end
+  end
+
+  return new NavigationStep<P, D>(execute, check, principals.provider(), principals.changeOwner(), principals.rowTracker(), dependents.rowTracker())
+end
+
+def referenceStep<P, D>(dependents: Query<D>, principals: Query<P>, relation: CollectionNavigation<P, D>): NavigationStep<D, P>
+  let check: fn(): QueryFailure? = fn(): QueryFailure?
+    return includeReference(dependents, principals, relation).validateQueries()
+  end
+  let execute: fn(TypedRows<D>, NavigationJournal): QueryResult<P> = fn(rows: TypedRows<D>, journal: NavigationJournal): QueryResult<P>
+    if rows.count() > 10000
+      return QueryResult<P>.Failure(QueryFailure.Provider("navigation path stage exceeds 10000 rows"))
+    end
+    let wrapped = navigationJournalled(relation, journal)
+
+    match includeReference(dependents, principals, wrapped).load(rows)
+      case QueryResult.Failure(error)
+        return QueryResult<P>.Failure(error)
+      case QueryResult.Rows(loaded)
+        let next = new TypedRows<P>()
+        var current = loaded.first()
+
+        while current != null
+          let principal = relation.reference(current.value)
+
+          if principal != null
+            navigationDistinct(next, principal)
+          end
+          current = current.next
+        end
+        return QueryResult<P>.Rows(next)
+    end
+  end
+
+  return new NavigationStep<D, P>(execute, check, dependents.provider(), dependents.changeOwner(), dependents.rowTracker(), principals.rowTracker())
+end

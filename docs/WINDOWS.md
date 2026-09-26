@@ -21,15 +21,15 @@ the .NET gzip API before the native backend materializes the host compiler.
 
 ## Build, test and install
 
-From the repository root, run:
-
-```powershell
-pwsh -File scripts/build.ps1 install
-```
+| Command or option | Contract |
+| --- | --- |
+| `pwsh -File scripts/build.ps1 install` | Build, validate and activate a toolchain from the repository root. |
+| `-Prefix <directory>` | Select the installation root. |
+| `-NoPath` | Preserve the current per-user `PATH`. |
 
 The command configures and builds the native components, bootstraps three
 compiler generations, and checks byte-identical Neri IR, COFF and PE output.
-It then runs the Windows contract suite: 74 CLI cases, UTF-8 paths, and LSP
+Validation includes Windows CLI cases, UTF-8 paths, and LSP
 framing and diagnostics. The native CTest suite runs as part of the build.
 
 The default installation is `%USERPROFILE%\.neri`. The launcher is installed at
@@ -72,11 +72,8 @@ self-hosted compiler bootstrap; use `scripts/build.ps1` for that workflow.
 The Windows runtime uses Win32 sockets, console handling, UTF-8/UTF-16 path
 conversion, and the MSVC-compatible ABI. POSIX-only suite helpers such as the
 worker and PTY helpers have no direct Windows port with identical behavior.
-Windows-specific tests and helper coverage are still being expanded.
-
-The local Windows validation recorded three identical compiler generations and
-7/7 CTest cases in both Debug and Release, plus the 74-case CLI, UTF-8 path,
-and LSP checks above. The HTTP example contracts were also verified locally.
+Windows validation covers compiler fixed points, Debug/Release native contracts,
+CLI behavior, UTF-8 paths, LSP framing and HTTP examples.
 The repository workflow retains the macOS and Linux
 jobs and adds Windows Debug/Release jobs plus a `Required / supported platforms`
 gate. Branch protection for `main` requires that gate, so all supported-platform

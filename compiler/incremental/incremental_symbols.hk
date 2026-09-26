@@ -1,0 +1,275 @@
+use crypto
+use files
+use host
+
+# dSYM bundles are cache sidecars. Keep their inventory separate from the
+# executable receipt so a missing or damaged symbol file invalidates the hit.
+class IncrementalSymbolsWalk
+  public root: files::Root
+  public source: String
+  public destination: String
+  public copyFiles: Bool
+  public paths: String[] = []
+  public digests: String[] = []
+  public count: Int = 0
+  public totalBytes: Int = 0
+  public valid: Bool = true
+
+  def init(root: files::Root, source: String, destination: String, copyFiles: Bool): Void
+    this.root = root
+    this.source = source
+    this.destination = destination
+    this.copyFiles = copyFiles
+  end
+end
+
+def incrementalSymbolsPathBefore(left: String, right: String): Bool
+  let leftLength = host::stringByteLength(left)
+  let rightLength = host::stringByteLength(right)
+  var index = 0
+
+  while index < leftLength && index < rightLength
+    let leftByte = host::stringByteAt(left, index) as Int
+    let rightByte = host::stringByteAt(right, index) as Int
+
+    if leftByte != rightByte
+      return leftByte < rightByte
+    end
+    index = index + 1
+  end
+  return leftLength < rightLength
+end
+
+def incrementalSymbolsSafeName(name: String): Bool
+  let length = host::stringByteLength(name)
+
+  if length == 0 || length > 255 || name == "." || name == ".."
+    return false
+  end
+  var index = 0
+
+  while index < length
+    let byte = host::stringByteAt(name, index) as Int
+
+    if byte < 32 || byte == 127 || byte == 47 || byte == 92 || byte == 58
+      return false
+    end
+    index = index + 1
+  end
+  return true
+end
+
+def incrementalSymbolsWalkDirectory(state: IncrementalSymbolsWalk, relative: String, depth: Int): Void
+  if !state.valid
+    return
+  end
+  if depth > 16
+    state.valid = false
+    return
+  end
+  let listing = state.root.list(relative, 4096)
+
+  if listing.failure != null || listing.closeFailure != null || listing.entries.Length > 4096
+    state.valid = false
+    return
+  end
+  var index = 0
+
+  while index < listing.entries.Length && state.valid
+    let entry = listing.entries[index]
+
+    index = index + 1
+    if !incrementalSymbolsSafeName(entry.name)
+      state.valid = false
+      return
+    end
+    let path = relative == "" ? entry.name : relative + "/" + entry.name
+
+    if entry.kind.isDirectory()
+      if state.copyFiles
+        let created = files::createDirectory(state.destination + "/" + path, true)
+
+        if created.failure != null
+          state.valid = false
+          return
+        end
+      end
+      incrementalSymbolsWalkDirectory(state, path, depth + 1)
+    else if entry.kind.isFile()
+      state.count = state.count + 1
+      if state.count > 4096
+        state.valid = false
+        return
+      end
+      let read = state.root.readBytes(path, 134217728)
+      let bytes = read.bytes
+
+      if read.failure != null || read.closeFailure != null || bytes == null || state.totalBytes + bytes.Length > 536870912
+        state.valid = false
+        return
+      end
+      state.totalBytes = state.totalBytes + bytes.Length
+      let digestBytes = crypto::sha256(bytes).bytes()
+      let digest = digestBytes == null ? null : crypto::encodeHex(digestBytes)
+
+      if digest == null
+        state.valid = false
+        return
+      end
+      state.paths = host::appendString(state.paths, path)
+      state.digests = host::appendString(state.digests, digest)
+      if state.copyFiles && !host::writeBytes(state.destination + "/" + path, bytes)
+        state.valid = false
+        return
+      end
+    else
+      # Symlinks, sockets, and other special files are not portable cache data.
+      state.valid = false
+      return
+    end
+  end
+end
+
+def incrementalSymbolsScan(source: String, destination: String, copyFiles: Bool): String?
+  let status = files::status(source).status
+
+  if status == null || !status.exists || status.symlink || !status.kind.isDirectory()
+    return null
+  end
+  let absolute = host::pathAbsolute(source)
+
+  if absolute == null
+    return null
+  end
+  let opened = files::Root.open(absolute)
+  let root = opened.root
+
+  if root == null
+    return null
+  end
+  if copyFiles && files::createDirectory(destination, true).failure != null
+    root.close()
+    return null
+  end
+  let state = new IncrementalSymbolsWalk(root, absolute, destination, copyFiles)
+
+  incrementalSymbolsWalkDirectory(state, "", 0)
+  let closeFailure = root.close()
+
+  if closeFailure != null || !state.valid || state.count == 0
+    return null
+  end
+  var index = 1
+
+  while index < state.paths.Length
+    let path = state.paths[index]
+    let digest = state.digests[index]
+    var insertAt = index
+
+    while insertAt > 0 && incrementalSymbolsPathBefore(path, state.paths[insertAt - 1])
+      state.paths[insertAt] = state.paths[insertAt - 1]
+      state.digests[insertAt] = state.digests[insertAt - 1]
+      insertAt = insertAt - 1
+    end
+    state.paths[insertAt] = path
+    state.digests[insertAt] = digest
+    index = index + 1
+  end
+  var manifest = "neri-dsym-v1\n"
+
+  index = 0
+
+  while index < state.paths.Length
+    let path = state.paths[index]
+
+    manifest = manifest + (host::stringByteLength(path) as String) + ":" + path + ":" + state.digests[index] + "\n"
+    index = index + 1
+  end
+  if host::stringByteLength(manifest) > 1048576
+    return null
+  end
+  return manifest
+end
+
+def incrementalSymbolsReceipt(cacheDirectory: String): String?
+  let status = files::status(cacheDirectory + "/symbols.receipt").status
+
+  if status == null || !status.exists || status.symlink || !status.kind.isFile()
+    return null
+  end
+  let read = files::readBytes(cacheDirectory + "/symbols.receipt", 1048576)
+  let bytes = read.bytes
+
+  if read.failure != null || read.closeFailure != null || bytes == null
+    return null
+  end
+  let text = host::stringFromBytes(bytes)
+
+  if text == null
+    return null
+  end
+  if host::stringByteLength(text) < 13 || host::stringSlice(text, 0, 13) != "neri-dsym-v1\n"
+    return null
+  end
+  return text
+end
+
+def incrementalSymbolsValid(cacheDirectory: String): Bool
+  let status = files::status(cacheDirectory + "/program.dSYM").status
+
+  if status == null || !status.exists || status.symlink || !status.kind.isDirectory()
+    return false
+  end
+  let receipt = incrementalSymbolsReceipt(cacheDirectory)
+  let actual = receipt == null ? null : incrementalSymbolsScan(cacheDirectory + "/program.dSYM", "", false)
+
+  return actual != null && actual == receipt
+end
+
+def incrementalSymbolsEquivalent(cacheDirectory: String, output: String): Bool
+  # Cache callers validate the full sidecar with incrementalSymbolsValid before
+  # they use this cheaper comparison to preserve an already matching output.
+  let expected = incrementalSymbolsReceipt(cacheDirectory)
+  let actual = incrementalSymbolsScan(output + ".dSYM", "", false)
+
+  return expected != null && actual != null && expected == actual
+end
+
+def incrementalSymbolsPublish(output: String, staging: String): Bool
+  let symbols = output + ".dSYM"
+  let status = files::status(symbols).status
+
+  if status == null || !status.exists || !status.kind.isDirectory() || status.symlink
+    return false
+  end
+  let manifest = incrementalSymbolsScan(symbols, staging + "/program.dSYM", true)
+
+  return manifest != null && host::writeText(staging + "/symbols.receipt", manifest)
+end
+
+def incrementalSymbolsRestore(cacheDirectory: String, output: String): Bool
+  if !incrementalSymbolsValid(cacheDirectory)
+    return false
+  end
+  if incrementalSymbolsEquivalent(cacheDirectory, output)
+    return true
+  end
+  let destination = output + ".dSYM"
+  let statusResult = files::status(destination)
+  let status = statusResult.status
+
+  if statusResult.failure != null || status == null
+    return false
+  end
+  if status.exists
+    if status.symlink || !status.kind.isDirectory() || files::removeTree(destination).failure != null
+      return false
+    end
+  end
+  let manifest = incrementalSymbolsScan(cacheDirectory + "/program.dSYM", destination, true)
+
+  if manifest == null
+    return false
+  end
+  return incrementalSymbolsEquivalent(cacheDirectory, output)
+end

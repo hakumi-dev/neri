@@ -1,0 +1,334 @@
+use clock
+namespace neri_data
+
+## Immutable summary emitted after one provider operation completes.
+class ProviderDiagnostic
+  private storedOperation: String
+  private storedSql: String
+  private storedParameterCount: Int
+  private storedStatementCount: Int
+  private storedDurationMilliseconds: Int
+  private storedAffectedCount: Int
+  private storedReturnedCount: Int
+  private storedFailureKind: String
+  private storedFailureMessage: String
+
+  def init(operation: String, sql: String = "", parameterCount: Int = 0, statementCount: Int = 0, durationMilliseconds: Int = -1, affectedCount: Int = 0, returnedCount: Int = 0, failureKind: String = "", failureMessage: String = ""): Void
+    this.storedOperation = operation
+    this.storedSql = sql
+    this.storedParameterCount = parameterCount
+    this.storedStatementCount = statementCount
+    this.storedDurationMilliseconds = durationMilliseconds
+    this.storedAffectedCount = affectedCount
+    this.storedReturnedCount = returnedCount
+    this.storedFailureKind = failureKind
+    this.storedFailureMessage = failureMessage
+  end
+
+  public readonly def operation(): String
+    return this.storedOperation
+  end
+  public readonly def sql(): String
+    return this.storedSql
+  end
+  public readonly def parameterCount(): Int
+    return this.storedParameterCount
+  end
+  public readonly def statementCount(): Int
+    return this.storedStatementCount
+  end
+  public readonly def durationMilliseconds(): Int
+    return this.storedDurationMilliseconds
+  end
+  public readonly def affectedCount(): Int
+    return this.storedAffectedCount
+  end
+  public readonly def returnedCount(): Int
+    return this.storedReturnedCount
+  end
+  public readonly def failureKind(): String
+    return this.storedFailureKind
+  end
+  public readonly def failureMessage(): String
+    return this.storedFailureMessage
+  end
+end
+
+def diagnosticFailureKind(error: WriteFailure): String
+  match error
+    case WriteFailure.Validation(message)
+      return "validation"
+    case WriteFailure.Concurrency(message)
+      return "concurrency"
+    case WriteFailure.Constraint(message)
+      return "constraint"
+    case WriteFailure.Provider(message)
+      return "provider"
+    case WriteFailure.Unsupported(message)
+      return "unsupported"
+    case WriteFailure.Transaction(message)
+      return "transaction"
+  end
+end
+
+def diagnosticQueryFailureKind(error: QueryFailure): String
+  match error
+    case QueryFailure.InvalidIdentifier(name)
+      return "validation"
+    case QueryFailure.InvalidLimit(value, maximum)
+      return "validation"
+    case QueryFailure.MissingLimit(maximum)
+      return "validation"
+    case QueryFailure.SourceMismatch(expected, actual)
+      return "validation"
+    case QueryFailure.UnsupportedCapability(name)
+      return "unsupported"
+    case QueryFailure.Provider(message)
+      return "provider"
+    case QueryFailure.MissingColumn(name)
+      return "decode"
+    case QueryFailure.TypeMismatch(column, expected, actual)
+      return "decode"
+    case QueryFailure.Cardinality(expected, actual)
+      return "decode"
+  end
+end
+
+## Decorates a provider with immutable, post-operation diagnostics. Observers
+## must not call this provider; reentrant calls fail before reaching it.
+class DiagnosedProvider: Provider
+  private underlying: Provider
+  private observer: fn(readonly ProviderDiagnostic): Void
+  private notifying: Bool = false
+  private streaming: Bool = false
+
+  public def init(provider: Provider, observe: fn(readonly ProviderDiagnostic): Void): Void
+    this.underlying = provider
+    this.observer = observe
+  end
+
+  public override readonly def dialect(): SqlDialect
+    return this.underlying.dialect()
+  end
+
+  public override readonly def supports(capability: ProviderCapability): Bool
+    return this.underlying.supports(capability)
+  end
+
+  private def elapsed(start: Int?): Int
+    let finish = clock::milliseconds()
+
+    if start == null || finish == null
+      return -1
+    end
+    if finish < start
+      return -1
+    end
+    return finish - start
+  end
+
+  private def emit(event: ProviderDiagnostic): Void
+    this.notifying = true
+    this.observer(event)
+    this.notifying = false
+  end
+
+  private readonly def batchParameterCount(batch: readonly WriteBatch): Int
+    var count = 0
+    var node = batch.first()
+
+    while node != null
+      count = count + node.command().parameters().count()
+      node = node.next()
+    end
+    return count
+  end
+
+  private readonly def batchSql(batch: readonly WriteBatch): String
+    var sql = ""
+    var first = true
+    var node = batch.first()
+
+    while node != null
+      sql = sql + "\n" if !first
+      sql = sql + node.command().sql()
+      first = false
+      node = node.next()
+    end
+    return sql
+  end
+
+  public override def execute(plan: readonly SqlPlan): ProviderResult
+    if this.notifying || this.streaming
+      return ProviderResult.Failure("diagnostic observer cannot reenter its provider")
+    end
+    let start = clock::milliseconds()
+    let result = this.underlying.execute(plan)
+
+    match result
+      case ProviderResult.Rows(rows)
+        this.emit(new ProviderDiagnostic("execute", plan.sql(), plan.parameters().count(), 1, this.elapsed(start), 0, rows.Length))
+      case ProviderResult.Failure(message)
+        this.emit(new ProviderDiagnostic("execute", plan.sql(), plan.parameters().count(), 1, this.elapsed(start), 0, 0, "provider"))
+    end
+    return result
+  end
+
+  public override def stream(plan: readonly StreamPlan, visit: fn(RawRow): Bool): StreamResult
+    if this.notifying || this.streaming
+      return StreamResult.Failure(QueryFailure.Provider("diagnostic observer or stream callback cannot reenter its provider"), 0)
+    end
+    let start = clock::milliseconds()
+
+    this.streaming = true
+    let result = this.underlying.stream(plan, visit)
+
+    this.streaming = false
+    match result
+      case StreamResult.Completed(count)
+        this.emit(new ProviderDiagnostic("stream", plan.sql(), plan.parameters().count(), 1, this.elapsed(start), returnedCount: count))
+      case StreamResult.Stopped(count)
+        this.emit(new ProviderDiagnostic("stream", plan.sql(), plan.parameters().count(), 1, this.elapsed(start), returnedCount: count, failureKind: "stopped"))
+      case StreamResult.Cancelled(count)
+        this.emit(new ProviderDiagnostic("stream", plan.sql(), plan.parameters().count(), 1, this.elapsed(start), returnedCount: count, failureKind: "cancelled"))
+      case StreamResult.Failure(error, count)
+        this.emit(new ProviderDiagnostic("stream", plan.sql(), plan.parameters().count(), 1, this.elapsed(start), returnedCount: count, failureKind: diagnosticQueryFailureKind(error)))
+    end
+    return result
+  end
+
+  private def diagnoseWrite(operation: String, sql: String, parameterCount: Int, statementCount: Int, start: Int?, result: WriteResult): WriteResult
+    match result
+      case WriteResult.Saved(count)
+        this.emit(new ProviderDiagnostic(operation, sql, parameterCount, statementCount, this.elapsed(start), count))
+      case WriteResult.SavedWithValues(count, outputs)
+        var returned = 0
+        var index = 0
+
+        while index < outputs.count()
+          if outputs.at(index) != null
+            returned = returned + 1
+          end
+          index = index + 1
+        end
+        this.emit(new ProviderDiagnostic(operation, sql, parameterCount, statementCount, this.elapsed(start), count, returned))
+      case WriteResult.Failure(error)
+        this.emit(new ProviderDiagnostic(operation, sql, parameterCount, statementCount, this.elapsed(start), 0, 0, diagnosticFailureKind(error)))
+    end
+    return result
+  end
+
+  public override def writeBatch(batch: readonly WriteBatch): WriteResult
+    if this.notifying || this.streaming
+      return WriteResult.Failure(WriteFailure.Transaction("diagnostic observer cannot reenter its provider"))
+    end
+    let sql = this.batchSql(batch)
+    let parameters = this.batchParameterCount(batch)
+    let start = clock::milliseconds()
+    let result = this.underlying.writeBatch(batch)
+
+    return this.diagnoseWrite("writeBatch", sql, parameters, batch.count(), start, result)
+  end
+
+  public override def beginTransaction(): TransactionOpenResult
+    if this.notifying || this.streaming
+      return TransactionOpenResult.Failure(WriteFailure.Transaction("diagnostic observer cannot reenter its provider"))
+    end
+    let start = clock::milliseconds()
+    let result = this.underlying.beginTransaction()
+
+    match result
+      case TransactionOpenResult.Begun(lease)
+        this.emit(new ProviderDiagnostic("beginTransaction", durationMilliseconds: this.elapsed(start)))
+      case TransactionOpenResult.Failure(error)
+        this.emit(new ProviderDiagnostic("beginTransaction", durationMilliseconds: this.elapsed(start), failureKind: diagnosticFailureKind(error)))
+    end
+    return result
+  end
+
+  public override def commitTransaction(lease: Int): WriteResult
+    if this.notifying || this.streaming
+      return WriteResult.Failure(WriteFailure.Transaction("diagnostic observer cannot reenter its provider"))
+    end
+    let start = clock::milliseconds()
+
+    return this.diagnoseWrite("commitTransaction", "", 0, 0, start, this.underlying.commitTransaction(lease))
+  end
+
+  public override def rollbackTransaction(lease: Int): WriteResult
+    if this.notifying || this.streaming
+      return WriteResult.Failure(WriteFailure.Transaction("diagnostic observer cannot reenter its provider"))
+    end
+    let start = clock::milliseconds()
+
+    return this.diagnoseWrite("rollbackTransaction", "", 0, 0, start, this.underlying.rollbackTransaction(lease))
+  end
+
+  public override def transactionState(lease: Int): TransactionState
+    return this.underlying.transactionState(lease)
+  end
+
+  public override def createSavepoint(lease: Int): SavepointOpenResult
+    if this.notifying || this.streaming
+      return SavepointOpenResult.Failure(WriteFailure.Transaction("diagnostic observer cannot reenter its provider"))
+    end
+    let start = clock::milliseconds()
+    let result = this.underlying.createSavepoint(lease)
+
+    match result
+      case SavepointOpenResult.Created(id)
+        this.emit(new ProviderDiagnostic("createSavepoint", durationMilliseconds: this.elapsed(start)))
+      case SavepointOpenResult.Failure(error)
+        this.emit(new ProviderDiagnostic("createSavepoint", durationMilliseconds: this.elapsed(start), failureKind: diagnosticFailureKind(error)))
+    end
+    return result
+  end
+
+  public override def rollbackToSavepoint(lease: Int, id: Int): WriteResult
+    if this.notifying || this.streaming
+      return WriteResult.Failure(WriteFailure.Transaction("diagnostic observer cannot reenter its provider"))
+    end
+    let start = clock::milliseconds()
+
+    return this.diagnoseWrite("rollbackToSavepoint", "", 0, 0, start, this.underlying.rollbackToSavepoint(lease, id))
+  end
+
+  public override def releaseSavepoint(lease: Int, id: Int): WriteResult
+    if this.notifying || this.streaming
+      return WriteResult.Failure(WriteFailure.Transaction("diagnostic observer cannot reenter its provider"))
+    end
+    let start = clock::milliseconds()
+
+    return this.diagnoseWrite("releaseSavepoint", "", 0, 0, start, this.underlying.releaseSavepoint(lease, id))
+  end
+
+  public override def writeBatchInTransaction(batch: readonly WriteBatch, lease: Int): WriteResult
+    if this.notifying || this.streaming
+      return WriteResult.Failure(WriteFailure.Transaction("diagnostic observer cannot reenter its provider"))
+    end
+    let sql = this.batchSql(batch)
+    let parameters = this.batchParameterCount(batch)
+    let start = clock::milliseconds()
+    let result = this.underlying.writeBatchInTransaction(batch, lease)
+
+    return this.diagnoseWrite("writeBatchInTransaction", sql, parameters, batch.count(), start, result)
+  end
+
+  public override def executeSet(plan: readonly SetWritePlan): WriteResult
+    if this.notifying || this.streaming
+      return WriteResult.Failure(WriteFailure.Transaction("diagnostic observer cannot reenter its provider"))
+    end
+    let start = clock::milliseconds()
+
+    return this.diagnoseWrite("executeSet", plan.sql(), plan.parameters().count(), 1, start, this.underlying.executeSet(plan))
+  end
+
+  public override def executeSetInTransaction(plan: readonly SetWritePlan, lease: Int): WriteResult
+    if this.notifying || this.streaming
+      return WriteResult.Failure(WriteFailure.Transaction("diagnostic observer cannot reenter its provider"))
+    end
+    let start = clock::milliseconds()
+
+    return this.diagnoseWrite("executeSetInTransaction", plan.sql(), plan.parameters().count(), 1, start, this.underlying.executeSetInTransaction(plan, lease))
+  end
+end

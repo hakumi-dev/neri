@@ -95,7 +95,10 @@ typedef struct neri_session_module_metadata_v1 {
   const neri_session_layout_v1 *layouts;
   uint64_t layout_count;
   uint64_t display_offset;
+  uint64_t flags;
 } neri_session_module_metadata_v1;
+
+#define NERI_SESSION_MODULE_NULLABLE_ENTRY_V1 UINT64_C(1)
 
 typedef const neri_session_module_metadata_v1 *(*neri_session_module_accessor_v1)(void);
 
@@ -118,10 +121,15 @@ NERI_RT_API neri_int_v1 neri_rt_v1_session_load_execute_retained(
 NERI_RT_API neri_int_v1 neri_rt_v1_session_load_execute_object(
     neri_int_v1 handle, neri_ref_v1 object_path,
     neri_ref_v1 artifact_identity, neri_ref_v1 linker_path);
+NERI_RT_API neri_int_v1 neri_rt_v1_session_load_execute_object_libraries(
+    neri_int_v1 handle, neri_ref_v1 object_path,
+    neri_ref_v1 artifact_identity, neri_ref_v1 linker_path,
+    neri_ref_v1 native_libraries);
 NERI_RT_API neri_int_v1 neri_rt_v1_session_reset(neri_int_v1 handle);
 NERI_RT_API neri_int_v1 neri_rt_v1_session_destroy(neri_int_v1 handle);
 NERI_RT_API neri_ref_v1 neri_rt_v1_session_error(neri_int_v1 handle);
 NERI_RT_API neri_ref_v1 neri_rt_v1_session_result(neri_int_v1 handle);
+NERI_RT_API void neri_rt_v1_session_fail(neri_ref_v1 message);
 
 typedef struct neri_optional_bool_v1 {
   neri_bool_v1 has_value;
@@ -296,6 +304,101 @@ NERI_RT_API neri_ref_v1 neri_rt_v1_task_generate(neri_int_v1 count,
     neri_int_v1 parallelism, const neri_type_descriptor_v1 *array_type,
     neri_ref_v1 callback, neri_task_generate_fn_v1 adapter);
 
+/* Isolated persistent workers. The native entry is trusted, noncapturing code:
+ * config is copied before open returns and is valid until entry returns. Each
+ * entry runs in a fresh runtime heap, calls ready after startup, then receives,
+ * reads and replies to one job at a time. No managed reference crosses threads.
+ * Entries must return normally, unwinding all roots/resources; native exceptions
+ * and longjmp across the entry boundary are outside this contract.
+ * Bounds: workers 1..64, outstanding 1..65536, input/output <=128 MiB,
+ * reserved <=1 GiB, config <=1 MiB. Admission reserves input + maximum output
+ * until take, including unread completions. Zero byte limits are supported.
+ * Pool handles belong to the creating thread AND active runtime heap.
+ * Joined task heaps cannot open or operate pools.
+ * Open waits for every ready; startup failure rolls back and joins all workers.
+ * Its optional report is zeroed on entry and preserves startup failure details.
+ * Stop cancels queued jobs and requests cooperative active cancellation. An
+ * entry may unwind and return after cancellation without replying; its active
+ * job completes cancelled. An uncancelled active return fails the job. Close
+ * stops and joins, discarding unread results; noncooperative entries can delay
+ * either open rollback or close indefinitely. Heap shutdown closes owned pools.
+ * Failure diagnostics are limited to 4096 bytes per worker, separately bounded.
+ * Close reports worker failures, including cleanup failures after a reply.
+ * Raw close invalidates the handle; resource wrappers provide idempotence. */
+#define NERI_WORKER_OK_V1 0
+#define NERI_WORKER_EMPTY_V1 1
+#define NERI_WORKER_STOPPED_V1 2
+#define NERI_WORKER_FULL_V1 3
+#define NERI_WORKER_INVALID_V1 4
+#define NERI_WORKER_LIMIT_V1 5
+#define NERI_WORKER_STARTUP_FAILED_V1 6
+#define NERI_WORKER_NO_MEMORY_V1 7
+#define NERI_WORKER_UNAVAILABLE_V1 8
+#define NERI_WORKER_SUCCESS_V1 0
+#define NERI_WORKER_FAILED_V1 1
+#define NERI_WORKER_CANCELLED_V1 2
+
+typedef void (*neri_worker_entry_v1)(const uint8_t *config, uint64_t length);
+typedef struct neri_worker_options_v1 {
+  uint32_t struct_size;
+  uint32_t worker_count;
+  uint64_t max_outstanding;
+  uint64_t max_input_bytes;
+  uint64_t max_output_bytes;
+  uint64_t max_reserved_bytes;
+} neri_worker_options_v1;
+typedef struct neri_worker_completion_v1 {
+  uint64_t job_id;
+  uint64_t payload_length;
+  uint32_t kind;
+  uint32_t reserved;
+} neri_worker_completion_v1;
+typedef struct neri_worker_close_report_v1 {
+  uint32_t failures;
+  uint32_t error_length;
+  uint8_t first_error[4096]; /* counted bytes, not NUL terminated */
+} neri_worker_close_report_v1;
+NERI_RT_API int32_t neri_rt_v1_worker_pool_open(const neri_worker_options_v1 *,
+    neri_worker_entry_v1, const uint8_t *, uint64_t, int64_t *,
+    neri_worker_close_report_v1 *);
+NERI_RT_API int32_t neri_rt_v1_worker_pool_submit(int64_t, const uint8_t *, uint64_t, uint64_t *);
+/* Poll peeks the oldest completion; zero timeout never blocks. Take copies and
+ * consumes a completed ticket only if capacity suffices; failed/cancelled jobs
+ * have empty payloads. Cancel is cooperative once a job has been received. */
+NERI_RT_API int32_t neri_rt_v1_worker_pool_poll(int64_t, uint32_t, neri_worker_completion_v1 *);
+NERI_RT_API int32_t neri_rt_v1_worker_pool_take(int64_t, uint64_t, uint8_t *, uint64_t);
+/* ABI 1.33: borrowed poll-only descriptor, valid until pool close. Signals
+ * completed results or a stopped pool with no outstanding jobs; readiness is
+ * advisory and may be stale. Stopping alone does not signal unfinished work.
+ * Call worker_pool_poll after a wakeup, allowing EMPTY. Poll and take reconcile
+ * an empty running pool without waiting for the notification channel.
+ * Never read/write/close the descriptor or alter its flags.
+ * The creator thread and heap restrictions apply; errors write -1 when the
+ * output pointer is non-null. POSIX uses a pipe, Windows a loopback socket. */
+NERI_RT_API int32_t neri_rt_v1_worker_pool_readiness(int64_t, int64_t *);
+NERI_RT_API int32_t neri_rt_v1_worker_pool_cancel(int64_t, uint64_t);
+NERI_RT_API int32_t neri_rt_v1_worker_pool_stop(int64_t);
+NERI_RT_API int32_t neri_rt_v1_worker_pool_close(int64_t, neri_worker_close_report_v1 *);
+NERI_RT_API int32_t neri_rt_v1_worker_ready(void);
+/* Receive blocks, claims a job and exposes its length. Read copies its bytes
+ * without consuming it. Reply copies output and completes the active job;
+ * an oversized reply leaves it active. Reply after cancellation is cancelled.
+ * Receive before ready or before the previous reply is invalid. */
+NERI_RT_API int32_t neri_rt_v1_worker_receive(uint64_t *);
+NERI_RT_API int32_t neri_rt_v1_worker_read(uint8_t *, uint64_t);
+NERI_RT_API int32_t neri_rt_v1_worker_reply(const uint8_t *, uint64_t);
+NERI_RT_API int32_t neri_rt_v1_worker_cancelled(void);
+/* Terminal failure, truncating diagnostic to 4096 bytes. Entry must unwind and
+ * return; further receive/reply calls are invalid. If no available workers
+ * remain, admission stops and queued jobs fail immediately, before cleanup. */
+NERI_RT_API int32_t neri_rt_v1_worker_fail(const uint8_t *, uint64_t);
+
+/* Sequential generation invokes an ordinary callback on the caller thread.
+ * The callback and partially populated result remain rooted throughout. */
+NERI_RT_API neri_ref_v1 neri_rt_v1_array_generate(neri_int_v1 count,
+    const neri_type_descriptor_v1 *array_type, neri_ref_v1 callback,
+    neri_task_generate_fn_v1 adapter);
+
 /* Immutable UTF-8 strings. Literal objects use the exported immortal type. */
 NERI_RT_API extern const neri_type_descriptor_v1
     neri_rt_v1_string_literal_type;
@@ -458,6 +561,20 @@ NERI_RT_API neri_int_v1 neri_rt_v1_net_connect_timeout(neri_int_v1 fd, neri_int_
 NERI_RT_API neri_int_v1 neri_rt_v1_net_local_port(neri_int_v1 fd);
 NERI_RT_API neri_int_v1 neri_rt_v1_net_accept(neri_int_v1 fd);
 NERI_RT_API neri_int_v1 neri_rt_v1_net_poll(neri_int_v1 fd, neri_int_v1 writing, neri_int_v1 milliseconds);
+/* Poll one descriptor set in a single OS wait. Arrays have count elements and
+ * events must not overlap either input array. Count is 0..4096; timeout is
+ * -1 (infinite) or 0..60000 ms. A zero count accepts NULL arrays and waits only
+ * for the timeout or interruption. Interests: 1 read, 2 write (0 observes only
+ * exceptional conditions). Events: 1 read, 2 write, 4 error, 8 hangup, 16 invalid.
+ * Returns the number of nonzero event entries, 0 on timeout/interruption, or -1
+ * on validation/OS/allocation failure. For a valid count and events pointer,
+ * outputs are cleared even on failure. POSIX accepts pipes as well as sockets;
+ * Windows accepts sockets and may fail if every socket is invalid. Events do
+ * not transfer descriptor ownership. Failure preserves the OS error through
+ * cleanup; success/interruption preserves the caller's previous error value. */
+NERI_RT_API neri_int_v1 neri_rt_v1_net_poll_many(const neri_int_v1 *descriptors,
+    const neri_int_v1 *interests, neri_int_v1 *events, neri_int_v1 count,
+    neri_int_v1 timeout_ms);
 NERI_RT_API neri_int_v1 neri_rt_v1_net_read(neri_int_v1 fd, uint8_t *bytes, neri_int_v1 length);
 NERI_RT_API neri_int_v1 neri_rt_v1_net_write(neri_int_v1 fd, uint8_t *bytes, neri_int_v1 length);
 NERI_RT_API void neri_rt_v1_net_close(neri_int_v1 fd);

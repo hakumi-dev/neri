@@ -1,13 +1,19 @@
 class IrVerifier
   public module: IrModule
   public result: IrVerification = new IrVerification()
-  public symbols: StringBuffer = new StringBuffer()
+  private symbols: StringTable<Bool> = new StringTable<Bool>()
+  private sources: StringTable<IrSource> = new StringTable<IrSource>()
+  private blocks: StringTable<IrBlock> = new StringTable<IrBlock>()
 
   def init(module: IrModule): Void
     this.module = module
   end
 
   def verify(): IrVerification
+    this.result = new IrVerification()
+    this.symbols = new StringTable<Bool>()
+    this.sources = new StringTable<IrSource>()
+    this.blocks = new StringTable<IrBlock>()
     if this.module.id == ""
       this.result.fail("module id is empty")
     end
@@ -71,26 +77,73 @@ class IrVerifier
       this.verifyFunction(function)
       function = function.nextFunction
     end
+    this.verifySessionExport()
     return this.result
+  end
+
+  def verifySessionExport(): Void
+    let entry = this.module.sessionEntry
+
+    if entry == null
+      return
+    end
+    var function = this.module.firstFunction
+
+    while function != null && (function.symbol.name != entry.name || function.symbol.moduleName != entry.moduleName || !function.symbol.kind.same(entry.kind))
+      function = function.nextFunction
+    end
+    if function == null || !entry.kind.isFunction() || entry.name != "__neri_session_entry"
+      this.result.fail("session export entry is missing")
+      return
+    end
+    let returned = function.resultType
+    let target = this.module.sessionTargetType
+    let source = this.module.sessionSourceType
+    let invalidResult = (returned != target && returned != "optional|" + target) || irTypeKind(target) != "class"
+    var invalidSource = function.parameterTypes.size > 1 || (function.parameterTypes.size == 0 && source != "void")
+
+    if function.parameterTypes.size == 1
+      invalidSource = irTypeKind(function.parameterTypes.get(0)) != "class" || function.parameterTypes.get(0) != source
+    end
+    if invalidResult || invalidSource
+      this.result.fail("session entry must return a managed frame or optional managed frame")
+    end
   end
 
   def verifySources(): Void
     if this.module.sourceCount == 0
       this.result.fail("module has no sources")
     end
+    let counts = new StringTable<Int>()
     var source = this.module.firstSource
+
+    while source != null
+      this.sources.add(source.id, source)
+      let entry = counts.find(source.id)
+
+      if entry == null
+        counts.add(source.id, 1)
+      else
+        entry.value = entry.value + 1
+      end
+      source = source.nextSource
+    end
+    source = this.module.firstSource
 
     while source != null
       if source.id == ""
         this.result.fail("source id is empty")
       end
-      var other = source.nextSource
+      let entry = counts.find(source.id)
 
-      while other != null
-        if source.id == other.id
+      if entry != null
+        entry.value = entry.value - 1
+        var remaining = entry.value
+
+        while remaining > 0
           this.result.fail("duplicate source '" + source.id + "'")
+          remaining = remaining - 1
         end
-        other = other.nextSource
       end
       source = source.nextSource
     end
@@ -103,17 +156,12 @@ class IrVerifier
     if symbol.name == ""
       this.result.fail("symbol name is empty")
     end
-    let key = symbol.moduleName + "|" + symbol.kind.displayName() + "|" + symbol.name
-    var index = 0
+    let kind = symbol.kind.displayName()
+    let key = (host::stringByteLength(symbol.moduleName) as String) + ":" + symbol.moduleName + (host::stringByteLength(kind) as String) + ":" + kind + (host::stringByteLength(symbol.name) as String) + ":" + symbol.name
 
-    while index < this.symbols.size
-      if this.symbols.get(index) == key
-        this.result.fail("duplicate symbol '" + symbol.name + "'")
-        return
-      end
-      index = index + 1
+    if !this.symbols.add(key, true)
+      this.result.fail("duplicate symbol '" + symbol.name + "'")
     end
-    this.symbols.add(key)
   end
 
   def verifyTypeBuffer(types: StringBuffer): Void
@@ -140,13 +188,10 @@ class IrVerifier
   end
 
   def sourceFor(id: String): IrSource?
-    var source = this.module.firstSource
+    let entry = this.sources.find(id)
 
-    while source != null
-      if source.id == id
-        return source
-      end
-      source = source.nextSource
+    if entry != null
+      return entry.value
     end
     return null
   end
@@ -192,20 +237,17 @@ class IrVerifier
     end
   end
 
-  def findBlock(function: IrFunction, id: Int): IrBlock?
-    var block = function.firstBlock
+  def findBlock(id: Int): IrBlock?
+    let entry = this.blocks.find(id as String)
 
-    while block != null
-      if block.id == id
-        return block
-      end
-      block = block.nextBlock
+    if entry != null
+      return entry.value
     end
     return null
   end
 
   def verifyEdge(function: IrFunction, targetId: Int, arguments: Int[], defined: IntBuffer): Void
-    let target = this.findBlock(function, targetId)
+    let target = this.findBlock(targetId)
 
     if target == null
       this.result.fail("branch targets unknown block in '" + function.symbol.name + "'")
@@ -319,7 +361,24 @@ class IrVerifier
     if function.blockCount == 0
       this.result.fail("function '" + function.symbol.name + "' has no blocks")
     end
-    let entry = this.findBlock(function, function.entryBlock)
+    this.blocks = new StringTable<IrBlock>()
+    let blockCounts = new StringTable<Int>()
+    var indexedBlock = function.firstBlock
+
+    while indexedBlock != null
+      let key = indexedBlock.id as String
+
+      this.blocks.add(key, indexedBlock)
+      let entry = blockCounts.find(key)
+
+      if entry == null
+        blockCounts.add(key, 1)
+      else
+        entry.value = entry.value + 1
+      end
+      indexedBlock = indexedBlock.nextBlock
+    end
+    let entry = this.findBlock(function.entryBlock)
 
     if entry == null
       this.result.fail("function '" + function.symbol.name + "' has no entry block")
@@ -360,13 +419,16 @@ class IrVerifier
     var block = function.firstBlock
 
     while block != null
-      var other = block.nextBlock
+      let countEntry = blockCounts.find(block.id as String)
 
-      while other != null
-        if block.id == other.id
+      if countEntry != null
+        countEntry.value = countEntry.value - 1
+        var remaining = countEntry.value
+
+        while remaining > 0
           this.result.fail("duplicate block id in '" + function.symbol.name + "'")
+          remaining = remaining - 1
         end
-        other = other.nextBlock
       end
       var parameter = block.firstParameter
 

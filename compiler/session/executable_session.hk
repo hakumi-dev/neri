@@ -14,6 +14,8 @@ class ExecutableSession
   private lastCacheLookupMilliseconds: Int = 0
   private objectLinker: String?
   private completionRevision: Int = 0
+  private startupProgress: (fn(String, Int, Int): Void)?
+  private startupNativeProgress: (fn(String, Int, Int, String): Void)?
 
   def init(toolchain: SessionToolchain): Void
     this.toolchain = toolchain
@@ -40,6 +42,32 @@ class ExecutableSession
     return this.completionRevision
   end
 
+  private def reportStartup(phase: String, projectCount: Int = 0, libraryCount: Int = 0): Void
+    let progress = this.startupProgress
+
+    progress(phase, projectCount, libraryCount) if progress != null
+  end
+
+  private def reportNativeProgress(phase: String, completed: Int, total: Int, detail: String, sourceOffset: Int, snapshot: SessionSourceSnapshot?): Void
+    let progress = this.startupNativeProgress
+
+    if progress == null
+      return
+    end
+    var label = detail
+
+    if phase == "lower" && snapshot != null && sourceOffset < host::stringByteLength(snapshot.source())
+      let path = snapshot.sourceIdentityAtByte(sourceOffset)
+
+      if path != "<submission>"
+        let fileName = host::pathFileName(path)
+
+        label = (fileName == null ? path : fileName) + ": " + detail
+      end
+    end
+    progress(phase, completed, total, label)
+  end
+
   private def discoverObjectLinker(): String?
     if !this.toolchain.target.isMacOS()
       return null
@@ -64,6 +92,42 @@ class ExecutableSession
     return null
   end
 
+  private def nativeLibraries(module: IrModule): StringBuffer
+    let result = new StringBuffer()
+    var imported = module.firstImport
+
+    while imported != null
+      let name = imported.nativeLibrary
+
+      if name != ""
+        var found = false
+        var index = 0
+
+        while index < result.size
+          if result.get(index) == name
+            found = true
+          end
+          index = index + 1
+        end
+        result.add(name) if !found
+      end
+      imported = imported.nextImport
+    end
+    return result
+  end
+
+  private def nativeLibraryList(names: StringBuffer): String
+    var result = ""
+    var index = 0
+
+    while index < names.size
+      result = result + "\n" if index > 0
+      result = result + names.get(index)
+      index = index + 1
+    end
+    return result
+  end
+
   private def compile(moduleIR: IrModule, snapshot: SessionSourceSnapshot?): String?
     this.lastCacheHit = false
     this.lastCodegenMetrics = "null"
@@ -77,6 +141,9 @@ class ExecutableSession
     let configuredLinker = host::environment("NERI_LINKER")
     let objectLinker = this.objectLinker
     let objectBackend = objectLinker != null
+    let nativeLibraries = this.nativeLibraries(moduleIR)
+    var serializedPayload: IrWireBuffer? = null
+    var payloadDigest = ""
 
     if this.toolchain.cacheEnabled && (objectBackend || (configuredLinker != null && configuredLinker == this.toolchain.linker))
       var dependencies = [this.toolchain.compiler]
@@ -91,13 +158,21 @@ class ExecutableSession
       for retained in this.retainedModules
         dependencies = host::appendString(dependencies, retained)
       end
+      let payload = irSerializePayload(moduleIR)
+
+      serializedPayload = payload
+      payloadDigest = sha256FastWire(payload.bytes)
+      let identity = runCacheFrame(irTransportMajor() as String) + runCacheFrame(moduleIR.requiredFeatures.minimumTransportMinor() as String) + runCacheFrame(payloadDigest)
+
       cache.prepare(moduleIR, this.toolchain.target, this.toolchain.release, null,
-        objectBackend ? "neri-session-object-cache-v1" : "neri-session-code-cache-v1",
-        configuration, dependencies, sessionCodeDigest(irSerializeEnvelopeHex(moduleIR)))
+        objectBackend ? "neri-session-object-cache-v2" : "neri-session-code-cache-v2",
+        configuration, dependencies, sessionCodeDigest(identity), objectBackend)
     end
     this.lastCacheLookupMilliseconds = runCacheTime() - cacheStarted if configuredMetrics != null && configuredMetrics != ""
+    this.reportStartup("cache-check") if cache.directory != ""
     if cache.hit()
       this.lastCacheHit = true
+      this.reportStartup("cache-hit")
       return cache.executable
     end
     var directory: String? = null
@@ -125,7 +200,22 @@ class ExecutableSession
     artifact.extraSources.add(directory + "/receipt")
     artifact.next = this.artifacts
     this.artifacts = artifact
-    if !bootstrapInvokeCodegen(moduleIR, EmissionKind.object(), object, this.toolchain.target, this.toolchain.release, null, codegenMetrics)
+    this.reportStartup("codegen")
+    let nativeProgress = this.startupNativeProgress
+    var relay: (fn(String, Int, Int, String, Int): Void)? = null
+
+    if nativeProgress != null
+      relay = fn(phase, completed, total, detail, sourceOffset)
+        this.reportNativeProgress(phase, completed, total, detail, sourceOffset, snapshot)
+      end
+    end
+    var serialized = ""
+    let payload = serializedPayload
+
+    if payload != null
+      serialized = irSerializeEnvelopePayloadHex(moduleIR, payload, payloadDigest)
+    end
+    if !bootstrapInvokeCodegen(moduleIR, EmissionKind.object(), object, this.toolchain.target, this.toolchain.release, null, codegenMetrics, serialized, relay)
       this.rollbackArtifact(artifact)
       return null
     end
@@ -149,11 +239,31 @@ class ExecutableSession
     var linkStarted = 0
 
     linkStarted = runCacheTime() if configuredMetrics != null && configuredMetrics != ""
+    this.reportStartup("link")
     var linkArguments = [object, "-o", module]
     var installNameIndex = -1
 
     for retained in this.retainedModules
       linkArguments = host::appendString(linkArguments, retained)
+    end
+    if nativeLibraries.size > 0
+      var nativeDirectory = this.toolchain.target.isMacOS() ? "/opt/homebrew/lib" : ""
+      let configured = host::environment("NERI_LIBRARY_PATH")
+
+      nativeDirectory = configured if configured != null && configured != ""
+      if nativeDirectory != ""
+        if !platformAbsolutePath(nativeDirectory, this.toolchain.target)
+          this.rollbackArtifact(artifact)
+          return null
+        end
+        linkArguments = platformLibraryArguments(linkArguments, nativeDirectory, this.toolchain.target)
+      end
+      var index = 0
+
+      while index < nativeLibraries.size
+        linkArguments = host::appendString(linkArguments, "-l" + nativeLibraries.get(index))
+        index = index + 1
+      end
     end
     if this.toolchain.target.isMacOS()
       linkArguments = host::appendString(linkArguments, "-dynamiclib")
@@ -213,7 +323,7 @@ class ExecutableSession
     bootstrapRemoveRunDirectory(artifact.directory)
   end
 
-  private def executeModule(prepared: PreparedSubmission, modulePath: String, artifactIdentity: String): SessionExecutionResult
+  private def executeModule(prepared: PreparedSubmission, modulePath: String, artifactIdentity: String, nativeLibraries: String): SessionExecutionResult
     if this.disposed
       return new SessionExecutionResult(SessionExecutionStatus.invokeState(), "submission is not executable")
     end
@@ -228,12 +338,13 @@ class ExecutableSession
     var resultMilliseconds = 0
 
     loadStarted = runCacheTime() if configuredMetrics != null && configuredMetrics != ""
+    this.reportStartup("load")
 
     unsafe
       let objectLinker = this.objectLinker
 
       if objectLinker != null
-        status = sessionBridgeLoadExecuteObject(this.handle, modulePath, artifactIdentity, objectLinker)
+        status = sessionBridgeLoadExecuteObjectLibraries(this.handle, modulePath, artifactIdentity, objectLinker, nativeLibraries)
       else
         status = sessionBridgeLoadExecuteRetained(this.handle, modulePath, artifactIdentity)
       end
@@ -286,10 +397,16 @@ class ExecutableSession
     if executionSource == null
       return new SessionExecutionResult(SessionExecutionStatus.invokeState(), "submission is not executable")
     end
+    let snapshot = this.environment.claimedSnapshot(prepared)
+
+    if snapshot != null
+      this.reportStartup("compile", snapshot.count(), snapshot.libraryCount())
+    end
     let configuredMetrics = host::environment("NERI_SESSION_METRICS")
     var lowerStarted = 0
 
     lowerStarted = runCacheTime() if configuredMetrics != null && configuredMetrics != ""
+    this.reportStartup("lower")
     let moduleIR = this.environment.claimedModule(prepared)
 
     this.lastLowerMilliseconds = runCacheTime() - lowerStarted if configuredMetrics != null && configuredMetrics != ""
@@ -300,13 +417,13 @@ class ExecutableSession
       this.environment.releaseExecution(prepared)
       return new SessionExecutionResult(SessionExecutionStatus.compilationFailed(), "session module lowering failed: " + error)
     end
-    let module = this.compile(moduleIR, this.environment.claimedSnapshot(prepared))
+    let module = this.compile(moduleIR, snapshot)
 
     if module == null
       this.environment.releaseExecution(prepared)
       return new SessionExecutionResult(SessionExecutionStatus.compilationFailed(), "session module compilation failed")
     end
-    let result = this.executeModule(prepared, module, moduleIR.sessionArtifactIdentity)
+    let result = this.executeModule(prepared, module, moduleIR.sessionArtifactIdentity, this.nativeLibraryList(this.nativeLibraries(moduleIR)))
 
     result.cacheHit = this.lastCacheHit
     if !result.succeeded()
@@ -336,10 +453,11 @@ class ExecutableSession
     return result
   end
 
-  def initializeProject(projectPath: String, unit: String, functionName: String, bindingName: String = "service", imports: String = ""): SessionExecutionResult
+  def initializeProject(projectPath: String, unit: String, functionName: String, bindingName: String = "service", imports: String = "", progress: (fn(String, Int, Int): Void)? = null, nativeProgress: (fn(String, Int, Int, String): Void)? = null): SessionExecutionResult
     if this.disposed
       return new SessionExecutionResult(SessionExecutionStatus.invalidHandle(), "session is disposed")
     end
+    progress("project", 0, 0) if progress != null
     let project = neriLoadProject(projectPath, unit)
 
     if project.error() != ""
@@ -350,6 +468,7 @@ class ExecutableSession
     if snapshot.error != ""
       return new SessionExecutionResult(SessionExecutionStatus.invokeState(), snapshot.error)
     end
+    progress("analyze", snapshot.count(), snapshot.libraryCount()) if progress != null
     let prepared = this.environment.validateInitializer(snapshot, functionName, bindingName, imports)
 
     if !prepared.status.isComplete()
@@ -361,7 +480,13 @@ class ExecutableSession
       end
       return new SessionExecutionResult(SessionExecutionStatus.invokeState(), message)
     end
-    return this.initialize(prepared)
+    this.startupProgress = progress
+    this.startupNativeProgress = nativeProgress
+    let result = this.initialize(prepared)
+
+    this.startupProgress = null
+    this.startupNativeProgress = null
+    return result
   end
 
   private def removeArtifacts(): Void

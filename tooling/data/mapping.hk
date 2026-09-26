@@ -91,6 +91,151 @@ def dataSqlIdentifier(value: String): Bool
   return true
 end
 
+def dataSqlSameIdentifier(left: String, right: String): Bool
+  if host::stringByteLength(left) != host::stringByteLength(right)
+    return false
+  end
+  var index = 0
+
+  while index < host::stringByteLength(left)
+    var first = host::stringByteAt(left, index) as Int
+    var second = host::stringByteAt(right, index) as Int
+
+    first = first + 32 if first >= 65 && first <= 90
+    second = second + 32 if second >= 65 && second <= 90
+    if first != second
+      return false
+    end
+    index = index + 1
+  end
+  return true
+end
+
+def dataSqlReserved(value: String): Bool
+  return host::stringByteLength(value) >= 7 && dataSqlSameIdentifier(host::stringSlice(value, 0, 7), "__neri_")
+end
+
+def dataStringLiteral(value: String): String
+  # Slice only at ASCII escapes so copied runs preserve complete UTF-8 scalars.
+  var result = "\""
+  var index = 0
+  var start = 0
+
+  while index < host::stringByteLength(value)
+    let byte = host::stringByteAt(value, index) as Int
+
+    if byte == 34 || byte == 92 || byte == 10 || byte == 13 || byte == 9
+      result = result + host::stringSlice(value, start, index - start)
+      if byte == 34 || byte == 92
+        result = result + "\\" + host::stringSlice(value, index, 1)
+      else if byte == 10
+        result = result + "\\n"
+      else if byte == 13
+        result = result + "\\r"
+      else
+        result = result + "\\t"
+      end
+      start = index + 1
+    end
+    index = index + 1
+  end
+  return result + host::stringSlice(value, start, host::stringByteLength(value) - start) + "\""
+end
+
+def dataFloatLiteral(value: String): String?
+  let parsed = host::parseFloat(value)
+
+  if parsed == null
+    return null
+  end
+  let difference = parsed - parsed
+
+  if !(difference >= 0.0 && difference <= 0.0)
+    return null
+  end
+  if parsed == 0.0
+    var digit = 0
+
+    while digit < host::stringByteLength(value)
+      let byte = host::stringByteAt(value, digit) as Int
+
+      if byte == 69 || byte == 101
+        break
+      end
+      if byte >= 49 && byte <= 57
+        return null
+      end
+      digit = digit + 1
+    end
+  end
+  let canonical = parsed as String
+  var start = 0
+  var sign = ""
+
+  if host::stringByteAt(canonical, 0) as Int == 45
+    sign = "-"
+    start = 1
+  end
+  var point = -1
+  var exponent = host::stringByteLength(canonical)
+  var index = start
+
+  while index < host::stringByteLength(canonical)
+    let byte = host::stringByteAt(canonical, index) as Int
+
+    point = index if byte == 46
+    if byte == 69 || byte == 101
+      exponent = index
+      break
+    end
+    index = index + 1
+  end
+  let digitsBefore = (point < 0 ? exponent : point) - start
+  var digits = ""
+
+  index = start
+  while index < exponent
+    if host::stringByteAt(canonical, index) as Int != 46
+      digits = digits + host::stringSlice(canonical, index, 1)
+    end
+    index = index + 1
+  end
+  var shift = 0
+
+  if exponent < host::stringByteLength(canonical)
+    var suffixStart = exponent + 1
+
+    suffixStart = suffixStart + 1 if host::stringByteAt(canonical, suffixStart) as Int == 43
+    let suffix = host::stringSlice(canonical, suffixStart, host::stringByteLength(canonical) - suffixStart)
+    let parsedShift = host::parseInt(suffix)
+
+    if parsedShift == null
+      return null
+    end
+    shift = parsedShift
+  end
+  var position = digitsBefore + shift
+  var literal = sign
+
+  if position <= 0
+    literal = literal + "0."
+    while position < 0
+      literal = literal + "0"
+      position = position + 1
+    end
+    return literal + digits
+  end
+  if position >= host::stringByteLength(digits)
+    literal = literal + digits
+    while position > host::stringByteLength(digits)
+      literal = literal + "0"
+      position = position - 1
+    end
+    return literal + ".0"
+  end
+  return literal + host::stringSlice(digits, 0, position) + "." + host::stringSlice(digits, position, host::stringByteLength(digits) - position)
+end
+
 def dataPathWithin(root: String, path: String): Bool
   return path == root || bootstrapStartsWith(path, root + "/")
 end
@@ -158,6 +303,8 @@ def dataTypeDomain(typeName: String): DataScalarKind?
     return DataScalarKind.Int()
   else if concrete == "Bool"
     return DataScalarKind.Bool()
+  else if concrete == "Float"
+    return DataScalarKind.Float()
   else if concrete == "String"
     return DataScalarKind.String()
   end
@@ -259,10 +406,77 @@ def dataInitializer(entity: DataEntity): Bool
   return true
 end
 
+def dataParseDefault(mapping: DataMapping, field: DataField, value: LspJson, context: String): Bool
+  if value.isMissing()
+    return true
+  end
+  field.defaultNode = value
+  if value.isNull()
+    if !field.optional
+      return mapping.fail(context + ".default may be null only for an optional field.")
+    end
+    field.defaultCode = "neri_data::SchemaDefault.Null()"
+    return true
+  end
+  match field.domain
+    case DataScalarKind.Bool()
+      if !value.isBoolean()
+        return mapping.fail(context + ".default must be a JSON boolean.")
+      end
+      field.defaultCode = "neri_data::SchemaDefault.Bool(" + (value.isTrue() ? "true" : "false") + ")"
+    case DataScalarKind.Int()
+      if !value.isNumber()
+        return mapping.fail(context + ".default must be a signed 64-bit JSON integer.")
+      end
+      let number = value.scalarText()
+      var index = 0
+
+      while index < host::stringByteLength(number)
+        let byte = host::stringByteAt(number, index) as Int
+
+        if byte == 46 || byte == 69 || byte == 101
+          return mapping.fail(context + ".default must be a signed 64-bit JSON integer without a fraction or exponent.")
+        end
+        index = index + 1
+      end
+      let parsed = host::parseInt(number)
+
+      if parsed == null
+        return mapping.fail(context + ".default is outside the signed 64-bit integer range.")
+      end
+      field.defaultCode = "neri_data::SchemaDefault.Int(" + (parsed as String) + ")"
+    case DataScalarKind.Float()
+      if !value.isNumber()
+        return mapping.fail(context + ".default must be a finite JSON number.")
+      end
+      let literal = dataFloatLiteral(value.scalarText())
+
+      if literal == null
+        return mapping.fail(context + ".default must be a finite Float number.")
+      end
+      field.defaultCode = "neri_data::SchemaDefault.Float(" + literal + ")"
+    case DataScalarKind.String()
+      if !value.isString()
+        return mapping.fail(context + ".default must be a JSON string.")
+      end
+      let text = value.scalarText()
+      var index = 0
+
+      while index < host::stringByteLength(text)
+        if host::stringByteAt(text, index) as Int == 0
+          return mapping.fail(context + ".default must not contain NUL.")
+        end
+        index = index + 1
+      end
+      field.defaultCode = "neri_data::SchemaDefault.Text(" + dataStringLiteral(text) + ")"
+  end
+  return true
+end
+
 def dataParseField(mapping: DataMapping, entity: DataEntity, node: LspJson, index: Int): Bool
   let context = "entities[" + (index as String) + "].columns"
 
-  if !dataObject(mapping, node, context, ["member", "column"])
+  if !dataObject(mapping, node, context, ["member", "column", "default", "valueGeneration"])
     return false
   end
   let memberName = dataString(mapping, node, "member", context)
@@ -283,7 +497,7 @@ def dataParseField(mapping: DataMapping, entity: DataEntity, node: LspJson, inde
   var existing = entity.firstField
 
   while existing != null
-    if existing.columnName == columnName
+    if dataSqlSameIdentifier(existing.columnName, columnName)
       return mapping.fail("Entity '" + entity.typeName + "' maps column '" + columnName + "' more than once.")
     end
     existing = existing.nextField
@@ -304,7 +518,7 @@ def dataParseField(mapping: DataMapping, entity: DataEntity, node: LspJson, inde
   let domain = dataTypeDomain(symbol.typeName)
 
   if domain == null
-    return mapping.fail("Mapped member '" + entity.typeName + "." + memberName + "' has unsupported type '" + symbol.typeName + "'; expected Int, Bool, String, or an optional of one of those types.")
+    return mapping.fail("Mapped member '" + entity.typeName + "." + memberName + "' has unsupported type '" + symbol.typeName + "'; expected Int, Bool, Float, String, or an optional of one of those types.")
   end
   let field = new DataField(domain)
 
@@ -312,6 +526,24 @@ def dataParseField(mapping: DataMapping, entity: DataEntity, node: LspJson, inde
   field.columnName = columnName
   field.typeName = symbol.typeName
   field.optional = semanticIsOptional(symbol.typeName)
+  if !dataParseDefault(mapping, field, node.get("default"), context)
+    return false
+  end
+  if memberName == entity.keyMember && field.defaultCode != ""
+    return mapping.fail(context + ".default is not allowed on a primary key.")
+  end
+  let generation = node.get("valueGeneration")
+
+  if !generation.isMissing()
+    if !generation.isString() || (generation.scalarText() != "onAdd" && generation.scalarText() != "onAddOrUpdate")
+      return mapping.fail(context + ".valueGeneration must be 'onAdd' or 'onAddOrUpdate'.")
+    end
+    if memberName == entity.keyMember
+      return mapping.fail(context + ".valueGeneration is for non-key fields; use entity keyGeneration for generated keys.")
+    end
+    field.generatedOnAdd = true
+    field.generatedOnUpdate = generation.scalarText() == "onAddOrUpdate"
+  end
   field.symbol = symbol
   let semantic = mapping.semantic
 
@@ -321,10 +553,98 @@ def dataParseField(mapping: DataMapping, entity: DataEntity, node: LspJson, inde
   return true
 end
 
+def dataParseIndex(mapping: DataMapping, entity: DataEntity, node: LspJson, index: Int): Bool
+  let context = "entities[" + entity.typeName + "].indexes[" + (index as String) + "]"
+
+  if !dataObject(mapping, node, context, ["name", "members", "unique"])
+    return false
+  end
+  let name = dataString(mapping, node, "name", context)
+  let members = dataRequired(mapping, node, "members", LspJsonType.Array(), context)
+
+  if mapping.error != "" || members == null
+    return false
+  end
+  if !dataSqlIdentifier(name) || dataSqlReserved(name)
+    return mapping.fail(context + ".name must be a valid, non-reserved SQL identifier.")
+  end
+  let unique = node.get("unique")
+
+  if !unique.isMissing() && !unique.isBoolean()
+    return mapping.fail(context + ".unique must be a JSON boolean.")
+  end
+  let definition = new DataIndex()
+
+  definition.name = name
+  definition.unique = unique.isTrue()
+  var member = members.first
+
+  while member != null
+    if !member.isString() || !dataIdentifier(member.scalarText())
+      return mapping.fail(context + ".members must contain mapped member identifiers.")
+    end
+    let field = entity.field(member.scalarText())
+
+    if field == null
+      return mapping.fail(context + ".members contains unknown mapped member '" + member.scalarText() + "'.")
+    end
+    let identity = dataFieldIdentity(field)
+    var position = 0
+
+    while position < definition.fields.size
+      if definition.fields.get(position) == identity
+        return mapping.fail(context + ".members repeats mapped member '" + member.scalarText() + "'.")
+      end
+      position = position + 1
+    end
+    definition.fields.add(identity)
+    member = member.next
+  end
+  if definition.fields.size == 0
+    return mapping.fail(context + ".members must contain at least one mapped member.")
+  end
+  entity.addIndex(definition)
+  return true
+end
+
+def dataValidateSchemaNames(mapping: DataMapping): Bool
+  var entity = mapping.firstEntity
+
+  while entity != null
+    var index = entity.firstIndex
+
+    while index != null
+      var table = mapping.firstEntity
+      var matches = 0
+
+      while table != null
+        if dataSqlSameIdentifier(index.name, table.tableName)
+          return mapping.fail("Index '" + index.name + "' collides with mapped table '" + table.tableName + "'.")
+        end
+        var other = table.firstIndex
+
+        while other != null
+          if dataSqlSameIdentifier(index.name, other.name)
+            matches = matches + 1
+            if matches > 1
+              return mapping.fail("Mapped index '" + index.name + "' is duplicated without regard to ASCII case.")
+            end
+          end
+          other = other.nextIndex
+        end
+        table = table.nextEntity
+      end
+      index = index.nextIndex
+    end
+    entity = entity.nextEntity
+  end
+  return true
+end
+
 def dataParseEntity(mapping: DataMapping, node: LspJson, index: Int): Bool
   let context = "entities[" + (index as String) + "]"
 
-  if !dataObject(mapping, node, context, ["type", "set", "table", "key", "columns"])
+  if !dataObject(mapping, node, context, ["type", "set", "table", "key", "keyGeneration", "columns", "indexes", "concurrencyTokens"])
     return false
   end
   let entity = new DataEntity()
@@ -333,10 +653,22 @@ def dataParseEntity(mapping: DataMapping, node: LspJson, index: Int): Bool
   entity.setName = dataString(mapping, node, "set", context)
   entity.tableName = dataString(mapping, node, "table", context)
   entity.keyMember = dataString(mapping, node, "key", context)
+  let keyGeneration = node.get("keyGeneration")
+
+  if !keyGeneration.isMissing()
+    if !keyGeneration.matches(LspJsonType.String()) || keyGeneration.scalarText() != "onAdd"
+      return mapping.fail(context + ".keyGeneration must be 'onAdd'.")
+    end
+    entity.generatedKey = true
+  end
   let columns = dataRequired(mapping, node, "columns", LspJsonType.Array(), context)
+  let indexes = node.get("indexes")
 
   if mapping.error != "" || columns == null
     return false
+  end
+  if !indexes.isMissing() && !indexes.isArray()
+    return mapping.fail(context + ".indexes must be a JSON array when present.")
   end
   if !dataIdentifier(entity.typeName, true)
     return mapping.fail(context + ".type must be a qualified Neri type name.")
@@ -344,8 +676,8 @@ def dataParseEntity(mapping: DataMapping, node: LspJson, index: Int): Bool
   if !dataIdentifier(entity.setName)
     return mapping.fail(context + ".set must be a Neri identifier.")
   end
-  if !dataSqlIdentifier(entity.tableName)
-    return mapping.fail(context + ".table must be an unquoted SQL identifier.")
+  if !dataSqlIdentifier(entity.tableName) || dataSqlReserved(entity.tableName)
+    return mapping.fail(context + ".table must be a valid, non-reserved SQL identifier.")
   end
   if !dataIdentifier(entity.keyMember)
     return mapping.fail(context + ".key must be a Neri member identifier.")
@@ -359,7 +691,7 @@ def dataParseEntity(mapping: DataMapping, node: LspJson, index: Int): Bool
     if existing.setName == entity.setName
       return mapping.fail("Mapped set '" + entity.setName + "' is duplicated.")
     end
-    if existing.tableName == entity.tableName
+    if dataSqlSameIdentifier(existing.tableName, entity.tableName)
       return mapping.fail("Mapped table '" + entity.tableName + "' is duplicated.")
     end
     existing = existing.nextEntity
@@ -409,8 +741,52 @@ def dataParseEntity(mapping: DataMapping, node: LspJson, index: Int): Bool
   if key.optional || !dataScalarSupportsKey(key.domain)
     return mapping.fail("Entity '" + entity.typeName + "' key must be a non-optional Int or String.")
   end
+  if entity.generatedKey && key.typeName != "Int"
+    return mapping.fail("Entity '" + entity.typeName + "' generated key must be Int.")
+  end
+  let tokens = node.get("concurrencyTokens")
+
+  if !tokens.isMissing()
+    if !tokens.isArray()
+      return mapping.fail(context + ".concurrencyTokens must be a JSON array of mapped non-key member names.")
+    end
+    let selected = new StringBuffer()
+    var token = tokens.first
+
+    while token != null
+      if !token.isString()
+        return mapping.fail(context + ".concurrencyTokens must contain mapped non-key member names.")
+      end
+      let field = entity.field(token.scalarText())
+
+      if field == null || field.memberName == entity.keyMember
+        return mapping.fail(context + ".concurrencyTokens references an unknown or key member '" + token.scalarText() + "'.")
+      end
+      var prior = 0
+
+      while prior < selected.size
+        if selected.get(prior) == field.columnName
+          return mapping.fail(context + ".concurrencyTokens repeats member '" + field.memberName + "'.")
+        end
+        prior = prior + 1
+      end
+      selected.add(field.columnName)
+      token = token.next
+    end
+    entity.concurrencyColumns = selected
+  end
   if !dataInitializer(entity)
     return mapping.fail("Entity '" + entity.typeName + "' needs an accessible initializer whose parameters match mapped columns in order, or zero-argument construction with public mapped fields.")
+  end
+  var indexDefinition = indexes.first
+  var indexNumber = 0
+
+  while indexDefinition != null
+    if !dataParseIndex(mapping, entity, indexDefinition, indexNumber)
+      return false
+    end
+    indexDefinition = indexDefinition.next
+    indexNumber = indexNumber + 1
   end
   mapping.addEntity(entity)
   return true
@@ -419,7 +795,7 @@ end
 def dataParseRelation(mapping: DataMapping, node: LspJson, index: Int): Bool
   let context = "relations[" + (index as String) + "]"
 
-  if !dataObject(mapping, node, context, ["principal", "dependent", "key", "foreignKey"])
+  if !dataObject(mapping, node, context, ["principal", "dependent", "key", "foreignKey", "collection", "reference", "deleteBehavior"])
     return false
   end
   let relation = new DataRelation()
@@ -428,6 +804,29 @@ def dataParseRelation(mapping: DataMapping, node: LspJson, index: Int): Bool
   relation.dependentType = dataString(mapping, node, "dependent", context)
   relation.keyMember = dataString(mapping, node, "key", context)
   relation.foreignKeyMember = dataString(mapping, node, "foreignKey", context)
+  let deleteBehavior = node.get("deleteBehavior")
+
+  if !deleteBehavior.isMissing()
+    if !deleteBehavior.matches(LspJsonType.String())
+      return mapping.fail(context + ".deleteBehavior must be a JSON string.")
+    end
+    let policy = deleteBehavior.scalarText()
+
+    if policy != "restrict" && policy != "clientCascade" && policy != "clientSetNull"
+      return mapping.fail(context + ".deleteBehavior must be 'restrict', 'clientCascade', or 'clientSetNull'.")
+    end
+    relation.deleteBehavior = policy
+  end
+  let collection = node.get("collection")
+  let reference = node.get("reference")
+
+  if collection.isMissing() != reference.isMissing()
+    return mapping.fail(context + " requires both collection and reference navigation members.")
+  end
+  if !collection.isMissing()
+    relation.collectionMember = dataString(mapping, node, "collection", context)
+    relation.referenceMember = dataString(mapping, node, "reference", context)
+  end
   if mapping.error != ""
     return false
   end
@@ -449,17 +848,57 @@ def dataParseRelation(mapping: DataMapping, node: LspJson, index: Int): Bool
   if foreignKey == null
     return mapping.fail(context + ".foreignKey must name a mapped dependent field.")
   end
+  if foreignKey.generatedOnAdd
+    return mapping.fail(context + ".foreignKey cannot be a store-generated non-key field; tracked relationship writes own its value.")
+  end
   if relation.keyMember != principal.keyMember
     return mapping.fail(context + ".key must name the principal entity key '" + principal.keyMember + "'.")
   end
-  if key.typeName != foreignKey.typeName
-    return mapping.fail(context + " fields must have the same type, got '" + key.typeName + "' and '" + foreignKey.typeName + "'.")
+  let foreignKeyValueType = foreignKey.optional ? semanticInnerType(foreignKey.typeName) : foreignKey.typeName
+
+  if key.typeName != foreignKeyValueType
+    return mapping.fail(context + " foreign key must have the principal key type or its optional form, got '" + key.typeName + "' and '" + foreignKey.typeName + "'.")
+  end
+  if relation.deleteBehavior == "clientSetNull" && (!foreignKey.optional || relation.foreignKeyMember == dependent.keyMember)
+    return mapping.fail(context + ".deleteBehavior 'clientSetNull' requires a nullable, non-identifying foreign key.")
+  end
+  if relation.collectionMember != ""
+    if !dataIdentifier(relation.collectionMember) || !dataIdentifier(relation.referenceMember)
+      return mapping.fail(context + " navigation members must be Neri identifiers.")
+    end
+    if principal.field(relation.collectionMember) != null || dependent.field(relation.referenceMember) != null
+      return mapping.fail(context + " navigation members must not be mapped as scalar columns.")
+    end
+    let principalSymbol = principal.symbol
+    let dependentSymbol = dependent.symbol
+
+    if principalSymbol == null || dependentSymbol == null
+      return mapping.fail(context + " navigation entity declarations are unavailable.")
+    end
+    let collectionSymbol = dataFindField(mapping.semantic, principalSymbol, relation.collectionMember)
+    let referenceSymbol = dataFindField(mapping.semantic, dependentSymbol, relation.referenceMember)
+
+    if collectionSymbol == null || !collectionSymbol.access.isPublic() || collectionSymbol.typeName != relation.dependentType + "[]"
+      return mapping.fail(context + ".collection must name a public " + relation.dependentType + "[] field on the principal.")
+    end
+    if referenceSymbol == null || !referenceSymbol.access.isPublic() || referenceSymbol.typeName != relation.principalType + "?"
+      return mapping.fail(context + ".reference must name a public " + relation.principalType + "? field on the dependent.")
+    end
+    let semantic = mapping.semantic
+
+    if semantic != null
+      relation.collectionOrigin = dataOrigin(mapping, dataDeclaration(semantic, "field:" + collectionSymbol.owner + "." + collectionSymbol.name))
+      relation.referenceOrigin = dataOrigin(mapping, dataDeclaration(semantic, "field:" + referenceSymbol.owner + "." + referenceSymbol.name))
+    end
   end
   var existing = mapping.firstRelation
 
   while existing != null
     if existing.principalType == relation.principalType && existing.dependentType == relation.dependentType && existing.keyMember == relation.keyMember && existing.foreignKeyMember == relation.foreignKeyMember
       return mapping.fail(context + " duplicates an existing relation.")
+    end
+    if relation.collectionMember != "" && ((existing.principalType == relation.principalType && existing.collectionMember == relation.collectionMember) || (existing.dependentType == relation.dependentType && existing.referenceMember == relation.referenceMember))
+      return mapping.fail(context + " reuses a navigation member from another relation.")
     end
     existing = existing.nextRelation
   end
@@ -698,6 +1137,9 @@ def dataLoadMapping(path: String): DataMapping
   end
   if mapping.firstEntity == null
     mapping.fail("mapping.entities must contain at least one entity.")
+    return mapping
+  end
+  if !dataValidateSchemaNames(mapping)
     return mapping
   end
   var relation = relations.first

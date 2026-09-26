@@ -21,6 +21,9 @@ NERI_SESSION_LINKER_API neri_session_linker_v1 *
 neri_session_linker_create_v1(char *error, size_t error_size);
 NERI_SESSION_LINKER_API void
 neri_session_linker_destroy_v1(neri_session_linker_v1 *linker);
+NERI_SESSION_LINKER_API int neri_session_linker_add_library_v1(
+    neri_session_linker_v1 *linker, const char *name, const char *directory,
+    char *error, size_t error_size);
 NERI_SESSION_LINKER_API neri_session_generation_v1 *
 neri_session_linker_add_object_v1(
     neri_session_linker_v1 *linker, const char *generation_name,

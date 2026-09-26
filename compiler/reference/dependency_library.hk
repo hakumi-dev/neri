@@ -1,0 +1,208 @@
+use host
+use files
+
+# A closed, checked source dependency prefix has one native implementation.
+# The consumer keeps the checked model as its semantic parent and emits only
+# its own definitions and any newly requested generic specializations.
+class DependencyLibrary
+  public error: String = ""
+  public declarations: IrModule?
+  public objectPath: String = ""
+  public objectDigest: String = ""
+  private metadataPath: String = ""
+
+  def prepare(dependency: BatchDependency, target: readonly TargetPlatform, release: Bool, debugIdentity: String): Void
+    let disabled = host::environment("NERI_LIBRARY_CACHE")
+
+    if disabled != null && disabled == "0"
+      return
+    end
+    let codegen = host::environment("NERI_CODEGEN")
+
+    if codegen == null
+      return
+    end
+    let digest = referenceFileDigest(codegen)
+
+    if digest == ""
+      return
+    end
+    let cache = new SemanticSnapshotCache()
+
+    cache.prepare(runCacheFrame("dependency-library-v1") + runCacheFrame(dependency.identity) + runCacheFrame(dependency.importScope) + runCacheFrame(target.name()) + runCacheFrame(release ? "release" : "debug") + runCacheFrame(digest) + runCacheFrame(debugIdentity))
+    if cache.path != ""
+      this.metadataPath = cache.path + ".nlib"
+      this.objectPath = cache.path + ".o"
+    end
+  end
+
+  private def load(moduleName: String, domains: IrDomainCatalog): Bool
+    if this.metadataPath == ""
+      return false
+    end
+    let before = new RunCacheFile(this.metadataPath, false)
+    let objectBefore = new RunCacheFile(this.objectPath, false)
+
+    if !before.owned || before.kind != 1 || !objectBefore.owned || objectBefore.kind != 1
+      return false
+    end
+    let read = files::readBytes(this.metadataPath, 67108929)
+    let bytes = read.bytes
+
+    if read.failure != null || read.closeFailure != null || bytes == null
+      return false
+    end
+    let content = host::stringFromBytes(bytes)
+
+    if content == null || host::stringByteLength(content) < 65
+      return false
+    end
+    let payload = host::stringSlice(content, 65, host::stringByteLength(content) - 65)
+
+    if host::stringByteAt(content, 64) != 10 as Byte || host::stringSlice(content, 0, 64) != sha256FastText(payload)
+      return false
+    end
+    let reader = new SemanticSnapshotReader(payload)
+    let version = reader.string()
+    let digest = reader.string()
+    let encoded = reader.string()
+
+    if !reader.complete() || version != "neri-dependency-library-v1" || host::stringByteLength(digest) != 64 || digest != referenceFileDigest(this.objectPath)
+      return false
+    end
+    let decoded = libraryDeclarationsDecode(encoded, moduleName, domains)
+    let after = new RunCacheFile(this.metadataPath, false)
+    let objectAfter = new RunCacheFile(this.objectPath, false)
+
+    if decoded == null || !after.owned || after.kind != 1 || !objectAfter.owned || objectAfter.kind != 1 || before.fingerprint != after.fingerprint || objectBefore.fingerprint != objectAfter.fingerprint
+      return false
+    end
+    this.declarations = decoded
+    this.objectDigest = digest
+    return true
+  end
+
+  def materialize(dependency: BatchDependency, combined: String, ids: StringBuffer, texts: StringBuffer, starts: IntBuffer, moduleName: String, target: readonly TargetPlatform, release: Bool, sources: BootstrapSourceInput?, timings: Bool, progress: (fn(String, Int, Int): Void)? = null, nativeProgress: (fn(String, Int, Int, String, Int): Void)? = null): Bool
+    let providerIds = new StringTable<Bool>()
+    var sourceIndex = 0
+
+    while sourceIndex < ids.size && starts.get(sourceIndex) < dependency.sourceLength
+      providerIds.add(ids.get(sourceIndex), true)
+      sourceIndex = sourceIndex + 1
+    end
+    var debugIdentity = ""
+    var source = sources
+
+    while source != null && !release
+      if providerIds.find(source.id) != null
+        debugIdentity = debugIdentity + runCacheFrame(source.id) + runCacheFrame(source.identityPath)
+      end
+      source = source.nextInput
+    end
+    this.prepare(dependency, target, release, debugIdentity)
+    if this.metadataPath == ""
+      return false
+    end
+    let lookupStarted = runCacheTime()
+    let hit = this.load(moduleName, dependency.model.irDomains)
+
+    runCacheReport(timings, hit ? "dependency-native-hit" : "dependency-native-miss", lookupStarted)
+    if hit
+      return true
+    end
+    let lowerStarted = runCacheTime()
+    let prefix = host::stringSlice(combined, 0, dependency.byteLength)
+    let lowerer = new IrLowerer(dependency.model, dependency.syntax, prefix, moduleName)
+
+    lowerer.module.clearSources()
+    var index = 0
+
+    while index < ids.size && starts.get(index) < dependency.sourceLength
+      lowerer.module.addSource(new IrSource(ids.get(index), texts.get(index), starts.get(index)))
+      index = index + 1
+    end
+    lowerer.module.requiredFeatures.requireRetainedModules()
+    let module = lowerer.lower()
+
+    runCacheReport(timings, "dependency-lower", lowerStarted)
+    let verification = irVerify(module)
+
+    if dependency.model.diagnostics.count() != 0 || !verification.succeeded()
+      this.error = "Dependency library lowering failed."
+      var failure = verification.errors.first.nextNode
+
+      while failure != null
+        this.error = this.error + "\nNIRV|" + failure.value
+        failure = failure.nextNode
+      end
+      return false
+    end
+    let encoded = libraryDeclarationsEncode(module)
+
+    if encoded == null
+      return false
+    end
+    let temporary = bootstrapTemporaryDirectory(bootstrapDirectory(this.metadataPath), "library")
+
+    if temporary == null
+      return false
+    end
+    let stagedObject = temporary + "/library.o"
+    let metricsPath = timings ? temporary + "/codegen-metrics.json" : ""
+    let codegenStarted = runCacheTime()
+
+    progress("codegen", 0, 0) if progress != null
+    let providerSources = bootstrapUnitSources(module, sources)
+    var succeeded = bootstrapInvokeCodegen(module, EmissionKind.object(), stagedObject, target, release, providerSources, metricsPath, "", nativeProgress)
+
+    runCacheReport(timings, "dependency-codegen", codegenStarted)
+    bootstrapReportCodegenMetrics(metricsPath, "dependency-") if timings
+    this.error = "Dependency library native compilation failed." if !succeeded
+    if succeeded
+      let digest = referenceFileDigest(stagedObject)
+      let writer = new SemanticSnapshotWriter()
+
+      writer.string("neri-dependency-library-v1")
+      writer.string(digest)
+      writer.string(encoded)
+      let payload = writer.finish()
+
+      succeeded = digest != "" && payload != null
+      if payload != null && succeeded
+        succeeded = host::writeText(temporary + "/library.nlib", sha256FastText(payload) + "\n" + payload)
+      end
+    end
+    if succeeded
+      succeeded = files::move(stagedObject, this.objectPath).failure == null
+      succeeded = files::move(temporary + "/library.nlib", this.metadataPath).failure == null if succeeded
+    end
+    bootstrapRemoveRunDirectory(temporary)
+    if succeeded && !this.load(moduleName, dependency.model.irDomains)
+      this.error = "Dependency library declaration or implementation validation failed."
+      return false
+    end
+    return succeeded
+  end
+
+  def retain(lowerer: IrLowerer, references: ReferenceInputs): Void
+    let declarations = this.declarations
+
+    if declarations == null
+      return
+    end
+    lowerer.retain(declarations)
+    lowerer.module.requiredFeatures.merge(declarations.requiredFeatures)
+    # Imports carry the complete transitive native link and runtime contract,
+    # including libraries used only by a precompiled implementation body.
+    var imported = declarations.firstImport
+
+    while imported != null
+      lowerer.module.addImport(irPartitionImport(imported))
+      imported = imported.nextImport
+    end
+    references.addObject(this.objectPath, this.objectDigest)
+    references.runtimeMinor = bootstrapRequiredRuntimeMinor(declarations)
+    references.runtimeFeatures = bootstrapRequiredRuntimeFeatures(declarations)
+    references.runtimeFeatureBits = references.runtimeFeatures.bits()
+  end
+end

@@ -20,6 +20,8 @@ class BootstrapBinder
   public recordCompletionSites: Bool = false
   public requireEntryPoint: Bool = true
   public allowSessionEntryReplacement: Bool = false
+  public inferSessionTryError: Bool = false
+  public sessionTryErrorType: String = ""
   public forbiddenEntryPointSources: StringBuffer = new StringBuffer()
   public followingUses: String[] = []
 
@@ -221,6 +223,8 @@ class BootstrapBinder
     validateAbstractClasses(this)
     return this.model if this.cancelled()
     this.registerFunctions()
+    return this.model if this.cancelled()
+    validateWorkerOperations(this)
     return this.model if this.cancelled()
     semanticValidateCDeclarations(this)
     return this.model if this.cancelled()
@@ -460,6 +464,7 @@ class BootstrapBinder
         symbol.isSealed = representation != "" || this.classSealed(node)
         symbol.isAbstract = abstract
         this.model.addClass(symbol)
+        configurePropagation(this, symbol)
         this.recordDeclaration("type:" + fullName, name, fullName, node, abstract ? "abstract class " + fullName : "class " + fullName)
       end
       index = index + 1
@@ -499,6 +504,8 @@ class BootstrapBinder
         else
           result = value
         end
+      else if this.syntax.annotationAt(annotation).isPropagation() && declaration.isAlternative
+        continue
       else
         this.report("NR245", annotation, "Unknown class annotation '@" + name + "'.")
       end
@@ -683,6 +690,19 @@ class BootstrapBinder
 
   def callableSourceIdentity(callable: SemanticCallable): String
     if callable.genericOrigin >= 0
+      if callable.className != ""
+        let classSymbol = this.model.findClass(callable.className)
+        var ownerName = callable.className
+
+        if classSymbol != null && classSymbol.genericOrigin >= 0
+          ownerName = genericName(this, classSymbol.genericOrigin)
+        end
+        let source = semanticDeclaration(this, callable.genericOrigin)
+
+        if source != null
+          return "callable:" + ownerName + "." + source.name
+        end
+      end
       return "callable:" + genericName(this, callable.genericOrigin)
     end
     if callable.className == ""
@@ -700,7 +720,7 @@ class BootstrapBinder
     var callableName = callable.fullName
 
     if callable.genericOrigin >= 0
-      callableName = genericName(this, callable.genericOrigin)
+      callableName = host::stringSlice(this.callableSourceIdentity(callable), 9, host::stringByteLength(this.callableSourceIdentity(callable)) - 9)
     else if callable.className != ""
       let classSymbol = this.model.findClass(callable.className)
 
@@ -733,7 +753,7 @@ class BootstrapBinder
     return written
   end
 
-  def validatePointerType(node: Int, unsafeAllowed: Bool): Void
+  def validatePointerType(node: Int, unsafeAllowed: Bool, namespaceName: String): Void
     let typeName = this.writtenTypeName(node)
 
     if !semanticContainsPointer(typeName)
@@ -742,10 +762,10 @@ class BootstrapBinder
     if !unsafeAllowed
       this.reportSecondary("NR190", node, "Raw pointer types can be used only inside an unsafe declaration or block.")
     end
-    this.validatePointerElement(node)
+    this.validatePointerElement(node, namespaceName)
   end
 
-  def validatePointerElement(node: Int): Void
+  def validatePointerElement(node: Int, namespaceName: String): Void
     let typeName = this.writtenTypeName(node)
 
     if !semanticContainsPointer(typeName)
@@ -756,7 +776,7 @@ class BootstrapBinder
     while semanticIsArray(baseName) || nativeFixedArray(baseName) || semanticIsOptional(baseName) || semanticIsPointer(baseName)
       baseName = semanticInnerType(baseName)
     end
-    if !semanticIsNumeric(baseName) && baseName != "Bool" && baseName != "Void" && baseName != "cabi fn" && !nativeValueType(semanticResolveType(this.model, baseName, this.currentNamespace))
+    if !semanticIsNumeric(baseName) && baseName != "Bool" && baseName != "Void" && baseName != "cabi fn" && !nativeValueType(semanticResolveType(this.model, baseName, namespaceName))
       this.reportSecondary("NR191", node, "Type '" + baseName + "' cannot be the element type of a raw pointer.")
     end
   end
@@ -839,7 +859,7 @@ class BootstrapBinder
     if semanticContainsResource(this.model, typeName)
       this.report("NR262", node, "Resource ownership cannot be stored in a field.")
     end
-    this.validatePointerType(typeNode, true)
+    this.validatePointerType(typeNode, true, classSymbol.namespaceName)
     classSymbol.addField(new SemanticField(classSymbol.fullName, name, typeName, access, node))
     this.recordDeclaration("field:" + classSymbol.fullName + "." + name, name, typeName, node, classSymbol.fullName + "." + name + ": " + semanticCFunctionDisplay(typeName))
   end
@@ -860,14 +880,14 @@ class BootstrapBinder
     end
     let abstract = validateAbstractMethod(this, node, classSymbol.isAbstract, validateAbstract)
 
-    if this.syntax.nodeAt(functionNode).typeParameters.Length > 0
-      this.report("NR220", functionNode, "Method type parameters are not supported; declare parameters on the class or a module function.")
-      return
-    end
     let name = functionDeclaration.name
 
-    if this.findDeclaredMethod(classSymbol, name) != null
+    if this.findDeclaredMethod(classSymbol, name) != null || genericMethodTemplate(this, classSymbol, name) >= 0
       this.report("NR155", functionNode, "Method '" + name + "' is already defined in class '" + classSymbol.fullName + "'.")
+      return
+    end
+    if this.syntax.nodeAt(functionNode).typeParameters.Length > 0
+      registerGenericMethod(this, classSymbol, node, functionNode, functionDeclaration)
       return
     end
     let callable = this.createCallable(functionNode, functionDeclaration, classSymbol, access, abstract)
@@ -976,8 +996,7 @@ class BootstrapBinder
     let returnNode = this.syntax.childAt(functionNode, annotationCount + parameterCount)
     let returnType = this.resolveTypeNode(returnNode, namespaceName, "")
 
-    this.validatePointerType(returnNode, isUnsafe)
-    this.validatePointerElement(returnNode)
+    this.validatePointerType(returnNode, isUnsafe, namespaceName)
     let callable = new SemanticCallable(fullName, name, namespaceName, className, returnType, isStatic, isUnsafe, access, functionNode)
 
     callable.genericOrigin = genericOrigin
@@ -1010,9 +1029,14 @@ class BootstrapBinder
         end
         sawIntrinsic = true
         callable.intrinsicName = this.classAnnotationArgument(annotationNode)
-        if semanticIntrinsic(this.model, callable.intrinsicName) == null
+        if semanticIntrinsic(this.model, callable.intrinsicName) == null && callable.intrinsicName != "reference.same"
           this.report("NR247", annotationNode, "Annotation '@intrinsic' requires one supported intrinsic name.")
         end
+      else if this.syntax.annotationAt(annotationNode).isOperation()
+        if callable.operationAnnotation >= 0
+          this.report("NR249", annotationNode, "Annotation '@operation' cannot be repeated.")
+        end
+        callable.operationAnnotation = annotationNode
       else if this.syntax.annotationAt(annotationNode).isCabiExport()
         if sawExport
           this.report("NR280", annotationNode, "Function annotation '@cabiExport' cannot be repeated.")
@@ -1082,8 +1106,7 @@ class BootstrapBinder
       let parameterName = this.syntax.dataAt(parameterNode)
       let parameterType = this.resolveTypeNode(this.syntax.childAt(parameterNode, 0), namespaceName, "")
 
-      this.validatePointerType(this.syntax.childAt(parameterNode, 0), isUnsafe)
-      this.validatePointerElement(this.syntax.childAt(parameterNode, 0))
+      this.validatePointerType(this.syntax.childAt(parameterNode, 0), isUnsafe, namespaceName)
       let hasDefault = this.syntax.childCountAt(parameterNode) > 1
       let mode = this.syntax.nodeAt(parameterNode).parameterMode
 
@@ -1130,6 +1153,17 @@ class BootstrapBinder
     if callable.intrinsicName != ""
       let intrinsic = semanticIntrinsic(this.model, callable.intrinsicName)
       var valid = false
+
+      if callable.intrinsicName == "reference.same"
+        valid = classSymbol == null && !isUnsafe && bodyCount == 0 && !sawCAbi && !sawLibrary && callable.returnType == "Bool" && callable.parameterCount == 2
+        let left = callable.parameterAt(0)
+        let right = callable.parameterAt(1)
+
+        valid = false if left == null || right == null || left.typeName != right.typeName || left.hasDefault || right.hasDefault
+        if callable.genericOrigin < 0
+          valid = false if this.syntax.nodeAt(functionNode).typeParameters.Length != 1 || left == null || right == null || left.typeName != "T" || right.typeName != "T"
+        end
+      end
 
       if intrinsic != null
         valid = intrinsic.linkName != "" && classSymbol == null && !isUnsafe && bodyCount == 0 && !sawCAbi && !sawLibrary && callable.returnType == intrinsic.resultType && callable.parameterCount == intrinsic.parameterTypes.Length

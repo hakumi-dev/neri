@@ -1,0 +1,234 @@
+use clock
+use console
+use files
+use host
+use process
+use resources
+use result
+namespace test
+
+class Suite
+  private name: String
+  private first: Case?
+  private last: Case?
+  private count: Int = 0
+  private configurationError: String = ""
+
+  def init(name: String): Void
+    this.name = name
+    if !this.validName(name)
+      this.configurationError = "suite name must contain 1..200 printable bytes"
+    end
+  end
+
+  def add(name: String, body: fn(Context): Void): Bool
+    if !this.validName(name)
+      this.configurationError = "case name must contain 1..200 printable bytes"
+      return false
+    end
+    var current = this.first
+
+    while current != null
+      if current.name == name
+        this.configurationError = "duplicate case name: " + name
+        return false
+      end
+      current = current.next
+    end
+    let created = new Case(name, body)
+    let tail = this.last
+
+    if tail == null
+      this.first = created
+    else
+      tail.next = created
+    end
+    this.last = created
+    this.count = this.count + 1
+    return true
+  end
+
+  def run(): Int
+    let argument = host::argumentAt(0)
+
+    if argument == "--neri-test-case-v1"
+      return this.runChild()
+    end
+    if this.configurationError != ""
+      console::println("ERROR " + this.name + ": " + this.configurationError)
+      console::println("No cases executed.")
+      return 1
+    end
+    if this.count == 0
+      console::println("ERROR " + this.name + ": no cases registered")
+      console::println("No cases executed.")
+      return 1
+    end
+    let executable = host::executablePath()
+
+    if executable == null
+      console::println("ERROR " + this.name + ": cannot locate test executable")
+      console::println("No cases executed.")
+      return 1
+    end
+    console::println("Suite " + this.name + " (" + (this.count as String) + " cases)")
+    let started = clock::milliseconds()
+    var passed = 0
+    var failed = 0
+    var index = 0
+    var current = this.first
+
+    while current != null
+      console::println("RUN  " + current.name)
+      let outcome = this.runCase(executable, index, current.name)
+      var report = new CaseReport()
+
+      match outcome.completion
+        case resources::Completion.Value(value)
+          report = value
+        case resources::Completion.Failure(problem)
+          if problem != null
+            report.detail = problem.operation + ": " + problem.code
+          else
+            report.detail = "cannot create case fixture directory"
+          end
+      end
+      if outcome.closeFailures.count() != 0
+        report.passed = false
+        report.detail = report.detail + " fixture cleanup failed"
+      end
+      let duration = report.durationMs < 0 ? "n/a" : (report.durationMs as String) + " ms"
+
+      if report.passed
+        passed = passed + 1
+        console::println("PASS " + current.name + " (" + duration + ")")
+      else
+        failed = failed + 1
+        console::println("FAIL " + current.name + " (" + duration + ")" + (report.detail == "" ? "" : ": " + report.detail))
+      end
+      if report.stdout != ""
+        console::println("  stdout:")
+        console::print(report.stdout)
+        console::println("")
+      end
+      if report.stderr != ""
+        console::println("  stderr:")
+        console::print(report.stderr)
+        console::println("")
+      end
+      if report.stdoutTruncated || report.stderrTruncated
+        console::println("  output truncated at 1 MiB per stream")
+      end
+      current = current.next
+      index = index + 1
+    end
+    let finished = clock::milliseconds()
+    var total = "n/a"
+
+    if started != null && finished != null && finished >= started
+      total = ((finished - started) as String) + " ms"
+    end
+    console::println((passed as String) + " passed, " + (failed as String) + " failed, " + (this.count as String) + " total (" + total + ")")
+    return failed == 0 ? 0 : 1
+  end
+
+  private def runChild(): Int
+    if this.configurationError != "" || host::argumentCount() != 5
+      return 1
+    end
+    let indexText = host::argumentAt(1)
+    let expectedName = host::argumentAt(2)
+    let directory = host::argumentAt(3)
+    let receipt = host::argumentAt(4)
+
+    if indexText == null || expectedName == null || directory == null || receipt == null
+      return 1
+    end
+    let index = host::parseInt(indexText)
+
+    if index == null || index < 0 || index >= this.count
+      return 1
+    end
+    var current = this.first
+    var position = 0
+
+    while current != null && position < index
+      current = current.next
+      position = position + 1
+    end
+    if current == null || current.name != expectedName
+      return 1
+    end
+    let body = current.body
+
+    body(new Context(directory))
+    return host::writeText(receipt, "complete") ? 0 : 1
+  end
+
+  private def runCase(executable: String, index: Int, name: String): resources::Outcome<CaseReport, result::Failure>
+    using temporary <- files::TemporaryDirectory.create("neri-test-")
+      let report = new CaseReport()
+      let receipt = temporary.path() + "/.neri-test-complete"
+      let options = new process::SpawnOptions(executable)
+
+      options.arguments = ["--neri-test-case-v1", index as String, name, temporary.path(), receipt]
+      let started = clock::milliseconds()
+      let executed = process::run(options)
+      let finished = clock::milliseconds()
+
+      if started != null && finished != null && finished >= started
+        report.durationMs = finished - started
+      else
+        report.durationMs = -1
+      end
+      match executed
+        case result::Result.Ok(completed)
+          let exit = completed.exit
+          let receiptText = host::readText(receipt)
+
+          report.passed = exit != null && exit.isExited() && exit.value() == 0 && receiptText == "complete"
+          if !report.passed
+            if exit == null
+              report.detail = "child has no exit status"
+            else if !exit.isExited()
+              report.detail = "child ended by " + exit.name() + " " + (exit.value() as String)
+            else if exit.value() != 0
+              report.detail = "child exited " + (exit.value() as String)
+            else
+              report.detail = "child exited without completing its case"
+            end
+          end
+          let stdout = host::stringFromBytes(completed.stdout)
+          let stderr = host::stringFromBytes(completed.stderr)
+
+          report.stdout = stdout == null ? "<non-UTF-8 output>" : stdout
+          report.stderr = stderr == null ? "<non-UTF-8 output>" : stderr
+          report.stdoutTruncated = completed.stdoutTruncated
+          report.stderrTruncated = completed.stderrTruncated
+        case result::Result.Error(problem)
+          report.detail = problem.operation + ": " + problem.code
+      end
+      return resources::success(report)
+    end
+    return resources::failure(new result::Failure("unexpected_exit", "test.runCase"))
+  end
+
+  private def validName(value: String): Bool
+    let length = host::stringByteLength(value)
+
+    if length < 1 || length > 200
+      return false
+    end
+    var index = 0
+
+    while index < length
+      let byte = host::stringByteAt(value, index) as Int
+
+      if byte < 32 || byte == 127
+        return false
+      end
+      index = index + 1
+    end
+    return true
+  end
+end

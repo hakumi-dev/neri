@@ -380,7 +380,10 @@ class IrLowerer
         function.cExportSymbol = sourceFunction.cExportSymbol
         this.module.requiredFeatures.requireCInterop() if function.cExportSymbol != ""
         function.effects = sourceFunction.effects
+        function.linkReferences = sourceFunction.linkReferences
+        function.linkRuntimeFeatures = sourceFunction.linkRuntimeFeatures
         function.localEffects = sourceFunction.effects
+        function.parallelUnsafe = sourceFunction.parallelUnsafe
         function.declaringClass = sourceFunction.declaringClass
         function.dispatchSlot = sourceFunction.dispatchSlot
         var parameter = sourceFunction.parameterTypes.first.nextNode
@@ -459,7 +462,7 @@ class IrLowerer
       var function = module.firstFunction
 
       while function != null
-        if function.symbol.name == name && !function.retained
+        if function.symbol.name == name
           return function
         end
         function = function.nextFunction
@@ -476,7 +479,7 @@ class IrLowerer
       var value = module.firstClass
 
       while value != null
-        if value.symbol.name == name && !value.retained
+        if value.symbol.name == name
           return value
         end
         value = value.nextClass
@@ -630,7 +633,7 @@ class IrLowerer
   end
 
   def lowerCallable(callable: SemanticCallable): Void
-    if callable.cAbiSymbol != "" || callable.intrinsicName != ""
+    if callable.cAbiSymbol != "" || callable.intrinsicName != "" || callable.operationBridge != ""
       return
     end
     this.requireType(irType(callable.returnType))
@@ -664,7 +667,7 @@ class IrLowerer
       if !callable.isStatic && callable.name != "init"
         let owner = this.semantic.findClass(callable.className)
 
-        if owner != null
+        if owner != null && (callable.genericOrigin < 0 || this.semantic.ownsClass(owner))
           function.dispatchSlot = irSymbol(this.module.id, this.module.domains.symbolKind.getMethod(), this.dispatchSlot(owner, callable))
         end
       end
@@ -795,7 +798,7 @@ class IrLowerer
       return context.emitConstant(typeName, this.module.domains.constantKind.getFloat(), "0x0000000000000000", location)
     end
     if typeName == "string"
-      let name = "literal.string.sha256." + sha256Text("")
+      let name = "literal.string.sha256." + sha256FastText("")
 
       if !this.hasGlobal(name)
         this.module.addGlobal(new IrGlobal(irSymbol(this.module.id, this.module.domains.symbolKind.getGlobal(), name), "", irNoLocation()))
@@ -1001,6 +1004,8 @@ class IrLowerer
     end
     let completionName = completionField.typeName
     let completion = context.emitSymbol(this.module.domains.opcode.getObjectAlloc(), irType(completionName), irEmptyInts(), irSymbol(this.module.id, this.module.domains.symbolKind.getClass(), completionName), this.location(node))
+
+    context.function.localEffects = context.function.localEffects.mergedWith(new EffectSet().withMayPanic().withManagedAllocate().withSafepoint())
     let tag = context.emitConstant("int", this.module.domains.constantKind.getInt(), "1", this.location(node))
 
     context.emitSymbol(this.module.domains.opcode.getFieldStore(), "void", [completion.id, tag.id], irSymbol(this.module.id, this.module.domains.symbolKind.getField(), completionName + ".$alternativeTag"), this.location(node))
@@ -1015,7 +1020,9 @@ class IrLowerer
 
     if initializer != null
       context.emitSymbol(this.module.domains.opcode.getCallDirect(), "void", [wrapped.id, completion.id, collector], irSymbol(this.module.id, this.module.domains.symbolKind.getMethod(), initializer.fullName), this.location(node))
+      context.function.addCallee(initializer.fullName)
     end
+    context.function.localEffects = context.function.localEffects.withWrite()
     context.returnValue(wrapped.id, this.location(node))
   end
 
@@ -1248,6 +1255,8 @@ class IrLowerer
       end
     else if kind.isUnary()
       return this.lowerUnary(context, node)
+    else if kind.isTry()
+      return this.lowerTry(context, node)
     else if kind.isBinary()
       return this.lowerBinary(context, node)
     else if kind.isTernary()
@@ -1269,7 +1278,7 @@ class IrLowerer
       let operands: Int[] = [receiver.id]
 
       context.function.localEffects = context.function.localEffects.withRead()
-      if field != null && semanticIsOptional(field.typeName) && semanticInnerType(field.typeName) == this.bound.typeAt(node)
+      if field != null && semanticIsOptional(field.typeName) && irType(semanticInnerType(field.typeName)) == typeName
         let value = context.emitSymbol(this.module.domains.opcode.getFieldLoad(), irType(field.typeName), operands, irSymbol(this.module.id, this.module.domains.symbolKind.getField(), this.bound.dataAt(node)), location)
 
         context.function.localEffects = context.function.localEffects.withMayPanic()
@@ -1282,6 +1291,10 @@ class IrLowerer
       return this.lowerCall(context, node)
     else if kind.isTaskGenerate()
       return irLowerTaskGenerate(this, context, node)
+    else if kind.isWorkerEntry()
+      return irLowerWorkerEntry(this, context, node)
+    else if kind.isArrayGenerate()
+      return irLowerArrayGenerate(this, context, node)
     else if kind.isInstanceCall()
       return this.lowerInstanceCall(context, node)
     else if kind.isNew()
@@ -1319,6 +1332,73 @@ class IrLowerer
     if irTypeKind(value.typeName) == "class" && irTypeKind(expectedType) == "class"
       return context.emitValue(this.module.domains.opcode.getClassUpcast(), expectedType, operands, this.location(node))
     end
+    return value
+  end
+
+  def lowerTry(context: IrFunctionContext, node: Int): IrValue
+    let operandNode = this.bound.childAt(node, 0)
+    let operand = this.lowerExpression(context, operandNode, "")
+    let sourceName = semanticMutableType(this.bound.typeAt(operandNode))
+    let source = this.semantic.findClass(sourceName)
+
+    if source == null
+      return new IrValue(-1, irType(this.bound.typeAt(node)))
+    end
+    let successIndex = source.propagationSuccessCase
+    let failureIndex = source.propagationFailureCase
+    let tag = context.emitSymbol(this.module.domains.opcode.getFieldLoad(), "int", [operand.id], irSymbol(this.module.id, this.module.domains.symbolKind.getField(), sourceName + ".$alternativeTag"), this.location(node))
+
+    context.function.localEffects = context.function.localEffects.withRead()
+    let expected = context.emitConstant("int", this.module.domains.constantKind.getInt(), successIndex as String, this.location(node))
+    let isSuccess = context.emitCompare(tag.id, expected.id, this.module.domains.comparison.getEqual(), this.location(node))
+    let success = context.function.createBlock()
+    let failure = context.function.createBlock()
+    let incoming = context.snapshot()
+    let incomingCloseFailures = context.closeFailures
+
+    context.conditional(isSuccess.id, success, irEmptyInts(), failure, irEmptyInts(), this.location(node))
+    context.setCurrent(failure)
+    let errorType = semanticViewMember(this.bound.typeAt(operandNode), propagationPayloadType(source, failureIndex))
+    let error = context.emitSymbol(this.module.domains.opcode.getFieldLoad(), irType(errorType), [operand.id], irSymbol(this.module.id, this.module.domains.symbolKind.getField(), sourceName + "." + alternativePayloadField(failureIndex, 0)), this.location(node))
+
+    context.function.localEffects = context.function.localEffects.withRead()
+    if this.resourceOutcome(context.function.resultType)
+      let outcomeName = semanticMutableType(irTypeInner(context.function.resultType))
+      let outcome = this.semantic.findClass(outcomeName)
+
+      if outcome == null || outcome.genericArguments.Length < 2
+        return new IrValue(-1, irType(this.bound.typeAt(node)))
+      end
+      let propagated = this.coerce(context, error, irType(outcome.genericArguments[1]), node)
+
+      this.emitResultAcquisitionFailure(context, node, propagated)
+    else
+      let targetName = semanticMutableType(irTypeInner(context.function.resultType))
+      let target = this.semantic.findClass(targetName)
+
+      if target == null
+        return new IrValue(-1, irType(this.bound.typeAt(node)))
+      end
+      let targetIndex = target.propagationFailureCase
+      let targetErrorType = propagationPayloadType(target, targetIndex)
+      let propagated = this.coerce(context, error, irType(targetErrorType), node)
+      let returned = context.emitSymbol(this.module.domains.opcode.getObjectAlloc(), context.function.resultType, irEmptyInts(), irSymbol(this.module.id, this.module.domains.symbolKind.getClass(), targetName), this.location(node))
+
+      context.function.localEffects = context.function.localEffects.mergedWith(new EffectSet().withMayPanic().withManagedAllocate().withSafepoint())
+      let failureTag = context.emitConstant("int", this.module.domains.constantKind.getInt(), targetIndex as String, this.location(node))
+
+      context.emitSymbol(this.module.domains.opcode.getFieldStore(), "void", [returned.id, failureTag.id], irSymbol(this.module.id, this.module.domains.symbolKind.getField(), targetName + ".$alternativeTag"), this.location(node))
+      context.emitSymbol(this.module.domains.opcode.getFieldStore(), "void", [returned.id, propagated.id], irSymbol(this.module.id, this.module.domains.symbolKind.getField(), targetName + "." + alternativePayloadField(targetIndex, 0)), this.location(node))
+      context.function.localEffects = context.function.localEffects.withWrite()
+      this.emitScopeCleanups(context, 0)
+      context.returnValue(returned.id, this.location(node))
+    end
+    context.restore(incoming)
+    context.closeFailures = incomingCloseFailures
+    context.setCurrent(success)
+    let value = context.emitSymbol(this.module.domains.opcode.getFieldLoad(), irType(this.bound.typeAt(node)), [operand.id], irSymbol(this.module.id, this.module.domains.symbolKind.getField(), sourceName + "." + alternativePayloadField(successIndex, 0)), this.location(node))
+
+    context.function.localEffects = context.function.localEffects.withRead()
     return value
   end
 
@@ -1630,7 +1710,7 @@ class IrLowerer
     if operation == "free"
       opcode = this.module.domains.opcode.getNativeFree()
     end
-    context.function.localEffects = context.function.localEffects.mergedWith(opcode.isNativeFree() ? new EffectSet().withUnsafe() : new EffectSet().withMayPanic().withNativeAllocate().withUnsafe())
+    context.function.localEffects = context.function.localEffects.mergedWith(opcode.isNativeFree() ? new EffectSet().withWrite().withUnsafe() : new EffectSet().withMayPanic().withNativeAllocate().withUnsafe())
     let types: String[] = [elementType]
 
     return context.emit(opcode, resultType, operands, types, null, null, "", null, operation == "calloc", this.location(node))
@@ -1723,7 +1803,7 @@ class IrLowerer
   end
 
   def lowerStringValue(context: IrFunctionContext, value: String, node: Int): IrValue
-    let name = "literal.string.sha256." + sha256Text(value)
+    let name = "literal.string.sha256." + sha256FastText(value)
     let symbol = irSymbol(this.module.id, this.module.domains.symbolKind.getGlobal(), name)
 
     if !this.hasGlobal(name)
@@ -1765,6 +1845,9 @@ class IrLowerer
     if resolvedCallable == null
       resolvedCallable = this.findCAbiCallable(target)
     end
+    if resolvedCallable != null && resolvedCallable.operationBridge != ""
+      return irLowerWorkerStart(this, context, node, resolvedCallable)
+    end
     if resolvedCallable != null && resolvedCallable.cAbiSymbol != ""
       if abiRuntimeContract(resolvedCallable.cAbiSymbol) != null
         return this.lowerRuntimeCall(context, node, resolvedCallable.cAbiSymbol)
@@ -1772,6 +1855,9 @@ class IrLowerer
       return this.lowerCAbiCall(context, node, resolvedCallable)
     end
     if resolvedCallable != null && resolvedCallable.intrinsicName != ""
+      if resolvedCallable.intrinsicName == "reference.same"
+        return this.lowerReferenceSame(context, node, resolvedCallable)
+      end
       return this.lowerIntrinsicCall(context, node, resolvedCallable)
     end
     if resolvedCallable == null && abiRuntimeContract(target) != null
@@ -1788,6 +1874,7 @@ class IrLowerer
     end
     context.function.addCallee(callTarget)
     if callable != null && callable.isUnsafe
+      context.function.localEffects = context.function.localEffects.withUnsafe()
       var unsafeOperands: Int[] = [this.currentUnsafe(context)]
 
       for operand in operands
@@ -1801,6 +1888,10 @@ class IrLowerer
   def lowerInstanceCall(context: IrFunctionContext, node: Int): IrValue
     var operands: Int[] = []
     let callable = this.findCallable(this.bound.dataAt(node))
+
+    if callable != null && callable.isUnsafe
+      context.function.localEffects = context.function.localEffects.withUnsafe()
+    end
     let receiverNode = this.bound.childAt(node, 0)
     var receiver = this.lowerExpression(context, receiverNode, "")
     let dispatchType = receiver.typeName
@@ -1809,7 +1900,7 @@ class IrLowerer
     if this.checkParallel && receiverClass != null && receiverClass.isFunctionType && !receiverClass.isParallelFunction
       context.function.parallelUnsafe = true
     end
-    let isDirect = this.bound.valueAt(node) == "direct"
+    let isDirect = this.bound.valueAt(node) == "direct" || (callable != null && callable.genericOrigin >= 0)
     let represented = callable != null && this.representedClass(callable.className)
     let symbolKind = represented ? this.module.domains.symbolKind.getFunction() : this.module.domains.symbolKind.getMethod()
 
@@ -1843,9 +1934,19 @@ class IrLowerer
       let adapterName = this.requestDefaultAdapter(callable, operands.Length - 1, opcode.isCallVirtual(), node)
 
       context.function.addCallee(adapterName)
+      if callable.isUnsafe
+        var unsafeOperands: Int[] = [this.currentUnsafe(context)]
+
+        for operand in operands
+          unsafeOperands = host::appendInt(unsafeOperands, operand)
+        end
+        return context.emitSymbol(this.module.domains.opcode.getCallUnsafe(), irType(this.bound.typeAt(node)), unsafeOperands, irSymbol(this.module.id, this.module.domains.symbolKind.getFunction(), adapterName), this.location(node))
+      end
       return context.emitSymbol(this.module.domains.opcode.getCall(), irType(this.bound.typeAt(node)), operands, irSymbol(this.module.id, this.module.domains.symbolKind.getFunction(), adapterName), this.location(node))
     end
-    if callable != null && !represented && !callable.isStatic && callable.name != "init"
+    if callable != null && callable.genericOrigin >= 0
+      targetName = callable.fullName
+    else if callable != null && !represented && !callable.isStatic && callable.name != "init"
       let owner = this.semantic.findClass(callable.className)
 
       if owner != null
@@ -1863,6 +1964,14 @@ class IrLowerer
     end
     if opcode.isCallVirtual()
       operands = this.virtualOperands(context, operands, receiver.typeName, targetName)
+      if callable != null && callable.isUnsafe
+        var unsafeOperands: Int[] = [this.currentUnsafe(context)]
+
+        for operand in operands
+          unsafeOperands = host::appendInt(unsafeOperands, operand)
+        end
+        operands = unsafeOperands
+      end
       this.addVirtualCallees(context, targetName, dispatchType)
     else
       context.function.addCallee(this.bound.dataAt(node))
@@ -1998,7 +2107,7 @@ class IrLowerer
   def lowerString(context: IrFunctionContext, node: Int): IrValue
     let encoded = this.bound.valueAt(node)
     let value = host::stringSlice(encoded, 2, host::stringByteLength(encoded) - 2)
-    let name = "literal.string.sha256." + sha256Text(value)
+    let name = "literal.string.sha256." + sha256FastText(value)
     let symbol = irSymbol(this.module.id, this.module.domains.symbolKind.getGlobal(), name)
 
     if !this.hasGlobal(name)
@@ -2345,17 +2454,21 @@ class IrLowerer
 
   def lowerOutcomeReturn(context: IrFunctionContext, node: Int): Void
     let child = this.bound.childAt(node, 0)
-    let returned = this.lowerExpression(context, child, "")
     let outcomeName = semanticMutableType(irTypeInner(context.function.resultType))
     let outcome = this.semantic.findClass(outcomeName)
 
     if outcome == null || outcome.genericArguments.Length < 2
+      let returned = this.lowerExpression(context, child, "")
+
       this.emitScopeCleanups(context, 0)
       context.returnValue(returned.id, this.location(node))
       return
     end
     let valueType = outcome.genericArguments[0]
     let failureType = outcome.genericArguments[1]
+    let isFailure = semanticAssignable(this.semantic, failureType, this.bound.typeAt(child)) && !semanticAssignable(this.semantic, valueType, this.bound.typeAt(child))
+    let expectedType = this.bound.typeAt(child) == outcomeName ? context.function.resultType : irType(isFailure ? failureType : valueType)
+    let returned = this.lowerExpression(context, child, expectedType)
     let completionField = this.findField(outcomeName + ".completion")
     let failuresField = this.findField(outcomeName + ".closeFailures")
     let collector = this.ensureCloseFailures(context)
@@ -2387,7 +2500,6 @@ class IrLowerer
         completionName = completionField.typeName
       end
       completion = context.emitSymbol(this.module.domains.opcode.getObjectAlloc(), irType(completionName), irEmptyInts(), irSymbol(this.module.id, this.module.domains.symbolKind.getClass(), completionName), this.location(node))
-      let isFailure = semanticAssignable(this.semantic, failureType, this.bound.typeAt(child)) && !semanticAssignable(this.semantic, valueType, this.bound.typeAt(child))
       let tag = context.emitConstant("int", this.module.domains.constantKind.getInt(), isFailure ? "1" : "0", this.location(node))
 
       context.emitSymbol(this.module.domains.opcode.getFieldStore(), "void", [completion.id, tag.id], irSymbol(this.module.id, this.module.domains.symbolKind.getField(), completionName + ".$alternativeTag"), this.location(node))
@@ -2633,6 +2745,17 @@ class IrLowerer
     return context.emitSymbol(this.module.domains.opcode.getCallImport(), irType(contract.resultType), operands, importSymbol, this.location(node))
   end
 
+  ## `reference.same` is a compiler intrinsic: its operands are managed
+  ## references, and COMPARE preserves both roots without an ABI call.
+  def lowerReferenceSame(context: IrFunctionContext, node: Int, callable: SemanticCallable): IrValue
+    let operands = this.lowerArguments(context, node, 0, callable)
+
+    if operands.Length != 2
+      return new IrValue(-1, "bool")
+    end
+    return context.emitCompare(operands[0], operands[1], this.module.domains.comparison.getEqual(), this.location(node))
+  end
+
   def representedClass(name: String): Bool
     if name == ""
       return false
@@ -2694,16 +2817,21 @@ class IrLowerer
 
     if names == null
       let created = new StringTable<SemanticField>()
-      var classSymbol = this.semantic.firstClass
+      var model: SemanticModel? = this.semantic
 
-      while classSymbol != null
-        var field = classSymbol.firstField
+      while model != null
+        var classSymbol = model.firstClass
 
-        while field != null
-          created.add(field.owner + "." + field.name, field)
-          field = field.nextField
+        while classSymbol != null
+          var field = classSymbol.firstField
+
+          while field != null
+            created.add(field.owner + "." + field.name, field)
+            field = field.nextField
+          end
+          classSymbol = classSymbol.nextClass
         end
-        classSymbol = classSymbol.nextClass
+        model = model.parent
       end
       this.fieldNames = created
       names = created
@@ -2719,13 +2847,18 @@ class IrLowerer
   end
 
   def findCAbiCallable(symbol: String): SemanticCallable?
-    var function = this.semantic.firstFunction
+    var model: SemanticModel? = this.semantic
 
-    while function != null
-      if function.cAbiSymbol == symbol
-        return function
+    while model != null
+      var function = model.firstFunction
+
+      while function != null
+        if function.cAbiSymbol == symbol
+          return function
+        end
+        function = function.nextCallable
       end
-      function = function.nextCallable
+      model = model.parent
     end
     return null
   end
@@ -2844,12 +2977,19 @@ class IrLowerer
     let previousLocationOverride = this.locationOverride
 
     this.locationOverride = adapterLocation
-    let function = new IrFunction(irSymbol(this.module.id, this.module.domains.symbolKind.getFunction(), name), irType(target.returnType), this.module.domains.functionKind.getDefaultAdapter(), false, adapterLocation)
+    let function = new IrFunction(irSymbol(this.module.id, this.module.domains.symbolKind.getFunction(), name), irType(target.returnType), this.module.domains.functionKind.getDefaultAdapter(), target.isUnsafe, adapterLocation)
 
     function.parallelCallees = new StringBuffer() if this.checkParallel
     let entry = function.createBlock()
     let context = new IrFunctionContext(this.module.domains, function, entry)
     var operands: Int[] = []
+
+    if target.isUnsafe
+      function.localEffects = function.localEffects.withUnsafe()
+      function.unsafeRootId = function.allocateValue()
+      context.unsafeCapabilities.add(function.unsafeRootId)
+      context.unsafeDepth = 1
+    end
 
     if target.className != "" && !target.isStatic
       let receiverType = irType(target.className)
@@ -2892,10 +3032,27 @@ class IrLowerer
         callTarget = this.dispatchSlot(owner, target)
       end
       operands = this.virtualOperands(context, operands, "class|" + target.className, callTarget)
+      if target.isUnsafe
+        var unsafeOperands: Int[] = [this.currentUnsafe(context)]
+
+        for operand in operands
+          unsafeOperands = host::appendInt(unsafeOperands, operand)
+        end
+        operands = unsafeOperands
+      end
       opcode = this.module.domains.opcode.getCallVirtual()
       this.addVirtualCallees(context, callTarget, "class|" + target.className)
     else
       function.addCallee(target.fullName)
+      if target.isUnsafe
+        var unsafeOperands: Int[] = [this.currentUnsafe(context)]
+
+        for operand in operands
+          unsafeOperands = host::appendInt(unsafeOperands, operand)
+        end
+        operands = unsafeOperands
+        opcode = this.module.domains.opcode.getCallUnsafe()
+      end
     end
     let symbolKind = target.className != "" && !represented ? this.module.domains.symbolKind.getMethod() : this.module.domains.symbolKind.getFunction()
     let result = context.emitSymbol(opcode, irType(target.returnType), operands, irSymbol(this.module.id, symbolKind, callTarget), this.location(target.boundNode))

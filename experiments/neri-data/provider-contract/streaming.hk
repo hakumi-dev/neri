@@ -1,0 +1,468 @@
+use test
+use clock
+use console
+use files
+use resources
+use result
+use app_data
+use model
+use neri_data
+use neri_data_sqlite
+use neri_data_sqlite_fixture
+
+class StreamCounter
+  public count: Int = 0
+  public lastId: Int = 0
+
+  def seen(value: Customer): Void
+    this.count = this.count + 1
+    this.lastId = value.id
+  end
+end
+
+class StreamNumbers
+  public first: Int = 0
+  public second: Int = 0
+end
+
+class DeadlineProbeProvider: Provider
+  private inner: SQLiteProvider
+  public dispatches: Int = 0
+
+  def init(inner: SQLiteProvider): Void
+    this.inner = inner
+  end
+
+  public override readonly def dialect(): SqlDialect
+    return this.inner.dialect()
+  end
+
+  public override readonly def supports(capability: ProviderCapability): Bool
+    return this.inner.supports(capability)
+  end
+
+  public override def execute(plan: readonly SqlPlan): ProviderResult
+    return this.inner.execute(plan)
+  end
+
+  public override def stream(plan: readonly StreamPlan, visit: fn(RawRow): Bool): StreamResult
+    let target = plan.deadlineMilliseconds()
+    let now = clock::milliseconds()
+
+    test::assertTrue(target != null && now != null)
+    if target != null && now != null
+      test::assertTrue(now < target)
+    end
+    this.dispatches = this.dispatches + 1
+    return this.inner.stream(plan, visit)
+  end
+end
+
+def completed(result: StreamResult, expected: Int): Void
+  match result
+    case StreamResult.Completed(count)
+      test::assertEqual(count, expected)
+    case StreamResult.Stopped(count)
+      test::assertTrue(false)
+    case StreamResult.Cancelled(count)
+      test::assertTrue(false)
+    case StreamResult.Failure(error, count)
+      test::assertTrue(false)
+  end
+end
+
+def stopped(result: StreamResult, expected: Int): Void
+  match result
+    case StreamResult.Stopped(count)
+      test::assertEqual(count, expected)
+    case StreamResult.Completed(count)
+      test::assertTrue(false)
+    case StreamResult.Cancelled(count)
+      test::assertTrue(false)
+    case StreamResult.Failure(error, count)
+      test::assertTrue(false)
+  end
+end
+
+def cancelled(result: StreamResult, expected: Int): Void
+  match result
+    case StreamResult.Cancelled(count)
+      test::assertEqual(count, expected)
+    case StreamResult.Completed(count)
+      test::assertTrue(false)
+    case StreamResult.Stopped(count)
+      test::assertTrue(false)
+    case StreamResult.Failure(error, count)
+      test::assertTrue(false)
+  end
+end
+
+def failed(result: StreamResult, expected: Int): Void
+  match result
+    case StreamResult.Failure(error, count)
+      test::assertEqual(count, expected)
+    case StreamResult.Completed(count)
+      test::assertTrue(false)
+    case StreamResult.Stopped(count)
+      test::assertTrue(false)
+    case StreamResult.Cancelled(count)
+      test::assertTrue(false)
+  end
+end
+
+def transactionSaved(result: WriteResult): Void
+  match result
+    case WriteResult.Saved(count)
+      test::assertEqual(count, 0)
+    case WriteResult.SavedWithValues(count, outputs)
+      test::assertTrue(false)
+    case WriteResult.Failure(error)
+      test::assertTrue(false)
+  end
+end
+
+def writeSaved(result: WriteResult, expected: Int): Void
+  match result
+    case WriteResult.Saved(count)
+      test::assertEqual(count, expected)
+    case WriteResult.SavedWithValues(count, outputs)
+      test::assertTrue(false)
+    case WriteResult.Failure(error)
+      test::assertTrue(false)
+  end
+end
+
+def writeRejected(result: WriteResult): Void
+  match result
+    case WriteResult.Failure(error)
+      test::assertTrue(writeFailureMessage(error) != "")
+    case WriteResult.Saved(count)
+      test::assertTrue(false)
+    case WriteResult.SavedWithValues(count, outputs)
+      test::assertTrue(false)
+  end
+end
+
+def streamCustomerId(): quote fn(Customer): Int
+  return quote do |value: Customer|: Int
+    return value.id
+  end
+end
+
+def streamCustomerName(): quote fn(Customer): String
+  return quote do |value: Customer|: String
+    return value.name
+  end
+end
+
+def streamCustomerNickname(): quote fn(Customer): String?
+  return quote do |value: Customer|: String?
+    return value.nickname
+  end
+end
+
+def streamOrderCustomerId(): quote fn(Order): Int
+  return quote do |value: Order|: Int
+    return value.customerId
+  end
+end
+
+def verifyProjected(provider: SQLiteProvider): Void
+  let db = database(provider)
+  let scalarCount = new StreamNumbers()
+  let scalarVisit: fn(String): Bool = fn(value: String): Bool
+    test::assertEqual(value, "seed")
+    scalarCount.first = scalarCount.first + 1
+    return true
+  end
+
+  completed(select(db.customers, textScalar(), streamCustomerName()).stream(scalarVisit), 1505)
+
+  test::assertEqual(scalarCount.first, 1505)
+
+  let pairCount = new StreamNumbers()
+  let pairMake: fn(Int, String): Int = fn(id: Int, name: String): Int
+    test::assertEqual(name, "seed")
+    return id
+  end
+  let pairVisit: fn(Int): Bool = fn(id: Int): Bool
+    pairCount.first = pairCount.first + 1
+    return true
+  end
+
+  completed(select2(db.customers, intScalar(), streamCustomerId(), textScalar(), streamCustomerName(), pairMake).stream(pairVisit), 1505)
+
+  test::assertEqual(pairCount.first, 1505)
+
+  let stopPair: fn(Int): Bool = fn(id: Int): Bool
+    return false
+  end
+
+  stopped(select2(db.customers, intScalar(), streamCustomerId(), textScalar(), streamCustomerName(), pairMake).streamWith(provider, stopPair), 1)
+  completed(select(db.customers.where(id: 1), intScalar(), streamCustomerId()).stream(pairVisit), 1)
+
+  let shapeCount = new StreamNumbers()
+  let shapeMake: fn(Int, String?): Int = fn(id: Int, nickname: String?): Int
+    test::assertTrue(nickname == null)
+    return id
+  end
+  let shape = combineShapes(fieldShape(intScalar(), streamCustomerId()), fieldShape(optionalTextScalar(), streamCustomerNickname()), shapeMake)
+  let shapeVisit: fn(Int): Bool = fn(id: Int): Bool
+    shapeCount.first = shapeCount.first + 1
+    return true
+  end
+
+  completed(project(db.customers, shape).stream(shapeVisit), 1505)
+
+  test::assertEqual(shapeCount.first, 1505)
+end
+
+def verifyJoined(provider: SQLiteProvider): Void
+  let db = database(provider)
+  let joinedCount = new StreamNumbers()
+  let joinedVisit: fn(Joined<Customer, Order>): Bool = fn(value: Joined<Customer, Order>): Bool
+    test::assertEqual(value.left.id, 1)
+    test::assertEqual(value.right.customerId, 1)
+    value.left.name = "visitor mutation"
+    value.right.total = -1
+    joinedCount.first = joinedCount.first + 1
+    return true
+  end
+  let left = db.customers.where(id: 1).take(1)
+
+  completed(join(left, db.orders, intScalar(), streamCustomerId(), streamOrderCustomerId()).stream(joinedVisit), 1505)
+
+  test::assertEqual(joinedCount.first, 1505)
+  transactionSaved(db.saveChanges())
+
+  let counts = new StreamNumbers()
+  let outerVisit: fn(LeftJoined<Customer, Customer>): Bool = fn(value: LeftJoined<Customer, Customer>): Bool
+    let right = value.right
+
+    if value.left.id == 1
+      test::assertTrue(right != null)
+      if right != null
+        test::assertTrue(right.nickname == null)
+        counts.first = counts.first + 1
+      end
+    else
+      test::assertEqual(value.left.id, 2)
+      test::assertTrue(right == null)
+      counts.second = counts.second + 1
+    end
+    return true
+  end
+
+  completed(leftJoin(db.customers.orderBy(streamCustomerId()).take(2), db.customers.where(id: 1), intScalar(), streamCustomerId(), streamCustomerId()).stream(outerVisit), 2)
+
+  test::assertEqual(counts.first, 1)
+  test::assertEqual(counts.second, 1)
+end
+
+def verifyMany(provider: SQLiteProvider): Void
+  let db = database(provider)
+  let counter = new StreamCounter()
+  let visitor: fn(Customer): Bool = fn(value: Customer): Bool
+    counter.seen(value)
+    value.name = "visitor mutation"
+    return true
+  end
+
+  completed(db.customers.stream(visitor), 1505)
+
+  test::assertEqual(counter.count, 1505)
+  let skipped = new StreamCounter()
+  let skippedVisitor: fn(Customer): Bool = fn(value: Customer): Bool
+    skipped.seen(value)
+    return true
+  end
+
+  completed(db.customers.skip(1).distinct().stream(skippedVisitor), 1504)
+
+  test::assertEqual(skipped.count, 1504)
+  transactionSaved(db.saveChanges())
+  match db.customers.where(id: 1).take(1).all()
+    case QueryResult.Failure(error)
+      test::assertTrue(false)
+    case QueryResult.Rows(rows)
+      let first = rows.first()
+
+      test::assertTrue(first != null)
+      if first != null
+        test::assertEqual(first.value.name, "seed")
+      end
+  end
+end
+
+def verifyEarlyStop(provider: SQLiteProvider): Void
+  let db = database(provider)
+  let counter = new StreamCounter()
+  let visitor: fn(Customer): Bool = fn(value: Customer): Bool
+    counter.seen(value)
+    if counter.count == 1
+      test::assertFalse(provider.close())
+      match db.customers.take(1).all()
+        case QueryResult.Failure(error)
+          match error
+            case QueryFailure.Provider(message)
+              test::assertTrue(message != "")
+            case QueryFailure.InvalidIdentifier(name)
+              test::assertTrue(false)
+            case QueryFailure.InvalidLimit(value, maximum)
+              test::assertTrue(false)
+            case QueryFailure.MissingLimit(maximum)
+              test::assertTrue(false)
+            case QueryFailure.SourceMismatch(expected, actual)
+              test::assertTrue(false)
+            case QueryFailure.UnsupportedCapability(name)
+              test::assertTrue(false)
+            case QueryFailure.MissingColumn(name)
+              test::assertTrue(false)
+            case QueryFailure.TypeMismatch(column, expected, actual)
+              test::assertTrue(false)
+            case QueryFailure.Cardinality(expected, actual)
+              test::assertTrue(false)
+          end
+        case QueryResult.Rows(rows)
+          test::assertTrue(false)
+      end
+      match provider.inspectSchema()
+        case SQLiteSchemaResult.Failure(message)
+          test::assertTrue(message != "")
+        case SQLiteSchemaResult.Snapshot(value)
+          test::assertTrue(false)
+      end
+      writeRejected(db.customers.where(id: 1).executeUpdate(name: "unexpected"))
+    end
+    return counter.count < 3
+  end
+
+  stopped(db.customers.stream(visitor), 3)
+
+  test::assertEqual(counter.count, 3)
+  match db.customers.where(id: 1).take(1).all()
+    case QueryResult.Failure(error)
+      test::assertTrue(false)
+    case QueryResult.Rows(rows)
+      test::assertEqual(rows.count(), 1)
+  end
+end
+
+def verifyCancellation(provider: SQLiteProvider): Void
+  let db = database(provider)
+  let token = new CancellationToken()
+  let counter = new StreamCounter()
+  let visitor: fn(Customer): Bool = fn(value: Customer): Bool
+    counter.seen(value)
+    if counter.count == 2
+      token.cancel()
+    end
+    return true
+  end
+
+  cancelled(db.customers.stream(visitor, new StreamOptions(token: token)), 2)
+
+  test::assertEqual(counter.count, 2)
+  cancelled(db.customers.stream(visitor, new StreamOptions(token: token)), 0)
+  let ordinary: fn(Customer): Bool = fn(value: Customer): Bool
+    return true
+  end
+
+  completed(db.customers.take(1).stream(ordinary), 1)
+end
+
+def verifyBadRows(provider: SQLiteProvider): Void
+  let db = database(provider)
+  let visitor: fn(Customer): Bool = fn(value: Customer): Bool
+    return true
+  end
+
+  failed(db.customers.where(name: "bad bool").stream(visitor), 0)
+  failed(db.customers.where(name: "null id").stream(visitor), 0)
+  failed(db.customers.where(name: "x\0y").stream(visitor), 0)
+  completed(db.customers.where(name: "O'Reilly; DROP TABLE customers; -- 水").stream(visitor), 1)
+end
+
+def heavyCustomers(provider: Provider): Query<Customer>
+  let columns = new ResultColumns([new ResultColumn("id", ResultColumnKind.Int()), new ResultColumn("name", ResultColumnKind.Text()), new ResultColumn("active", ResultColumnKind.Bool()), new ResultColumn("nickname", ResultColumnKind.Text(), true)])
+
+  return new Query<Customer>("heavy_customers", new Decoder<Customer>(decodeEntity_8_Customer, columns), provider: provider)
+end
+
+def verifyDeadline(provider: SQLiteProvider): Void
+  let db = database(provider)
+  let probe = new DeadlineProbeProvider(provider)
+  let counter = new StreamCounter()
+  let visitor: fn(Customer): Bool = fn(value: Customer): Bool
+    counter.seen(value)
+    return true
+  end
+
+  transactionSaved(db.beginTransaction())
+  writeSaved(db.customers.where(id: 1).executeUpdate(name: "pending"), 1)
+  cancelled(heavyCustomers(probe).stream(visitor, new StreamOptions(timeoutMilliseconds: 50)), 0)
+
+  test::assertEqual(probe.dispatches, 1)
+  test::assertEqual(counter.count, 0)
+  transactionSaved(db.commitTransaction())
+  match db.customers.where(id: 1).take(1).all()
+    case QueryResult.Failure(error)
+      test::assertTrue(false)
+    case QueryResult.Rows(rows)
+      let first = rows.first()
+
+      test::assertTrue(first != null)
+      if first != null
+        test::assertEqual(first.value.name, "pending")
+      end
+  end
+  completed(db.customers.take(1).stream(visitor), 1)
+end
+
+def withProvider(path: String, verify: fn(SQLiteProvider): Void): Void
+  match SQLiteProvider.openWritable(path)
+    case SQLiteOpenResult.Failure(message)
+      test::assertTrue(false)
+    case SQLiteOpenResult.Opened(provider)
+      verify(provider)
+
+      test::assertTrue(provider.close())
+  end
+end
+
+def verifyFiles(): resources::Outcome<Int, result::Failure>
+  using temporary <- files::TemporaryDirectory.create("neri-stream-")
+    let cleanPath = temporary.path() + "/clean.sqlite"
+    let badPath = temporary.path() + "/bad.sqlite"
+    let heavyPath = temporary.path() + "/heavy.sqlite"
+    let clean = "CREATE TABLE customers(id INTEGER, name TEXT, active INTEGER, nickname TEXT); CREATE TABLE orders(id INTEGER, customer_id INTEGER, total INTEGER); WITH RECURSIVE n(id) AS (VALUES(1) UNION ALL SELECT id + 1 FROM n WHERE id < 1505) INSERT INTO customers SELECT id, 'seed', 0, NULL FROM n; WITH RECURSIVE n(id) AS (VALUES(1) UNION ALL SELECT id + 1 FROM n WHERE id < 1505) INSERT INTO orders SELECT id, 1, id FROM n;"
+    let bad = "CREATE TABLE customers(id INTEGER, name TEXT, active INTEGER, nickname TEXT); CREATE TABLE orders(id INTEGER, customer_id INTEGER, total INTEGER); INSERT INTO customers VALUES(1, 'bad bool', 2, NULL), (NULL, 'null id', 1, NULL), (2, 'O''Reilly; DROP TABLE customers; -- 水', 1, NULL);"
+    let heavy = "CREATE TABLE customers(id INTEGER, name TEXT, active INTEGER, nickname TEXT); CREATE TABLE orders(id INTEGER, customer_id INTEGER, total INTEGER); INSERT INTO customers VALUES(1, 'seed', 1, NULL); CREATE VIEW heavy_customers AS WITH RECURSIVE n(value) AS (VALUES(1) UNION ALL SELECT value + 1 FROM n WHERE value < 100000000) SELECT MAX(value) AS id, 'heavy' AS name, 1 AS active, NULL AS nickname FROM n;"
+
+    test::assertTrue(createSQLiteFixture(cleanPath, clean))
+    test::assertTrue(createSQLiteFixture(badPath, bad))
+    test::assertTrue(createSQLiteFixture(heavyPath, heavy))
+    withProvider(cleanPath, verifyMany)
+    withProvider(cleanPath, verifyProjected)
+    withProvider(cleanPath, verifyJoined)
+    withProvider(cleanPath, verifyEarlyStop)
+    withProvider(cleanPath, verifyCancellation)
+    withProvider(badPath, verifyBadRows)
+    withProvider(heavyPath, verifyDeadline)
+    return 0
+  end
+  return 1
+end
+
+def main(): Void
+  let completed = verifyFiles()
+
+  test::assertEqual(completed.closeFailures.count(), 0)
+  match completed.completion
+    case resources::Completion.Value(value)
+      test::assertEqual(value, 0)
+    case resources::Completion.Failure(problem)
+      test::assertTrue(false)
+  end
+  console::println("SQLite streaming contracts passed")
+end

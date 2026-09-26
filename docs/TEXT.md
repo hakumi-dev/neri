@@ -21,6 +21,13 @@ not allocate an intermediate array. `fromBytes(value)` returns a new `String`
 only for valid UTF-8 and otherwise returns `null`. `concat` and `equal` use the
 built-in `String` operations.
 
+`invalidUtf8Offset(bytes): Int?` returns `null` for valid UTF-8. For invalid
+input it returns the zero-based byte position that violates the encoding rules;
+for an incomplete final sequence, it returns that sequence's first byte. It
+allocates no output and follows [RFC 3629 section 4](https://www.rfc-editor.org/rfc/rfc3629.html#section-4)
+and [Unicode Table 3-7](https://www.unicode.org/versions/Unicode17.0.0/core-spec/chapter-3/).
+Call it after `fromBytes` fails when a diagnostic needs the byte position.
+
 `scalarCount(value)` counts Unicode scalar values. `scalarAt(value, index)`
 returns the scalar value as an `Int`, or `null` for a negative or out-of-range
 index. A scalar is not a grapheme cluster: for example, a base letter followed
@@ -39,7 +46,7 @@ the scalar values.
 `byteLength`, `byteAt`, and `isScalarBoundary` are constant time.
 `Scalar.fromInt` has constant work and creates one `Scalar`; `utf8()` has
 constant byte work and creates one array of one to four bytes. `sliceBytes`,
-`copyBytes`, `bytes`, and `fromBytes` are linear in byte length. `scalarCount`
+`copyBytes`, `bytes`, `fromBytes`, and `invalidUtf8Offset` are linear in byte length. `scalarCount`
 and `scalarAt` scan UTF-8 and are linear in the traversed byte length. `concat`
 allocates the combined string and `equal` may compare each byte. These choices
 follow the usual distinction between bytes, scalar values, and character

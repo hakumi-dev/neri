@@ -13,6 +13,10 @@ def genericFunctionAnnotationsSupported(owner: BootstrapBinder, node: Int): Bool
   while index < annotationCount
     let kind = syntax.annotationAt(syntax.childAt(node, index))
 
+    if kind.isIntrinsic() && owner.classAnnotationArgument(syntax.childAt(node, index)) == "reference.same"
+      index = index + 1
+      continue
+    end
     if !kind.isExact() && !kind.isOperation()
       return false
     end
@@ -62,7 +66,7 @@ def genericName(owner: BootstrapBinder, node: Int): String
   return semanticQualifiedName(declaration.namespaceName, declaration.name)
 end
 
-def referenceGenericUses(owner: BootstrapBinder, node: Int, namespaceName: String): Void
+def referenceGenericUses(owner: BootstrapBinder, node: Int, namespaceName: String, genericNames: StringTable<Bool>): Void
   if !owner.checkpoint()
     return
   end
@@ -81,13 +85,8 @@ def referenceGenericUses(owner: BootstrapBinder, node: Int, namespaceName: Strin
       if owner.model.findFunction(qualified) != null
         owner.model.referenceUse(owner.model.usedNames.get(useIndex))
       end
-      var genericIndex = 0
-
-      while genericIndex < owner.model.genericTemplates.size
-        if genericName(owner, owner.model.genericTemplates.get(genericIndex)) == qualified
-          owner.model.referenceUse(owner.model.usedNames.get(useIndex))
-        end
-        genericIndex = genericIndex + 1
+      if genericNames.find(qualified) != null
+        owner.model.referenceUse(owner.model.usedNames.get(useIndex))
       end
       useIndex = useIndex + 1
     end
@@ -99,15 +98,9 @@ def referenceGenericUses(owner: BootstrapBinder, node: Int, namespaceName: Strin
     owner.recordNamespaceQualifier(base, node)
     while !semanticIsQualifiedName(base) && useIndex < owner.model.usedNames.size
       let qualified = semanticQualifiedName(owner.model.usedNames.get(useIndex), base)
-      var genericIndex = 0
 
-      while genericIndex < owner.model.genericTemplates.size
-        let declared = genericName(owner, owner.model.genericTemplates.get(genericIndex))
-
-        if declared == qualified
-          owner.model.referenceUse(owner.model.usedNames.get(useIndex))
-        end
-        genericIndex = genericIndex + 1
+      if genericNames.find(qualified) != null
+        owner.model.referenceUse(owner.model.usedNames.get(useIndex))
       end
       useIndex = useIndex + 1
     end
@@ -115,23 +108,30 @@ def referenceGenericUses(owner: BootstrapBinder, node: Int, namespaceName: Strin
   var index = 0
 
   while index < owner.syntax.childCountAt(node) && owner.checkpoint()
-    referenceGenericUses(owner, owner.syntax.childAt(node, index), namespaceName)
+    referenceGenericUses(owner, owner.syntax.childAt(node, index), namespaceName, genericNames)
     index = index + 1
   end
 end
 
 def referenceGenericTemplateUses(owner: BootstrapBinder): Void
-  if owner.model.usedNames.size == 0
+  if !owner.recordSourceSymbols || owner.model.usedNames.size == 0
     return
   end
   var index = 0
+  let genericNames = new StringTable<Bool>()
 
+  # This pass only records imports; template declarations stay fixed throughout it.
+  while index < owner.model.genericTemplates.size && owner.checkpoint()
+    genericNames.add(genericName(owner, owner.model.genericTemplates.get(index)), true)
+    index = index + 1
+  end
+  index = 0
   while index < owner.model.genericTemplates.size && owner.checkpoint()
     let node = owner.model.genericTemplates.get(index)
     let declaration = semanticDeclaration(owner, node)
 
     if declaration != null
-      referenceGenericUses(owner, node, declaration.namespaceName)
+      referenceGenericUses(owner, node, declaration.namespaceName, genericNames)
     end
     index = index + 1
   end
@@ -240,6 +240,7 @@ def registerGenericTemplates(owner: BootstrapBinder): Void
         owner.report("NR220", node, "Generic declaration '" + genericName(owner, node) + "' conflicts with an existing contract.")
       end
       owner.model.genericTemplates.add(node)
+      propagationCases(owner, node) if owner.syntax.kindAt(node).isClass()
       semanticGenericConstraintsValid(owner, node)
       let parent = owner.model.parent
 
@@ -374,10 +375,8 @@ end
 def findGenericTemplateReadOnly(model: SemanticModel, syntax: SyntaxArena, name: String, namespaceName: String, kind: readonly SyntaxKind): Int
   # A value at or below -3 encodes the second conflicting node as -node-3.
   # Callers that only query visibility can treat every negative value as absent.
-  var candidate = -1
-  var index = 0
-
   if semanticIsQualifiedName(name)
+    var index = 0
     let qualified = model.resolveQualifiedName(name)
 
     while index < model.genericTemplates.size
@@ -391,19 +390,30 @@ def findGenericTemplateReadOnly(model: SemanticModel, syntax: SyntaxArena, name:
     return -1
   end
 
+  let namespaceCandidate = semanticQualifiedName(namespaceName, name)
+  var candidate = -1
+  var index = 0
+
   while index < model.genericTemplates.size
     let node = model.genericTemplates.get(index)
 
     if syntax.kindAt(node).same(kind)
       let fullName = genericSyntaxName(syntax, node)
 
-      if fullName == semanticQualifiedName(namespaceName, name)
+      if fullName == namespaceCandidate
         return node
       end
       if fullName == name
         candidate = node
       end
     end
+    index = index + 1
+  end
+  let importedNames = new StringTable<Bool>()
+
+  index = 0
+  while index < model.usedNames.size
+    importedNames.add(semanticQualifiedName(model.usedNames.get(index), name), true)
     index = index + 1
   end
   var imported = -1
@@ -413,16 +423,13 @@ def findGenericTemplateReadOnly(model: SemanticModel, syntax: SyntaxArena, name:
     let node = model.genericTemplates.get(index)
 
     if syntax.kindAt(node).same(kind)
-      var useIndex = 0
+      let fullName = genericSyntaxName(syntax, node)
 
-      while useIndex < model.usedNames.size
-        if genericSyntaxName(syntax, node) == semanticQualifiedName(model.usedNames.get(useIndex), name)
-          if imported >= 0 && imported != node
-            return -node - 3
-          end
-          imported = node
+      if importedNames.find(fullName) != null
+        if imported >= 0 && imported != node
+          return -node - 3
         end
-        useIndex = useIndex + 1
+        imported = node
       end
     end
     index = index + 1

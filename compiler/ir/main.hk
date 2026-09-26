@@ -4,6 +4,24 @@ use host
 def main(): Void
   let firstArgument = host::argumentAt(0)
 
+  if firstArgument != null && firstArgument == "--print-runtime-manifest"
+    let configured = host::environment("NERI_RUNTIME_MANIFEST")
+
+    if host::argumentCount() != 1 || configured == null || configured == ""
+      console::println("NERI_TOOLCHAIN: Select a launcher with NERI_RUNTIME_MANIFEST configured.")
+      host::exit(2)
+      return
+    end
+    let manifest = neriCanonicalPath(configured)
+
+    if manifest == null || host::readText(manifest) == null
+      console::println("NERI_TOOLCHAIN: Runtime manifest is unavailable.")
+      host::exit(2)
+      return
+    end
+    console::println(manifest)
+    return
+  end
   if firstArgument != null && firstArgument == "build-batch"
     bootstrapBatchMain()
     return
@@ -48,682 +66,6 @@ def main(): Void
   bootstrapCompile(arguments)
 end
 
-def bootstrapCompile(arguments: String[], batch: BatchCompilation? = null): Void
-  let started = runCacheTime()
-  var timings = false
-  var noCache = false
-  var quiet = false
-  var moduleName = "main"
-  var sourceRoot = ""
-  var projectPath = ""
-  let referencedPaths = new StringBuffer()
-  let referencedIds = new StringBuffer()
-  var unit = ""
-  var projectKind: ProjectUnitKind? = null
-  var implicitProject = false
-  var loadedProject: NeriProject? = null
-  var consumerOwner = ""
-  var emitName = "neri-ir"
-  var emitExplicit = false
-  var output = ""
-  var targetName = ""
-  var release = false
-  var sessionModule = false
-  var command = "run"
-  var firstSource: BootstrapSourceInput? = null
-  var lastSource: BootstrapSourceInput? = null
-  var sourceCount = 0
-  var programArguments: String[] = []
-  var index = 0
-
-  while index < arguments.Length
-    let optionalArgument: String? = arguments[index]
-
-    if optionalArgument == null
-      return
-    end
-    let argument = optionalArgument
-
-    if index == 0 && (argument == "build" || argument == "check" || argument == "run")
-      command = argument
-      index = index + 1
-    else if argument == "--" && command == "run"
-      index = index + 1
-      while index < arguments.Length
-        let value: String? = arguments[index]
-
-        if value != null
-          programArguments = host::appendString(programArguments, value)
-        end
-        index = index + 1
-      end
-    else if argument == "--version" || (index == 0 && argument == "version")
-      console::println("neri " + neriVersion())
-      return
-    else if argument == "--help"
-      bootstrapUsage()
-      return
-    else if argument == "--module" || argument == "--source-root" || argument == "--output" || argument == "--target" || argument == "--project" || argument == "--unit"
-      if index + 1 >= arguments.Length
-        bootstrapUsage()
-        host::exit(2)
-        return
-      end
-      let optionalValue: String? = arguments[index + 1]
-
-      if optionalValue == null
-        return
-      end
-      if argument == "--project"
-        projectPath = optionalValue
-      else if argument == "--unit"
-        unit = optionalValue
-      else if argument == "--module"
-        moduleName = optionalValue
-      else if argument == "--source-root"
-        sourceRoot = optionalValue
-      else if argument == "--output"
-        output = optionalValue
-      else
-        targetName = optionalValue
-      end
-      index = index + 2
-    else if bootstrapStartsWith(argument, "--module=")
-      moduleName = host::stringSlice(argument, 9, host::stringByteLength(argument) - 9)
-      index = index + 1
-    else if bootstrapStartsWith(argument, "--source-root=")
-      sourceRoot = host::stringSlice(argument, 14, host::stringByteLength(argument) - 14)
-      index = index + 1
-    else if bootstrapStartsWith(argument, "--emit=")
-      emitName = host::stringSlice(argument, 7, host::stringByteLength(argument) - 7)
-      emitExplicit = true
-      index = index + 1
-    else if argument == "--timings"
-      timings = true
-      index = index + 1
-    else if argument == "--no-cache"
-      noCache = true
-      index = index + 1
-    else if argument == "--quiet"
-      quiet = true
-      index = index + 1
-    else if argument == "--release"
-      release = true
-      index = index + 1
-    else if argument == "--session-module"
-      sessionModule = true
-      index = index + 1
-    else if bootstrapStartsWith(argument, "--")
-      console::println("unknown option: " + argument)
-      bootstrapUsage()
-      host::exit(2)
-      return
-    else
-      let optionalPath = host::pathAbsolute(argument)
-
-      if optionalPath == null
-        console::println("source path is invalid: " + argument)
-        host::exit(2)
-        return
-      end
-      let path = optionalPath
-
-      if !neriSourceNameValid(path)
-        console::println(".hk file names must not contain whitespace: " + argument)
-        host::exit(2)
-        return
-      end
-      let text = host::readText(path)
-
-      if text == null
-        console::println("could not read source: " + argument)
-        host::exit(2)
-        return
-      end
-      let input = new BootstrapSourceInput(path, "", text)
-
-      if firstSource == null
-        firstSource = input
-      else
-        let last = lastSource
-
-        if last != null
-          last.nextInput = input
-        end
-      end
-      lastSource = input
-      sourceCount = sourceCount + 1
-      index = index + 1
-    end
-  end
-  if projectPath != ""
-    if sourceCount != 0
-      console::println("--project cannot be combined with explicit source files")
-      host::exit(2)
-      return
-    end
-    let project = neriLoadProject(projectPath, unit)
-
-    if project.error() != ""
-      console::println(project.error())
-      host::exit(2)
-      return
-    end
-    projectKind = project.kind
-    implicitProject = project.implicit
-    loadedProject = project
-    let ownSource = project.ownSources.first.nextNode
-
-    if ownSource != null
-      let owner = neriUnitSourceOwner(project, ownSource.value)
-
-      consumerOwner = owner if owner != null
-    end
-    var reference = project.referenceSources.first.nextNode
-
-    while reference != null
-      referencedPaths.add(reference.value)
-      reference = reference.nextNode
-    end
-    var entry = project.sources.first.nextNode
-
-    while entry != null
-      let text = neriProjectVerifiedText(project, entry.value)
-
-      if text == null
-        console::println("could not read project source: " + entry.value)
-        host::exit(2)
-        return
-      end
-      let input = new BootstrapSourceInput(entry.value, "", text)
-
-      if firstSource == null
-        firstSource = input
-      else
-        let last = lastSource
-
-        if last != null
-          last.nextInput = input
-        end
-      end
-      lastSource = input
-      sourceCount = sourceCount + 1
-      entry = entry.nextNode
-    end
-  else if unit != ""
-    console::println("--unit requires --project")
-    host::exit(2)
-    return
-  end
-  if sourceCount == 0
-    bootstrapUsage()
-    host::exit(2)
-    return
-  end
-  if (command == "build" || command == "run") && !emitExplicit
-    emitName = "executable"
-  end
-  let emit = EmissionKind.parse(emitName)
-
-  if projectUnitIsLibrary(projectKind) && emit != null && emit.isExecutable()
-    console::println("A library unit cannot be emitted as an executable; use check or build --emit=obj --output <file>.")
-    host::exit(2)
-    return
-  end
-  if command == "run" && (emit == null || !emit.isExecutable() || output != "")
-    console::println("run owns its executable location; --output and non-executable --emit are invalid")
-    host::exit(2)
-    return
-  end
-  if emit == null
-    console::println("unknown emit kind: " + emitName)
-    bootstrapUsage()
-    host::exit(2)
-    return
-  end
-
-  var logicalRoot = ""
-
-  if sourceRoot != ""
-    let optionalRoot = host::pathAbsolute(sourceRoot)
-
-    if optionalRoot == null
-      console::println("source root is invalid: " + sourceRoot)
-      host::exit(2)
-      return
-    end
-    logicalRoot = optionalRoot
-  else if sourceCount > 1
-    logicalRoot = bootstrapCommonSourceRoot(firstSource)
-  end
-
-  let libraryDirectory = host::environment("NERI_STDLIB")
-
-  if libraryDirectory == null || libraryDirectory == ""
-    console::println("required standard library core is unavailable: NERI_STDLIB is not set")
-    host::exit(2)
-    return
-  end
-  let libraries = new StandardLibraryCatalog(libraryDirectory)
-
-  if libraries.error != ""
-    console::println(libraries.error)
-    host::exit(2)
-    return
-  end
-  var source = firstSource
-  let sourceIdentities = new StringTable<Bool>()
-  let suppliedPaths = new StringTable<Bool>()
-  let libraryReferences = new BootstrapLibraryReferences()
-
-  while source != null
-    if logicalRoot != "" && !bootstrapPathWithin(logicalRoot, source.path)
-      console::println("source is outside source root: " + source.path)
-      host::exit(2)
-      return
-    end
-    let librarySourceName = libraries.sourceName(source.path)
-
-    if librarySourceName != null
-      source.id = "@stdlib/" + librarySourceName
-    else
-      source.id = bootstrapSourceId(source.path, logicalRoot, sourceCount == 1 && sourceRoot == "")
-    end
-    if !sourceIdentities.add(source.id, true)
-      console::println("source identity is specified more than once: " + source.id)
-      host::exit(2)
-      return
-    end
-    let canonical = neriCanonicalPath(source.path)
-
-    suppliedPaths.add(canonical, true) if canonical != null
-    libraryReferences.addSource(source.text)
-    source = source.nextInput
-  end
-  var pendingLibraries = true
-
-  while pendingLibraries
-    pendingLibraries = false
-    for libraryName in libraryReferences.libraryNames()
-      let paths = libraries.sourcePaths(libraryName)
-
-      if libraries.error != "" || (libraryName == bootstrapCoreLibraryName() && paths.size == 0)
-        console::println(libraries.error != "" ? libraries.error : "required standard library core is unavailable")
-        host::exit(2)
-        return
-      end
-      var path = paths.first.nextNode
-
-      while path != null
-        let libraryPath = libraryDirectory + "/" + path.value
-        let canonical = neriCanonicalPath(libraryPath)
-        let supplied = canonical != null && suppliedPaths.find(canonical) != null
-
-        if !supplied
-          let project = loadedProject
-          var libraryText: String? = null
-
-          if project == null
-            libraryText = host::readText(libraryPath)
-          else
-            libraryText = neriProjectVerifiedText(project, libraryPath)
-          end
-
-          if libraryText != null
-            libraryReferences.addSource(libraryText)
-            let library = new BootstrapSourceInput(libraryPath, "@stdlib/" + path.value, libraryText)
-            let last = lastSource
-
-            if last != null
-              last.nextInput = library
-            end
-            lastSource = library
-            suppliedPaths.add(canonical, true) if canonical != null
-            pendingLibraries = true
-          else
-            console::println("standard library source is unavailable: " + libraryPath)
-            host::exit(2)
-            return
-          end
-        end
-        path = path.nextNode
-      end
-    end
-  end
-  let sourceIds = new StringBuffer()
-  let sourceOwners = new StringBuffer()
-  let sourcePaths = new StringBuffer()
-  let sourceTexts = new StringBuffer()
-  let sourceStarts = new IntBuffer()
-  var combined = ""
-  var combinedLength = 0
-
-  source = bootstrapNextSource(firstSource)
-  while source != null
-    source.emitted = true
-    sourceIds.add(source.id)
-    var owner = consumerOwner
-
-    owner = "@stdlib" if bootstrapStartsWith(source.id, "@stdlib/")
-    let project = loadedProject
-
-    if project != null
-      let declaredOwner = neriUnitSourceOwner(project, source.path)
-
-      if declaredOwner != null
-        owner = declaredOwner
-      end
-    end
-    sourceOwners.add(owner)
-    if projectUnitIsLibrary(projectKind) || neriProjectListed(referencedPaths, source.path)
-      referencedIds.add(source.id)
-    end
-    let optionalFileName = host::pathFileName(source.path)
-    var displayName = source.id
-
-    if optionalFileName != null
-      displayName = optionalFileName
-    end
-    sourcePaths.add(displayName)
-    sourceTexts.add(source.text)
-    sourceStarts.add(combinedLength)
-    combined = combined + source.text + "\n"
-    combinedLength = combinedLength + (new IrSourceMap(source.text)).utf16Length() + 1
-    source = bootstrapNextSource(firstSource)
-  end
-
-  var dependency: BatchDependency? = null
-
-  runCacheReport(timings, "source-load", started)
-  if batch != null && projectUnitIsExecutable(projectKind) && !sessionModule
-    dependency = batch.prepare(combined, sourceIds, sourceTexts, sourceStarts, sourceOwners, consumerOwner, timings)
-  end
-  var parseSource = combined
-  var parseOffset = 0
-  var retainedSyntax: SyntaxArena? = null
-  var retainedModel: SemanticModel? = null
-
-  if dependency != null
-    parseSource = host::stringSlice(combined, dependency.byteLength, host::stringByteLength(combined) - dependency.byteLength)
-    parseOffset = dependency.sourceLength
-    retainedSyntax = dependency.parser.arena
-    retainedModel = dependency.model
-  end
-  let parseStarted = runCacheTime()
-  let lexer = new BootstrapLexer(parseSource)
-
-  lexer.utf16Position = parseOffset
-  let tokens = lexer.lex()
-  let parser = new BootstrapParser(tokens, retainedSyntax)
-
-  index = 0
-  while index < sourceStarts.size
-    parser.addSourceBoundary(sourceStarts.get(index)) if sourceStarts.get(index) >= parseOffset
-    index = index + 1
-  end
-  let root = parser.parseProgram()
-
-  runCacheReport(timings, "parse", parseStarted)
-  if parser.diagnostics.count() > 0
-    irEmitDiagnostics(parser.diagnostics, "Parse", sourcePaths, sourceTexts, sourceStarts)
-    host::exit(1)
-    return
-  end
-  let bindStarted = runCacheTime()
-  let binder = new BootstrapBinder(parser.arena, root, tokens.startAt(tokens.count() - 1), retainedModel)
-
-  binder.requireEntryPoint = !sessionModule && (projectUnitIsExecutable(projectKind) || (projectKind == null && (projectPath == "" || emit.isExecutable())))
-  binder.forbiddenEntryPointSources = referencedIds
-  binder.clearSources()
-  index = 0
-  while index < sourceIds.size
-    binder.addSource(sourceIds.get(index), sourceStarts.get(index))
-    index = index + 1
-  end
-  let semantic = binder.bind()
-
-  runCacheReport(timings, "bind", bindStarted)
-  if semantic.diagnostics.count() > 0
-    if implicitProject
-      index = 0
-      while index < semantic.diagnostics.count()
-        semantic.diagnostics.messages.set(index, semantic.diagnostics.messages.get(index) + neriImplicitProjectHint(semantic.diagnostics.codes.get(index)))
-        index = index + 1
-      end
-    end
-    irEmitDiagnostics(semantic.diagnostics, "TypeCheck", sourcePaths, sourceTexts, sourceStarts)
-    host::exit(1)
-    return
-  end
-  if retainedModel != null
-    semanticAdoptDeclarations(semantic, retainedModel)
-  end
-  let lowerStarted = runCacheTime()
-  let lowerer = new IrLowerer(semantic, parser.arena, combined, moduleName)
-
-  lowerer.setSources(sourceIds, sourceTexts, sourceStarts)
-  let module = lowerer.lower()
-
-  runCacheReport(timings, "lower", lowerStarted)
-  if semantic.diagnostics.count() > 0
-    irEmitDiagnostics(semantic.diagnostics, "TypeCheck", sourcePaths, sourceTexts, sourceStarts)
-    host::exit(1)
-    return
-  end
-  if sessionModule
-    var sessionEntry: IrFunction? = null
-    var candidate = module.firstFunction
-
-    while candidate != null
-      if candidate.symbol.name == "__neri_session_entry"
-        sessionEntry = candidate
-      end
-      candidate = candidate.nextFunction
-    end
-    if sessionEntry == null
-      console::println("SessionModule: generated __neri_session_entry is missing")
-      host::exit(1)
-      return
-    end
-    let entry = sessionEntry
-
-    if entry.parameterTypes.size > 1 || entry.resultType == "void"
-      console::println("SessionModule: entry must take zero or one managed frame and return a managed frame")
-      host::exit(1)
-      return
-    end
-    module.exportSession(entry)
-  end
-  let verificationStarted = runCacheTime()
-  let verification = irVerify(module)
-
-  runCacheReport(timings, "ir-verify", verificationStarted)
-  if !verification.succeeded()
-    index = 0
-    while index < verification.errors.size
-      console::println("NIRV|" + verification.errors.get(index))
-      index = index + 1
-    end
-    host::exit(1)
-    return
-  end
-  if emit.usesCodegen()
-    runCacheReport(timings, "frontend", started)
-    if targetName == ""
-      let manifestPath = host::environment("NERI_RUNTIME_MANIFEST")
-
-      if manifestPath != null
-        let manifest = host::readText(manifestPath)
-
-        if manifest != null
-          targetName = bootstrapManifestString(manifest, "target")
-        end
-      end
-    end
-    let target = TargetPlatform.parse(targetName)
-
-    if target == null
-      console::println("--target must be linux-x86_64, macos-arm64 or windows-x86_64 for native artifacts")
-      host::exit(2)
-      return
-    end
-    var runDirectory = ""
-    let cache = new RunCache()
-
-    if command == "run"
-      let lookupStarted = runCacheTime()
-
-      if !noCache
-        cache.prepare(module, target, release, firstSource)
-      end
-      let hit = cache.hit()
-
-      runCacheReport(timings, hit ? "cache-hit" : "cache-miss", lookupStarted)
-      if hit
-        runCacheReport(timings, "ready", started)
-        let executionStarted = runCacheTime()
-        let result = host::run(cache.executable, programArguments)
-
-        runCacheReport(timings, "execute", executionStarted)
-        if result != null
-          host::exit(result > 125 ? 125 : result)
-          return
-        end
-        # A vanished or non-executable artifact is a miss, not a program error.
-      end
-      var directory: String? = null
-
-      if cache.directory != ""
-        directory = bootstrapTemporaryDirectory(bootstrapDirectory(cache.directory), "pending")
-      end
-      if directory == null
-        directory = bootstrapRunDirectory()
-      end
-      if directory == null
-        console::println("could not create temporary run directory")
-        host::exit(2)
-        return
-      end
-      runDirectory = directory
-      output = directory + "/program"
-    end
-    if output == "" && command == "build" && emit.isExecutable()
-      let first = firstSource
-
-      if first != null
-        let name = host::pathFileName(first.path)
-
-        if name != null
-          let length = host::stringByteLength(name)
-
-          if length > 3 && (host::stringByteAt(name, length - 3) as Int) == 46 && (host::stringByteAt(name, length - 2) as Int) == 104 && (host::stringByteAt(name, length - 1) as Int) == 107
-            output = "./" + host::stringSlice(name, 0, length - 3)
-          end
-        end
-      end
-    end
-    if output == ""
-      console::println("--output is required for native artifacts")
-      host::exit(2)
-      return
-    end
-    if (emit.isObject() || emit.isExecutable()) && output == "-"
-      console::println("--output - is not valid for " + emit.name())
-      host::exit(2)
-      return
-    end
-    if emit.isExecutable()
-      output = platformExecutable(output, target)
-    end
-    var units: IrCompilationUnit? = null
-
-    if emit.isExecutable() && !sessionModule && consumerOwner != ""
-      let partitionStarted = runCacheTime()
-
-      units = irPartitionModule(module, semantic, sourceIds, sourceOwners, consumerOwner)
-      runCacheReport(timings, units == null ? "partition-fallback" : "partition", partitionStarted)
-    end
-    var nativeSucceeded = false
-
-    if units != null
-      let configuration = bootstrapAotConfiguration(sourceOwners)
-      var configurationText = ""
-
-      configurationText = configuration if configuration != null
-
-      nativeSucceeded = bootstrapEmitCompilationUnits(module, units, output, target, release, timings,
-        noCache || configuration == null, firstSource, configurationText)
-    else
-      nativeSucceeded = bootstrapEmitNative(module, emit, output, target, release, timings, firstSource)
-    end
-
-    if nativeSucceeded && command == "build"
-      runCacheReport(timings, "build-complete", started)
-    end
-    if command == "run"
-      var status = 2
-
-      if nativeSucceeded
-        if cache.publish(runDirectory)
-          runDirectory = ""
-        end
-        if cache.hit()
-          output = cache.executable
-        end
-        runCacheReport(timings, "ready", started)
-        let executionStarted = runCacheTime()
-        let result = host::run(output, programArguments)
-
-        runCacheReport(timings, "execute", executionStarted)
-        if result != null
-          status = result
-        else
-          console::println("could not run executable: " + host::errorMessage())
-        end
-      end
-      if runDirectory != ""
-        bootstrapRemoveRunDirectory(runDirectory)
-      end
-      if status > 125
-        status = 125
-      end
-      host::exit(status)
-      return
-    end
-    if !nativeSucceeded
-      host::exit(2)
-    end
-    if output != "-" && !quiet
-      console::println(output)
-    end
-  else if emit.isCHeader()
-    let headerError = irCHeaderError(module)
-
-    if headerError != ""
-      console::println("CHeader: " + headerError)
-      host::exit(1)
-      return
-    end
-    let artifact = irCHeader(module)
-
-    if !bootstrapWriteArtifact(output, artifact)
-      host::exit(2)
-    end
-  else if emit.isNeriIRHex()
-    let artifact = irSerializeEnvelopeHex(module)
-
-    if !bootstrapWriteArtifact(output, artifact)
-      host::exit(2)
-    end
-  else
-    let artifact = irRenderModule(module)
-
-    if !bootstrapWriteArtifact(output, artifact)
-      host::exit(2)
-    end
-  end
-end
-
 def neriProjectUnitsFieldValid(value: String): Bool
   var index = 0
 
@@ -740,6 +82,8 @@ end
 
 def neriProjectUnitsCli(): Void
   var projectPath = ""
+  var testSuite = ""
+  var selectingTests = false
   var index = 1
 
   while index < host::argumentCount()
@@ -750,13 +94,19 @@ def neriProjectUnitsCli(): Void
 
       projectPath = value if value != null
       index = index + 2
+    else if argument != null && argument == "--test-suite" && index + 1 < host::argumentCount()
+      let value = host::argumentAt(index + 1)
+
+      testSuite = value if value != null
+      selectingTests = true
+      index = index + 2
     else
       bootstrapUsage()
       host::exit(2)
       return
     end
   end
-  if projectPath == ""
+  if projectPath == "" || (selectingTests && testSuite == "")
     bootstrapUsage()
     host::exit(2)
     return
@@ -775,31 +125,76 @@ def neriProjectUnitsCli(): Void
     host::exit(2)
     return
   end
-  var name = names.first.nextNode
   let records = new StringBuffer()
 
-  while name != null
-    let selected = neriLoadProject(project.manifest, name.value)
+  if selectingTests
+    let suite = new NeriTestSuite(testSuite)
 
-    if selected.error() != ""
-      console::println(selected.error())
+    if suite.error != ""
+      console::println(suite.error)
       host::exit(2)
       return
     end
-    if projectUnitIsExecutable(selected.kind)
-      var source = selected.ownSources.first.nextNode
+    let known = new StringTable<Bool>()
+    var name = names.first.nextNode
 
-      while source != null
-        if !neriProjectUnitsFieldValid(name.value) || !neriProjectUnitsFieldValid(source.value)
-          console::println("project-units cannot represent a unit or source containing a tab or line break.")
-          host::exit(2)
-          return
-        end
-        records.add(name.value + "\t" + source.value + "\n")
-        source = source.nextNode
-      end
+    while name != null
+      known.add(name.value, true)
+      name = name.nextNode
     end
-    name = name.nextNode
+    name = suite.units.first.nextNode
+    while name != null
+      if known.find(name.value) == null
+        console::println("Unknown test suite unit: " + name.value)
+        host::exit(2)
+        return
+      end
+      let selected = neriLoadProject(project.manifest, name.value)
+
+      if selected.error() != ""
+        console::println(selected.error())
+        host::exit(2)
+        return
+      end
+      if !projectUnitIsExecutable(selected.kind) || !selected.testDeclared || !neriProjectUnitsFieldValid(name.value)
+        console::println("Test suite unit must be a representable executable with test metadata: " + name.value)
+        host::exit(2)
+        return
+      end
+      var record = name.value + "\t" + (selected.testTimeoutMs as String)
+
+      for argument in selected.testArguments
+        record = record + "\t" + irHex(argument)
+      end
+      records.add(record + "\n")
+      name = name.nextNode
+    end
+  else
+    var name = names.first.nextNode
+
+    while name != null
+      let selected = neriLoadProject(project.manifest, name.value)
+
+      if selected.error() != ""
+        console::println(selected.error())
+        host::exit(2)
+        return
+      end
+      if projectUnitIsExecutable(selected.kind)
+        var source = selected.ownSources.first.nextNode
+
+        while source != null
+          if !neriProjectUnitsFieldValid(name.value) || !neriProjectUnitsFieldValid(source.value)
+            console::println("project-units cannot represent a unit or source containing a tab or line break.")
+            host::exit(2)
+            return
+          end
+          records.add(name.value + "\t" + source.value + "\n")
+          source = source.nextNode
+        end
+      end
+      name = name.nextNode
+    end
   end
   var record = records.first.nextNode
 

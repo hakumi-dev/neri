@@ -1,0 +1,742 @@
+use tasks
+namespace neri_data
+
+## A typed aggregate expression whose leaves are scalar quotations or COUNT(*).
+class AggregateShape<T, R>
+  private compileFn: fn(EntityMapping, Int, SqlDialect, CompileState, Expression?, Bool): ShapeCompileResult<R>
+  private distinctAllowed: Bool
+  private stickyFailure: QueryFailure?
+  private scalarType: String?
+
+  internal def init(compile: fn(EntityMapping, Int, SqlDialect, CompileState, Expression?, Bool): ShapeCompileResult<R>, distinctAllowed: Bool = true, failure: QueryFailure? = null, scalarType: String? = null): Void
+    this.compileFn = compile
+    this.distinctAllowed = distinctAllowed
+    this.stickyFailure = failure
+    this.scalarType = scalarType
+  end
+
+  internal readonly def scalarTypeName(): String?
+    return this.scalarType
+  end
+
+  internal def compile(mapping: EntityMapping, offset: Int, dialect: SqlDialect, state: CompileState, filter: Expression? = null, distinct: Bool = false): ShapeCompileResult<R>
+    let failure = this.stickyFailure
+
+    if failure != null
+      return ShapeCompileResult<R>.Failure(failure)
+    end
+    return this.compileFn(mapping, offset, dialect, state, filter, distinct)
+  end
+
+  public def distinct(): AggregateShape<T, R>
+    let failure = this.stickyFailure
+
+    if failure != null
+      return this
+    end
+    if !this.distinctAllowed
+      return new AggregateShape<T, R>(this.compileFn, false, QueryFailure.UnsupportedCapability("DISTINCT requires one scalar aggregate leaf"), this.scalarType)
+    end
+    let shape = this
+    let compile: fn(EntityMapping, Int, SqlDialect, CompileState, Expression?, Bool): ShapeCompileResult<R> = fn(mapping: EntityMapping, offset: Int, dialect: SqlDialect, state: CompileState, filter: Expression?, distinct: Bool): ShapeCompileResult<R>
+      return shape.compile(mapping, offset, dialect, state, filter, true)
+    end
+
+    return new AggregateShape<T, R>(compile, this.distinctAllowed, scalarType: this.scalarType)
+  end
+
+  public def where(predicate: quote fn(T): Bool): AggregateShape<T, R>
+    if this.stickyFailure != null
+      return this
+    end
+    let shape = this
+    let compile: fn(EntityMapping, Int, SqlDialect, CompileState, Expression?, Bool): ShapeCompileResult<R> = fn(mapping: EntityMapping, offset: Int, dialect: SqlDialect, state: CompileState, filter: Expression?, distinct: Bool): ShapeCompileResult<R>
+      match translateQuotation(mapping, predicate.tree())
+        case TranslationResult.Failure(error)
+          return shape.compile(mapping, offset, dialect, state, aggregateAndFilter(new Expression(ExpressionKind.Scalar(), scalarTree: predicate.tree(), scalarMapping: mapping), filter), distinct)
+        case TranslationResult.Expression(expression)
+          return shape.compile(mapping, offset, dialect, state, aggregateAndFilter(expression, filter), distinct)
+      end
+    end
+
+    return new AggregateShape<T, R>(compile, this.distinctAllowed, scalarType: this.scalarType)
+  end
+end
+
+def aggregateAndFilter(left: Expression?, right: Expression?): Expression?
+  if left == null
+    return right
+  end
+  if right == null
+    return left
+  end
+  return new Expression(ExpressionKind.And(), left: left, right: right)
+end
+
+enum AggregateOperator
+  case Count()
+  case SumInt()
+  case SumIntOrZero()
+  case MinInt()
+  case MaxInt()
+  case MinString()
+  case MaxString()
+  case SumFloat()
+  case SumFloatOrZero()
+  case MinFloat()
+  case MaxFloat()
+  case Average()
+end
+
+def aggregateLeaf<R>(expression: String, offset: Int, codec: ScalarCodec<R>, checkedScalars: Bool = false): ShapePlan<R>
+  let alias = "__neri_aggregate_" + (offset as String)
+  let columns = new ResultColumns([new ResultColumn(alias, codec.kind(), codec.nullable())])
+  let prepare: fn(RawRow): ShapePrepareResult<R> = fn(row: RawRow): ShapePrepareResult<R>
+    match decodeScalarColumn(row, alias, codec)
+      case DecodeResult.Failure(error)
+        return ShapePrepareResult<R>.Failure(error)
+      case DecodeResult.Value(value)
+        let make: fn(): R = fn(): R
+          return value
+        end
+
+        return ShapePrepareResult<R>.Ready(new ShapePrepared<R>(make))
+    end
+  end
+
+  return new ShapePlan<R>(expression + " AS \"" + alias + "\"", columns, 1, prepare, checkedScalars, scalar: codec.preservesSqlValue() ? alias : null)
+end
+
+def aggregateFilterSql(filter: Expression?, state: CompileState, mapping: EntityMapping, dialect: SqlDialect): ExpressionCompileResult
+  if filter == null
+    return ExpressionCompileResult.Sql("")
+  end
+  match compileExpression(filter, state, mapping.table(), dialect)
+    case ExpressionCompileResult.Failure(error)
+      return ExpressionCompileResult.Failure(error)
+    case ExpressionCompileResult.Sql(sql)
+      return ExpressionCompileResult.Sql(" FILTER (WHERE " + sql + ")")
+  end
+end
+
+def countRows<T>(): AggregateShape<T, Int>
+  let compile: fn(EntityMapping, Int, SqlDialect, CompileState, Expression?, Bool): ShapeCompileResult<Int> = fn(mapping: EntityMapping, offset: Int, dialect: SqlDialect, state: CompileState, filter: Expression?, distinct: Bool): ShapeCompileResult<Int>
+    if distinct
+      return ShapeCompileResult<Int>.Failure(QueryFailure.UnsupportedCapability("COUNT(DISTINCT *) is unsupported"))
+    end
+    match aggregateFilterSql(filter, state, mapping, dialect)
+      case ExpressionCompileResult.Failure(error)
+        return ShapeCompileResult<Int>.Failure(error)
+      case ExpressionCompileResult.Sql(suffix)
+        return ShapeCompileResult<Int>.Plan(aggregateLeaf<Int>("COUNT(*)" + suffix, offset, intScalar(), state.requiresCheckedScalars))
+    end
+  end
+
+  return new AggregateShape<T, Int>(compile, false, scalarType: "Int")
+end
+
+def aggregateInputMatches<F>(name: String, codec: ScalarCodec<F>): Bool
+  if name != codec.typeName()
+    return false
+  end
+  if (name == "Int?" || name == "Float?" || name == "String?" || name == "Bool?") != codec.nullable()
+    return false
+  end
+  match codec.kind()
+    case ResultColumnKind.Int()
+      return name == "Int" || name == "Int?"
+    case ResultColumnKind.Float()
+      return name == "Float" || name == "Float?"
+    case ResultColumnKind.Text()
+      return name == "String" || name == "String?"
+    case ResultColumnKind.Bool()
+      return name == "Bool" || name == "Bool?"
+  end
+end
+
+def aggregateOutputMatches<R>(codec: ScalarCodec<R>, expected: String): Bool
+  if codec.typeName() != expected
+    return false
+  end
+  if (expected == "Int?" || expected == "Float?" || expected == "String?") != codec.nullable()
+    return false
+  end
+  match codec.kind()
+    case ResultColumnKind.Int()
+      return expected == "Int" || expected == "Int?"
+    case ResultColumnKind.Float()
+      return expected == "Float" || expected == "Float?"
+    case ResultColumnKind.Text()
+      return expected == "String?"
+    case ResultColumnKind.Bool()
+      return false
+  end
+end
+
+def aggregateArgument<T, F>(mapping: EntityMapping, selector: quote fn(T): F, input: ScalarCodec<F>, state: CompileState, dialect: SqlDialect): ScalarSqlResult
+  let tree = selector.tree()
+
+  match translateSelection(mapping, tree)
+    case SelectionResult.Column(column)
+      if !aggregateInputMatches<F>(column.typeName(), input)
+        return ScalarSqlResult.Failure(QueryFailure.TypeMismatch(column.column(), input.typeName(), column.typeName()))
+      end
+      return ScalarSqlResult.Value(new ScalarSql(quoted(mapping.table(), column.column())))
+    case SelectionResult.Failure(error)
+      match compileScalarQuotation(mapping, tree, tree.resultType(), state, dialect)
+        case ScalarSqlResult.Failure(failure)
+          return ScalarSqlResult.Failure(failure)
+        case ScalarSqlResult.Value(value)
+          if !aggregateInputMatches<F>(tree.resultType(), input)
+            return ScalarSqlResult.Failure(QueryFailure.TypeMismatch("aggregate expression", input.typeName(), tree.resultType()))
+          end
+          state.requiresCheckedScalars = state.requiresCheckedScalars || value.checkedScalars
+          return ScalarSqlResult.Value(value)
+      end
+  end
+end
+
+def aggregateField<T, F, R>(input: ScalarCodec<F>, selector: quote fn(T): F, operation: AggregateOperator, output: ScalarCodec<R>): AggregateShape<T, R>
+  let compile: fn(EntityMapping, Int, SqlDialect, CompileState, Expression?, Bool): ShapeCompileResult<R> = fn(mapping: EntityMapping, offset: Int, dialect: SqlDialect, state: CompileState, filter: Expression?, distinct: Bool): ShapeCompileResult<R>
+    match aggregateArgument<T, F>(mapping, selector, input, state, dialect)
+      case ScalarSqlResult.Failure(error)
+        return ShapeCompileResult<R>.Failure(error)
+      case ScalarSqlResult.Value(selected)
+        let argument = distinct ? "DISTINCT " + selected.sql : selected.sql
+        let inputType = selector.tree().resultType()
+        var expression = ""
+        var expectedInput = ""
+        var expectedOutput = ""
+
+        match operation
+          case AggregateOperator.Count()
+            expression = "COUNT(" + argument + ")"
+            expectedOutput = "Int"
+          case AggregateOperator.SumInt()
+            expression = "SUM(" + argument + ")"
+            expectedInput = "Int"
+            expectedOutput = "Int?"
+          case AggregateOperator.SumIntOrZero()
+            expression = "SUM(" + argument + ")"
+            expectedInput = "Int"
+            expectedOutput = "Int"
+          case AggregateOperator.MinInt()
+            expression = "MIN(" + argument + ")"
+            expectedInput = "Int"
+            expectedOutput = "Int?"
+          case AggregateOperator.MaxInt()
+            expression = "MAX(" + argument + ")"
+            expectedInput = "Int"
+            expectedOutput = "Int?"
+          case AggregateOperator.MinString()
+            expression = "MIN(" + argument + ")"
+            expectedInput = "String"
+            expectedOutput = "String?"
+          case AggregateOperator.MaxString()
+            expression = "MAX(" + argument + ")"
+            expectedInput = "String"
+            expectedOutput = "String?"
+          case AggregateOperator.SumFloat()
+            expression = "SUM(" + argument + ")"
+            expectedInput = "Float"
+            expectedOutput = "Float?"
+          case AggregateOperator.SumFloatOrZero()
+            expression = "SUM(" + argument + ")"
+            expectedInput = "Float"
+            expectedOutput = "Float"
+          case AggregateOperator.MinFloat()
+            expression = "MIN(" + argument + ")"
+            expectedInput = "Float"
+            expectedOutput = "Float?"
+          case AggregateOperator.MaxFloat()
+            expression = "MAX(" + argument + ")"
+            expectedInput = "Float"
+            expectedOutput = "Float?"
+          case AggregateOperator.Average()
+            expression = "AVG(" + argument + ")"
+            expectedInput = "IntOrFloat"
+            expectedOutput = "Float?"
+        end
+        if !aggregateOutputMatches<R>(output, expectedOutput)
+          return ShapeCompileResult<R>.Failure(QueryFailure.UnsupportedCapability("aggregate output codec is incompatible with operation"))
+        end
+        if expectedInput == "Int" && inputType != "Int" && inputType != "Int?"
+          return ShapeCompileResult<R>.Failure(QueryFailure.UnsupportedCapability("aggregate field must be Int"))
+        end
+        if expectedInput == "String" && inputType != "String" && inputType != "String?"
+          return ShapeCompileResult<R>.Failure(QueryFailure.UnsupportedCapability("aggregate field must be String"))
+        end
+        if expectedInput == "Float" && inputType != "Float" && inputType != "Float?"
+          return ShapeCompileResult<R>.Failure(QueryFailure.UnsupportedCapability("aggregate field must be Float"))
+        end
+        if expectedInput == "IntOrFloat" && inputType != "Int" && inputType != "Int?" && inputType != "Float" && inputType != "Float?"
+          return ShapeCompileResult<R>.Failure(QueryFailure.UnsupportedCapability("average field must be Int or Float"))
+        end
+
+        match aggregateFilterSql(filter, state, mapping, dialect)
+          case ExpressionCompileResult.Failure(error)
+            return ShapeCompileResult<R>.Failure(error)
+          case ExpressionCompileResult.Sql(suffix)
+            if expectedOutput == "Int" && expectedInput == "Int"
+              expression = "COALESCE(" + expression + suffix + ", 0)"
+            else if expectedOutput == "Float" && expectedInput == "Float"
+              expression = "COALESCE(" + expression + suffix + ", 0.0)"
+            else
+              expression = expression + suffix
+            end
+            return ShapeCompileResult<R>.Plan(aggregateLeaf<R>(expression, offset, output, selected.checkedScalars || state.requiresCheckedScalars))
+        end
+    end
+  end
+
+  return new AggregateShape<T, R>(compile, scalarType: output.typeName())
+end
+
+def countNonNull<T, F>(codec: ScalarCodec<F>, selector: quote fn(T): F): AggregateShape<T, Int>
+  return aggregateField<T, F, Int>(codec, selector, AggregateOperator.Count(), intScalar())
+end
+
+def sumInt<T, F>(codec: ScalarCodec<F>, selector: quote fn(T): F): AggregateShape<T, Int?>
+  return aggregateField<T, F, Int?>(codec, selector, AggregateOperator.SumInt(), optionalIntScalar())
+end
+
+def sumIntOrZero<T, F>(codec: ScalarCodec<F>, selector: quote fn(T): F): AggregateShape<T, Int>
+  return aggregateField<T, F, Int>(codec, selector, AggregateOperator.SumIntOrZero(), intScalar())
+end
+
+def minInt<T, F>(codec: ScalarCodec<F>, selector: quote fn(T): F): AggregateShape<T, Int?>
+  return aggregateField<T, F, Int?>(codec, selector, AggregateOperator.MinInt(), optionalIntScalar())
+end
+
+def maxInt<T, F>(codec: ScalarCodec<F>, selector: quote fn(T): F): AggregateShape<T, Int?>
+  return aggregateField<T, F, Int?>(codec, selector, AggregateOperator.MaxInt(), optionalIntScalar())
+end
+
+def minString<T, F>(codec: ScalarCodec<F>, selector: quote fn(T): F): AggregateShape<T, String?>
+  return aggregateField<T, F, String?>(codec, selector, AggregateOperator.MinString(), optionalTextScalar())
+end
+
+def maxString<T, F>(codec: ScalarCodec<F>, selector: quote fn(T): F): AggregateShape<T, String?>
+  return aggregateField<T, F, String?>(codec, selector, AggregateOperator.MaxString(), optionalTextScalar())
+end
+
+def sumFloat<T, F>(codec: ScalarCodec<F>, selector: quote fn(T): F): AggregateShape<T, Float?>
+  return aggregateField<T, F, Float?>(codec, selector, AggregateOperator.SumFloat(), optionalFloatScalar())
+end
+
+def sumFloatOrZero<T, F>(codec: ScalarCodec<F>, selector: quote fn(T): F): AggregateShape<T, Float>
+  return aggregateField<T, F, Float>(codec, selector, AggregateOperator.SumFloatOrZero(), floatScalar())
+end
+
+def minFloat<T, F>(codec: ScalarCodec<F>, selector: quote fn(T): F): AggregateShape<T, Float?>
+  return aggregateField<T, F, Float?>(codec, selector, AggregateOperator.MinFloat(), optionalFloatScalar())
+end
+
+def maxFloat<T, F>(codec: ScalarCodec<F>, selector: quote fn(T): F): AggregateShape<T, Float?>
+  return aggregateField<T, F, Float?>(codec, selector, AggregateOperator.MaxFloat(), optionalFloatScalar())
+end
+
+def average<T, F>(codec: ScalarCodec<F>, selector: quote fn(T): F): AggregateShape<T, Float?>
+  return aggregateField<T, F, Float?>(codec, selector, AggregateOperator.Average(), optionalFloatScalar())
+end
+
+def combineAggregatePlans<A, B, R>(first: ShapePlan<A>, second: ShapePlan<B>, materialize: fn(A, B): R): ShapePlan<R>
+  let values: ResultColumn[] = tasks::generate(first.count() + second.count(), 1) do |index|
+    if index < first.count()
+      let column = first.columns().at(index)
+
+      return new ResultColumn(column.name(), shapeKind(column.kind()), column.nullable())
+    end
+    let column = second.columns().at(index - first.count())
+
+    return new ResultColumn(column.name(), shapeKind(column.kind()), column.nullable())
+  end
+  let prepare: fn(RawRow): ShapePrepareResult<R> = fn(row: RawRow): ShapePrepareResult<R>
+    match first.prepare(row)
+      case ShapePrepareResult.Failure(error)
+        return ShapePrepareResult<R>.Failure(error)
+      case ShapePrepareResult.Ready(left)
+        match second.prepare(row)
+          case ShapePrepareResult.Failure(error)
+            return ShapePrepareResult<R>.Failure(error)
+          case ShapePrepareResult.Ready(right)
+            let make: fn(): R = fn(): R
+              return materialize(left.value(), right.value())
+            end
+
+            return ShapePrepareResult<R>.Ready(new ShapePrepared<R>(make))
+        end
+    end
+  end
+
+  return new ShapePlan<R>(first.sql() + ", " + second.sql(), new ResultColumns(values), first.count() + second.count(), prepare, first.requiresCheckedScalars() || second.requiresCheckedScalars())
+end
+
+def combineAggregates<T, A, B, R>(left: AggregateShape<T, A>, right: AggregateShape<T, B>, materialize: fn(A, B): R): AggregateShape<T, R>
+  let compile: fn(EntityMapping, Int, SqlDialect, CompileState, Expression?, Bool): ShapeCompileResult<R> = fn(mapping: EntityMapping, offset: Int, dialect: SqlDialect, state: CompileState, filter: Expression?, distinct: Bool): ShapeCompileResult<R>
+    if distinct
+      return ShapeCompileResult<R>.Failure(QueryFailure.UnsupportedCapability("DISTINCT on combined aggregate shape is ambiguous"))
+    end
+    match left.compile(mapping, offset, dialect, state, filter)
+      case ShapeCompileResult.Failure(error)
+        return ShapeCompileResult<R>.Failure(error)
+      case ShapeCompileResult.Plan(first)
+        match right.compile(mapping, offset + first.count(), dialect, state, filter)
+          case ShapeCompileResult.Failure(error)
+            return ShapeCompileResult<R>.Failure(error)
+          case ShapeCompileResult.Plan(second)
+            return ShapeCompileResult<R>.Plan(combineAggregatePlans<A, B, R>(first, second, materialize))
+        end
+    end
+  end
+
+  return new AggregateShape<T, R>(compile, false)
+end
+
+## Combines aggregate leaves into a certified structural pair.
+def aggregatePair<T, A, B>(left: AggregateShape<T, A>, right: AggregateShape<T, B>): AggregateShape<T, ProjectedPair<A, B>>
+  let compile: fn(EntityMapping, Int, SqlDialect, CompileState, Expression?, Bool): ShapeCompileResult<ProjectedPair<A, B>> = fn(mapping: EntityMapping, offset: Int, dialect: SqlDialect, state: CompileState, filter: Expression?, distinct: Bool): ShapeCompileResult<ProjectedPair<A, B>>
+    if distinct
+      return ShapeCompileResult<ProjectedPair<A, B>>.Failure(QueryFailure.UnsupportedCapability("DISTINCT on paired aggregate shape is ambiguous"))
+    end
+    match left.compile(mapping, offset, dialect, state, filter)
+      case ShapeCompileResult.Failure(error)
+        return ShapeCompileResult<ProjectedPair<A, B>>.Failure(error)
+      case ShapeCompileResult.Plan(first)
+        match right.compile(mapping, offset + first.count(), dialect, state, filter)
+          case ShapeCompileResult.Failure(error)
+            return ShapeCompileResult<ProjectedPair<A, B>>.Failure(error)
+          case ShapeCompileResult.Plan(second)
+            return ShapeCompileResult<ProjectedPair<A, B>>.Plan(pairShapePlan<A, B>(first, second))
+        end
+    end
+  end
+
+  return new AggregateShape<T, ProjectedPair<A, B>>(compile, false)
+end
+
+class GlobalAggregate<T, R>
+  private source: Relation<T>
+  private shape: AggregateShape<T, R>
+
+  public def init(source: Relation<T>, shape: AggregateShape<T, R>): Void
+    this.source = source
+    this.shape = shape
+  end
+
+  public def compile(dialect: SqlDialect = SqlDialect.QuestionMark()): CompileResult<R>
+    match this.source.build(dialect)
+      case RelationBuildResult.Failure(error)
+        return CompileResult<R>.Failure(error)
+      case RelationBuildResult.Plan(sourcePlan)
+        let mapping = sourcePlan.mapping
+        let state = new CompileState()
+
+        match this.shape.compile(mapping, 0, dialect, state)
+          case ShapeCompileResult.Failure(error)
+            return CompileResult<R>.Failure(error)
+          case ShapeCompileResult.Plan(shapePlan)
+            let shifted = joinShiftSql(sourcePlan.sql, state.count, dialect)
+
+            if shifted == null
+              return CompileResult<R>.Failure(QueryFailure.Provider("aggregate source parameters cannot be rebased"))
+            end
+            joinParameterCopy(sourcePlan.parameters, state)
+            let sql = "SELECT " + shapePlan.sql() + " FROM (" + shifted + ") AS \"" + mapping.table() + "\""
+            let decoder = shapePlan.decoder()
+
+            return CompileResult<R>.Plan(new TypedPlan<R>(new SqlPlan(sql, new ParameterValues(state.head, state.count), 1, decoder.columns(), sourcePlan.checkedScalars || shapePlan.requiresCheckedScalars()), decoder))
+        end
+    end
+  end
+
+  public def value(provider: Provider? = null): QueryValue<R>
+    let selected = provider != null ? provider : this.source.provider()
+
+    if selected == null
+      return QueryValue<R>.Failure(QueryFailure.UnsupportedCapability("aggregate requires a provider"))
+    end
+    if !selected.supports(ProviderCapability.BoundedTypedReads())
+      return QueryValue<R>.Failure(QueryFailure.UnsupportedCapability("bounded-typed-reads"))
+    end
+    match execute<R>(this.compile(selected.dialect()), selected)
+      case QueryResult.Failure(error)
+        return QueryValue<R>.Failure(error)
+      case QueryResult.Rows(rows)
+        let first = rows.first()
+
+        if first == null
+          return QueryValue<R>.Failure(QueryFailure.Cardinality("exactly one", 0))
+        end
+        return QueryValue<R>.Value(first.value)
+    end
+  end
+end
+
+def aggregateRows<T, R>(query: Query<T>, shape: AggregateShape<T, R>): GlobalAggregate<T, R>
+  return new GlobalAggregate<T, R>(query.asRelation(), shape)
+end
+
+class Grouping<T, K>
+  private source: Relation<T>
+  private keys: RowShape<T, K>
+
+  public def init(source: Relation<T>, keys: RowShape<T, K>): Void
+    this.source = source
+    this.keys = keys
+  end
+
+  internal def relationSource(): Relation<T>
+    return this.source
+  end
+
+  internal def keyShape(): RowShape<T, K>
+    return this.keys
+  end
+end
+
+def groupBy<T, K>(query: Query<T>, keys: RowShape<T, K>): Grouping<T, K>
+  return new Grouping<T, K>(query.asRelation(), keys)
+end
+
+def selectGroups<T, K, A, R>(grouping: Grouping<T, K>, aggregates: AggregateShape<T, A>, materialize: fn(K, A): R): GroupedAggregate<T, K, A, R>
+  return new GroupedAggregate<T, K, A, R>(grouping.relationSource(), grouping.keyShape(), aggregates, materialize)
+end
+
+def selectGroupPairs<T, K, A>(grouping: Grouping<T, K>, aggregates: AggregateShape<T, A>): GroupedAggregate<T, K, A, ProjectedPair<K, A>>
+  let materialize: fn(K, A): ProjectedPair<K, A> = fn(key: K, value: A): ProjectedPair<K, A>
+    return new ProjectedPair<K, A>(key, value)
+  end
+  let structural: fn(ShapePlan<K>, ShapePlan<A>): ShapePlan<ProjectedPair<K, A>> = fn(key: ShapePlan<K>, value: ShapePlan<A>): ShapePlan<ProjectedPair<K, A>>
+    return pairShapePlan<K, A>(key, value)
+  end
+
+  let grouped = new GroupedAggregate<T, K, A, ProjectedPair<K, A>>(grouping.relationSource(), grouping.keyShape(), aggregates, materialize)
+
+  grouped.certifyStructure(structural)
+  return grouped
+end
+
+class GroupedAggregate<T, K, A, R>
+  private source: Relation<T>
+  private keys: RowShape<T, K>
+  private aggregates: AggregateShape<T, A>
+  private materialize: fn(K, A): R
+  private bound: Int?
+  private stages: GroupStage<T>?
+  private stickyFailure: QueryFailure?
+  private combinePlan: fn(ShapePlan<K>, ShapePlan<A>): ShapePlan<R>
+  private structural: Bool
+
+  public def init(source: Relation<T>, keys: RowShape<T, K>, aggregates: AggregateShape<T, A>, materialize: fn(K, A): R, limit: Int? = null, stages: GroupStage<T>? = null, failure: QueryFailure? = null): Void
+    this.source = source
+    this.keys = keys
+    this.aggregates = aggregates
+    this.materialize = materialize
+    this.bound = limit
+    this.stages = stages
+    if stages == null && limit != null
+      this.stages = new GroupStage<T>(7, count: limit)
+    end
+    this.stickyFailure = failure
+    this.structural = false
+    this.combinePlan = fn(key: ShapePlan<K>, value: ShapePlan<A>): ShapePlan<R>
+      return combineAggregatePlans<K, A, R>(key, value, materialize)
+    end
+    if failure == null && limit != null && (limit < 1 || limit > queryRowLimit())
+      this.stickyFailure = QueryFailure.InvalidLimit(limit, queryRowLimit())
+    end
+  end
+
+  internal def certifyStructure(combine: fn(ShapePlan<K>, ShapePlan<A>): ShapePlan<R>): Void
+    this.combinePlan = combine
+    this.structural = true
+  end
+
+  private def continueWith(limit: Int?, stages: GroupStage<T>?, failure: QueryFailure? = null): GroupedAggregate<T, K, A, R>
+    let next = new GroupedAggregate<T, K, A, R>(this.source, this.keys, this.aggregates, this.materialize, limit, stages, failure)
+
+    if this.structural
+      next.certifyStructure(this.combinePlan)
+    end
+    return next
+  end
+
+  public def take(limit: Int): GroupedAggregate<T, K, A, R>
+    if this.stickyFailure != null
+      return this
+    end
+    if limit < 1 || limit > queryRowLimit()
+      return this.continueWith(this.bound, this.stages, QueryFailure.InvalidLimit(limit, queryRowLimit()))
+    end
+    let existing = this.bound
+    var bounded = limit
+
+    if existing != null
+      bounded = existing < limit ? existing : limit
+    end
+    return this.continueWith(bounded, new GroupStage<T>(7, this.stages, count: limit))
+  end
+
+  public def skip(count: Int): GroupedAggregate<T, K, A, R>
+    if this.stickyFailure != null
+      return this
+    end
+    if count < 0 || count > 2147483647
+      return this.continueWith(this.bound, this.stages, QueryFailure.Provider("invalid grouped offset"))
+    end
+    if count == 0
+      return this
+    end
+    return this.continueWith(this.bound, new GroupStage<T>(6, this.stages, count: count))
+  end
+
+  public def having(condition: GroupHaving<T>): GroupedAggregate<T, K, A, R>
+    if this.stickyFailure != null
+      return this
+    end
+    return this.continueWith(this.bound, new GroupStage<T>(1, this.stages, having: condition))
+  end
+
+  public def orderByAggregate(order: GroupOrder<T>): GroupedAggregate<T, K, A, R>
+    if this.stickyFailure != null
+      return this
+    end
+    return this.continueWith(this.bound, new GroupStage<T>(2, this.stages, order: order))
+  end
+
+  public def thenByAggregate(order: GroupOrder<T>): GroupedAggregate<T, K, A, R>
+    if this.stickyFailure != null
+      return this
+    end
+    return this.continueWith(this.bound, new GroupStage<T>(3, this.stages, order: order))
+  end
+
+  public def orderByKey(descending: Bool = false): GroupedAggregate<T, K, A, R>
+    if this.stickyFailure != null
+      return this
+    end
+    return this.continueWith(this.bound, new GroupStage<T>(4, this.stages, descending: descending))
+  end
+
+  public def thenByKey(descending: Bool = false): GroupedAggregate<T, K, A, R>
+    if this.stickyFailure != null
+      return this
+    end
+    return this.continueWith(this.bound, new GroupStage<T>(5, this.stages, descending: descending))
+  end
+
+  ## Exposes certified grouped pairs as a deferred source for relational stages.
+  public def asRelation(): Relation<R>
+    let build: fn(SqlDialect): RelationBuildResult<R> = fn(dialect: SqlDialect): RelationBuildResult<R>
+      let failure = this.stickyFailure
+
+      if failure != null
+        return RelationBuildResult<R>.Failure(failure)
+      end
+      if !this.structural
+        return RelationBuildResult<R>.Failure(QueryFailure.UnsupportedCapability("deferred grouping requires a certified structural pair"))
+      end
+      match this.source.build(dialect)
+        case RelationBuildResult.Failure(error)
+          return RelationBuildResult<R>.Failure(error)
+        case RelationBuildResult.Plan(sourcePlan)
+          let relationOutput = new GroupRelationOutput()
+          let bound = this.bound
+          var limit = queryRowLimit()
+
+          if bound != null
+            limit = bound
+          end
+          match compileComposedGroups<T, K, A, R>(sourcePlan, this.keys, this.aggregates, this.combinePlan, this.stages, limit, dialect, true, relationOutput)
+            case CompileResult.Failure(error)
+              return RelationBuildResult<R>.Failure(error)
+            case CompileResult.Plan(plan)
+              let layout = relationOutput.layout
+
+              if layout == null
+                return RelationBuildResult<R>.Failure(QueryFailure.UnsupportedCapability("deferred grouping requires a certified structural pair"))
+              end
+              let read: fn(RawRow): DecodeResult<R> = fn(row: RawRow): DecodeResult<R>
+                return plan.decode(row)
+              end
+              let columns = relationColumnsCopy(plan.sql().columns())
+
+              return RelationBuildResult<R>.Plan(new RelationPlan<R>(plan.sql().sql(), plan.parameterValues(), columns, new Decoder<R>(read, columns), layout, plan.sql().requiresCheckedScalars(), relationOutput.order))
+          end
+      end
+    end
+
+    return new Relation<R>(build, this.source.provider(), bound: this.bound)
+  end
+
+  public def compile(dialect: SqlDialect = SqlDialect.QuestionMark()): CompileResult<R>
+    let failure = this.stickyFailure
+
+    if failure != null
+      return CompileResult<R>.Failure(failure)
+    end
+    let limit = this.bound
+
+    if limit == null
+      return CompileResult<R>.Failure(QueryFailure.MissingLimit(queryRowLimit()))
+    end
+    if limit < 1 || limit > queryRowLimit()
+      return CompileResult<R>.Failure(QueryFailure.InvalidLimit(limit, queryRowLimit()))
+    end
+    match this.source.build(dialect)
+      case RelationBuildResult.Failure(error)
+        return CompileResult<R>.Failure(error)
+      case RelationBuildResult.Plan(sourcePlan)
+        if !groupOnlyTakes<T>(this.stages)
+          return compileComposedGroups<T, K, A, R>(sourcePlan, this.keys, this.aggregates, this.combinePlan, this.stages, limit, dialect)
+        end
+        let mapping = sourcePlan.mapping
+        let state = new CompileState()
+
+        match this.keys.compile(mapping, 0, state, dialect)
+          case ShapeCompileResult.Failure(error)
+            return CompileResult<R>.Failure(error)
+          case ShapeCompileResult.Plan(keyPlan)
+            match this.aggregates.compile(mapping, keyPlan.count(), dialect, state)
+              case ShapeCompileResult.Failure(error)
+                return CompileResult<R>.Failure(error)
+              case ShapeCompileResult.Plan(aggregatePlan)
+                let shifted = joinShiftSql(sourcePlan.sql, state.count, dialect)
+
+                if shifted == null
+                  return CompileResult<R>.Failure(QueryFailure.Provider("aggregate source parameters cannot be rebased"))
+                end
+                joinParameterCopy(sourcePlan.parameters, state)
+                let combined = combineAggregatePlans<K, A, R>(keyPlan, aggregatePlan, this.materialize)
+                var ordinals = ""
+                var position = 1
+
+                while position <= keyPlan.count()
+                  if position > 1
+                    ordinals = ordinals + ", "
+                  end
+                  ordinals = ordinals + (position as String)
+                  position = position + 1
+                end
+                let sql = "SELECT " + combined.sql() + " FROM (" + shifted + ") AS \"" + mapping.table() + "\" GROUP BY " + ordinals + " ORDER BY " + ordinals + " LIMIT " + (limit as String)
+                let decoder = combined.decoder()
+
+                return CompileResult<R>.Plan(new TypedPlan<R>(new SqlPlan(sql, new ParameterValues(state.head, state.count), limit, decoder.columns(), sourcePlan.checkedScalars || combined.requiresCheckedScalars()), decoder))
+            end
+        end
+    end
+  end
+
+  public def all(provider: Provider? = null): QueryResult<R>
+    let selected = provider != null ? provider : this.source.provider()
+
+    if selected == null
+      return QueryResult<R>.Failure(QueryFailure.UnsupportedCapability("grouping requires a provider"))
+    end
+    if !selected.supports(ProviderCapability.BoundedTypedReads())
+      return QueryResult<R>.Failure(QueryFailure.UnsupportedCapability("bounded-typed-reads"))
+    end
+    return execute<R>(this.compile(selected.dialect()), selected)
+  end
+end

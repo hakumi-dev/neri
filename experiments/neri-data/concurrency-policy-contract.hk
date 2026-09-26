@@ -1,0 +1,195 @@
+use neri_data
+use test
+
+class ConcurrencyPolicyItem
+  public id: Int
+  public name: String
+  public note: String?
+  public version: Int
+
+  def init(id: Int, name: String, note: String?, version: Int): Void
+    this.id = id
+    this.name = name
+    this.note = note
+    this.version = version
+  end
+end
+
+def captureConcurrencyPolicy(item: ConcurrencyPolicyItem): RawRow
+  let noteValue = item.note
+  var note: Cell = Cell.Null()
+
+  if noteValue != null
+    note = Cell.Text(noteValue)
+  end
+  return new RawRow([new RawColumn("id", Cell.Int(item.id)), new RawColumn("name", Cell.Text(item.name)), new RawColumn("note", note), new RawColumn("version", Cell.Int(item.version))])
+end
+
+def concurrencyValueText(value: readonly Cell): String
+  match value
+    case Cell.Null()
+      return "null|"
+    case Cell.Int(number)
+      return "int:" + (number as String) + "|"
+    case Cell.Text(text)
+      return "text:" + text + "|"
+    case Cell.Bool(value)
+      return "bool|"
+    case Cell.Float(value)
+      return "float|"
+  end
+end
+
+class ConcurrencyPolicyProvider: Provider
+  public sql: String = ""
+  public values: String = ""
+  public calls: Int = 0
+
+  public override readonly def dialect(): SqlDialect
+    return SqlDialect.QuestionMark()
+  end
+
+  public override readonly def supports(capability: ProviderCapability): Bool
+    return true
+  end
+
+  public override def execute(plan: readonly SqlPlan): ProviderResult
+    return ProviderResult.Rows([])
+  end
+
+  public override def writeBatch(batch: readonly WriteBatch): WriteResult
+    this.calls = this.calls + 1
+    let first = batch.first()
+
+    if first == null || batch.count() != 1
+      return WriteResult.Failure(WriteFailure.Provider("expected one command"))
+    end
+    let command = first.command()
+
+    this.sql = command.sql()
+    var parameter = command.parameters().first()
+
+    while parameter != null
+      this.values = this.values + concurrencyValueText(parameter.value())
+      parameter = parameter.next()
+    end
+    return WriteResult.Saved(1)
+  end
+end
+
+def concurrencyColumns(): ResultColumns
+  return new ResultColumns([new ResultColumn("id", ResultColumnKind.Int()), new ResultColumn("name", ResultColumnKind.Text()), new ResultColumn("note", ResultColumnKind.Text(), true), new ResultColumn("version", ResultColumnKind.Int())])
+end
+
+def expectPolicySaved(result: WriteResult): Void
+  match result
+    case WriteResult.Saved(count)
+      test::assertEqual(count, 1)
+    case WriteResult.SavedWithValues(count, outputs)
+      test::assertTrue(false)
+    case WriteResult.Failure(error)
+      test::assertTrue(false)
+  end
+end
+
+def expectPolicyValidation(result: WriteResult): Void
+  match result
+    case WriteResult.Saved(count)
+      test::assertTrue(false)
+    case WriteResult.SavedWithValues(count, outputs)
+      test::assertTrue(false)
+    case WriteResult.Failure(error)
+      match error
+        case WriteFailure.Validation(message)
+          test::assertTrue(message != "")
+        case WriteFailure.Provider(message)
+          test::assertTrue(false)
+        case WriteFailure.Concurrency(message)
+          test::assertTrue(false)
+        case WriteFailure.Constraint(message)
+          test::assertTrue(false)
+        case WriteFailure.Unsupported(message)
+          test::assertTrue(false)
+        case WriteFailure.Transaction(message)
+          test::assertTrue(false)
+      end
+  end
+end
+
+def policyCase(policy: Int, deleting: Bool, note: String?, expectedSql: String, expectedValues: String): Void
+  var tokens: String[]? = null
+
+  if policy == 1
+    let empty: String[] = []
+
+    tokens = empty
+  else if policy == 2
+    tokens = ["version", "note"]
+  end
+  let provider = new ConcurrencyPolicyProvider()
+  let tracker = new EntityTracker<ConcurrencyPolicyItem>("items", "id", concurrencyColumns(), captureConcurrencyPolicy, concurrencyColumns: tokens)
+  let context = new ChangeContext(provider)
+  let item = new ConcurrencyPolicyItem(7, "old", note, 4)
+
+  context.register(tracker.changeSet())
+
+  test::assertTrue(tracker.attach(item) == null)
+  if deleting
+    test::assertTrue(tracker.remove(item) == null)
+  else
+    item.name = "new"
+  end
+  expectPolicySaved(context.saveChanges())
+
+  test::assertEqual(provider.calls, 1)
+  test::assertEqual(provider.sql, expectedSql)
+  test::assertEqual(provider.values, expectedValues)
+end
+
+def policyInvalid(tokens: String[]): Void
+  let provider = new ConcurrencyPolicyProvider()
+  let tracker = new EntityTracker<ConcurrencyPolicyItem>("items", "id", concurrencyColumns(), captureConcurrencyPolicy, concurrencyColumns: tokens)
+  let context = new ChangeContext(provider)
+  let item = new ConcurrencyPolicyItem(7, "old", null, 4)
+
+  context.register(tracker.changeSet())
+
+  test::assertTrue(tracker.attach(item) == null)
+  item.name = "new"
+  expectPolicyValidation(context.saveChanges())
+
+  test::assertEqual(provider.calls, 0)
+end
+
+def policyDefensiveCopy(): Void
+  let chosen: String[] = ["version"]
+  let provider = new ConcurrencyPolicyProvider()
+  let tracker = new EntityTracker<ConcurrencyPolicyItem>("items", "id", concurrencyColumns(), captureConcurrencyPolicy, concurrencyColumns: chosen)
+  let context = new ChangeContext(provider)
+  let item = new ConcurrencyPolicyItem(7, "old", null, 4)
+
+  chosen[0] = "name"
+  context.register(tracker.changeSet())
+
+  test::assertTrue(tracker.attach(item) == null)
+  item.name = "new"
+  expectPolicySaved(context.saveChanges())
+
+  test::assertEqual(provider.sql, "UPDATE \"items\" SET \"name\" = ? WHERE \"id\" = ? AND \"version\" = ?")
+  test::assertEqual(provider.values, "text:new|int:7|int:4|")
+end
+
+def main(): Void
+  policyCase(0, false, null, "UPDATE \"items\" SET \"name\" = ? WHERE \"id\" = ? AND \"name\" = ? AND \"note\" IS NULL AND \"version\" = ?", "text:new|int:7|text:old|int:4|")
+  policyCase(1, false, null, "UPDATE \"items\" SET \"name\" = ? WHERE \"id\" = ?", "text:new|int:7|")
+  policyCase(2, false, null, "UPDATE \"items\" SET \"name\" = ? WHERE \"id\" = ? AND \"note\" IS NULL AND \"version\" = ?", "text:new|int:7|int:4|")
+  policyCase(2, false, "memo", "UPDATE \"items\" SET \"name\" = ? WHERE \"id\" = ? AND \"note\" = ? AND \"version\" = ?", "text:new|int:7|text:memo|int:4|")
+  policyCase(0, true, null, "DELETE FROM \"items\" WHERE \"id\" = ? AND \"name\" = ? AND \"note\" IS NULL AND \"version\" = ?", "int:7|text:old|int:4|")
+  policyCase(1, true, null, "DELETE FROM \"items\" WHERE \"id\" = ?", "int:7|")
+  policyCase(2, true, null, "DELETE FROM \"items\" WHERE \"id\" = ? AND \"note\" IS NULL AND \"version\" = ?", "int:7|int:4|")
+  policyInvalid(["id"])
+  policyInvalid(["missing"])
+  policyInvalid(["version", "version"])
+  policyInvalid(["bad-name"])
+  policyDefensiveCopy()
+end

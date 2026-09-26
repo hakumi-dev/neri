@@ -1,0 +1,5177 @@
+use tasks
+use reference
+namespace neri_data
+
+## A structured write failure that callers can inspect before choosing recovery.
+enum WriteFailure
+  case Validation(message: String)
+  case Concurrency(message: String)
+  case Constraint(message: String)
+  case Provider(message: String)
+  case Unsupported(message: String)
+  case Transaction(message: String)
+end
+
+def writeFailureMessage(error: WriteFailure): String
+  match error
+    case WriteFailure.Validation(message)
+      return message
+    case WriteFailure.Concurrency(message)
+      return message
+    case WriteFailure.Constraint(message)
+      return message
+    case WriteFailure.Provider(message)
+      return message
+    case WriteFailure.Unsupported(message)
+      return message
+    case WriteFailure.Transaction(message)
+      return message
+  end
+end
+
+## The result of an atomic write batch. Count is the number of changed rows.
+enum WriteResult
+  case Saved(count: Int)
+  case SavedWithValues(count: Int, outputs: WriteReturnedRows)
+  case Failure(error: WriteFailure)
+end
+
+enum SavepointOpenResult
+  case Created(id: Int)
+  case Failure(error: WriteFailure)
+end
+
+enum TransactionOpenResult
+  case Begun(lease: Int)
+  case Failure(error: WriteFailure)
+end
+
+enum TransactionState
+  case Active()
+  case RolledBack()
+  case Committed()
+  case Invalid()
+  case Failed()
+end
+
+class WriteValueNode
+  private stored: Cell
+  private following: WriteValueNode?
+
+  internal def init(value: Cell): Void
+    this.stored = value
+  end
+
+  public readonly def value(): readonly Cell
+    return this.stored
+  end
+
+  public readonly def next(): readonly WriteValueNode?
+    return this.following
+  end
+
+  internal def append(node: WriteValueNode): Void
+    this.following = node
+  end
+end
+
+class WriteValues
+  private head: WriteValueNode?
+  private tail: WriteValueNode?
+  private size: Int = 0
+
+  internal def add(value: Cell): Void
+    let node = new WriteValueNode(value)
+    let current = this.tail
+
+    if current == null
+      this.head = node
+    else
+      current.append(node)
+    end
+    this.tail = node
+    this.size = this.size + 1
+  end
+
+  public readonly def count(): Int
+    return this.size
+  end
+
+  public readonly def first(): readonly WriteValueNode?
+    return this.head
+  end
+end
+
+class WriteCommand
+  private statement: String
+  private bound: WriteValues
+  private expected: Int
+  private returning: ResultColumns?
+
+  internal def init(sql: String, parameters: WriteValues, expectedRows: Int, returningColumns: ResultColumns? = null): Void
+    this.statement = sql
+    this.bound = parameters
+    this.expected = expectedRows
+    this.returning = returningColumns
+  end
+
+  public readonly def sql(): String
+    return this.statement
+  end
+
+  public readonly def parameters(): readonly WriteValues
+    return this.bound
+  end
+
+  public readonly def expectedRows(): Int
+    return this.expected
+  end
+
+  public readonly def returningColumns(): readonly ResultColumns?
+    return this.returning
+  end
+end
+
+class WriteReturnedRowNode
+  private stored: RawRow?
+  private following: WriteReturnedRowNode?
+
+  public def init(row: RawRow?): Void
+    this.stored = row
+  end
+
+  public readonly def row(): readonly RawRow?
+    return this.stored
+  end
+
+  public readonly def next(): readonly WriteReturnedRowNode?
+    return this.following
+  end
+
+  internal def append(node: WriteReturnedRowNode): Void
+    this.following = node
+  end
+end
+
+class WriteReturnedRows
+  private head: WriteReturnedRowNode?
+  private tail: WriteReturnedRowNode?
+  private size: Int = 0
+
+  public def add(row: RawRow?): Void
+    let node = new WriteReturnedRowNode(row)
+    let current = this.tail
+
+    if current == null
+      this.head = node
+    else
+      current.append(node)
+    end
+    this.tail = node
+    this.size = this.size + 1
+  end
+
+  public readonly def count(): Int
+    return this.size
+  end
+
+  public readonly def first(): readonly WriteReturnedRowNode?
+    return this.head
+  end
+
+  public readonly def at(index: Int): readonly RawRow?
+    var node = this.head
+    var position = 0
+
+    while node != null
+      if position == index
+        return node.row()
+      end
+      node = node.next()
+      position = position + 1
+    end
+    return null
+  end
+end
+
+enum GeneratedValueTiming
+  case OnAdd()
+  case OnAddOrUpdate()
+end
+
+def writeReturnedPresenceMatches(batch: readonly WriteBatch, outputs: readonly WriteReturnedRows): Bool
+  if batch.count() != outputs.count()
+    return false
+  end
+  var command = batch.first()
+  var index = 0
+
+  while command != null
+    if (command.command().returningColumns() == null) != (outputs.at(index) == null)
+      return false
+    end
+    index = index + 1
+    command = command.next()
+  end
+  return true
+end
+
+def copyResultColumnKind(kind: readonly ResultColumnKind): ResultColumnKind
+  match kind
+    case ResultColumnKind.Int()
+      return ResultColumnKind.Int()
+    case ResultColumnKind.Bool()
+      return ResultColumnKind.Bool()
+    case ResultColumnKind.Float()
+      return ResultColumnKind.Float()
+    case ResultColumnKind.Text()
+      return ResultColumnKind.Text()
+  end
+end
+
+def copyGeneratedValueTiming(timing: readonly GeneratedValueTiming): GeneratedValueTiming
+  match timing
+    case GeneratedValueTiming.OnAdd()
+      return GeneratedValueTiming.OnAdd()
+    case GeneratedValueTiming.OnAddOrUpdate()
+      return GeneratedValueTiming.OnAddOrUpdate()
+  end
+end
+
+def generatedKindCode(kind: readonly ResultColumnKind): Int
+  match kind
+    case ResultColumnKind.Int()
+      return 1
+    case ResultColumnKind.Bool()
+      return 2
+    case ResultColumnKind.Float()
+      return 3
+    case ResultColumnKind.Text()
+      return 4
+  end
+end
+
+class GeneratedValueColumn
+  private storedColumn: ResultColumn
+  private storedTiming: GeneratedValueTiming
+
+  public def init(column: ResultColumn, timing: GeneratedValueTiming): Void
+    this.storedColumn = new ResultColumn(column.name(), copyResultColumnKind(column.kind()), column.nullable())
+    this.storedTiming = copyGeneratedValueTiming(timing)
+  end
+
+  public readonly def column(): readonly ResultColumn
+    return this.storedColumn
+  end
+
+  public readonly def timing(): readonly GeneratedValueTiming
+    return this.storedTiming
+  end
+
+end
+
+class WriteCommandNode
+  private stored: WriteCommand
+  private following: WriteCommandNode?
+
+  internal def init(value: WriteCommand): Void
+    this.stored = value
+  end
+
+  public readonly def command(): readonly WriteCommand
+    return this.stored
+  end
+
+  public readonly def next(): readonly WriteCommandNode?
+    return this.following
+  end
+
+  internal def append(node: WriteCommandNode): Void
+    this.following = node
+  end
+end
+
+## Commands can only be assembled by the tracker.
+class WriteBatch
+  private head: WriteCommandNode?
+  private tail: WriteCommandNode?
+  private size: Int = 0
+
+  internal def add(sql: String, parameters: WriteValues, expectedRows: Int, returning: ResultColumns? = null): Void
+    let node = new WriteCommandNode(new WriteCommand(sql, parameters, expectedRows, returning))
+    let current = this.tail
+
+    if current == null
+      this.head = node
+    else
+      current.append(node)
+    end
+    this.tail = node
+    this.size = this.size + 1
+  end
+
+  public readonly def count(): Int
+    return this.size
+  end
+
+  public readonly def first(): readonly WriteCommandNode?
+    return this.head
+  end
+end
+
+enum EntityState
+  case Added()
+  case Unchanged()
+  case Deleted()
+  case Detached()
+end
+
+enum RelationshipDeletePolicy
+  case Restrict()
+  case ClientCascade()
+  case ClientSetNull()
+end
+
+## The public state includes Modified, derived from the latest scalar snapshot.
+enum TrackingState
+  case Added()
+  case Unchanged()
+  case Modified()
+  case Deleted()
+  case Detached()
+end
+
+class TrackedEntry<T>
+  public entity: T
+  public original: RawRow
+  public pending: RawRow?
+  public state: EntityState
+  public next: TrackedEntry<T>?
+  public transactionCreated: Bool = false
+  public transactionAdded: Bool = false
+  public transactionRetryAdded: Bool = false
+  public transactionBirthOriginal: RawRow?
+  public transactionBirthEntity: T?
+  public transactionBirthGeneration: Int = 0
+  public transactionBirthIdentity: GraphIdentity?
+  public transactionDeleted: Bool = false
+  public transactionDetached: Bool = false
+  public pendingWrite: Bool = false
+  public transactionWritten: Bool = false
+  public pendingCommandIndex: Int = -1
+  public pendingGeneratedKey: Int?
+  public pendingGeneratedValues: RawRow?
+  public transactionGeneratedBefore: RawRow?
+  public transactionGeneratedLast: RawRow?
+  public saveGeneratedBefore: RawRow?
+  public transactionGeneratedApplied: Bool = false
+  public actionId: Int = -1
+  public generation: Int = 0
+  public graphIdentity: GraphIdentity = new GraphIdentity()
+
+  internal def init(entity: T, original: RawRow, state: EntityState): Void
+    this.entity = entity
+    this.original = original
+    this.state = state
+  end
+end
+
+class GraphIdentity
+end
+
+class CascadeNode
+  public identity: GraphIdentity
+  public owner: ChangeSet
+  public validateFn: fn(): QueryFailure?
+  public removeFn: fn(): QueryFailure?
+  public planned: Bool = false
+  public order: Int = -1
+  public next: CascadeNode?
+
+  internal def init(identity: GraphIdentity, owner: ChangeSet, validate: fn(): QueryFailure?, remove: fn(): QueryFailure?): Void
+    this.identity = identity
+    this.owner = owner
+    this.validateFn = validate
+    this.removeFn = remove
+  end
+
+  internal def validate(): QueryFailure?
+    return this.validateFn()
+  end
+
+  internal def remove(): QueryFailure?
+    return this.removeFn()
+  end
+
+end
+
+class CascadePlan
+  public first: CascadeNode?
+  public last: CascadeNode?
+  public count: Int = 0
+
+  internal def find(identity: GraphIdentity): CascadeNode?
+    var current = this.first
+
+    while current != null
+      if reference::same(current.identity, identity)
+        return current
+      end
+      current = current.next
+    end
+    return null
+  end
+
+  internal def append(node: CascadeNode): Void
+    if this.find(node.identity) != null
+      return
+    end
+    let tail = this.last
+
+    if tail == null
+      this.first = node
+    else
+      tail.next = node
+    end
+    this.last = node
+    this.count = this.count + 1
+  end
+end
+
+## An opaque handle minted only when an entry is successfully tracked.
+class TrackedHandle<T>
+  private tracked: TrackedEntry<T>
+  private mintedEntity: T
+  private changeSetOwner: ChangeSet
+  private generation: Int
+  private identity: GraphIdentity
+  private mappedColumns: readonly ResultColumns
+  private mappedKeyName: String
+  private generatedColumns: GeneratedValueColumn[]
+  private captureEntity: fn(T): RawRow
+  private removeEntity: fn(T): QueryFailure?
+
+  internal def init(entry: TrackedEntry<T>, owner: ChangeSet, columns: readonly ResultColumns, keyName: String, capture: fn(T): RawRow, remove: fn(T): QueryFailure?, generatedColumns: GeneratedValueColumn[]): Void
+    this.tracked = entry
+    this.mintedEntity = entry.entity
+    this.changeSetOwner = owner
+    this.generation = entry.generation
+    this.identity = entry.graphIdentity
+    this.mappedColumns = columns
+    this.mappedKeyName = keyName
+    this.generatedColumns = generatedColumns
+    this.captureEntity = capture
+    this.removeEntity = remove
+  end
+
+  public def entity(): T
+    return this.mintedEntity
+  end
+
+  internal def entry(): TrackedEntry<T>
+    return this.tracked
+  end
+
+  internal def owner(): ChangeSet
+    return this.changeSetOwner
+  end
+
+  internal def valid(): Bool
+    return this.generation == this.tracked.generation && reference::same(this.identity, this.tracked.graphIdentity)
+  end
+
+  internal def graphIdentity(): GraphIdentity
+    return this.identity
+  end
+
+  internal def validateCascade(): QueryFailure?
+    if !this.valid()
+      return QueryFailure.Provider("cascade handle is stale")
+    end
+    let current = this.captureEntity(this.tracked.entity)
+
+    match current.value(this.mappedKeyName)
+      case CellLookup.Missing()
+        return QueryFailure.Provider("cascade entity key is missing")
+      case CellLookup.Found(key)
+        match this.tracked.original.value(this.mappedKeyName)
+          case CellLookup.Missing()
+            return QueryFailure.Provider("cascade tracked key is missing")
+          case CellLookup.Found(original)
+            if !sameCell(key, original)
+              return QueryFailure.Provider("cascade entity key changed")
+            end
+        end
+    end
+    match this.tracked.state
+      case EntityState.Detached()
+        return QueryFailure.Provider("cascade entity is detached")
+      case EntityState.Added()
+      case EntityState.Unchanged()
+      case EntityState.Deleted()
+    end
+    return null
+  end
+
+  internal def markCascadeDeleted(): QueryFailure?
+    let invalid = this.validateCascade()
+
+    if invalid != null
+      return invalid
+    end
+    match this.tracked.state
+      case EntityState.Deleted()
+        return null
+      case EntityState.Added()
+        return this.removeEntity(this.tracked.entity)
+      case EntityState.Unchanged()
+        return this.removeEntity(this.tracked.entity)
+      case EntityState.Detached()
+        return QueryFailure.Provider("cascade entity is detached")
+    end
+    return null
+  end
+
+  internal def cascadeNode(): CascadeNode
+    let handle = this
+    let validate: fn(): QueryFailure? = fn(): QueryFailure?
+      return handle.validateCascade()
+    end
+    let remove: fn(): QueryFailure? = fn(): QueryFailure?
+      return handle.markCascadeDeleted()
+    end
+
+    return new CascadeNode(this.identity, this.changeSetOwner, validate, remove)
+  end
+
+  internal def hasScalarSlot(slot: String, kind: ResultColumnKind, optional: Bool, allowKey: Bool = false): Bool
+    if slot == this.mappedKeyName && !allowKey
+      return false
+    end
+    for generated in this.generatedColumns
+      if generated.column().name() == slot
+        return false
+      end
+    end
+    var index = 0
+
+    while index < this.mappedColumns.count()
+      let column = this.mappedColumns.at(index)
+
+      if column.name() == slot
+        if column.nullable() != optional
+          return false
+        end
+        match kind
+          case ResultColumnKind.Int()
+            match column.kind()
+              case ResultColumnKind.Int()
+                return true
+              case ResultColumnKind.Text()
+                return false
+              case ResultColumnKind.Bool()
+                return false
+              case ResultColumnKind.Float()
+                return false
+            end
+          case ResultColumnKind.Text()
+            match column.kind()
+              case ResultColumnKind.Text()
+                return true
+              case ResultColumnKind.Int()
+                return false
+              case ResultColumnKind.Bool()
+                return false
+              case ResultColumnKind.Float()
+                return false
+            end
+          case ResultColumnKind.Bool()
+            return false
+          case ResultColumnKind.Float()
+            return false
+        end
+      end
+      index = index + 1
+    end
+    return false
+  end
+end
+
+enum TrackHandleResult<T>
+  case Tracked(handle: TrackedHandle<T>)
+  case Failure(error: QueryFailure)
+end
+
+class TrackerCheckpoint<T>
+  public entry: TrackedEntry<T>
+  public entity: T
+  public original: RawRow
+  public state: EntityState
+  public generation: Int
+  public graphIdentity: GraphIdentity
+  public next: TrackerCheckpoint<T>?
+
+  internal def init(entry: TrackedEntry<T>): Void
+    this.entry = entry
+    this.entity = entry.entity
+    this.original = entry.original
+    this.state = entry.state
+    this.generation = entry.generation
+    this.graphIdentity = entry.graphIdentity
+  end
+end
+
+class SaveCheckpoint<T>
+  public entry: TrackedEntry<T>
+  public entity: T
+  public original: RawRow
+  public state: EntityState
+  public generation: Int
+  public graphIdentity: GraphIdentity
+  public pending: RawRow?
+  public pendingWrite: Bool
+  public pendingCommandIndex: Int
+  public pendingGeneratedKey: Int?
+  public pendingGeneratedValues: RawRow?
+  public transactionWritten: Bool
+  public transactionGeneratedApplied: Bool
+  public transactionGeneratedBefore: RawRow?
+  public transactionGeneratedLast: RawRow?
+  public saveGeneratedBefore: RawRow?
+  public actionId: Int
+  public next: SaveCheckpoint<T>?
+
+  internal def init(entry: TrackedEntry<T>): Void
+    this.entry = entry
+    this.entity = entry.entity
+    this.original = entry.original
+    this.state = entry.state
+    this.generation = entry.generation
+    this.graphIdentity = entry.graphIdentity
+    this.pending = entry.pending
+    this.pendingWrite = entry.pendingWrite
+    this.pendingCommandIndex = entry.pendingCommandIndex
+    this.pendingGeneratedKey = entry.pendingGeneratedKey
+    this.pendingGeneratedValues = entry.pendingGeneratedValues
+    this.transactionWritten = entry.transactionWritten
+    this.transactionGeneratedApplied = entry.transactionGeneratedApplied
+    this.transactionGeneratedBefore = entry.transactionGeneratedBefore
+    this.transactionGeneratedLast = entry.transactionGeneratedLast
+    this.saveGeneratedBefore = entry.saveGeneratedBefore
+    this.actionId = entry.actionId
+  end
+end
+
+class ChangeSet
+  private prepareFn: fn(WriteBatch, SqlDialect): String?
+  private acceptFn: fn(): Void
+  private clearFn: fn(): Void
+  private checkpointFn: fn(): Void
+  private restoreFn: fn(): Void
+  private discardFn: fn(): Void
+  private validateReturnedFn: fn(readonly WriteReturnedRows): String?
+  private applyReturnedFn: fn(): Void
+  private collectActionsFn: fn(WriteActionList): String?
+  private graphActionSnapshotFn: fn(GraphJournal): Void
+  private checkpointSaveFn: fn(): Void
+  private restoreSaveFn: fn(): Void
+  private discardSaveFn: fn(): Void
+  private registered: Bool = false
+
+  internal def init(prepare: fn(WriteBatch, SqlDialect): String?, accept: fn(): Void, clear: fn(): Void, checkpoint: fn(): Void, restore: fn(): Void, discard: fn(): Void, validateReturned: fn(readonly WriteReturnedRows): String?, applyReturned: fn(): Void, collectActions: fn(WriteActionList): String?, checkpointSave: fn(): Void, restoreSave: fn(): Void, discardSave: fn(): Void, graphActionSnapshot: fn(GraphJournal): Void): Void
+    this.prepareFn = prepare
+    this.acceptFn = accept
+    this.clearFn = clear
+    this.checkpointFn = checkpoint
+    this.restoreFn = restore
+    this.discardFn = discard
+    this.validateReturnedFn = validateReturned
+    this.applyReturnedFn = applyReturned
+    this.collectActionsFn = collectActions
+    this.graphActionSnapshotFn = graphActionSnapshot
+    this.checkpointSaveFn = checkpointSave
+    this.restoreSaveFn = restoreSave
+    this.discardSaveFn = discardSave
+  end
+
+  internal def registerOnce(): Bool
+    if this.registered
+      return false
+    end
+    this.registered = true
+    return true
+  end
+
+  internal def prepare(batch: WriteBatch, dialect: SqlDialect): String?
+    return this.prepareFn(batch, dialect)
+  end
+
+  internal def accept(): Void
+    this.acceptFn()
+  end
+
+  internal def clear(): Void
+    this.clearFn()
+  end
+
+  internal def checkpoint(): Void
+    this.checkpointFn()
+  end
+
+  internal def restore(): Void
+    this.restoreFn()
+  end
+
+  internal def discard(): Void
+    this.discardFn()
+  end
+
+  internal def validateReturned(outputs: readonly WriteReturnedRows): String?
+    return this.validateReturnedFn(outputs)
+  end
+
+  internal def applyReturned(): Void
+    this.applyReturnedFn()
+  end
+
+  internal def collectActions(actions: WriteActionList): String?
+    return this.collectActionsFn(actions)
+  end
+
+  internal def graphActionSnapshot(journal: GraphJournal): Void
+    this.graphActionSnapshotFn(journal)
+  end
+
+  internal def checkpointSave(): Void
+    this.checkpointSaveFn()
+  end
+
+  internal def restoreSave(): Void
+    this.restoreSaveFn()
+  end
+
+  internal def discardSave(): Void
+    this.discardSaveFn()
+  end
+end
+
+class ChangeSetNode
+  public value: ChangeSet
+  public next: ChangeSetNode?
+
+  internal def init(value: ChangeSet): Void
+    this.value = value
+  end
+end
+
+## One explicitly linked foreign-key dependency between tracked entries.
+class RelationshipEdge
+  private principalOwnerFn: fn(): ChangeSet
+  private dependentOwnerFn: fn(): ChangeSet
+  private principalIdentityFn: fn(): GraphIdentity
+  private dependentIdentityFn: fn(): GraphIdentity
+  private principalValidFn: fn(): Bool
+  private dependentValidFn: fn(): Bool
+  private slotName: String
+  private principalIdFn: fn(): Int
+  private dependentIdFn: fn(): Int
+  private principalStateFn: fn(): EntityState
+  private dependentStateFn: fn(): EntityState
+  private propagateFn: fn(): QueryFailure?
+  private clearFn: fn(): QueryFailure?
+  private validateClearFn: fn(): QueryFailure?
+  private persistedFn: fn(): Bool
+  private mappedSlotFn: fn(): Bool
+  private mappedOrphanSlotFn: fn(): Bool
+  private nullable: Bool
+  private scalarKind: ResultColumnKind
+  private deletePolicy: RelationshipDeletePolicy
+  private dependentCascadeFn: fn(): CascadeNode
+  private active: Bool = true
+  private checkpointFn: fn(): Void
+  private restoreFn: fn(): Void
+  private orphanCaptureFn: fn(): Void
+  private orphanRestoreFn: fn(): Void
+  private orphaned: Bool = false
+  private discardFn: fn(): Void
+  private registered: Bool = false
+  public next: RelationshipEdge?
+
+  internal def init(principalOwner: fn(): ChangeSet, dependentOwner: fn(): ChangeSet, principalIdentity: fn(): GraphIdentity, dependentIdentity: fn(): GraphIdentity, principalValid: fn(): Bool, dependentValid: fn(): Bool, slot: String, principalId: fn(): Int, dependentId: fn(): Int, principalState: fn(): EntityState, dependentState: fn(): EntityState, propagate: fn(): QueryFailure?, clear: fn(): QueryFailure?, validateClear: fn(): QueryFailure?, persisted: fn(): Bool, mappedSlot: fn(): Bool, mappedOrphanSlot: fn(): Bool, kind: ResultColumnKind, nullable: Bool, deletePolicy: RelationshipDeletePolicy, dependentCascade: fn(): CascadeNode, checkpoint: fn(): Void, restore: fn(): Void, orphanCapture: fn(): Void, orphanRestore: fn(): Void, discard: fn(): Void): Void
+    this.principalOwnerFn = principalOwner
+    this.dependentOwnerFn = dependentOwner
+    this.principalIdentityFn = principalIdentity
+    this.dependentIdentityFn = dependentIdentity
+    this.principalValidFn = principalValid
+    this.dependentValidFn = dependentValid
+    this.slotName = slot
+    this.principalIdFn = principalId
+    this.dependentIdFn = dependentId
+    this.principalStateFn = principalState
+    this.dependentStateFn = dependentState
+    this.propagateFn = propagate
+    this.clearFn = clear
+    this.validateClearFn = validateClear
+    this.persistedFn = persisted
+    this.mappedSlotFn = mappedSlot
+    this.mappedOrphanSlotFn = mappedOrphanSlot
+    this.nullable = nullable
+    this.scalarKind = kind
+    this.deletePolicy = deletePolicy
+    this.dependentCascadeFn = dependentCascade
+    this.checkpointFn = checkpoint
+    this.restoreFn = restore
+    this.orphanCaptureFn = orphanCapture
+    this.orphanRestoreFn = orphanRestore
+    this.discardFn = discard
+  end
+
+  internal def registerOnce(): Bool
+    if this.registered
+      return false
+    end
+    this.registered = true
+    return true
+  end
+
+  internal def isRegistered(): Bool
+    return this.registered
+  end
+
+  internal def undoGraphRegistration(): Void
+    this.registered = false
+    this.next = null
+    this.discardFn()
+  end
+
+  internal def principalOwner(): ChangeSet
+    return this.principalOwnerFn()
+  end
+
+  internal def dependentOwner(): ChangeSet
+    return this.dependentOwnerFn()
+  end
+
+  internal def principalIdentity(): GraphIdentity
+    return this.principalIdentityFn()
+  end
+
+  internal def dependentIdentity(): GraphIdentity
+    return this.dependentIdentityFn()
+  end
+
+  internal def valid(): Bool
+    return this.principalValidFn() && this.dependentValidFn()
+  end
+
+  internal def principalValid(): Bool
+    return this.principalValidFn()
+  end
+
+  internal def dependentValid(): Bool
+    return this.dependentValidFn()
+  end
+
+  internal def slot(): String
+    return this.slotName
+  end
+
+  internal def principalId(): Int
+    return this.principalIdFn()
+  end
+
+  internal def dependentId(): Int
+    return this.dependentIdFn()
+  end
+
+  internal def principalState(): EntityState
+    return this.principalStateFn()
+  end
+
+  internal def dependentState(): EntityState
+    return this.dependentStateFn()
+  end
+
+  internal def propagate(): QueryFailure?
+    return this.propagateFn()
+  end
+
+  internal def clearForeignKey(): QueryFailure?
+    return this.clearFn()
+  end
+
+  internal def validateClearForeignKey(): QueryFailure?
+    return this.validateClearFn()
+  end
+
+  internal def isNullable(): Bool
+    return this.nullable
+  end
+
+  internal def sameScalarShape(other: RelationshipEdge): Bool
+    if this.nullable != other.isNullable()
+      return false
+    end
+    match this.scalarKind
+      case ResultColumnKind.Int()
+        match other.scalarKind
+          case ResultColumnKind.Int()
+            return true
+          case ResultColumnKind.Text()
+            return false
+          case ResultColumnKind.Bool()
+            return false
+          case ResultColumnKind.Float()
+            return false
+        end
+      case ResultColumnKind.Text()
+        match other.scalarKind
+          case ResultColumnKind.Text()
+            return true
+          case ResultColumnKind.Int()
+            return false
+          case ResultColumnKind.Bool()
+            return false
+          case ResultColumnKind.Float()
+            return false
+        end
+      case ResultColumnKind.Bool()
+        return false
+      case ResultColumnKind.Float()
+        return false
+    end
+  end
+
+  internal def cascadesOnDelete(): Bool
+    match this.deletePolicy
+      case RelationshipDeletePolicy.ClientCascade()
+        return true
+      case RelationshipDeletePolicy.Restrict()
+        return false
+      case RelationshipDeletePolicy.ClientSetNull()
+        return false
+    end
+  end
+
+  internal def setsNullOnDelete(): Bool
+    match this.deletePolicy
+      case RelationshipDeletePolicy.ClientSetNull()
+        return true
+      case RelationshipDeletePolicy.Restrict()
+        return false
+      case RelationshipDeletePolicy.ClientCascade()
+        return false
+    end
+  end
+
+  internal def validDeletePolicy(): Bool
+    if this.setsNullOnDelete()
+      return this.nullable && this.hasMappedSlot()
+    end
+    return true
+  end
+
+  internal def sameDeletePolicy(other: RelationshipEdge): Bool
+    return this.cascadesOnDelete() == other.cascadesOnDelete() && this.setsNullOnDelete() == other.setsNullOnDelete()
+  end
+
+  internal def dependentCascadeNode(): CascadeNode
+    return this.dependentCascadeFn()
+  end
+
+  internal def isActive(): Bool
+    return this.active
+  end
+
+  internal def persistsOldForeignKey(): Bool
+    return this.persistedFn()
+  end
+
+  internal def hasMappedSlot(): Bool
+    return this.mappedSlotFn()
+  end
+
+  internal def hasMappedOrphanSlot(): Bool
+    return this.mappedOrphanSlotFn()
+  end
+
+  internal def retire(): Void
+    this.active = false
+  end
+
+  internal def retireOrphan(): Void
+    this.orphanCaptureFn()
+    this.active = false
+    this.orphaned = true
+  end
+
+  internal def checkpoint(): Void
+    this.checkpointFn()
+  end
+
+  internal def restore(): Void
+    if this.active
+      this.restoreFn()
+    else
+      if this.orphaned
+        this.orphanRestoreFn()
+      end
+    end
+  end
+
+  internal def discard(): Void
+    this.discardFn()
+  end
+end
+
+## A typed scalar link. Graph ordering uses handle identities, never key values.
+class ScalarRelationshipLink<P, D>
+  private principal: TrackedHandle<P>
+  private dependent: TrackedHandle<D>
+  private readPrincipal: fn(P): Cell
+  private readForeignKey: fn(D): Cell
+  private writeForeignKey: fn(D, Cell): Void
+  private keyKind: ResultColumnKind
+  private nullableForeignKey: Bool
+  private deletePolicy: RelationshipDeletePolicy
+  private slotName: String
+  private cachedEdge: RelationshipEdge?
+  private orphanForeignKey: Cell?
+  private lastAssignedForeignKey: Cell?
+
+  public def init(principal: TrackedHandle<P>, dependent: TrackedHandle<D>, getPrincipalKey: fn(P): Cell, getForeignKey: fn(D): Cell, setForeignKey: fn(D, Cell): Void, kind: ResultColumnKind, optional: Bool, slot: String = "", deletePolicy: RelationshipDeletePolicy = RelationshipDeletePolicy.Restrict()): Void
+    this.principal = principal
+    this.dependent = dependent
+    this.readPrincipal = getPrincipalKey
+    this.readForeignKey = getForeignKey
+    this.writeForeignKey = setForeignKey
+    this.keyKind = kind
+    this.nullableForeignKey = optional
+    this.deletePolicy = deletePolicy
+    this.slotName = slot
+  end
+
+  public def edge(): RelationshipEdge
+    let existing = this.cachedEdge
+
+    if existing != null
+      return existing
+    end
+    let link = this
+    let principalOwner: fn(): ChangeSet = fn(): ChangeSet
+      return link.principal.owner()
+    end
+    let dependentOwner: fn(): ChangeSet = fn(): ChangeSet
+      return link.dependent.owner()
+    end
+    let principalIdentity: fn(): GraphIdentity = fn(): GraphIdentity
+      return link.principal.graphIdentity()
+    end
+    let dependentIdentity: fn(): GraphIdentity = fn(): GraphIdentity
+      return link.dependent.graphIdentity()
+    end
+    let principalValid: fn(): Bool = fn(): Bool
+      return link.principal.valid()
+    end
+    let dependentValid: fn(): Bool = fn(): Bool
+      return link.dependent.valid()
+    end
+    let principalId: fn(): Int = fn(): Int
+      return link.principal.entry().actionId
+    end
+    let dependentId: fn(): Int = fn(): Int
+      return link.dependent.entry().actionId
+    end
+    let principalState: fn(): EntityState = fn(): EntityState
+      return link.principal.entry().state
+    end
+    let dependentState: fn(): EntityState = fn(): EntityState
+      return link.dependent.entry().state
+    end
+    let propagate: fn(): QueryFailure? = fn(): QueryFailure?
+      return link.propagate()
+    end
+    let clear: fn(): QueryFailure? = fn(): QueryFailure?
+      return link.clearForeignKey()
+    end
+    let validateClear: fn(): QueryFailure? = fn(): QueryFailure?
+      return link.validateClearForeignKey()
+    end
+    let persisted: fn(): Bool = fn(): Bool
+      return link.persistedForeignKey()
+    end
+    let mappedSlot: fn(): Bool = fn(): Bool
+      return link.dependent.hasScalarSlot(link.slotName, link.keyKind, link.nullableForeignKey)
+    end
+    let mappedOrphanSlot: fn(): Bool = fn(): Bool
+      return link.dependent.hasScalarSlot(link.slotName, link.keyKind, link.nullableForeignKey, true)
+    end
+    let dependentCascade: fn(): CascadeNode = fn(): CascadeNode
+      return link.dependent.cascadeNode()
+    end
+    let checkpoint: fn(): Void = fn(): Void
+      link.checkpoint()
+    end
+    let restore: fn(): Void = fn(): Void
+      link.restore()
+    end
+    let orphanCapture: fn(): Void = fn(): Void
+      link.captureOrphanForeignKey()
+    end
+    let orphanRestore: fn(): Void = fn(): Void
+      link.restoreOrphanForeignKey()
+    end
+    let discard: fn(): Void = fn(): Void
+      link.discard()
+    end
+    let created = new RelationshipEdge(principalOwner, dependentOwner, principalIdentity, dependentIdentity, principalValid, dependentValid, this.slotName, principalId, dependentId, principalState, dependentState, propagate, clear, validateClear, persisted, mappedSlot, mappedOrphanSlot, this.keyKind, this.nullableForeignKey, this.deletePolicy, dependentCascade, checkpoint, restore, orphanCapture, orphanRestore, discard)
+
+    this.cachedEdge = created
+    return created
+  end
+
+  private def propagate(): QueryFailure?
+    if !this.principal.valid() || !this.dependent.valid()
+      return QueryFailure.Provider("relationship handle is stale")
+    end
+    let principalEntry = this.principal.entry()
+    let dependentEntry = this.dependent.entry()
+    let kindFailure = this.validateKind()
+
+    if kindFailure != null
+      return kindFailure
+    end
+
+    match principalEntry.state
+      case EntityState.Detached()
+        return QueryFailure.Provider("linked principal is detached")
+      case EntityState.Deleted()
+        match dependentEntry.state
+          case EntityState.Deleted()
+            return null
+          case EntityState.Detached()
+            return QueryFailure.Provider("linked dependent is detached")
+          case EntityState.Added()
+            return QueryFailure.Provider("cannot add a dependent of a deleted principal")
+          case EntityState.Unchanged()
+            return QueryFailure.Provider("cannot retain a dependent of a deleted principal")
+        end
+      case EntityState.Added()
+      case EntityState.Unchanged()
+    end
+    match dependentEntry.state
+      case EntityState.Detached()
+        return QueryFailure.Provider("linked dependent is detached")
+      case EntityState.Deleted()
+        return null
+      case EntityState.Added()
+      case EntityState.Unchanged()
+    end
+    let key = this.readPrincipal(principalEntry.entity)
+    let current = this.readForeignKey(dependentEntry.entity)
+
+    if !this.matchesKind(key)
+      return QueryFailure.Provider("linked principal key has the wrong scalar kind")
+    end
+    if !this.matchesKind(current) && !(this.nullableForeignKey && this.isNull(current))
+      return QueryFailure.Provider("linked dependent foreign key has the wrong scalar kind or nullability")
+    end
+    if !this.sameCell(current, key)
+      this.writeForeignKey(dependentEntry.entity, key)
+
+      if !this.sameCell(this.readForeignKey(dependentEntry.entity), key)
+        return QueryFailure.Provider("relationship setter did not assign the principal key")
+      end
+    end
+    this.lastAssignedForeignKey = key
+    return null
+  end
+
+  private def clearForeignKey(): QueryFailure?
+    let invalid = this.validateClearForeignKey()
+
+    if invalid != null
+      return invalid
+    end
+    let dependentEntry = this.dependent.entry()
+    let current = this.readForeignKey(dependentEntry.entity)
+
+    if !this.isNull(current)
+      this.writeForeignKey(dependentEntry.entity, Cell.Null())
+
+      if !this.isNull(this.readForeignKey(dependentEntry.entity))
+        return QueryFailure.Provider("relationship setter did not clear the foreign key")
+      end
+    end
+    return null
+  end
+
+  private def validateClearForeignKey(): QueryFailure?
+    if !this.nullableForeignKey
+      return QueryFailure.Provider("required foreign key cannot be unlinked")
+    end
+    if !this.principal.valid() || !this.dependent.valid()
+      return QueryFailure.Provider("relationship handle is stale")
+    end
+    let dependentEntry = this.dependent.entry()
+    let kindFailure = this.validateKind()
+
+    if kindFailure != null
+      return kindFailure
+    end
+    let entityFailure = this.dependent.validateCascade()
+
+    if entityFailure != null
+      return entityFailure
+    end
+    match dependentEntry.state
+      case EntityState.Detached()
+        return QueryFailure.Provider("linked dependent is detached")
+      case EntityState.Deleted()
+        return QueryFailure.Provider("linked dependent is deleted")
+      case EntityState.Added()
+      case EntityState.Unchanged()
+    end
+    let current = this.readForeignKey(dependentEntry.entity)
+
+    if !this.matchesKind(current) && !this.isNull(current)
+      return QueryFailure.Provider("linked dependent foreign key has the wrong scalar kind")
+    end
+    return null
+  end
+
+  private def persistedForeignKey(): Bool
+    if !this.principal.valid() || !this.dependent.valid()
+      return false
+    end
+    let dependentEntry = this.dependent.entry()
+
+    match dependentEntry.state
+      case EntityState.Added()
+        return false
+      case EntityState.Detached()
+        return false
+      case EntityState.Unchanged()
+      case EntityState.Deleted()
+    end
+    if !this.matchesKind(this.readPrincipal(this.principal.entry().entity))
+      return false
+    end
+    match dependentEntry.original.value(this.slotName)
+      case CellLookup.Found(value)
+        return this.sameCell(value, this.readPrincipal(this.principal.entry().entity))
+      case CellLookup.Missing()
+        return false
+    end
+  end
+
+  private def validateKind(): QueryFailure?
+    match this.keyKind
+      case ResultColumnKind.Int()
+        return null
+      case ResultColumnKind.Text()
+        return null
+      case ResultColumnKind.Bool()
+        return QueryFailure.UnsupportedCapability("relationship keys must be Int or String")
+      case ResultColumnKind.Float()
+        return QueryFailure.UnsupportedCapability("relationship keys must be Int or String")
+    end
+  end
+
+  private def isNull(value: Cell): Bool
+    match value
+      case Cell.Null()
+        return true
+      case Cell.Int(number)
+        return false
+      case Cell.Text(text)
+        return false
+      case Cell.Bool(boolean)
+        return false
+      case Cell.Float(number)
+        return false
+    end
+  end
+
+  private def matchesKind(value: Cell): Bool
+    match this.keyKind
+      case ResultColumnKind.Int()
+        match value
+          case Cell.Int(number)
+            return true
+          case Cell.Null()
+            return false
+          case Cell.Text(text)
+            return false
+          case Cell.Bool(boolean)
+            return false
+          case Cell.Float(number)
+            return false
+        end
+      case ResultColumnKind.Text()
+        match value
+          case Cell.Text(text)
+            return true
+          case Cell.Null()
+            return false
+          case Cell.Int(number)
+            return false
+          case Cell.Bool(boolean)
+            return false
+          case Cell.Float(number)
+            return false
+        end
+      case ResultColumnKind.Bool()
+        return false
+      case ResultColumnKind.Float()
+        return false
+    end
+  end
+
+  private def sameCell(left: Cell, right: Cell): Bool
+    match left
+      case Cell.Int(value)
+        match right
+          case Cell.Int(other)
+            return value == other
+          case Cell.Null()
+            return false
+          case Cell.Text(other)
+            return false
+          case Cell.Bool(other)
+            return false
+          case Cell.Float(other)
+            return false
+        end
+      case Cell.Text(value)
+        match right
+          case Cell.Text(other)
+            return value == other
+          case Cell.Null()
+            return false
+          case Cell.Int(other)
+            return false
+          case Cell.Bool(other)
+            return false
+          case Cell.Float(other)
+            return false
+        end
+      case Cell.Null()
+        return this.isNull(right)
+      case Cell.Bool(value)
+        return false
+      case Cell.Float(value)
+        return false
+    end
+  end
+
+  private def checkpoint(): Void
+    return
+  end
+
+  private def captureOrphanForeignKey(): Void
+    if this.dependent.valid()
+      let current = this.readForeignKey(this.dependent.entry().entity)
+      let key = this.readPrincipal(this.principal.entry().entity)
+
+      if this.matchesKind(key) && this.sameCell(current, key)
+        this.orphanForeignKey = current
+      end
+    end
+  end
+
+  private def restoreOrphanForeignKey(): Void
+    let expected = this.orphanForeignKey
+
+    if expected != null
+      this.restoreForeignKey(expected)
+    end
+  end
+
+  private def restoreForeignKey(expected: Cell): Void
+    if !this.principal.valid() || !this.dependent.valid()
+      return
+    end
+    let principalEntry = this.principal.entry()
+    let dependentEntry = this.dependent.entry()
+    let current = this.readForeignKey(dependentEntry.entity)
+    let restored = this.readPrincipal(principalEntry.entity)
+
+    if this.matchesKind(restored) && this.sameCell(current, expected) && !this.sameCell(current, restored)
+      this.writeForeignKey(dependentEntry.entity, restored)
+      this.lastAssignedForeignKey = restored
+      this.orphanForeignKey = restored
+    end
+  end
+
+  private def restore(): Void
+    if !this.principal.valid() || !this.dependent.valid()
+      return
+    end
+    let principalEntry = this.principal.entry()
+    let dependentEntry = this.dependent.entry()
+
+    match dependentEntry.state
+      case EntityState.Detached()
+        let expected = this.lastAssignedForeignKey
+
+        if expected != null
+          this.restoreForeignKey(expected)
+        end
+        return
+      case EntityState.Added()
+      case EntityState.Unchanged()
+      case EntityState.Deleted()
+    end
+    match principalEntry.state
+      case EntityState.Detached()
+        let expected = this.lastAssignedForeignKey
+
+        if expected != null
+          this.restoreForeignKey(expected)
+        end
+      case EntityState.Added()
+        this.repropagate(principalEntry.entity, dependentEntry.entity)
+      case EntityState.Unchanged()
+        this.repropagate(principalEntry.entity, dependentEntry.entity)
+      case EntityState.Deleted()
+    end
+  end
+
+  private def repropagate(principal: P, dependent: D): Void
+    let key = this.readPrincipal(principal)
+
+    if this.validateKind() == null && this.matchesKind(key)
+      this.writeForeignKey(dependent, key)
+    end
+  end
+
+  private def discard(): Void
+    return
+  end
+end
+
+## Compatibility link for required Int foreign keys.
+class RelationshipLink<P, D>
+  private scalar: ScalarRelationshipLink<P, D>
+
+  public def init(principal: TrackedHandle<P>, dependent: TrackedHandle<D>, getPrincipalKey: fn(P): Int, getForeignKey: fn(D): Int, setForeignKey: fn(D, Int): Void, slot: String = "", deletePolicy: RelationshipDeletePolicy = RelationshipDeletePolicy.Restrict()): Void
+    let readPrincipal: fn(P): Cell = fn(entity: P): Cell
+      return Cell.Int(getPrincipalKey(entity))
+    end
+    let readForeignKey: fn(D): Cell = fn(entity: D): Cell
+      return Cell.Int(getForeignKey(entity))
+    end
+    let writeForeignKey: fn(D, Cell): Void = fn(entity: D, value: Cell): Void
+      match value
+        case Cell.Int(number)
+          setForeignKey(entity, number)
+        case Cell.Null()
+          return
+        case Cell.Text(text)
+          return
+        case Cell.Bool(boolean)
+          return
+        case Cell.Float(number)
+          return
+      end
+    end
+
+    this.scalar = new ScalarRelationshipLink<P, D>(principal, dependent, readPrincipal, readForeignKey, writeForeignKey, ResultColumnKind.Int(), false, slot, deletePolicy)
+  end
+
+  public def edge(): RelationshipEdge
+    return this.scalar.edge()
+  end
+end
+
+enum WriteActionKind
+  case Insert()
+  case Update()
+  case Delete()
+end
+
+class WriteAction
+  public id: Int
+  public kind: WriteActionKind
+  public planned: Bool = false
+  public done: Bool = false
+  public next: WriteAction?
+  private prepareFn: fn(WriteBatch, SqlDialect): String?
+  private validateFn: fn(readonly WriteReturnedRows): String?
+  private applyFn: fn(): Void
+  private acceptFn: fn(): Void
+
+  internal def init(id: Int, kind: WriteActionKind, prepare: fn(WriteBatch, SqlDialect): String?, validate: fn(readonly WriteReturnedRows): String?, apply: fn(): Void, accept: fn(): Void): Void
+    this.id = id
+    this.kind = kind
+    this.prepareFn = prepare
+    this.validateFn = validate
+    this.applyFn = apply
+    this.acceptFn = accept
+  end
+
+  internal def prepare(batch: WriteBatch, dialect: SqlDialect): String?
+    return this.prepareFn(batch, dialect)
+  end
+
+  internal def validateReturned(outputs: readonly WriteReturnedRows): String?
+    return this.validateFn(outputs)
+  end
+
+  internal def applyReturned(): Void
+    this.applyFn()
+  end
+
+  internal def accept(): Void
+    this.acceptFn()
+  end
+end
+
+class WriteActionList
+  public first: WriteAction?
+  public last: WriteAction?
+  public count: Int = 0
+
+  internal def add(kind: WriteActionKind, prepare: fn(WriteBatch, SqlDialect): String?, validate: fn(readonly WriteReturnedRows): String?, apply: fn(): Void, accept: fn(): Void): Int
+    let id = this.count
+    let action = new WriteAction(id, kind, prepare, validate, apply, accept)
+    let last = this.last
+
+    if last == null
+      this.first = action
+    else
+      last.next = action
+    end
+    this.last = action
+    this.count = id + 1
+    return id
+  end
+
+  internal def at(id: Int): WriteAction?
+    var current = this.first
+
+    while current != null
+      if current.id == id
+        return current
+      end
+      current = current.next
+    end
+    return null
+  end
+end
+
+## Tracks one mapped entity type by its assigned scalar key.
+class EntityTracker<T>
+  private tableName: String
+  private keyName: String
+  private columns: ResultColumns
+  private captureRow: fn(T): RawRow
+  private applyRow: (fn(T, T): Void)?
+  private setGeneratedKey: (fn(T, Int): Void)?
+  private generatedColumns: GeneratedValueColumn[]
+  private applyGenerated: (fn(T, readonly RawRow): Void)?
+  private concurrencyColumns: String[]?
+  private generatedKey: Bool = false
+  private nextTemporaryKey: Int = -1
+  private entries: TrackedEntry<T>?
+  private lastEntry: TrackedEntry<T>?
+  private set: ChangeSet?
+  private transactionActive: Bool = false
+  private checkpoints: TrackerCheckpoint<T>?
+  private saveCheckpoints: SaveCheckpoint<T>?
+  private graphEnrollmentActive: Bool = false
+
+  public def init(table: String, keyColumn: String, columns: ResultColumns, capture: fn(T): RawRow, apply: (fn(T, T): Void)? = null, generatedKey: Bool = false, setGeneratedKey: (fn(T, Int): Void)? = null, generatedColumns: GeneratedValueColumn[] = [], applyGenerated: (fn(T, readonly RawRow): Void)? = null, concurrencyColumns: String[]? = null): Void
+    this.tableName = table
+    this.keyName = keyColumn
+    this.columns = columns
+    this.captureRow = capture
+    this.applyRow = apply
+    this.generatedKey = generatedKey
+    this.setGeneratedKey = setGeneratedKey
+    this.generatedColumns = tasks::generate(generatedColumns.Length, 1) do |index|
+      let item = generatedColumns[index]
+      let column = item.column()
+
+      return new GeneratedValueColumn(new ResultColumn(column.name(), copyResultColumnKind(column.kind()), column.nullable()), copyGeneratedValueTiming(item.timing()))
+    end
+    this.applyGenerated = applyGenerated
+    if concurrencyColumns != null
+      let copied: String[] = tasks::generate(concurrencyColumns.Length, 1) do |index|
+        return concurrencyColumns[index]
+      end
+
+      this.concurrencyColumns = copied
+    end
+  end
+
+  public def changeSet(): ChangeSet
+    let existing = this.set
+
+    if existing != null
+      return existing
+    end
+    let tracker = this
+    let prepare: fn(WriteBatch, SqlDialect): String? = fn(batch: WriteBatch, dialect: SqlDialect): String?
+      return tracker.prepare(batch, dialect)
+    end
+    let accept: fn(): Void = fn(): Void
+      tracker.accept()
+    end
+    let clear: fn(): Void = fn(): Void
+      tracker.clear()
+    end
+    let checkpoint: fn(): Void = fn(): Void
+      tracker.checkpoint()
+    end
+    let restore: fn(): Void = fn(): Void
+      tracker.restore()
+    end
+    let discard: fn(): Void = fn(): Void
+      tracker.discard()
+    end
+    let validateReturned: fn(readonly WriteReturnedRows): String? = fn(outputs: readonly WriteReturnedRows): String?
+      return tracker.validateReturned(outputs)
+    end
+    let applyReturned: fn(): Void = fn(): Void
+      tracker.applyReturned()
+    end
+    let collectActions: fn(WriteActionList): String? = fn(actions: WriteActionList): String?
+      return tracker.collectActions(actions)
+    end
+    let checkpointSave: fn(): Void = fn(): Void
+      tracker.checkpointSave()
+    end
+    let restoreSave: fn(): Void = fn(): Void
+      tracker.restoreSave()
+    end
+    let discardSave: fn(): Void = fn(): Void
+      tracker.discardSave()
+    end
+    let graphActionSnapshot: fn(GraphJournal): Void = fn(journal: GraphJournal): Void
+      tracker.graphActionSnapshot(journal)
+    end
+    let created = new ChangeSet(prepare, accept, clear, checkpoint, restore, discard, validateReturned, applyReturned, collectActions, checkpointSave, restoreSave, discardSave, graphActionSnapshot)
+
+    this.set = created
+    return created
+  end
+
+  private def key(row: RawRow): Cell?
+    match row.value(this.keyName)
+      case CellLookup.Found(value)
+        return value
+      case CellLookup.Missing()
+        return null
+    end
+  end
+
+  private def find(key: Cell): TrackedEntry<T>?
+    var current = this.entries
+
+    while current != null
+      let trackedKey = this.key(current.original)
+
+      if trackedKey != null && sameCell(trackedKey, key)
+        match current.state
+          case EntityState.Detached()
+            return current
+          case EntityState.Added()
+            return current
+          case EntityState.Unchanged()
+            return current
+          case EntityState.Deleted()
+            return current
+        end
+      end
+      current = current.next
+    end
+    return null
+  end
+
+  private def insert(entity: T, row: RawRow, state: EntityState): Void
+    let entry = new TrackedEntry<T>(entity, row, state)
+
+    entry.transactionCreated = this.transactionActive
+    if this.transactionActive
+      match state
+        case EntityState.Added()
+          entry.transactionAdded = true
+          entry.transactionBirthOriginal = row
+          entry.transactionBirthEntity = entity
+          entry.transactionBirthGeneration = entry.generation
+          entry.transactionBirthIdentity = entry.graphIdentity
+        case EntityState.Unchanged()
+        case EntityState.Deleted()
+        case EntityState.Detached()
+      end
+    end
+    let tail = this.lastEntry
+
+    if tail == null
+      this.entries = entry
+    else
+      tail.next = entry
+    end
+    this.lastEntry = entry
+  end
+
+  private def validateKey(row: RawRow): QueryFailure?
+    let key = this.key(row)
+
+    if key == null
+      return QueryFailure.Provider("entity key is missing")
+    end
+    match key
+      case Cell.Null()
+        return QueryFailure.Provider("entity key is null")
+      case Cell.Bool(value)
+        return QueryFailure.Provider("entity key must be an integer or string")
+      case Cell.Float(value)
+        return QueryFailure.Provider("entity key must be an integer or string")
+      case Cell.Int(value)
+        return null
+      case Cell.Text(value)
+        return null
+    end
+  end
+
+  public def add(entity: T): QueryFailure?
+    if this.graphEnrollmentActive
+      return QueryFailure.Provider("cannot add directly during graph enrollment")
+    end
+    return this.addCore(entity)
+  end
+
+  private def addCore(entity: T): QueryFailure?
+    if this.generatedKey
+      let setter = this.setGeneratedKey
+
+      if setter == null
+        return QueryFailure.UnsupportedCapability("generated key requires a key setter")
+      end
+      let metadataError = this.validateMetadata()
+
+      if metadataError != null
+        return QueryFailure.Provider(metadataError)
+      end
+      let initialRow = this.captureRow(entity)
+      let rowError = this.validateRow(initialRow)
+
+      if rowError != null
+        return QueryFailure.Provider(rowError)
+      end
+      let initial = this.key(initialRow)
+
+      if initial == null
+        return QueryFailure.Provider("entity key is missing")
+      end
+      match initial
+        case Cell.Int(value)
+          if value != 0
+            return QueryFailure.Provider("generated key must be zero before add")
+          end
+        case Cell.Null()
+          return QueryFailure.Provider("generated key must be an integer")
+        case Cell.Bool(value)
+          return QueryFailure.Provider("generated key must be an integer")
+        case Cell.Text(value)
+          return QueryFailure.Provider("generated key must be an integer")
+        case Cell.Float(value)
+          return QueryFailure.Provider("generated key must be an integer")
+      end
+      if this.nextTemporaryKey == -9223372036854775808
+        return QueryFailure.Provider("temporary generated keys exhausted")
+      end
+      var temporary = this.nextTemporaryKey
+
+      while this.find(Cell.Int(temporary)) != null
+        temporary = temporary - 1
+        if temporary == -9223372036854775808
+          return QueryFailure.Provider("temporary generated keys exhausted")
+        end
+      end
+      setter(entity, temporary)
+      let assigned = this.captureRow(entity)
+      let assignedError = this.validateRow(assigned)
+
+      if assignedError != null || !sameOptionalCell(this.key(assigned), Cell.Int(temporary))
+        setter(entity, 0)
+        return QueryFailure.Provider("generated key setter did not preserve a valid entity snapshot")
+      end
+      this.nextTemporaryKey = temporary - 1
+    end
+    let row = this.captureRow(entity)
+    let invalid = this.validateKey(row)
+
+    if invalid != null
+      return invalid
+    end
+    let key = this.key(row)
+
+    if key == null
+      return QueryFailure.Provider("entity key is missing")
+    end
+    let existing = this.find(key)
+
+    if existing != null
+      match existing.state
+        case EntityState.Detached()
+          if this.transactionActive && existing.transactionDeleted
+            return QueryFailure.Provider("deleted key cannot be reused before transaction commit")
+          end
+          existing.generation = existing.generation + 1
+          existing.graphIdentity = new GraphIdentity()
+          existing.entity = entity
+          existing.original = row
+          existing.state = EntityState.Added()
+          if this.transactionActive
+            existing.transactionAdded = true
+            existing.transactionBirthOriginal = row
+            existing.transactionBirthEntity = entity
+            existing.transactionBirthGeneration = existing.generation
+            existing.transactionBirthIdentity = existing.graphIdentity
+            existing.transactionDetached = false
+          end
+          return null
+        case EntityState.Added()
+          return QueryFailure.Provider("entity key is already tracked")
+        case EntityState.Unchanged()
+          return QueryFailure.Provider("entity key is already tracked")
+        case EntityState.Deleted()
+          return QueryFailure.Provider("entity key is already tracked")
+      end
+    end
+    this.insert(entity, row, EntityState.Added())
+    return null
+  end
+
+  public def addWithHandle(entity: T): TrackHandleResult<T>
+    let error = this.add(entity)
+
+    if error != null
+      return TrackHandleResult<T>.Failure(error)
+    end
+    let key = this.key(this.captureRow(entity))
+
+    if key == null
+      return TrackHandleResult<T>.Failure(QueryFailure.Provider("tracked entity key is missing"))
+    end
+    let entry = this.find(key)
+
+    if entry == null
+      return TrackHandleResult<T>.Failure(QueryFailure.Provider("tracked entity entry is missing"))
+    end
+    let tracker = this
+    let remove: fn(T): QueryFailure? = fn(value: T): QueryFailure?
+      return tracker.remove(value)
+    end
+
+    return TrackHandleResult<T>.Tracked(new TrackedHandle<T>(entry, this.changeSet(), this.columns, this.keyName, this.captureRow, remove, this.generatedColumns))
+  end
+
+  ## Enrolls one graph object and records every tracker-side mutation before add.
+  internal def graphAddWithHandle(entity: T, journal: GraphJournal): TrackHandleResult<T>
+    if !this.graphEnrollmentActive
+      this.graphEnrollmentActive = true
+      let tracker = this
+      let finish: fn(): Void = fn(): Void
+        tracker.graphEnrollmentActive = false
+      end
+
+      journal.finallyDo(finish)
+    end
+    let row = this.captureRow(entity)
+    let key = this.key(row)
+
+    if key == null
+      return TrackHandleResult<T>.Failure(QueryFailure.Provider("entity key is missing"))
+    end
+    var byReference = this.entries
+
+    while byReference != null
+      if reference::same(byReference.entity, entity)
+        if !sameOptionalCell(key, this.key(byReference.original))
+          return TrackHandleResult<T>.Failure(QueryFailure.Provider("tracked graph entity key changed"))
+        end
+        match byReference.state
+          case EntityState.Added()
+            return this.graphExistingHandle(byReference, entity, key)
+          case EntityState.Unchanged()
+            return this.graphExistingHandle(byReference, entity, key)
+          case EntityState.Deleted()
+            return TrackHandleResult<T>.Failure(QueryFailure.Provider("graph entity is already deleted"))
+          case EntityState.Detached()
+            break
+        end
+      end
+      byReference = byReference.next
+    end
+    let existing = this.find(key)
+
+    if existing != null
+      match existing.state
+        case EntityState.Added()
+          return this.graphExistingHandle(existing, entity, key)
+        case EntityState.Unchanged()
+          return this.graphExistingHandle(existing, entity, key)
+        case EntityState.Deleted()
+          return TrackHandleResult<T>.Failure(QueryFailure.Provider("graph entity is already deleted"))
+        case EntityState.Detached()
+      end
+    end
+    let firstBefore = this.entries
+    let lastBefore = this.lastEntry
+    let temporaryBefore = this.nextTemporaryKey
+    let setter = this.setGeneratedKey
+    let resetGenerated = this.generatedKey && sameOptionalCell(key, Cell.Int(0))
+    let undo: fn(): Void = fn(): Void
+      var appended = this.entries
+
+      if lastBefore != null
+        appended = lastBefore.next
+      end
+      while appended != null
+        appended.state = EntityState.Detached()
+        appended.generation = appended.generation + 1
+        appended.graphIdentity = new GraphIdentity()
+        appended = appended.next
+      end
+      this.entries = firstBefore
+      this.lastEntry = lastBefore
+      if lastBefore != null
+        lastBefore.next = null
+      end
+      this.nextTemporaryKey = temporaryBefore
+      if resetGenerated && setter != null
+        setter(entity, 0)
+      end
+    end
+
+    journal.record(undo)
+    if existing != null
+      let prior = existing
+      let priorEntity = prior.entity
+      let priorOriginal = prior.original
+      let priorState = prior.state
+      let priorGeneration = prior.generation
+      let priorIdentity = prior.graphIdentity
+      let priorDeleted = prior.transactionDeleted
+      let priorDetached = prior.transactionDetached
+      let priorAdded = prior.transactionAdded
+      let priorRetryAdded = prior.transactionRetryAdded
+      let priorBirthOriginal = prior.transactionBirthOriginal
+      let priorBirthEntity = prior.transactionBirthEntity
+      let priorBirthGeneration = prior.transactionBirthGeneration
+      let priorBirthIdentity = prior.transactionBirthIdentity
+      let undoEntry: fn(): Void = fn(): Void
+        prior.entity = priorEntity
+        prior.original = priorOriginal
+        prior.state = priorState
+        prior.generation = priorGeneration
+        prior.graphIdentity = priorIdentity
+        prior.transactionDeleted = priorDeleted
+        prior.transactionDetached = priorDetached
+        prior.transactionAdded = priorAdded
+        prior.transactionRetryAdded = priorRetryAdded
+        prior.transactionBirthOriginal = priorBirthOriginal
+        prior.transactionBirthEntity = priorBirthEntity
+        prior.transactionBirthGeneration = priorBirthGeneration
+        prior.transactionBirthIdentity = priorBirthIdentity
+      end
+
+      journal.record(undoEntry)
+    end
+    let error = this.addCore(entity)
+
+    if error != null
+      return TrackHandleResult<T>.Failure(error)
+    end
+    let assigned = this.key(this.captureRow(entity))
+
+    if assigned == null
+      return TrackHandleResult<T>.Failure(QueryFailure.Provider("tracked graph entity key is missing"))
+    end
+    let entry = this.find(assigned)
+
+    if entry == null
+      return TrackHandleResult<T>.Failure(QueryFailure.Provider("tracked graph entity entry is missing"))
+    end
+    return this.graphExistingHandle(entry, entity, assigned)
+  end
+
+  private def graphExistingHandle(entry: TrackedEntry<T>, entity: T, key: Cell): TrackHandleResult<T>
+    if !reference::same(entry.entity, entity)
+      return TrackHandleResult<T>.Failure(QueryFailure.Provider("different graph entity instance has an already tracked key"))
+    end
+    if !sameOptionalCell(key, this.key(entry.original))
+      return TrackHandleResult<T>.Failure(QueryFailure.Provider("tracked graph entity key changed"))
+    end
+    let tracker = this
+    let remove: fn(T): QueryFailure? = fn(value: T): QueryFailure?
+      return tracker.remove(value)
+    end
+
+    return TrackHandleResult<T>.Tracked(new TrackedHandle<T>(entry, this.changeSet(), this.columns, this.keyName, this.captureRow, remove, this.generatedColumns))
+  end
+
+  internal def graphActionSnapshot(journal: GraphJournal): Void
+    var current = this.entries
+
+    while current != null
+      let entry = current
+      let previous = entry.actionId
+      let undo: fn(): Void = fn(): Void
+        entry.actionId = previous
+      end
+
+      journal.record(undo)
+      current = current.next
+    end
+  end
+
+  public def attach(entity: T): QueryFailure?
+    if this.graphEnrollmentActive
+      return QueryFailure.Provider("cannot attach directly during graph enrollment")
+    end
+    let row = this.captureRow(entity)
+    let invalid = this.validateKey(row)
+
+    if invalid != null
+      return invalid
+    end
+    let key = this.key(row)
+
+    if key == null
+      return QueryFailure.Provider("entity key is missing")
+    end
+    let existing = this.find(key)
+
+    if existing != null
+      match existing.state
+        case EntityState.Detached()
+          existing.generation = existing.generation + 1
+          existing.graphIdentity = new GraphIdentity()
+          existing.entity = entity
+          existing.original = row
+          existing.state = EntityState.Unchanged()
+          if this.transactionActive
+            existing.transactionDeleted = false
+            existing.transactionDetached = false
+          end
+          return null
+        case EntityState.Added()
+          return QueryFailure.Provider("entity key is already tracked")
+        case EntityState.Unchanged()
+          return QueryFailure.Provider("entity key is already tracked")
+        case EntityState.Deleted()
+          return QueryFailure.Provider("entity key is already tracked")
+      end
+    end
+    this.insert(entity, row, EntityState.Unchanged())
+    return null
+  end
+
+  public def attachWithHandle(entity: T): TrackHandleResult<T>
+    let error = this.attach(entity)
+
+    if error != null
+      return TrackHandleResult<T>.Failure(error)
+    end
+    let key = this.key(this.captureRow(entity))
+
+    if key == null
+      return TrackHandleResult<T>.Failure(QueryFailure.Provider("tracked entity key is missing"))
+    end
+    let entry = this.find(key)
+
+    if entry == null
+      return TrackHandleResult<T>.Failure(QueryFailure.Provider("tracked entity entry is missing"))
+    end
+    let tracker = this
+    let remove: fn(T): QueryFailure? = fn(value: T): QueryFailure?
+      return tracker.remove(value)
+    end
+
+    return TrackHandleResult<T>.Tracked(new TrackedHandle<T>(entry, this.changeSet(), this.columns, this.keyName, this.captureRow, remove, this.generatedColumns))
+  end
+
+  public def remove(entity: T): QueryFailure?
+    if this.graphEnrollmentActive
+      return QueryFailure.Provider("cannot remove directly during graph enrollment")
+    end
+    let row = this.captureRow(entity)
+    let key = this.key(row)
+
+    if key == null
+      return QueryFailure.Provider("entity key is missing")
+    end
+    let existing = this.find(key)
+
+    if existing == null
+      return QueryFailure.Provider("entity is not tracked")
+    end
+    match existing.state
+      case EntityState.Added()
+        existing.state = EntityState.Detached()
+        if this.transactionActive
+          existing.transactionDetached = true
+        end
+      case EntityState.Unchanged()
+        existing.state = EntityState.Deleted()
+        if this.transactionActive
+          existing.transactionDeleted = true
+          var checkpoint = this.checkpoints
+
+          while checkpoint != null
+            if reference::same(checkpoint.entry, existing) && reference::same(checkpoint.graphIdentity, existing.graphIdentity)
+              match checkpoint.state
+                case EntityState.Added()
+                  existing.transactionDetached = true
+                case EntityState.Unchanged()
+                case EntityState.Deleted()
+                case EntityState.Detached()
+              end
+              break
+            end
+            checkpoint = checkpoint.next
+          end
+        end
+      case EntityState.Deleted()
+        return QueryFailure.Provider("entity is already deleted")
+      case EntityState.Detached()
+        return QueryFailure.Provider("entity is detached")
+    end
+    return null
+  end
+
+  ## Returns the state of the entry identified by the entity's assigned key.
+  public def stateOf(entity: T): TrackingState?
+    let key = this.key(this.captureRow(entity))
+
+    if key == null
+      return null
+    end
+    let entry = this.find(key)
+
+    if entry == null
+      return null
+    end
+    match entry.state
+      case EntityState.Added()
+        return TrackingState.Added()
+      case EntityState.Deleted()
+        return TrackingState.Deleted()
+      case EntityState.Detached()
+        return TrackingState.Detached()
+      case EntityState.Unchanged()
+        if sameRows(entry.original, this.captureRow(entry.entity), this.columns)
+          return TrackingState.Unchanged()
+        end
+        return TrackingState.Modified()
+    end
+  end
+
+  internal def ownsPersistedForNavigation(entity: T): Bool
+    let current = this.captureRow(entity)
+    let key = this.key(current)
+
+    if key == null
+      return false
+    end
+    let entry = this.find(key)
+
+    if entry == null || !reference::same(entry.entity, entity) || !sameOptionalCell(key, this.key(entry.original))
+      return false
+    end
+    match entry.state
+      case EntityState.Unchanged()
+        return true
+      case EntityState.Added()
+        return false
+      case EntityState.Deleted()
+        return false
+      case EntityState.Detached()
+        return false
+    end
+  end
+
+  internal def visitTracked(visitor: fn(T): Bool): Bool
+    var current = this.entries
+
+    while current != null
+      var active = false
+
+      match current.state
+        case EntityState.Detached()
+          active = false
+        case EntityState.Added()
+          active = true
+        case EntityState.Unchanged()
+          active = true
+        case EntityState.Deleted()
+          active = true
+      end
+      if active && !visitor(current.entity)
+        return false
+      end
+      current = current.next
+    end
+    return true
+  end
+
+  ## Returns the tracked scalar baseline for this key, when attached.
+  public def original(entity: T): RawRow?
+    let key = this.key(this.captureRow(entity))
+
+    if key == null
+      return null
+    end
+    let entry = this.find(key)
+
+    if entry == null
+      return null
+    end
+    match entry.state
+      case EntityState.Detached()
+        return null
+      case EntityState.Added()
+        return copyRow(entry.original, this.columns)
+      case EntityState.Unchanged()
+        return copyRow(entry.original, this.columns)
+      case EntityState.Deleted()
+        return copyRow(entry.original, this.columns)
+    end
+  end
+
+  ## Captures current mapped scalar values of the tracked entry for this key.
+  public def current(entity: T): RawRow?
+    let key = this.key(this.captureRow(entity))
+
+    if key == null
+      return null
+    end
+    let entry = this.find(key)
+
+    if entry == null
+      return null
+    end
+    match entry.state
+      case EntityState.Detached()
+        return null
+      case EntityState.Added()
+        return this.captureRow(entry.entity)
+      case EntityState.Unchanged()
+        return this.captureRow(entry.entity)
+      case EntityState.Deleted()
+        return this.captureRow(entry.entity)
+    end
+  end
+
+  ## Stops tracking the key without writing to the provider.
+  public def detach(entity: T): QueryFailure?
+    let key = this.key(this.captureRow(entity))
+
+    if key == null
+      return QueryFailure.Provider("entity key is missing")
+    end
+    let entry = this.find(key)
+
+    if entry == null
+      return QueryFailure.Provider("entity is not tracked")
+    end
+    entry.state = EntityState.Detached()
+    entry.pending = null
+    if this.transactionActive
+      entry.transactionDetached = true
+      entry.transactionDeleted = false
+    end
+    return null
+  end
+
+  ## Rebases one pending update or delete onto explicitly supplied database values.
+  ## Local writable fields are preserved; store-owned fields take fresh values.
+  public def rebase(entity: T, databaseEntity: T): QueryFailure?
+    let local = this.captureRow(entity)
+    let key = this.key(local)
+
+    if key == null
+      return QueryFailure.Provider("entity key is missing")
+    end
+    let entry = this.find(key)
+
+    if entry == null
+      return QueryFailure.Provider("entity is not tracked")
+    end
+    let tracked = this.captureRow(entry.entity)
+    let trackedError = this.validateRow(tracked)
+
+    if trackedError != null
+      return QueryFailure.Provider(trackedError)
+    end
+    if !sameOptionalCell(key, this.key(tracked))
+      return QueryFailure.Provider("tracked entity key changed")
+    end
+    match entry.state
+      case EntityState.Added()
+        return QueryFailure.Provider("added entity cannot be rebased")
+      case EntityState.Detached()
+        return QueryFailure.Provider("detached entity cannot be rebased")
+      case EntityState.Unchanged()
+      case EntityState.Deleted()
+    end
+    if this.transactionActive && entry.transactionWritten
+      return QueryFailure.UnsupportedCapability("cannot rebase an entity already saved in an active transaction")
+    end
+    let fresh = this.captureRow(databaseEntity)
+    let metadataError = this.validateMetadata()
+
+    if metadataError != null
+      return QueryFailure.Provider(metadataError)
+    end
+    let rowError = this.validateRow(fresh)
+
+    if rowError != null
+      return QueryFailure.Provider(rowError)
+    end
+    if !sameOptionalCell(key, this.key(entry.original)) || !sameOptionalCell(key, this.key(fresh))
+      return QueryFailure.Provider("rebase key mismatch")
+    end
+    let generated = this.returningColumns(false)
+
+    if generated != null
+      let applyGenerated = this.applyGenerated
+
+      if applyGenerated == null
+        return QueryFailure.UnsupportedCapability("store-generated rebase requires an apply callback")
+      end
+      let selected = copyRow(fresh, generated)
+
+      if this.transactionActive
+        entry.transactionGeneratedBefore = generatedBeforeRow(entry.transactionGeneratedBefore, selected, tracked, this.keyName)
+      end
+      applyGenerated(entry.entity, selected)
+    end
+    entry.original = fresh
+    entry.pending = null
+    return null
+  end
+
+  ## Explicit store-wins refresh from a separately fetched entity of the same key.
+  ## Validation completes before any mapped field on the tracked instance changes.
+  public def refreshFrom(entity: T, databaseEntity: T): QueryFailure?
+    let apply = this.applyRow
+
+    if apply == null
+      return QueryFailure.UnsupportedCapability("entity refresh requires a generated apply function")
+    end
+    let metadataError = this.validateMetadata()
+
+    if metadataError != null
+      return QueryFailure.Provider(metadataError)
+    end
+    let local = this.captureRow(entity)
+    let localError = this.validateRow(local)
+
+    if localError != null
+      return QueryFailure.Provider(localError)
+    end
+    let key = this.key(local)
+
+    if key == null
+      return QueryFailure.Provider("entity key is missing")
+    end
+    let entry = this.find(key)
+
+    if entry == null
+      return QueryFailure.Provider("entity is not tracked")
+    end
+    let tracked = this.captureRow(entry.entity)
+    let trackedError = this.validateRow(tracked)
+
+    if trackedError != null
+      return QueryFailure.Provider(trackedError)
+    end
+    if !sameOptionalCell(key, this.key(tracked))
+      return QueryFailure.Provider("tracked entity key changed")
+    end
+    match entry.state
+      case EntityState.Added()
+        return QueryFailure.Provider("added entity cannot be refreshed")
+      case EntityState.Detached()
+        return QueryFailure.Provider("detached entity cannot be refreshed")
+      case EntityState.Unchanged()
+      case EntityState.Deleted()
+    end
+    if this.transactionActive && entry.transactionWritten
+      return QueryFailure.UnsupportedCapability("cannot refresh an entity already saved in an active transaction")
+    end
+    let fresh = this.captureRow(databaseEntity)
+    let freshError = this.validateRow(fresh)
+
+    if freshError != null
+      return QueryFailure.Provider(freshError)
+    end
+    if !sameOptionalCell(key, this.key(entry.original)) || !sameOptionalCell(key, this.key(fresh))
+      return QueryFailure.Provider("refresh key mismatch")
+    end
+    apply(entry.entity, databaseEntity)
+    entry.original = fresh
+    entry.pending = null
+    entry.state = EntityState.Unchanged()
+    if this.transactionActive
+      entry.transactionDeleted = false
+      entry.transactionDetached = false
+    end
+    return null
+  end
+
+  ## Discards every tracked state in this entity set without changing the database.
+  public def clear(): Void
+    if this.transactionActive
+      var current = this.entries
+
+      while current != null
+        current.state = EntityState.Detached()
+        current.pending = null
+        current.transactionDetached = true
+        current.transactionDeleted = false
+        current = current.next
+      end
+    else
+      var current = this.entries
+
+      while current != null
+        current.state = EntityState.Detached()
+        current = current.next
+      end
+      this.entries = null
+      this.lastEntry = null
+    end
+  end
+
+  internal def checkpointSave(): Void
+    this.saveCheckpoints = null
+    var current = this.entries
+    var tail: SaveCheckpoint<T>? = null
+
+    while current != null
+      let node = new SaveCheckpoint<T>(current)
+
+      current.saveGeneratedBefore = null
+
+      if tail == null
+        this.saveCheckpoints = node
+      else
+        tail.next = node
+      end
+      tail = node
+      current = current.next
+    end
+  end
+
+  internal def restoreSave(): Void
+    var checkpoint = this.saveCheckpoints
+
+    while checkpoint != null
+      let entry = checkpoint.entry
+      let saveGenerated = entry.saveGeneratedBefore
+
+      entry.entity = checkpoint.entity
+      entry.original = checkpoint.original
+      entry.state = checkpoint.state
+      entry.generation = checkpoint.generation
+      entry.graphIdentity = checkpoint.graphIdentity
+      entry.pending = checkpoint.pending
+      entry.pendingWrite = checkpoint.pendingWrite
+      entry.pendingCommandIndex = checkpoint.pendingCommandIndex
+      entry.pendingGeneratedKey = checkpoint.pendingGeneratedKey
+      entry.pendingGeneratedValues = checkpoint.pendingGeneratedValues
+      entry.transactionWritten = checkpoint.transactionWritten
+      entry.transactionGeneratedApplied = checkpoint.transactionGeneratedApplied
+      entry.transactionGeneratedBefore = checkpoint.transactionGeneratedBefore
+      entry.transactionGeneratedLast = checkpoint.transactionGeneratedLast
+      entry.saveGeneratedBefore = checkpoint.saveGeneratedBefore
+      entry.actionId = checkpoint.actionId
+      if this.generatedKey
+        let setter = this.setGeneratedKey
+        let originalKey = this.key(checkpoint.original)
+
+        if setter != null && originalKey != null
+          match originalKey
+            case Cell.Int(value)
+              setter(entry.entity, value)
+            case Cell.Null()
+            case Cell.Bool(value)
+            case Cell.Text(value)
+            case Cell.Float(value)
+          end
+        end
+      end
+      let applyGenerated = this.applyGenerated
+
+      if applyGenerated != null && saveGenerated != null
+        applyGenerated(entry.entity, saveGenerated)
+      end
+      checkpoint = checkpoint.next
+    end
+    this.saveCheckpoints = null
+  end
+
+  internal def discardSave(): Void
+    this.saveCheckpoints = null
+    var current = this.entries
+
+    while current != null
+      current.saveGeneratedBefore = null
+      current = current.next
+    end
+  end
+
+  internal def checkpoint(): Void
+    if this.transactionActive
+      return
+    end
+    this.transactionActive = true
+    var current = this.entries
+    var tail: TrackerCheckpoint<T>? = null
+
+    while current != null
+      let node = new TrackerCheckpoint<T>(current)
+
+      if tail == null
+        this.checkpoints = node
+      else
+        tail.next = node
+      end
+      tail = node
+      current = current.next
+    end
+  end
+
+  internal def restore(): Void
+    if !this.transactionActive
+      return
+    end
+    var current = this.entries
+
+    while current != null
+      current.transactionRetryAdded = false
+      if current.transactionAdded
+        match current.state
+          case EntityState.Added()
+            current.transactionRetryAdded = true
+          case EntityState.Unchanged()
+            current.transactionRetryAdded = true
+          case EntityState.Deleted()
+          case EntityState.Detached()
+        end
+      end
+      current = current.next
+    end
+    var checkpoint = this.checkpoints
+
+    while checkpoint != null
+      checkpoint.entry.entity = checkpoint.entity
+      checkpoint.entry.original = checkpoint.original
+      checkpoint.entry.state = checkpoint.state
+      checkpoint.entry.generation = checkpoint.generation
+      checkpoint.entry.graphIdentity = checkpoint.graphIdentity
+      checkpoint.entry.pending = null
+      checkpoint = checkpoint.next
+    end
+    current = this.entries
+
+    while current != null
+      if current.transactionDetached
+        current.state = EntityState.Detached()
+      else
+        if current.transactionRetryAdded
+          let birth = current.transactionBirthOriginal
+          let entity = current.transactionBirthEntity
+
+          if birth != null
+            current.original = birth
+          end
+          if entity != null
+            current.entity = entity
+          end
+          let identity = current.transactionBirthIdentity
+
+          if identity != null
+            current.generation = current.transactionBirthGeneration
+            current.graphIdentity = identity
+          end
+          current.state = EntityState.Added()
+        else
+          if current.transactionDeleted
+            if current.transactionAdded || current.transactionCreated
+              current.state = EntityState.Detached()
+            else
+              match current.state
+                case EntityState.Added()
+                  current.state = EntityState.Added()
+                case EntityState.Unchanged()
+                  current.state = EntityState.Deleted()
+                case EntityState.Deleted()
+                  current.state = EntityState.Deleted()
+                case EntityState.Detached()
+                  current.state = EntityState.Detached()
+              end
+            end
+          else
+            if current.transactionCreated
+              current.state = EntityState.Detached()
+            end
+          end
+        end
+      end
+      if current.transactionAdded
+        match current.state
+          case EntityState.Detached()
+            let birth = current.transactionBirthOriginal
+            let entity = current.transactionBirthEntity
+            let identity = current.transactionBirthIdentity
+
+            if birth != null
+              current.original = birth
+            end
+            if entity != null
+              current.entity = entity
+            end
+            if identity != null
+              current.generation = current.transactionBirthGeneration
+              current.graphIdentity = identity
+            end
+          case EntityState.Added()
+          case EntityState.Unchanged()
+          case EntityState.Deleted()
+        end
+      end
+      current.pending = null
+      current.pendingWrite = false
+      current.pendingCommandIndex = -1
+      current.pendingGeneratedKey = null
+      current.pendingGeneratedValues = null
+      if this.generatedKey && current.transactionGeneratedApplied
+        let setter = this.setGeneratedKey
+        var restored = this.key(current.original)
+
+        if current.transactionAdded
+          let birth = current.transactionBirthOriginal
+
+          if birth != null
+            restored = this.key(birth)
+          end
+        end
+
+        if setter != null && restored != null
+          match restored
+            case Cell.Int(value)
+              setter(current.entity, value)
+            case Cell.Null()
+            case Cell.Bool(value)
+            case Cell.Text(value)
+            case Cell.Float(value)
+          end
+        end
+      end
+      let applyGenerated = this.applyGenerated
+      let generatedBefore = current.transactionGeneratedBefore
+
+      if applyGenerated != null && generatedBefore != null
+        this.restoreGeneratedBefore(current.entity, generatedBefore, current.transactionGeneratedLast)
+      end
+      current = current.next
+    end
+    this.discard()
+  end
+
+  internal def discard(): Void
+    this.transactionActive = false
+    this.checkpoints = null
+    # Pending RETURNING values survive commit cleanup until applyReturned/accept.
+    var current = this.entries
+
+    while current != null
+      current.transactionCreated = false
+      current.transactionAdded = false
+      current.transactionRetryAdded = false
+      current.transactionBirthOriginal = null
+      current.transactionBirthEntity = null
+      current.transactionBirthGeneration = 0
+      current.transactionBirthIdentity = null
+      current.transactionDeleted = false
+      current.transactionDetached = false
+      current.pendingWrite = false
+      current.transactionWritten = false
+      current.transactionGeneratedApplied = false
+      current.transactionGeneratedBefore = null
+      current.transactionGeneratedLast = null
+      current = current.next
+    end
+  end
+
+  ## Reuses tracked instances for rows with the same key.
+  public def resolveRows(rows: TypedRows<T>): QueryResult<T>
+    let resolved = new TypedRows<T>()
+    var current = rows.first()
+
+    while current != null
+      let entity = current.value
+      let row = this.captureRow(entity)
+      let key = this.key(row)
+
+      if key == null
+        return QueryResult<T>.Failure(QueryFailure.Provider("decoded entity key is missing"))
+      end
+      let existing = this.find(key)
+
+      if existing == null
+        this.insert(entity, row, EntityState.Unchanged())
+        resolved.add(entity)
+      else
+        match existing.state
+          case EntityState.Detached()
+            existing.generation = existing.generation + 1
+            existing.graphIdentity = new GraphIdentity()
+            existing.entity = entity
+            existing.original = row
+            existing.state = EntityState.Unchanged()
+            resolved.add(entity)
+          case EntityState.Added()
+            resolved.add(existing.entity)
+          case EntityState.Unchanged()
+            resolved.add(existing.entity)
+          case EntityState.Deleted()
+            resolved.add(existing.entity)
+        end
+      end
+      current = current.next
+    end
+    return QueryResult<T>.Rows(resolved)
+  end
+
+  internal def prepare(batch: WriteBatch, dialect: SqlDialect): String?
+    let metadataError = this.validateMetadata()
+
+    if metadataError != null
+      return metadataError
+    end
+    var current = this.entries
+
+    while current != null
+      let error = this.prepareEntry(current, batch, dialect)
+
+      if error != null
+        return error
+      end
+      current = current.next
+    end
+    return null
+  end
+
+  private def prepareEntry(current: TrackedEntry<T>, batch: WriteBatch, dialect: SqlDialect): String?
+    current.pending = null
+    current.pendingWrite = false
+    current.pendingCommandIndex = -1
+    current.pendingGeneratedKey = null
+    current.pendingGeneratedValues = null
+    match current.state
+      case EntityState.Added()
+        let snapshot = this.captureRow(current.entity)
+        let rowError = this.validateRow(snapshot)
+
+        if rowError != null
+          return rowError
+        end
+        let key = this.key(snapshot)
+
+        if !sameOptionalCell(key, this.key(current.original))
+          return "tracked entity key changed"
+        end
+        current.pending = snapshot
+        let error = this.prepareInsert(batch, snapshot, dialect)
+
+        if error != null
+          return error
+        end
+        current.pendingWrite = true
+        current.pendingCommandIndex = batch.count() - 1
+      case EntityState.Unchanged()
+        let snapshot = this.captureRow(current.entity)
+        let rowError = this.validateRow(snapshot)
+
+        if rowError != null
+          return rowError
+        end
+        let key = this.key(snapshot)
+
+        if !sameOptionalCell(key, this.key(current.original))
+          return "tracked entity key changed"
+        end
+        current.pending = snapshot
+        let beforeCommands = batch.count()
+        let error = this.prepareUpdate(batch, current.original, snapshot, dialect)
+
+        if error != null
+          return error
+        end
+        current.pendingWrite = batch.count() > beforeCommands
+        if current.pendingWrite && this.returningColumns(false) != null
+          current.pendingCommandIndex = batch.count() - 1
+        end
+      case EntityState.Deleted()
+        let snapshot = this.captureRow(current.entity)
+        let rowError = this.validateRow(snapshot)
+
+        if rowError != null
+          return rowError
+        end
+        if !sameOptionalCell(this.key(snapshot), this.key(current.original))
+          return "tracked entity key changed"
+        end
+        let error = this.prepareDelete(batch, current.original, dialect)
+
+        if error != null
+          return error
+        end
+        current.pendingWrite = true
+      case EntityState.Detached()
+    end
+    return null
+  end
+
+  internal def collectActions(actions: WriteActionList): String?
+    let metadataError = this.validateMetadata()
+
+    if metadataError != null
+      return metadataError
+    end
+    var current = this.entries
+
+    while current != null
+      current.actionId = -1
+      match current.state
+        case EntityState.Detached()
+        case EntityState.Added()
+          let error = this.collectEntry(current, actions, WriteActionKind.Insert())
+
+          if error != null
+            return error
+          end
+        case EntityState.Unchanged()
+          let error = this.collectEntry(current, actions, WriteActionKind.Update())
+
+          if error != null
+            return error
+          end
+        case EntityState.Deleted()
+          let error = this.collectEntry(current, actions, WriteActionKind.Delete())
+
+          if error != null
+            return error
+          end
+      end
+      current = current.next
+    end
+    return null
+  end
+
+  private def collectEntry(entry: TrackedEntry<T>, actions: WriteActionList, kind: WriteActionKind): String?
+    let snapshot = this.captureRow(entry.entity)
+    let invalid = this.validateRow(snapshot)
+
+    if invalid != null
+      return invalid
+    end
+    if !sameOptionalCell(this.key(snapshot), this.key(entry.original))
+      return "tracked entity key changed"
+    end
+    let tracker = this
+    let prepare: fn(WriteBatch, SqlDialect): String? = fn(batch: WriteBatch, dialect: SqlDialect): String?
+      return tracker.prepareEntry(entry, batch, dialect)
+    end
+    let validate: fn(readonly WriteReturnedRows): String? = fn(outputs: readonly WriteReturnedRows): String?
+      return tracker.validateReturned(outputs)
+    end
+    let apply: fn(): Void = fn(): Void
+      tracker.applyReturned()
+    end
+    let accept: fn(): Void = fn(): Void
+      tracker.acceptEntry(entry)
+    end
+
+    entry.actionId = actions.add(kind, prepare, validate, apply, accept)
+    return null
+  end
+
+  private def validateMetadata(): String?
+    if !identifierValid(this.tableName) || !identifierValid(this.keyName) || this.columns.count() == 0
+      return "invalid tracked table or key identifier"
+    end
+    if this.generatedKey && this.setGeneratedKey == null
+      return "generated key requires a key setter"
+    end
+    if this.generatedColumns.Length > 0 && this.applyGenerated == null
+      return "generated columns require an apply callback"
+    end
+    var keyFound = false
+    var index = 0
+
+    while index < this.columns.count()
+      let column = this.columns.at(index)
+      let name = column.name()
+
+      if !identifierValid(name)
+        return "invalid tracked column identifier"
+      end
+      var previous = 0
+
+      while previous < index
+        if this.columns.at(previous).name() == name
+          return "duplicate tracked column identifier"
+        end
+        previous = previous + 1
+      end
+      if name == this.keyName
+        keyFound = true
+
+        if column.nullable()
+          return "tracked key must be required"
+        end
+        match column.kind()
+          case ResultColumnKind.Bool()
+            return "tracked key must be integer or string"
+          case ResultColumnKind.Float()
+            return "tracked key must be integer or string"
+          case ResultColumnKind.Int()
+          case ResultColumnKind.Text()
+            if this.generatedKey
+              return "generated key must be an integer"
+            end
+        end
+      end
+      index = index + 1
+    end
+    if !keyFound
+      return "tracked key column is missing"
+    end
+    var generated = 0
+
+    while generated < this.generatedColumns.Length
+      let definition = this.generatedColumns[generated].column()
+
+      if definition.name() == this.keyName
+        return "generated scalar column must not be the key"
+      end
+      var matching = false
+      var mapped = 0
+
+      while mapped < this.columns.count()
+        let column = this.columns.at(mapped)
+
+        if column.name() == definition.name()
+          if column.nullable() != definition.nullable() || generatedKindCode(column.kind()) != generatedKindCode(definition.kind())
+            return "generated column descriptor does not match mapped column: " + definition.name()
+          end
+          matching = true
+        end
+        mapped = mapped + 1
+      end
+      if !matching
+        return "generated column is not mapped: " + definition.name()
+      end
+      var prior = 0
+
+      while prior < generated
+        if this.generatedColumns[prior].column().name() == definition.name()
+          return "duplicate generated column: " + definition.name()
+        end
+        prior = prior + 1
+      end
+      generated = generated + 1
+    end
+    let concurrency = this.concurrencyColumns
+
+    if concurrency != null
+      var token = 0
+
+      while token < concurrency.Length
+        let name = concurrency[token]
+
+        if !identifierValid(name) || name == this.keyName
+          return "concurrency column must be a mapped non-key column: " + name
+        end
+        var found = false
+        var mapped = 0
+
+        while mapped < this.columns.count()
+          found = true if this.columns.at(mapped).name() == name
+          mapped = mapped + 1
+        end
+        if !found
+          return "concurrency column is not mapped: " + name
+        end
+        var prior = 0
+
+        while prior < token
+          if concurrency[prior] == name
+            return "duplicate concurrency column: " + name
+          end
+          prior = prior + 1
+        end
+        token = token + 1
+      end
+    end
+    return null
+  end
+
+  private def predicateIncludes(name: String): Bool
+    if name == this.keyName
+      return true
+    end
+    let concurrency = this.concurrencyColumns
+
+    if concurrency == null
+      return true
+    end
+    for selected in concurrency
+      if selected == name
+        return true
+      end
+    end
+    return false
+  end
+
+  private readonly def generatedColumn(name: String): readonly GeneratedValueColumn?
+    for definition in this.generatedColumns
+      if definition.column().name() == name
+        return definition
+      end
+    end
+    return null
+  end
+
+  private def generatedOnUpdate(name: String): Bool
+    let definition = this.generatedColumn(name)
+
+    if definition == null
+      return false
+    end
+    match definition.timing()
+      case GeneratedValueTiming.OnAdd()
+        return false
+      case GeneratedValueTiming.OnAddOrUpdate()
+        return true
+    end
+  end
+
+  private def returningColumns(insert: Bool): ResultColumns?
+    var count = insert && this.generatedKey ? 1 : 0
+
+    for definition in this.generatedColumns
+      match definition.timing()
+        case GeneratedValueTiming.OnAdd()
+          count = count + 1 if insert
+        case GeneratedValueTiming.OnAddOrUpdate()
+          count = count + 1
+      end
+    end
+    if count == 0
+      return null
+    end
+    let columns: ResultColumn[] = tasks::generate(count, 1) do |index|
+      if insert && this.generatedKey && index == 0
+        return new ResultColumn(this.keyName, ResultColumnKind.Int(), false)
+      end
+      var position = insert && this.generatedKey ? 1 : 0
+
+      for definition in this.generatedColumns
+        var included = insert
+
+        if !insert
+          match definition.timing()
+            case GeneratedValueTiming.OnAdd()
+              included = false
+            case GeneratedValueTiming.OnAddOrUpdate()
+              included = true
+          end
+        end
+        if included
+          if position == index
+            let column = definition.column()
+
+            return new ResultColumn(column.name(), copyResultColumnKind(column.kind()), column.nullable())
+          end
+          position = position + 1
+        end
+      end
+      return new ResultColumn("", ResultColumnKind.Int(), false)
+    end
+
+    return new ResultColumns(columns)
+  end
+
+  private readonly def shouldRestoreGenerated(name: String, current: readonly RawRow, last: readonly RawRow?): Bool
+    let definition = this.generatedColumn(name)
+
+    if definition == null
+      return false
+    end
+    match definition.timing()
+      case GeneratedValueTiming.OnAddOrUpdate()
+        return true
+      case GeneratedValueTiming.OnAdd()
+        if last == null
+          return true
+        end
+        let applied = cellFromRow(last, name)
+        let local = cellFromRow(current, name)
+
+        return applied == null || local == null || sameCell(applied, local)
+    end
+  end
+
+  private def restoreGeneratedBefore(entity: T, before: readonly RawRow, last: readonly RawRow?): Void
+    let applyGenerated = this.applyGenerated
+
+    if applyGenerated == null
+      return
+    end
+    let current = this.captureRow(entity)
+    var count = 0
+    var index = 0
+
+    while index < before.count()
+      let column = before.at(index)
+
+      if column != null && this.shouldRestoreGenerated(column.name, current, last)
+        count = count + 1
+      end
+      index = index + 1
+    end
+    if count == 0
+      return
+    end
+    let fields: RawColumn[] = tasks::generate(count, 1) do |position|
+      var seen = 0
+      var source = 0
+
+      while source < before.count()
+        let column = before.at(source)
+
+        if column != null && this.shouldRestoreGenerated(column.name, current, last)
+          if seen == position
+            let value = cellFromRow(before, column.name)
+
+            if value != null
+              return new RawColumn(column.name, value)
+            end
+          end
+          seen = seen + 1
+        end
+        source = source + 1
+      end
+      return new RawColumn("", Cell.Null())
+    end
+
+    applyGenerated(entity, new RawRow(fields))
+  end
+
+  private def validateRow(row: RawRow): String?
+    var index = 0
+
+    while index < this.columns.count()
+      let column = this.columns.at(index)
+      let cell = cellFromRow(row, column.name())
+
+      if cell == null
+        return "captured entity column is missing: " + column.name()
+      end
+      if !writeCellMatches(cell, column)
+        return "captured column type or nullability mismatch: " + column.name()
+      end
+      index = index + 1
+    end
+    return null
+  end
+
+  private def returningSql(columns: readonly ResultColumns): String
+    var result = " RETURNING "
+    var index = 0
+
+    while index < columns.count()
+      result = result + (index == 0 ? "" : ", ") + "\"" + columns.at(index).name() + "\""
+      index = index + 1
+    end
+    return result
+  end
+
+  private def prepareInsert(batch: WriteBatch, row: RawRow, dialect: SqlDialect): String?
+    var names = ""
+    var markers = ""
+    let values = new WriteValues()
+    var index = 0
+
+    while index < this.columns.count()
+      let column = this.columns.at(index).name()
+
+      if !identifierValid(column)
+        return "invalid tracked column identifier"
+      end
+      if (!this.generatedKey || column != this.keyName) && this.generatedColumn(column) == null
+        match row.value(column)
+          case CellLookup.Missing()
+            return "captured entity column is missing: " + column
+          case CellLookup.Found(value)
+            let separator = values.count() == 0 ? "" : ", "
+
+            names = names + separator + "\"" + column + "\""
+            values.add(value)
+            markers = markers + separator + dialectPlaceholder(dialect, values.count())
+        end
+      end
+      index = index + 1
+    end
+    let returning = this.returningColumns(true)
+    let suffix = returning == null ? "" : this.returningSql(returning)
+
+    if values.count() == 0
+      batch.add("INSERT INTO \"" + this.tableName + "\" DEFAULT VALUES" + suffix, values, 1, returning)
+    else
+      batch.add("INSERT INTO \"" + this.tableName + "\" (" + names + ") VALUES (" + markers + ")" + suffix, values, 1, returning)
+    end
+    return null
+  end
+
+  private def prepareUpdate(batch: WriteBatch, original: RawRow, snapshot: RawRow, dialect: SqlDialect): String?
+    let values = new WriteValues()
+    var assignments = ""
+    var separator = ""
+    var index = 0
+
+    while index < this.columns.count()
+      let column = this.columns.at(index).name()
+
+      if !identifierValid(column)
+        return "invalid tracked column identifier"
+      end
+      if column != this.keyName
+        let before = cellFromRow(original, column)
+        let after = cellFromRow(snapshot, column)
+
+        if before == null || after == null
+          return "captured entity column is missing: " + column
+        end
+        if this.generatedOnUpdate(column) && !sameCell(before, after)
+          return "store-generated column changed by application: " + column
+        end
+        if !this.generatedOnUpdate(column) && !sameCell(before, after)
+          values.add(after)
+          assignments = assignments + separator + "\"" + column + "\" = " + dialectPlaceholder(dialect, values.count())
+          separator = ", "
+        end
+      end
+      index = index + 1
+    end
+    if assignments == ""
+      return null
+    end
+    let predicate = this.originalPredicate(original, values, dialect)
+
+    if predicate == null
+      return "captured entity column is missing"
+    end
+    let returning = this.returningColumns(false)
+    let suffix = returning == null ? "" : this.returningSql(returning)
+
+    batch.add("UPDATE \"" + this.tableName + "\" SET " + assignments + " WHERE " + predicate + suffix, values, 1, returning)
+    return null
+  end
+
+  private def prepareDelete(batch: WriteBatch, original: RawRow, dialect: SqlDialect): String?
+    let values = new WriteValues()
+    let predicate = this.originalPredicate(original, values, dialect)
+
+    if predicate == null
+      return "captured entity column is missing"
+    end
+    batch.add("DELETE FROM \"" + this.tableName + "\" WHERE " + predicate, values, 1)
+    return null
+  end
+
+  private def originalPredicate(row: RawRow, values: WriteValues, dialect: SqlDialect): String?
+    var sql = ""
+    var index = 0
+
+    while index < this.columns.count()
+      let column = this.columns.at(index).name()
+
+      if this.predicateIncludes(column)
+        let cell = cellFromRow(row, column)
+
+        if cell == null
+          return null
+        end
+        sql = sql + (sql == "" ? "" : " AND ") + "\"" + column + "\""
+        match cell
+          case Cell.Null()
+            sql = sql + " IS NULL"
+          case Cell.Bool(value)
+            values.add(cell)
+            sql = sql + " = " + dialectPlaceholder(dialect, values.count())
+          case Cell.Int(value)
+            values.add(cell)
+            sql = sql + " = " + dialectPlaceholder(dialect, values.count())
+          case Cell.Float(value)
+            values.add(cell)
+            sql = sql + " = " + dialectPlaceholder(dialect, values.count())
+          case Cell.Text(value)
+            values.add(cell)
+            sql = sql + " = " + dialectPlaceholder(dialect, values.count())
+        end
+      end
+      index = index + 1
+    end
+    return sql
+  end
+
+  internal def validateReturned(outputs: readonly WriteReturnedRows): String?
+    var current = this.entries
+
+    while current != null
+      if current.pendingCommandIndex >= 0 && (this.generatedKey || this.generatedColumns.Length > 0)
+        let row = outputs.at(current.pendingCommandIndex)
+
+        if row == null
+          return "generated write returned no row"
+        end
+        var inserting = false
+
+        match current.state
+          case EntityState.Added()
+            inserting = true
+          case EntityState.Unchanged()
+          case EntityState.Deleted()
+          case EntityState.Detached()
+        end
+        let expected = this.returningColumns(inserting)
+
+        if expected == null || row.count() != expected.count()
+          return "generated write returned an invalid column count"
+        end
+        var index = 0
+
+        while index < expected.count()
+          let column = row.at(index)
+          let descriptor = expected.at(index)
+
+          if column == null || column.name != descriptor.name()
+            return "generated write returned an unexpected column"
+          end
+          let value = cellFromRow(row, descriptor.name())
+
+          if value == null || !writeCellMatches(value, descriptor)
+            return "generated write returned a type or nullability mismatch: " + descriptor.name()
+          end
+          index = index + 1
+        end
+        current.pendingGeneratedValues = copyRow(row, expected)
+        if inserting && this.generatedKey
+          let key = cellFromRow(row, this.keyName)
+
+          if key == null
+            return "generated insert returned no key column"
+          end
+          match key
+            case Cell.Int(value)
+              var other = this.entries
+
+              while other != null
+                let otherKey = other.pendingGeneratedKey
+
+                if otherKey != null && otherKey == value
+                  return "generated key collides with another returned key"
+                end
+                match other.state
+                  case EntityState.Detached()
+                  case EntityState.Added()
+                    let trackedKey = this.key(other.original)
+
+                    if trackedKey != null && sameCell(trackedKey, Cell.Int(value)) && !sameOptionalCell(trackedKey, this.key(current.original))
+                      return "generated key collides with a tracked key"
+                    end
+                  case EntityState.Unchanged()
+                    let trackedKey = this.key(other.original)
+
+                    if trackedKey != null && sameCell(trackedKey, Cell.Int(value)) && !sameOptionalCell(trackedKey, this.key(current.original))
+                      return "generated key collides with a tracked key"
+                    end
+                  case EntityState.Deleted()
+                    let trackedKey = this.key(other.original)
+
+                    if trackedKey != null && sameCell(trackedKey, Cell.Int(value)) && !sameOptionalCell(trackedKey, this.key(current.original))
+                      return "generated key collides with a tracked key"
+                    end
+                end
+                other = other.next
+              end
+              current.pendingGeneratedKey = value
+            case Cell.Null()
+              return "generated insert returned a null key"
+            case Cell.Bool(value)
+              return "generated insert returned a non-integer key"
+            case Cell.Text(value)
+              return "generated insert returned a non-integer key"
+            case Cell.Float(value)
+              return "generated insert returned a non-integer key"
+          end
+        end
+      end
+      current = current.next
+    end
+    return null
+  end
+
+  internal def applyReturned(): Void
+    let setter = this.setGeneratedKey
+    let applyGenerated = this.applyGenerated
+    var current = this.entries
+
+    while current != null
+      let generated = current.pendingGeneratedKey
+      let returned = current.pendingGeneratedValues
+
+      if returned != null && this.generatedColumns.Length > 0
+        let before = this.captureRow(current.entity)
+
+        if this.transactionActive
+          current.transactionGeneratedBefore = generatedBeforeRow(current.transactionGeneratedBefore, returned, before, this.keyName)
+          match current.state
+            case EntityState.Added()
+              current.transactionGeneratedLast = returned
+            case EntityState.Unchanged()
+            case EntityState.Deleted()
+            case EntityState.Detached()
+          end
+        end
+        if this.saveCheckpoints != null
+          current.saveGeneratedBefore = generatedBeforeRow(current.saveGeneratedBefore, returned, before, this.keyName)
+        end
+      end
+      if generated != null && setter != null
+        setter(current.entity, generated)
+      end
+      if returned != null && applyGenerated != null && this.generatedColumns.Length > 0
+        applyGenerated(current.entity, returned)
+      end
+      if generated != null || returned != null
+        current.transactionGeneratedApplied = true if this.transactionActive
+        current.pending = this.captureRow(current.entity)
+        current.pendingGeneratedKey = null
+        current.pendingGeneratedValues = null
+      end
+      current = current.next
+    end
+  end
+
+  internal def accept(): Void
+    var current = this.entries
+
+    while current != null
+      this.acceptEntry(current)
+      current = current.next
+    end
+  end
+
+  private def acceptEntry(current: TrackedEntry<T>): Void
+    match current.state
+      case EntityState.Added()
+        let pending = current.pending
+
+        if pending != null
+          current.original = pending
+        end
+        current.state = EntityState.Unchanged()
+      case EntityState.Unchanged()
+        let pending = current.pending
+
+        if pending != null
+          current.original = pending
+        end
+      case EntityState.Deleted()
+        current.state = EntityState.Detached()
+      case EntityState.Detached()
+    end
+    if this.transactionActive && current.pendingWrite
+      current.transactionWritten = true
+    end
+    current.pending = null
+    current.pendingWrite = false
+    current.pendingCommandIndex = -1
+    current.pendingGeneratedKey = null
+    current.pendingGeneratedValues = null
+  end
+end
+
+## Unlinks a nullable relationship identified by its tracked dependent and FK slot.
+def unlinkRelation<D>(context: ChangeContext, dependent: TrackedHandle<D>, slot: String): QueryFailure?
+  return context.unlinkByIdentity(dependent.graphIdentity(), dependent.owner(), dependent.valid(), slot)
+end
+
+## Deletes a tracked root and every reachable registered client-cascade dependent.
+def removeCascade<T>(context: ChangeContext, root: TrackedHandle<T>): QueryFailure?
+  return context.removeCascadeNode(root.cascadeNode())
+end
+
+def writeCellMatches(cell: Cell, column: readonly ResultColumn): Bool
+  match cell
+    case Cell.Null()
+      return column.nullable()
+    case Cell.Bool(value)
+      match column.kind()
+        case ResultColumnKind.Bool()
+          return true
+        case ResultColumnKind.Int()
+          return false
+        case ResultColumnKind.Float()
+          return false
+        case ResultColumnKind.Text()
+          return false
+      end
+    case Cell.Int(value)
+      match column.kind()
+        case ResultColumnKind.Int()
+          return true
+        case ResultColumnKind.Bool()
+          return false
+        case ResultColumnKind.Float()
+          return false
+        case ResultColumnKind.Text()
+          return false
+      end
+    case Cell.Float(value)
+      match column.kind()
+        case ResultColumnKind.Float()
+          return dataFloatFinite(value)
+        case ResultColumnKind.Bool()
+          return false
+        case ResultColumnKind.Int()
+          return false
+        case ResultColumnKind.Text()
+          return false
+      end
+    case Cell.Text(value)
+      match column.kind()
+        case ResultColumnKind.Text()
+          return true
+        case ResultColumnKind.Bool()
+          return false
+        case ResultColumnKind.Int()
+          return false
+        case ResultColumnKind.Float()
+          return false
+      end
+  end
+end
+
+## One context coordinates all mapped entity trackers and one atomic provider write.
+class ChangeContext
+  private boundProvider: Provider?
+  private firstSet: ChangeSetNode?
+  private lastSet: ChangeSetNode?
+  private firstEdge: RelationshipEdge?
+  private lastEdge: RelationshipEdge?
+  private lease: Int?
+  private transactionFailed: Bool = false
+  private graphRegistrationActive: Bool = false
+
+  public def init(provider: Provider? = null): Void
+    this.boundProvider = provider
+  end
+
+  internal def matchesProvider(expected: Provider): Bool
+    let actual = this.boundProvider
+
+    return actual != null && reference::same(actual, expected)
+  end
+
+  public def register(set: ChangeSet): Void
+    if this.graphRegistrationActive
+      return
+    end
+    if !set.registerOnce()
+      return
+    end
+    let node = new ChangeSetNode(set)
+    let last = this.lastSet
+
+    if last == null
+      this.firstSet = node
+    else
+      last.next = node
+    end
+    this.lastSet = node
+  end
+
+  private def ownsSet(owner: ChangeSet): Bool
+    var current = this.firstSet
+
+    while current != null
+      if reference::same(current.value, owner)
+        return true
+      end
+      current = current.next
+    end
+    return false
+  end
+
+  internal def ownsGraphSet(owner: ChangeSet): Bool
+    return this.ownsSet(owner)
+  end
+
+  internal def beginGraphRegistration(journal: GraphJournal): QueryFailure?
+    if this.graphRegistrationActive
+      return QueryFailure.Provider("graph enrollment is already active")
+    end
+    if this.transactionFailed
+      return QueryFailure.Provider("transaction state is uncertain")
+    end
+    this.graphRegistrationActive = true
+    let firstBefore = this.firstEdge
+    let lastBefore = this.lastEdge
+    let undo: fn(): Void = fn(): Void
+      var added = this.firstEdge
+
+      if lastBefore != null
+        added = lastBefore.next
+      end
+      while added != null
+        let next = added.next
+
+        added.undoGraphRegistration()
+        added = next
+      end
+      this.firstEdge = firstBefore
+      this.lastEdge = lastBefore
+      if lastBefore != null
+        lastBefore.next = null
+      end
+    end
+
+    journal.record(undo)
+    return null
+  end
+
+  internal def endGraphRegistration(): Void
+    this.graphRegistrationActive = false
+  end
+
+  internal def registerGraphRelation(edge: RelationshipEdge): QueryFailure?
+    if !this.graphRegistrationActive
+      return QueryFailure.Provider("graph enrollment is not active")
+    end
+    return this.registerRelationCore(edge)
+  end
+
+  internal def graphPreflight(): QueryFailure?
+    if !this.graphRegistrationActive
+      return QueryFailure.Provider("graph enrollment is not active")
+    end
+    let actions = new WriteActionList()
+    let actionJournal = new GraphJournal()
+    var set = this.firstSet
+
+    while set != null
+      set.value.graphActionSnapshot(actionJournal)
+      set = set.next
+    end
+    set = this.firstSet
+
+    while set != null
+      let error = set.value.collectActions(actions)
+
+      if error != null
+        actionJournal.rollback()
+        return QueryFailure.Provider(error)
+      end
+      set = set.next
+    end
+    let planError = this.graphPlan(actions)
+
+    actionJournal.rollback()
+
+    if planError != null
+      return QueryFailure.Provider(planError)
+    end
+    return null
+  end
+
+  public def registerRelation(edge: RelationshipEdge): QueryFailure?
+    if this.graphRegistrationActive
+      return QueryFailure.Provider("cannot register a relationship during graph enrollment")
+    end
+    return this.registerRelationCore(edge)
+  end
+
+  private def registerRelationCore(edge: RelationshipEdge): QueryFailure?
+    if !this.ownsSet(edge.principalOwner()) || !this.ownsSet(edge.dependentOwner())
+      return QueryFailure.Provider("relationship handle belongs to another context")
+    end
+    if !edge.valid()
+      return QueryFailure.Provider("relationship handle is stale")
+    end
+    if !edge.validDeletePolicy()
+      return QueryFailure.Provider("client set-null requires a mapped optional non-key foreign key")
+    end
+    match edge.principalState()
+      case EntityState.Detached()
+        return QueryFailure.Provider("linked principal is detached")
+      case EntityState.Added()
+      case EntityState.Unchanged()
+      case EntityState.Deleted()
+    end
+    match edge.dependentState()
+      case EntityState.Detached()
+        return QueryFailure.Provider("linked dependent is detached")
+      case EntityState.Added()
+      case EntityState.Unchanged()
+      case EntityState.Deleted()
+    end
+    if this.lease == null && !this.graphRegistrationActive
+      this.pruneEdges()
+    end
+    var current = this.firstEdge
+
+    while current != null
+      if current.isActive() && !current.dependentValid()
+        return QueryFailure.Provider("existing relationship dependent handle is stale")
+      end
+      if current.isActive() && !current.principalValid()
+        return QueryFailure.Provider("existing relationship principal handle is stale")
+      end
+      if current.isActive() && current.slot() == edge.slot() && reference::same(current.dependentIdentity(), edge.dependentIdentity())
+        if reference::same(current.principalIdentity(), edge.principalIdentity())
+          if !current.sameDeletePolicy(edge) || !current.sameScalarShape(edge)
+            return QueryFailure.Provider("registered relationship policy or scalar mapping differs")
+          end
+          return null
+        end
+        return QueryFailure.Provider("dependent foreign key is already linked to another principal")
+      end
+      current = current.next
+    end
+    if edge.isRegistered()
+      return QueryFailure.Provider("relationship link is already registered")
+    end
+    let invalid = edge.propagate()
+
+    if invalid != null
+      return invalid
+    end
+    if !edge.registerOnce()
+      return QueryFailure.Provider("relationship link is already registered")
+    end
+    this.appendRelation(edge)
+    if this.lease != null
+      edge.checkpoint()
+    end
+    return null
+  end
+
+  ## Replaces an explicitly registered link for the same dependent and FK slot.
+  public def reassignRelation(newEdge: RelationshipEdge): QueryFailure?
+    if this.graphRegistrationActive
+      return QueryFailure.Provider("cannot reassign a relationship during graph enrollment")
+    end
+    if !this.ownsSet(newEdge.principalOwner()) || !this.ownsSet(newEdge.dependentOwner())
+      return QueryFailure.Provider("relationship handle belongs to another context")
+    end
+    if !newEdge.valid()
+      return QueryFailure.Provider("relationship handle is stale")
+    end
+    if !newEdge.validDeletePolicy()
+      return QueryFailure.Provider("client set-null requires a mapped optional non-key foreign key")
+    end
+    var old = this.firstEdge
+
+    while old != null
+      if old.isActive() && old.slot() == newEdge.slot() && reference::same(old.dependentIdentity(), newEdge.dependentIdentity())
+        break
+      end
+      old = old.next
+    end
+    if old == null
+      return QueryFailure.Provider("dependent foreign key has no registered relationship")
+    end
+    if !old.dependentValid()
+      return QueryFailure.Provider("existing relationship dependent handle is stale")
+    end
+    if !old.principalValid()
+      return QueryFailure.Provider("existing relationship principal handle is stale")
+    end
+    if !old.sameScalarShape(newEdge) || !old.sameDeletePolicy(newEdge)
+      return QueryFailure.Provider("replacement relationship scalar mapping differs")
+    end
+    if !old.hasMappedSlot() || !newEdge.hasMappedSlot()
+      return QueryFailure.Provider("relationship FK slot is missing, identifying, or has incompatible metadata")
+    end
+    match old.dependentState()
+      case EntityState.Detached()
+        return QueryFailure.Provider("linked dependent is detached")
+      case EntityState.Deleted()
+        return QueryFailure.Provider("linked dependent is deleted")
+      case EntityState.Added()
+      case EntityState.Unchanged()
+    end
+    match newEdge.principalState()
+      case EntityState.Detached()
+        return QueryFailure.Provider("linked principal is detached")
+      case EntityState.Deleted()
+        return QueryFailure.Provider("linked principal is deleted")
+      case EntityState.Added()
+      case EntityState.Unchanged()
+    end
+    if reference::same(old.principalIdentity(), newEdge.principalIdentity())
+      return null
+    end
+    if newEdge.isRegistered()
+      return QueryFailure.Provider("replacement relationship link is already registered")
+    end
+    let invalid = newEdge.propagate()
+
+    if invalid != null
+      return invalid
+    end
+    if !newEdge.registerOnce()
+      return QueryFailure.Provider("replacement relationship link is already registered")
+    end
+    old.retire()
+    this.appendRelation(newEdge)
+    if this.lease != null
+      newEdge.checkpoint()
+    end
+    return null
+  end
+
+  ## Clears an optional FK, or retires a required cascade link after deleting its dependent closure.
+  internal def unlinkByIdentity(identity: GraphIdentity, owner: ChangeSet, valid: Bool, slot: String): QueryFailure?
+    if !this.ownsSet(owner)
+      return QueryFailure.Provider("relationship handle belongs to another context")
+    end
+    if !valid
+      return QueryFailure.Provider("relationship handle is stale")
+    end
+    var edge = this.firstEdge
+
+    while edge != null
+      if edge.isActive() && edge.slot() == slot && reference::same(edge.dependentIdentity(), identity)
+        break
+      end
+      edge = edge.next
+    end
+    if edge == null
+      return QueryFailure.Provider("dependent foreign key has no registered relationship")
+    end
+    if !edge.principalValid() || !edge.dependentValid()
+      return QueryFailure.Provider("existing relationship handle is stale")
+    end
+    if !edge.isNullable()
+      if !edge.cascadesOnDelete()
+        return QueryFailure.Provider("required foreign key cannot be unlinked")
+      end
+      if !edge.hasMappedOrphanSlot()
+        return QueryFailure.Provider("relationship FK slot is missing or has incompatible metadata")
+      end
+      let orphanError = this.removeCascadeNode(edge.dependentCascadeNode(), edge.principalIdentity())
+
+      if orphanError != null
+        return orphanError
+      end
+      edge.retireOrphan()
+      return null
+    end
+    if !edge.hasMappedSlot()
+      return QueryFailure.Provider("relationship FK slot is missing, identifying, or has incompatible metadata")
+    end
+    let invalid = edge.clearForeignKey()
+
+    if invalid != null
+      return invalid
+    end
+    edge.retire()
+    return null
+  end
+
+  private def appendRelation(edge: RelationshipEdge): Void
+    let last = this.lastEdge
+
+    if last == null
+      this.firstEdge = edge
+    else
+      last.next = edge
+    end
+    this.lastEdge = edge
+  end
+
+  internal def removeCascadeNode(root: CascadeNode, protectedIdentity: GraphIdentity? = null): QueryFailure?
+    if !this.ownsSet(root.owner)
+      return QueryFailure.Provider("cascade handle belongs to another context")
+    end
+    let rootError = root.validate()
+
+    if rootError != null
+      return rootError
+    end
+    let plan = new CascadePlan()
+
+    plan.append(root)
+    var growing = true
+
+    while growing
+      growing = false
+      var edge = this.firstEdge
+
+      while edge != null
+        if edge.isActive() && plan.find(edge.principalIdentity()) != null
+          if !edge.valid() || !this.ownsSet(edge.principalOwner()) || !this.ownsSet(edge.dependentOwner())
+            return QueryFailure.Provider("cascade relationship handle is stale or foreign")
+          end
+          match edge.dependentState()
+            case EntityState.Detached()
+            case EntityState.Added()
+              if edge.cascadesOnDelete() && plan.find(edge.dependentIdentity()) == null
+                plan.append(edge.dependentCascadeNode())
+                growing = true
+              end
+            case EntityState.Unchanged()
+              if edge.cascadesOnDelete() && plan.find(edge.dependentIdentity()) == null
+                plan.append(edge.dependentCascadeNode())
+                growing = true
+              end
+            case EntityState.Deleted()
+              if plan.find(edge.dependentIdentity()) == null
+                plan.append(edge.dependentCascadeNode())
+                growing = true
+              end
+          end
+        end
+        edge = edge.next
+      end
+    end
+    if protectedIdentity != null && plan.find(protectedIdentity) != null
+      return QueryFailure.Provider("required orphan cascade reaches its principal")
+    end
+    var node = plan.first
+
+    while node != null
+      if !this.ownsSet(node.owner)
+        return QueryFailure.Provider("cascade node belongs to another context")
+      end
+      let invalid = node.validate()
+
+      if invalid != null
+        return invalid
+      end
+      node = node.next
+    end
+    var edge = this.firstEdge
+
+    while edge != null
+      if edge.isActive() && plan.find(edge.principalIdentity()) != null
+        if !edge.valid() || !this.ownsSet(edge.principalOwner()) || !this.ownsSet(edge.dependentOwner())
+          return QueryFailure.Provider("cascade relationship handle is stale or foreign")
+        end
+        if plan.find(edge.dependentIdentity()) == null
+          var surviving = false
+
+          match edge.dependentState()
+            case EntityState.Detached()
+              surviving = false
+            case EntityState.Deleted()
+              return QueryFailure.Provider("cascade deleted dependent was not included")
+            case EntityState.Added()
+              surviving = true
+            case EntityState.Unchanged()
+              surviving = true
+          end
+          if surviving
+            if edge.setsNullOnDelete()
+              if !edge.validDeletePolicy()
+                return QueryFailure.Provider("client set-null requires a mapped optional non-key foreign key")
+              end
+              let clearError = edge.validateClearForeignKey()
+
+              if clearError != null
+                return clearError
+              end
+            else
+              return QueryFailure.Provider("registered dependent restricts principal removal")
+            end
+          end
+        end
+      end
+      edge = edge.next
+    end
+    var ordered = 0
+
+    while ordered < plan.count
+      node = plan.first
+      var selected: CascadeNode? = null
+
+      while node != null
+        if !node.planned && this.cascadeReady(node, plan)
+          selected = node
+          break
+        end
+        node = node.next
+      end
+      if selected == null
+        return QueryFailure.Provider("cascade relationship cycle")
+      end
+      selected.planned = true
+      selected.order = ordered
+      ordered = ordered + 1
+    end
+    edge = this.firstEdge
+
+    while edge != null
+      if edge.isActive() && edge.setsNullOnDelete() && plan.find(edge.principalIdentity()) != null && plan.find(edge.dependentIdentity()) == null
+        match edge.dependentState()
+          case EntityState.Detached()
+          case EntityState.Deleted()
+          case EntityState.Added()
+            let clearError = edge.clearForeignKey()
+
+            if clearError != null
+              return clearError
+            end
+            edge.retire()
+          case EntityState.Unchanged()
+            let clearError = edge.clearForeignKey()
+
+            if clearError != null
+              return clearError
+            end
+            edge.retire()
+        end
+      end
+      edge = edge.next
+    end
+    ordered = 0
+
+    while ordered < plan.count
+      node = plan.first
+
+      while node != null && node.order != ordered
+        node = node.next
+      end
+      if node == null
+        return QueryFailure.Provider("cascade order is incomplete")
+      end
+      let failure = node.remove()
+
+      if failure != null
+        return failure
+      end
+      ordered = ordered + 1
+    end
+    return null
+  end
+
+  private def cascadeReady(node: CascadeNode, plan: CascadePlan): Bool
+    var edge = this.firstEdge
+
+    while edge != null
+      if (edge.isActive() || edge.persistsOldForeignKey()) && reference::same(edge.principalIdentity(), node.identity)
+        let dependent = plan.find(edge.dependentIdentity())
+
+        if dependent != null && !reference::same(dependent.identity, node.identity) && !dependent.planned
+          return false
+        end
+      end
+      edge = edge.next
+    end
+    return true
+  end
+
+  ## Discards all tracked entries while retaining the borrowed provider and mappings.
+  public def clear(): Void
+    if this.graphRegistrationActive
+      return
+    end
+    var set = this.firstSet
+
+    while set != null
+      set.value.clear()
+      set = set.next
+    end
+    if this.lease == null
+      this.firstEdge = null
+      this.lastEdge = null
+    end
+  end
+
+  ## Opens one explicit transaction and captures every tracked baseline.
+  public def beginTransaction(): WriteResult
+    if this.graphRegistrationActive
+      return WriteResult.Failure(WriteFailure.Validation("cannot begin a transaction during graph enrollment"))
+    end
+    if this.lease != null
+      return WriteResult.Failure(WriteFailure.Validation("transaction is already active"))
+    end
+    if this.transactionFailed
+      return WriteResult.Failure(WriteFailure.Transaction("transaction state is uncertain"))
+    end
+    let provider = this.boundProvider
+
+    if provider == null
+      return WriteResult.Failure(WriteFailure.Unsupported("transaction requires a provider"))
+    end
+    this.checkpointSets()
+    match provider.beginTransaction()
+      case TransactionOpenResult.Begun(lease)
+        this.lease = lease
+        return WriteResult.Saved(0)
+      case TransactionOpenResult.Failure(error)
+        this.discardCheckpoints()
+        return WriteResult.Failure(error)
+    end
+  end
+
+  ## Commits the provider before making provisional tracker baselines final.
+  public def commitTransaction(): WriteResult
+    if this.graphRegistrationActive
+      return WriteResult.Failure(WriteFailure.Validation("cannot commit a transaction during graph enrollment"))
+    end
+    let lease = this.lease
+
+    if lease == null
+      return WriteResult.Failure(WriteFailure.Validation("transaction is not active"))
+    end
+    if this.transactionFailed
+      return WriteResult.Failure(WriteFailure.Transaction("transaction state is uncertain"))
+    end
+    let provider = this.boundProvider
+
+    if provider == null
+      return WriteResult.Failure(WriteFailure.Unsupported("transaction requires a provider"))
+    end
+    let result = provider.commitTransaction(lease)
+
+    match result
+      case WriteResult.Saved(count)
+        if count != 0
+          return this.reconcile(WriteFailure.Provider("transaction commit returned a row count"), provider, lease)
+        end
+        this.discardCheckpoints()
+        this.lease = null
+        this.pruneEdges()
+        return WriteResult.Saved(0)
+      case WriteResult.Failure(error)
+        return this.reconcile(error, provider, lease)
+      case WriteResult.SavedWithValues(count, outputs)
+        return this.reconcile(WriteFailure.Provider("transaction commit returned row values"), provider, lease)
+    end
+  end
+
+  ## Rolls back provider writes, then restores the tracked pre-transaction baselines.
+  public def rollbackTransaction(): WriteResult
+    if this.graphRegistrationActive
+      return WriteResult.Failure(WriteFailure.Validation("cannot roll back a transaction during graph enrollment"))
+    end
+    let lease = this.lease
+
+    if lease == null
+      return WriteResult.Failure(WriteFailure.Validation("transaction is not active"))
+    end
+    let provider = this.boundProvider
+
+    if provider == null
+      return WriteResult.Failure(WriteFailure.Unsupported("transaction requires a provider"))
+    end
+    let result = provider.rollbackTransaction(lease)
+
+    match result
+      case WriteResult.Saved(count)
+        if count != 0
+          return this.reconcile(WriteFailure.Provider("transaction rollback returned a row count"), provider, lease)
+        end
+        this.restoreCheckpoints()
+        this.lease = null
+        this.transactionFailed = false
+        return WriteResult.Saved(0)
+      case WriteResult.Failure(error)
+        return this.reconcile(error, provider, lease)
+      case WriteResult.SavedWithValues(count, outputs)
+        return this.reconcile(WriteFailure.Provider("transaction rollback returned row values"), provider, lease)
+    end
+  end
+
+  private def checkpointSets(): Void
+    var set = this.firstSet
+
+    while set != null
+      set.value.checkpoint()
+      set = set.next
+    end
+    var edge = this.firstEdge
+
+    while edge != null
+      edge.checkpoint()
+      edge = edge.next
+    end
+  end
+
+  private def checkpointGraphSave(): Void
+    var set = this.firstSet
+
+    while set != null
+      set.value.checkpointSave()
+      set = set.next
+    end
+  end
+
+  private def restoreGraphSave(): Void
+    var set = this.firstSet
+
+    while set != null
+      set.value.restoreSave()
+      set = set.next
+    end
+    var edge = this.firstEdge
+
+    while edge != null
+      edge.restore()
+      edge = edge.next
+    end
+  end
+
+  private def discardGraphSave(): Void
+    var set = this.firstSet
+
+    while set != null
+      set.value.discardSave()
+      set = set.next
+    end
+  end
+
+  private def restoreCheckpoints(): Void
+    var set = this.firstSet
+
+    while set != null
+      set.value.restore()
+      set.value.discardSave()
+      set = set.next
+    end
+    var edge = this.firstEdge
+
+    while edge != null
+      edge.restore()
+      edge = edge.next
+    end
+  end
+
+  private def discardCheckpoints(): Void
+    var set = this.firstSet
+
+    while set != null
+      set.value.discard()
+      set.value.discardSave()
+      set = set.next
+    end
+    var edge = this.firstEdge
+
+    while edge != null
+      edge.discard()
+      edge = edge.next
+    end
+  end
+
+  private def pruneEdges(): Void
+    var previous: RelationshipEdge? = null
+    var current = this.firstEdge
+
+    while current != null
+      let following = current.next
+      var detached = false
+
+      match current.dependentState()
+        case EntityState.Detached()
+          detached = true
+        case EntityState.Added()
+        case EntityState.Unchanged()
+        case EntityState.Deleted()
+      end
+      if !current.dependentValid()
+        detached = true
+      end
+      if !current.isActive() && !current.persistsOldForeignKey()
+        detached = true
+      end
+      if detached
+        if previous == null
+          this.firstEdge = following
+        else
+          previous.next = following
+        end
+        if following == null
+          this.lastEdge = previous
+        end
+        current.next = null
+      else
+        previous = current
+      end
+      current = following
+    end
+  end
+
+  private def reconcile(error: WriteFailure, provider: Provider, lease: Int): WriteResult
+    match provider.transactionState(lease)
+      case TransactionState.Active()
+        return WriteResult.Failure(error)
+      case TransactionState.RolledBack()
+        this.restoreCheckpoints()
+        this.lease = null
+        this.transactionFailed = false
+        return WriteResult.Failure(error)
+      case TransactionState.Committed()
+        this.discardCheckpoints()
+        this.lease = null
+        this.transactionFailed = false
+        this.pruneEdges()
+        return WriteResult.Failure(error)
+      case TransactionState.Invalid()
+        this.transactionFailed = true
+        return WriteResult.Failure(error)
+      case TransactionState.Failed()
+        this.transactionFailed = true
+        return WriteResult.Failure(error)
+    end
+  end
+
+  ## Executes a typed set write without changing any tracked snapshots.
+  public def executeSet(plan: readonly SetWritePlan, expectedProvider: Provider? = null): WriteResult
+    if this.transactionFailed
+      return WriteResult.Failure(WriteFailure.Transaction("transaction state is uncertain"))
+    end
+    let provider = this.boundProvider
+
+    if provider == null
+      return WriteResult.Failure(WriteFailure.Unsupported("set write requires a provider"))
+    end
+    if expectedProvider != null && !reference::same(provider, expectedProvider)
+      return WriteResult.Failure(WriteFailure.Validation("set write provider does not belong to this context"))
+    end
+    if plan.requiresCheckedScalars() && !provider.supports(ProviderCapability.CheckedScalarExpressions())
+      return WriteResult.Failure(WriteFailure.Unsupported("provider does not support checked scalar expressions"))
+    end
+    let activeLease = this.lease
+
+    if activeLease != null
+      match provider.transactionState(activeLease)
+        case TransactionState.Active()
+        case TransactionState.RolledBack()
+          return this.reconcile(WriteFailure.Transaction("transaction ended before set write"), provider, activeLease)
+        case TransactionState.Committed()
+          return this.reconcile(WriteFailure.Transaction("transaction ended before set write"), provider, activeLease)
+        case TransactionState.Invalid()
+          return this.reconcile(WriteFailure.Transaction("transaction lease is invalid"), provider, activeLease)
+        case TransactionState.Failed()
+          return this.reconcile(WriteFailure.Transaction("transaction state is uncertain"), provider, activeLease)
+      end
+    end
+    var result = WriteResult.Saved(0)
+
+    if activeLease != null
+      result = provider.executeSetInTransaction(plan, activeLease)
+    else
+      result = provider.executeSet(plan)
+    end
+    match result
+      case WriteResult.Saved(count)
+        if count < 0
+          if activeLease != null
+            return this.abortInvalidSetResult(WriteFailure.Provider("set write returned a negative row count"), provider, activeLease)
+          end
+          return WriteResult.Failure(WriteFailure.Provider("set write returned a negative row count"))
+        end
+        return WriteResult.Saved(count)
+      case WriteResult.Failure(error)
+        if activeLease != null
+          return this.reconcile(error, provider, activeLease)
+        end
+        return WriteResult.Failure(error)
+      case WriteResult.SavedWithValues(count, outputs)
+        if activeLease != null
+          return this.abortInvalidSetResult(WriteFailure.Provider("set write returned row values"), provider, activeLease)
+        end
+        return WriteResult.Failure(WriteFailure.Provider("set write returned row values"))
+    end
+  end
+
+  private def abortInvalidSetResult(error: WriteFailure, provider: Provider, lease: Int): WriteResult
+    match provider.transactionState(lease)
+      case TransactionState.Active()
+        match this.rollbackTransaction()
+          case WriteResult.Saved(count)
+            return WriteResult.Failure(error)
+          case WriteResult.Failure(cleanup)
+            return WriteResult.Failure(WriteFailure.Transaction(writeFailureMessage(error) + "; rollback failed: " + writeFailureMessage(cleanup)))
+          case WriteResult.SavedWithValues(count, outputs)
+            return WriteResult.Failure(WriteFailure.Transaction(writeFailureMessage(error) + "; rollback returned values"))
+        end
+      case TransactionState.RolledBack()
+        return this.reconcile(error, provider, lease)
+      case TransactionState.Committed()
+        return this.reconcile(error, provider, lease)
+      case TransactionState.Invalid()
+        return this.reconcile(error, provider, lease)
+      case TransactionState.Failed()
+        return this.reconcile(error, provider, lease)
+    end
+  end
+
+  public def saveChanges(): WriteResult
+    if this.graphRegistrationActive
+      return WriteResult.Failure(WriteFailure.Validation("cannot save during graph enrollment"))
+    end
+    if this.transactionFailed
+      return WriteResult.Failure(WriteFailure.Transaction("transaction state is uncertain"))
+    end
+    let provider = this.boundProvider
+
+    if provider == null
+      return WriteResult.Failure(WriteFailure.Unsupported("saveChanges requires a provider"))
+    end
+    let activeLease = this.lease
+
+    if activeLease != null
+      match provider.transactionState(activeLease)
+        case TransactionState.Active()
+        case TransactionState.RolledBack()
+          return this.reconcile(WriteFailure.Transaction("transaction ended before save"), provider, activeLease)
+        case TransactionState.Committed()
+          return this.reconcile(WriteFailure.Transaction("transaction ended before save"), provider, activeLease)
+        case TransactionState.Invalid()
+          return this.reconcile(WriteFailure.Transaction("transaction lease is invalid"), provider, activeLease)
+        case TransactionState.Failed()
+          return this.reconcile(WriteFailure.Transaction("transaction state is uncertain"), provider, activeLease)
+      end
+    end
+    if this.firstEdge != null
+      return this.saveGraphChanges(provider)
+    end
+    let batch = new WriteBatch()
+    var set = this.firstSet
+
+    while set != null
+      let failure = set.value.prepare(batch, provider.dialect())
+
+      if failure != null
+        return WriteResult.Failure(WriteFailure.Validation(failure))
+      end
+      set = set.next
+    end
+    if batch.count() == 0
+      return WriteResult.Saved(0)
+    end
+    var generated = false
+    var command = batch.first()
+
+    while command != null
+      if command.command().returningColumns() != null
+        generated = true
+      end
+      command = command.next()
+    end
+    var implicit = false
+
+    if generated && this.lease == null
+      match this.beginTransaction()
+        case WriteResult.Saved(count)
+          implicit = true
+        case WriteResult.Failure(error)
+          return WriteResult.Failure(error)
+        case WriteResult.SavedWithValues(count, outputs)
+          return WriteResult.Failure(WriteFailure.Provider("transaction begin returned row values"))
+      end
+    end
+    let lease = this.lease
+    var result = WriteResult.Saved(0)
+
+    if lease != null
+      result = provider.writeBatchInTransaction(batch, lease)
+    else
+      result = provider.writeBatch(batch)
+    end
+
+    match result
+      case WriteResult.Failure(error)
+        if implicit
+          return this.rollbackGenerated(error)
+        end
+        if lease != null
+          return this.reconcile(error, provider, lease)
+        end
+        return result
+      case WriteResult.Saved(count)
+        if generated
+          return this.rollbackGenerated(WriteFailure.Provider("provider omitted generated key values"))
+        end
+        if count != batch.count()
+          if lease != null
+            this.transactionFailed = true
+          end
+          return WriteResult.Failure(WriteFailure.Provider("provider saved row count differs from the write batch"))
+        end
+        set = this.firstSet
+
+        while set != null
+          set.value.accept()
+          set = set.next
+        end
+        return WriteResult.Saved(count)
+      case WriteResult.SavedWithValues(count, outputs)
+        if !generated || count != batch.count() || !writeReturnedPresenceMatches(batch, outputs)
+          return this.rollbackGenerated(WriteFailure.Provider("provider returned invalid generated values"))
+        end
+        set = this.firstSet
+
+        while set != null
+          let invalid = set.value.validateReturned(outputs)
+
+          if invalid != null
+            return this.rollbackGenerated(WriteFailure.Provider(invalid))
+          end
+          set = set.next
+        end
+        if implicit
+          match this.commitTransaction()
+            case WriteResult.Saved(committed)
+            case WriteResult.Failure(error)
+              return this.rollbackGenerated(error)
+            case WriteResult.SavedWithValues(committed, returned)
+              return this.rollbackGenerated(WriteFailure.Provider("transaction commit returned row values"))
+          end
+        end
+        set = this.firstSet
+
+        while set != null
+          set.value.applyReturned()
+          set.value.accept()
+          set = set.next
+        end
+        return WriteResult.Saved(count)
+    end
+  end
+
+  private def graphReady(action: WriteAction, actions: WriteActionList, planning: Bool): Bool
+    var edge = this.firstEdge
+
+    while edge != null
+      var inactive = false
+
+      match edge.dependentState()
+        case EntityState.Detached()
+          inactive = true
+        case EntityState.Added()
+        case EntityState.Unchanged()
+        case EntityState.Deleted()
+      end
+      if !inactive && (edge.isActive() || edge.persistsOldForeignKey())
+        let principal = actions.at(edge.principalId())
+        let dependent = actions.at(edge.dependentId())
+
+        if principal != null && dependent != null
+          if !edge.isActive()
+            match principal.kind
+              case WriteActionKind.Delete()
+                match dependent.kind
+                  case WriteActionKind.Delete()
+                    if principal.id != dependent.id && action.id == principal.id && ((planning && !dependent.planned) || (!planning && !dependent.done))
+                      return false
+                    end
+                  case WriteActionKind.Update()
+                    if principal.id != dependent.id && action.id == principal.id && ((planning && !dependent.planned) || (!planning && !dependent.done))
+                      return false
+                    end
+                  case WriteActionKind.Insert()
+                end
+              case WriteActionKind.Insert()
+              case WriteActionKind.Update()
+            end
+          else
+            match principal.kind
+              case WriteActionKind.Insert()
+                if action.id == dependent.id
+                  if planning && !principal.planned
+                    return false
+                  end
+                  if !planning && !principal.done
+                    return false
+                  end
+                end
+              case WriteActionKind.Delete()
+                match dependent.kind
+                  case WriteActionKind.Delete()
+                    if principal.id != dependent.id && action.id == principal.id
+                      if planning && !dependent.planned
+                        return false
+                      end
+                      if !planning && !dependent.done
+                        return false
+                      end
+                    end
+                  case WriteActionKind.Insert()
+                  case WriteActionKind.Update()
+                end
+              case WriteActionKind.Update()
+            end
+          end
+        end
+      end
+      edge = edge.next
+    end
+    return true
+  end
+
+  private def graphPlan(actions: WriteActionList): String?
+    var edge = this.firstEdge
+
+    while edge != null
+      var inactive = false
+
+      match edge.dependentState()
+        case EntityState.Detached()
+          inactive = true
+        case EntityState.Added()
+        case EntityState.Unchanged()
+        case EntityState.Deleted()
+      end
+      if !inactive && (edge.isActive() || edge.persistsOldForeignKey())
+        if !edge.valid()
+          return "relationship handle is stale"
+        end
+        let principal = actions.at(edge.principalId())
+        let dependent = actions.at(edge.dependentId())
+
+        if edge.isActive() && (principal == null || dependent == null)
+          return "relationship endpoint is not tracked in this context"
+        end
+        if edge.isActive() && principal != null && dependent != null
+          match principal.kind
+            case WriteActionKind.Delete()
+              match dependent.kind
+                case WriteActionKind.Delete()
+                case WriteActionKind.Insert()
+                  return "cannot add a dependent of a deleted principal"
+                case WriteActionKind.Update()
+                  return "cannot retain a dependent of a deleted principal"
+              end
+            case WriteActionKind.Insert()
+            case WriteActionKind.Update()
+          end
+        end
+      end
+      edge = edge.next
+    end
+    var planned = 0
+
+    while planned < actions.count
+      var current = actions.first
+      var selected: WriteAction? = null
+
+      while current != null
+        if !current.planned && this.graphReady(current, actions, true)
+          selected = current
+          break
+        end
+        current = current.next
+      end
+      if selected == null
+        return "relationship dependency cycle"
+      end
+      selected.planned = true
+      planned = planned + 1
+    end
+    var current = actions.first
+
+    while current != null
+      current.planned = false
+      current = current.next
+    end
+    return null
+  end
+
+  private def propagateFor(action: WriteAction): String?
+    var edge = this.firstEdge
+
+    while edge != null
+      if edge.isActive() && edge.dependentId() == action.id
+        let error = edge.propagate()
+
+        if error != null
+          match error
+            case QueryFailure.Provider(message)
+              return message
+            case QueryFailure.UnsupportedCapability(name)
+              return name
+            case QueryFailure.InvalidIdentifier(name)
+              return name
+            case QueryFailure.InvalidLimit(value, maximum)
+              return "relationship propagation failed"
+            case QueryFailure.MissingLimit(maximum)
+              return "relationship propagation failed"
+            case QueryFailure.SourceMismatch(expected, actual)
+              return "relationship propagation failed"
+            case QueryFailure.MissingColumn(name)
+              return name
+            case QueryFailure.TypeMismatch(column, expected, actual)
+              return "relationship propagation failed"
+            case QueryFailure.Cardinality(expected, actual)
+              return "relationship propagation failed"
+          end
+        end
+      end
+      edge = edge.next
+    end
+    return null
+  end
+
+  private def saveGraphChanges(provider: Provider): WriteResult
+    let actions = new WriteActionList()
+    var set = this.firstSet
+
+    while set != null
+      let error = set.value.collectActions(actions)
+
+      if error != null
+        return WriteResult.Failure(WriteFailure.Validation(error))
+      end
+      set = set.next
+    end
+    let planError = this.graphPlan(actions)
+
+    if planError != null
+      return WriteResult.Failure(WriteFailure.Validation(planError))
+    end
+    if actions.count == 0
+      return WriteResult.Saved(0)
+    end
+    var implicit = false
+
+    if this.lease == null
+      match this.beginTransaction()
+        case WriteResult.Saved(count)
+          implicit = true
+        case WriteResult.Failure(error)
+          return WriteResult.Failure(error)
+        case WriteResult.SavedWithValues(count, outputs)
+          return WriteResult.Failure(WriteFailure.Provider("transaction begin returned row values"))
+      end
+    end
+    let lease = this.lease
+
+    if lease == null
+      return WriteResult.Failure(WriteFailure.Transaction("relationship transaction did not open"))
+    end
+    var graphScope: Int? = null
+
+    if !implicit && provider.supports(ProviderCapability.Savepoints())
+      match provider.createSavepoint(lease)
+        case SavepointOpenResult.Created(id)
+          if id <= 0
+            return this.rollbackGenerated(WriteFailure.Provider("provider returned an invalid savepoint id"))
+          end
+          graphScope = id
+          this.checkpointGraphSave()
+        case SavepointOpenResult.Failure(error)
+          return this.reconcile(error, provider, lease)
+      end
+    end
+    var completed = 0
+    var saved = 0
+
+    while completed < actions.count
+      var selected: WriteAction? = null
+      var current = actions.first
+
+      while current != null
+        if !current.done && this.graphReady(current, actions, false)
+          selected = current
+          break
+        end
+        current = current.next
+      end
+      if selected == null
+        return this.failGraphSave(WriteFailure.Validation("relationship dependency cycle"), graphScope)
+      end
+      let propagationError = this.propagateFor(selected)
+
+      if propagationError != null
+        return this.failGraphSave(WriteFailure.Validation(propagationError), graphScope)
+      end
+      let batch = new WriteBatch()
+      let prepareError = selected.prepare(batch, provider.dialect())
+
+      if prepareError != null
+        return this.failGraphSave(WriteFailure.Validation(prepareError), graphScope)
+      end
+      if batch.count() > 0
+        match provider.writeBatchInTransaction(batch, lease)
+          case WriteResult.Failure(error)
+            return this.failGraphSave(error, graphScope)
+          case WriteResult.Saved(count)
+            let first = batch.first()
+
+            if first == null
+              return this.failGraphSave(WriteFailure.Provider("relationship write batch was empty"), graphScope)
+            end
+            if count != batch.count() || first.command().returningColumns() != null
+              return this.failGraphSave(WriteFailure.Provider("relationship write omitted generated values or row count"), graphScope)
+            end
+            saved = saved + count
+          case WriteResult.SavedWithValues(count, outputs)
+            if count != batch.count() || !writeReturnedPresenceMatches(batch, outputs)
+              return this.failGraphSave(WriteFailure.Provider("relationship write returned invalid row count"), graphScope)
+            end
+            let invalid = selected.validateReturned(outputs)
+
+            if invalid != null
+              return this.failGraphSave(WriteFailure.Provider(invalid), graphScope)
+            end
+            selected.applyReturned()
+            saved = saved + count
+        end
+      end
+      selected.accept()
+      selected.done = true
+      completed = completed + 1
+    end
+    if graphScope != null
+      match provider.releaseSavepoint(lease, graphScope)
+        case WriteResult.Saved(count)
+          if count != 0
+            return this.failGraphSave(WriteFailure.Provider("savepoint release returned a row count"), graphScope)
+          end
+          this.discardGraphSave()
+        case WriteResult.Failure(error)
+          return this.failGraphSave(error, graphScope)
+        case WriteResult.SavedWithValues(count, outputs)
+          return this.failGraphSave(WriteFailure.Provider("savepoint release returned row values"), graphScope)
+      end
+    end
+    if implicit
+      match this.commitTransaction()
+        case WriteResult.Saved(count)
+          return WriteResult.Saved(saved)
+        case WriteResult.Failure(error)
+          return this.rollbackGenerated(error)
+        case WriteResult.SavedWithValues(count, outputs)
+          return this.rollbackGenerated(WriteFailure.Provider("transaction commit returned row values"))
+      end
+    end
+    return WriteResult.Saved(saved)
+  end
+
+  private def rollbackGenerated(error: WriteFailure): WriteResult
+    let lease = this.lease
+
+    if lease == null
+      return WriteResult.Failure(error)
+    end
+    let provider = this.boundProvider
+
+    if provider == null
+      return WriteResult.Failure(error)
+    end
+    match provider.transactionState(lease)
+      case TransactionState.RolledBack()
+        return this.reconcile(error, provider, lease)
+      case TransactionState.Committed()
+        return this.reconcile(error, provider, lease)
+      case TransactionState.Invalid()
+        return this.reconcile(error, provider, lease)
+      case TransactionState.Failed()
+        return this.reconcile(error, provider, lease)
+      case TransactionState.Active()
+    end
+    match this.rollbackTransaction()
+      case WriteResult.Saved(count)
+        return WriteResult.Failure(error)
+      case WriteResult.Failure(rollbackError)
+        return WriteResult.Failure(WriteFailure.Transaction(writeFailureMessage(error) + "; rollback failed: " + writeFailureMessage(rollbackError)))
+      case WriteResult.SavedWithValues(count, outputs)
+        return WriteResult.Failure(WriteFailure.Provider("transaction rollback returned row values"))
+    end
+  end
+
+  private def failGraphSave(error: WriteFailure, scope: Int?): WriteResult
+    let id = scope
+
+    if id == null
+      return this.rollbackGenerated(error)
+    end
+    let provider = this.boundProvider
+    let lease = this.lease
+
+    if provider == null || lease == null
+      this.transactionFailed = true
+      return WriteResult.Failure(WriteFailure.Transaction(writeFailureMessage(error) + "; graph savepoint lost its transaction"))
+    end
+    match provider.transactionState(lease)
+      case TransactionState.RolledBack()
+        return this.reconcile(error, provider, lease)
+      case TransactionState.Committed()
+        return this.reconcile(error, provider, lease)
+      case TransactionState.Invalid()
+        return this.reconcile(error, provider, lease)
+      case TransactionState.Failed()
+        return this.reconcile(error, provider, lease)
+      case TransactionState.Active()
+    end
+    match provider.rollbackToSavepoint(lease, id)
+      case WriteResult.Saved(count)
+        if count != 0
+          this.transactionFailed = true
+          return WriteResult.Failure(WriteFailure.Transaction(writeFailureMessage(error) + "; graph savepoint rollback returned a row count"))
+        end
+      case WriteResult.Failure(cleanup)
+        match provider.transactionState(lease)
+          case TransactionState.RolledBack()
+            return this.reconcile(error, provider, lease)
+          case TransactionState.Committed()
+            return this.reconcile(error, provider, lease)
+          case TransactionState.Active()
+          case TransactionState.Invalid()
+          case TransactionState.Failed()
+        end
+        this.transactionFailed = true
+        return WriteResult.Failure(WriteFailure.Transaction(writeFailureMessage(error) + "; graph savepoint rollback failed: " + writeFailureMessage(cleanup)))
+      case WriteResult.SavedWithValues(count, outputs)
+        this.transactionFailed = true
+        return WriteResult.Failure(WriteFailure.Transaction(writeFailureMessage(error) + "; graph savepoint rollback returned values"))
+    end
+    match provider.releaseSavepoint(lease, id)
+      case WriteResult.Saved(count)
+        if count != 0
+          this.transactionFailed = true
+          return WriteResult.Failure(WriteFailure.Transaction(writeFailureMessage(error) + "; graph savepoint release returned a row count"))
+        end
+        this.restoreGraphSave()
+        return WriteResult.Failure(error)
+      case WriteResult.Failure(cleanup)
+        match provider.transactionState(lease)
+          case TransactionState.RolledBack()
+            return this.reconcile(error, provider, lease)
+          case TransactionState.Committed()
+            return this.reconcile(error, provider, lease)
+          case TransactionState.Active()
+          case TransactionState.Invalid()
+          case TransactionState.Failed()
+        end
+        this.transactionFailed = true
+        return WriteResult.Failure(WriteFailure.Transaction(writeFailureMessage(error) + "; graph savepoint release failed: " + writeFailureMessage(cleanup)))
+      case WriteResult.SavedWithValues(count, outputs)
+        this.transactionFailed = true
+        return WriteResult.Failure(WriteFailure.Transaction(writeFailureMessage(error) + "; graph savepoint release returned values"))
+    end
+  end
+end
+
+def cellFromRow(row: readonly RawRow, column: String): Cell?
+  match row.value(column)
+    case CellLookup.Found(value)
+      return value
+    case CellLookup.Missing()
+      return null
+  end
+end
+
+def copyRow(row: readonly RawRow, columns: readonly ResultColumns): RawRow
+  let copied: RawColumn[] = tasks::generate(columns.count(), 1) do |index|
+    let name = columns.at(index).name()
+    let value = cellFromRow(row, name)
+
+    if value == null
+      return new RawColumn(name, Cell.Null())
+    end
+    return new RawColumn(name, value)
+  end
+
+  return new RawRow(copied)
+end
+
+def generatedBeforeRow(existing: RawRow?, returned: readonly RawRow, current: readonly RawRow, keyName: String): RawRow?
+  let oldCount = existing == null ? 0 : existing.count()
+  var added = 0
+  var index = 0
+
+  while index < returned.count()
+    let column = returned.at(index)
+
+    if column != null && column.name != keyName && (existing == null || cellFromRow(existing, column.name) == null)
+      added = added + 1
+    end
+    index = index + 1
+  end
+  if added == 0
+    return existing
+  end
+  let values: RawColumn[] = tasks::generate(oldCount + added, 1) do |position|
+    if existing != null && position < oldCount
+      let prior = existing.at(position)
+
+      if prior != null
+        let value = cellFromRow(existing, prior.name)
+
+        if value != null
+          return new RawColumn(prior.name, value)
+        end
+      end
+    end
+    var wanted = position - oldCount
+    var source = 0
+
+    while source < returned.count()
+      let candidate = returned.at(source)
+
+      if candidate != null && candidate.name != keyName && (existing == null || cellFromRow(existing, candidate.name) == null)
+        if wanted == 0
+          let value = cellFromRow(current, candidate.name)
+
+          if value != null
+            return new RawColumn(candidate.name, value)
+          end
+        end
+        wanted = wanted - 1
+      end
+      source = source + 1
+    end
+    return new RawColumn("", Cell.Null())
+  end
+
+  return new RawRow(values)
+end
+
+def sameRows(left: RawRow, right: RawRow, columns: readonly ResultColumns): Bool
+  var index = 0
+
+  while index < columns.count()
+    let name = columns.at(index).name()
+
+    if !sameOptionalCell(cellFromRow(left, name), cellFromRow(right, name))
+      return false
+    end
+    index = index + 1
+  end
+  return true
+end
+
+def sameOptionalCell(left: Cell?, right: Cell?): Bool
+  if left == null || right == null
+    return left == null && right == null
+  end
+  return sameCell(left, right)
+end
+
+def sameCell(left: Cell, right: Cell): Bool
+  match left
+    case Cell.Null()
+      match right
+        case Cell.Null()
+          return true
+        case Cell.Bool(value)
+          return false
+        case Cell.Int(value)
+          return false
+        case Cell.Float(value)
+          return false
+        case Cell.Text(value)
+          return false
+      end
+    case Cell.Bool(value)
+      match right
+        case Cell.Bool(other)
+          return value == other
+        case Cell.Null()
+          return false
+        case Cell.Int(other)
+          return false
+        case Cell.Float(other)
+          return false
+        case Cell.Text(other)
+          return false
+      end
+    case Cell.Int(value)
+      match right
+        case Cell.Int(other)
+          return value == other
+        case Cell.Null()
+          return false
+        case Cell.Bool(other)
+          return false
+        case Cell.Float(other)
+          return false
+        case Cell.Text(other)
+          return false
+      end
+    case Cell.Text(value)
+      match right
+        case Cell.Text(other)
+          return value == other
+        case Cell.Null()
+          return false
+        case Cell.Bool(other)
+          return false
+        case Cell.Int(other)
+          return false
+        case Cell.Float(other)
+          return false
+      end
+    case Cell.Float(value)
+      match right
+        case Cell.Float(other)
+          return dataFloatFinite(value) && dataFloatFinite(other) && value == other
+        case Cell.Null()
+          return false
+        case Cell.Bool(other)
+          return false
+        case Cell.Int(other)
+          return false
+        case Cell.Text(other)
+          return false
+      end
+  end
+end
+
+def cellOptionalBool(value: Bool?): Cell
+  if value == null
+    return Cell.Null()
+  end
+  return Cell.Bool(value)
+end
+
+def cellOptionalInt(value: Int?): Cell
+  if value == null
+    return Cell.Null()
+  end
+  return Cell.Int(value)
+end
+
+def cellOptionalFloat(value: Float?): Cell
+  if value == null
+    return Cell.Null()
+  end
+  return Cell.Float(value)
+end
+
+def cellOptionalString(value: String?): Cell
+  if value == null
+    return Cell.Null()
+  end
+  return Cell.Text(value)
+end

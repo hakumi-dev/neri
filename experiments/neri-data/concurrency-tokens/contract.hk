@@ -1,0 +1,280 @@
+use test
+use console
+use files
+use resources
+use result
+use concurrency_tokens_data
+use concurrency_tokens_model
+use neri_data
+use neri_data_sqlite
+use neri_data_sqlite_fixture
+
+def saved(result: WriteResult, expected: Int): Void
+  match result
+    case WriteResult.Saved(count)
+      test::assertEqual(count, expected)
+    case WriteResult.SavedWithValues(count, outputs)
+      test::assertTrue(false)
+    case WriteResult.Failure(error)
+      console::println(writeFailureMessage(error))
+
+      test::assertTrue(false)
+  end
+end
+
+def failedConcurrency(result: WriteResult): Void
+  match result
+    case WriteResult.Saved(count)
+      test::assertTrue(false)
+    case WriteResult.SavedWithValues(count, outputs)
+      test::assertTrue(false)
+    case WriteResult.Failure(error)
+      match error
+        case WriteFailure.Concurrency(message)
+          test::assertTrue(message != "")
+        case WriteFailure.Validation(message)
+          test::assertTrue(false)
+        case WriteFailure.Constraint(message)
+          test::assertTrue(false)
+        case WriteFailure.Provider(message)
+          test::assertTrue(false)
+        case WriteFailure.Unsupported(message)
+          test::assertTrue(false)
+        case WriteFailure.Transaction(message)
+          test::assertTrue(false)
+      end
+  end
+end
+
+def record(db: ConcurrencyDatabase, id: Int): Record?
+  match db.records.where(id: id).first()
+    case QueryValue.Value(value)
+      return value
+    case QueryValue.Failure(error)
+      test::assertTrue(false)
+  end
+  return null
+end
+
+def optionalRecord(db: ConcurrencyDatabase, id: Int): OptionalRecord?
+  match db.optionalRecords.where(id: id).first()
+    case QueryValue.Value(value)
+      return value
+    case QueryValue.Failure(error)
+      test::assertTrue(false)
+  end
+  return null
+end
+
+def keyOnlyRecord(db: ConcurrencyDatabase, id: Int): KeyOnlyRecord?
+  match db.keyOnlyRecords.where(id: id).first()
+    case QueryValue.Value(value)
+      return value
+    case QueryValue.Failure(error)
+      test::assertTrue(false)
+  end
+  return null
+end
+
+def rowName(db: ConcurrencyDatabase, id: Int, expected: String): Void
+  let value = record(db, id)
+
+  test::assertTrue(value != null)
+  if value != null
+    test::assertEqual(value.name, expected)
+  end
+end
+
+def verifyTokenUpdates(firstProvider: SQLiteProvider, secondProvider: SQLiteProvider): Void
+  let first = new ConcurrencyDatabase(firstProvider)
+  let second = new ConcurrencyDatabase(secondProvider)
+  let local = record(first, 1)
+  let remote = record(second, 1)
+
+  test::assertTrue(local != null && remote != null)
+  if local == null || remote == null
+    return
+  end
+
+  local.name = "local name"
+  remote.note = "remote note without token change"
+  saved(second.saveChanges(), 1)
+  local.version = local.version + 1
+  saved(first.saveChanges(), 1)
+
+  rowName(new ConcurrencyDatabase(secondProvider), 1, "local name")
+  let stale = record(first, 1)
+  let latestRemote = new ConcurrencyDatabase(secondProvider)
+  let current = record(latestRemote, 1)
+
+  test::assertTrue(stale != null && current != null)
+  if stale == null || current == null
+    return
+  end
+  stale.name = "stale local edit"
+  stale.version = stale.version + 1
+  current.note = "remote token conflict"
+  current.version = current.version + 1
+  saved(latestRemote.saveChanges(), 1)
+
+  failedConcurrency(first.saveChanges())
+
+  test::assertEqual(stale.name, "stale local edit")
+  test::assertEqual(stale.version, current.version)
+
+  let freshDb = new ConcurrencyDatabase(secondProvider)
+  let fresh = record(freshDb, 1)
+
+  test::assertTrue(fresh != null)
+  if fresh != null
+    test::assertEqual(fresh.version, current.version)
+    test::assertTrue(first.records.rebase(stale, fresh) == null)
+    stale.version = stale.version + 1
+    saved(first.saveChanges(), 1)
+    saved(first.saveChanges(), 0)
+  end
+
+  rowName(new ConcurrencyDatabase(secondProvider), 1, "stale local edit")
+end
+
+def verifyStaleDeleteAndMissingRow(firstProvider: SQLiteProvider, secondProvider: SQLiteProvider): Void
+  let first = new ConcurrencyDatabase(firstProvider)
+  let second = new ConcurrencyDatabase(secondProvider)
+  let staleDelete = record(first, 2)
+  let remoteDelete = record(second, 2)
+
+  test::assertTrue(staleDelete != null && remoteDelete != null)
+  if staleDelete == null || remoteDelete == null
+    return
+  end
+  remoteDelete.version = remoteDelete.version + 1
+  remoteDelete.name = "remote delete competitor"
+  saved(second.saveChanges(), 1)
+
+  test::assertTrue(first.records.remove(staleDelete) == null)
+  failedConcurrency(first.saveChanges())
+  rowName(new ConcurrencyDatabase(secondProvider), 2, "remote delete competitor")
+
+  let missingFirst = new ConcurrencyDatabase(firstProvider)
+  let missingSecond = new ConcurrencyDatabase(secondProvider)
+  let staleMissing = record(missingFirst, 3)
+  let remoteMissing = record(missingSecond, 3)
+
+  test::assertTrue(staleMissing != null && remoteMissing != null)
+  if staleMissing == null || remoteMissing == null
+    return
+  end
+
+  test::assertTrue(missingSecond.records.remove(remoteMissing) == null)
+  saved(missingSecond.saveChanges(), 1)
+  staleMissing.name = "local edit to missing row"
+  failedConcurrency(missingFirst.saveChanges())
+
+  test::assertEqual(staleMissing.name, "local edit to missing row")
+end
+
+def verifyNullableToken(firstProvider: SQLiteProvider, secondProvider: SQLiteProvider): Void
+  let first = new ConcurrencyDatabase(firstProvider)
+  let second = new ConcurrencyDatabase(secondProvider)
+  let stale = optionalRecord(first, 10)
+  let remote = optionalRecord(second, 10)
+
+  test::assertTrue(stale != null && remote != null)
+  if stale == null || remote == null
+    return
+  end
+
+  test::assertTrue(stale.token == null && remote.token == null)
+  remote.token = "set remotely"
+  saved(second.saveChanges(), 1)
+  stale.name = "stale nullable token edit"
+  failedConcurrency(first.saveChanges())
+
+  test::assertTrue(stale.token == null)
+  test::assertEqual(stale.name, "stale nullable token edit")
+end
+
+def verifyEmptyTokenPolicy(firstProvider: SQLiteProvider, secondProvider: SQLiteProvider): Void
+  let first = new ConcurrencyDatabase(firstProvider)
+  let second = new ConcurrencyDatabase(secondProvider)
+  let localUpdate = keyOnlyRecord(first, 1)
+  let remoteUpdate = keyOnlyRecord(second, 1)
+
+  test::assertTrue(localUpdate != null && remoteUpdate != null)
+  if localUpdate == null || remoteUpdate == null
+    return
+  end
+
+  remoteUpdate.version = remoteUpdate.version + 1
+  remoteUpdate.name = "remote update"
+  saved(second.saveChanges(), 1)
+  localUpdate.name = "key-only update wins"
+  saved(first.saveChanges(), 1)
+
+  let staleDelete = keyOnlyRecord(first, 2)
+  let remoteDelete = keyOnlyRecord(second, 2)
+
+  test::assertTrue(staleDelete != null && remoteDelete != null)
+  if staleDelete == null || remoteDelete == null
+    return
+  end
+
+  remoteDelete.version = remoteDelete.version + 1
+  remoteDelete.name = "remote before delete"
+  saved(second.saveChanges(), 1)
+
+  test::assertTrue(first.keyOnlyRecords.remove(staleDelete) == null)
+  saved(first.saveChanges(), 1)
+end
+
+def verifyProviders(path: String): Void
+  let schema = "CREATE TABLE records(id INTEGER PRIMARY KEY, name TEXT NOT NULL, note TEXT, revision INTEGER NOT NULL); INSERT INTO records VALUES(1,'initial',NULL,1); INSERT INTO records VALUES(2,'delete stale',NULL,1); INSERT INTO records VALUES(3,'delete remote',NULL,1); CREATE TABLE optional_records(id INTEGER PRIMARY KEY, name TEXT NOT NULL, token TEXT); INSERT INTO optional_records VALUES(10,'optional initial',NULL); CREATE TABLE key_only_records(id INTEGER PRIMARY KEY, name TEXT NOT NULL, revision INTEGER NOT NULL); INSERT INTO key_only_records VALUES(1,'key-only initial',1); INSERT INTO key_only_records VALUES(2,'key-only stale delete',1);"
+
+  test::assertTrue(createSQLiteFixture(path, schema))
+  match SQLiteProvider.openWritable(path)
+    case SQLiteOpenResult.Failure(message)
+      console::println(message)
+
+      test::assertTrue(false)
+    case SQLiteOpenResult.Opened(firstProvider)
+      match SQLiteProvider.openWritable(path)
+        case SQLiteOpenResult.Failure(message)
+          console::println(message)
+
+          test::assertTrue(false)
+        case SQLiteOpenResult.Opened(secondProvider)
+          console::println("Concurrency tokens: non-token edits and stale update rebase")
+          verifyTokenUpdates(firstProvider, secondProvider)
+          console::println("Concurrency tokens: stale delete and missing row")
+          verifyStaleDeleteAndMissingRow(firstProvider, secondProvider)
+          console::println("Concurrency tokens: nullable NULL-to-value conflict")
+          verifyNullableToken(firstProvider, secondProvider)
+          console::println("Concurrency tokens: explicit empty policy uses key only")
+          verifyEmptyTokenPolicy(firstProvider, secondProvider)
+
+          test::assertTrue(secondProvider.close())
+      end
+
+      test::assertTrue(firstProvider.close())
+  end
+end
+
+def verifyFiles(): resources::Outcome<Int, result::Failure>
+  using temporary <- files::TemporaryDirectory.create("neri-concurrency-tokens-")
+    verifyProviders(temporary.path() + "/tokens.sqlite")
+    return 0
+  end
+  return 1
+end
+
+def main(): Void
+  let outcome = verifyFiles()
+
+  test::assertEqual(outcome.closeFailures.count(), 0)
+  match outcome.completion
+    case resources::Completion.Value(value)
+      test::assertEqual(value, 0)
+    case resources::Completion.Failure(problem)
+      test::assertTrue(false)
+  end
+end

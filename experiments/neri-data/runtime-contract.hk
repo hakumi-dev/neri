@@ -12,6 +12,20 @@ class Record
   end
 end
 
+class RecordSummary
+  public id: Int
+  public active: Bool
+
+  def init(id: Int, active: Bool): Void
+    this.id = id
+    this.active = active
+  end
+end
+
+def summary(id: Int, active: Bool): RecordSummary
+  return new RecordSummary(id, active)
+end
+
 def decodeRecord(row: RawRow): DecodeResult<Record>
   match decodeInt(row, "id")
     case DecodeResult.Value(value)
@@ -38,6 +52,31 @@ def isMissingId(error: QueryFailure): Bool
     case QueryFailure.Provider(message)
       return false
     case QueryFailure.TypeMismatch(column, expected, actual)
+      return false
+    case QueryFailure.Cardinality(expected, actual)
+      return false
+  end
+end
+
+def isMissingProvider(error: QueryFailure): Bool
+  match error
+    case QueryFailure.UnsupportedCapability(name)
+      return name == "query requires a provider" || name == "projection requires a provider"
+    case QueryFailure.InvalidIdentifier(name)
+      return false
+    case QueryFailure.InvalidLimit(value, maximum)
+      return false
+    case QueryFailure.MissingLimit(maximum)
+      return false
+    case QueryFailure.SourceMismatch(expected, actual)
+      return false
+    case QueryFailure.Provider(message)
+      return false
+    case QueryFailure.MissingColumn(name)
+      return false
+    case QueryFailure.TypeMismatch(column, expected, actual)
+      return false
+    case QueryFailure.Cardinality(expected, actual)
       return false
   end
 end
@@ -72,6 +111,9 @@ class MemoryProvider: Provider
     this.seenSql = plan.sql()
     return ProviderResult.Rows(this.rows)
   end
+  public override def writeBatch(batch: readonly WriteBatch): WriteResult
+    return WriteResult.Failure(WriteFailure.Unsupported("memory provider does not support transactional writes"))
+  end
 end
 
 def recordMapping(): EntityMapping
@@ -82,6 +124,57 @@ def records(): Query<Record>
   let columns = new ResultColumns([new ResultColumn("id", ResultColumnKind.Int())])
 
   return new Query<Record>("records", new Decoder<Record>(decodeRecord, columns), mapping: recordMapping())
+end
+
+def projectedIdWith(offset: Int): quote fn(Record): Int
+  return quote do |record: Record|: Int
+    return record.id + offset
+  end
+end
+
+def idAbove(bound: Int): quote fn(Record): Bool
+  return quote do |record: Record|: Bool
+    return record.id > bound
+  end
+end
+
+def idShiftedAbove(offset: Int): quote fn(Record): Bool
+  return quote do |record: Record|: Bool
+    return record.id + offset > record.id
+  end
+end
+
+def idPlus(offset: Int): quote fn(Record): Int
+  return quote do |record: Record|: Int
+    return record.id + offset
+  end
+end
+
+def assertIntParameterValues(parameters: readonly ParameterValues, expected: Int[]): Void
+  test::assertEqual(parameters.count(), expected.Length)
+  let first = parameters.first()
+
+  test::assertTrue(first != null)
+  if first == null
+    return
+  end
+  var current: readonly ParameterNode? = first
+  var index = 0
+
+  while current != null
+    match current.value()
+      case Parameter.Int(value)
+        test::assertEqual(value, expected[index])
+      case Parameter.Float(value)
+        test::assertTrue(false)
+      case Parameter.Bool(value)
+        test::assertTrue(false)
+      case Parameter.Text(value)
+        test::assertTrue(false)
+    end
+    index = index + 1
+    current = current.next()
+  end
 end
 
 def main(): Void
@@ -117,6 +210,22 @@ def main(): Void
       test::assertTrue(false)
   end
 
+  let projectionCapture = 11
+  let sourceCapture = 3
+  let postTakeCapture = 20
+  let primaryOrderCapture = 5
+  let secondaryOrderCapture = 7
+  let computedStages = records().matching(idAbove(sourceCapture)).take(8).matching(idShiftedAbove(postTakeCapture)).orderBy(idPlus(primaryOrderCapture)).thenBy(idPlus(secondaryOrderCapture)).take(4)
+  let computedProjection = project(computedStages, expressionShape(intScalar(), projectedIdWith(projectionCapture)))
+
+  match computedProjection.compile()
+    case CompileResult.Plan(plan)
+      test::assertEqual(plan.sql().parameters().count(), 5)
+      assertIntParameterValues(plan.sql().parameters(), [projectionCapture, sourceCapture, postTakeCapture, primaryOrderCapture, secondaryOrderCapture])
+    case CompileResult.Failure(error)
+      test::assertTrue(false)
+  end
+
   let projection = select(query, intScalar(), byId)
   let projectionProvider = new MemoryProvider(true, [new RawRow([new RawColumn("id", Cell.Int(7))])])
 
@@ -143,6 +252,8 @@ def main(): Void
       test::assertTrue(parameter != null)
       if parameter != null
         match parameter.value()
+          case Parameter.Float(value)
+            test::assertTrue(false)
           case Parameter.Bool(value)
             test::assertFalse(value)
           case Parameter.Int(value)
@@ -178,6 +289,8 @@ def main(): Void
         match first.value()
           case Parameter.Text(value)
             test::assertEqual(value, "neo")
+          case Parameter.Float(value)
+            test::assertTrue(false)
           case Parameter.Bool(value)
             test::assertTrue(false)
           case Parameter.Int(value)
@@ -190,6 +303,8 @@ def main(): Void
           match second.value()
             case Parameter.Int(value)
               test::assertEqual(value, 7)
+            case Parameter.Float(value)
+              test::assertTrue(false)
             case Parameter.Bool(value)
               test::assertTrue(false)
             case Parameter.Text(value)
@@ -217,6 +332,8 @@ def main(): Void
         match first.value()
           case Parameter.Int(value)
             test::assertEqual(value, 7)
+          case Parameter.Float(value)
+            test::assertTrue(false)
           case Parameter.Bool(value)
             test::assertTrue(false)
           case Parameter.Text(value)
@@ -269,5 +386,213 @@ def main(): Void
       test::assertTrue(false)
     case QueryResult.Failure(error)
       test::assertEqual(unsupported.calls, 0)
+  end
+
+  let bound = new MemoryProvider(true, [new RawRow([new RawColumn("id", Cell.Int(8))])])
+  let overridden = new MemoryProvider(true, [new RawRow([new RawColumn("id", Cell.Int(9))])])
+  let boundQuery = new Query<Record>("records", new Decoder<Record>(decodeRecord, new ResultColumns([new ResultColumn("id", ResultColumnKind.Int())])), mapping: recordMapping(), provider: bound).where(active: true).orderBy(byId).take(1)
+
+  match boundQuery.all()
+    case QueryResult.Rows(rows)
+      test::assertEqual(bound.calls, 1)
+      test::assertEqual(overridden.calls, 0)
+    case QueryResult.Failure(error)
+      test::assertTrue(false)
+  end
+  match boundQuery.all(overridden)
+    case QueryResult.Rows(rows)
+      test::assertEqual(bound.calls, 1)
+      test::assertEqual(overridden.calls, 1)
+    case QueryResult.Failure(error)
+      test::assertTrue(false)
+  end
+  let boundProjection = select(boundQuery, intScalar(), byId)
+
+  match boundProjection.all()
+    case QueryResult.Rows(rows)
+      test::assertEqual(bound.calls, 2)
+    case QueryResult.Failure(error)
+      test::assertTrue(false)
+  end
+  let unbound = records().take(1)
+
+  match unbound.all()
+    case QueryResult.Rows(rows)
+      test::assertTrue(false)
+    case QueryResult.Failure(error)
+      test::assertTrue(isMissingProvider(error))
+  end
+  match select(unbound, intScalar(), byId).all()
+    case QueryResult.Rows(rows)
+      test::assertTrue(false)
+    case QueryResult.Failure(error)
+      test::assertTrue(isMissingProvider(error))
+  end
+
+  match records().take(3).take(2).compile()
+    case CompileResult.Plan(plan)
+      test::assertEqual(plan.sql().sql(), "SELECT \"records\".\"id\" FROM \"records\" LIMIT 2")
+    case CompileResult.Failure(error)
+      test::assertTrue(false)
+  end
+  match records().take(2).where(active: true).compile()
+    case CompileResult.Plan(plan)
+      test::assertEqual(plan.sql().sql(), "SELECT \"records\".\"id\" FROM (SELECT \"records\".\"id\", \"records\".\"active\", \"records\".\"nickname\" FROM \"records\" LIMIT 2) AS \"records\" WHERE \"records\".\"active\" = ? LIMIT 1000")
+    case CompileResult.Failure(error)
+      test::assertTrue(false)
+  end
+  let byActive: quote fn(Record): Bool = quote do |record: Record|: Bool
+    return record.active
+  end
+
+  match records().where(id: 7).take(2).where(active: true).take(1).compile(SqlDialect.PostgreSql())
+    case CompileResult.Plan(plan)
+      test::assertEqual(plan.sql().sql(), "SELECT \"records\".\"id\" FROM (SELECT \"records\".\"id\", \"records\".\"active\", \"records\".\"nickname\" FROM \"records\" WHERE \"records\".\"id\" = $1 LIMIT 2) AS \"records\" WHERE \"records\".\"active\" = $2 LIMIT 1")
+      test::assertEqual(plan.sql().parameters().count(), 2)
+    case CompileResult.Failure(error)
+      test::assertTrue(false)
+  end
+  match records().orderBy(byId).skip(2).take(3).compile()
+    case CompileResult.Plan(plan)
+      test::assertEqual(plan.sql().sql(), "SELECT \"records\".\"id\" FROM \"records\" ORDER BY \"records\".\"id\" ASC LIMIT 3 OFFSET 2")
+    case CompileResult.Failure(error)
+      test::assertTrue(false)
+  end
+  match records().orderBy(byId).take(2).orderByBool(byActive, true).compile()
+    case CompileResult.Plan(plan)
+      test::assertEqual(plan.sql().sql(), "SELECT \"records\".\"id\" FROM (SELECT \"records\".\"id\", \"records\".\"active\", \"records\".\"nickname\" FROM \"records\" ORDER BY \"records\".\"id\" ASC LIMIT 2) AS \"records\" ORDER BY \"records\".\"active\" DESC LIMIT 1000")
+    case CompileResult.Failure(error)
+      test::assertTrue(false)
+  end
+  match records().orderByBool(byActive).thenBy(byId, true).take(2).compile()
+    case CompileResult.Plan(plan)
+      test::assertEqual(plan.sql().sql(), "SELECT \"records\".\"id\" FROM \"records\" ORDER BY \"records\".\"active\" ASC, \"records\".\"id\" DESC LIMIT 2")
+    case CompileResult.Failure(error)
+      test::assertTrue(false)
+  end
+  match select(records().distinct().take(2), boolScalar(), byActive).compile()
+    case CompileResult.Plan(plan)
+      test::assertEqual(plan.sql().sql(), "SELECT \"records\".\"active\" FROM (SELECT DISTINCT \"records\".\"id\", \"records\".\"active\", \"records\".\"nickname\" FROM \"records\") AS \"records\" LIMIT 2")
+    case CompileResult.Failure(error)
+      test::assertTrue(false)
+  end
+  match records().take(1001).take(1).compile()
+    case CompileResult.Plan(plan)
+      test::assertTrue(false)
+    case CompileResult.Failure(error)
+      test::assertTrue(true)
+  end
+  let summaries = select2(records().where(active: true).take(2), intScalar(), byId, boolScalar(), byActive, summary)
+
+  match summaries.compile()
+    case CompileResult.Plan(plan)
+      test::assertEqual(plan.sql().sql(), "SELECT \"records\".\"id\" AS \"__neri_select_0\", \"records\".\"active\" AS \"__neri_select_1\" FROM \"records\" WHERE \"records\".\"active\" = ? LIMIT 2")
+    case CompileResult.Failure(error)
+      test::assertTrue(false)
+  end
+  let summaryProvider = new MemoryProvider(true, [new RawRow([new RawColumn("__neri_select_0", Cell.Int(7)), new RawColumn("__neri_select_1", Cell.Bool(true))])])
+
+  match summaries.all(summaryProvider)
+    case QueryResult.Rows(rows)
+      let first = rows.first()
+
+      test::assertTrue(first != null)
+      if first != null
+        test::assertEqual(first.value.id, 7)
+        test::assertTrue(first.value.active)
+      end
+    case QueryResult.Failure(error)
+      test::assertTrue(false)
+  end
+  match query.first(provider)
+    case QueryValue.Value(value)
+      test::assertTrue(value != null)
+      if value != null
+        test::assertEqual(value.id, 7)
+      end
+    case QueryValue.Failure(error)
+      test::assertTrue(false)
+  end
+  match records().first(new MemoryProvider(true, []))
+    case QueryValue.Value(value)
+      test::assertTrue(value == null)
+    case QueryValue.Failure(error)
+      test::assertTrue(false)
+  end
+  let anyProvider = new MemoryProvider(true, [new RawRow([new RawColumn("__neri_any", Cell.Int(1))])])
+
+  match records().take(2).any(anyProvider)
+    case QueryValue.Value(value)
+      test::assertTrue(value)
+      test::assertEqual(anyProvider.seenSql, "SELECT 1 AS \"__neri_any\" FROM \"records\" LIMIT 1")
+    case QueryValue.Failure(error)
+      test::assertTrue(false)
+  end
+  let countProvider = new MemoryProvider(true, [new RawRow([new RawColumn("__neri_count", Cell.Int(2))])])
+
+  match records().take(2).count(countProvider)
+    case QueryValue.Value(value)
+      test::assertEqual(value, 2)
+      test::assertEqual(countProvider.seenSql, "SELECT COUNT(*) AS \"__neri_count\" FROM (SELECT 1 AS \"__neri_count_input\" FROM \"records\" LIMIT 2) AS \"__neri_count_source\" LIMIT 1")
+    case QueryValue.Failure(error)
+      test::assertTrue(false)
+  end
+  let duplicateProvider = new MemoryProvider(true, [new RawRow([new RawColumn("id", Cell.Int(1))]), new RawRow([new RawColumn("id", Cell.Int(2))])])
+
+  match records().single(duplicateProvider)
+    case QueryValue.Value(value)
+      test::assertTrue(false)
+    case QueryValue.Failure(error)
+      match error
+        case QueryFailure.Cardinality(expected, actual)
+          test::assertEqual(actual, 2)
+        case QueryFailure.InvalidIdentifier(name)
+          test::assertTrue(false)
+        case QueryFailure.InvalidLimit(value, maximum)
+          test::assertTrue(false)
+        case QueryFailure.MissingLimit(maximum)
+          test::assertTrue(false)
+        case QueryFailure.SourceMismatch(expected, actual)
+          test::assertTrue(false)
+        case QueryFailure.UnsupportedCapability(name)
+          test::assertTrue(false)
+        case QueryFailure.Provider(message)
+          test::assertTrue(false)
+        case QueryFailure.MissingColumn(name)
+          test::assertTrue(false)
+        case QueryFailure.TypeMismatch(column, expected, actual)
+          test::assertTrue(false)
+      end
+  end
+  match records().singleOrDefault(new MemoryProvider(true, []))
+    case QueryValue.Value(value)
+      test::assertTrue(value == null)
+    case QueryValue.Failure(error)
+      test::assertTrue(false)
+  end
+  match records().single(new MemoryProvider(true, []))
+    case QueryValue.Value(value)
+      test::assertTrue(false)
+    case QueryValue.Failure(error)
+      match error
+        case QueryFailure.Cardinality(expected, actual)
+          test::assertEqual(actual, 0)
+        case QueryFailure.InvalidIdentifier(name)
+          test::assertTrue(false)
+        case QueryFailure.InvalidLimit(value, maximum)
+          test::assertTrue(false)
+        case QueryFailure.MissingLimit(maximum)
+          test::assertTrue(false)
+        case QueryFailure.SourceMismatch(expected, actual)
+          test::assertTrue(false)
+        case QueryFailure.UnsupportedCapability(name)
+          test::assertTrue(false)
+        case QueryFailure.Provider(message)
+          test::assertTrue(false)
+        case QueryFailure.MissingColumn(name)
+          test::assertTrue(false)
+        case QueryFailure.TypeMismatch(column, expected, actual)
+          test::assertTrue(false)
+      end
   end
 end

@@ -1,0 +1,133 @@
+# Only the entry conversion is intrinsic. The declared bridge owns the public
+# result and option types, native calls, and resource construction.
+def semanticWorkerEntryType(): String
+  let components = new StringBuffer()
+
+  components.add("Void")
+  components.add("Byte*")
+  components.add("UInt64")
+  return semanticCFunctionType(components)
+end
+
+def workerOperationShape(owner: BootstrapBinder, callable: SemanticCallable): Bool
+  let syntax = owner.syntax
+  let annotation = callable.operationAnnotation
+  let declaration = semanticDeclaration(owner, callable.syntaxNode)
+
+  if declaration == null || declaration.annotationCount != 1 || syntax.childCountAt(annotation) != 2 || !syntax.kindAt(syntax.childAt(annotation, 0)).isStringLiteral() || syntax.dataAt(syntax.childAt(annotation, 0)) != "\"workers.start\""
+    return false
+  end
+  if callable.className != "" || callable.isUnsafe || callable.isStatic || callable.bodyCount != 0 || callable.genericOrigin >= 0 || syntax.nodeAt(callable.syntaxNode).typeParameters.Length != 0 || callable.parameterCount < 2 || callable.cAbiSymbol != "" || callable.cExportSymbol != "" || callable.nativeLibrary != "" || callable.intrinsicName != ""
+    return false
+  end
+  let entry = callable.parameterAt(0)
+  let config = callable.parameterAt(1)
+
+  if entry == null || config == null || config.typeName != "Byte[]"
+    return false
+  end
+  let signature = owner.model.findClass(entry.typeName)
+
+  if signature == null || !signature.isFunctionType || signature.isSharedFunction || signature.isParallelFunction
+    return false
+  end
+  let invoke = signature.firstMethod
+
+  if invoke == null || invoke.parameterCount != 1 || invoke.returnType != "Void"
+    return false
+  end
+  let parameter = invoke.firstParameter
+
+  if parameter == null || parameter.typeName != "Byte[]"
+    return false
+  end
+  var current = callable.firstParameter
+
+  while current != null
+    if current.hasDefault || !current.mode.isOrdinary()
+      return false
+    end
+    current = current.nextParameter
+  end
+  return true
+end
+
+def workerBridgeShape(owner: BootstrapBinder, operation: SemanticCallable, bridge: SemanticCallable): Bool
+  if bridge.className != "" || !bridge.isUnsafe || bridge.isStatic || bridge.bodyCount == 0 || bridge.operationAnnotation >= 0 || bridge.genericOrigin >= 0 || owner.syntax.nodeAt(bridge.syntaxNode).typeParameters.Length != 0 || bridge.cAbiSymbol != "" || bridge.cExportSymbol != "" || bridge.nativeLibrary != "" || bridge.intrinsicName != "" || bridge.returnType != operation.returnType || bridge.parameterCount != operation.parameterCount
+    return false
+  end
+  var index = 0
+
+  while index < operation.parameterCount
+    let parameter = operation.parameterAt(index)
+    let nativeParameter = bridge.parameterAt(index)
+
+    if parameter == null || nativeParameter == null || nativeParameter.hasDefault || !nativeParameter.mode.isOrdinary()
+      return false
+    end
+    let expected = index == 0 ? semanticWorkerEntryType() : parameter.typeName
+
+    if nativeParameter.typeName != expected
+      return false
+    end
+    index = index + 1
+  end
+  return true
+end
+
+def validateWorkerOperations(owner: BootstrapBinder): Void
+  let previousNamespace = owner.currentNamespace
+  let resolver = new BootstrapBodyBinder(owner)
+  var callable = owner.model.firstFunction
+
+  while callable != null && owner.checkpoint()
+    let annotation = callable.operationAnnotation
+
+    if annotation >= 0
+      var valid = workerOperationShape(owner, callable)
+
+      if valid
+        let target = owner.syntax.childAt(annotation, 1)
+        let name = genericCalleeName(resolver, target)
+
+        owner.currentNamespace = callable.namespaceName
+        let bridge = name == "" ? null : resolver.resolveFunction(name)
+
+        if bridge == null || !workerBridgeShape(owner, callable, bridge)
+          valid = false
+        else
+          callable.operationBridge = bridge.fullName
+          owner.recordNamespaceQualifier(name, target)
+          owner.recordOccurrence(owner.callableSourceIdentity(bridge), target)
+        end
+      end
+      if !valid
+        owner.report("NR249", annotation, "Operation 'workers.start' requires a safe empty-body nongeneric module function with fn(Byte[]): Void and Byte[] parameters, followed by ordinary parameters without defaults; its named unsafe module bridge must accept cabi fn(Byte*, UInt64): Void followed by the same parameter types and return the same type.")
+      end
+    end
+    callable = callable.nextCallable
+  end
+  owner.currentNamespace = previousNamespace
+end
+
+def bindWorkerEntry(body: BootstrapBodyBinder, node: Int): BoundValue
+  let name = genericCalleeName(body, node)
+  let target = name == "" ? null : body.resolveFunction(name)
+  var valid = target != null && body.syntax().nodeAt(node).typeArguments.Length == 0
+
+  if target != null
+    valid = valid && target.syntaxNode >= 0 && target.className == "" && !target.isUnsafe && !target.isStatic && target.cAbiSymbol == "" && target.cExportSymbol == "" && target.nativeLibrary == "" && target.intrinsicName == "" && target.operationAnnotation < 0 && target.genericOrigin < 0 && target.parameterCount == 1 && target.returnType == "Void" && target.firstSessionLocal == null && target.fullName != "__neri_session_entry" && body.syntax().nodeAt(target.syntaxNode).typeParameters.Length == 0
+    let parameter = target.firstParameter
+
+    valid = false if parameter == null || parameter.typeName != "Byte[]" || parameter.hasDefault || !parameter.mode.isOrdinary()
+  end
+  if !valid || target == null
+    body.report("NR249", node, "Worker entry must name a safe nongeneric Neri module function with the exact signature fn(Byte[]): Void; closures, variables, methods, compiler operations, and C ABI functions are not entries.")
+    return new BoundValue("Error", body.addBound(body.boundKinds().getErrorExpression(), "Error", "", node, emptyInts()))
+  end
+  body.owner.recordNamespaceQualifier(name, node)
+  body.owner.recordOccurrence(body.owner.callableSourceIdentity(target), node)
+  let typeName = semanticWorkerEntryType()
+
+  return new BoundValue(typeName, body.addBound(body.boundKinds().getWorkerEntry(), typeName, target.fullName, node, emptyInts()))
+end

@@ -5,6 +5,7 @@
 #include "../platform/session_loader.h"
 #include "terminal.h"
 #include "task_heap.h"
+#include "worker_pool.h"
 
 #include <algorithm>
 #include <array>
@@ -27,6 +28,7 @@
 #include <limits>
 #include <mutex>
 #include <new>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -98,6 +100,36 @@ struct task_result_heap final {
   task_result_heap *next = nullptr;
 };
 
+struct memory_profile_type final {
+  uint64_t allocated_objects = 0;
+  uint64_t allocated_bytes = 0;
+  uint64_t reclaimed_objects = 0;
+  uint64_t reclaimed_bytes = 0;
+  uint64_t live_objects = 0;
+  uint64_t live_bytes = 0;
+};
+
+struct memory_profile final {
+  std::mutex mutex;
+  std::map<std::string, memory_profile_type, std::less<>> types;
+  uint64_t allocated_objects = 0;
+  uint64_t allocated_bytes = 0;
+  uint64_t reclaimed_objects = 0;
+  uint64_t reclaimed_bytes = 0;
+  uint64_t live_objects = 0;
+  uint64_t live_bytes = 0;
+  uint64_t peak_live_objects = 0;
+  uint64_t peak_live_bytes = 0;
+  uint64_t collections = 0;
+  uint64_t gc_pause_ns = 0;
+  uint64_t gc_pause_max_ns = 0;
+  uint64_t last_gc_survivor_objects = 0;
+  uint64_t last_gc_survivor_bytes = 0;
+  uint64_t string_concat_calls = 0;
+  uint64_t string_concat_empty_operand_calls = 0;
+  uint64_t string_concat_result_bytes = 0;
+};
+
 enum class borrow_slot : size_t { previous, owner, byte_length, cookie };
 enum class foreign_entry_slot : size_t {
   previous, heap, roots, borrows, owns_heap, cookie
@@ -149,6 +181,144 @@ runtime_state &current_state() {
   return *active_state;
 }
 thread_local mark_stack *active_mark_stack = nullptr;
+
+bool memory_profile_enabled() {
+  static const bool enabled = [] {
+    const char *value = std::getenv("NERI_MEMORY_PROFILE");
+    return value != nullptr && std::strcmp(value, "1") == 0;
+  }();
+  return enabled;
+}
+
+memory_profile &process_memory_profile() {
+  // The profile outlives thread-local heaps and can be reused after a runtime
+  // shutdown in an embedding process.
+  static auto *profile = new memory_profile;
+  return *profile;
+}
+
+const char *profile_type_name(const neri_type_descriptor_v1 *type) {
+  return type->mangled_name == nullptr ? "<unnamed>" : type->mangled_name;
+}
+
+void profile_alloc(const neri_type_descriptor_v1 *type, uint64_t bytes) {
+  auto &profile = process_memory_profile();
+  std::lock_guard lock(profile.mutex);
+  const std::string_view name = profile_type_name(type);
+  auto found = profile.types.find(name);
+  if (found == profile.types.end()) {
+    found = profile.types.emplace(std::string(name), memory_profile_type{}).first;
+  }
+  auto &item = found->second;
+  ++item.allocated_objects;
+  item.allocated_bytes += bytes;
+  ++item.live_objects;
+  item.live_bytes += bytes;
+  ++profile.allocated_objects;
+  profile.allocated_bytes += bytes;
+  ++profile.live_objects;
+  profile.live_bytes += bytes;
+  profile.peak_live_objects = std::max(profile.peak_live_objects, profile.live_objects);
+  profile.peak_live_bytes = std::max(profile.peak_live_bytes, profile.live_bytes);
+}
+
+void profile_free(const neri_type_descriptor_v1 *type, uint64_t bytes,
+                  bool reclaimed) {
+  auto &profile = process_memory_profile();
+  std::lock_guard lock(profile.mutex);
+  const auto found = profile.types.find(std::string_view(profile_type_name(type)));
+  assert(found != profile.types.end());
+  auto &item = found->second;
+  --item.live_objects;
+  item.live_bytes -= bytes;
+  --profile.live_objects;
+  profile.live_bytes -= bytes;
+  if (reclaimed) {
+    ++item.reclaimed_objects;
+    item.reclaimed_bytes += bytes;
+    ++profile.reclaimed_objects;
+    profile.reclaimed_bytes += bytes;
+  }
+}
+
+void profile_collection(std::chrono::steady_clock::time_point start,
+                        uint64_t survivor_objects, uint64_t survivor_bytes) {
+  const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::steady_clock::now() - start).count();
+  auto &profile = process_memory_profile();
+  std::lock_guard lock(profile.mutex);
+  ++profile.collections;
+  profile.gc_pause_ns += static_cast<uint64_t>(elapsed);
+  profile.gc_pause_max_ns = std::max(profile.gc_pause_max_ns,
+                                    static_cast<uint64_t>(elapsed));
+  profile.last_gc_survivor_objects = survivor_objects;
+  profile.last_gc_survivor_bytes = survivor_bytes;
+}
+
+void profile_string_concat(uint64_t result_bytes, bool empty_operand) {
+  auto &profile = process_memory_profile();
+  std::lock_guard lock(profile.mutex);
+  ++profile.string_concat_calls;
+  profile.string_concat_empty_operand_calls += empty_operand ? 1 : 0;
+  profile.string_concat_result_bytes += result_bytes;
+}
+
+void print_json_string(std::ostream &output, const std::string &value) {
+  output << '"';
+  for (unsigned char character : value) {
+    if (character == '"' || character == '\\') {
+      output << '\\' << character;
+    } else if (character < 0x20) {
+      constexpr char hex[] = "0123456789abcdef";
+      output << "\\u00" << hex[character >> 4] << hex[character & 0xf];
+    } else {
+      output << character;
+    }
+  }
+  output << '"';
+}
+
+void print_memory_profile() {
+  auto &profile = process_memory_profile();
+  std::lock_guard lock(profile.mutex);
+  std::ostringstream output;
+  output << "{\"event\":\"neri_memory_profile\",\"scope\":\"process_cumulative\","
+         << "\"managed_allocated_objects\":" << profile.allocated_objects
+         << ",\"managed_allocated_bytes\":" << profile.allocated_bytes
+         << ",\"managed_reclaimed_objects\":" << profile.reclaimed_objects
+         << ",\"managed_reclaimed_bytes\":" << profile.reclaimed_bytes
+         << ",\"managed_outstanding_objects\":" << profile.live_objects
+         << ",\"managed_outstanding_bytes\":" << profile.live_bytes
+         << ",\"managed_peak_outstanding_objects\":" << profile.peak_live_objects
+         << ",\"managed_peak_outstanding_bytes\":" << profile.peak_live_bytes
+         << ",\"gc_collections\":" << profile.collections
+         << ",\"gc_pause_total_ns\":" << profile.gc_pause_ns
+         << ",\"gc_pause_max_ns\":" << profile.gc_pause_max_ns
+         << ",\"last_collected_heap_survivor_objects\":"
+         << profile.last_gc_survivor_objects
+         << ",\"last_collected_heap_survivor_bytes\":"
+         << profile.last_gc_survivor_bytes
+         << ",\"string_concat_calls\":" << profile.string_concat_calls
+         << ",\"string_concat_empty_operand_calls\":"
+         << profile.string_concat_empty_operand_calls
+         << ",\"string_concat_result_bytes\":" << profile.string_concat_result_bytes
+         << ",\"types\":{";
+  bool first = true;
+  for (const auto &[name, item] : profile.types) {
+    if (!first) output << ',';
+    first = false;
+    print_json_string(output, name);
+    output << ":{\"allocated_objects\":" << item.allocated_objects
+           << ",\"allocated_bytes\":" << item.allocated_bytes
+           << ",\"reclaimed_objects\":" << item.reclaimed_objects
+           << ",\"reclaimed_bytes\":" << item.reclaimed_bytes
+           << ",\"outstanding_objects\":" << item.live_objects
+           << ",\"outstanding_bytes\":" << item.live_bytes << '}';
+  }
+  output << "}}\n";
+  const auto line = output.str();
+  std::fwrite(line.data(), 1, line.size(), stderr);
+}
 
 const neri_type_descriptor_v1 dynamic_string_type = {
     sizeof(neri_type_descriptor_v1),
@@ -414,6 +584,9 @@ void unlink_native(native_allocation *allocation) {
 }
 
 void collect_impl() {
+  const bool profiling = memory_profile_enabled();
+  const auto profile_start = profiling ? std::chrono::steady_clock::now()
+                                       : std::chrono::steady_clock::time_point{};
   auto &heap = current_state();
   if (heap.phase == heap_phase::collecting) {
     contract_panic("nested GC collection is not supported by ABI v1.0");
@@ -461,6 +634,11 @@ void collect_impl() {
       heap.managed_object_count -= 1;
       heap.managed_byte_count -=
           sizeof(neri_object_header_v1) + allocation->payload_size;
+      if (profiling) {
+        profile_free(allocation->object->type,
+                     sizeof(neri_object_header_v1) + allocation->payload_size,
+                     true);
+      }
       std::free(allocation);
     } else {
       // Outside collection every live object is unmarked. Reset survivors
@@ -474,6 +652,10 @@ void collect_impl() {
       heap.managed_byte_count > UINT64_MAX / 2 ? UINT64_MAX : heap.managed_byte_count * 2);
   heap.phase = heap_phase::active;
   assert_consistent();
+  if (profiling) {
+    profile_collection(profile_start, heap.managed_object_count,
+                       heap.managed_byte_count);
+  }
 }
 
 void validate_type(const neri_type_descriptor_v1 *type,
@@ -975,9 +1157,15 @@ void release_heap() {
       heap.foreign_entry != nullptr || !heap.persistent_roots.empty()) {
     contract_panic("runtime shutdown requires no live roots, borrows or foreign entries");
   }
+  neri_worker_close_owned(&heap);
   while (heap.managed_head != nullptr) {
     auto *allocation = heap.managed_head;
     heap.managed_head = allocation->next;
+    if (memory_profile_enabled()) {
+      profile_free(allocation->object->type,
+                   sizeof(neri_object_header_v1) + allocation->payload_size,
+                   false);
+    }
     std::free(allocation);
   }
   release_native_allocations(heap);
@@ -1047,6 +1235,7 @@ struct session_coordinator final {
   uint64_t nonce{};
   neri_ref_v1 state{};
   uint64_t display_offset{UINT64_MAX};
+  bool entry_failed{};
   std::string target_type;
   std::map<std::string, session_layout_record> layouts;
   std::vector<void *> modules;
@@ -1055,6 +1244,7 @@ struct session_coordinator final {
   std::vector<neri_session_generation_v1 *> object_generations;
   decltype(&neri_session_linker_create_v1) object_create{};
   decltype(&neri_session_linker_destroy_v1) object_destroy{};
+  decltype(&neri_session_linker_add_library_v1) object_add_library{};
   decltype(&neri_session_linker_add_object_v1) object_add{};
   decltype(&neri_session_linker_symbol_v1) object_symbol{};
   decltype(&neri_session_linker_remove_v1) object_remove{};
@@ -1066,6 +1256,7 @@ std::map<int64_t, std::shared_ptr<session_coordinator>> sessions;
 std::atomic<uint64_t> next_session_nonce{1};
 std::atomic<uint64_t> next_session_identity{1};
 std::atomic<uint64_t> next_session_metric{1};
+thread_local session_coordinator *active_session_entry{};
 
 [[nodiscard]] bool session_power_of_two(uint64_t value) {
   return value != 0 && (value & (value - 1)) == 0;
@@ -1094,10 +1285,14 @@ std::atomic<uint64_t> next_session_metric{1};
   std::memcpy(&accessor, &accessor_symbol, sizeof(accessor));
   metadata = accessor();
   constexpr auto metadata_v1_size = offsetof(neri_session_module_metadata_v1, display_offset);
+  constexpr auto metadata_v1_1_size = offsetof(neri_session_module_metadata_v1, flags);
   if (metadata == nullptr || metadata->struct_size < metadata_v1_size ||
-      metadata->version_major != 1 || metadata->version_minor > 1 ||
+      metadata->version_major != 1 || metadata->version_minor > 2 ||
       (metadata->version_minor >= 1 &&
-       metadata->struct_size < sizeof(neri_session_module_metadata_v1)) ||
+       metadata->struct_size < metadata_v1_1_size) ||
+      (metadata->version_minor >= 2 &&
+       (metadata->struct_size < sizeof(neri_session_module_metadata_v1) ||
+        (metadata->flags & ~NERI_SESSION_MODULE_NULLABLE_ENTRY_V1) != 0)) ||
       metadata->entry_name == nullptr ||
       std::strcmp(metadata->entry_name, entry_name) != 0 ||
       metadata->source_type_id == nullptr ||
@@ -1154,7 +1349,7 @@ std::atomic<uint64_t> next_session_metric{1};
     return NERI_SESSION_INVALID_METADATA_V1;
   }
   if (metadata->version_minor >= 1 &&
-      metadata->struct_size >= sizeof(neri_session_module_metadata_v1) &&
+      metadata->struct_size >= metadata_v1_1_size &&
       metadata->display_offset != UINT64_MAX) {
     const auto &target = candidate.at(metadata->target_type_id);
     if (metadata->display_offset < sizeof(neri_object_header_v1) ||
@@ -1242,6 +1437,42 @@ NERI_RT_API neri_ref_v1 neri_rt_v1_task_generate(neri_int_v1 count,
   neri_task_parallel_for(length, parallelism == 0 ? UINT32_MAX : static_cast<uint32_t>(parallelism),
       generate_range, &range, references ? reinterpret_cast<neri_ref_v1 *>(elements) : nullptr,
       references ? 1 : 0);
+  neri_rt_v1_gc_root_frame_leave(&frame);
+  return roots[1];
+}
+
+NERI_RT_API neri_ref_v1 neri_rt_v1_array_generate(neri_int_v1 count,
+    const neri_type_descriptor_v1 *array_type, neri_ref_v1 callback,
+    neri_task_generate_fn_v1 adapter) {
+  require_initialized();
+  if (count < 0 || array_type == nullptr ||
+      array_type->kind != NERI_TYPE_KIND_ARRAY_V1 ||
+      array_type->element_size == 0 || callback == nullptr ||
+      find_readable(callback) == nullptr || adapter == nullptr) {
+    contract_panic("invalid sequential array generation contract");
+  }
+  const auto length = static_cast<uint64_t>(count);
+  if (length > (UINT64_MAX - array_type->payload_size) / array_type->element_size) {
+    out_of_memory("array generation size overflow");
+  }
+  const bool references = (array_type->flags & NERI_TYPE_FLAG_CONTAINS_REFS_V1) != 0;
+  if (references && (array_type->element_size != sizeof(neri_ref_v1) ||
+                     array_type->element_alignment != alignof(neri_ref_v1))) {
+    contract_panic("array result references require pointer-sized elements");
+  }
+  neri_ref_v1 roots[2]{callback, nullptr};
+  neri_gc_root_frame_v1 frame{nullptr, roots, 2, 0};
+  neri_rt_v1_gc_root_frame_enter(&frame);
+  roots[1] = neri_rt_v1_gc_alloc(array_type,
+      array_type->payload_size + length * array_type->element_size,
+      array_type->payload_alignment);
+  reinterpret_cast<neri_array_prefix_v1 *>(roots[1])->length = length;
+  auto *elements = reinterpret_cast<uint8_t *>(roots[1]) +
+      sizeof(neri_object_header_v1) + array_type->payload_size;
+  for (uint64_t index = 0; index < length; ++index) {
+    adapter(roots[0], static_cast<neri_int_v1>(index),
+            elements + index * array_type->element_size);
+  }
   neri_rt_v1_gc_root_frame_leave(&frame);
   return roots[1];
 }
@@ -1352,6 +1583,11 @@ void neri_task_execute(neri_task_ticket *ticket, neri_task_body body, void *cont
   }
 }
 
+const void *neri_worker_heap_identity(void) {
+  return current_state().phase == heap_phase::active && current_state().read_parent == nullptr
+      ? &current_state() : nullptr;
+}
+
 NERI_RT_API neri_abi_status_v1 neri_rt_v1_initialize(
     const neri_runtime_abi_requirements_v1 *requirements) {
   if (current_state().phase == heap_phase::suspended) {
@@ -1429,6 +1665,7 @@ NERI_RT_API void neri_rt_v1_shutdown(void) {
   if (current_state().phase == heap_phase::uninitialized) {
     return;
   }
+  if (memory_profile_enabled()) print_memory_profile();
   release_heap();
   if (std::fflush(stdout) != 0 || std::fflush(stderr) != 0) {
     contract_panic("console flush failed during runtime shutdown");
@@ -1482,6 +1719,7 @@ neri_rt_v1_gc_alloc(const neri_type_descriptor_v1 *type,
   object->runtime_word = reinterpret_cast<uintptr_t>(metadata);
   heap.managed_object_count += 1;
   heap.managed_byte_count += total_size;
+  if (memory_profile_enabled()) profile_alloc(type, total_size);
   assert_consistent();
   return object;
 }
@@ -1585,6 +1823,10 @@ neri_rt_v1_string_concat(neri_ref_v1 left, neri_ref_v1 right) {
               static_cast<size_t>(rooted_left.byte_length));
   std::memcpy(destination + rooted_left.byte_length, rooted_right.bytes,
               static_cast<size_t>(rooted_right.byte_length));
+  if (memory_profile_enabled()) {
+    profile_string_concat(byte_length,
+                          initial_left.byte_length == 0 || initial_right.byte_length == 0);
+  }
   neri_rt_v1_gc_root_frame_leave(&frame);
   return result;
 }
@@ -2254,6 +2496,7 @@ NERI_RT_API neri_ref_v1 neri_rt_v1_session_owner(neri_int_v1 handle) {
   };
   assign(session.object_create, "neri_session_linker_create_v1");
   assign(session.object_destroy, "neri_session_linker_destroy_v1");
+  assign(session.object_add_library, "neri_session_linker_add_library_v1");
   assign(session.object_add, "neri_session_linker_add_object_v1");
   assign(session.object_symbol, "neri_session_linker_symbol_v1");
   assign(session.object_remove, "neri_session_linker_remove_v1");
@@ -2348,17 +2591,27 @@ static neri_int_v1 session_load_execute_impl(
     return NERI_SESSION_INVOKE_STATE_V1;
   }
   const auto entry_started = std::chrono::steady_clock::now();
+  const auto previous_state = session.state;
+  session.error.clear();
+  session.entry_failed = false;
+  auto *const previous_active_entry = active_session_entry;
+  active_session_entry = &session;
   session.phase = session_phase::executing;
-  session.state = metadata->entry(session.state);
+  const auto next_state = metadata->entry(previous_state);
   session.phase = session_phase::ready;
-  const auto gc_started = std::chrono::steady_clock::now();
+  active_session_entry = previous_active_entry;
+  if (session.entry_failed || next_state == nullptr) {
+    if (!session.entry_failed) session.error = "session entry returned no frame without reporting failure";
+    session.state = previous_state;
+    return NERI_SESSION_INVOKE_STATE_V1;
+  }
+  session.state = next_state;
   session.target_type.swap(target);
   session.display_offset = metadata->version_minor >= 1 &&
-                                   metadata->struct_size >= sizeof(*metadata)
+                                   metadata->struct_size >= offsetof(neri_session_module_metadata_v1, flags)
                                ? metadata->display_offset
                                : UINT64_MAX;
   session.layouts.swap(merged);
-  neri_rt_v1_gc_collect();
   const auto finished = std::chrono::steady_clock::now();
   if (measure) {
     const auto nanoseconds = [](auto duration) {
@@ -2375,8 +2628,8 @@ static neri_int_v1 session_load_execute_impl(
            << nanoseconds(metadata_started - validation_started)
            << ",\"metadataCommitNs\":"
            << nanoseconds(entry_started - metadata_started)
-           << ",\"entryNs\":" << nanoseconds(gc_started - entry_started)
-           << ",\"gcNs\":" << nanoseconds(finished - gc_started) << "}\n";
+           << ",\"entryNs\":" << nanoseconds(finished - entry_started)
+           << ",\"gcNs\":0}\n";
   }
   return NERI_SESSION_OK_V1;
 }
@@ -2408,9 +2661,10 @@ NERI_RT_API neri_int_v1 neri_rt_v1_session_load_execute_retained(
                                    entry.c_str());
 }
 
-NERI_RT_API neri_int_v1 neri_rt_v1_session_load_execute_object(
+static neri_int_v1 session_load_execute_object_impl(
     neri_int_v1 handle, neri_ref_v1 object_path,
-    neri_ref_v1 artifact_identity, neri_ref_v1 linker_path) {
+    neri_ref_v1 artifact_identity, neri_ref_v1 linker_path,
+    const std::string &native_libraries) {
   require_initialized();
   std::string path;
   std::string identity;
@@ -2437,6 +2691,60 @@ NERI_RT_API neri_int_v1 neri_rt_v1_session_load_execute_object(
   }
   if (!session_load_object_linker(session, bridge))
     return NERI_SESSION_LOAD_FAILED_V1;
+  if (!native_libraries.empty()) {
+    if (native_libraries.size() > 8192 || session.object_add_library == nullptr) {
+      session.error = "session object linker cannot load native libraries";
+      return NERI_SESSION_LOAD_FAILED_V1;
+    }
+    const auto *configured_directory = std::getenv("NERI_LIBRARY_PATH");
+#if defined(__APPLE__)
+    const auto *directory = configured_directory != nullptr && configured_directory[0] != '\0'
+                                ? configured_directory : "/opt/homebrew/lib";
+#else
+    const auto *directory = configured_directory != nullptr ? configured_directory : "";
+#endif
+    if (native_libraries.find('\0') != std::string::npos) {
+      session.error = "invalid session native library list";
+      return NERI_SESSION_LOAD_FAILED_V1;
+    }
+    std::vector<std::string> names;
+    size_t start = 0;
+    while (start < native_libraries.size()) {
+      const auto end = native_libraries.find('\n', start);
+      const auto length = (end == std::string::npos ? native_libraries.size() : end) - start;
+      if (length == 0 || length > 128) {
+        session.error = "invalid session native library list";
+        return NERI_SESSION_LOAD_FAILED_V1;
+      }
+      const auto name = native_libraries.substr(start, length);
+      for (size_t index = 0; index < name.size(); ++index) {
+        const auto character = static_cast<unsigned char>(name[index]);
+        const auto alpha_numeric = (character >= 'A' && character <= 'Z') ||
+                                   (character >= 'a' && character <= 'z') ||
+                                   (character >= '0' && character <= '9');
+        if (!alpha_numeric && (index == 0 ||
+                               (character != '_' && character != '-' && character != '.'))) {
+          session.error = "invalid session native library list";
+          return NERI_SESSION_LOAD_FAILED_V1;
+        }
+      }
+      names.push_back(name);
+      if (end == std::string::npos) break;
+      start = end + 1;
+    }
+    if (native_libraries.back() == '\n') {
+      session.error = "invalid session native library list";
+      return NERI_SESSION_LOAD_FAILED_V1;
+    }
+    for (const auto &name : names) {
+      std::array<char, 512> library_error{};
+      if (session.object_add_library(session.object_linker, name.c_str(), directory,
+                                     library_error.data(), library_error.size()) == 0) {
+        session.error = "cannot load native library " + name + ": " + library_error.data();
+        return NERI_SESSION_LOAD_FAILED_V1;
+      }
+    }
+  }
   static constexpr char digits[] = "0123456789abcdef";
   std::string suffix;
   suffix.reserve(identity.size() * 2U);
@@ -2494,13 +2802,43 @@ NERI_RT_API neri_int_v1 neri_rt_v1_session_load_execute_object(
     return NERI_SESSION_INVOKE_STATE_V1;
   }
   session.phase = session_phase::executing;
-  session.state = metadata->entry(session.state);
+  const auto previous_state = session.state;
+  session.error.clear();
+  session.entry_failed = false;
+  auto *const previous_active_entry = active_session_entry;
+  active_session_entry = &session;
+  const auto next_state = metadata->entry(previous_state);
   session.phase = session_phase::ready;
+  active_session_entry = previous_active_entry;
+  if (session.entry_failed || next_state == nullptr) {
+    if (!session.entry_failed) session.error = "session entry returned no frame without reporting failure";
+    session.state = previous_state;
+    return NERI_SESSION_INVOKE_STATE_V1;
+  }
+  session.state = next_state;
   session.target_type.swap(target);
   session.display_offset = metadata->display_offset;
   session.layouts.swap(merged);
-  neri_rt_v1_gc_collect();
   return NERI_SESSION_OK_V1;
+}
+
+NERI_RT_API neri_int_v1 neri_rt_v1_session_load_execute_object(
+    neri_int_v1 handle, neri_ref_v1 object_path,
+    neri_ref_v1 artifact_identity, neri_ref_v1 linker_path) {
+  return session_load_execute_object_impl(handle, object_path, artifact_identity,
+                                          linker_path, "");
+}
+
+NERI_RT_API neri_int_v1 neri_rt_v1_session_load_execute_object_libraries(
+    neri_int_v1 handle, neri_ref_v1 object_path,
+    neri_ref_v1 artifact_identity, neri_ref_v1 linker_path,
+    neri_ref_v1 native_libraries) {
+  require_initialized();
+  std::string libraries;
+  if (!host_string(native_libraries, libraries, "session native libraries"))
+    return NERI_SESSION_LOAD_FAILED_V1;
+  return session_load_execute_object_impl(handle, object_path, artifact_identity,
+                                          linker_path, libraries);
 }
 
 NERI_RT_API neri_int_v1 neri_rt_v1_session_reset(neri_int_v1 handle) {
@@ -2615,5 +2953,25 @@ NERI_RT_API neri_ref_v1 neri_rt_v1_session_result(neri_int_v1 handle) {
     return create_ascii_string("");
   return create_utf8_string(reinterpret_cast<const uint8_t *>(bytes.data()),
                             bytes.size());
+}
+
+NERI_RT_API void neri_rt_v1_session_fail(neri_ref_v1 message) {
+  require_initialized();
+  auto *session = active_session_entry;
+  if (session == nullptr || session->phase != session_phase::executing ||
+      session->owner_thread != std::this_thread::get_id()) {
+    contract_panic("session failure reported outside session entry execution");
+  }
+  session->entry_failed = true;
+  try {
+    std::string text;
+    if (!host_string(message, text, "session failure message")) {
+      session->error = "session failure message is invalid";
+      return;
+    }
+    session->error = std::move(text);
+  } catch (...) {
+    session->error = "session failure message allocation failed";
+  }
 }
 }

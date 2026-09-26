@@ -1,0 +1,339 @@
+use tasks
+namespace neri_data
+
+def joinProjectionMapping(source: EntityMapping, alias: String): EntityMapping?
+  let columns: MappingColumn[] = tasks::generate(source.count(), 1) do |index|
+    return new MappingColumn("", "", "")
+  end
+  var index = 0
+
+  while index < source.count()
+    let original = source.columnAt(index)
+
+    if original == null
+      return null
+    end
+    columns[index] = new MappingColumn(original.identity(), original.typeName(), original.column(), original.path())
+    index = index + 1
+  end
+
+  return new EntityMapping(source.entityType(), alias, columns, presences: mappingPresenceCopy(source))
+end
+
+class JoinShapeParts<A, B>
+  internal left: ShapePlan<A>
+  internal right: ShapePlan<B>
+
+  internal def init(left: ShapePlan<A>, right: ShapePlan<B>): Void
+    this.left = left
+    this.right = right
+  end
+end
+
+enum JoinShapeCompileResult<A, B>
+  case Plans(value: JoinShapeParts<A, B>)
+  case Failure(error: QueryFailure)
+end
+
+def compileJoinShapes<L, R, A, B>(joined: JoinSql, left: RowShape<L, A>, right: RowShape<R, B>, state: CompileState, dialect: SqlDialect, outer: Bool): JoinShapeCompileResult<A, B>
+  let alias = "__neri_join"
+  let leftMapping = joinProjectionMapping(joined.leftMapping, alias)
+  let rightMapping = joinProjectionMapping(joined.rightMapping, alias)
+
+  if leftMapping == null || rightMapping == null
+    return JoinShapeCompileResult<A, B>.Failure(QueryFailure.Provider("join projection mapping has a missing column"))
+  end
+  var rightGuard: String? = null
+
+  if outer
+    rightGuard = quoted(alias, "__neri_present") + " = 1"
+  end
+
+  match left.compile(leftMapping, 0, state, dialect)
+    case ShapeCompileResult.Failure(error)
+      return JoinShapeCompileResult<A, B>.Failure(error)
+    case ShapeCompileResult.Plan(leftPlan)
+      match right.compile(rightMapping, leftPlan.count(), state, dialect, rightGuard)
+        case ShapeCompileResult.Failure(error)
+          return JoinShapeCompileResult<A, B>.Failure(error)
+        case ShapeCompileResult.Plan(rightPlan)
+          return JoinShapeCompileResult<A, B>.Plans(new JoinShapeParts<A, B>(leftPlan, rightPlan))
+      end
+  end
+end
+
+def joinShapeColumns<A, B>(left: ShapePlan<A>, right: ShapePlan<B>, outer: Bool): ResultColumns
+  let leftCount = left.count()
+  let rightCount = right.count()
+  let extra = outer ? 1 : 0
+  let columns: ResultColumn[] = tasks::generate(leftCount + rightCount + extra, 1) do |index|
+    if index < leftCount
+      let column = left.columns().at(index)
+
+      return new ResultColumn(column.name(), shapeKind(column.kind()), column.nullable())
+    end
+    if index < leftCount + rightCount
+      let column = right.columns().at(index - leftCount)
+
+      return new ResultColumn(column.name(), shapeKind(column.kind()), outer || column.nullable())
+    end
+    return new ResultColumn("__neri_present", ResultColumnKind.Int())
+  end
+
+  return new ResultColumns(columns)
+end
+
+def joinShapeLimit(bound: Int?, unbounded: Bool): QueryFailure?
+  if bound == null && !unbounded
+    return QueryFailure.MissingLimit(queryRowLimit())
+  end
+  if bound != null && (bound < 1 || bound > queryRowLimit())
+    return QueryFailure.InvalidLimit(bound, queryRowLimit())
+  end
+  return null
+end
+
+def joinShapeSql(joined: JoinSql, parts: String, outer: Bool, selectionCount: Int, dialect: SqlDialect): String?
+  let alias = "__neri_join"
+  let marker = outer ? ", " + quoted(alias, "__neri_present") + " AS \"__neri_present\"" : ""
+  let source = joinShiftSql(joined.text, selectionCount, dialect)
+
+  if source == null
+    return null
+  end
+  return "SELECT " + parts + marker + " FROM (" + source + ") AS \"" + alias + "\"" + joined.orderSql(alias)
+end
+
+def joinedShapeDecoder<A, B, V>(left: ShapePlan<A>, right: ShapePlan<B>, materialize: fn(A, B): V, columns: ResultColumns): Decoder<V>
+  let read: fn(RawRow): DecodeResult<V> = fn(row: RawRow): DecodeResult<V>
+    match left.prepare(row)
+      case ShapePrepareResult.Failure(error)
+        return DecodeResult<V>.Failure(error)
+      case ShapePrepareResult.Ready(leftValue)
+        match right.prepare(row)
+          case ShapePrepareResult.Failure(error)
+            return DecodeResult<V>.Failure(error)
+          case ShapePrepareResult.Ready(rightValue)
+            return DecodeResult<V>.Value(materialize(leftValue.value(), rightValue.value()))
+        end
+    end
+  end
+
+  return new Decoder<V>(read, columns)
+end
+
+def leftJoinedShapeDecoder<A, B, V>(left: ShapePlan<A>, right: ShapePlan<B>, materialize: fn(A, B?): V, columns: ResultColumns): Decoder<V>
+  let read: fn(RawRow): DecodeResult<V> = fn(row: RawRow): DecodeResult<V>
+    match left.prepare(row)
+      case ShapePrepareResult.Failure(error)
+        return DecodeResult<V>.Failure(error)
+      case ShapePrepareResult.Ready(leftValue)
+        match row.value("__neri_present")
+          case CellLookup.Missing()
+            return DecodeResult<V>.Failure(QueryFailure.MissingColumn("__neri_present"))
+          case CellLookup.Found(cell)
+            match cell
+              case Cell.Int(value)
+                if value == 0
+                  return DecodeResult<V>.Value(materialize(leftValue.value(), null))
+                end
+                if value != 1
+                  return DecodeResult<V>.Failure(QueryFailure.Provider("invalid left join presence marker"))
+                end
+              case Cell.Null()
+                return DecodeResult<V>.Failure(QueryFailure.TypeMismatch("__neri_present", "Int", "NULL"))
+              case Cell.Bool(value)
+                return DecodeResult<V>.Failure(QueryFailure.TypeMismatch("__neri_present", "Int", "Bool"))
+              case Cell.Float(value)
+                return DecodeResult<V>.Failure(QueryFailure.TypeMismatch("__neri_present", "Int", "Float"))
+              case Cell.Text(value)
+                return DecodeResult<V>.Failure(QueryFailure.TypeMismatch("__neri_present", "Int", "String"))
+            end
+        end
+        match right.prepare(row)
+          case ShapePrepareResult.Failure(error)
+            return DecodeResult<V>.Failure(error)
+          case ShapePrepareResult.Ready(rightValue)
+            return DecodeResult<V>.Value(materialize(leftValue.value(), rightValue.value()))
+        end
+    end
+  end
+
+  return new Decoder<V>(read, columns)
+end
+
+class JoinShapeProjection<L, R, K, A, B, V>
+  private joined: JoinedQuery<L, R, K>
+  private left: RowShape<L, A>
+  private right: RowShape<R, B>
+  private materialize: fn(A, B): V
+
+  public def init(joined: JoinedQuery<L, R, K>, left: RowShape<L, A>, right: RowShape<R, B>, materialize: fn(A, B): V): Void
+    this.joined = joined
+    this.left = left
+    this.right = right
+    this.materialize = materialize
+  end
+
+  public def compile(dialect: SqlDialect = SqlDialect.QuestionMark()): CompileResult<V>
+    return this.compilePlan(dialect, false)
+  end
+
+  private def compilePlan(dialect: SqlDialect, unbounded: Bool): CompileResult<V>
+    let bound = this.joined.rowLimit()
+    let invalid = joinShapeLimit(bound, unbounded)
+
+    if invalid != null
+      return CompileResult<V>.Failure(invalid)
+    end
+    match this.joined.compositionPlan(dialect)
+      case JoinBuildResult.Failure(error)
+        return CompileResult<V>.Failure(error)
+      case JoinBuildResult.Plan(joined)
+        let state = new CompileState()
+
+        match compileJoinShapes<L, R, A, B>(joined, this.left, this.right, state, dialect, false)
+          case JoinShapeCompileResult.Failure(error)
+            return CompileResult<V>.Failure(error)
+          case JoinShapeCompileResult.Plans(parts)
+            let columns = joinShapeColumns(parts.left, parts.right, false)
+            let decoder = joinedShapeDecoder(parts.left, parts.right, this.materialize, columns)
+            let sql = joinShapeSql(joined, parts.left.sql() + ", " + parts.right.sql(), false, state.count, dialect)
+
+            if sql == null
+              return CompileResult<V>.Failure(QueryFailure.Provider("join projection parameter index exceeds supported range"))
+            end
+            joinParameterCopy(joined.parameters, state)
+            var maximum = queryRowLimit()
+
+            if bound != null
+              maximum = bound
+            end
+
+            let checkedScalars = joined.checkedScalars || parts.left.requiresCheckedScalars() || parts.right.requiresCheckedScalars()
+
+            return CompileResult<V>.Plan(new TypedPlan<V>(new SqlPlan(sql, new ParameterValues(state.head, state.count), maximum, columns, checkedScalars), decoder))
+        end
+    end
+  end
+
+  public def all(provider: Provider? = null): QueryResult<V>
+    let selected = this.joined.boundProvider(provider)
+
+    if selected == null
+      return QueryResult<V>.Failure(QueryFailure.UnsupportedCapability("join requires one shared provider or explicit override"))
+    end
+    if !selected.supports(ProviderCapability.BoundedTypedReads())
+      return QueryResult<V>.Failure(QueryFailure.UnsupportedCapability("bounded-typed-reads"))
+    end
+    return execute<V>(this.compile(selected.dialect()), selected)
+  end
+
+  public def stream(visit: fn(V): Bool, options: StreamOptions? = null): StreamResult
+    let compile: fn(SqlDialect): CompileResult<V> = fn(dialect: SqlDialect): CompileResult<V>
+      return this.compilePlan(dialect, true)
+    end
+
+    return streamCompiled<V>(this.joined.boundProvider(), compile, visit, options, this.joined.rowLimit())
+  end
+
+  public def streamWith(provider: Provider, visit: fn(V): Bool, options: StreamOptions? = null): StreamResult
+    let compile: fn(SqlDialect): CompileResult<V> = fn(dialect: SqlDialect): CompileResult<V>
+      return this.compilePlan(dialect, true)
+    end
+
+    return streamCompiled<V>(this.joined.boundProvider(provider), compile, visit, options, this.joined.rowLimit())
+  end
+end
+
+def projectJoin<L, R, K, A, B, V>(joined: JoinedQuery<L, R, K>, left: RowShape<L, A>, right: RowShape<R, B>, materialize: fn(A, B): V): JoinShapeProjection<L, R, K, A, B, V>
+  return new JoinShapeProjection<L, R, K, A, B, V>(joined, left, right, materialize)
+end
+
+class LeftJoinShapeProjection<L, R, K, A, B, V>
+  private joined: LeftJoinedQuery<L, R, K>
+  private left: RowShape<L, A>
+  private right: RowShape<R, B>
+  private materialize: fn(A, B?): V
+
+  public def init(joined: LeftJoinedQuery<L, R, K>, left: RowShape<L, A>, right: RowShape<R, B>, materialize: fn(A, B?): V): Void
+    this.joined = joined
+    this.left = left
+    this.right = right
+    this.materialize = materialize
+  end
+
+  public def compile(dialect: SqlDialect = SqlDialect.QuestionMark()): CompileResult<V>
+    return this.compilePlan(dialect, false)
+  end
+
+  private def compilePlan(dialect: SqlDialect, unbounded: Bool): CompileResult<V>
+    let bound = this.joined.rowLimit()
+    let invalid = joinShapeLimit(bound, unbounded)
+
+    if invalid != null
+      return CompileResult<V>.Failure(invalid)
+    end
+    match this.joined.compositionPlan(dialect)
+      case JoinBuildResult.Failure(error)
+        return CompileResult<V>.Failure(error)
+      case JoinBuildResult.Plan(joined)
+        let state = new CompileState()
+
+        match compileJoinShapes<L, R, A, B>(joined, this.left, this.right, state, dialect, true)
+          case JoinShapeCompileResult.Failure(error)
+            return CompileResult<V>.Failure(error)
+          case JoinShapeCompileResult.Plans(parts)
+            let columns = joinShapeColumns(parts.left, parts.right, true)
+            let decoder = leftJoinedShapeDecoder(parts.left, parts.right, this.materialize, columns)
+            let sql = joinShapeSql(joined, parts.left.sql() + ", " + parts.right.sql(), true, state.count, dialect)
+
+            if sql == null
+              return CompileResult<V>.Failure(QueryFailure.Provider("join projection parameter index exceeds supported range"))
+            end
+            joinParameterCopy(joined.parameters, state)
+            var maximum = queryRowLimit()
+
+            if bound != null
+              maximum = bound
+            end
+
+            let checkedScalars = joined.checkedScalars || parts.left.requiresCheckedScalars() || parts.right.requiresCheckedScalars()
+
+            return CompileResult<V>.Plan(new TypedPlan<V>(new SqlPlan(sql, new ParameterValues(state.head, state.count), maximum, columns, checkedScalars), decoder))
+        end
+    end
+  end
+
+  public def all(provider: Provider? = null): QueryResult<V>
+    let selected = this.joined.boundProvider(provider)
+
+    if selected == null
+      return QueryResult<V>.Failure(QueryFailure.UnsupportedCapability("join requires one shared provider or explicit override"))
+    end
+    if !selected.supports(ProviderCapability.BoundedTypedReads())
+      return QueryResult<V>.Failure(QueryFailure.UnsupportedCapability("bounded-typed-reads"))
+    end
+    return execute<V>(this.compile(selected.dialect()), selected)
+  end
+
+  public def stream(visit: fn(V): Bool, options: StreamOptions? = null): StreamResult
+    let compile: fn(SqlDialect): CompileResult<V> = fn(dialect: SqlDialect): CompileResult<V>
+      return this.compilePlan(dialect, true)
+    end
+
+    return streamCompiled<V>(this.joined.boundProvider(), compile, visit, options, this.joined.rowLimit())
+  end
+
+  public def streamWith(provider: Provider, visit: fn(V): Bool, options: StreamOptions? = null): StreamResult
+    let compile: fn(SqlDialect): CompileResult<V> = fn(dialect: SqlDialect): CompileResult<V>
+      return this.compilePlan(dialect, true)
+    end
+
+    return streamCompiled<V>(this.joined.boundProvider(provider), compile, visit, options, this.joined.rowLimit())
+  end
+end
+
+def projectLeftJoin<L, R, K, A, B, V>(joined: LeftJoinedQuery<L, R, K>, left: RowShape<L, A>, right: RowShape<R, B>, materialize: fn(A, B?): V): LeftJoinShapeProjection<L, R, K, A, B, V>
+  return new LeftJoinShapeProjection<L, R, K, A, B, V>(joined, left, right, materialize)
+end

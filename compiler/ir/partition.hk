@@ -1,12 +1,39 @@
 class IrCompilationUnit
   public module: IrModule
   public owner: String
+  public key: String
+  public entry: Bool
   public next: IrCompilationUnit?
 
-  def init(module: IrModule, owner: String): Void
+  def init(module: IrModule, owner: String, key: String, entry: Bool): Void
     this.module = module
     this.owner = owner
+    this.key = key
+    this.entry = entry
   end
+end
+
+# A source's bucket never depends on how many other sources an owner declares.
+# The entry source and consumer-created definitions occupy bucket zero.
+def irPartitionBucketCount(): Int
+  return 2
+end
+
+def irPartitionBucket(sourceId: String): Int
+  let buckets = irPartitionBucketCount()
+  var hash = 0
+  var index = 0
+
+  while index < host::stringByteLength(sourceId)
+    hash = hash * 31 + (host::stringByteAt(sourceId, index) as Int)
+    hash = hash - (hash / buckets) * buckets
+    index = index + 1
+  end
+  return hash
+end
+
+def irPartitionKey(owner: String, bucket: Int): String
+  return (host::stringByteLength(owner) as String) + ":" + owner + ":" + (bucket as String)
 end
 
 def irPartitionLocation(value: IrLocation): IrLocation
@@ -114,16 +141,11 @@ def irPartitionHasName(values: StringBuffer, name: String): Bool
   return false
 end
 
-def irPartitionSourceOwner(sourceId: String, sourceIds: StringBuffer, sourceOwners: StringBuffer): String?
-  var source = sourceIds.first.nextNode
-  var owner = sourceOwners.first.nextNode
+def irPartitionSourceOwner(sourceId: String, ownersBySource: StringTable<String>): String?
+  let found = ownersBySource.find(sourceId)
 
-  while source != null && owner != null
-    if source.value == sourceId
-      return owner.value
-    end
-    source = source.nextNode
-    owner = owner.nextNode
+  if found != null
+    return found.value
   end
   return null
 end
@@ -146,11 +168,11 @@ def irPartitionClassByName(module: IrModule, name: String): IrClass?
   return null
 end
 
-def irPartitionClassOwner(value: IrClass, sourceIds: StringBuffer, sourceOwners: StringBuffer): String?
+def irPartitionClassOwner(value: IrClass, ownersBySource: StringTable<String>): String?
   if value.declarationSourceId != ""
-    return irPartitionSourceOwner(value.declarationSourceId, sourceIds, sourceOwners)
+    return irPartitionSourceOwner(value.declarationSourceId, ownersBySource)
   end
-  return irPartitionOwner(value.location, sourceIds, sourceOwners)
+  return irPartitionOwner(value.location, ownersBySource)
 end
 
 def irPartitionFunctionConsumer(semantic: SemanticModel, value: IrFunction): Bool
@@ -164,11 +186,11 @@ def irPartitionFunctionConsumer(semantic: SemanticModel, value: IrFunction): Boo
   return callable != null && callable.genericOrigin >= 0
 end
 
-def irPartitionOwner(location: IrLocation, sourceIds: StringBuffer, sourceOwners: StringBuffer): String?
+def irPartitionOwner(location: IrLocation, ownersBySource: StringTable<String>): String?
   if !location.present
     return null
   end
-  let owner = irPartitionSourceOwner(location.sourceId, sourceIds, sourceOwners)
+  let owner = irPartitionSourceOwner(location.sourceId, ownersBySource)
 
   if owner == null || owner == ""
     return null
@@ -176,19 +198,16 @@ def irPartitionOwner(location: IrLocation, sourceIds: StringBuffer, sourceOwners
   return owner
 end
 
-def irPartitionFindUnit(first: IrCompilationUnit?, owner: String): IrCompilationUnit?
-  var current = first
+def irPartitionFindUnit(unitsByKey: StringTable<IrCompilationUnit>, key: String): IrCompilationUnit?
+  let found = unitsByKey.find(key)
 
-  while current != null
-    if current.owner == owner
-      return current
-    end
-    current = current.next
+  if found != null
+    return found.value
   end
   return null
 end
 
-def irPartitionNewUnit(module: IrModule, owner: String, entry: Bool): IrCompilationUnit
+def irPartitionNewUnit(module: IrModule, owner: String, key: String, entry: Bool): IrCompilationUnit
   let result = new IrModule(module.id, "", module.domains)
 
   result.clearSources()
@@ -200,7 +219,7 @@ def irPartitionNewUnit(module: IrModule, owner: String, entry: Bool): IrCompilat
   end
   result.requiredFeatures.requireRetainedModules()
   result.requiredFeatures.requireCInterop() if module.requiredFeatures.hasCInterop()
-  return new IrCompilationUnit(result, owner)
+  return new IrCompilationUnit(result, owner, key, entry)
 end
 
 def irPartitionAddSource(unit: IrCompilationUnit, original: IrModule, sourceId: String): Void
@@ -280,6 +299,8 @@ def irPartitionNeedDependencies(unit: IrCompilationUnit, function: IrFunction, g
       let symbol = instruction.symbol
 
       unit.module.requiredFeatures.requireScopedTasks() if instruction.opcode.isTaskGenerate()
+      unit.module.requiredFeatures.requireIsolatedWorkers() if instruction.opcode.isWorkerEntry()
+      unit.module.requiredFeatures.requireSequentialArrays() if instruction.opcode.isArrayGenerate()
       let constantKind = instruction.constantKind
 
       if constantKind != null && constantKind.isStringGlobal() && !irPartitionHasName(globals, instruction.constantValue)
@@ -299,7 +320,7 @@ def irPartitionNeedDependencies(unit: IrCompilationUnit, function: IrFunction, g
   end
 end
 
-def irPartitionCopyDependencies(unit: IrCompilationUnit, original: IrModule, entry: Bool): Void
+def irPartitionCopyDependencies(unit: IrCompilationUnit, original: IrModule): Void
   let globals = new StringBuffer()
   let imports = new StringBuffer()
   var function = unit.module.firstFunction
@@ -323,7 +344,7 @@ def irPartitionCopyDependencies(unit: IrCompilationUnit, original: IrModule, ent
   var importValue = original.firstImport
 
   while importValue != null
-    if entry || irPartitionHasName(imports, importValue.symbol.name)
+    if unit.entry || irPartitionHasName(imports, importValue.symbol.name)
       let copied = irPartitionImport(importValue)
 
       copied.location = irNoLocation()
@@ -334,143 +355,177 @@ def irPartitionCopyDependencies(unit: IrCompilationUnit, original: IrModule, ent
   end
 end
 
-def irPartitionHasConsumerEntry(module: IrModule, sourceIds: StringBuffer, sourceOwners: StringBuffer, consumerOwner: String): Bool
+def irPartitionConsumerSourceId(module: IrModule, ownersBySource: StringTable<String>, consumerOwner: String): String
   var entries = 0
-  var classValue = module.firstClass
-
-  while classValue != null
-    if classValue.retained
-      return false
-    end
-    classValue = classValue.nextClass
-  end
+  var sourceId = ""
   var function = module.firstFunction
 
   while function != null
-    if function.retained
-      return false
-    end
-    if function.symbol.kind.isFunction() && function.symbol.name == "main" && function.kind.isFunction() && function.parameterTypes.size == 0 && function.resultType == "void"
+    if !function.retained && function.symbol.kind.isFunction() && function.symbol.name == "main" && function.kind.isFunction() && function.parameterTypes.size == 0 && function.resultType == "void"
       entries = entries + 1
-      let owner = irPartitionOwner(function.location, sourceIds, sourceOwners)
+      let owner = irPartitionOwner(function.location, ownersBySource)
 
       if owner == null || owner != consumerOwner
-        return false
+        return ""
       end
+      sourceId = function.location.sourceId
     end
     function = function.nextFunction
   end
-  return entries == 1
+  return entries == 1 ? sourceId : ""
 end
 
 def irPartitionModule(module: IrModule, semantic: SemanticModel, sourceIds: StringBuffer, sourceOwners: StringBuffer, consumerOwner: String): IrCompilationUnit?
   if sourceIds.size != sourceOwners.size || consumerOwner == "" || module.sessionEntry != null
     return null
   end
-  if !irPartitionHasConsumerEntry(module, sourceIds, sourceOwners, consumerOwner)
+  let ownersBySource = new StringTable<String>()
+  var source = sourceIds.first.nextNode
+  var sourceOwner = sourceOwners.first.nextNode
+
+  while source != null && sourceOwner != null
+    if !ownersBySource.add(source.value, sourceOwner.value)
+      return null
+    end
+    source = source.nextNode
+    sourceOwner = sourceOwner.nextNode
+  end
+  let entrySourceId = irPartitionConsumerSourceId(module, ownersBySource, consumerOwner)
+
+  if entrySourceId == ""
     return null
   end
-  var first: IrCompilationUnit? = null
-  var last: IrCompilationUnit? = null
-  let consumer = irPartitionNewUnit(module, consumerOwner, true)
+  let unitsByKey = new StringTable<IrCompilationUnit>()
+  let consumerKey = irPartitionKey(consumerOwner, 0)
+  let consumer = irPartitionNewUnit(module, consumerOwner, consumerKey, true)
 
-  first = consumer
-  last = consumer
+  unitsByKey.add(consumerKey, consumer)
+  var last = consumer
   var classValue = module.firstClass
 
   while classValue != null
-    let declaredOwner = irPartitionClassOwner(classValue, sourceIds, sourceOwners)
-    var owner = consumerOwner
+    if !classValue.retained
+      let declaredOwner = irPartitionClassOwner(classValue, ownersBySource)
+      let consumerClass = irPartitionClassConsumer(semantic, classValue.symbol.name)
+      var owner = consumerOwner
+      var sourceId = classValue.declarationSourceId
 
-    if declaredOwner != null && !irPartitionClassConsumer(semantic, classValue.symbol.name)
-      owner = declaredOwner
-    end
-    let existing = irPartitionFindUnit(first, owner)
-    var unit = existing
+      if sourceId == "" && classValue.location.present
+        sourceId = classValue.location.sourceId
+      end
+      if declaredOwner != null && !consumerClass
+        owner = declaredOwner
+      end
+      var bucket = irPartitionBucket(sourceId)
 
-    if unit == null
-      let created = irPartitionNewUnit(module, owner, false)
-      let tail = last
+      if owner == consumerOwner && (consumerClass || declaredOwner == null || sourceId == entrySourceId)
+        bucket = 0
+      end
+      let key = irPartitionKey(owner, bucket)
+      let existing = irPartitionFindUnit(unitsByKey, key)
+      var unit = existing
 
-      if tail == null
+      if unit == null
+        let created = irPartitionNewUnit(module, owner, key, owner == consumerOwner && bucket == 0)
+
+        last.next = created
+        last = created
+        unitsByKey.add(key, created)
+        unit = created
+      end
+      if unit == null
         return null
       end
-      tail.next = created
-      last = created
-      unit = created
-    end
-    if unit == null
-      return null
-    end
-    unit.module.addClass(irPartitionClass(classValue))
-    irPartitionAddSource(unit, module, classValue.declarationSourceId)
-    irPartitionNeedLocation(unit, module, classValue.location)
-    var field = classValue.firstField
+      unit.module.addClass(irPartitionClass(classValue))
+      irPartitionAddSource(unit, module, classValue.declarationSourceId)
+      irPartitionNeedLocation(unit, module, classValue.location)
+      var field = classValue.firstField
 
-    while field != null
-      irPartitionNeedLocation(unit, module, field.location)
-      field = field.nextField
-    end
-    var method = classValue.firstMethod
+      while field != null
+        irPartitionNeedLocation(unit, module, field.location)
+        field = field.nextField
+      end
+      var method = classValue.firstMethod
 
-    while method != null
-      irPartitionNeedLocation(unit, module, method.location)
-      method = method.nextMethod
+      while method != null
+        irPartitionNeedLocation(unit, module, method.location)
+        method = method.nextMethod
+      end
     end
     classValue = classValue.nextClass
   end
   var function = module.firstFunction
 
   while function != null
-    var owner = irPartitionOwner(function.location, sourceIds, sourceOwners)
-    let declaringClass = function.declaringClass
+    if !function.retained
+      var owner = irPartitionOwner(function.location, ownersBySource)
+      var sourceId = function.location.sourceId
+      var consumerFunction = false
+      let declaringClass = function.declaringClass
 
-    if declaringClass != null
-      let classValue = irPartitionClassByName(module, declaringClass.name)
+      if declaringClass != null
+        let classValue = irPartitionClassByName(module, declaringClass.name)
 
-      if classValue == null
+        if classValue == null
+          return null
+        end
+        if classValue.retained
+          owner = consumerOwner
+          consumerFunction = true
+        else
+          owner = irPartitionClassOwner(classValue, ownersBySource)
+          sourceId = classValue.declarationSourceId
+          if sourceId == "" && classValue.location.present
+            sourceId = classValue.location.sourceId
+          end
+          if irPartitionClassConsumer(semantic, declaringClass.name)
+            owner = consumerOwner
+            consumerFunction = true
+          end
+        end
+      end
+
+      if irPartitionFunctionConsumer(semantic, function)
+        owner = consumerOwner
+        consumerFunction = true
+      end
+      if owner == null
         return null
       end
-      owner = irPartitionClassOwner(classValue, sourceIds, sourceOwners)
-      owner = consumerOwner if irPartitionClassConsumer(semantic, declaringClass.name)
-    end
+      var bucket = irPartitionBucket(sourceId)
 
-    if irPartitionFunctionConsumer(semantic, function)
-      owner = consumerOwner
-    end
-    if owner == null
-      return null
-    end
-    let existing = irPartitionFindUnit(first, owner)
-    var unit = existing
+      if owner == consumerOwner && (consumerFunction || sourceId == entrySourceId)
+        bucket = 0
+      end
+      let key = irPartitionKey(owner, bucket)
+      let existing = irPartitionFindUnit(unitsByKey, key)
+      var unit = existing
 
-    if unit == null
-      let created = irPartitionNewUnit(module, owner, false)
-      let tail = last
+      if unit == null
+        let created = irPartitionNewUnit(module, owner, key, owner == consumerOwner && bucket == 0)
 
-      if tail == null
+        last.next = created
+        last = created
+        unitsByKey.add(key, created)
+        unit = created
+      end
+      if unit == null
         return null
       end
-      tail.next = created
-      last = created
-      unit = created
-    end
-    if unit == null
-      return null
-    end
-    let copied = irPartitionFunction(function)
+      let copied = irPartitionFunction(function)
 
-    unit.module.addFunction(copied)
-    irPartitionNeedFunctionLocations(unit, module, copied)
+      unit.module.addFunction(copied)
+      irPartitionNeedFunctionLocations(unit, module, copied)
+    end
     function = function.nextFunction
   end
   let retainedLowerer = new IrLowerer(new SemanticModel(), new SyntaxArena(), "", module.id)
-  var unit = first
+  var unit: IrCompilationUnit? = consumer
 
   while unit != null
-    irPartitionCopyDependencies(unit, module, unit.owner == consumerOwner)
+    irPartitionCopyDependencies(unit, module)
     retainedLowerer.retainDeclarations(unit.module, module)
     unit = unit.next
   end
-  return first
+  return consumer
 end

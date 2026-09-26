@@ -1,0 +1,443 @@
+use arrays
+use reference
+namespace neri_data
+
+class ReferenceSelection<P, D>
+  public dependent: D
+  public key: Cell
+  public foreignKey: Cell
+  public target: P?
+  public next: ReferenceSelection<P, D>?
+
+  internal def init(dependent: D, key: Cell, foreignKey: Cell): Void
+    this.dependent = dependent
+    this.key = key
+    this.foreignKey = foreignKey
+  end
+end
+
+class ReferencePublication<P, D>
+  public principal: P
+  public children: D[]
+  public next: ReferencePublication<P, D>?
+
+  internal def init(principal: P, children: D[]): Void
+    this.principal = principal
+    this.children = children
+  end
+end
+
+class ReferenceCollectionAudit<P, D>
+  private relation: CollectionNavigation<P, D>
+  private selected: ReferenceSelection<P, D>?
+
+  internal def init(relation: CollectionNavigation<P, D>, selected: ReferenceSelection<P, D>?): Void
+    this.relation = relation
+    this.selected = selected
+  end
+
+  internal def accepts(principal: P): Bool
+    var selected = this.selected
+
+    while selected != null
+      for member in this.relation.collection(principal)
+        if reference::same(member, selected.dependent)
+          let target = selected.target
+          let inverse = this.relation.reference(selected.dependent)
+
+          if target == null || inverse == null || !reference::same(target, principal) || !reference::same(inverse, principal)
+            return false
+          end
+        end
+      end
+      selected = selected.next
+    end
+    return true
+  end
+end
+
+def referenceForeignKeyAllowed(value: Cell): Bool
+  match value
+    case Cell.Null()
+      return true
+    case Cell.Int(number)
+      return true
+    case Cell.Text(text)
+      return true
+    case Cell.Bool(boolean)
+      return false
+    case Cell.Float(number)
+      return false
+  end
+end
+
+class ReferencedQuery<P, D>
+  private dependents: Query<D>
+  private principals: Query<P>
+  private relation: CollectionNavigation<P, D>
+
+  internal def init(dependents: Query<D>, principals: Query<P>, relation: CollectionNavigation<P, D>): Void
+    this.dependents = dependents
+    this.principals = principals
+    this.relation = relation
+  end
+
+  internal def validateQueries(): QueryFailure?
+    let dependentFailure = this.dependents.queryFailure()
+
+    if dependentFailure != null
+      return dependentFailure
+    end
+    let principalFailure = this.principals.queryFailure()
+
+    if principalFailure != null
+      return principalFailure
+    end
+    if !this.principals.isUnfilteredRoot()
+      return QueryFailure.UnsupportedCapability("reference loading requires an unfiltered principal query root")
+    end
+    let dependentProvider = this.dependents.provider()
+    let principalProvider = this.principals.provider()
+    let dependentOwner = this.dependents.changeOwner()
+    let principalOwner = this.principals.changeOwner()
+
+    if dependentProvider == null || principalProvider == null || !reference::same(dependentProvider, principalProvider)
+      return QueryFailure.Provider("reference queries require the same provider")
+    end
+    if dependentOwner == null || principalOwner == null || !reference::same(dependentOwner, principalOwner) || !dependentOwner.matchesProvider(dependentProvider)
+      return QueryFailure.Provider("reference queries require the same change context and provider")
+    end
+    if this.dependents.rowTracker() == null || this.principals.rowTracker() == null
+      return QueryFailure.UnsupportedCapability("reference loading requires tracked query roots")
+    end
+    let dependentMapping = this.dependents.entityMapping()
+    let principalMapping = this.principals.entityMapping()
+
+    if dependentMapping == null || principalMapping == null
+      return QueryFailure.UnsupportedCapability("reference loading requires mapped entities")
+    end
+    let dependentKey = dependentMapping.keyColumn()
+    let principalKey = principalMapping.keyColumn()
+
+    if dependentKey == null || principalKey == null
+      return QueryFailure.UnsupportedCapability("reference loading requires mapped primary keys")
+    end
+    let dependentType = navigationColumnType(dependentMapping, dependentKey)
+    let principalType = navigationColumnType(principalMapping, principalKey)
+    let foreignType = navigationColumnType(dependentMapping, this.relation.column())
+
+    if (dependentType != "Int" && dependentType != "String") || (principalType != "Int" && principalType != "String") || (foreignType != "Int" && foreignType != "String" && foreignType != "Int?" && foreignType != "String?") || principalType != navigationUnderlyingType(foreignType)
+      return QueryFailure.UnsupportedCapability("reference keys and foreign key require matching Int or String mappings")
+    end
+    return null
+  end
+
+  public def all(): QueryResult<D>
+    let invalid = this.validateQueries()
+
+    if invalid != null
+      return QueryResult<D>.Failure(invalid)
+    end
+    match this.dependents.all()
+      case QueryResult.Failure(error)
+        return QueryResult<D>.Failure(error)
+      case QueryResult.Rows(rows)
+        return this.load(rows)
+    end
+  end
+
+  public def load(rows: TypedRows<D>): QueryResult<D>
+    let invalid = this.validateQueries()
+
+    if invalid != null
+      return QueryResult<D>.Failure(invalid)
+    end
+    if rows.count() > 10000
+      return QueryResult<D>.Failure(QueryFailure.Provider("reference root exceeds 10000 rows"))
+    end
+    let dependentTracker = this.dependents.rowTracker()
+    let principalTracker = this.principals.rowTracker()
+    let dependentMapping = this.dependents.entityMapping()
+    let principalMapping = this.principals.entityMapping()
+
+    if dependentTracker == null || principalTracker == null || dependentMapping == null || principalMapping == null
+      return QueryResult<D>.Failure(QueryFailure.UnsupportedCapability("reference loading requires tracked mapped entities"))
+    end
+    let dependentKeyColumn = dependentMapping.keyColumn()
+    let principalKeyColumn = principalMapping.keyColumn()
+
+    if dependentKeyColumn == null || principalKeyColumn == null
+      return QueryResult<D>.Failure(QueryFailure.UnsupportedCapability("reference loading requires mapped primary keys"))
+    end
+    var first: ReferenceSelection<P, D>? = null
+    var last: ReferenceSelection<P, D>? = null
+    let requested = new TypedRows<Cell>()
+    var row = rows.first()
+
+    while row != null
+      let dependent = row.value
+      let key = this.relation.dependentKey(dependent)
+      let foreignKey = this.relation.foreignKey(dependent)
+
+      if !navigationKeyValid(key) || !dependentTracker.ownsPersistedForNavigation(dependent)
+        return QueryResult<D>.Failure(QueryFailure.Provider("reference dependent must be a live persisted tracked instance"))
+      end
+      if !referenceForeignKeyAllowed(foreignKey)
+        return QueryResult<D>.Failure(QueryFailure.Provider("reference foreign key must be Int, String, or null"))
+      end
+      let current = dependentTracker.current(dependent)
+      let baseline = dependentTracker.original(dependent)
+
+      if current == null || baseline == null || !navigationRowMatches(current, dependentKeyColumn, key) || !navigationRowMatchesOptional(current, this.relation.column(), foreignKey) || !navigationRowMatchesOptional(baseline, this.relation.column(), foreignKey)
+        return QueryResult<D>.Failure(QueryFailure.Provider("reference dependent key or foreign key differs from mapped baseline"))
+      end
+      var prior = first
+      var duplicate = false
+
+      while prior != null
+        if navigationCellEqual(prior.key, key)
+          if !reference::same(prior.dependent, dependent)
+            return QueryResult<D>.Failure(QueryFailure.Provider("reference dependent key is duplicated"))
+          end
+          duplicate = true
+        end
+        prior = prior.next
+      end
+      if !duplicate
+        let selected = new ReferenceSelection<P, D>(dependent, key, foreignKey)
+
+        if last == null
+          first = selected
+        else
+          last.next = selected
+        end
+        last = selected
+        if navigationKeyValid(foreignKey)
+          var requestedNode = requested.first()
+          var found = false
+
+          while requestedNode != null
+            if navigationCellEqual(requestedNode.value, foreignKey)
+              found = true
+              break
+            end
+            requestedNode = requestedNode.next
+          end
+          if !found
+            requested.add(foreignKey)
+          end
+        end
+      end
+      row = row.next
+    end
+    let staged = new NavigationStage<P>(requested.count())
+    var batch = requested.first()
+
+    while batch != null
+      let keys = new TypedRows<Cell>()
+      var taken = 0
+      var cursor: TypedRowNode<Cell>? = batch
+
+      while cursor != null && taken < 50
+        keys.add(cursor.value)
+        cursor = cursor.next
+        taken = taken + 1
+      end
+      batch = cursor
+      let principalQuery = this.principals.matchingCells(principalKeyColumn, keys)
+      let visit: fn(P): Bool = fn(value: P): Bool
+        return staged.accept(value)
+      end
+
+      match principalQuery.stream(visit)
+        case StreamResult.Completed(count)
+          continue
+        case StreamResult.Stopped(count)
+          return QueryResult<D>.Failure(QueryFailure.Provider("reference principal query returned too many rows"))
+        case StreamResult.Cancelled(count)
+          return QueryResult<D>.Failure(QueryFailure.Provider("reference principal load cancelled"))
+        case StreamResult.Failure(error, count)
+          return QueryResult<D>.Failure(error)
+      end
+    end
+    var stagedPrincipal = staged.rows.first()
+    var seen = new TypedRows<Cell>()
+
+    while stagedPrincipal != null
+      let key = this.relation.principalKey(stagedPrincipal.value)
+
+      if !navigationKeyValid(key)
+        return QueryResult<D>.Failure(QueryFailure.Provider("reference principal key must be Int or String"))
+      end
+      var request = requested.first()
+      var matched = false
+
+      while request != null
+        if navigationCellEqual(request.value, key)
+          matched = true
+          break
+        end
+        request = request.next
+      end
+      if !matched
+        return QueryResult<D>.Failure(QueryFailure.Provider("reference principal query returned an unrequested key"))
+      end
+      var earlier = seen.first()
+
+      while earlier != null
+        if navigationCellEqual(earlier.value, key)
+          return QueryResult<D>.Failure(QueryFailure.Provider("reference principal query returned a duplicate key"))
+        end
+        earlier = earlier.next
+      end
+      seen.add(key)
+      stagedPrincipal = stagedPrincipal.next
+    end
+    var firstTarget: NavigationBucket<P, D>? = null
+    var lastTarget: NavigationBucket<P, D>? = null
+
+    match principalTracker.resolveRows(staged.rows)
+      case QueryResult.Failure(error)
+        return QueryResult<D>.Failure(error)
+      case QueryResult.Rows(resolved)
+        var principal = resolved.first()
+        var raw = staged.rows.first()
+
+        while principal != null && raw != null
+          let key = this.relation.principalKey(principal.value)
+          let original = principalTracker.original(principal.value)
+
+          if !principalTracker.ownsPersistedForNavigation(principal.value) || !navigationCellEqual(key, this.relation.principalKey(raw.value)) || original == null || !navigationRowMatches(original, principalKeyColumn, key)
+            return QueryResult<D>.Failure(QueryFailure.Provider("tracked reference principal key differs from database row"))
+          end
+          let target = new NavigationBucket<P, D>(principal.value, key)
+
+          if lastTarget == null
+            firstTarget = target
+          else
+            lastTarget.next = target
+          end
+          lastTarget = target
+          principal = principal.next
+          raw = raw.next
+        end
+    end
+    var selected = first
+
+    while selected != null
+      let foreignKey = selected.foreignKey
+      var target = firstTarget
+
+      while target != null
+        if navigationCellEqual(target.key, foreignKey)
+          selected.target = target.principal
+          break
+        end
+        target = target.next
+      end
+      if navigationKeyValid(foreignKey) && target == null
+        return QueryResult<D>.Failure(QueryFailure.Provider("reference foreign key has no principal"))
+      end
+      let existingReference = this.relation.reference(selected.dependent)
+
+      if existingReference != null
+        if target == null || !reference::same(existingReference, target.principal)
+          return QueryResult<D>.Failure(QueryFailure.Provider("tracked reference conflicts with foreign key"))
+        end
+      end
+      if target != null
+        let collection = this.relation.collection(target.principal)
+        var present = false
+
+        for member in collection
+          if reference::same(member, selected.dependent)
+            present = true
+            break
+          end
+        end
+        if existingReference != null && !present
+          return QueryResult<D>.Failure(QueryFailure.Provider("tracked reference is absent from principal collection"))
+        end
+        if existingReference == null && present
+          return QueryResult<D>.Failure(QueryFailure.Provider("principal collection contains dependent with missing inverse"))
+        end
+        if !present
+          target.children.add(selected.dependent)
+        end
+      end
+      selected = selected.next
+    end
+    let collectionAudit = new ReferenceCollectionAudit<P, D>(this.relation, first)
+    let acceptPrincipal: fn(P): Bool = fn(value: P): Bool
+      return collectionAudit.accepts(value)
+    end
+
+    if !principalTracker.visitTracked(acceptPrincipal)
+      return QueryResult<D>.Failure(QueryFailure.Provider("selected dependent appears in an incompatible principal collection"))
+    end
+    var target = firstTarget
+    var firstPublication: ReferencePublication<P, D>? = null
+    var lastPublication: ReferencePublication<P, D>? = null
+
+    while target != null
+      let audit = new NavigationInverseAudit<P, D>(this.relation, target.principal)
+      let acceptTracked: fn(D): Bool = fn(value: D): Bool
+        return audit.accepts(value)
+      end
+
+      if !dependentTracker.visitTracked(acceptTracked)
+        return QueryResult<D>.Failure(QueryFailure.Provider("tracked reference inverse is absent from principal collection"))
+      end
+      let existing = this.relation.collection(target.principal)
+
+      for member in existing
+        let inverse = this.relation.reference(member)
+        let currentMember = dependentTracker.current(member)
+        let originalMember = dependentTracker.original(member)
+
+        if inverse == null || !reference::same(inverse, target.principal) || !dependentTracker.ownsPersistedForNavigation(member) || !navigationCellEqual(this.relation.foreignKey(member), target.key) || currentMember == null || originalMember == null || !navigationRowMatches(currentMember, dependentKeyColumn, this.relation.dependentKey(member)) || !navigationRowMatchesOptional(currentMember, this.relation.column(), target.key) || !navigationRowMatchesOptional(originalMember, this.relation.column(), target.key)
+          return QueryResult<D>.Failure(QueryFailure.Provider("principal collection contains contradictory member"))
+        end
+      end
+      var exact = existing
+      let addition = target.children.first()
+
+      if addition != null
+        let cursor = new NavigationArrayCursor<D>(addition)
+
+        exact = arrays::generate<D>(existing.Length + target.children.count()) do |index|
+          if index < existing.Length
+            return existing[index]
+          end
+          return cursor.next()
+        end
+      end
+      let publication = new ReferencePublication<P, D>(target.principal, exact)
+
+      if lastPublication == null
+        firstPublication = publication
+      else
+        lastPublication.next = publication
+      end
+      lastPublication = publication
+      target = target.next
+    end
+    var publication = firstPublication
+
+    while publication != null
+      this.relation.setCollection(publication.principal, publication.children)
+      publication = publication.next
+    end
+    selected = first
+
+    while selected != null
+      this.relation.setReference(selected.dependent, selected.target)
+      selected = selected.next
+    end
+    return QueryResult<D>.Rows(rows)
+  end
+end
+
+def includeReference<P, D>(dependents: Query<D>, principals: Query<P>, relation: CollectionNavigation<P, D>): ReferencedQuery<P, D>
+  return new ReferencedQuery<P, D>(dependents, principals, relation)
+end

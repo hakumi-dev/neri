@@ -165,24 +165,6 @@ def reportScopedConnection(options: Options?, outcome: resources::Outcome<Exchan
   end
 end
 
-def stopRequested(options: Options?, interruptToken: Int = 0): Bool
-  if interruptToken > 0
-    unsafe
-      if interruptPending(interruptToken) != 0
-        return true
-      end
-    end
-  end
-  if options != null
-    let stop = options.stop
-
-    if stop != null
-      return stop.isRequested()
-    end
-  end
-  return false
-end
-
 def report(options: Options?, message: String): Void
   if options != null
     let log = options.log
@@ -578,57 +560,8 @@ def serve(address: String, handler: fn(Request): Response, options: Options? = n
 end
 
 def serveResult(address: String, handler: fn(Request): Response, options: Options? = null): Failure?
-  var token = 0
-  var drainToken = 0
-  var forceAfter: Int? = null
+  let outcome = serveLoop(address, handler, options)
 
-  if options != null
-    forceAfter = options.forceExitAfterStopMilliseconds
-    if forceAfter != null && (forceAfter < 1 || forceAfter > 60000)
-      return new Failure("invalid_timeout", "listen.drain", "forceExitAfterStopMilliseconds must be 1..60000")
-    end
-  end
-  if options != null && options.handleInterrupts
-    unsafe
-      token = interruptOpen()
-    end
-    if token == 0
-      return new Failure("interrupt_unavailable", "listen.interrupt", "Process interrupt handling is already owned or unavailable")
-    end
-  end
-  if forceAfter != null
-    unsafe
-      drainToken = drainOpen(forceAfter, token > 0 ? 1 : 0)
-    end
-    if drainToken == 0
-      unsafe
-        interruptClose(token) if token > 0
-      end
-      return new Failure("drain_unavailable", "listen.drain", "Could not start the forced-exit deadline watcher")
-    end
-    if options != null
-      let stop = options.stop
-
-      stop.attachDrain(drainToken) if stop != null
-    end
-  end
-  let outcome = serveLoop(address, handler, options, token)
-
-  if drainToken > 0
-    if options != null
-      let stop = options.stop
-
-      stop.detachDrain(drainToken) if stop != null
-    end
-    unsafe
-      drainClose(drainToken)
-    end
-  end
-  if token > 0
-    unsafe
-      interruptClose(token)
-    end
-  end
   match outcome.completion
     case resources::Completion.Value(stopped)
       if outcome.closeFailures.count() == 0
@@ -639,64 +572,78 @@ def serveResult(address: String, handler: fn(Request): Response, options: Option
       failure.closeFailures = outcome.closeFailures
       return failure
     case resources::Completion.Failure(primary)
-      if primary != null
-        primary.closeFailures = outcome.closeFailures
-        return primary
-      end
-      let failure = new Failure("listen_failed", "listen")
+      var failure = new Failure("listen_failed", "listen")
 
+      if primary != null
+        failure = new Failure(primary.code, primary.operation, primary.detail)
+      end
       failure.closeFailures = outcome.closeFailures
       return failure
   end
 end
 
-def serveLoop(address: String, handler: fn(Request): Response, options: Options?, interruptToken: Int): resources::Outcome<Bool, Failure>
-  if host::stringByteLength(address) < 11 || find(address, "127.0.0.1:", 0) != 0
-    return new Failure("invalid_address", "listen", "Address must be 127.0.0.1:<port>")
+def serveLoop(address: String, handler: fn(Request): Response, options: Options?): resources::Outcome<Bool, result::Failure>
+  var handleInterrupts = false
+  var forceAfter: Int? = null
+  var stop: Stop? = null
+
+  if options != null
+    handleInterrupts = options.handleInterrupts
+    forceAfter = options.forceExitAfterStopMilliseconds
+    stop = options.stop
   end
-  let portText = host::stringSlice(address, 10, host::stringByteLength(address) - 10)
-  let port = host::parseInt(portText)
+  using lifetime <- Lifetime.open(handleInterrupts, forceAfter, stop)
+    if host::stringByteLength(address) < 11 || find(address, "127.0.0.1:", 0) != 0
+      return new result::Failure("invalid_address", "listen", "Address must be 127.0.0.1:<port>")
+    end
+    let portText = host::stringSlice(address, 10, host::stringByteLength(address) - 10)
+    let port = host::parseInt(portText)
 
-  if port == null || port < 1 || port > 65535
-    return new Failure("invalid_port", "listen", "Port must be an integer from 1 to 65535")
-  end
-  if stopRequested(options, interruptToken)
-    return true
-  end
-  unsafe
-    using listener <- Socket.ownListener(netOpen())
-      let descriptor = listener.nativeHandle()
-
-      if netConfigure(descriptor) < 0
-        return new Failure("socket_error", "listen.configure", socketError())
-      else if netBind(descriptor, port) < 0
-        return new Failure("socket_error", "listen.bind", socketError())
-      else if netListen(descriptor) < 0
-        return new Failure("socket_error", "listen.start", socketError())
-      end
-      if options != null
-        let onListening = options.onListening
-
-        onListening(address) if onListening != null
-      end
-      while !stopRequested(options, interruptToken)
-        let ready = netPoll(descriptor, 0, interruptToken > 0 ? 50 : -1)
-
-        if ready == -1
-          return new Failure("socket_error", "listen.wait", socketError())
-        end
-        if ready > 0 && !stopRequested(options, interruptToken)
-          let fd = netAccept(descriptor)
-
-          if fd == -1
-            return new Failure("socket_error", "listen.accept", socketError())
-          end
-          if fd >= 0
-            reportScopedConnection(options, scopedConnection(fd, handler))
-          end
-        end
-      end
+    if port == null || port < 1 || port > 65535
+      return new result::Failure("invalid_port", "listen", "Port must be an integer from 1 to 65535")
+    end
+    if lifetime.isStopping()
       return true
+    end
+    unsafe
+      using listener <- Socket.ownListener(netOpen())
+        let descriptor = listener.nativeHandle()
+
+        if netConfigure(descriptor) < 0
+          return new result::Failure("socket_error", "listen.configure", socketError())
+        else if netBind(descriptor, port) < 0
+          return new result::Failure("socket_error", "listen.bind", socketError())
+        else if netListen(descriptor) < 0
+          return new result::Failure("socket_error", "listen.start", socketError())
+        end
+        if options != null
+          let onListening = options.onListening
+
+          onListening(address) if onListening != null
+        end
+        while !lifetime.isStopping()
+          let ready = netPoll(descriptor, 0, lifetime.pollMilliseconds())
+
+          if ready == -1
+            return new result::Failure("socket_error", "listen.wait", socketError())
+          end
+          if ready > 0 && !lifetime.isStopping()
+            let fd = netAccept(descriptor)
+
+            if fd == -1
+              return new result::Failure("socket_error", "listen.accept", socketError())
+            end
+            if fd >= 0 && lifetime.isStopping()
+              if netCloseResult(fd) < 0
+                return new result::Failure("close_failed", "connection.close", socketError())
+              end
+            else if fd >= 0
+              reportScopedConnection(options, scopedConnection(fd, handler))
+            end
+          end
+        end
+        return true
+      end
     end
   end
   return true
@@ -738,6 +685,9 @@ unsafe def netAccept(fd: Int): Int
 end
 @cabiImport("neri_rt_v1_net_poll")
 unsafe def netPoll(fd: Int, writing: Int, milliseconds: Int): Int
+end
+@cabiImport("neri_rt_v1_net_poll_many")
+unsafe def netPollMany(descriptors: Int*, interests: Int*, events: Int*, count: Int, milliseconds: Int): Int
 end
 @cabiImport("neri_rt_v1_net_read")
 unsafe def netRead(fd: Int, bytes: Byte*, length: Int): Int

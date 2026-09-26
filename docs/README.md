@@ -21,6 +21,7 @@ example and verification references. Repository paths refer to this checkout.
 | Stale `expectedRevision`, UTF-16 edits, snapshot digests | [Revisions and snapshots](AGENT-FEEDBACK.md#revisions-and-snapshots) |
 | Source to IR to native code; component ownership | [Architecture](ARCHITECTURE.md) |
 | Runtime layouts, roots, ABI versions and features | [Runtime and IR ABI](ABI.md) |
+| Native worker isolation, bounded mailboxes and shutdown | [Isolated workers](WORKERS.md) |
 | Stage0, fixed point, `refresh-seed`, seed provenance | [Bootstrapping](BOOTSTRAP.md) |
 
 ## Use Neri
@@ -31,7 +32,9 @@ example and verification references. Repository paths refer to this checkout.
 | Look up syntax, types and commands | [Language](LANGUAGE.md), [projects](PROJECTS.md) |
 | Format and debug code | [CodeStyle](CODESTYLE.md), [debugging](DEBUGGING.md) |
 | Work with text and collections | [Text](TEXT.md), [buffers](BUFFERS.md), [results](RESULT.md) |
+| Parse and encode bounded JSON | [JSON](JSON.md) |
 | Inspect typed expressions | [Quotations](QUOTATIONS.md) |
+| Generate typed database access and use SQLite | [Neri Data](DATA.md) |
 | Accept typed field arguments | [Fields](FIELDS.md) |
 | Call C libraries and export Neri functions | [C interoperability](C-INTEROP.md) |
 | Connect an agent to compiler feedback | [Agent feedback](AGENT-FEEDBACK.md) |

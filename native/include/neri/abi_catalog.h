@@ -6,7 +6,7 @@
 #include <string.h>
 
 #define NERI_RUNTIME_ABI_MAJOR UINT16_C(1)
-#define NERI_RUNTIME_ABI_MINOR UINT16_C(28)
+#define NERI_RUNTIME_ABI_MINOR UINT16_C(33)
 
 enum neri_ir_effect_v1 {
   NERI_IR_EFFECT_READ_V1 = UINT32_C(1),
@@ -48,7 +48,10 @@ enum neri_ir_effect_v1 {
 #define NERI_RT_FEATURE_PROCESS_IO (UINT64_C(1) << 26)
 #define NERI_RT_FEATURE_FILESYSTEM_MUTATION (UINT64_C(1) << 27)
 #define NERI_RT_FEATURE_SOCKET_ENDPOINTS (UINT64_C(1) << 28)
-#define NERI_RT_ADVERTISED_FEATURES UINT64_C(536869631)
+#define NERI_RT_FEATURE_SEQUENTIAL_ARRAYS (UINT64_C(1) << 29)
+#define NERI_RT_FEATURE_ISOLATED_WORKERS (UINT64_C(1) << 30)
+#define NERI_RT_FEATURE_MULTIPLEXED_IO (UINT64_C(1) << 31)
+#define NERI_RT_ADVERTISED_FEATURES UINT64_C(4294966015)
 
 static inline uint16_t neri_abi_symbol_minimum_minor(const char *link_name) {
   uint16_t result = UINT16_C(0);
@@ -65,6 +68,8 @@ static inline uint16_t neri_abi_symbol_minimum_minor(const char *link_name) {
   if (strncmp(link_name, "neri_rt_v1_file_mutation_", sizeof("neri_rt_v1_file_mutation_") - 1U) == 0 && result < UINT16_C(22)) result = UINT16_C(22);
   if (strcmp(link_name, "neri_rt_v1_net_connect_timeout") == 0 && result < UINT16_C(22)) result = UINT16_C(22);
   if (strcmp(link_name, "neri_rt_v1_net_local_port") == 0 && result < UINT16_C(22)) result = UINT16_C(22);
+  if (strcmp(link_name, "neri_rt_v1_net_poll_many") == 0 && result < UINT16_C(33)) result = UINT16_C(33);
+  if (strcmp(link_name, "neri_rt_v1_worker_pool_readiness") == 0 && result < UINT16_C(33)) result = UINT16_C(33);
   if (strncmp(link_name, "neri_rt_v1_file_directory_", sizeof("neri_rt_v1_file_directory_") - 1U) == 0 && result < UINT16_C(17)) result = UINT16_C(17);
   if (strcmp(link_name, "neri_rt_v1_net_close_result") == 0 && result < UINT16_C(18)) result = UINT16_C(18);
   if (strncmp(link_name, "neri_rt_v1_drain_", sizeof("neri_rt_v1_drain_") - 1U) == 0 && result < UINT16_C(20)) result = UINT16_C(20);
@@ -78,6 +83,7 @@ static inline uint16_t neri_abi_symbol_minimum_minor(const char *link_name) {
   if (strncmp(link_name, "neri_rt_v1_terminal_", sizeof("neri_rt_v1_terminal_") - 1U) == 0 && result < UINT16_C(8)) result = UINT16_C(8);
   if (strncmp(link_name, "neri_rt_v1_clock_", sizeof("neri_rt_v1_clock_") - 1U) == 0 && result < UINT16_C(8)) result = UINT16_C(8);
   if (strncmp(link_name, "neri_rt_v1_net_", sizeof("neri_rt_v1_net_") - 1U) == 0 && result < UINT16_C(7)) result = UINT16_C(7);
+  if (strncmp(link_name, "neri_rt_v1_worker_", sizeof("neri_rt_v1_worker_") - 1U) == 0 && result < UINT16_C(32)) result = UINT16_C(32);
   return result;
 }
 
@@ -95,6 +101,8 @@ static inline uint64_t neri_abi_symbol_features(const char *link_name) {
   if (strncmp(link_name, "neri_rt_v1_file_mutation_", sizeof("neri_rt_v1_file_mutation_") - 1U) == 0) result |= NERI_RT_FEATURE_FILESYSTEM_MUTATION;
   if (strcmp(link_name, "neri_rt_v1_net_connect_timeout") == 0) result |= NERI_RT_FEATURE_SOCKET_ENDPOINTS;
   if (strcmp(link_name, "neri_rt_v1_net_local_port") == 0) result |= NERI_RT_FEATURE_SOCKET_ENDPOINTS;
+  if (strcmp(link_name, "neri_rt_v1_net_poll_many") == 0) result |= NERI_RT_FEATURE_MULTIPLEXED_IO;
+  if (strcmp(link_name, "neri_rt_v1_worker_pool_readiness") == 0) result |= NERI_RT_FEATURE_MULTIPLEXED_IO;
   if (strncmp(link_name, "neri_rt_v1_file_directory_", sizeof("neri_rt_v1_file_directory_") - 1U) == 0) result |= NERI_RT_FEATURE_DIRECTORY;
   if (strcmp(link_name, "neri_rt_v1_net_close_result") == 0) result |= NERI_RT_FEATURE_SOCKET_CLOSE_RESULT;
   if (strncmp(link_name, "neri_rt_v1_drain_", sizeof("neri_rt_v1_drain_") - 1U) == 0) result |= NERI_RT_FEATURE_DRAIN;
@@ -105,6 +113,7 @@ static inline uint64_t neri_abi_symbol_features(const char *link_name) {
   if (strncmp(link_name, "neri_rt_v1_terminal_", sizeof("neri_rt_v1_terminal_") - 1U) == 0) result |= NERI_RT_FEATURE_INTERACTIVE_IO;
   if (strncmp(link_name, "neri_rt_v1_clock_", sizeof("neri_rt_v1_clock_") - 1U) == 0) result |= NERI_RT_FEATURE_INTERACTIVE_IO;
   if (strncmp(link_name, "neri_rt_v1_net_", sizeof("neri_rt_v1_net_") - 1U) == 0) result |= NERI_RT_FEATURE_SOCKETS;
+  if (strncmp(link_name, "neri_rt_v1_worker_", sizeof("neri_rt_v1_worker_") - 1U) == 0) result |= NERI_RT_FEATURE_ISOLATED_WORKERS;
   return result;
 }
 

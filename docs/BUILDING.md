@@ -1,7 +1,7 @@
 # Building Neri
 
-Use this guide to build the compiler from a source checkout. To write programs
-with an installed toolchain, start with the [installation instructions](../README.md#install).
+Source-build requirements and command contracts. Installed-toolchain usage is
+documented in [installation](../README.md#install). Commands use the repository root.
 
 ## Supported platforms
 
@@ -13,7 +13,7 @@ with an installed toolchain, start with the [installation instructions](../READM
 
 Windows support targets native execution. WSL and MinGW are outside the supported
 setup. POSIX worker and PTY helpers require platform-specific replacements;
-Windows-specific coverage remains in progress.
+Windows coverage uses its own native and language contract suite.
 
 CI runs macOS and Linux jobs and Windows Debug and Release jobs. The required
 `Required / supported platforms` check combines all three platform results;
@@ -37,13 +37,6 @@ It covers the PowerShell 7 entry point, Visual Studio C++ and Windows SDK
 requirements, the pinned LLVM download, and the
 Windows CMake presets.
 
-Clone the source from GitHub, then run the following commands from its root:
-
-```sh
-git clone https://github.com/hakumi-dev/neri.git
-cd neri
-```
-
 For Linux dependencies and full source installation, follow
 [Linux setup from GitHub](LINUX.md).
 
@@ -63,25 +56,16 @@ The native backend materializes the checked-in IR seed as a host compiler.
 That compiler builds the Neri build driver through the root manifest. Every
 compiler generation uses the current compiler unit and standard library.
 
-```sh
-scripts/build.sh doctor
-scripts/build.sh test
-```
+| Command | Contract |
+| --- | --- |
+| `scripts/build.sh doctor` | Check native build prerequisites. |
+| `scripts/build.sh test` | Build and validate the checkout; select the verified toolchain at `build/current`. |
+| `scripts/build.sh debugger-test` | Opt-in LLDB contract on macOS; see [debugging](DEBUGGING.md). |
+| `scripts/neri.sh <arguments>` | Use the selected checkout toolchain without changing the installed compiler. |
 
 `scripts/build.sh test` builds and validates the current checkout, then selects
 its verified toolchain at `build/current`. See [bootstrapping](BOOTSTRAP.md) for
 generation checks and [testing](../tests/README.md) for suite composition.
-
-The opt-in `scripts/build.sh debugger-test` command verifies real LLDB debugging
-on macOS; see [debugging](DEBUGGING.md) for setup and the supported contract.
-
-Use that toolchain without changing your installed `neri` command:
-
-```sh
-scripts/neri.sh examples/hello.hk
-scripts/neri.sh build examples/functions.hk --release
-./functions
-```
 
 ## Build native components
 
@@ -131,3 +115,25 @@ scripts/build.sh install
 
 See [packaging and installation](PACKAGING.md) for verified archives, installer
 options, integrity checks and PATH setup.
+
+## Compiler progress for packaged frontends
+
+The compiler SDK's `compiler-core` unit exposes `bootstrapCompile(arguments,
+ batch, progress, nativeProgress)`. The last three parameters are optional;
+command-line compilation uses the same implementation with no callbacks.
+The call retains the CLI's exit-status behavior, including executing the program
+for `run`, and is intended for dedicated compiler frontend processes.
+
+`progress` accepts `(phase: String, projectSources: Int, librarySources: Int)`.
+Its phases describe project loading, analysis, compilation, cache lookup/reuse,
+lowering, native generation, linking, and the boundary before application output
+(`load`). Counts are provided for `analyze` and `compile`. `nativeProgress`
+accepts `(phase: String, completed: Int, total: Int, detail: String)` and reports
+native function lowering, verification, optimization, emission, and `end`.
+Lowering detail includes the source filename when available. Counts describe the
+current native module; partitioned compilation can report several modules.
+
+Frontends own terminal rendering and should clear transient output at `load`,
+`link`, and native `end`. Omitting callbacks leaves compilation and caching
+unchanged. Progress events describe actual work and do not imply that console JIT
+modules and ahead-of-time executables share an artifact cache.

@@ -7,6 +7,7 @@ namespace neri_data
 enum Parameter
   case Bool(value: Bool)
   case Int(value: Int)
+  case Float(value: Float)
   case Text(value: String)
 end
 
@@ -15,11 +16,26 @@ enum Cell
   case Null()
   case Bool(value: Bool)
   case Int(value: Int)
+  case Float(value: Float)
   case Text(value: String)
+end
+
+## Accepts only finite Float values for data reads, predicates, and writes.
+def dataFloatFinite(value: Float): Bool
+  let difference = value - value
+
+  return difference >= 0.0 && difference <= 0.0
 end
 
 enum ProviderCapability
   case BoundedTypedReads()
+  case CheckedScalarExpressions()
+  case WindowFunctions()
+  case StreamingReads()
+  case SetWrites()
+  case TrackedWrites()
+  case ExplicitTransactions()
+  case Savepoints()
 end
 
 enum SqlDialect
@@ -36,6 +52,7 @@ enum QueryFailure
   case Provider(message: String)
   case MissingColumn(name: String)
   case TypeMismatch(column: String, expected: String, actual: String)
+  case Cardinality(expected: String, actual: Int)
 end
 
 enum CellLookup
@@ -58,8 +75,16 @@ enum ProviderResult
   case Failure(message: String)
 end
 
+@propagation("Rows", "Failure")
 enum QueryResult<T>
   case Rows(value: TypedRows<T>)
+  case Failure(error: QueryFailure)
+end
+
+## A typed value produced by a scalar query terminal.
+@propagation("Value", "Failure")
+enum QueryValue<T>
+  case Value(value: T)
   case Failure(error: QueryFailure)
 end
 
@@ -80,10 +105,32 @@ class RawRow
     this.columns = columns
   end
 
-  public def value(name: String): CellLookup
+  internal readonly def count(): Int
+    return this.columns.Length
+  end
+
+  internal readonly def at(index: Int): readonly RawColumn?
+    if index < 0 || index >= this.columns.Length
+      return null
+    end
+    return this.columns[index]
+  end
+
+  public readonly def value(name: String): CellLookup
     for column in this.columns
       if column.name == name
-        return CellLookup.Found(column.value)
+        match column.value
+          case Cell.Null()
+            return CellLookup.Found(Cell.Null())
+          case Cell.Bool(value)
+            return CellLookup.Found(Cell.Bool(value))
+          case Cell.Int(value)
+            return CellLookup.Found(Cell.Int(value))
+          case Cell.Float(value)
+            return CellLookup.Found(Cell.Float(value))
+          case Cell.Text(value)
+            return CellLookup.Found(Cell.Text(value))
+        end
       end
     end
     return CellLookup.Missing()
@@ -118,6 +165,55 @@ abstract class Provider
   ## Executes a read-only plan by binding every parameter and stopping at its limit.
   ## Every required result column is checked during typed decoding.
   public abstract def execute(plan: readonly SqlPlan): ProviderResult
+
+  public def stream(plan: readonly StreamPlan, visit: fn(RawRow): Bool): StreamResult
+    return StreamResult.Failure(QueryFailure.UnsupportedCapability("streaming-reads"), 0)
+  end
+
+  ## Read-only providers retain a typed unsupported write result.
+  public def writeBatch(batch: readonly WriteBatch): WriteResult
+    return WriteResult.Failure(WriteFailure.Unsupported("provider does not support transactional writes"))
+  end
+
+  public def beginTransaction(): TransactionOpenResult
+    return TransactionOpenResult.Failure(WriteFailure.Unsupported("provider does not support explicit transactions"))
+  end
+
+  public def commitTransaction(lease: Int): WriteResult
+    return WriteResult.Failure(WriteFailure.Unsupported("provider does not support explicit transactions"))
+  end
+
+  public def rollbackTransaction(lease: Int): WriteResult
+    return WriteResult.Failure(WriteFailure.Unsupported("provider does not support explicit transactions"))
+  end
+
+  public def transactionState(lease: Int): TransactionState
+    return TransactionState.Invalid()
+  end
+
+  public def createSavepoint(lease: Int): SavepointOpenResult
+    return SavepointOpenResult.Failure(WriteFailure.Unsupported("provider does not support savepoints"))
+  end
+
+  public def rollbackToSavepoint(lease: Int, id: Int): WriteResult
+    return WriteResult.Failure(WriteFailure.Unsupported("provider does not support savepoints"))
+  end
+
+  public def releaseSavepoint(lease: Int, id: Int): WriteResult
+    return WriteResult.Failure(WriteFailure.Unsupported("provider does not support savepoints"))
+  end
+
+  public def writeBatchInTransaction(batch: readonly WriteBatch, lease: Int): WriteResult
+    return WriteResult.Failure(WriteFailure.Unsupported("provider does not support explicit transactions"))
+  end
+
+  public def executeSet(plan: readonly SetWritePlan): WriteResult
+    return WriteResult.Failure(WriteFailure.Unsupported("provider does not support set writes"))
+  end
+
+  public def executeSetInTransaction(plan: readonly SetWritePlan, lease: Int): WriteResult
+    return WriteResult.Failure(WriteFailure.Unsupported("provider does not support transactional set writes"))
+  end
 end
 
 class ParameterNode
@@ -163,6 +259,7 @@ end
 enum ResultColumnKind
   case Bool()
   case Int()
+  case Float()
   case Text()
 end
 
@@ -244,12 +341,14 @@ class SqlPlan
   private boundParameters: ParameterValues
   private rowLimit: Int
   private resultColumns: readonly ResultColumns
+  private checkedScalars: Bool
 
-  internal def init(sql: String, parameters: ParameterValues, limit: Int, columns: readonly ResultColumns): Void
+  internal def init(sql: String, parameters: ParameterValues, limit: Int, columns: readonly ResultColumns, requiresCheckedScalars: Bool = false): Void
     this.text = sql
     this.boundParameters = parameters
     this.rowLimit = limit
     this.resultColumns = columns
+    this.checkedScalars = requiresCheckedScalars
   end
 
   public readonly def sql(): String
@@ -260,12 +359,20 @@ class SqlPlan
     return this.boundParameters
   end
 
+  internal def parameterValues(): ParameterValues
+    return this.boundParameters
+  end
+
   public readonly def limit(): Int
     return this.rowLimit
   end
 
   public readonly def columns(): readonly ResultColumns
     return this.resultColumns
+  end
+
+  public readonly def requiresCheckedScalars(): Bool
+    return this.checkedScalars
   end
 end
 
@@ -284,6 +391,10 @@ class TypedPlan<T>
 
   internal def decode(row: RawRow): DecodeResult<T>
     return this.decoder.decode(row)
+  end
+
+  internal def parameterValues(): ParameterValues
+    return this.plan.parameterValues()
   end
 end
 
@@ -310,6 +421,28 @@ class TypedRows<T>
     return this.head
   end
 
+  ## Opts into bounded console inspection of already materialized rows.
+  public readonly def inspectItems(limit: Int): (readonly T)[]
+    let first = this.head
+
+    if first == null || limit <= 0
+      return []
+    end
+    var count = limit < this.size ? limit : this.size
+
+    count = 64 if count > 64
+    return tasks::generate(count, 1) do |index|
+      var current: (readonly TypedRowNode<T>)? = first
+      var position = 0
+
+      while current != null && position < index
+        current = current.next
+        position = position + 1
+      end
+      return current != null ? current.value : first.value
+    end
+  end
+
   internal def add(value: T): Void
     let node = new TypedRowNode<T>(value)
     let existing = this.tail
@@ -325,6 +458,7 @@ class TypedRows<T>
 end
 
 enum ExpressionKind
+  case Scalar()
   case Equal()
   case Greater()
   case GreaterOrEqual()
@@ -342,16 +476,70 @@ class Expression
   internal table: String
   internal column: String
   internal parameter: Parameter?
+  internal rightTable: String?
+  internal rightColumn: String?
   internal left: Expression?
   internal right: Expression?
+  internal scalarTree: readonly quotation::Tree?
+  internal scalarMapping: EntityMapping?
+  internal hasScalar: Bool
 
-  internal def init(kind: ExpressionKind, table: String = "", column: String = "", parameter: Parameter? = null, left: Expression? = null, right: Expression? = null): Void
+  internal def init(kind: ExpressionKind, table: String = "", column: String = "", parameter: Parameter? = null, left: Expression? = null, right: Expression? = null, rightTable: String? = null, rightColumn: String? = null, scalarTree: readonly quotation::Tree? = null, scalarMapping: EntityMapping? = null): Void
     this.kind = kind
     this.table = table
     this.column = column
     this.parameter = parameter
+    this.rightTable = rightTable
+    this.rightColumn = rightColumn
     this.left = left
     this.right = right
+    this.scalarTree = scalarTree
+    this.scalarMapping = scalarMapping
+    this.hasScalar = scalarTree != null || (left != null && left.hasScalar) || (right != null && right.hasScalar)
+  end
+end
+
+## An internally constructed SQL selection emitted only by typed query operations.
+class SqlSelection
+  private text: String
+  private boundParameters: ParameterValues?
+  private checkedScalars: Bool
+
+  internal def init(sql: String, parameters: ParameterValues? = null, requiresCheckedScalars: Bool = false): Void
+    this.text = sql
+    this.boundParameters = parameters
+    this.checkedScalars = requiresCheckedScalars
+  end
+
+  internal readonly def sql(): String
+    return this.text
+  end
+
+  internal readonly def parameters(): readonly ParameterValues?
+    return this.boundParameters
+  end
+
+  internal readonly def requiresCheckedScalars(): Bool
+    return this.checkedScalars
+  end
+end
+
+## An internally constructed relation; callers cannot supply SQL fragments.
+class SqlSource
+  private text: String
+  private checkedScalars: Bool
+
+  internal def init(sql: String, requiresCheckedScalars: Bool = false): Void
+    this.text = sql
+    this.checkedScalars = requiresCheckedScalars
+  end
+
+  internal readonly def sql(): String
+    return this.text
+  end
+
+  internal readonly def requiresCheckedScalars(): Bool
+    return this.checkedScalars
   end
 end
 
@@ -387,6 +575,7 @@ class CompileState
   public head: ParameterNode?
   public tail: ParameterNode?
   public count: Int = 0
+  public requiresCheckedScalars: Bool = false
 
   public def bind(value: Parameter): Void
     let node = new ParameterNode(value)
@@ -443,6 +632,20 @@ end
 
 def compileExpression(expression: Expression, state: CompileState, source: String, dialect: SqlDialect): ExpressionCompileResult
   match expression.kind
+    case ExpressionKind.Scalar()
+      let tree = expression.scalarTree
+      let mapping = expression.scalarMapping
+
+      if tree == null || mapping == null || mapping.table() != source
+        return ExpressionCompileResult.Failure(QueryFailure.UnsupportedCapability("computed predicate source or quotation is invalid"))
+      end
+      match compileScalarQuotation(mapping, tree, "Bool", state, dialect)
+        case ScalarSqlResult.Failure(error)
+          return ExpressionCompileResult.Failure(error)
+        case ScalarSqlResult.Value(value)
+          state.requiresCheckedScalars = state.requiresCheckedScalars || value.checkedScalars
+          return ExpressionCompileResult.Sql(value.sql)
+      end
     case ExpressionKind.And()
       return compilePair(expression, state, source, dialect, " AND ")
     case ExpressionKind.Or()
@@ -491,6 +694,14 @@ def compilePair(expression: Expression, state: CompileState, source: String, dia
         case ExpressionCompileResult.Failure(error)
           return ExpressionCompileResult.Failure(error)
         case ExpressionCompileResult.Sql(rightSql)
+          if expression.hasScalar
+            let rightBool = "(CASE WHEN " + rightSql + " THEN TRUE ELSE FALSE END)"
+
+            if operator == " AND "
+              return ExpressionCompileResult.Sql("(CASE WHEN " + leftSql + " THEN " + rightBool + " ELSE FALSE END)")
+            end
+            return ExpressionCompileResult.Sql("(CASE WHEN " + leftSql + " THEN TRUE ELSE " + rightBool + " END)")
+          end
           return ExpressionCompileResult.Sql("(" + leftSql + operator + rightSql + ")")
       end
   end
@@ -506,18 +717,64 @@ def compileLeaf(expression: Expression, state: CompileState, source: String, dia
   if expression.table != source
     return ExpressionCompileResult.Failure(QueryFailure.SourceMismatch(source, expression.table))
   end
+  let rightTable = expression.rightTable
+  let rightColumn = expression.rightColumn
   var suffix = operator
 
-  if binds
+  if rightTable != null || rightColumn != null
+    if !binds || rightTable == null || rightColumn == null || expression.parameter != null
+      return ExpressionCompileResult.Failure(QueryFailure.Provider("invalid predicate column comparison"))
+    end
+    if !identifierValid(rightTable)
+      return ExpressionCompileResult.Failure(QueryFailure.InvalidIdentifier(rightTable))
+    end
+    if !identifierValid(rightColumn)
+      return ExpressionCompileResult.Failure(QueryFailure.InvalidIdentifier(rightColumn))
+    end
+    if rightTable != source
+      return ExpressionCompileResult.Failure(QueryFailure.SourceMismatch(source, rightTable))
+    end
+    suffix = suffix + quoted(rightTable, rightColumn)
+  else if binds
     let parameter = expression.parameter
 
     if parameter == null
       return ExpressionCompileResult.Failure(QueryFailure.Provider("missing predicate parameter"))
     end
+    match parameter
+      case Parameter.Float(value)
+        if !dataFloatFinite(value)
+          return ExpressionCompileResult.Failure(QueryFailure.UnsupportedCapability("Float parameter must be finite"))
+        end
+      case Parameter.Bool(value)
+      case Parameter.Int(value)
+      case Parameter.Text(value)
+    end
     state.bind(parameter)
     suffix = suffix + dialectPlaceholder(dialect, state.count)
   end
   return ExpressionCompileResult.Sql(quoted(expression.table, expression.column) + suffix)
+end
+
+class OrderTerm
+  internal column: String
+  internal descending: Bool
+  internal next: OrderTerm?
+  internal tree: readonly quotation::Tree?
+
+  internal def init(column: String, descending: Bool, next: OrderTerm? = null, tree: readonly quotation::Tree? = null): Void
+    this.column = column
+    this.descending = descending
+    this.next = next
+    this.tree = tree
+  end
+end
+
+def appendOrder(terms: OrderTerm?, column: String, descending: Bool, tree: readonly quotation::Tree? = null): OrderTerm
+  if terms == null
+    return new OrderTerm(column, descending, tree: tree)
+  end
+  return new OrderTerm(terms.column, terms.descending, appendOrder(terms.next, column, descending, tree), terms.tree)
 end
 
 class Query<T>
@@ -530,8 +787,16 @@ class Query<T>
   private limit: Int?
   private mapping: EntityMapping?
   private failure: QueryFailure?
+  private boundProvider: Provider?
+  private tracker: EntityTracker<T>?
+  private previous: Query<T>?
+  private offset: Int
+  private unique: Bool
+  private thenTerms: OrderTerm?
+  private changes: ChangeContext?
+  private primaryOrderTree: readonly quotation::Tree?
 
-  public def init(source: String, decoder: Decoder<T>, predicate: Predicate<T>? = null, orderTable: String? = null, orderColumn: String? = null, descending: Bool = false, limit: Int? = null, mapping: EntityMapping? = null, failure: QueryFailure? = null): Void
+  public def init(source: String, decoder: Decoder<T>, predicate: Predicate<T>? = null, orderTable: String? = null, orderColumn: String? = null, descending: Bool = false, limit: Int? = null, mapping: EntityMapping? = null, failure: QueryFailure? = null, provider: Provider? = null, tracker: EntityTracker<T>? = null, previous: Query<T>? = null, offset: Int = 0, unique: Bool = false, thenTerms: OrderTerm? = null, changes: ChangeContext? = null, primaryOrderTree: readonly quotation::Tree? = null): Void
     this.source = source
     this.decoder = decoder
     this.predicate = predicate
@@ -541,6 +806,33 @@ class Query<T>
     this.limit = limit
     this.mapping = mapping
     this.failure = failure
+    this.boundProvider = provider
+    this.tracker = tracker
+    this.previous = previous
+    this.offset = offset
+    this.unique = unique
+    this.thenTerms = thenTerms
+    this.changes = changes
+    this.primaryOrderTree = primaryOrderTree
+  end
+
+  ## Exposes the staged query as a deferred source for further joins.
+  public def asRelation(): Relation<T>
+    let build: fn(SqlDialect): RelationBuildResult<T> = fn(dialect: SqlDialect): RelationBuildResult<T>
+      let mapping = this.entityMapping()
+
+      if mapping == null
+        return RelationBuildResult<T>.Failure(QueryFailure.UnsupportedCapability("relation requires mapped entities"))
+      end
+      match compilePipeline<T, T>(this, this.rowDecoder(), mappedSelection(mapping), this.rowLimit(), dialect, inner: true)
+        case CompileResult.Failure(error)
+          return RelationBuildResult<T>.Failure(error)
+        case CompileResult.Plan(plan)
+          return compileQueryRelationPlan<T>(this, plan, mapping, dialect)
+      end
+    end
+
+    return new Relation<T>(build, this.provider(), bound: streamMaximum<T>(this))
   end
 
   ## Adds equality filters checked against the entity's declared public fields.
@@ -560,7 +852,15 @@ class Query<T>
     if mapping == null
       return this.failed(QueryFailure.UnsupportedCapability("query requires entity mapping metadata"))
     end
-    return this.translated(translateQuotation(mapping, predicate.tree()))
+    match translateQuotation(mapping, predicate.tree())
+      case TranslationResult.Expression(expression)
+        if expression == null
+          return this
+        end
+        return this.filtered(new Predicate<T>(expression))
+      case TranslationResult.Failure(error)
+        return this.filtered(new Predicate<T>(new Expression(ExpressionKind.Scalar(), scalarTree: predicate.tree(), scalarMapping: mapping)))
+    end
   end
 
   private def translated(result: TranslationResult): Query<T>
@@ -581,21 +881,132 @@ class Query<T>
     if existing != null
       return this
     end
-    return new Query<T>(this.source, this.decoder, this.predicate, this.orderTable, this.orderColumn, this.descending, this.limit, this.mapping, error)
+    return new Query<T>(this.source, this.decoder, this.predicate, this.orderTable, this.orderColumn, this.descending, this.limit, this.mapping, error, this.boundProvider, this.tracker, this.previous, this.offset, this.unique, this.thenTerms, changes: this.changes, primaryOrderTree: this.primaryOrderTree)
   end
 
   private def filtered(predicate: Predicate<T>): Query<T>
+    if this.limit != null || this.offset > 0 || this.unique
+      return this.freeze().filtered(predicate)
+    end
     let existing = this.predicate
 
     if existing != null
-      return new Query<T>(this.source, this.decoder, existing.and(predicate), this.orderTable, this.orderColumn, this.descending, this.limit, this.mapping, this.failure)
+      return new Query<T>(this.source, this.decoder, existing.and(predicate), this.orderTable, this.orderColumn, this.descending, this.limit, this.mapping, this.failure, this.boundProvider, this.tracker, this.previous, this.offset, this.unique, this.thenTerms, changes: this.changes, primaryOrderTree: this.primaryOrderTree)
     end
-    return new Query<T>(this.source, this.decoder, predicate, this.orderTable, this.orderColumn, this.descending, this.limit, this.mapping, this.failure)
+    return new Query<T>(this.source, this.decoder, predicate, this.orderTable, this.orderColumn, this.descending, this.limit, this.mapping, this.failure, this.boundProvider, this.tracker, this.previous, this.offset, this.unique, this.thenTerms, changes: this.changes, primaryOrderTree: this.primaryOrderTree)
+  end
+
+  internal def matchingCells(column: String, values: TypedRows<Cell>): Query<T>
+    let mapping = this.mapping
+
+    if mapping == null || values.count() == 0
+      return this.failed(QueryFailure.UnsupportedCapability("navigation loading requires mapped nonempty keys"))
+    end
+    var found = false
+    var columnType = ""
+    var index = 0
+
+    while index < mapping.count()
+      let field = mapping.columnAt(index)
+
+      if field != null && field.column() == column
+        found = true
+        columnType = field.typeName()
+      end
+      index = index + 1
+    end
+    if !found
+      return this.failed(QueryFailure.MissingColumn(column))
+    end
+    if columnType != "Int" && columnType != "String" && columnType != "Int?" && columnType != "String?"
+      return this.failed(QueryFailure.UnsupportedCapability("navigation key column must be Int or String, required or optional"))
+    end
+    var combined: Expression? = null
+
+    var item = values.first()
+
+    while item != null
+      let value = item.value
+      var parameter: Parameter? = null
+
+      match value
+        case Cell.Int(number)
+          if columnType != "Int" && columnType != "Int?"
+            return this.failed(QueryFailure.TypeMismatch(column, columnType, "Int"))
+          end
+          parameter = Parameter.Int(number)
+        case Cell.Text(text)
+          if columnType != "String" && columnType != "String?"
+            return this.failed(QueryFailure.TypeMismatch(column, columnType, "String"))
+          end
+          parameter = Parameter.Text(text)
+        case Cell.Bool(boolean)
+          return this.failed(QueryFailure.UnsupportedCapability("navigation keys must be Int or String"))
+        case Cell.Float(number)
+          return this.failed(QueryFailure.UnsupportedCapability("navigation keys must be Int or String"))
+        case Cell.Null()
+          return this.failed(QueryFailure.UnsupportedCapability("navigation keys cannot be null"))
+      end
+      let term = new Expression(ExpressionKind.Equal(), table: this.source, column: column, parameter: parameter)
+
+      if combined == null
+        combined = term
+      else
+        combined = new Expression(ExpressionKind.Or(), left: combined, right: term)
+      end
+      item = item.next
+    end
+    if combined == null
+      return this.failed(QueryFailure.Provider("navigation key predicate is empty"))
+    end
+    return this.filtered(new Predicate<T>(combined))
+  end
+
+  private def freeze(): Query<T>
+    return new Query<T>(this.source, this.decoder, orderTable: this.orderTable, orderColumn: this.orderColumn, descending: this.descending, mapping: this.mapping, failure: this.failure, provider: this.boundProvider, tracker: this.tracker, previous: this, thenTerms: this.thenTerms, changes: this.changes, primaryOrderTree: this.primaryOrderTree)
   end
 
   ## Bounds execution to 1 through queryRowLimit rows; compile reports invalid bounds.
   public def take(count: Int): Query<T>
-    return new Query<T>(this.source, this.decoder, this.predicate, this.orderTable, this.orderColumn, this.descending, count, this.mapping, this.failure)
+    if count < 1 || count > queryRowLimit()
+      return this.failed(QueryFailure.InvalidLimit(count, queryRowLimit()))
+    end
+    let existing = this.limit
+    var bounded = count
+
+    if existing != null
+      if existing < 1 || existing > queryRowLimit()
+        return this.failed(QueryFailure.InvalidLimit(existing, queryRowLimit()))
+      end
+      bounded = existing < count ? existing : count
+    end
+
+    return new Query<T>(this.source, this.decoder, this.predicate, this.orderTable, this.orderColumn, this.descending, bounded, this.mapping, this.failure, this.boundProvider, this.tracker, this.previous, this.offset, this.unique, this.thenTerms, changes: this.changes, primaryOrderTree: this.primaryOrderTree)
+  end
+
+  ## Skips rows in the current ordered stage before any later take.
+  public def skip(count: Int): Query<T>
+    if count < 0 || count > 2147483647
+      return this.failed(QueryFailure.Provider("invalid query offset"))
+    end
+    if count == 0
+      return this
+    end
+    if this.limit != null || this.unique
+      return this.freeze().skip(count)
+    end
+    if this.offset > 2147483647 - count
+      return this.failed(QueryFailure.Provider("query offset exceeds supported range"))
+    end
+    return new Query<T>(this.source, this.decoder, this.predicate, this.orderTable, this.orderColumn, this.descending, this.limit, this.mapping, this.failure, this.boundProvider, this.tracker, this.previous, this.offset + count, this.unique, this.thenTerms, changes: this.changes, primaryOrderTree: this.primaryOrderTree)
+  end
+
+  ## Removes duplicate complete mapped rows at this point in the pipeline.
+  public def distinct(): Query<T>
+    if this.limit != null || this.offset > 0
+      return this.freeze().distinct()
+    end
+    return new Query<T>(this.source, this.decoder, this.predicate, this.orderTable, this.orderColumn, this.descending, this.limit, this.mapping, this.failure, this.boundProvider, this.tracker, this.previous, this.offset, true, this.thenTerms, changes: this.changes, primaryOrderTree: this.primaryOrderTree)
   end
 
   public def orderBy(field: quote fn(T): Int, descending: Bool = false): Query<T>
@@ -610,7 +1021,33 @@ class Query<T>
     return this.orderTree(field.tree(), descending)
   end
 
-  private def orderTree(tree: readonly quotation::Tree, descending: Bool): Query<T>
+  public def orderByFloat(field: quote fn(T): Float, descending: Bool = false): Query<T>
+    return this.orderTree(field.tree(), descending)
+  end
+
+  public def thenBy(field: quote fn(T): Int, descending: Bool = false): Query<T>
+    return this.thenTree(field.tree(), descending)
+  end
+
+  public def thenByString(field: quote fn(T): String, descending: Bool = false): Query<T>
+    return this.thenTree(field.tree(), descending)
+  end
+
+  public def thenByBool(field: quote fn(T): Bool, descending: Bool = false): Query<T>
+    return this.thenTree(field.tree(), descending)
+  end
+
+  public def thenByFloat(field: quote fn(T): Float, descending: Bool = false): Query<T>
+    return this.thenTree(field.tree(), descending)
+  end
+
+  private def thenTree(tree: readonly quotation::Tree, descending: Bool): Query<T>
+    if this.orderColumn == null && this.primaryOrderTree == null
+      return this.failed(QueryFailure.UnsupportedCapability("thenBy requires a primary orderBy"))
+    end
+    if this.limit != null || this.offset > 0
+      return this.freeze().thenTree(tree, descending)
+    end
     let mapping = this.mapping
 
     if mapping == null
@@ -618,9 +1055,26 @@ class Query<T>
     end
     match translateSelection(mapping, tree)
       case SelectionResult.Failure(error)
-        return this.failed(error)
+        return new Query<T>(this.source, this.decoder, this.predicate, this.orderTable, this.orderColumn, this.descending, this.limit, this.mapping, this.failure, this.boundProvider, this.tracker, this.previous, this.offset, this.unique, appendOrder(this.thenTerms, "", descending, tree), changes: this.changes, primaryOrderTree: this.primaryOrderTree)
       case SelectionResult.Column(column)
-        return new Query<T>(this.source, this.decoder, this.predicate, mapping.table(), column.column(), descending, this.limit, this.mapping, this.failure)
+        return new Query<T>(this.source, this.decoder, this.predicate, this.orderTable, this.orderColumn, this.descending, this.limit, this.mapping, this.failure, this.boundProvider, this.tracker, this.previous, this.offset, this.unique, appendOrder(this.thenTerms, column.column(), descending), changes: this.changes, primaryOrderTree: this.primaryOrderTree)
+    end
+  end
+
+  private def orderTree(tree: readonly quotation::Tree, descending: Bool): Query<T>
+    if this.limit != null || this.offset > 0
+      return this.freeze().orderTree(tree, descending)
+    end
+    let mapping = this.mapping
+
+    if mapping == null
+      return this.failed(QueryFailure.UnsupportedCapability("ordering requires entity mapping metadata"))
+    end
+    match translateSelection(mapping, tree)
+      case SelectionResult.Failure(error)
+        return new Query<T>(this.source, this.decoder, this.predicate, descending: descending, limit: this.limit, mapping: this.mapping, failure: this.failure, provider: this.boundProvider, tracker: this.tracker, previous: this.previous, offset: this.offset, unique: this.unique, changes: this.changes, primaryOrderTree: tree)
+      case SelectionResult.Column(column)
+        return new Query<T>(this.source, this.decoder, this.predicate, mapping.table(), column.column(), descending, this.limit, this.mapping, this.failure, this.boundProvider, this.tracker, this.previous, this.offset, this.unique, changes: this.changes)
     end
   end
 
@@ -636,15 +1090,454 @@ class Query<T>
     if mapping != null && mapping.table() != this.source
       return CompileResult<T>.Failure(QueryFailure.SourceMismatch(this.source, mapping.table()))
     end
-    return compileQuery<T>(this.source, this.decoder, this.filterExpression(), this.orderTable, this.orderColumn, this.descending, this.limit, dialect)
+    return compilePipeline<T, T>(this, this.decoder, null, this.limit, dialect)
   end
 
-  ## Executes a bounded typed read and materializes rows through this query's decoder.
-  public def all(provider: Provider): QueryResult<T>
-    if !provider.supports(ProviderCapability.BoundedTypedReads())
+  ## Visits decoded rows synchronously without adding them to this query's tracker.
+  public def stream(visit: fn(T): Bool, options: StreamOptions? = null): StreamResult
+    return streamTyped<T>(this, visit, options)
+  end
+
+  public def streamWith(provider: Provider, visit: fn(T): Bool, options: StreamOptions? = null): StreamResult
+    return streamTypedWith<T>(this, provider, visit, options)
+  end
+
+  ## Deletes all rows selected by the complete typed query pipeline.
+  public def executeDelete(): WriteResult
+    let provider = this.boundProvider
+
+    if provider == null
+      return WriteResult.Failure(WriteFailure.Unsupported("bulk delete requires a provider"))
+    end
+    if !provider.supports(ProviderCapability.SetWrites())
+      return WriteResult.Failure(WriteFailure.Unsupported("provider does not support set writes"))
+    end
+    match compileSetDelete<T>(this, provider.dialect())
+      case SetPlanResult.Failure(error)
+        return WriteResult.Failure(error)
+      case SetPlanResult.Plan(plan)
+        if plan.requiresCheckedScalars() && !provider.supports(ProviderCapability.CheckedScalarExpressions())
+          return WriteResult.Failure(WriteFailure.Unsupported("provider does not support checked scalar expressions"))
+        end
+        let owner = this.changes
+
+        if owner != null
+          return owner.executeSet(plan, provider)
+        end
+        return normalizeSetWrite(provider.executeSet(plan))
+    end
+  end
+
+  ## Updates mapped non-key scalar fields without materializing selected rows.
+  public def executeUpdate(labels changes: fields of T): WriteResult
+    let provider = this.boundProvider
+
+    if provider == null
+      return WriteResult.Failure(WriteFailure.Unsupported("bulk update requires a provider"))
+    end
+    if !provider.supports(ProviderCapability.SetWrites())
+      return WriteResult.Failure(WriteFailure.Unsupported("provider does not support set writes"))
+    end
+    match compileSetUpdate<T>(this, changes.pack(), provider.dialect())
+      case SetPlanResult.Failure(error)
+        return WriteResult.Failure(error)
+      case SetPlanResult.Plan(plan)
+        if plan.requiresCheckedScalars() && !provider.supports(ProviderCapability.CheckedScalarExpressions())
+          return WriteResult.Failure(WriteFailure.Unsupported("provider does not support checked scalar expressions"))
+        end
+        let owner = this.changes
+
+        if owner != null
+          return owner.executeSet(plan, provider)
+        end
+        return normalizeSetWrite(provider.executeSet(plan))
+    end
+  end
+
+  ## Updates several mapped fields from expressions over each original row.
+  public def executeUpdateSet(setters: readonly UpdateSet<T>): WriteResult
+    let provider = this.boundProvider
+
+    if provider == null
+      return WriteResult.Failure(WriteFailure.Unsupported("computed bulk update requires a provider"))
+    end
+    if !provider.supports(ProviderCapability.SetWrites())
+      return WriteResult.Failure(WriteFailure.Unsupported("provider does not support set writes"))
+    end
+    match compileSetUpdateExpressions<T>(this, setters, provider.dialect())
+      case SetPlanResult.Failure(error)
+        return WriteResult.Failure(error)
+      case SetPlanResult.Plan(plan)
+        if plan.requiresCheckedScalars() && !provider.supports(ProviderCapability.CheckedScalarExpressions())
+          return WriteResult.Failure(WriteFailure.Unsupported("provider does not support checked scalar expressions"))
+        end
+        let owner = this.changes
+
+        if owner != null
+          return owner.executeSet(plan, provider)
+        end
+        return normalizeSetWrite(provider.executeSet(plan))
+    end
+  end
+
+  ## Materializes every selected row; an explicit take retains its SQL bound.
+  public def all(provider: Provider? = null): QueryResult<T>
+    let selected = provider != null ? provider : this.boundProvider
+
+    if selected == null
+      return QueryResult<T>.Failure(QueryFailure.UnsupportedCapability("query requires a provider"))
+    end
+    if this.hasBound() && !selected.supports(ProviderCapability.BoundedTypedReads())
       return QueryResult<T>.Failure(QueryFailure.UnsupportedCapability("bounded-typed-reads"))
     end
-    return execute<T>(this.compile(provider.dialect()), provider)
+    match this.materialize(selected)
+      case QueryResult.Failure(error)
+        return QueryResult<T>.Failure(error)
+      case QueryResult.Rows(rows)
+        let entityTracker = this.tracker
+
+        ## An explicit provider override never populates this context's tracker.
+        if entityTracker != null && provider == null
+          return entityTracker.resolveRows(rows)
+        end
+        return QueryResult<T>.Rows(rows)
+    end
+  end
+
+  private def materialize(provider: Provider): QueryResult<T>
+    if this.hasBound()
+      return execute<T>(this.compile(provider.dialect()), provider)
+    end
+    let compile: fn(SqlDialect): CompileResult<T> = fn(dialect: SqlDialect): CompileResult<T>
+      return compilePipeline<T, T>(this, this.decoder, null, this.limit, dialect, unbounded: true)
+    end
+
+    return materializeStream<T>(provider, compile)
+  end
+
+  ## Returns the first decoded row, or null when the bounded query has no rows.
+  public def first(provider: Provider? = null): QueryValue<T?>
+    match this.take(1).all(provider)
+      case QueryResult.Failure(error)
+        return QueryValue<T?>.Failure(error)
+      case QueryResult.Rows(rows)
+        let first = rows.first()
+
+        if first == null
+          return QueryValue<T?>.Value(null)
+        end
+        return QueryValue<T?>.Value(first.value)
+    end
+  end
+
+  public def firstOrDefault(provider: Provider? = null): QueryValue<T?>
+    return this.first(provider)
+  end
+
+  private def probeSingle(provider: Provider?): QueryResult<T>
+    let selected = provider != null ? provider : this.boundProvider
+
+    if selected == null
+      return QueryResult<T>.Failure(QueryFailure.UnsupportedCapability("query requires a provider"))
+    end
+    if !selected.supports(ProviderCapability.BoundedTypedReads())
+      return QueryResult<T>.Failure(QueryFailure.UnsupportedCapability("bounded-typed-reads"))
+    end
+    match execute<T>(this.take(2).compile(selected.dialect()), selected)
+      case QueryResult.Failure(error)
+        return QueryResult<T>.Failure(error)
+      case QueryResult.Rows(rows)
+        if rows.count() > 1
+          return QueryResult<T>.Failure(QueryFailure.Cardinality("at most one", rows.count()))
+        end
+        let entityTracker = this.tracker
+
+        if rows.count() == 1 && entityTracker != null && provider == null
+          return entityTracker.resolveRows(rows)
+        end
+        return QueryResult<T>.Rows(rows)
+    end
+  end
+
+  ## Requires exactly one row; the two-row probe never tracks ambiguous results.
+  public def single(provider: Provider? = null): QueryValue<T>
+    match this.probeSingle(provider)
+      case QueryResult.Failure(error)
+        return QueryValue<T>.Failure(error)
+      case QueryResult.Rows(rows)
+        let first = rows.first()
+
+        if first == null
+          return QueryValue<T>.Failure(QueryFailure.Cardinality("exactly one", 0))
+        end
+        return QueryValue<T>.Value(first.value)
+    end
+  end
+
+  ## Returns null for no row and fails if a second row exists.
+  public def singleOrDefault(provider: Provider? = null): QueryValue<T?>
+    match this.probeSingle(provider)
+      case QueryResult.Failure(error)
+        return QueryValue<T?>.Failure(error)
+      case QueryResult.Rows(rows)
+        let first = rows.first()
+
+        if first == null
+          return QueryValue<T?>.Value(null)
+        end
+        return QueryValue<T?>.Value(first.value)
+    end
+  end
+
+  ## Reports whether this query yields at least one row without materializing entities.
+  public def any(provider: Provider? = null): QueryValue<Bool>
+    let selected = provider != null ? provider : this.boundProvider
+
+    if selected == null
+      return QueryValue<Bool>.Failure(QueryFailure.UnsupportedCapability("query requires a provider"))
+    end
+    if !selected.supports(ProviderCapability.BoundedTypedReads())
+      return QueryValue<Bool>.Failure(QueryFailure.UnsupportedCapability("bounded-typed-reads"))
+    end
+    let alias = "__neri_any"
+
+    match execute<Int>(compileTerminal(this, intScalar().decoder(alias), new SqlSelection("1 AS \"" + alias + "\""), 1, selected.dialect(), false), selected)
+      case QueryResult.Failure(error)
+        return QueryValue<Bool>.Failure(error)
+      case QueryResult.Rows(rows)
+        return QueryValue<Bool>.Value(rows.count() != 0)
+    end
+  end
+
+  ## Counts rows, preserving a prior take through a bounded inner query.
+  public def count(provider: Provider? = null): QueryValue<Int>
+    let selected = provider != null ? provider : this.boundProvider
+
+    if selected == null
+      return QueryValue<Int>.Failure(QueryFailure.UnsupportedCapability("query requires a provider"))
+    end
+    if !selected.supports(ProviderCapability.BoundedTypedReads())
+      return QueryValue<Int>.Failure(QueryFailure.UnsupportedCapability("bounded-typed-reads"))
+    end
+    let alias = "__neri_count"
+    let decoder = intScalar().decoder(alias)
+    let configured = this.limit
+
+    if this.previous != null || this.offset > 0 || this.unique
+      let mapping = this.mapping
+
+      if mapping == null
+        return QueryValue<Int>.Failure(QueryFailure.UnsupportedCapability("staged count requires entity mapping metadata"))
+      end
+      match compilePipeline<T, T>(this, this.decoder, mappedSelection(mapping), configured, selected.dialect(), true, true)
+        case CompileResult.Failure(error)
+          return QueryValue<Int>.Failure(error)
+        case CompileResult.Plan(inner)
+          let sql = "SELECT COUNT(*) AS \"" + alias + "\" FROM (" + inner.sql().sql() + ") AS \"__neri_count_source\" LIMIT 1"
+          let compiled = CompileResult<Int>.Plan(new TypedPlan<Int>(new SqlPlan(sql, inner.parameterValues(), 1, decoder.columns(), inner.sql().requiresCheckedScalars()), decoder))
+
+          match execute<Int>(compiled, selected)
+            case QueryResult.Failure(error)
+              return QueryValue<Int>.Failure(error)
+            case QueryResult.Rows(rows)
+              let first = rows.first()
+
+              if first == null
+                return QueryValue<Int>.Failure(QueryFailure.Provider("count query returned no row"))
+              end
+              return QueryValue<Int>.Value(first.value)
+          end
+      end
+    end
+
+    if configured == null
+      match execute<Int>(compileTerminal(this, decoder, new SqlSelection("COUNT(*) AS \"" + alias + "\""), 1, selected.dialect(), false), selected)
+        case QueryResult.Failure(error)
+          return QueryValue<Int>.Failure(error)
+        case QueryResult.Rows(rows)
+          let first = rows.first()
+
+          if first == null
+            return QueryValue<Int>.Failure(QueryFailure.Provider("count query returned no row"))
+          end
+          return QueryValue<Int>.Value(first.value)
+      end
+    end
+    match compileTerminal(this, intScalar().decoder("__neri_count_input"), new SqlSelection("1 AS \"__neri_count_input\""), configured, selected.dialect())
+      case CompileResult.Failure(error)
+        return QueryValue<Int>.Failure(error)
+      case CompileResult.Plan(inner)
+        let plan = inner.sql()
+        let sql = "SELECT COUNT(*) AS \"" + alias + "\" FROM (" + plan.sql() + ") AS \"__neri_count_source\" LIMIT 1"
+        let compiled = CompileResult<Int>.Plan(new TypedPlan<Int>(new SqlPlan(sql, inner.parameterValues(), 1, decoder.columns(), plan.requiresCheckedScalars()), decoder))
+
+        match execute<Int>(compiled, selected)
+          case QueryResult.Failure(error)
+            return QueryValue<Int>.Failure(error)
+          case QueryResult.Rows(rows)
+            let first = rows.first()
+
+            if first == null
+              return QueryValue<Int>.Failure(QueryFailure.Provider("count query returned no row"))
+            end
+            return QueryValue<Int>.Value(first.value)
+        end
+    end
+  end
+
+  ## Starts tracking a new entity through this query's root context.
+  public def add(entity: T): QueryFailure?
+    let mutationFailure = this.mutationFailure()
+
+    if mutationFailure != null
+      return mutationFailure
+    end
+    let entityTracker = this.tracker
+
+    if entityTracker == null
+      return QueryFailure.UnsupportedCapability("query requires an entity tracker")
+    end
+    return entityTracker.add(entity)
+  end
+
+  ## Starts tracking an existing entity through this query's root context.
+  public def attach(entity: T): QueryFailure?
+    let mutationFailure = this.mutationFailure()
+
+    if mutationFailure != null
+      return mutationFailure
+    end
+    let entityTracker = this.tracker
+
+    if entityTracker == null
+      return QueryFailure.UnsupportedCapability("query requires an entity tracker")
+    end
+    return entityTracker.attach(entity)
+  end
+
+  public def addWithHandle(entity: T): TrackHandleResult<T>
+    let failure = this.mutationFailure()
+
+    if failure != null
+      return TrackHandleResult<T>.Failure(failure)
+    end
+    let tracker = this.tracker
+
+    if tracker == null
+      return TrackHandleResult<T>.Failure(QueryFailure.UnsupportedCapability("query requires an entity tracker"))
+    end
+    return tracker.addWithHandle(entity)
+  end
+
+  public def attachWithHandle(entity: T): TrackHandleResult<T>
+    let failure = this.mutationFailure()
+
+    if failure != null
+      return TrackHandleResult<T>.Failure(failure)
+    end
+    let tracker = this.tracker
+
+    if tracker == null
+      return TrackHandleResult<T>.Failure(QueryFailure.UnsupportedCapability("query requires an entity tracker"))
+    end
+    return tracker.attachWithHandle(entity)
+  end
+
+  ## Marks a tracked entity for removal through this query's root context.
+  public def remove(entity: T): QueryFailure?
+    let mutationFailure = this.mutationFailure()
+
+    if mutationFailure != null
+      return mutationFailure
+    end
+    let entityTracker = this.tracker
+
+    if entityTracker == null
+      return QueryFailure.UnsupportedCapability("query requires an entity tracker")
+    end
+    return entityTracker.remove(entity)
+  end
+
+  public def stateOf(entity: T): TrackingState?
+    let tracker = this.tracker
+
+    if tracker == null
+      return null
+    end
+    return tracker.stateOf(entity)
+  end
+
+  public def original(entity: T): RawRow?
+    let tracker = this.tracker
+
+    if tracker == null
+      return null
+    end
+    return tracker.original(entity)
+  end
+
+  public def current(entity: T): RawRow?
+    let tracker = this.tracker
+
+    if tracker == null
+      return null
+    end
+    return tracker.current(entity)
+  end
+
+  public def detach(entity: T): QueryFailure?
+    let failure = this.mutationFailure()
+
+    if failure != null
+      return failure
+    end
+    let tracker = this.tracker
+
+    if tracker == null
+      return QueryFailure.UnsupportedCapability("query requires an entity tracker")
+    end
+    return tracker.detach(entity)
+  end
+
+  public def rebase(entity: T, databaseEntity: T): QueryFailure?
+    let failure = this.mutationFailure()
+
+    if failure != null
+      return failure
+    end
+    let tracker = this.tracker
+
+    if tracker == null
+      return QueryFailure.UnsupportedCapability("query requires an entity tracker")
+    end
+    return tracker.rebase(entity, databaseEntity)
+  end
+
+  ## Applies a separately fetched, untracked database snapshot to a tracked entity.
+  public def refreshFrom(entity: T, databaseEntity: T): QueryFailure?
+    let failure = this.mutationFailure()
+
+    if failure != null
+      return failure
+    end
+    let tracker = this.tracker
+
+    if tracker == null
+      return QueryFailure.UnsupportedCapability("query requires an entity tracker")
+    end
+    return tracker.refreshFrom(entity, databaseEntity)
+  end
+
+  private def mutationFailure(): QueryFailure?
+    let failure = this.failure
+
+    if failure != null
+      return failure
+    end
+    if this.predicate != null || this.orderTable != null || this.orderColumn != null || this.limit != null || this.previous != null || this.offset > 0 || this.unique
+      return QueryFailure.UnsupportedCapability("entity mutations require an unfiltered query root")
+    end
+    return null
   end
 
   internal readonly def sourceName(): String
@@ -676,9 +1569,292 @@ class Query<T>
   internal readonly def orderingDescending(): Bool
     return this.descending
   end
+  internal readonly def primaryOrderingTree(): readonly quotation::Tree?
+    return this.primaryOrderTree
+  end
+  internal def secondaryOrder(): OrderTerm?
+    return this.thenTerms
+  end
   internal readonly def rowLimit(): Int?
     return this.limit
   end
+  internal def prior(): Query<T>?
+    return this.previous
+  end
+  internal readonly def rowOffset(): Int
+    return this.offset
+  end
+  internal readonly def isDistinct(): Bool
+    return this.unique
+  end
+  internal def hasBound(): Bool
+    if this.limit != null
+      return true
+    end
+    let prior = this.previous
+
+    if prior != null
+      return prior.hasBound()
+    end
+    return false
+  end
+  internal def provider(): Provider?
+    return this.boundProvider
+  end
+  internal def rowTracker(): EntityTracker<T>?
+    return this.tracker
+  end
+  internal def changeOwner(): ChangeContext?
+    return this.changes
+  end
+  internal readonly def isUnfilteredRoot(): Bool
+    return this.predicate == null && this.orderTable == null && this.orderColumn == null && this.primaryOrderTree == null && this.limit == null && this.previous == null && this.offset == 0 && !this.unique
+  end
+end
+
+def mappedSelection(mapping: EntityMapping): SqlSelection
+  var text = ""
+  var index = 0
+
+  while index < mapping.count()
+    let column = mapping.columnAt(index)
+
+    if column != null
+      text = text + (index == 0 ? "" : ", ") + quoted(mapping.table(), column.column())
+    end
+    index = index + 1
+  end
+  return new SqlSelection(text)
+end
+
+def queryRelationOrders<T>(query: Query<T>): OrderTerm?
+  let tree = query.primaryOrderingTree()
+  let column = query.orderingColumn()
+
+  if tree == null && column == null
+    return null
+  end
+  return new OrderTerm(column == null ? "" : column, query.orderingDescending(), query.secondaryOrder(), tree)
+end
+
+def queryRelationColumnType(mapping: EntityMapping, physical: String): String?
+  var index = 0
+
+  while index < mapping.count()
+    let column = mapping.columnAt(index)
+
+    if column != null && column.column() == physical
+      return column.typeName()
+    end
+    index = index + 1
+  end
+  return null
+end
+
+def compileQueryRelationPlan<T>(query: Query<T>, sourcePlan: TypedPlan<T>, mapping: EntityMapping, dialect: SqlDialect): RelationBuildResult<T>
+  let read: fn(RawRow): DecodeResult<T> = fn(row: RawRow): DecodeResult<T>
+    return sourcePlan.decode(row)
+  end
+  # The mapped SQL source can expose more fields than a terminal decoder consumes.
+  var sourceColumns = new ResultColumns([])
+  var fieldIndex = 0
+
+  while fieldIndex < mapping.count()
+    let field = mapping.columnAt(fieldIndex)
+
+    if field != null
+      sourceColumns = joinOrderColumns(sourceColumns, field.column(), field.typeName(), false)
+    end
+    fieldIndex = fieldIndex + 1
+  end
+  let orders = queryRelationOrders(query)
+
+  if orders == null
+    return RelationBuildResult<T>.Plan(new RelationPlan<T>(sourcePlan.sql().sql(), sourcePlan.parameterValues(), sourceColumns, new Decoder<T>(read, sourceColumns), mapping, sourcePlan.sql().requiresCheckedScalars()))
+  end
+  let source = "__neri_query_relation_source"
+  let output = "__neri_query_relation_output"
+  let orderMapping = joinStageMapping(mapping, source)
+  let state = new CompileState()
+  var columns = sourceColumns
+  var selection = ""
+  var index = 0
+
+  while index < sourceColumns.count()
+    let column = sourceColumns.at(index)
+
+    selection = selection + (index == 0 ? "" : ", ") + quoted(source, column.name()) + " AS \"" + column.name() + "\""
+    index = index + 1
+  end
+  var current: OrderTerm? = orders
+  var outputOrder: OrderTerm? = null
+  var orderIndex = 0
+
+  while current != null
+    var expression = ""
+    var typeName = ""
+    let tree = current.tree
+
+    if tree == null
+      let found = queryRelationColumnType(mapping, current.column)
+
+      if found == null
+        return RelationBuildResult<T>.Failure(QueryFailure.MissingColumn(current.column))
+      end
+      typeName = found
+      expression = quoted(source, current.column)
+    else
+      typeName = tree.resultType()
+
+      match compileScalarQuotation(orderMapping, tree, tree.resultType(), state, dialect)
+        case ScalarSqlResult.Failure(error)
+          return RelationBuildResult<T>.Failure(error)
+        case ScalarSqlResult.Value(value)
+          expression = value.sql
+          state.requiresCheckedScalars = state.requiresCheckedScalars || value.checkedScalars
+      end
+    end
+    var alias = "__neri_query_order" + (orderIndex as String)
+
+    while relationColumnIndex(columns, alias) >= 0
+      orderIndex = orderIndex + 1
+      alias = "__neri_query_order" + (orderIndex as String)
+    end
+    selection = selection + ", " + expression + " AS \"" + alias + "\""
+    columns = joinOrderColumns(columns, alias, typeName, false)
+    outputOrder = appendOrder(outputOrder, alias, current.descending)
+    orderIndex = orderIndex + 1
+    current = current.next
+  end
+  let shifted = joinShiftSql(sourcePlan.sql().sql(), state.count, dialect)
+
+  if shifted == null
+    return RelationBuildResult<T>.Failure(QueryFailure.Provider("relation source parameters cannot be rebased"))
+  end
+  joinParameterCopy(sourcePlan.parameterValues(), state)
+  let sql = "SELECT * FROM (SELECT " + selection + " FROM (" + shifted + ") AS \"" + source + "\") AS \"" + output + "\"" + joinOrderSql(outputOrder, output)
+
+  return RelationBuildResult<T>.Plan(new RelationPlan<T>(sql, new ParameterValues(state.head, state.count), columns, new Decoder<T>(read, columns), mapping, sourcePlan.sql().requiresCheckedScalars() || state.requiresCheckedScalars, outputOrder))
+end
+
+def compilePipeline<T, R>(query: Query<T>, decoder: Decoder<R>, selected: readonly SqlSelection?, limit: Int?, dialect: SqlDialect, ordered: Bool = true, inner: Bool = false, unbounded: Bool = false, rawDistinct: Bool = false): CompileResult<R>
+  let failure = query.queryFailure()
+
+  if failure != null
+    return CompileResult<R>.Failure(failure)
+  end
+  let mapping = query.entityMapping()
+
+  if mapping != null
+    if mapping.table() != query.sourceName()
+      return CompileResult<R>.Failure(QueryFailure.SourceMismatch(query.sourceName(), mapping.table()))
+    end
+    let invalid = mapping.failure()
+
+    if invalid != null
+      return CompileResult<R>.Failure(invalid)
+    end
+  end
+
+  if query.isDistinct() && !rawDistinct
+    if mapping == null
+      return CompileResult<R>.Failure(QueryFailure.UnsupportedCapability("distinct requires entity mapping metadata"))
+    end
+    match compilePipeline<T, T>(query, query.rowDecoder(), mappedSelection(mapping), null, dialect, ordered: false, inner: true, unbounded: true, rawDistinct: true)
+      case CompileResult.Failure(error)
+        return CompileResult<R>.Failure(error)
+      case CompileResult.Plan(distinctPlan)
+        let fromSql = new SqlSource("(" + distinctPlan.sql().sql() + ") AS \"" + query.sourceName() + "\"", distinctPlan.sql().requiresCheckedScalars())
+        var orderTable: String? = null
+        var orderColumn: String? = null
+        var secondary: OrderTerm? = null
+        var primaryTree: readonly quotation::Tree? = null
+
+        if ordered
+          orderTable = query.orderingTable()
+          orderColumn = query.orderingColumn()
+          secondary = query.secondaryOrder()
+          primaryTree = query.primaryOrderingTree()
+        end
+
+        var finalLimit = limit
+
+        if finalLimit == null && query.hasBound() && !inner && !unbounded
+          finalLimit = queryRowLimit()
+        end
+        return compileQuery<R>(query.sourceName(), decoder, null, orderTable, orderColumn, query.orderingDescending(), finalLimit, dialect, selected, fromSql, distinctPlan.sql().parameters(), offset: query.rowOffset(), allowUnbounded: inner || unbounded, secondary: secondary, primaryOrderTree: primaryTree, orderMapping: mapping)
+    end
+  end
+  let previous = query.prior()
+  var fromSql: SqlSource? = null
+  var prefix: readonly ParameterValues? = null
+
+  if previous != null
+    if mapping == null
+      return CompileResult<R>.Failure(QueryFailure.UnsupportedCapability("staged queries require entity mapping metadata"))
+    end
+    match compilePipeline<T, T>(previous, query.rowDecoder(), mappedSelection(mapping), previous.rowLimit(), dialect, true, true)
+      case CompileResult.Failure(error)
+        return CompileResult<R>.Failure(error)
+      case CompileResult.Plan(priorPlan)
+        fromSql = new SqlSource("(" + priorPlan.sql().sql() + ") AS \"" + query.sourceName() + "\"", priorPlan.sql().requiresCheckedScalars())
+        prefix = priorPlan.sql().parameters()
+    end
+  end
+  var bounded = limit
+
+  if bounded == null && !inner && !unbounded && query.hasBound()
+    bounded = queryRowLimit()
+  end
+  var orderTable: String? = null
+  var orderColumn: String? = null
+
+  if ordered
+    orderTable = query.orderingTable()
+    orderColumn = query.orderingColumn()
+  end
+
+  var secondary: OrderTerm? = null
+  var primaryTree: readonly quotation::Tree? = null
+
+  if ordered
+    secondary = query.secondaryOrder()
+    primaryTree = query.primaryOrderingTree()
+  end
+  return compileQuery<R>(query.sourceName(), decoder, query.filterExpression(), orderTable, orderColumn, query.orderingDescending(), bounded, dialect, selected, fromSql, prefix, rawDistinct ? 0 : query.rowOffset(), query.isDistinct(), inner || unbounded, secondary, primaryTree, mapping)
+end
+
+def compileTerminal<T, R>(query: Query<T>, decoder: Decoder<R>, selected: readonly SqlSelection, maximum: Int, dialect: SqlDialect, ordered: Bool = true): CompileResult<R>
+  let failure = query.queryFailure()
+
+  if failure != null
+    return CompileResult<R>.Failure(failure)
+  end
+  let mapping = query.entityMapping()
+
+  if mapping != null && mapping.table() != query.sourceName()
+    return CompileResult<R>.Failure(QueryFailure.SourceMismatch(query.sourceName(), mapping.table()))
+  end
+  let configured = query.rowLimit()
+
+  if configured != null && (configured < 1 || configured > queryRowLimit())
+    return CompileResult<R>.Failure(QueryFailure.InvalidLimit(configured, queryRowLimit()))
+  end
+  var bounded = maximum
+
+  if configured != null
+    bounded = configured < maximum ? configured : maximum
+  end
+  var orderTable: String? = null
+  var orderColumn: String? = null
+  var descending = false
+
+  if ordered
+    orderTable = query.orderingTable()
+    orderColumn = query.orderingColumn()
+    descending = query.orderingDescending()
+  end
+  return compilePipeline<T, R>(query, decoder, selected, bounded, dialect, ordered)
 end
 
 class Projection<T, R>
@@ -693,6 +1869,10 @@ class Projection<T, R>
   end
 
   public def compile(dialect: SqlDialect = SqlDialect.QuestionMark()): CompileResult<R>
+    return this.compilePlan(dialect, false)
+  end
+
+  private def compilePlan(dialect: SqlDialect, unbounded: Bool): CompileResult<R>
     let failure = this.query.queryFailure()
 
     if failure != null
@@ -713,15 +1893,138 @@ class Projection<T, R>
         if column.typeName() != this.codec.typeName()
           return CompileResult<R>.Failure(QueryFailure.TypeMismatch(column.column(), this.codec.typeName(), column.typeName()))
         end
-        return compileQuery<R>(this.query.sourceName(), this.codec.decoder(column.column()), this.query.filterExpression(), this.query.orderingTable(), this.query.orderingColumn(), this.query.orderingDescending(), this.query.rowLimit(), dialect)
+        return compilePipeline<T, R>(this.query, this.codec.decoder(column.column()), null, this.query.rowLimit(), dialect, unbounded: unbounded)
     end
   end
 
-  public def all(provider: Provider): QueryResult<R>
-    if !provider.supports(ProviderCapability.BoundedTypedReads())
+  public def stream(visit: fn(R): Bool, options: StreamOptions? = null): StreamResult
+    let compile: fn(SqlDialect): CompileResult<R> = fn(dialect: SqlDialect): CompileResult<R>
+      return this.compilePlan(dialect, true)
+    end
+
+    return streamCompiled<R>(this.query.provider(), compile, visit, options, streamMaximum<T>(this.query))
+  end
+
+  public def streamWith(provider: Provider, visit: fn(R): Bool, options: StreamOptions? = null): StreamResult
+    let compile: fn(SqlDialect): CompileResult<R> = fn(dialect: SqlDialect): CompileResult<R>
+      return this.compilePlan(dialect, true)
+    end
+
+    return streamCompiled<R>(provider, compile, visit, options, streamMaximum<T>(this.query))
+  end
+
+  public def all(provider: Provider? = null): QueryResult<R>
+    let selected = provider != null ? provider : this.query.provider()
+
+    if selected == null
+      return QueryResult<R>.Failure(QueryFailure.UnsupportedCapability("projection requires a provider"))
+    end
+    if this.query.hasBound() && !selected.supports(ProviderCapability.BoundedTypedReads())
       return QueryResult<R>.Failure(QueryFailure.UnsupportedCapability("bounded-typed-reads"))
     end
-    return execute<R>(this.compile(provider.dialect()), provider)
+    if !this.query.hasBound()
+      let compile: fn(SqlDialect): CompileResult<R> = fn(dialect: SqlDialect): CompileResult<R>
+        return this.compilePlan(dialect, true)
+      end
+
+      return materializeStream<R>(selected, compile)
+    end
+    return execute<R>(this.compile(selected.dialect()), selected)
+  end
+end
+
+## A two-field, server-selected projection materialized only after strict decoding.
+class Projection2<T, A, B, R>
+  private query: Query<T>
+  private firstCodec: ScalarCodec<A>
+  private firstSelector: quote fn(T): A
+  private secondCodec: ScalarCodec<B>
+  private secondSelector: quote fn(T): B
+  private materialize: fn(A, B): R
+
+  public def init(query: Query<T>, firstCodec: ScalarCodec<A>, firstSelector: quote fn(T): A, secondCodec: ScalarCodec<B>, secondSelector: quote fn(T): B, materialize: fn(A, B): R): Void
+    this.query = query
+    this.firstCodec = firstCodec
+    this.firstSelector = firstSelector
+    this.secondCodec = secondCodec
+    this.secondSelector = secondSelector
+    this.materialize = materialize
+  end
+
+  public def compile(dialect: SqlDialect = SqlDialect.QuestionMark()): CompileResult<R>
+    return this.compilePlan(dialect, false)
+  end
+
+  private def compilePlan(dialect: SqlDialect, unbounded: Bool): CompileResult<R>
+    let failure = this.query.queryFailure()
+
+    if failure != null
+      return CompileResult<R>.Failure(failure)
+    end
+    let mapping = this.query.entityMapping()
+
+    if mapping == null
+      return CompileResult<R>.Failure(QueryFailure.UnsupportedCapability("projection requires entity mapping metadata"))
+    end
+    if mapping.table() != this.query.sourceName()
+      return CompileResult<R>.Failure(QueryFailure.SourceMismatch(this.query.sourceName(), mapping.table()))
+    end
+    match translateSelection(mapping, this.firstSelector.tree())
+      case SelectionResult.Failure(error)
+        return CompileResult<R>.Failure(error)
+      case SelectionResult.Column(firstColumn)
+        if firstColumn.typeName() != this.firstCodec.typeName()
+          return CompileResult<R>.Failure(QueryFailure.TypeMismatch(firstColumn.column(), this.firstCodec.typeName(), firstColumn.typeName()))
+        end
+        match translateSelection(mapping, this.secondSelector.tree())
+          case SelectionResult.Failure(error)
+            return CompileResult<R>.Failure(error)
+          case SelectionResult.Column(secondColumn)
+            if secondColumn.typeName() != this.secondCodec.typeName()
+              return CompileResult<R>.Failure(QueryFailure.TypeMismatch(secondColumn.column(), this.secondCodec.typeName(), secondColumn.typeName()))
+            end
+            let firstAlias = "__neri_select_0"
+            let secondAlias = "__neri_select_1"
+            let selected = new SqlSelection(quoted(this.query.sourceName(), firstColumn.column()) + " AS \"" + firstAlias + "\", " + quoted(this.query.sourceName(), secondColumn.column()) + " AS \"" + secondAlias + "\"")
+
+            return compilePipeline<T, R>(this.query, select2Decoder(this.firstCodec, firstAlias, this.secondCodec, secondAlias, this.materialize), selected, this.query.rowLimit(), dialect, unbounded: unbounded)
+        end
+    end
+  end
+
+  public def stream(visit: fn(R): Bool, options: StreamOptions? = null): StreamResult
+    let compile: fn(SqlDialect): CompileResult<R> = fn(dialect: SqlDialect): CompileResult<R>
+      return this.compilePlan(dialect, true)
+    end
+
+    return streamCompiled<R>(this.query.provider(), compile, visit, options, streamMaximum<T>(this.query))
+  end
+
+  public def streamWith(provider: Provider, visit: fn(R): Bool, options: StreamOptions? = null): StreamResult
+    let compile: fn(SqlDialect): CompileResult<R> = fn(dialect: SqlDialect): CompileResult<R>
+      return this.compilePlan(dialect, true)
+    end
+
+    return streamCompiled<R>(provider, compile, visit, options, streamMaximum<T>(this.query))
+  end
+
+  public def all(provider: Provider? = null): QueryResult<R>
+    let selected = provider != null ? provider : this.query.provider()
+
+    if selected == null
+      return QueryResult<R>.Failure(QueryFailure.UnsupportedCapability("projection requires a provider"))
+    end
+    if this.query.hasBound() && !selected.supports(ProviderCapability.BoundedTypedReads())
+      return QueryResult<R>.Failure(QueryFailure.UnsupportedCapability("bounded-typed-reads"))
+    end
+    if !this.query.hasBound()
+      let compile: fn(SqlDialect): CompileResult<R> = fn(dialect: SqlDialect): CompileResult<R>
+        return this.compilePlan(dialect, true)
+      end
+
+      return materializeStream<R>(selected, compile)
+    end
+    return execute<R>(this.compile(selected.dialect()), selected)
   end
 end
 
@@ -730,30 +2033,90 @@ def select<T, R>(query: Query<T>, codec: ScalarCodec<R>, selector: quote fn(T): 
   return new Projection<T, R>(query, codec, selector)
 end
 
+## Projects two mapped scalars; materialize runs only after both selected cells decode strictly.
+def select2<T, A, B, R>(query: Query<T>, firstCodec: ScalarCodec<A>, firstSelector: quote fn(T): A, secondCodec: ScalarCodec<B>, secondSelector: quote fn(T): B, materialize: fn(A, B): R): Projection2<T, A, B, R>
+  return new Projection2<T, A, B, R>(query, firstCodec, firstSelector, secondCodec, secondSelector, materialize)
+end
+
 ## Captures supplied scalar fields once in an invariant, readonly inspection value.
 def snapshot<T>(labels values: fields of T): fields of T
   return values
 end
 
-def compileQuery<T>(source: String, decoder: Decoder<T>, predicate: Expression?, orderTable: String?, orderColumn: String?, descending: Bool, limit: Int?, dialect: SqlDialect): CompileResult<T>
+def compileQuery<T>(source: String, decoder: Decoder<T>, predicate: Expression?, orderTable: String?, orderColumn: String?, descending: Bool, limit: Int?, dialect: SqlDialect, selected: readonly SqlSelection? = null, fromSql: readonly SqlSource? = null, prefix: readonly ParameterValues? = null, offset: Int = 0, unique: Bool = false, allowUnbounded: Bool = false, secondary: OrderTerm? = null, primaryOrderTree: readonly quotation::Tree? = null, orderMapping: EntityMapping? = null): CompileResult<T>
   if !identifierValid(source)
     return CompileResult<T>.Failure(QueryFailure.InvalidIdentifier(source))
   end
   let bounded = limit
 
-  if bounded == null
+  if bounded == null && !allowUnbounded
     return CompileResult<T>.Failure(QueryFailure.MissingLimit(queryRowLimit()))
   end
-  if bounded < 1 || bounded > queryRowLimit()
+  if bounded != null && (bounded < 1 || bounded > queryRowLimit())
     return CompileResult<T>.Failure(QueryFailure.InvalidLimit(bounded, queryRowLimit()))
   end
   let state = new CompileState()
+  let customSelection = selected
+  var selectionParameter: readonly ParameterNode? = null
+  var selectionCount = 0
+
+  if customSelection != null
+    let values = customSelection.parameters()
+
+    if values != null
+      selectionParameter = values.first()
+      selectionCount = values.count()
+    end
+  end
+
+  while selectionParameter != null
+    match selectionParameter.value()
+      case Parameter.Bool(value)
+        state.bind(Parameter.Bool(value))
+      case Parameter.Int(value)
+        state.bind(Parameter.Int(value))
+      case Parameter.Float(value)
+        if !dataFloatFinite(value)
+          return CompileResult<T>.Failure(QueryFailure.UnsupportedCapability("Float parameter must be finite"))
+        end
+        state.bind(Parameter.Float(value))
+      case Parameter.Text(value)
+        state.bind(Parameter.Text(value))
+    end
+    selectionParameter = selectionParameter.next()
+  end
+  var priorParameter: readonly ParameterNode? = null
+
+  if prefix != null
+    priorParameter = prefix.first()
+  end
+
+  while priorParameter != null
+    match priorParameter.value()
+      case Parameter.Bool(value)
+        state.bind(Parameter.Bool(value))
+      case Parameter.Int(value)
+        state.bind(Parameter.Int(value))
+      case Parameter.Float(value)
+        if !dataFloatFinite(value)
+          return CompileResult<T>.Failure(QueryFailure.UnsupportedCapability("Float parameter must be finite"))
+        end
+        state.bind(Parameter.Float(value))
+      case Parameter.Text(value)
+        state.bind(Parameter.Text(value))
+    end
+    priorParameter = priorParameter.next()
+  end
   let columns = decoder.columns()
 
   if columns.count() == 0
     return CompileResult<T>.Failure(QueryFailure.Provider("decoder has no result columns"))
   end
   var selection = ""
+
+  if customSelection != null
+    selection = customSelection.sql()
+  end
   var columnIndex = 0
 
   while columnIndex < columns.count()
@@ -770,10 +2133,22 @@ def compileQuery<T>(source: String, decoder: Decoder<T>, predicate: Expression?,
       end
       previous = previous + 1
     end
-    selection = selection + (columnIndex == 0 ? "" : ", ") + quoted(source, column.name())
+    if customSelection == null
+      selection = selection + (columnIndex == 0 ? "" : ", ") + quoted(source, column.name())
+    end
     columnIndex = columnIndex + 1
   end
-  var sql = "SELECT " + selection + " FROM \"" + source + "\""
+  var relation = "\"" + source + "\""
+
+  if fromSql != null
+    let shifted = joinShiftSql(fromSql.sql(), selectionCount, dialect)
+
+    if shifted == null
+      return CompileResult<T>.Failure(QueryFailure.Provider("projection parameter index exceeds supported range"))
+    end
+    relation = shifted
+  end
+  var sql = "SELECT " + (unique ? "DISTINCT " : "") + selection + " FROM " + relation
 
   if predicate != null
     match compileExpression(predicate, state, source, dialect)
@@ -783,22 +2158,83 @@ def compileQuery<T>(source: String, decoder: Decoder<T>, predicate: Expression?,
         sql = sql + " WHERE " + value
     end
   end
-  if orderTable != null && orderColumn != null
-    if !identifierValid(orderTable)
-      return CompileResult<T>.Failure(QueryFailure.InvalidIdentifier(orderTable))
+  if primaryOrderTree != null || (orderTable != null && orderColumn != null)
+    if primaryOrderTree != null
+      if orderMapping == null || orderMapping.table() != source
+        return CompileResult<T>.Failure(QueryFailure.UnsupportedCapability("computed ordering requires matching entity mapping"))
+      end
+      match compileScalarQuotation(orderMapping, primaryOrderTree, primaryOrderTree.resultType(), state, dialect)
+        case ScalarSqlResult.Failure(error)
+          return CompileResult<T>.Failure(error)
+        case ScalarSqlResult.Value(value)
+          state.requiresCheckedScalars = state.requiresCheckedScalars || value.checkedScalars
+          sql = sql + " ORDER BY " + value.sql + (descending ? " DESC" : " ASC")
+      end
+    else
+      if orderTable == null || orderColumn == null
+        return CompileResult<T>.Failure(QueryFailure.Provider("ordering is missing a mapped column"))
+      end
+      if !identifierValid(orderTable)
+        return CompileResult<T>.Failure(QueryFailure.InvalidIdentifier(orderTable))
+      end
+      if !identifierValid(orderColumn)
+        return CompileResult<T>.Failure(QueryFailure.InvalidIdentifier(orderColumn))
+      end
+      if orderTable != source
+        return CompileResult<T>.Failure(QueryFailure.SourceMismatch(source, orderTable))
+      end
+      sql = sql + " ORDER BY " + quoted(orderTable, orderColumn) + (descending ? " DESC" : " ASC")
     end
-    if !identifierValid(orderColumn)
-      return CompileResult<T>.Failure(QueryFailure.InvalidIdentifier(orderColumn))
+    var nextOrder = secondary
+
+    while nextOrder != null
+      let tree = nextOrder.tree
+
+      if tree != null
+        if orderMapping == null || orderMapping.table() != source
+          return CompileResult<T>.Failure(QueryFailure.UnsupportedCapability("computed ordering requires matching entity mapping"))
+        end
+        match compileScalarQuotation(orderMapping, tree, tree.resultType(), state, dialect)
+          case ScalarSqlResult.Failure(error)
+            return CompileResult<T>.Failure(error)
+          case ScalarSqlResult.Value(value)
+            state.requiresCheckedScalars = state.requiresCheckedScalars || value.checkedScalars
+            sql = sql + ", " + value.sql + (nextOrder.descending ? " DESC" : " ASC")
+        end
+      else
+        if !identifierValid(nextOrder.column)
+          return CompileResult<T>.Failure(QueryFailure.InvalidIdentifier(nextOrder.column))
+        end
+        sql = sql + ", " + quoted(source, nextOrder.column) + (nextOrder.descending ? " DESC" : " ASC")
+      end
+      nextOrder = nextOrder.next
     end
-    if orderTable != source
-      return CompileResult<T>.Failure(QueryFailure.SourceMismatch(source, orderTable))
-    end
-    sql = sql + " ORDER BY " + quoted(orderTable, orderColumn) + (descending ? " DESC" : " ASC")
   end
-  sql = sql + " LIMIT " + (bounded as String)
+  if bounded != null
+    sql = sql + " LIMIT " + (bounded as String)
+  else
+    match dialect
+      case SqlDialect.QuestionMark()
+        if offset > 0
+          sql = sql + " LIMIT -1"
+        end
+      case SqlDialect.PostgreSql()
+        sql = sql
+    end
+  end
+  if offset > 0
+    sql = sql + " OFFSET " + (offset as String)
+  end
   let parameters = new ParameterValues(state.head, state.count)
 
-  return CompileResult<T>.Plan(new TypedPlan<T>(new SqlPlan(sql, parameters, bounded, columns), decoder))
+  var planLimit = queryRowLimit()
+
+  if bounded != null
+    planLimit = bounded
+  end
+  let requiresCheckedScalars = state.requiresCheckedScalars || (customSelection != null && customSelection.requiresCheckedScalars()) || (fromSql != null && fromSql.requiresCheckedScalars())
+
+  return CompileResult<T>.Plan(new TypedPlan<T>(new SqlPlan(sql, parameters, planLimit, columns, requiresCheckedScalars), decoder))
 end
 
 def execute<T>(compiled: CompileResult<T>, provider: Provider): QueryResult<T>
@@ -807,6 +2243,10 @@ def execute<T>(compiled: CompileResult<T>, provider: Provider): QueryResult<T>
       return QueryResult<T>.Failure(error)
     case CompileResult.Plan(plan)
       let sql = plan.sql()
+
+      if sql.requiresCheckedScalars() && !provider.supports(ProviderCapability.CheckedScalarExpressions())
+        return QueryResult<T>.Failure(QueryFailure.UnsupportedCapability("checked-scalar-expressions"))
+      end
 
       match provider.execute(sql)
         case ProviderResult.Failure(message)
@@ -838,6 +2278,8 @@ def cellKind(value: Cell): String
       return "Bool"
     case Cell.Int(found)
       return "Int"
+    case Cell.Float(found)
+      return "Float"
     case Cell.Text(found)
       return "String"
   end
@@ -855,6 +2297,8 @@ def decodeBool(row: RawRow, column: String): DecodeResult<Bool>
           return DecodeResult<Bool>.Failure(QueryFailure.TypeMismatch(column, "Bool", "NULL"))
         case Cell.Int(value)
           return DecodeResult<Bool>.Failure(QueryFailure.TypeMismatch(column, "Bool", "Int"))
+        case Cell.Float(value)
+          return DecodeResult<Bool>.Failure(QueryFailure.TypeMismatch(column, "Bool", "Float"))
         case Cell.Text(value)
           return DecodeResult<Bool>.Failure(QueryFailure.TypeMismatch(column, "Bool", "String"))
       end
@@ -873,6 +2317,8 @@ def decodeInt(row: RawRow, column: String): DecodeResult<Int>
           return DecodeResult<Int>.Failure(QueryFailure.TypeMismatch(column, "Int", "NULL"))
         case Cell.Bool(value)
           return DecodeResult<Int>.Failure(QueryFailure.TypeMismatch(column, "Int", "Bool"))
+        case Cell.Float(value)
+          return DecodeResult<Int>.Failure(QueryFailure.TypeMismatch(column, "Int", "Float"))
         case Cell.Text(value)
           return DecodeResult<Int>.Failure(QueryFailure.TypeMismatch(column, "Int", "String"))
       end
@@ -891,6 +2337,8 @@ def decodeString(row: RawRow, column: String): DecodeResult<String>
           return DecodeResult<String>.Failure(QueryFailure.TypeMismatch(column, "String", "NULL"))
         case Cell.Bool(value)
           return DecodeResult<String>.Failure(QueryFailure.TypeMismatch(column, "String", "Bool"))
+        case Cell.Float(value)
+          return DecodeResult<String>.Failure(QueryFailure.TypeMismatch(column, "String", "Float"))
         case Cell.Int(value)
           return DecodeResult<String>.Failure(QueryFailure.TypeMismatch(column, "String", "Int"))
       end
@@ -909,6 +2357,8 @@ def decodeNullableBool(row: RawRow, column: String): DecodeResult<Bool?>
           return DecodeResult<Bool?>.Value(value)
         case Cell.Int(value)
           return DecodeResult<Bool?>.Failure(QueryFailure.TypeMismatch(column, "Bool?", "Int"))
+        case Cell.Float(value)
+          return DecodeResult<Bool?>.Failure(QueryFailure.TypeMismatch(column, "Bool?", "Float"))
         case Cell.Text(value)
           return DecodeResult<Bool?>.Failure(QueryFailure.TypeMismatch(column, "Bool?", "String"))
       end
@@ -927,6 +2377,8 @@ def decodeNullableInt(row: RawRow, column: String): DecodeResult<Int?>
           return DecodeResult<Int?>.Value(value)
         case Cell.Bool(value)
           return DecodeResult<Int?>.Failure(QueryFailure.TypeMismatch(column, "Int?", "Bool"))
+        case Cell.Float(value)
+          return DecodeResult<Int?>.Failure(QueryFailure.TypeMismatch(column, "Int?", "Float"))
         case Cell.Text(value)
           return DecodeResult<Int?>.Failure(QueryFailure.TypeMismatch(column, "Int?", "String"))
       end
@@ -945,8 +2397,56 @@ def decodeNullableString(row: RawRow, column: String): DecodeResult<String?>
           return DecodeResult<String?>.Value(value)
         case Cell.Bool(value)
           return DecodeResult<String?>.Failure(QueryFailure.TypeMismatch(column, "String?", "Bool"))
+        case Cell.Float(value)
+          return DecodeResult<String?>.Failure(QueryFailure.TypeMismatch(column, "String?", "Float"))
         case Cell.Int(value)
           return DecodeResult<String?>.Failure(QueryFailure.TypeMismatch(column, "String?", "Int"))
+      end
+  end
+end
+
+def decodeFloat(row: RawRow, column: String): DecodeResult<Float>
+  match row.value(column)
+    case CellLookup.Missing()
+      return DecodeResult<Float>.Failure(QueryFailure.MissingColumn(column))
+    case CellLookup.Found(cell)
+      match cell
+        case Cell.Float(value)
+          if !dataFloatFinite(value)
+            return DecodeResult<Float>.Failure(QueryFailure.TypeMismatch(column, "finite Float", "Float"))
+          end
+          return DecodeResult<Float>.Value(value)
+        case Cell.Null()
+          return DecodeResult<Float>.Failure(QueryFailure.TypeMismatch(column, "Float", "NULL"))
+        case Cell.Bool(value)
+          return DecodeResult<Float>.Failure(QueryFailure.TypeMismatch(column, "Float", "Bool"))
+        case Cell.Int(value)
+          return DecodeResult<Float>.Failure(QueryFailure.TypeMismatch(column, "Float", "Int"))
+        case Cell.Text(value)
+          return DecodeResult<Float>.Failure(QueryFailure.TypeMismatch(column, "Float", "String"))
+      end
+  end
+end
+
+def decodeNullableFloat(row: RawRow, column: String): DecodeResult<Float?>
+  match row.value(column)
+    case CellLookup.Missing()
+      return DecodeResult<Float?>.Failure(QueryFailure.MissingColumn(column))
+    case CellLookup.Found(cell)
+      match cell
+        case Cell.Null()
+          return DecodeResult<Float?>.Value(null)
+        case Cell.Float(value)
+          if !dataFloatFinite(value)
+            return DecodeResult<Float?>.Failure(QueryFailure.TypeMismatch(column, "finite Float?", "Float"))
+          end
+          return DecodeResult<Float?>.Value(value)
+        case Cell.Bool(value)
+          return DecodeResult<Float?>.Failure(QueryFailure.TypeMismatch(column, "Float?", "Bool"))
+        case Cell.Int(value)
+          return DecodeResult<Float?>.Failure(QueryFailure.TypeMismatch(column, "Float?", "Int"))
+        case Cell.Text(value)
+          return DecodeResult<Float?>.Failure(QueryFailure.TypeMismatch(column, "Float?", "String"))
       end
   end
 end

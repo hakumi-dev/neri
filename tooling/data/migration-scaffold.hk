@@ -1,0 +1,162 @@
+use files
+use host
+use neri_data
+
+def dataMigrationFailure(error: neri_data::MigrationFailure): String
+  match error
+    case neri_data::MigrationFailure.Validation(message)
+      return message
+    case neri_data::MigrationFailure.Drift(message)
+      return message
+    case neri_data::MigrationFailure.Unsupported(message)
+      return message
+    case neri_data::MigrationFailure.Provider(message)
+      return message
+  end
+end
+
+def dataMigrationPrepare(mapping: DataMapping, before: neri_data::SchemaModel, id: String): DataMigrationDraft
+  let draft = new DataMigrationDraft()
+
+  if mapping.error != ""
+    draft.error = mapping.error
+    return draft
+  end
+  if !dataIdentifier(id)
+    draft.error = "migration id must be one Neri identifier"
+    return draft
+  end
+  let current = dataMigrationModel(mapping)
+  let after = current.model
+
+  if current.error != "" || after == null
+    draft.error = current.error != "" ? current.error : "mapping has no schema model"
+    return draft
+  end
+  match neri_data::diffSchema(id, before, after)
+    case neri_data::SchemaDiffResult.Unchanged()
+      draft.unchanged = true
+      draft.beforeSignature = before.signature()
+      draft.afterSignature = after.signature()
+    case neri_data::SchemaDiffResult.Failure(error)
+      draft.error = dataMigrationFailure(error)
+    case neri_data::SchemaDiffResult.Plan(plan)
+      draft.beforeSignature = plan.beforeSignature()
+      draft.afterSignature = plan.afterSignature()
+      draft.upDataLoss = plan.upDataLoss()
+      draft.downDataLoss = plan.downDataLoss()
+      draft.source = dataMigrationSource(id, mapping.namespaceName + ".migrations", plan, after)
+      draft.snapshot = dataMigrationSnapshot(after)
+      if draft.source == "" || draft.snapshot == ""
+        draft.error = "cannot render migration source or schema snapshot"
+      end
+  end
+  return draft
+end
+
+def dataMigrationMarker(mapping: DataMapping, draft: DataMigrationDraft): String
+  return "{\n  \"version\": 1,\n  \"generator\": \"neri-data-migration\",\n  \"beforeSignature\": " + lspQuote(draft.beforeSignature) + ",\n  \"afterSignature\": " + lspQuote(draft.afterSignature) + ",\n  \"snapshotSha256\": \"" + sha256Text(draft.snapshot) + "\",\n  \"sourceSha256\": \"" + sha256Text(draft.source) + "\",\n  \"mappingSha256\": \"" + sha256Text(mapping.mappingText) + "\",\n  \"upDataLoss\": " + (draft.upDataLoss ? "true" : "false") + ",\n  \"downDataLoss\": " + (draft.downDataLoss ? "true" : "false") + "\n}\n"
+end
+
+def dataMigrationRemoveOwn(path: String, content: String): Void
+  let actual = host::readText(path)
+
+  if actual != null && actual == content
+    files::removeFile(path)
+  end
+end
+
+def dataMigrationHistoricalUnchanged(draft: DataMigrationDraft): Bool
+  if draft.historicalPath == ""
+    return true
+  end
+  return dataMigrationReadLimited(draft.historicalPath, host::stringByteLength(draft.historicalSnapshotText)) == draft.historicalSnapshotText && dataMigrationReadLimited(bootstrapDirectory(draft.historicalPath) + "/scaffold.json", host::stringByteLength(draft.historicalMarkerText)) == draft.historicalMarkerText
+end
+
+def dataMigrationOutputName(name: String): Bool
+  if name == "" || name == "." || name == ".." || host::stringByteLength(name) > 128
+    return false
+  end
+  var index = 0
+
+  while index < host::stringByteLength(name)
+    let byte = host::stringByteAt(name, index) as Int
+
+    if !((byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) || (byte >= 48 && byte <= 57) || byte == 95 || byte == 45 || byte == 46)
+      return false
+    end
+    index = index + 1
+  end
+  return true
+end
+
+def dataMigrationPublish(mapping: DataMapping, draft: DataMigrationDraft, outputPath: String): Bool
+  if mapping.error != ""
+    return false
+  end
+  if draft.error != "" || draft.unchanged || draft.source == "" || draft.snapshot == ""
+    return mapping.fail(draft.error != "" ? draft.error : "migration draft has no changes to publish")
+  end
+  let parentPath = bootstrapDirectory(outputPath)
+  let parent = neriCanonicalPath(parentPath)
+
+  if parent == null
+    return mapping.fail("migration output parent must already exist")
+  end
+  let parentStatus = files::status(parent)
+  let parentValue = parentStatus.status
+
+  if parentStatus.failure != null || parentValue == null || !parentValue.exists || !parentValue.kind.isDirectory() || parentValue.symlink
+    return mapping.fail("migration output parent must be an existing directory")
+  end
+  let nameStart = host::stringByteLength(parentPath) + (parentPath == "/" ? 0 : 1)
+  let name = host::stringSlice(outputPath, nameStart, host::stringByteLength(outputPath) - nameStart)
+
+  if !dataMigrationOutputName(name)
+    return mapping.fail("migration output directory must end in a safe name")
+  end
+  let destination = parent + (parent == "/" ? "" : "/") + name
+  let existing = files::status(destination)
+  let state = existing.status
+
+  if existing.failure != null || state == null
+    return mapping.fail("cannot inspect migration output destination")
+  end
+  if state.exists
+    return mapping.fail("migration output destination already exists")
+  end
+  let inputs = dataPublishInputs(mapping)
+
+  if inputs == null || !dataPublishVerifyInputs(mapping, inputs)
+    return false
+  end
+  if !dataMigrationHistoricalUnchanged(draft)
+    return mapping.fail("historical snapshot or marker changed before publication")
+  end
+  if files::createDirectory(destination).failure != null
+    return mapping.fail("cannot reserve migration output directory; it may already exist")
+  end
+  let sourcePath = destination + "/migration.hk"
+  let snapshotPath = destination + "/snapshot.json"
+  let markerPath = destination + "/scaffold.json"
+  let marker = dataMigrationMarker(mapping, draft)
+  var complete = host::writeText(sourcePath, draft.source) && host::writeText(snapshotPath, draft.snapshot)
+
+  if complete
+    complete = host::readText(sourcePath) == draft.source && host::readText(snapshotPath) == draft.snapshot && dataPublishVerifyInputs(mapping, inputs) && dataMigrationHistoricalUnchanged(draft)
+  end
+  if complete
+    complete = host::writeText(markerPath, marker) && host::readText(markerPath) == marker
+  end
+  if complete
+    complete = dataPublishVerifyInputs(mapping, inputs) && dataMigrationHistoricalUnchanged(draft)
+  end
+  if complete
+    return true
+  end
+  dataMigrationRemoveOwn(markerPath, marker)
+  dataMigrationRemoveOwn(snapshotPath, draft.snapshot)
+  dataMigrationRemoveOwn(sourcePath, draft.source)
+  files::removeDirectory(destination)
+  return mapping.fail("migration publication failed; inspect incomplete output directory if cleanup could not remove it")
+end

@@ -1,0 +1,770 @@
+use cascade_data
+use cascade_model
+use console
+use files
+use neri_data
+use neri_data_sqlite
+use neri_data_sqlite_fixture
+use resources
+use result
+use test
+
+def tracked<T>(result: TrackHandleResult<T>): TrackedHandle<T>?
+  match result
+    case TrackHandleResult.Tracked(handle)
+      return handle
+    case TrackHandleResult.Failure(error)
+      test::assertTrue(false)
+      return null
+  end
+end
+
+def saved(result: WriteResult, expected: Int): Void
+  match result
+    case WriteResult.Saved(count)
+
+      test::assertEqual(count, expected)
+    case WriteResult.SavedWithValues(count, outputs)
+      test::assertTrue(false)
+    case WriteResult.Failure(error)
+      console::println(writeFailureMessage(error))
+
+      test::assertTrue(false)
+  end
+end
+
+def failed(result: WriteResult): Void
+  match result
+    case WriteResult.Saved(count)
+      test::assertTrue(false)
+    case WriteResult.SavedWithValues(count, outputs)
+      test::assertTrue(false)
+    case WriteResult.Failure(error)
+      test::assertEqual(writeFailureMessage(error), "SQLite step failed (code 1811): FOREIGN KEY constraint failed")
+  end
+end
+
+def detachedRemoval(result: QueryFailure?): Void
+  test::assertTrue(result != null)
+  if result != null
+    match result
+      case QueryFailure.Provider(message)
+        test::assertEqual(message, "entity is detached")
+      case QueryFailure.InvalidIdentifier(name)
+        test::assertTrue(false)
+      case QueryFailure.InvalidLimit(value, maximum)
+        test::assertTrue(false)
+      case QueryFailure.MissingLimit(maximum)
+        test::assertTrue(false)
+      case QueryFailure.SourceMismatch(expected, actual)
+        test::assertTrue(false)
+      case QueryFailure.UnsupportedCapability(name)
+        test::assertTrue(false)
+      case QueryFailure.MissingColumn(name)
+        test::assertTrue(false)
+      case QueryFailure.TypeMismatch(column, expected, actual)
+        test::assertTrue(false)
+      case QueryFailure.Cardinality(expected, actual)
+        test::assertTrue(false)
+    end
+  end
+end
+
+def counts(provider: SQLiteProvider, roots: Int, branches: Int, leaves: Int): Void
+  let read = new CascadeDatabase(provider)
+
+  match read.roots.count()
+    case QueryValue.Value(value)
+      test::assertEqual(value, roots)
+    case QueryValue.Failure(error)
+      test::assertTrue(false)
+  end
+  match read.branches.count()
+    case QueryValue.Value(value)
+      test::assertEqual(value, branches)
+    case QueryValue.Failure(error)
+      test::assertTrue(false)
+  end
+  match read.leaves.count()
+    case QueryValue.Value(value)
+      test::assertEqual(value, leaves)
+    case QueryValue.Failure(error)
+      test::assertTrue(false)
+  end
+end
+
+def verifyDiamond(provider: SQLiteProvider): Void
+  let db = new CascadeDatabase(provider)
+  let root = new cascade_model::Root(0, "diamond")
+  let left = new Branch(0, 0, "left")
+  let right = new Branch(0, 0, "right")
+  let shared = new Leaf(0, null, 0, "shared")
+  let r = tracked(db.roots.addWithHandle(root))
+  let l = tracked(db.branches.addWithHandle(left))
+  let b = tracked(db.branches.addWithHandle(right))
+  let s = tracked(db.leaves.addWithHandle(shared))
+
+  test::assertTrue(r != null && l != null && b != null && s != null)
+  if r == null || l == null || b == null || s == null
+    return
+  end
+
+  test::assertTrue(db.link_branchesFor_Root_by_rootId(r, l) == null)
+  test::assertTrue(db.link_branchesFor_Root_by_rootId(r, b) == null)
+  test::assertTrue(db.link_leavesFor_Branch_by_leftId(l, s) == null)
+  test::assertTrue(db.link_leavesFor_Branch_by_rightId(b, s) == null)
+  saved(db.saveChanges(), 4)
+  counts(provider, 1, 2, 1)
+
+  test::assertTrue(db.removeCascade_roots(r) == null)
+  saved(db.saveChanges(), 4)
+  counts(provider, 0, 0, 0)
+end
+
+def verifyUnregisteredRetry(provider: SQLiteProvider, path: String): Void
+  let db = new CascadeDatabase(provider)
+  let root = new cascade_model::Root(0, "registered")
+  let branch = new Branch(0, 0, "registered")
+  let known = new Leaf(0, null, 0, "known")
+  let r = tracked(db.roots.addWithHandle(root))
+  let b = tracked(db.branches.addWithHandle(branch))
+  let k = tracked(db.leaves.addWithHandle(known))
+
+  test::assertTrue(r != null && b != null && k != null)
+  if r == null || b == null || k == null
+    return
+  end
+
+  test::assertTrue(db.link_branchesFor_Root_by_rootId(r, b) == null)
+  test::assertTrue(db.link_leavesFor_Branch_by_rightId(b, k) == null)
+  saved(db.saveChanges(), 3)
+  counts(provider, 1, 1, 1)
+  let hiddenSql = "INSERT INTO leaves(id,left_id,right_id,name) VALUES(100," + (branch.id as String) + "," + (branch.id as String) + ",'hidden');"
+
+  test::assertTrue(createSQLiteFixture(path, hiddenSql))
+  counts(provider, 1, 1, 2)
+  let earlier = new cascade_model::Root(0, "earlier save")
+
+  saved(db.beginTransaction(), 0)
+
+  test::assertTrue(db.roots.add(earlier) == null)
+  saved(db.saveChanges(), 1)
+
+  test::assertTrue(earlier.id > 0)
+  let earlierId = earlier.id
+
+  test::assertTrue(db.removeCascade_roots(r) == null)
+  failed(db.saveChanges())
+  counts(provider, 2, 1, 2)
+  let afterFailure = new CascadeDatabase(provider)
+
+  test::assertEqual(earlier.id, earlierId)
+  match afterFailure.leaves.where(id: known.id).count()
+    case QueryValue.Value(value)
+      test::assertEqual(value, 1)
+    case QueryValue.Failure(error)
+      test::assertTrue(false)
+  end
+  let hidden = new Leaf(100, branch.id, branch.id, "hidden")
+  let h = tracked(db.leaves.attachWithHandle(hidden))
+
+  test::assertTrue(h != null)
+  if h == null
+    return
+  end
+
+  test::assertTrue(db.leaves.remove(hidden) == null)
+  test::assertTrue(db.link_leavesFor_Branch_by_leftId(b, h) == null)
+  test::assertTrue(db.link_leavesFor_Branch_by_rightId(b, h) == null)
+  saved(db.saveChanges(), 4)
+  counts(provider, 1, 0, 0)
+  saved(db.commitTransaction(), 0)
+  counts(provider, 1, 0, 0)
+end
+
+def verifyReassignedAndUnlinked(provider: SQLiteProvider): Void
+  let db = new CascadeDatabase(provider)
+  let oldRoot = new cascade_model::Root(0, "old root")
+  let newRoot = new cascade_model::Root(0, "new root")
+  let moved = new Branch(0, 0, "moved")
+  let oldBranch = new Branch(0, 0, "old branch")
+  let survivor = new Leaf(0, null, 0, "survivor")
+  let a = tracked(db.roots.addWithHandle(oldRoot))
+  let n = tracked(db.roots.addWithHandle(newRoot))
+  let m = tracked(db.branches.addWithHandle(moved))
+  let b = tracked(db.branches.addWithHandle(oldBranch))
+  let s = tracked(db.leaves.addWithHandle(survivor))
+
+  test::assertTrue(a != null && n != null && m != null && b != null && s != null)
+  if a == null || n == null || m == null || b == null || s == null
+    return
+  end
+
+  test::assertTrue(db.link_branchesFor_Root_by_rootId(a, m) == null)
+  test::assertTrue(db.link_branchesFor_Root_by_rootId(a, b) == null)
+  test::assertTrue(db.link_leavesFor_Branch_by_leftId(b, s) == null)
+  test::assertTrue(db.link_leavesFor_Branch_by_rightId(m, s) == null)
+  saved(db.saveChanges(), 5)
+
+  test::assertTrue(db.reassign_branchesFor_Root_by_rootId(n, m) == null)
+  test::assertTrue(db.unlink_leavesFor_Branch_by_leftId(s) == null)
+  test::assertTrue(survivor.leftId == null)
+  test::assertTrue(db.removeCascade_roots(a) == null)
+  saved(db.saveChanges(), 4)
+  counts(provider, 1, 1, 1)
+  let read = new CascadeDatabase(provider)
+
+  match read.branches.where(id: moved.id).single()
+    case QueryValue.Value(value)
+      test::assertEqual(value.rootId, newRoot.id)
+    case QueryValue.Failure(error)
+      test::assertTrue(false)
+  end
+  match read.leaves.where(id: survivor.id).single()
+    case QueryValue.Value(value)
+      test::assertTrue(value.leftId == null)
+      test::assertEqual(value.rightId, moved.id)
+    case QueryValue.Failure(error)
+      test::assertTrue(false)
+  end
+end
+
+def verifyAddedCancellation(provider: SQLiteProvider): Void
+  let db = new CascadeDatabase(provider)
+  let root = new cascade_model::Root(0, "added")
+  let branch = new Branch(0, 0, "added")
+  let leaf = new Leaf(0, null, 0, "added")
+  let r = tracked(db.roots.addWithHandle(root))
+  let b = tracked(db.branches.addWithHandle(branch))
+  let l = tracked(db.leaves.addWithHandle(leaf))
+
+  test::assertTrue(r != null && b != null && l != null)
+  if r == null || b == null || l == null
+    return
+  end
+
+  test::assertTrue(db.link_branchesFor_Root_by_rootId(r, b) == null)
+  test::assertTrue(db.link_leavesFor_Branch_by_rightId(b, l) == null)
+  saved(db.beginTransaction(), 0)
+
+  test::assertTrue(db.removeCascade_roots(r) == null)
+  saved(db.saveChanges(), 0)
+  saved(db.rollbackTransaction(), 0)
+  saved(db.saveChanges(), 0)
+  counts(provider, 0, 0, 0)
+end
+
+def verifyRollback(provider: SQLiteProvider): Void
+  let db = new CascadeDatabase(provider)
+  let root = new cascade_model::Root(0, "rollback")
+  let branch = new Branch(0, 0, "rollback")
+  let r = tracked(db.roots.addWithHandle(root))
+  let b = tracked(db.branches.addWithHandle(branch))
+
+  test::assertTrue(r != null && b != null)
+  if r == null || b == null
+    return
+  end
+
+  test::assertTrue(db.link_branchesFor_Root_by_rootId(r, b) == null)
+  saved(db.saveChanges(), 2)
+  saved(db.beginTransaction(), 0)
+
+  test::assertTrue(db.removeCascade_roots(r) == null)
+  saved(db.saveChanges(), 2)
+  counts(provider, 0, 0, 0)
+  saved(db.rollbackTransaction(), 0)
+  counts(provider, 1, 1, 0)
+  saved(db.saveChanges(), 2)
+  counts(provider, 0, 0, 0)
+end
+
+def verifySelfEdge(provider: SQLiteProvider): Void
+  let db = new CascadeDatabase(provider)
+  let node = new cascade_model::Node(1, 1)
+  let handle = tracked(db.nodes.attachWithHandle(node))
+
+  test::assertTrue(handle != null)
+  if handle == null
+    return
+  end
+
+  test::assertTrue(db.link_nodesFor_Node_by_parentId(handle, handle) == null)
+  test::assertTrue(db.removeCascade_nodes(handle) == null)
+  saved(db.saveChanges(), 1)
+  let read = new CascadeDatabase(provider)
+
+  match read.nodes.count()
+    case QueryValue.Value(value)
+      test::assertEqual(value, 0)
+    case QueryValue.Failure(error)
+      test::assertTrue(false)
+  end
+end
+
+def verifyStringCascade(provider: SQLiteProvider): Void
+  let db = new CascadeDatabase(provider)
+  let key = "O'Reilly; DROP TABLE codes; -- 水"
+  let code = new CodeRoot(key)
+  let child = new TextChild(1, null)
+  let c = tracked(db.codes.addWithHandle(code))
+  let t = tracked(db.textChildren.addWithHandle(child))
+
+  test::assertTrue(c != null && t != null)
+  if c == null || t == null
+    return
+  end
+
+  test::assertTrue(db.link_textChildrenFor_CodeRoot_by_codeValue(c, t) == null)
+  saved(db.saveChanges(), 2)
+  let read = new CascadeDatabase(provider)
+
+  match read.textChildren.where(id: child.id).single()
+    case QueryValue.Value(value)
+      let codeValue = value.codeValue
+
+      test::assertTrue(codeValue != null)
+      if codeValue != null
+        test::assertEqual(codeValue, key)
+      end
+    case QueryValue.Failure(error)
+      test::assertTrue(false)
+  end
+
+  test::assertTrue(db.removeCascade_codes(c) == null)
+  saved(db.saveChanges(), 2)
+  let after = new CascadeDatabase(provider)
+
+  match after.codes.count()
+    case QueryValue.Value(value)
+      test::assertEqual(value, 0)
+    case QueryValue.Failure(error)
+      test::assertTrue(false)
+  end
+  match after.textChildren.count()
+    case QueryValue.Value(value)
+      test::assertEqual(value, 0)
+    case QueryValue.Failure(error)
+      test::assertTrue(false)
+  end
+end
+
+def verifyRequiredOrphan(provider: SQLiteProvider): Void
+  let db = new CascadeDatabase(provider)
+  let root = new cascade_model::Root(0, "orphan root")
+  let branch = new Branch(0, 0, "orphan branch")
+  let leaf = new Leaf(0, null, 0, "orphan leaf")
+  let r = tracked(db.roots.addWithHandle(root))
+  let b = tracked(db.branches.addWithHandle(branch))
+  let l = tracked(db.leaves.addWithHandle(leaf))
+
+  test::assertTrue(r != null && b != null && l != null)
+  if r == null || b == null || l == null
+    return
+  end
+
+  test::assertTrue(db.link_branchesFor_Root_by_rootId(r, b) == null)
+  test::assertTrue(db.link_leavesFor_Branch_by_rightId(b, l) == null)
+  saved(db.saveChanges(), 3)
+  let rootId = root.id
+  let branchId = branch.id
+
+  test::assertTrue(db.unlink_branchesFor_Root_by_rootId(b) == null)
+  test::assertEqual(branch.rootId, rootId)
+  test::assertEqual(leaf.rightId, branchId)
+  saved(db.saveChanges(), 2)
+  counts(provider, 1, 0, 0)
+  let read = new CascadeDatabase(provider)
+
+  match read.roots.where(id: rootId).count()
+    case QueryValue.Value(value)
+      test::assertEqual(value, 1)
+    case QueryValue.Failure(error)
+      test::assertTrue(false)
+  end
+end
+
+def verifyRequiredOrphanAndParentDelete(provider: SQLiteProvider): Void
+  let db = new CascadeDatabase(provider)
+  let root = new cascade_model::Root(0, "same save root")
+  let branch = new Branch(0, 0, "same save branch")
+  let leaf = new Leaf(0, null, 0, "same save leaf")
+  let r = tracked(db.roots.addWithHandle(root))
+  let b = tracked(db.branches.addWithHandle(branch))
+  let l = tracked(db.leaves.addWithHandle(leaf))
+
+  test::assertTrue(r != null && b != null && l != null)
+  if r == null || b == null || l == null
+    return
+  end
+
+  test::assertTrue(db.link_branchesFor_Root_by_rootId(r, b) == null)
+  test::assertTrue(db.link_leavesFor_Branch_by_rightId(b, l) == null)
+  saved(db.saveChanges(), 3)
+  let oldId = root.id
+  let replacement = new cascade_model::Root(0, "replacement root")
+  let newRoot = tracked(db.roots.addWithHandle(replacement))
+
+  test::assertTrue(newRoot != null)
+  if newRoot == null
+    return
+  end
+
+  test::assertTrue(db.reassign_branchesFor_Root_by_rootId(newRoot, b) == null)
+  test::assertTrue(db.unlink_branchesFor_Root_by_rootId(b) == null)
+  test::assertTrue(db.removeCascade_roots(r) == null)
+  saved(db.saveChanges(), 4)
+  counts(provider, 1, 0, 0)
+  let read = new CascadeDatabase(provider)
+
+  test::assertTrue(replacement.id > 0)
+  match read.roots.where(id: oldId).count()
+    case QueryValue.Value(value)
+      test::assertEqual(value, 0)
+    case QueryValue.Failure(error)
+      test::assertTrue(false)
+  end
+  match read.roots.where(id: replacement.id).count()
+    case QueryValue.Value(value)
+      test::assertEqual(value, 1)
+    case QueryValue.Failure(error)
+      test::assertTrue(false)
+  end
+end
+
+def verifyAddedOrphan(provider: SQLiteProvider): Void
+  let db = new CascadeDatabase(provider)
+  let root = new cascade_model::Root(0, "added orphan root")
+  let branch = new Branch(0, 0, "added orphan branch")
+  let leaf = new Leaf(0, null, 0, "added orphan leaf")
+  let r = tracked(db.roots.addWithHandle(root))
+  let b = tracked(db.branches.addWithHandle(branch))
+  let l = tracked(db.leaves.addWithHandle(leaf))
+
+  test::assertTrue(r != null && b != null && l != null)
+  if r == null || b == null || l == null
+    return
+  end
+
+  test::assertTrue(db.link_branchesFor_Root_by_rootId(r, b) == null)
+  test::assertTrue(db.link_leavesFor_Branch_by_rightId(b, l) == null)
+  test::assertTrue(db.unlink_branchesFor_Root_by_rootId(b) == null)
+  saved(db.saveChanges(), 1)
+  counts(provider, 1, 0, 0)
+  let staged = new CascadeDatabase(provider)
+  let stagedRoot = new cascade_model::Root(0, "outer added orphan root")
+  let stagedBranch = new Branch(0, 0, "outer added orphan branch")
+  let stagedLeaf = new Leaf(0, null, 0, "outer added orphan leaf")
+
+  saved(staged.beginTransaction(), 0)
+  let outerRoot = tracked(staged.roots.addWithHandle(stagedRoot))
+  let outerBranch = tracked(staged.branches.addWithHandle(stagedBranch))
+  let outerLeaf = tracked(staged.leaves.addWithHandle(stagedLeaf))
+
+  test::assertTrue(outerRoot != null && outerBranch != null && outerLeaf != null)
+  if outerRoot == null || outerBranch == null || outerLeaf == null
+    return
+  end
+  let temporaryRoot = stagedRoot.id
+  let temporaryBranch = stagedBranch.id
+  let temporaryLeaf = stagedLeaf.id
+
+  test::assertTrue(staged.link_branchesFor_Root_by_rootId(outerRoot, outerBranch) == null)
+  test::assertTrue(staged.link_leavesFor_Branch_by_rightId(outerBranch, outerLeaf) == null)
+  saved(staged.saveChanges(), 3)
+
+  test::assertTrue(stagedRoot.id > 0 && stagedBranch.id > 0 && stagedLeaf.id > 0)
+  test::assertTrue(staged.unlink_branchesFor_Root_by_rootId(outerBranch) == null)
+  saved(staged.rollbackTransaction(), 0)
+  counts(provider, 1, 0, 0)
+
+  test::assertEqual(stagedRoot.id, temporaryRoot)
+  test::assertEqual(stagedBranch.id, temporaryBranch)
+  test::assertEqual(stagedLeaf.id, temporaryLeaf)
+  test::assertEqual(stagedBranch.rootId, temporaryRoot)
+  test::assertEqual(stagedLeaf.rightId, temporaryBranch)
+  detachedRemoval(staged.branches.remove(stagedBranch))
+  detachedRemoval(staged.leaves.remove(stagedLeaf))
+  saved(staged.saveChanges(), 1)
+  counts(provider, 2, 0, 0)
+end
+
+def verifyOrphanRollback(provider: SQLiteProvider): Void
+  let db = new CascadeDatabase(provider)
+  let root = new cascade_model::Root(0, "rollback orphan root")
+  let branch = new Branch(0, 0, "rollback orphan branch")
+  let leaf = new Leaf(0, null, 0, "rollback orphan leaf")
+  let r = tracked(db.roots.addWithHandle(root))
+  let b = tracked(db.branches.addWithHandle(branch))
+  let l = tracked(db.leaves.addWithHandle(leaf))
+
+  test::assertTrue(r != null && b != null && l != null)
+  if r == null || b == null || l == null
+    return
+  end
+
+  test::assertTrue(db.link_branchesFor_Root_by_rootId(r, b) == null)
+  test::assertTrue(db.link_leavesFor_Branch_by_rightId(b, l) == null)
+  saved(db.saveChanges(), 3)
+  let rootId = root.id
+
+  saved(db.beginTransaction(), 0)
+
+  test::assertTrue(db.unlink_branchesFor_Root_by_rootId(b) == null)
+  saved(db.saveChanges(), 2)
+  counts(provider, 1, 0, 0)
+  saved(db.rollbackTransaction(), 0)
+  counts(provider, 1, 1, 1)
+
+  test::assertEqual(branch.rootId, rootId)
+  saved(db.saveChanges(), 2)
+  counts(provider, 1, 0, 0)
+end
+
+def verifyHiddenOrphanRetry(provider: SQLiteProvider, path: String): Void
+  let db = new CascadeDatabase(provider)
+  let root = new cascade_model::Root(0, "hidden orphan root")
+  let branch = new Branch(0, 0, "hidden orphan branch")
+  let known = new Leaf(0, null, 0, "known orphan leaf")
+  let r = tracked(db.roots.addWithHandle(root))
+  let b = tracked(db.branches.addWithHandle(branch))
+  let k = tracked(db.leaves.addWithHandle(known))
+
+  test::assertTrue(r != null && b != null && k != null)
+  if r == null || b == null || k == null
+    return
+  end
+
+  test::assertTrue(db.link_branchesFor_Root_by_rootId(r, b) == null)
+  test::assertTrue(db.link_leavesFor_Branch_by_rightId(b, k) == null)
+  saved(db.saveChanges(), 3)
+  let hiddenSql = "INSERT INTO leaves(id,left_id,right_id,name) VALUES(101,NULL," + (branch.id as String) + ",'hidden orphan');"
+
+  test::assertTrue(createSQLiteFixture(path, hiddenSql))
+  counts(provider, 1, 1, 2)
+  let earlier = new cascade_model::Root(0, "earlier accepted orphan")
+
+  saved(db.beginTransaction(), 0)
+
+  test::assertTrue(db.roots.add(earlier) == null)
+  saved(db.saveChanges(), 1)
+
+  test::assertTrue(earlier.id > 0)
+  let earlierId = earlier.id
+
+  test::assertTrue(db.unlink_branchesFor_Root_by_rootId(b) == null)
+  failed(db.saveChanges())
+  counts(provider, 2, 1, 2)
+  let afterFailure = new CascadeDatabase(provider)
+
+  test::assertEqual(earlier.id, earlierId)
+  match afterFailure.leaves.where(id: known.id).count()
+    case QueryValue.Value(value)
+      test::assertEqual(value, 1)
+    case QueryValue.Failure(error)
+      test::assertTrue(false)
+  end
+  let hidden = new Leaf(101, null, branch.id, "hidden orphan")
+  let h = tracked(db.leaves.attachWithHandle(hidden))
+
+  test::assertTrue(h != null)
+  if h == null
+    return
+  end
+
+  test::assertTrue(db.leaves.remove(hidden) == null)
+  test::assertTrue(db.link_leavesFor_Branch_by_rightId(b, h) == null)
+  saved(db.saveChanges(), 3)
+  counts(provider, 2, 0, 0)
+  saved(db.commitTransaction(), 0)
+  counts(provider, 2, 0, 0)
+end
+
+def verifyRequiredStringOrphan(provider: SQLiteProvider): Void
+  let db = new CascadeDatabase(provider)
+  let key = "O'Reilly; -- required 水"
+  let code = new CodeRoot(key)
+  let child = new RequiredTextChild(1, "unassigned")
+  let c = tracked(db.codes.addWithHandle(code))
+  let t = tracked(db.requiredTextChildren.addWithHandle(child))
+
+  test::assertTrue(c != null && t != null)
+  if c == null || t == null
+    return
+  end
+
+  test::assertTrue(db.link_requiredTextChildrenFor_CodeRoot_by_codeValue(c, t) == null)
+  saved(db.saveChanges(), 2)
+
+  test::assertEqual(child.codeValue, key)
+  test::assertTrue(db.unlink_requiredTextChildrenFor_CodeRoot_by_codeValue(t) == null)
+  test::assertEqual(child.codeValue, key)
+  saved(db.saveChanges(), 1)
+  let read = new CascadeDatabase(provider)
+
+  match read.codes.where(code: key).count()
+    case QueryValue.Value(value)
+      test::assertEqual(value, 1)
+    case QueryValue.Failure(error)
+      test::assertTrue(false)
+  end
+  match read.requiredTextChildren.count()
+    case QueryValue.Value(value)
+      test::assertEqual(value, 0)
+    case QueryValue.Failure(error)
+      test::assertTrue(false)
+  end
+end
+
+def verifyFiles(): resources::Outcome<Int, result::Failure>
+  using temporary <- files::TemporaryDirectory.create("neri-cascades-")
+    let schema = "CREATE TABLE roots(id INTEGER PRIMARY KEY,name TEXT NOT NULL); CREATE TABLE branches(id INTEGER PRIMARY KEY,root_id INTEGER NOT NULL REFERENCES roots(id) ON DELETE RESTRICT,name TEXT NOT NULL); CREATE TABLE leaves(id INTEGER PRIMARY KEY,left_id INTEGER REFERENCES branches(id) ON DELETE RESTRICT,right_id INTEGER NOT NULL REFERENCES branches(id) ON DELETE RESTRICT,name TEXT NOT NULL); CREATE TABLE nodes(id INTEGER PRIMARY KEY,parent_id INTEGER REFERENCES nodes(id) ON DELETE RESTRICT); CREATE TABLE codes(code TEXT PRIMARY KEY); CREATE TABLE text_children(id INTEGER PRIMARY KEY,code_value TEXT REFERENCES codes(code) ON DELETE RESTRICT); CREATE TABLE required_text_children(id INTEGER PRIMARY KEY,code_value TEXT NOT NULL REFERENCES codes(code) ON DELETE RESTRICT);"
+    let diamondPath = temporary.path() + "/diamond.sqlite"
+    let hiddenPath = temporary.path() + "/hidden.sqlite"
+    let changedPath = temporary.path() + "/changed.sqlite"
+    let addedPath = temporary.path() + "/added.sqlite"
+    let rollbackPath = temporary.path() + "/rollback.sqlite"
+    let selfPath = temporary.path() + "/self.sqlite"
+    let stringPath = temporary.path() + "/string.sqlite"
+    let orphanPath = temporary.path() + "/orphan.sqlite"
+    let orphanParentPath = temporary.path() + "/orphan-parent.sqlite"
+    let addedOrphanPath = temporary.path() + "/added-orphan.sqlite"
+    let orphanRollbackPath = temporary.path() + "/orphan-rollback.sqlite"
+    let hiddenOrphanPath = temporary.path() + "/hidden-orphan.sqlite"
+    let stringOrphanPath = temporary.path() + "/string-orphan.sqlite"
+
+    test::assertTrue(createSQLiteFixture(diamondPath, schema))
+    test::assertTrue(createSQLiteFixture(hiddenPath, schema))
+    test::assertTrue(createSQLiteFixture(changedPath, schema))
+    test::assertTrue(createSQLiteFixture(addedPath, schema))
+    test::assertTrue(createSQLiteFixture(rollbackPath, schema))
+    test::assertTrue(createSQLiteFixture(selfPath, schema))
+    test::assertTrue(createSQLiteFixture(stringPath, schema))
+    test::assertTrue(createSQLiteFixture(orphanPath, schema))
+    test::assertTrue(createSQLiteFixture(orphanParentPath, schema))
+    test::assertTrue(createSQLiteFixture(addedOrphanPath, schema))
+    test::assertTrue(createSQLiteFixture(orphanRollbackPath, schema))
+    test::assertTrue(createSQLiteFixture(hiddenOrphanPath, schema))
+    test::assertTrue(createSQLiteFixture(stringOrphanPath, schema))
+    test::assertTrue(createSQLiteFixture(selfPath, "INSERT INTO nodes(id,parent_id) VALUES(1,1);"))
+    match SQLiteProvider.openWritable(diamondPath)
+      case SQLiteOpenResult.Opened(provider)
+        verifyDiamond(provider)
+
+        test::assertTrue(provider.close())
+      case SQLiteOpenResult.Failure(message)
+        test::assertTrue(false)
+    end
+    match SQLiteProvider.openWritable(hiddenPath)
+      case SQLiteOpenResult.Opened(provider)
+        verifyUnregisteredRetry(provider, hiddenPath)
+
+        test::assertTrue(provider.close())
+      case SQLiteOpenResult.Failure(message)
+        test::assertTrue(false)
+    end
+    match SQLiteProvider.openWritable(changedPath)
+      case SQLiteOpenResult.Opened(provider)
+        verifyReassignedAndUnlinked(provider)
+
+        test::assertTrue(provider.close())
+      case SQLiteOpenResult.Failure(message)
+        test::assertTrue(false)
+    end
+    match SQLiteProvider.openWritable(addedPath)
+      case SQLiteOpenResult.Opened(provider)
+        verifyAddedCancellation(provider)
+
+        test::assertTrue(provider.close())
+      case SQLiteOpenResult.Failure(message)
+        test::assertTrue(false)
+    end
+    match SQLiteProvider.openWritable(rollbackPath)
+      case SQLiteOpenResult.Opened(provider)
+        verifyRollback(provider)
+
+        test::assertTrue(provider.close())
+      case SQLiteOpenResult.Failure(message)
+        test::assertTrue(false)
+    end
+    match SQLiteProvider.openWritable(selfPath)
+      case SQLiteOpenResult.Opened(provider)
+        verifySelfEdge(provider)
+
+        test::assertTrue(provider.close())
+      case SQLiteOpenResult.Failure(message)
+        test::assertTrue(false)
+    end
+    match SQLiteProvider.openWritable(stringPath)
+      case SQLiteOpenResult.Opened(provider)
+        verifyStringCascade(provider)
+
+        test::assertTrue(provider.close())
+      case SQLiteOpenResult.Failure(message)
+        test::assertTrue(false)
+    end
+    match SQLiteProvider.openWritable(orphanPath)
+      case SQLiteOpenResult.Opened(provider)
+        verifyRequiredOrphan(provider)
+
+        test::assertTrue(provider.close())
+      case SQLiteOpenResult.Failure(message)
+        test::assertTrue(false)
+    end
+    match SQLiteProvider.openWritable(orphanParentPath)
+      case SQLiteOpenResult.Opened(provider)
+        verifyRequiredOrphanAndParentDelete(provider)
+
+        test::assertTrue(provider.close())
+      case SQLiteOpenResult.Failure(message)
+        test::assertTrue(false)
+    end
+    match SQLiteProvider.openWritable(addedOrphanPath)
+      case SQLiteOpenResult.Opened(provider)
+        verifyAddedOrphan(provider)
+
+        test::assertTrue(provider.close())
+      case SQLiteOpenResult.Failure(message)
+        test::assertTrue(false)
+    end
+    match SQLiteProvider.openWritable(orphanRollbackPath)
+      case SQLiteOpenResult.Opened(provider)
+        verifyOrphanRollback(provider)
+
+        test::assertTrue(provider.close())
+      case SQLiteOpenResult.Failure(message)
+        test::assertTrue(false)
+    end
+    match SQLiteProvider.openWritable(hiddenOrphanPath)
+      case SQLiteOpenResult.Opened(provider)
+        verifyHiddenOrphanRetry(provider, hiddenOrphanPath)
+
+        test::assertTrue(provider.close())
+      case SQLiteOpenResult.Failure(message)
+        test::assertTrue(false)
+    end
+    match SQLiteProvider.openWritable(stringOrphanPath)
+      case SQLiteOpenResult.Opened(provider)
+        verifyRequiredStringOrphan(provider)
+
+        test::assertTrue(provider.close())
+      case SQLiteOpenResult.Failure(message)
+        test::assertTrue(false)
+    end
+    return 0
+  end
+  return 1
+end
+
+def main(): Void
+  let completed = verifyFiles()
+
+  test::assertEqual(completed.closeFailures.count(), 0)
+  match completed.completion
+    case resources::Completion.Value(value)
+      test::assertEqual(value, 0)
+    case resources::Completion.Failure(error)
+      test::assertTrue(false)
+  end
+  console::println("Cascade integration contract passed")
+end

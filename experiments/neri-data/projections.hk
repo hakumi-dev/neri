@@ -1,0 +1,602 @@
+use tasks
+namespace neri_data
+
+def shapeKind(kind: readonly ResultColumnKind): ResultColumnKind
+  match kind
+    case ResultColumnKind.Bool()
+      return ResultColumnKind.Bool()
+    case ResultColumnKind.Int()
+      return ResultColumnKind.Int()
+    case ResultColumnKind.Float()
+      return ResultColumnKind.Float()
+    case ResultColumnKind.Text()
+      return ResultColumnKind.Text()
+  end
+end
+
+class ShapePrepared<R>
+  private make: fn(): R
+
+  internal def init(materialize: fn(): R): Void
+    this.make = materialize
+  end
+
+  internal def value(): R
+    return this.make()
+  end
+end
+
+enum ShapePrepareResult<R>
+  case Ready(value: ShapePrepared<R>)
+  case Failure(error: QueryFailure)
+end
+
+## A compiled selection fragment that decodes leaves before materialization.
+class ShapePlan<R>
+  private selection: String
+  private resultColumns: ResultColumns
+  private width: Int
+  private checkedScalars: Bool
+  private prepareRow: fn(RawRow): ShapePrepareResult<R>
+  private relationLayout: EntityMapping?
+  private scalarAlias: String?
+
+  internal def init(sql: String, columns: ResultColumns, count: Int, prepare: fn(RawRow): ShapePrepareResult<R>, requiresCheckedScalars: Bool = false, layout: EntityMapping? = null, scalar: String? = null): Void
+    this.selection = sql
+    this.resultColumns = columns
+    this.width = count
+    this.checkedScalars = requiresCheckedScalars
+    this.prepareRow = prepare
+    this.relationLayout = layout
+    this.scalarAlias = scalar
+  end
+
+  internal readonly def sql(): String
+    return this.selection
+  end
+
+  internal readonly def columns(): readonly ResultColumns
+    return this.resultColumns
+  end
+
+  internal readonly def count(): Int
+    return this.width
+  end
+
+  internal readonly def requiresCheckedScalars(): Bool
+    return this.checkedScalars
+  end
+
+  internal def layout(): EntityMapping?
+    return this.relationLayout
+  end
+
+  internal readonly def scalar(): String?
+    return this.scalarAlias
+  end
+
+  internal def decoder(): Decoder<R>
+    let plan = this
+    let decode: fn(RawRow): DecodeResult<R> = fn(row: RawRow): DecodeResult<R>
+      match plan.prepare(row)
+        case ShapePrepareResult.Failure(error)
+          return DecodeResult<R>.Failure(error)
+        case ShapePrepareResult.Ready(prepared)
+          return DecodeResult<R>.Value(prepared.value())
+      end
+    end
+
+    return new Decoder<R>(decode, this.resultColumns)
+  end
+
+  internal def prepare(row: RawRow): ShapePrepareResult<R>
+    return this.prepareRow(row)
+  end
+end
+
+enum ShapeCompileResult<R>
+  case Plan(value: ShapePlan<R>)
+  case Failure(error: QueryFailure)
+end
+
+## A typed, composable selection of mapped scalar fields.
+class RowShape<T, R>
+  private compileFn: fn(EntityMapping, Int, CompileState, SqlDialect, String?): ShapeCompileResult<R>
+
+  internal def init(compile: fn(EntityMapping, Int, CompileState, SqlDialect, String?): ShapeCompileResult<R>): Void
+    this.compileFn = compile
+  end
+
+  internal def compile(mapping: EntityMapping, offset: Int, state: CompileState, dialect: SqlDialect, presenceGuard: String? = null): ShapeCompileResult<R>
+    return this.compileFn(mapping, offset, state, dialect, presenceGuard)
+  end
+end
+
+def fieldShape<T, R>(codec: ScalarCodec<R>, selector: quote fn(T): R): RowShape<T, R>
+  let compile: fn(EntityMapping, Int, CompileState, SqlDialect, String?): ShapeCompileResult<R> = fn(mapping: EntityMapping, offset: Int, state: CompileState, dialect: SqlDialect, presenceGuard: String?): ShapeCompileResult<R>
+    match translateSelection(mapping, selector.tree())
+      case SelectionResult.Failure(error)
+        return ShapeCompileResult<R>.Failure(error)
+      case SelectionResult.Column(column)
+        if column.typeName() != codec.typeName()
+          return ShapeCompileResult<R>.Failure(QueryFailure.TypeMismatch(column.column(), codec.typeName(), column.typeName()))
+        end
+        let alias = "__neri_shape_" + (offset as String)
+        var valueSql = quoted(mapping.table(), column.column())
+
+        if presenceGuard != null
+          valueSql = "CASE WHEN " + presenceGuard + " THEN " + valueSql + " ELSE NULL END"
+        end
+        let sql = valueSql + " AS \"" + alias + "\""
+        let columns = new ResultColumns([new ResultColumn(alias, codec.kind(), codec.nullable())])
+        let prepare: fn(RawRow): ShapePrepareResult<R> = fn(row: RawRow): ShapePrepareResult<R>
+          match decodeScalarColumn(row, alias, codec)
+            case DecodeResult.Failure(error)
+              return ShapePrepareResult<R>.Failure(error)
+            case DecodeResult.Value(value)
+              let make: fn(): R = fn(): R
+                return value
+              end
+
+              return ShapePrepareResult<R>.Ready(new ShapePrepared<R>(make))
+          end
+        end
+
+        return ShapeCompileResult<R>.Plan(new ShapePlan<R>(sql, columns, 1, prepare, scalar: codec.preservesSqlValue() ? alias : null))
+    end
+  end
+
+  return new RowShape<T, R>(compile)
+end
+
+## Selects a compiler-validated scalar expression entirely in SQL.
+def expressionShape<T, R>(codec: ScalarCodec<R>, selector: quote fn(T): R): RowShape<T, R>
+  let compile: fn(EntityMapping, Int, CompileState, SqlDialect, String?): ShapeCompileResult<R> = fn(mapping: EntityMapping, offset: Int, state: CompileState, dialect: SqlDialect, presenceGuard: String?): ShapeCompileResult<R>
+    match compileScalarQuotation(mapping, selector.tree(), codec.typeName(), state, dialect)
+      case ScalarSqlResult.Failure(error)
+        return ShapeCompileResult<R>.Failure(error)
+      case ScalarSqlResult.Value(expression)
+        let alias = "__neri_shape_" + (offset as String)
+        var valueSql = expression.sql
+
+        if presenceGuard != null
+          valueSql = "CASE WHEN " + presenceGuard + " THEN " + valueSql + " ELSE NULL END"
+        end
+        let sql = valueSql + " AS \"" + alias + "\""
+        let columns = new ResultColumns([new ResultColumn(alias, codec.kind(), codec.nullable())])
+        let prepare: fn(RawRow): ShapePrepareResult<R> = fn(row: RawRow): ShapePrepareResult<R>
+          match decodeScalarColumn(row, alias, codec)
+            case DecodeResult.Failure(error)
+              return ShapePrepareResult<R>.Failure(error)
+            case DecodeResult.Value(value)
+              let make: fn(): R = fn(): R
+                return value
+              end
+
+              return ShapePrepareResult<R>.Ready(new ShapePrepared<R>(make))
+          end
+        end
+
+        return ShapeCompileResult<R>.Plan(new ShapePlan<R>(sql, columns, 1, prepare, expression.checkedScalars, scalar: codec.preservesSqlValue() ? alias : null))
+    end
+  end
+
+  return new RowShape<T, R>(compile)
+end
+
+def combinedShapePlan<A, B, R>(first: ShapePlan<A>, second: ShapePlan<B>, materialize: fn(A, B): R, layout: EntityMapping? = null): ShapePlan<R>
+  let values: ResultColumn[] = tasks::generate(first.count() + second.count(), 1) do |index|
+    if index < first.count()
+      let column = first.columns().at(index)
+
+      return new ResultColumn(column.name(), shapeKind(column.kind()), column.nullable())
+    end
+    let column = second.columns().at(index - first.count())
+
+    return new ResultColumn(column.name(), shapeKind(column.kind()), column.nullable())
+  end
+  let prepare: fn(RawRow): ShapePrepareResult<R> = fn(row: RawRow): ShapePrepareResult<R>
+    match first.prepare(row)
+      case ShapePrepareResult.Failure(error)
+        return ShapePrepareResult<R>.Failure(error)
+      case ShapePrepareResult.Ready(firstValue)
+        match second.prepare(row)
+          case ShapePrepareResult.Failure(error)
+            return ShapePrepareResult<R>.Failure(error)
+          case ShapePrepareResult.Ready(secondValue)
+            let make: fn(): R = fn(): R
+              return materialize(firstValue.value(), secondValue.value())
+            end
+
+            return ShapePrepareResult<R>.Ready(new ShapePrepared<R>(make))
+        end
+    end
+  end
+
+  return new ShapePlan<R>(first.sql() + ", " + second.sql(), new ResultColumns(values), first.count() + second.count(), prepare, first.requiresCheckedScalars() || second.requiresCheckedScalars(), layout: layout)
+end
+
+def combineShapes<T, A, B, R>(left: RowShape<T, A>, right: RowShape<T, B>, materialize: fn(A, B): R): RowShape<T, R>
+  let compile: fn(EntityMapping, Int, CompileState, SqlDialect, String?): ShapeCompileResult<R> = fn(mapping: EntityMapping, offset: Int, state: CompileState, dialect: SqlDialect, presenceGuard: String?): ShapeCompileResult<R>
+    match left.compile(mapping, offset, state, dialect, presenceGuard)
+      case ShapeCompileResult.Failure(error)
+        return ShapeCompileResult<R>.Failure(error)
+      case ShapeCompileResult.Plan(first)
+        match right.compile(mapping, offset + first.count(), state, dialect, presenceGuard)
+          case ShapeCompileResult.Failure(error)
+            return ShapeCompileResult<R>.Failure(error)
+          case ShapeCompileResult.Plan(second)
+            return ShapeCompileResult<R>.Plan(combinedShapePlan(first, second, materialize))
+        end
+    end
+  end
+
+  return new RowShape<T, R>(compile)
+end
+
+## A structural projection whose member values are exactly the decoded leaves.
+class ProjectedPair<A, B>
+  public first: A
+  public second: B
+
+  public def init(first: A, second: B): Void
+    this.first = first
+    this.second = second
+  end
+end
+
+def pairLayoutSide<R>(plan: ShapePlan<R>, member: readonly quotation::Node, values: MappingColumn[], start: Int): Bool
+  let scalar = plan.scalar()
+
+  if scalar != null
+    values[start] = new MappingColumn(member.identity(), member.typeName(), scalar)
+    return true
+  end
+  let nested = plan.layout()
+
+  if nested == null
+    return false
+  end
+  var index = 0
+
+  while index < nested.count()
+    let column = nested.columnAt(index)
+
+    if column == null
+      return false
+    end
+    values[start + index] = new MappingColumn(column.identity(), column.typeName(), column.column(), mappingPathPrefix(column.path(), member.identity(), member.typeName()))
+    index = index + 1
+  end
+  return true
+end
+
+def pairShapePlan<A, B>(first: ShapePlan<A>, second: ShapePlan<B>): ShapePlan<ProjectedPair<A, B>>
+  let firstSelector: quote fn(ProjectedPair<A, B>): A = quote do |pair: ProjectedPair<A, B>|: A
+    return pair.first
+  end
+  let secondSelector: quote fn(ProjectedPair<A, B>): B = quote do |pair: ProjectedPair<A, B>|: B
+    return pair.second
+  end
+  let firstTree = firstSelector.tree()
+  let secondTree = secondSelector.tree()
+  let firstMember = firstTree.nodeAt(firstTree.root())
+  let secondMember = secondTree.nodeAt(secondTree.root())
+  let resultType = firstTree.parameterTypeAt(0)
+  let materialize: fn(A, B): ProjectedPair<A, B> = fn(first: A, second: B): ProjectedPair<A, B>
+    return new ProjectedPair<A, B>(first, second)
+  end
+  var layout: EntityMapping? = null
+
+  if firstMember != null && secondMember != null && resultType != null && secondTree.parameterTypeAt(0) == resultType && translationNodeCode(firstMember.kind()) == 2 && translationNodeCode(secondMember.kind()) == 2
+    let firstNested = first.layout()
+    let secondNested = second.layout()
+    let firstCount = first.scalar() != null ? 1 : (firstNested != null ? firstNested.count() : 0)
+    let secondCount = second.scalar() != null ? 1 : (secondNested != null ? secondNested.count() : 0)
+
+    if firstCount > 0 && secondCount > 0
+      let columns: MappingColumn[] = tasks::generate(firstCount + secondCount, 1) do |index|
+        return new MappingColumn("unused", "Int", "unused")
+      end
+
+      if pairLayoutSide(first, firstMember, columns, 0) && pairLayoutSide(second, secondMember, columns, firstCount)
+        layout = new EntityMapping(resultType, "__neri_projected", columns)
+      end
+    end
+  end
+  return combinedShapePlan(first, second, materialize, layout)
+end
+
+def pairShape<T, A, B>(left: RowShape<T, A>, right: RowShape<T, B>): RowShape<T, ProjectedPair<A, B>>
+  let compile: fn(EntityMapping, Int, CompileState, SqlDialect, String?): ShapeCompileResult<ProjectedPair<A, B>> = fn(mapping: EntityMapping, offset: Int, state: CompileState, dialect: SqlDialect, presenceGuard: String?): ShapeCompileResult<ProjectedPair<A, B>>
+    match left.compile(mapping, offset, state, dialect, presenceGuard)
+      case ShapeCompileResult.Failure(error)
+        return ShapeCompileResult<ProjectedPair<A, B>>.Failure(error)
+      case ShapeCompileResult.Plan(first)
+        match right.compile(mapping, offset + first.count(), state, dialect, presenceGuard)
+          case ShapeCompileResult.Failure(error)
+            return ShapeCompileResult<ProjectedPair<A, B>>.Failure(error)
+          case ShapeCompileResult.Plan(second)
+            return ShapeCompileResult<ProjectedPair<A, B>>.Plan(pairShapePlan(first, second))
+        end
+    end
+  end
+
+  return new RowShape<T, ProjectedPair<A, B>>(compile)
+end
+
+class ShapeProjection<T, R>
+  private query: Query<T>
+  private shape: RowShape<T, R>
+
+  public def init(query: Query<T>, shape: RowShape<T, R>): Void
+    this.query = query
+    this.shape = shape
+  end
+
+  public def compile(dialect: SqlDialect = SqlDialect.QuestionMark()): CompileResult<R>
+    return this.compilePlan(dialect, false)
+  end
+
+  ## Keeps a certified structural result available to later relational stages.
+  public def asRelation(): Relation<R>
+    let build: fn(SqlDialect): RelationBuildResult<R> = fn(dialect: SqlDialect): RelationBuildResult<R>
+      return projectRelation<T, R>(this.query.asRelation(), this.shape).asRelation().build(dialect)
+    end
+
+    return new Relation<R>(build, this.query.provider(), bound: streamMaximum<T>(this.query))
+  end
+
+  private def compilePlan(dialect: SqlDialect, unbounded: Bool): CompileResult<R>
+    let failure = this.query.queryFailure()
+
+    if failure != null
+      return CompileResult<R>.Failure(failure)
+    end
+    let mapping = this.query.entityMapping()
+
+    if mapping == null
+      return CompileResult<R>.Failure(QueryFailure.UnsupportedCapability("projection requires entity mapping metadata"))
+    end
+    if mapping.table() != this.query.sourceName()
+      return CompileResult<R>.Failure(QueryFailure.SourceMismatch(this.query.sourceName(), mapping.table()))
+    end
+    let state = new CompileState()
+
+    match this.shape.compile(mapping, 0, state, dialect)
+      case ShapeCompileResult.Failure(error)
+        return CompileResult<R>.Failure(error)
+      case ShapeCompileResult.Plan(plan)
+        return compilePipeline<T, R>(this.query, plan.decoder(), new SqlSelection(plan.sql(), new ParameterValues(state.head, state.count), plan.requiresCheckedScalars()), this.query.rowLimit(), dialect, unbounded: unbounded)
+    end
+  end
+
+  public def stream(visit: fn(R): Bool, options: StreamOptions? = null): StreamResult
+    let compile: fn(SqlDialect): CompileResult<R> = fn(dialect: SqlDialect): CompileResult<R>
+      return this.compilePlan(dialect, true)
+    end
+
+    return streamCompiled<R>(this.query.provider(), compile, visit, options, streamMaximum<T>(this.query))
+  end
+
+  public def streamWith(provider: Provider, visit: fn(R): Bool, options: StreamOptions? = null): StreamResult
+    let compile: fn(SqlDialect): CompileResult<R> = fn(dialect: SqlDialect): CompileResult<R>
+      return this.compilePlan(dialect, true)
+    end
+
+    return streamCompiled<R>(provider, compile, visit, options, streamMaximum<T>(this.query))
+  end
+
+  public def all(provider: Provider? = null): QueryResult<R>
+    let selected = provider != null ? provider : this.query.provider()
+
+    if selected == null
+      return QueryResult<R>.Failure(QueryFailure.UnsupportedCapability("projection requires a provider"))
+    end
+    if this.query.hasBound() && !selected.supports(ProviderCapability.BoundedTypedReads())
+      return QueryResult<R>.Failure(QueryFailure.UnsupportedCapability("bounded-typed-reads"))
+    end
+    if !this.query.hasBound()
+      let compile: fn(SqlDialect): CompileResult<R> = fn(dialect: SqlDialect): CompileResult<R>
+        return this.compilePlan(dialect, true)
+      end
+
+      return materializeStream<R>(selected, compile)
+    end
+    return execute<R>(this.compile(selected.dialect()), selected)
+  end
+end
+
+def project<T, R>(query: Query<T>, shape: RowShape<T, R>): ShapeProjection<T, R>
+  return new ShapeProjection<T, R>(query, shape)
+end
+
+## Projects a deferred source without decoding its intermediate rows.
+class RelationShapeProjection<T, R>
+  private source: Relation<T>
+  private shape: RowShape<T, R>
+  private bound: Int?
+  private stickyFailure: QueryFailure?
+
+  public def init(source: Relation<T>, shape: RowShape<T, R>, bound: Int? = null, failure: QueryFailure? = null): Void
+    this.source = source
+    this.shape = shape
+    this.bound = bound
+    this.stickyFailure = failure
+    if failure == null && bound != null && (bound < 1 || bound > queryRowLimit())
+      this.stickyFailure = QueryFailure.InvalidLimit(bound, queryRowLimit())
+    end
+  end
+
+  private def relationPlan(dialect: SqlDialect, requireLayout: Bool): RelationBuildResult<R>
+    let failure = this.stickyFailure
+
+    if failure != null
+      return RelationBuildResult<R>.Failure(failure)
+    end
+    match this.source.build(dialect)
+      case RelationBuildResult.Failure(error)
+        return RelationBuildResult<R>.Failure(error)
+      case RelationBuildResult.Plan(sourcePlan)
+        let mapping = joinStageMapping(sourcePlan.mapping, "__neri_project_source")
+        let state = new CompileState()
+
+        match this.shape.compile(mapping, 0, state, dialect)
+          case ShapeCompileResult.Failure(error)
+            return RelationBuildResult<R>.Failure(error)
+          case ShapeCompileResult.Plan(shapePlan)
+            let layout = shapePlan.layout()
+
+            if layout == null && requireLayout
+              return RelationBuildResult<R>.Failure(QueryFailure.UnsupportedCapability("deferred projection requires a certified structural shape"))
+            end
+            let outputMapping = layout != null ? layout : new EntityMapping("__neri_terminal_projection", "__neri_projected", [])
+            let shifted = joinShiftSql(sourcePlan.sql, state.count, dialect)
+
+            if shifted == null
+              return RelationBuildResult<R>.Failure(QueryFailure.Provider("projection parameter index exceeds supported range"))
+            end
+            joinParameterCopy(sourcePlan.parameters, state)
+            var orderCount = 0
+            var current = sourcePlan.order
+
+            while current != null
+              orderCount = orderCount + 1
+              current = current.next
+            end
+            let columns: ResultColumn[] = tasks::generate(shapePlan.count() + orderCount, 1) do |index|
+              if index < shapePlan.count()
+                let column = shapePlan.columns().at(index)
+
+                return new ResultColumn(column.name(), shapeKind(column.kind()), column.nullable())
+              end
+              return new ResultColumn("unused", ResultColumnKind.Int())
+            end
+            var selected = shapePlan.sql()
+            var outputOrder: OrderTerm? = null
+
+            current = sourcePlan.order
+            var index = 0
+
+            while current != null
+              let position = relationColumnIndex(sourcePlan.columns, current.column)
+
+              if position < 0
+                return RelationBuildResult<R>.Failure(QueryFailure.Provider("projection source order column is missing"))
+              end
+              let sourceColumn = sourcePlan.columns.at(position)
+              let alias = "__neri_project_order" + (index as String)
+
+              selected = selected + ", " + quoted("__neri_project_source", current.column) + " AS \"" + alias + "\""
+              columns[shapePlan.count() + index] = new ResultColumn(alias, shapeKind(sourceColumn.kind()), sourceColumn.nullable())
+              outputOrder = appendOrder(outputOrder, alias, current.descending)
+              index = index + 1
+              current = current.next
+            end
+            var sql = "SELECT " + selected + " FROM (" + shifted + ") AS \"__neri_project_source\"" + joinOrderSql(sourcePlan.order, "__neri_project_source")
+            let limit = this.bound
+
+            if limit != null
+              sql = sql + " LIMIT " + (limit as String)
+            end
+
+            return RelationBuildResult<R>.Plan(new RelationPlan<R>(sql, new ParameterValues(state.head, state.count), new ResultColumns(columns), shapePlan.decoder(), outputMapping, sourcePlan.checkedScalars || shapePlan.requiresCheckedScalars(), outputOrder))
+        end
+    end
+  end
+
+  public def asRelation(): Relation<R>
+    let build: fn(SqlDialect): RelationBuildResult<R> = fn(dialect: SqlDialect): RelationBuildResult<R>
+      return this.relationPlan(dialect, true)
+    end
+
+    return new Relation<R>(build, this.source.provider(), bound: this.bound)
+  end
+
+  public def take(count: Int): RelationShapeProjection<T, R>
+    if this.stickyFailure != null
+      return this
+    end
+    if count < 1 || count > queryRowLimit()
+      return new RelationShapeProjection<T, R>(this.source, this.shape, this.bound, QueryFailure.InvalidLimit(count, queryRowLimit()))
+    end
+    return new RelationShapeProjection<T, R>(this.source, this.shape, joinTakeBound(this.bound, count))
+  end
+
+  public def compile(dialect: SqlDialect = SqlDialect.QuestionMark()): CompileResult<R>
+    let failure = this.stickyFailure
+
+    if failure != null
+      return CompileResult<R>.Failure(failure)
+    end
+    let limit = this.bound
+
+    if limit == null
+      return CompileResult<R>.Failure(QueryFailure.MissingLimit(queryRowLimit()))
+    end
+    if limit < 1 || limit > queryRowLimit()
+      return CompileResult<R>.Failure(QueryFailure.InvalidLimit(limit, queryRowLimit()))
+    end
+    match this.relationPlan(dialect, false)
+      case RelationBuildResult.Failure(error)
+        return CompileResult<R>.Failure(error)
+      case RelationBuildResult.Plan(plan)
+        return CompileResult<R>.Plan(new TypedPlan<R>(new SqlPlan(plan.sql, plan.parameters, limit, plan.columns, plan.checkedScalars), plan.decoder))
+    end
+  end
+
+  public def all(provider: Provider? = null): QueryResult<R>
+    let selected = provider != null ? provider : this.source.provider()
+
+    if selected == null
+      return QueryResult<R>.Failure(QueryFailure.UnsupportedCapability("projection requires a provider"))
+    end
+    if this.bound != null && !selected.supports(ProviderCapability.BoundedTypedReads())
+      return QueryResult<R>.Failure(QueryFailure.UnsupportedCapability("bounded-typed-reads"))
+    end
+    if this.bound == null
+      let compile: fn(SqlDialect): CompileResult<R> = fn(dialect: SqlDialect): CompileResult<R>
+        return this.streamPlan(dialect)
+      end
+
+      return materializeStream<R>(selected, compile)
+    end
+    return execute<R>(this.compile(selected.dialect()), selected)
+  end
+
+  public def stream(visit: fn(R): Bool, options: StreamOptions? = null): StreamResult
+    let compile: fn(SqlDialect): CompileResult<R> = fn(dialect: SqlDialect): CompileResult<R>
+      return this.streamPlan(dialect)
+    end
+
+    return streamCompiled<R>(this.source.provider(), compile, visit, options, this.bound)
+  end
+
+  public def streamWith(provider: Provider, visit: fn(R): Bool, options: StreamOptions? = null): StreamResult
+    let compile: fn(SqlDialect): CompileResult<R> = fn(dialect: SqlDialect): CompileResult<R>
+      return this.streamPlan(dialect)
+    end
+
+    return streamCompiled<R>(provider, compile, visit, options, this.bound)
+  end
+
+  private def streamPlan(dialect: SqlDialect): CompileResult<R>
+    match this.relationPlan(dialect, false)
+      case RelationBuildResult.Failure(error)
+        return CompileResult<R>.Failure(error)
+      case RelationBuildResult.Plan(plan)
+        var maximum = queryRowLimit()
+        let bound = this.bound
+
+        if bound != null
+          maximum = bound
+        end
+
+        return CompileResult<R>.Plan(new TypedPlan<R>(new SqlPlan(plan.sql, plan.parameters, maximum, plan.columns, plan.checkedScalars), plan.decoder))
+    end
+  end
+end
+
+def projectRelation<T, R>(source: Relation<T>, shape: RowShape<T, R>): RelationShapeProjection<T, R>
+  return new RelationShapeProjection<T, R>(source, shape)
+end
