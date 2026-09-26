@@ -37,6 +37,9 @@ accessing the released SQLite handle.
 Concurrent workers require SQLite configured in multi-thread or serialized mode;
 single-thread builds are unsuitable even when every worker owns a different
 connection. This follows SQLite's [threading contract](https://sqlite.org/threadsafe.html).
+Opening rejects libraries compiled with `SQLITE_THREADSAFE=0`. SQLite's
+`sqlite3_threadsafe()` reports only the compile-time setting; applications must
+also preserve multi-thread or serialized mode when configuring SQLite globally.
 The provider starts write transactions with `BEGIN IMMEDIATE`. Another writer
 returns a structured driver contention error when its configured lock wait is
 exhausted. The default wait is zero milliseconds. The adapter does not replay
