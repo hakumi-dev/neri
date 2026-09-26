@@ -24,6 +24,12 @@ has not yet been collected, so these fields do not measure retained reachable
 objects. `last_collected_heap_survivor_*` describes only the most recently
 collected heap, which may be a worker heap.
 
+`gc_collections` totals collections across all heaps. A task heap can collect
+while preserving every result for adoption by its parent. A rising collection
+count therefore does not establish that the parent heap has collected or that
+any objects have been reclaimed. To measure retained managed memory, sample the
+owning heap after its operations return and after collecting that heap.
+
 `managed_reclaimed_*` counts objects freed by garbage collection. Releasing a
 heap at shutdown or at the end of a task lowers outstanding totals but does not
 count as collection reclamation. The `types` object groups allocations by a
