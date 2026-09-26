@@ -516,8 +516,9 @@ NERI_RT_API neri_int_v1 neri_rt_v1_file_mutation_mkdir(const uint8_t *path, neri
 NERI_RT_API neri_int_v1 neri_rt_v1_file_mutation_rename(const uint8_t *source, neri_int_v1 source_length, const uint8_t *destination, neri_int_v1 destination_length, neri_int_v1 *os_code);
 NERI_RT_API neri_int_v1 neri_rt_v1_file_mutation_remove(const uint8_t *path, neri_int_v1 length, neri_int_v1 kind, neri_int_v1 *os_code);
 NERI_RT_API neri_int_v1 neri_rt_v1_file_mutation_status(const uint8_t *path, neri_int_v1 length, neri_int_v1 *exists, neri_int_v1 *kind, neri_int_v1 *executable, neri_int_v1 *symlink, neri_int_v1 *os_code);
-/* ABI 1.28: compiler cache metadata, available only on macOS arm64.
- * supported returns 1 when the current compiler cache policy is implemented.
+/* ABI 1.28: compiler cache metadata on macOS arm64 and Linux.
+ * supported returns 1 when the executable cache policy is implemented
+ * (macOS arm64 only); metadata availability is independent of that policy.
  * metadata returns 0 on success, -1 on invalid input, failure or unsupported host.
  * Paths are nonempty byte sequences without NUL, at most 1 MiB; follow is 0/1.
  * Outputs are kind (regular=1, directory=2, symlink=3, other=4), permission bits

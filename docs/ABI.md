@@ -21,8 +21,12 @@ and [GetModuleFileNameW on Windows](https://learn.microsoft.com/en-us/windows/wi
 The package manifest also identifies the toolchain version and native target.
 
 Compiler cache metadata requires ABI 1.28. `neri_rt_v1_cache_supported` reports
-whether the current host supports persistent compiler caching: macOS ARM64 does;
-Linux and Windows use the normal build path. `neri_rt_v1_cache_metadata` returns
+whether the current host supports the executable cache policy: macOS ARM64 does;
+Linux and Windows use the normal executable build path. Semantic snapshots use
+the independent metadata operation, available on macOS ARM64 and Linux.
+`neri_rt_v1_cache_metadata` requires the `Crypto` feature for its SHA-256
+fingerprint; the compiler includes that transitive dependency during linking.
+It returns
 normalized file kind, permission bits, real-user ownership and a 32-byte SHA-256
 fingerprint. The fingerprint covers device, inode, mode, owner, group, modification
 and change timestamps, and size, using fixed-width little-endian fields. Access
