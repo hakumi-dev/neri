@@ -6,9 +6,11 @@ param(
   [string]$Prefix = "$env:USERPROFILE/.neri",
   [string]$LLVM,
   [ValidateRange(1,3)][int]$Stage,
+  [switch]$FullValidation,
   [switch]$NoPath
 )
 $ErrorActionPreference = 'Stop'
+if ($FullValidation -and $Action -ne 'install') { throw '-FullValidation requires install' }
 Set-StrictMode -Version Latest
 if (!$PSBoundParameters.ContainsKey('Stage')) { $Stage = if ($Action -eq 'install') { 2 } else { 1 } }
 if ($Action -eq 'install' -and $Stage -lt 2) { throw 'install requires -Stage 2 or -Stage 3' }
@@ -53,7 +55,9 @@ try {
   $native = Join-Path $root "build/native/windows-$mode"
   Invoke-Checked cmake @('-S',$root,'-B',$native,'-G','Ninja',"-DCMAKE_BUILD_TYPE=$Configuration",'-DCMAKE_C_COMPILER=clang','-DCMAKE_CXX_COMPILER=clang++',"-DLLVM_DIR=$env:LLVM_PREFIX/lib/cmake/llvm",'-DBUILD_TESTING=ON')
   Invoke-Checked cmake @('--build',$native,'--parallel','4')
-  Invoke-Checked ctest @('--test-dir',$native,'--output-on-failure','--no-tests=error')
+  if ($Action -in 'native','test' -or $FullValidation) {
+    Invoke-Checked ctest @('--test-dir',$native,'--output-on-failure','--no-tests=error')
+  }
   if ($Action -eq 'native') { return }
 
   $seed = Get-Content "$root/bootstrap/seed.json" -Raw | ConvertFrom-Json
@@ -159,11 +163,18 @@ try {
   if ($Action -eq 'build') { Write-Host "Toolchain: $tree/bin/neri.exe"; return }
   Invoke-Checked "$tree/bin/neri.exe" @('run','--project',"$root/tooling/abi/manifest.json",'--','--check',$root)
   Invoke-Checked "$tree/bin/neri.exe" @('run','--project',"$root/tooling/kinds/manifest.json",'--','--check',$root)
-  Invoke-Checked node @("$PSScriptRoot/test-windows.mjs","$tree/bin/neri.exe",$native)
-  Invoke-Checked "$tree/bin/neri.exe" @('run','--project',"$root/tests/native/cabi-exports/manifest.json",'--unit','driver','--',"$tree/bin/neri.exe",$root,$native,"$env:LLVM_PREFIX/bin",'windows-x86_64',"$work/cabi-exports")
+  $contractsPassed = $false
+  if ($Action -eq 'test' -or $FullValidation) {
+    Invoke-Checked node @("$PSScriptRoot/test-windows.mjs","$tree/bin/neri.exe",$native)
+    Invoke-Checked "$tree/bin/neri.exe" @('run','--project',"$root/tests/native/cabi-exports/manifest.json",'--unit','driver','--',"$tree/bin/neri.exe",$root,$native,"$env:LLVM_PREFIX/bin",'windows-x86_64',"$work/cabi-exports")
+    $contractsPassed = $true
+  }
   & "$root/tests/windows-launcher.ps1" -Compiler "$tree/bin/neri.exe"
-  [IO.File]::WriteAllText("$work/VALIDATED", "Windows native, language, UTF-8 paths and LSP contracts passed.`n")
-  $verification = if ($Stage -eq 3) { 'fixed-point-and-windows-contracts' } else { "stage$Stage-and-windows-contracts" }
+  if ($contractsPassed) {
+    [IO.File]::WriteAllText("$work/VALIDATED", "Windows native, language, UTF-8 paths and LSP contracts passed.`n")
+  }
+  $scope = if ($Action -eq 'test') { 'windows-contracts' } elseif ($contractsPassed) { 'windows-and-installation-contracts' } else { 'installation-contracts' }
+  $verification = if ($Stage -eq 3) { "fixed-point-and-$scope" } else { "stage$Stage-and-$scope" }
   $provenance = [ordered]@{
     schemaVersion = 1
     target = 'windows-x86_64'

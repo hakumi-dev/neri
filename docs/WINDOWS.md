@@ -23,7 +23,9 @@ the .NET gzip API before the native backend materializes the host compiler.
 
 | Command or option | Contract |
 | --- | --- |
-| `pwsh -File scripts/build.ps1 install` | Build, validate and activate a toolchain from the repository root. |
+| `pwsh -File scripts/build.ps1 install` | Build, verify installation and activate a Stage2 toolchain. |
+| `install -FullValidation` | Run the full Windows contract suite before installation. |
+| `test` | Build and run the full Windows contract suite without installation. |
 | `-Prefix <directory>` | Select the installation root. |
 | `-NoPath` | Preserve the current per-user `PATH`. |
 | `-Stage 1\|2\|3` | Select the last compiler generation; installation requires Stage2 or Stage3. |

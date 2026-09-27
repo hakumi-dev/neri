@@ -9,7 +9,7 @@ contract. For dependency installation, use [Building](BUILDING.md) or
 | Build native components without a seed | `scripts/build-native.sh` | Native backend, runtime and host helper |
 | Bootstrap on macOS or Linux | `scripts/build.sh bootstrap` | Stage1 compiler tuple selected by `build/current` |
 | Verify compiler self-reproduction | `scripts/build.sh bootstrap --stage 3` | Stage2 and Stage3 IR, object and executable equality |
-| Build a distribution | `scripts/build.sh package` | Stage2 compiler with native, language and installation contracts |
+| Build a distribution | `scripts/build.sh package` | Stage2 compiler with installation and reproducibility contracts |
 | Validate before publishing a compiler tuple | `scripts/build.sh test` | Native and language contracts pass before publication |
 | Regenerate the canonical seed | `scripts/build.sh refresh-seed` | Validated seed candidate and provenance replace the previous set |
 | Build and test on Windows | `scripts/build.ps1 -Action test` | Stage1 compiler and Windows platform contracts |
@@ -71,7 +71,8 @@ accepts exactly the previous and next versions. Keep the current version in
 `VERSION` and the CLI during that refresh. Then update those values and restore
 the compiler's strict check to the new version, and run `refresh-seed` again.
 Both refreshes use the ordinary fixed-point and contract gates. The final
-package gate materializes the final seed and validates the delivered toolchain;
+package gate with `--stage 3 --full-validation` materializes the final seed and
+validates the delivered toolchain;
 run that gate instead of adding another standalone full test invocation.
 
 Keep the ABI, feature, target and IR checks in place throughout this transition.
@@ -83,10 +84,13 @@ Stage0 is the pinned seed materialized with the current native backend. Stage1
 is the current compiler built by Stage0 and is the default for development and
 language contracts. Stage2 is built by Stage1 and is the default for `package`
 and `install`. Stage3 is built by Stage2 and compares self-reproduction against
-Stage2. The supported-platform CI requests Stage3 explicitly.
+Stage2. The supported-platform CI requests Stage3 and full validation explicitly.
 
 `--stage 1|2|3` selects the final generation and composes with build-mode options;
 `install` also accepts `--prefix <directory>`. Packages require Stage2 or Stage3.
+`package` and `install` accept `--full-validation` to run the complete compiler
+suite before package assembly. Without it they retain all package, installation
+and reproducibility checks; provenance records only the checks actually passed.
 `refresh-seed` requires Stage3. Windows uses the corresponding `-Stage` option,
 with Stage1 for `build` and `test`, and Stage2 for `install`.
 
@@ -180,7 +184,9 @@ compiler, codegen and runtime with the standard-library sources from the same
 checkout. Packaged launchers use their toolchain's bundled standard library.
 
 Windows uses `scripts/build.ps1` to materialize the same seed, compile the
-current compiler unit and run its platform contracts. `-Stage 3` additionally
+current compiler unit. `test` runs its platform contracts; `install -FullValidation`
+runs them before installation. A plain `install` retains launcher and installed
+consumer checks. `-Stage 3` additionally
 compares NIR, COFF and PE output. See [Windows](WINDOWS.md) for dependencies and commands.
 
 ## Refreshing the seed

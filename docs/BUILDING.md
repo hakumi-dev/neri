@@ -61,7 +61,8 @@ compiler generation uses the current compiler unit and standard library.
 | `scripts/build.sh doctor` | Check native build prerequisites. |
 | `scripts/build.sh build` | Build and select the current Stage1 development compiler. |
 | `scripts/build.sh test` | Build and validate the checkout; select the verified toolchain at `build/current`. |
-| `scripts/build.sh package` | Build and validate a Stage2 distribution. |
+| `scripts/build.sh package` | Build a Stage2 distribution and verify package installation and reproducibility. |
+| `package` or `install` with `--full-validation` | Run the full compiler suite before packaging, sharing the prepared compiler. |
 | `--stage 3` | Add a generation and verify the compiler fixed point. |
 | `smoke-test`, `negative-test`, `cabi-test` with `--compiler <path>` | Run the selected contracts with an existing compiler; verify its checkout version and native compile/run compatibility. |
 | `scripts/build.sh debugger-test` | Opt-in LLDB contract on macOS; see [debugging](DEBUGGING.md). |
