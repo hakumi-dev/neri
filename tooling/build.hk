@@ -186,6 +186,21 @@ class Build
     end
   end
 
+  def finishWork(): Void
+    if this.work == ""
+      return
+    end
+    # Only the directory created by this invocation belongs to this driver.
+    # Failed commands exit before cleanup so their diagnostics remain available.
+    if packageParentDirectory(this.work) != this.root + "/build" || !contains(this.work, "/work.")
+      fail("refusing to remove an unexpected build workspace")
+    end
+    if files::removeTree(this.work).failure != null
+      fail("cannot remove completed build workspace: " + this.work)
+    end
+    this.work = ""
+  end
+
   def sourceFiles(): String[]
     let inventory = this.work + "/compiler-sources.txt"
 
@@ -1588,6 +1603,19 @@ class Build
     end
   end
 
+  def codegenCacheContracts(): Void
+    var arguments = this.environment()
+
+    for argument in [this.compiler, "run", "--project", this.root + "/manifest.json", "--unit", "codegen-cache-contracts", "--release", "--", this.nativeDirectory() + "/neri-codegen", this.root + "/tests/golden", this.target.name()]
+      arguments = host::appendString(arguments, argument)
+    end
+    if this.capture(arguments, "codegen-cache-contract", 120) != 0
+      console::print(requiredText(this.work + "/codegen-cache-contract.stdout"))
+      console::print(requiredText(this.work + "/codegen-cache-contract.stderr"))
+      fail("Native object cache contract failed")
+    end
+  end
+
   def sessionProbe(directory: String, name: String, source: String, module: String): Void
     var arguments = this.environment()
 
@@ -1836,6 +1864,7 @@ class Build
     this.unicodeProjectContracts()
     this.projectManifestContracts()
     this.aotCacheContracts()
+    this.codegenCacheContracts()
     this.sessionContracts()
     this.standardLibraryContracts()
     this.fileContracts()
@@ -2284,10 +2313,47 @@ class Build
     end
   end
 
-  def selectedTest(command: String): Void
-    this.prepareCompiler()
+  def selectExistingCompiler(path: String): Void
+    this.startWork()
+    # Contract drivers need the current native host; runtime contracts also need codegen/runtime.
+    this.nativeBuild()
+    if this.capture(["realpath", path], "selected-compiler-path", 30) != 0
+      fail("cannot resolve selected compiler: " + path)
+    end
+    let resolved = lines(requiredText(this.work + "/selected-compiler-path.stdout"))
+
+    if resolved.Length != 1
+      fail("selected compiler must resolve to one executable path")
+    end
+    this.compiler = resolved[0]
+    execute("test", ["-f", this.compiler])
+    execute("test", ["-x", this.compiler])
+    var version = this.environment()
+
+    version = host::appendString(version, this.compiler)
+    version = host::appendString(version, "--version")
+    if this.capture(version, "selected-compiler-version", 30) != 0
+      fail("selected compiler version probe failed")
+    end
+    let expected = lines(requiredText(this.root + "/VERSION"))
+
+    if expected.Length != 1 || requiredText(this.work + "/selected-compiler-version.stdout") != "neri " + expected[0] + "\n"
+      fail("selected compiler version does not match this checkout")
+    end
+    # A successful native compile/run checks the selected target and runtime ABI together.
+    this.languageCase("examples/hello.hk", 0, "Hello, Neri!\n", true)
+  end
+
+  def selectedTest(command: String, existingCompiler: String = ""): Void
+    if existingCompiler == ""
+      this.prepareCompiler()
+    else
+      this.selectExistingCompiler(existingCompiler)
+    end
     if command == "smoke-test"
-      this.languageCase("examples/hello.hk", 0, "Hello, Neri!\n", true)
+      if existingCompiler == ""
+        this.languageCase("examples/hello.hk", 0, "Hello, Neri!\n", true)
+      end
       this.runContract()
     else if command == "cabi-test"
       this.cAbiExportContracts()
@@ -2342,6 +2408,7 @@ def main(): Void
   var command = "doctor"
   var mode = BuildMode.release()
   var prefix = ""
+  var existingCompiler = ""
   let first = host::argumentAt(0)
 
   if first != null
@@ -2362,7 +2429,7 @@ def main(): Void
       fail("missing build option")
       return
     end
-    if option == "--stage" || option == "--prefix"
+    if option == "--stage" || option == "--prefix" || option == "--compiler"
       let value = host::argumentAt(index + 1)
 
       if value == null
@@ -2376,6 +2443,12 @@ def main(): Void
         end
         stage = value == "1" ? 1 : (value == "2" ? 2 : 3)
         stageSpecified = true
+      else if option == "--compiler"
+        if existingCompiler != "" || value == ""
+          fail("--compiler requires exactly one executable path")
+          return
+        end
+        existingCompiler = value
       else
         if command != "install" || prefixSpecified || value == ""
           fail("--prefix requires one directory and the install command")
@@ -2396,6 +2469,9 @@ def main(): Void
       modeSpecified = true
       index = index + 1
     end
+  end
+  if existingCompiler != "" && (stageSpecified || (command != "smoke-test" && command != "negative-test" && command != "cabi-test"))
+    fail("--compiler is only valid for smoke-test, negative-test or cabi-test without --stage")
   end
   if (command == "package" || command == "install") && stage < 2
     fail("package and install require --stage 2 or --stage 3")
@@ -2430,7 +2506,7 @@ def main(): Void
   else if command == "check" || command == "test"
     build.test()
   else if command == "smoke-test" || command == "negative-test" || command == "cabi-test"
-    build.selectedTest(command)
+    build.selectedTest(command, existingCompiler)
   else if command == "debugger-test"
     build.debuggerTest()
   else if command == "package"
@@ -2443,5 +2519,8 @@ def main(): Void
     build.benchmark()
   else
     fail("unknown command: " + command)
+  end
+  if command != "benchmark"
+    build.finishWork()
   end
 end

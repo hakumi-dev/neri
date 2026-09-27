@@ -4,6 +4,7 @@
 #include "../platform/windows_support.h"
 #endif
 #include "neri/codegen/reader.h"
+#include "object_cache.h"
 
 #include <algorithm>
 #include <cctype>
@@ -41,6 +42,7 @@ struct arguments final {
   std::filesystem::path output;
   std::filesystem::path metrics;
   std::filesystem::path progress;
+  std::filesystem::path object_cache;
   neri::codegen::debug_source_paths debug_sources;
 };
 
@@ -53,7 +55,8 @@ void print_usage(std::ostream &stream) {
             "<binary|hex> --target <macos-arm64|linux-x86_64|windows-x86_64> "
             "--optimization <debug|release> "
             "--emit <llvm-ir|assembly|object> --output <path|-> "
-            "[--metrics <path>] [--progress <path>] [--debug-source <id> <path>]\n";
+            "[--metrics <path>] [--progress <path>] [--debug-source <id> <path>] "
+            "[--object-cache <absolute-private-directory>]\n";
 }
 
 arguments parse_arguments(int argc, char **argv) {
@@ -70,6 +73,7 @@ arguments parse_arguments(int argc, char **argv) {
   std::string output;
   std::string metrics;
   std::string progress;
+  std::string object_cache;
   neri::codegen::debug_source_paths debug_sources;
   for (int index = 1; index < argc; index += 2) {
     const std::string_view option(argv[index]);
@@ -112,6 +116,9 @@ arguments parse_arguments(int argc, char **argv) {
       if (option == "--progress") {
         return progress;
       }
+      if (option == "--object-cache") {
+        return object_cache;
+      }
       usage_error("Unknown option '" + std::string(option) + "'.");
     }();
     if (!destination.empty()) {
@@ -129,6 +136,13 @@ arguments parse_arguments(int argc, char **argv) {
     usage_error("Input format must be binary or hex.");
   }
   const auto kind = neri::codegen::parse_output_kind(emit);
+  if (!object_cache.empty() &&
+      (!neri::host_path(object_cache).is_absolute() ||
+       kind != neri::codegen::output_kind::object || optimization != "release" ||
+       !metrics.empty() || !progress.empty() || !debug_sources.empty())) {
+    usage_error("Object cache requires an absolute private directory, release object output, "
+                "and no metrics, progress, or debug sources.");
+  }
   if (output == "-" && kind == neri::codegen::output_kind::object) {
     usage_error("Object output requires a file path.");
   }
@@ -147,6 +161,7 @@ arguments parse_arguments(int argc, char **argv) {
           neri::host_path(output),
           neri::host_path(metrics),
           neri::host_path(progress),
+          neri::host_path(object_cache),
           std::move(debug_sources)};
 }
 
@@ -299,6 +314,15 @@ int main(int argc, char **argv) {
     if (options.format == input_format::hex) {
       bytes = decode_hex(bytes);
     }
+    neri::codegen::object_cache cache(options.object_cache, bytes, options.target,
+                                     options.optimization);
+    neri::codegen::artifact artifact;
+    if (cache.restore(artifact)) {
+      // Only verified emission publishes entries. The key includes these exact
+      // IR bytes and this generator, so a hit already proves IR verification.
+      write_output(options.output, artifact);
+      return 0;
+    }
     const auto reader_started = std::chrono::steady_clock::now();
     const auto module = neri::codegen::read_verified_module(bytes);
     const auto emission_started = std::chrono::steady_clock::now();
@@ -321,12 +345,13 @@ int main(int argc, char **argv) {
           progress_file << line << std::flush;
           progress_bytes += line.size();
         };
-    write_output(options.output,
-                 neri::codegen::emit_module(module, options.target,
+    artifact = neri::codegen::emit_module(module, options.target,
                                               options.optimization,
                                               options.kind, &metrics,
                                               options.debug_sources,
-                                              options.progress.empty() ? neri::codegen::emission_progress{} : progress));
+                                              options.progress.empty() ? neri::codegen::emission_progress{} : progress);
+    cache.publish(artifact);
+    write_output(options.output, artifact);
     write_metrics(
         options.metrics,
         static_cast<std::uint64_t>(

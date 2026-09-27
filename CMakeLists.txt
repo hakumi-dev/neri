@@ -119,10 +119,11 @@ target_include_directories(neri_codegen PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/nati
 target_include_directories(neri_codegen SYSTEM PRIVATE ${LLVM_INCLUDE_DIRS})
 target_link_libraries(neri_codegen PUBLIC neri_build_options PRIVATE ${NERI_LLVM_LIBRARIES})
 
-add_executable(neri_codegen_cli native/codegen/main.cpp)
+add_executable(neri_codegen_cli native/codegen/main.cpp native/codegen/object_cache.cpp)
+target_include_directories(neri_codegen_cli SYSTEM PRIVATE ${LLVM_INCLUDE_DIRS})
 set_target_properties(neri_codegen_cli PROPERTIES OUTPUT_NAME neri-codegen)
 target_compile_definitions(neri_codegen_cli PRIVATE NERI_TOOLCHAIN_VERSION="${NERI_VERSION}")
-target_link_libraries(neri_codegen_cli PRIVATE neri_build_options neri_codegen ${NERI_LLVM_LIBRARIES})
+target_link_libraries(neri_codegen_cli PRIVATE neri_build_options neri_codegen ${NERI_LLVM_LIBRARIES} ${CMAKE_DL_LIBS})
 
 if(APPLE)
   add_library(neri_session_object_linker SHARED native/session/object_linker.cpp)

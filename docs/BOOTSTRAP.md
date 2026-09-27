@@ -121,6 +121,11 @@ directory:
 4. When Stage3 is requested, Stage2 and Stage3 must contain byte-identical
    serialized NIR envelopes, objects and executables.
 
+Successful commands remove their invocation's workspace after publishing the
+selected toolchain or package. Failed commands retain their workspace for
+diagnostics. `benchmark` retains its measurements and prints their location.
+Other invocations' workspaces are never removed automatically.
+
 Each requested generation performs one compiler invocation. On Unix, Stage2 and
 Stage3 retain the object and NIR transport from that executable compilation
 using `--save-temps`; comparison does not repeat frontend or native generation.
@@ -145,14 +150,28 @@ it part of the reproducibility contract.
 The selected compiler, codegen, runtime and manifest are copied together
 under `build/toolchains/<artifact-manifest-sha256>`. An atomic symlink replacement
 selects that immutable tuple at `build/current`. Failures preserve the last
-published tuple. Work directories retain comparisons and test output for
-inspection.
+published tuple and retain comparisons and diagnostics in their work directory.
 
 Build commands use a private compiler cache under `build/cache/compiler`.
 Producer copies under `build/cache/producers` have content-addressed identities.
 Cache lookup still resolves the current source closure and validates native
 dependencies; an existing executable alone is insufficient. Stage messages
 distinguish execution from reuse and include elapsed milliseconds.
+
+On macOS and Linux, Stage0 object generation uses the private cache at
+`build/cache/bootstrap-objects`. Its identity includes the decoded seed, target,
+optimization mode and the native generator's loaded executable and libraries.
+macOS shared-cache images use the loader's shared-cache UUID; other images are
+verified against their mapped files and hashed. Entries contain a checked object
+and receipt, with publication serialized and atomic. Incomplete dependency
+discovery, unsafe loader environments and unsafe cache paths use normal code
+generation. The backend reports `hit`, `miss` or `unavailable`. Stage0 linking
+still runs with the current runtime and linker.
+
+This native cache operates before a Neri executable is available. Compiler
+generation, contract selection and package policy remain in the Neri driver.
+The macOS image identity comes from the SDK's `TASK_DYLD_INFO` and
+[`dyld_all_image_infos`](https://github.com/apple-oss-distributions/dyld/blob/main/include/mach-o/dyld_images.h).
 
 `scripts/build.sh test` runs native probes and language contracts against the
 current native artifacts and candidate compiler, then publishes the tuple after

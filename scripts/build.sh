@@ -64,7 +64,8 @@ gzip -dc "$ROOT_DIR/bootstrap/compiler.nir.gz" > "$LAUNCH_DIR/compiler.nir"
 verify_digest "$LAUNCH_DIR/compiler.nir" "$(seed_digest irSha256)"
 echo '[bootstrap] Materializing Stage0 from verified seed'
 "$NATIVE_DIR/neri-codegen" --input "$LAUNCH_DIR/compiler.nir" --input-format binary \
-  --target "$TARGET" --optimization release --emit object --output "$LAUNCH_DIR/compiler.o"
+  --target "$TARGET" --optimization release --emit object --output "$LAUNCH_DIR/compiler.o" \
+  --object-cache "$ROOT_DIR/build/cache/bootstrap-objects"
 LINK_ARGUMENTS=("$LAUNCH_DIR/compiler.o" "$NATIVE_DIR/libneri-runtime.a" -o "$LAUNCH_DIR/bin/neri")
 if [[ "$TARGET" == linux-x86_64 ]]; then LINK_ARGUMENTS+=(-lcrypto); fi
 "$LLVM_PREFIX/bin/clang++" "${LINK_ARGUMENTS[@]}"

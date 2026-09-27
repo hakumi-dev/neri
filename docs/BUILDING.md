@@ -63,12 +63,18 @@ compiler generation uses the current compiler unit and standard library.
 | `scripts/build.sh test` | Build and validate the checkout; select the verified toolchain at `build/current`. |
 | `scripts/build.sh package` | Build and validate a Stage2 distribution. |
 | `--stage 3` | Add a generation and verify the compiler fixed point. |
+| `smoke-test`, `negative-test`, `cabi-test` with `--compiler <path>` | Run the selected contracts with an existing compiler; verify its checkout version and native compile/run compatibility. |
 | `scripts/build.sh debugger-test` | Opt-in LLDB contract on macOS; see [debugging](DEBUGGING.md). |
 | `scripts/neri.sh <arguments>` | Use the selected checkout toolchain without changing the installed compiler. |
 
 `scripts/build.sh test` builds and validates the current checkout, then selects
 its verified toolchain at `build/current`. See [bootstrapping](BOOTSTRAP.md) for
 generation checks and [testing](../tests/README.md) for suite composition.
+
+`--compiler` selects an executable for the three focused contract commands.
+It bypasses compiler generations and leaves `build/current` unchanged. Native
+components are prepared for the current checkout. The option cannot be combined
+with `--stage` or used for distribution, installation, or seed refresh.
 
 ## Build native components
 
