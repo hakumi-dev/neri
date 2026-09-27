@@ -16,7 +16,7 @@ class IncrementalProjectCache
   private artifactsDigest: String = ""
   private checkedHit: Bool = false
 
-  def prepare(firstSource: BootstrapSourceInput?, sourceIds: StringBuffer, sourceOwners: StringBuffer, target: readonly TargetPlatform, release: Bool, configurationInputs: String, noCache: Bool, project: NeriProject, saveTemps: Bool = false): Void
+  def prepare(firstSource: BootstrapSourceInput?, sourceIds: StringBuffer, sourceOwners: StringBuffer, target: readonly TargetPlatform, release: Bool, configurationInputs: String, noCache: Bool, project: NeriProject, saveTemps: Bool = false, linkToolchain: NativeLinkToolchain? = null): Void
     if noCache || firstSource == null
       return
     end
@@ -44,7 +44,7 @@ class IncrementalProjectCache
 
     configuration = configuration + runCacheFrame(libraryPath) if libraryPath != null
     configuration = configuration + runCacheFrame("save-temps") if saveTemps
-    var identity = runCacheFrame("neri-project-artifact-v1") + runCacheFrame(configuration)
+    var identity = runCacheFrame("neri-project-artifact-v2") + runCacheFrame(configuration)
     var index = 0
 
     while index < sourceIds.size
@@ -86,7 +86,7 @@ class IncrementalProjectCache
     let probe = new RunCache()
     let module = new IrModule("incremental-probe", "")
 
-    probe.prepare(module, target, release, firstSource, "neri-project-artifact-v1", configuration, extraDependencies, sourceDigest)
+    probe.prepare(module, target, release, firstSource, "neri-project-artifact-v1", configuration, extraDependencies, sourceDigest, false, false, linkToolchain)
     if probe.directory == ""
       return
     end
@@ -97,7 +97,7 @@ class IncrementalProjectCache
     end
     this.toolchainDigest = dependencies
     this.contentDigest = sha256FastText(runCacheFrame(sourceDigest) + runCacheFrame(dependencies))
-    this.cache.prepare(module, target, release, firstSource, "neri-project-artifact-v1", configuration, extraDependencies, this.contentDigest)
+    this.cache.prepare(module, target, release, firstSource, "neri-project-artifact-v1", configuration, extraDependencies, this.contentDigest, false, false, linkToolchain)
     this.enabled = this.cache.directory != ""
   end
 
@@ -336,6 +336,36 @@ def incrementalSourceById(first: BootstrapSourceInput?, id: String): BootstrapSo
   return null
 end
 
+def incrementalManifestValue(value: LspJson): String
+  if !value.isObject() && !value.isArray()
+    return lspJsonStringify(value)
+  end
+  var members: IrOrderNode<LspJson>? = null
+  var member = value.first
+  var ordinal = 0
+
+  while member != null
+    let node = new IrOrderNode<LspJson>(member, 0, value.isObject() ? member.key : "", ordinal)
+
+    node.next = members
+    members = node
+    ordinal = ordinal + 1
+    member = member.next
+  end
+  var ordered = irOrderSort(members)
+  var result = value.isObject() ? "{" : "["
+  var separator = ""
+
+  while ordered != null
+    result = result + separator
+    result = result + lspQuote(ordered.value.key) + ":" if value.isObject()
+    result = result + incrementalManifestValue(ordered.value)
+    separator = ","
+    ordered = ordered.next
+  end
+  return result + (value.isObject() ? "}" : "]")
+end
+
 def incrementalOwnerManifests(owners: StringBuffer, project: NeriProject): String?
   let seen = new StringTable<Bool>()
   var result = ""
@@ -355,14 +385,33 @@ def incrementalOwnerManifests(owners: StringBuffer, project: NeriProject): Strin
       end
       let path = host::stringSlice(owner, 0, separator)
 
-      if seen.add(path, true)
+      if seen.add(owner, true)
         let observed = project.manifestTexts.find(path)
 
         if observed != null
           if host::readText(path) != observed.value
             return null
           end
-          result = result + runCacheFrame(path) + runCacheFrame(sha256FastText(observed.value))
+          let parser = new LspJsonParser(observed.value)
+          let config = parser.parse()
+          let name = host::stringSlice(owner, separator + 1, host::stringByteLength(owner) - separator - 1)
+          let definition = config.get("units").get(name)
+
+          parser.spaces()
+          if parser.failed || parser.position != host::stringByteLength(observed.value) || !definition.isObject()
+            return null
+          end
+          # The resolver requires an own source for every selected unit, so the
+          # ordered owners cover the complete graph, including generated units.
+          # Keep whole-file checks above as in-flight guards, but key only the
+          # selected definition and build-relevant project configuration.
+          result = result + runCacheFrame(owner)
+          for field in ["version", "sourceMap"]
+            result = result + runCacheFrame(incrementalManifestValue(config.get(field)))
+          end
+          for field in ["kind", "sources", "exclude", "references", "generated"]
+            result = result + runCacheFrame(incrementalManifestValue(definition.get(field)))
+          end
         else
           let status = files::status(path)
           let fileStatus = status.status

@@ -1,0 +1,220 @@
+use host
+use process
+use files
+use test
+use json
+use result
+
+def runtimeTarget(): String?
+  let path = host::environment("NERI_RUNTIME_MANIFEST")
+
+  return null if path == null
+  let read = files::readBytes(path, 1048576)
+  let bytes = read.bytes
+
+  return null if read.failure != null || read.closeFailure != null || bytes == null
+  match json::parseBytes(bytes)
+    case result::Result.Ok(value)
+      let target = value.get("target")
+
+      return target != null && target.kind() == "string" ? target.text() : null
+    case result::Result.Error(error)
+      return null
+  end
+end
+
+def command(executable: String, arguments: String[]): Void
+  let status = host::run(executable, arguments)
+
+  test::assertTrue(status != null && status == 0)
+end
+
+def write(path: String, text: String): Void
+  test::assertTrue(host::writeText(path, text))
+end
+
+def overlay(source: String, destination: String, exclude: String): Void
+  command("mkdir", ["-p", destination])
+  let root = files::Root.open(source).root
+
+  test::assertTrue(root != null)
+  if root == null
+    return
+  end
+  let listed = root.list("", 4096)
+  let closed = root.close()
+
+  test::assertTrue(listed.failure == null && closed == null)
+  for entry in listed.entries
+    if entry.name != exclude
+      command("ln", ["-s", source + "/" + entry.name, destination + "/" + entry.name])
+    end
+  end
+end
+
+def contains(text: String, part: String): Bool
+  var index = 0
+
+  while index + host::stringByteLength(part) <= host::stringByteLength(text)
+    if host::stringSlice(text, index, host::stringByteLength(part)) == part
+      return true
+    end
+    index = index + 1
+  end
+  return false
+end
+
+def run(compiler: String, source: String, cache: String, sdk: String, hit: Bool): Void
+  let options = new process::SpawnOptions(compiler)
+
+  options.arguments = ["run", "--release", "--timings", source]
+  options.environment = [new process::EnvironmentEntry("NERI_CACHE_DIR", cache),
+    new process::EnvironmentEntry("SDKROOT", sdk)]
+  let started = process::spawn(options)
+  let child = started.child()
+
+  test::assertTrue(started.failure() == null && child != null)
+  if child == null
+    return
+  end
+  let result = child.wait(60000)
+
+  if result.running || result.failure != null
+    let cancelled = child.cancel()
+    let stopped = child.wait(5000)
+    let cleaned = child.dispose()
+
+    test::assertTrue(cancelled && !stopped.running && cleaned)
+    test::assertTrue(false)
+    return
+  end
+  let disposed = child.dispose()
+  let status = result.exit
+
+  test::assertTrue(result.failure == null && !result.running && disposed && status != null)
+  test::assertTrue(!result.stdoutTruncated && !result.stderrTruncated)
+  if status != null
+    test::assertTrue(status.isExited() && status.value() == 0)
+  end
+
+  let stdout = host::stringFromBytes(result.stdout)
+  let stderr = host::stringFromBytes(result.stderr)
+
+  test::assertTrue(stdout != null && stderr != null)
+  if stdout != null && stderr != null
+    test::assertEqual(stdout, "run-cache-fixture\n")
+    test::assertEqual(contains(stderr, "neri timing cache-hit "), hit)
+  end
+end
+
+def entry(cache: String): String
+  let root = files::Root.open(cache).root
+
+  test::assertTrue(root != null)
+  if root == null
+    return ""
+  end
+  let listed = root.list("", 4096)
+  let closed = root.close()
+
+  test::assertTrue(listed.failure == null && closed == null)
+  var selected = ""
+  var count = 0
+
+  for item in listed.entries
+    let candidate = cache + "/" + item.name
+    let receipt = item.kind.isDirectory() ? host::readText(candidate + "/receipt") : null
+
+    if receipt != null && contains(receipt, "neri-run-native-v1")
+      selected = candidate
+      count = count + 1
+    end
+  end
+
+  test::assertEqual(count, 1)
+  return selected
+end
+
+def main(): Void
+  let compiler = host::argumentAt(0)
+  let work = host::argumentAt(1)
+  let target = runtimeTarget()
+
+  test::assertTrue(compiler != null && work != null && target != null)
+  if compiler == null || work == null || target != "macos-arm64"
+    return
+  end
+  let installedSDK = host::environment("SDKROOT")
+
+  test::assertTrue(installedSDK != null)
+  if installedSDK == null
+    return
+  end
+  let root = work + "/run-cache-contract"
+  let sdk = root + "/SDK"
+  let cache = root + "/cache"
+  let source = root + "/main.hk"
+
+  overlay(installedSDK, sdk, "usr")
+  overlay(installedSDK + "/usr", sdk + "/usr", "lib")
+  overlay(installedSDK + "/usr/lib", sdk + "/usr/lib", "system")
+  command("cp", ["-RL", installedSDK + "/usr/lib/system", sdk + "/usr/lib/system"])
+  command("mkdir", ["-p", cache])
+  command("chmod", ["700", cache])
+  write(source, "use console\ndef main(): Void\n  console::println(\"run-cache-fixture\")\nend\n")
+  run(compiler, source, cache, sdk, false)
+  run(compiler, source, cache, sdk, true)
+  let cached = entry(cache)
+  let receipt = host::readText(cached + "/receipt")
+
+  test::assertTrue(cached != "" && receipt != null)
+  if receipt == null
+    return
+  end
+  let libraries = files::Root.open(sdk + "/usr/lib/system").root
+
+  test::assertTrue(libraries != null)
+  if libraries == null
+    return
+  end
+  let listed = libraries.list("", 4096)
+  let closed = libraries.close()
+  var consumed = ""
+
+  test::assertTrue(listed.failure == null && closed == null)
+  for item in listed.entries
+    let candidate = sdk + "/usr/lib/system/" + item.name
+
+    if consumed == "" && item.kind.isFile() && contains(candidate, ".tbd") && contains(receipt, candidate)
+      consumed = candidate
+    end
+  end
+  let checked = files::status(consumed)
+  let status = checked.status
+
+  test::assertTrue(checked.failure == null && status != null)
+  if status == null
+    return
+  end
+
+  test::assertTrue(status.exists && status.kind.isFile() && !status.symlink)
+  if !status.exists || !status.kind.isFile() || status.symlink
+    return
+  end
+  let original = host::readText(consumed)
+
+  test::assertTrue(consumed != "" && original != null)
+  if original == null
+    return
+  end
+  write(consumed, original + "\n")
+  run(compiler, source, cache, sdk, false)
+  write(consumed, original)
+  run(compiler, source, cache, sdk, true)
+  write(cached + "/receipt", "invalid receipt\n")
+  run(compiler, source, cache, sdk, false)
+  write(cached + "/receipt", receipt)
+  run(compiler, source, cache, sdk, true)
+  write(cached + "/program", "corrupt executable\n")
+  run(compiler, source, cache, sdk, false)
+end

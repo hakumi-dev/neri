@@ -185,6 +185,26 @@ Cache lookup still resolves the current source closure and validates native
 dependencies; an existing executable alone is insufficient. Stage messages
 distinguish execution from reuse and include elapsed milliseconds.
 
+Project cache identities include the selected units and their ordered reference
+graph, source contents, generated inputs and source mappings. Unselected units,
+test invocation metadata and documentation do not invalidate those artifacts.
+The complete manifests are still checked for changes during a compilation.
+
+On macOS ARM64, executable `run` entries record the files consumed by the native
+linker and its unsuccessful file searches. Reuse verifies those file contents,
+the continued absence of missing candidates and the executable's SHA-256 digest.
+Malformed receipts or changed inputs cause compilation instead of reuse.
+
+For the supported macOS Clang driver, executable compilation resolves the active
+Xcode linker and the driver's LTO library once. The same plan supplies explicit
+link arguments and content identities for the driver, linker and LTO library.
+Clang's implicit configuration files are disabled, and `--no-cache` preserves
+the same link policy. These checks cover the selected tool files; they do not
+establish the complete set of libraries loaded dynamically by those tools.
+The selection follows Clang's documented
+[configuration policy](https://clang.llvm.org/docs/UsersManual.html#configuration-files)
+and [linker override](https://clang.llvm.org/docs/ClangCommandLineReference.html#cmdoption-ld-path).
+
 Compiler artifact caches and source dependency libraries also bind their
 entries to the generator's loaded-image identity. The compiler queries
 `neri-codegen --cache-identity` before lookup and rechecks it before accepting
