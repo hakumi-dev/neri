@@ -72,20 +72,7 @@ stages and a maximum recursive depth of 64. Repeated references count on every
 visit. Excessive complexity fails with `UnsupportedCapability` before provider
 execution, preventing exponential expansion of repeatedly shared conditions.
 
-## Verification and references
-
-```sh
-scripts/neri.sh run --project experiments/neri-data --unit group-predicate-contract
-scripts/neri.sh run --project experiments/neri-data --unit group-predicate-contract --release
-scripts/neri.sh run --project experiments/neri-data/provider-contract --unit group-predicates
-scripts/neri.sh run --project experiments/neri-data/provider-contract --unit group-predicates --release
-```
-
-SQLite contracts cover nullable integer/text truth tables, integer ordering,
-Boolean identities, independent aggregate filters, distinct metrics, empty
-sources, and filters after pagination. Core contracts verify numbered SQL and
-bound values, invalid metrics, and rejection before provider dispatch.
-PostgreSQL coverage is compilation only; it is not a running second adapter.
+## References
 
 Primary references checked on 2026-09-22:
 

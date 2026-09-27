@@ -126,16 +126,7 @@ independent historical snapshots as reviewable bundles. Compound/alternate key
 constraints, database foreign-key modeling and reverse engineering remain
 unsupported. Callers assemble and apply their migration catalog explicitly.
 
-## Verification and references
-
-```sh
-scripts/neri.sh run --project experiments/neri-data/providers/sqlite --unit schema-diff-contract
-scripts/neri.sh run --project experiments/neri-data/providers/sqlite --unit schema-diff-contract --release
-scripts/neri.sh run --project . --unit data-generation-contracts -- "$PWD"
-scripts/neri.sh run --project . --unit data-schema-mapping-contracts -- "$PWD"
-scripts/neri.sh run --project experiments/neri-data/provider-contract --unit migrations
-scripts/neri.sh run --project experiments/neri-data/provider-contract --unit migrations --release
-```
+## References
 
 Primary references verified on 2026-09-23:
 

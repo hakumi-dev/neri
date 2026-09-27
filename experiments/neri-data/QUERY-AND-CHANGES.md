@@ -211,39 +211,18 @@ owned savepoints; generated tracked contexts manage them internally rather than
 exposing manual nested checkpoints. See [graph savepoint recovery](SAVEPOINTS.md).
 An uncertain transaction outcome prevents further writes.
 
-## Verified references
+## References
 
-These primary sources were checked on 2026-09-22. They motivate the contracts
-and test cases; they do not prove this implementation correct.
+These primary sources were checked on 2026-09-22. They motivate the contracts;
+they do not prove this implementation correct.
 
-| Source | Applied contract and verification |
+| Source | Applied contract |
 | --- | --- |
-| Meijer, Beckman, Bierman, [LINQ](https://gavinbierman.github.io/assets/pdf/sigmod2006.pdf), SIGMOD 2006; Cheney, Lindley, Wadler, [A Practical Theory of Language-Integrated Query](https://homepages.inf.ed.ac.uk/jcheney/publications/cheney13icfp.pdf), ICFP 2013 | Composable typed queries and inspectable expressions motivate an explicit supported translation vocabulary. Nested SQL preserves operator order; tests cover filters after limits, offset boundaries, and server-selected DTO fields. Neri does not implement the full normalization calculus. |
-| Microsoft, [pagination](https://learn.microsoft.com/en-us/ef/core/querying/pagination); SQLite, [SELECT processing](https://sqlite.org/lang_select.html) | Ordering is explicit at each stage. Tests verify secondary ordering, offset before a later filter, and distinct over mapped columns rather than the physical table. Offset does not introduce an implicit inner materialization limit. |
-| Gray, [The Transaction Concept: Virtues and Limitations](https://people.eecs.berkeley.edu/~kubitron/courses/cs262a-S16/handouts/papers/theTransactionConcept.pdf), Tandem TR 81.3 / VLDB 1981, abstract and general model | Transaction effects must commit together or be undone. Integration forces a later statement to fail, checks that an earlier insert disappeared, then repairs and retries the pending changes. |
-| Berenson et al., [A Critique of ANSI SQL Isolation Levels](https://www.microsoft.com/en-us/research/wp-content/uploads/2016/02/tr-95-51.pdf), SIGMOD 1995, §4.1 | Lost updates motivate a stale-context test. The implementation uses original-value predicates; atomic saving alone does not imply serializability of earlier reads. |
-| Microsoft, [snapshot change detection](https://learn.microsoft.com/en-us/ef/core/change-tracking/change-detection), [identity resolution](https://learn.microsoft.com/en-us/ef/core/change-tracking/identity-resolution), and [optimistic concurrency](https://learn.microsoft.com/en-us/ef/core/saving/concurrency) | Track scalar baselines, retain one instance per key, and check configured originals on mutation. Neri preserves all mapped originals as the omitted-policy default. Tests cover identity reuse, unchanged saves, key mutation, selected tokens, and conflicting contexts. |
+| Meijer, Beckman, Bierman, [LINQ](https://gavinbierman.github.io/assets/pdf/sigmod2006.pdf), SIGMOD 2006; Cheney, Lindley, Wadler, [A Practical Theory of Language-Integrated Query](https://homepages.inf.ed.ac.uk/jcheney/publications/cheney13icfp.pdf), ICFP 2013 | Composable typed queries and inspectable expressions motivate an explicit supported translation vocabulary. Nested SQL preserves operator order for filters, limits and projections. Neri does not implement the full normalization calculus. |
+| Microsoft, [pagination](https://learn.microsoft.com/en-us/ef/core/querying/pagination); SQLite, [SELECT processing](https://sqlite.org/lang_select.html) | Ordering is explicit at each stage. Distinct applies to mapped columns. Offset does not introduce an implicit inner materialization limit. |
+| Gray, [The Transaction Concept: Virtues and Limitations](https://people.eecs.berkeley.edu/~kubitron/courses/cs262a-S16/handouts/papers/theTransactionConcept.pdf), Tandem TR 81.3 / VLDB 1981, abstract and general model | Transaction effects must commit together or be undone. Failed saves recover through rollback while preserving pending tracked changes. |
+| Berenson et al., [A Critique of ANSI SQL Isolation Levels](https://www.microsoft.com/en-us/research/wp-content/uploads/2016/02/tr-95-51.pdf), SIGMOD 1995, §4.1 | Lost updates motivate original-value predicates. Atomic saving alone does not imply serializability of earlier reads. |
+| Microsoft, [snapshot change detection](https://learn.microsoft.com/en-us/ef/core/change-tracking/change-detection), [identity resolution](https://learn.microsoft.com/en-us/ef/core/change-tracking/identity-resolution), and [optimistic concurrency](https://learn.microsoft.com/en-us/ef/core/saving/concurrency) | Track scalar baselines, retain one instance per key, and check configured originals on mutation. Neri preserves all mapped originals as the omitted-policy default. |
 | Microsoft, [SaveChanges transactions](https://learn.microsoft.com/en-us/ef/core/saving/transactions); Fowler, [Unit of Work](https://martinfowler.com/eaaCatalog/unitOfWork.html) | One context gathers changes across entity sets and submits one atomic batch. In-memory baselines advance only after success. |
 | SQLite, [transactions](https://www.sqlite.org/lang_transaction.html), [affected rows](https://www.sqlite.org/c3ref/changes.html), [autocommit state](https://www.sqlite.org/c3ref/get_autocommit.html), and [foreign keys](https://www.sqlite.org/foreignkeys.html) | Use an explicit write transaction, check each mutation's affected rows, account for automatic rollback and commit failures, and enable foreign keys per connection. |
-| SQLite, [savepoints](https://sqlite.org/lang_savepoint.html) and [extended result codes](https://sqlite.org/rescode.html) | Savepoint release remains provisional until outer commit. Integration tests force a failed savepoint, outer rollback, and trigger-driven automatic rollback; callers receive distinct constraint and concurrency categories. |
-
-## Focused verification
-
-From the repository root:
-
-```sh
-neri run --project experiments/neri-data --unit runtime-contract
-neri run --project experiments/neri-data --unit persistence-contract
-neri run --project experiments/neri-data/providers/sqlite --unit contract
-neri run --project experiments/neri-data/provider-contract --unit persistence
-neri run --project experiments/neri-data/provider-contract --unit persistence --release
-neri run --project . --unit data-generation-contracts -- "$PWD"
-```
-
-The persistence integration uses isolated temporary files. It verifies query
-terminals, DTO projections, insert/update/delete, cancelled additions,
-snapshot acceptance, key validation, atomic rollback and retry, stale writes,
-read-only rejection, and persistence after reopening the database. Native
-SQLite verification is currently on macOS.
-Explicit-transaction checks cover multiple saves, insert and delete retries,
-savepoint recovery, ownership rejection, automatic rollback, and close cleanup.
+| SQLite, [savepoints](https://sqlite.org/lang_savepoint.html) and [extended result codes](https://sqlite.org/rescode.html) | Savepoint release remains provisional until outer commit. Callers receive distinct constraint and concurrency categories; failed recovery blocks further writes until transaction state is resolved. |

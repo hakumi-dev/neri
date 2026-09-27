@@ -14,11 +14,10 @@ the existing Boolean NULL compensation; nullable ordered comparisons remain
 unsupported.
 
 The quotation ABI includes `FloatLiteral`, `Node.floatValue()`, and
-`CaptureValue.Float`. The new Node constructor argument is trailing and
-defaulted so existing positional construction retains its meaning. General
-Float arithmetic inside database quotations remains outside the translator.
-For a negative comparison constant, capture a precomputed Float binding;
-the database translator currently rejects unary Negate nodes.
+`CaptureValue.Float`.
+Computed Float arithmetic and negation follow the
+[computed scalar contract](COMPUTED-EXPRESSIONS.md), including its finite-result
+checks and provider capability requirement.
 
 ## SQLite and numeric boundaries
 
@@ -46,24 +45,7 @@ empty/all-null inputs, DISTINCT, and FILTER. A returned infinity fails decoding.
 These are approximate calculations; exact decimal arithmetic, currency codecs,
 rounding policies, and numeric conversion mappings are outside this scalar contract.
 
-## Verification
-
-The provider fixture checks strict storage classes, REAL affinity, bound values,
-typed projections, set-based and tracked writes, rollback, and special-value
-rejection. The generated consumer combines authored Float migrations, mapping
-generation, captured quotations, field packs, ordering, aggregates, nullable
-snapshots, and retry after outer rollback.
-
-```sh
-scripts/neri.sh run --project tooling/data --unit generator -- "$PWD/experiments/neri-data/float-values/mapping.json"
-scripts/neri.sh run --project experiments/neri-data/provider-contract --unit floats
-scripts/neri.sh run --project experiments/neri-data/provider-contract --unit floats --release
-scripts/neri.sh run --project experiments/neri-data/float-values
-scripts/neri.sh run --project experiments/neri-data/float-values --release
-scripts/neri.sh run --project experiments/neri-data --unit migration-contract
-```
-
-## Verified references
+## References
 
 Primary sources checked on 2026-09-22:
 

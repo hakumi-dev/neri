@@ -130,7 +130,7 @@ Scalar quotations accept at most 256 nodes, 512 reachable-node visits, and a
 65,536-byte SQL expression. Validation also applies to manually constructed
 trees and rejects cycles, excessive repeated subtrees and invalid child types.
 
-## Verified references
+## References
 
 Primary sources checked on 2026-09-23:
 

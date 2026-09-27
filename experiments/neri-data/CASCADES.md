@@ -47,8 +47,8 @@ were already inserted provisionally within it.
 
 ## Database and loading boundary
 
-SQLite fixtures use enforced foreign keys without database cascade actions, so
-successful deletion proves the client emitted the required dependent writes.
+Client cascades emit dependent writes explicitly and do not require database
+cascade actions.
 An unregistered database dependent is outside the known graph and may cause the
 database to reject the principal delete. That save is rolled back; the client
 does not silently claim to have removed the missing dependent.
@@ -64,26 +64,7 @@ The existing entity-set `remove` operation still stages one entity. The explicit
 context cascade operation is the entry point for this policy. No implicit
 required-relationship cascade convention is applied.
 
-## Verification and sources
-
-Runtime contracts exercise transitive closure, shared dependents, restrictions,
-atomic preflight rejection, handle lifetime, temporary keys, policy mismatches,
-and active/retired dependency cycles. They also cover cancellation of additions
-staged before and during an outer transaction, including provisional inserts.
-The generated SQLite consumer exercises actual FK enforcement, delete ordering,
-save failure after a partial delete and retry, outer rollback, self-reference,
-Unicode string keys, and reassignment/unlink boundaries.
-
-```sh
-scripts/neri.sh run --project experiments/neri-data --unit cascade-contract
-scripts/neri.sh run --project tooling/data --unit generator -- \
-  "$PWD/experiments/neri-data/cascades/mapping.json"
-scripts/neri.sh run --project experiments/neri-data/cascades --unit contract
-scripts/neri.sh run --project experiments/neri-data/cascades --unit contract --release
-```
-
-Primary references checked on 2026-09-22:
-
+## References
 - Microsoft, [Cascade delete](https://learn.microsoft.com/en-us/ef/core/saving/cascade-delete):
   distinguishes client processing of tracked dependents from database cascades;
   a missing dependent can make a client-cascade deletion fail its database FK.

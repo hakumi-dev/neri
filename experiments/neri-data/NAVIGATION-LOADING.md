@@ -108,26 +108,7 @@ validate observed rows but cannot prove arbitrary callback semantics, especially
 when no dependent row matches. Generated descriptors establish that agreement
 by construction.
 
-## Verification
-
-`loading-contract` exercises staged publication, identity and ownership checks,
-and conflicting local relationship changes. The generated SQLite consumer tests
-empty, one, and many children; a 51-parent result split into two dependent
-queries; bound string keys containing SQL-looking Unicode text; repeat loads;
-malformed rows; and clearing an inverse reference after a database deletion.
-
-Run from the repository root with the local compiler:
-
-```sh
-scripts/neri.sh run --project experiments/neri-data --unit loading-contract
-scripts/neri.sh run --project experiments/neri-data --unit loading-contract --release
-scripts/neri.sh run --project tooling/data --unit generator -- \
-  "$PWD/experiments/neri-data/navigation/mapping.json"
-scripts/neri.sh run --project experiments/neri-data/navigation --unit contract
-scripts/neri.sh run --project experiments/neri-data/navigation --unit contract --release
-```
-
-## Verified primary references
+## References
 
 These sources were checked on 2026-09-22. They motivate the design; Neri does not
 inherit their correctness results or claim complete EF Core behavior.

@@ -72,14 +72,7 @@ triggers, configurable sentinels/save behaviors and computed-schema definitions
 are unsupported. Set-based operations retain their existing untracked
 execution and stale-tracker semantics.
 
-## Verification and references
-
-```sh
-scripts/neri.sh run --project tooling/data --unit generator -- experiments/neri-data/generated-properties/mapping.json
-scripts/neri.sh run --project experiments/neri-data --unit generated-properties-contract
-scripts/neri.sh run --project experiments/neri-data/generated-properties --unit contract
-scripts/neri.sh run --project experiments/neri-data/generated-properties --unit contract --release
-```
+## References
 
 Primary references verified on 2026-09-23:
 

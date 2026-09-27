@@ -108,24 +108,7 @@ uses authored model snapshots. Automatic entity scaffolding and a complete
 index/foreign-key catalog are outside schema inspection. Inspection does not establish that
 an application's migration history matches all external DDL changes.
 
-## Verification
-
-Contracts cover whole-call upgrade rollback, partial downgrade rollback,
-modified signatures and malformed history ordinals, foreign-key-protected
-drops, and a deferred constraint that fails specifically at COMMIT. They verify
-restored rows, schema and history before retry. A generated application context
-also saves and queries entities in a database created by the migration API.
-
-```sh
-scripts/neri.sh run --project experiments/neri-data --unit migration-contract
-scripts/neri.sh run --project experiments/neri-data/providers/sqlite --unit migration-contract
-scripts/neri.sh run --project experiments/neri-data/providers/sqlite --unit migration-contract --release
-scripts/neri.sh run --project experiments/neri-data/providers/sqlite --unit schema-inspection-contract
-scripts/neri.sh run --project experiments/neri-data/providers/sqlite --unit schema-inspection-contract --release
-scripts/neri.sh run --project experiments/neri-data/provider-contract --unit migrations --release
-```
-
-## Verified primary references
+## References
 
 - Curino, Moon and Zaniolo, [Graceful Database Schema Evolution: the PRISM
   Workbench](https://www.vldb.org/pvldb/vol1/1453939.pdf), PVLDB 1(1), 2008,

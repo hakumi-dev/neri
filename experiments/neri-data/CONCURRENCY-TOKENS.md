@@ -55,24 +55,13 @@ Hand-authored `EntityTracker` instances use the optional
 The tracker copies the array and validates it before writes. Its `null`, empty
 and nonempty policies correspond to the mapping policies above.
 
-## Limits and verification
+## Limits
 
 Token comparison follows database comparison semantics. Equal replacement
 values, changes later reversed, unselected fields and collation-equivalent
 values need not conflict. These per-row checks do not guarantee serializability
 of earlier reads or invariants spanning multiple rows. Set-based writes retain
 their explicit untracked semantics and do not infer tracked tokens.
-
-```sh
-scripts/neri.sh run --project tooling/data --unit generator -- experiments/neri-data/concurrency-tokens/mapping.json
-scripts/neri.sh run --project experiments/neri-data --unit concurrency-policy-contract
-scripts/neri.sh run --project experiments/neri-data/concurrency-tokens --unit contract
-scripts/neri.sh run --project experiments/neri-data/concurrency-tokens --unit contract --release
-```
-
-The generated-properties fixture also covers store-generated tokens, failed
-stale writes, rebase/retry and rollback. Mapping contracts reject invalid
-declarations and check logical-to-physical resolution.
 
 Primary references verified on 2026-09-23:
 

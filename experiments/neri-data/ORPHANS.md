@@ -48,20 +48,7 @@ collection-change detection, navigation fixup, and configurable orphan timing
 are not implemented. Database foreign keys still enforce dependencies outside
 the registered graph; missing children can reject the save.
 
-## Verification and references
-
-The runtime cascade contract checks required-policy rejection, descendant
-restrictions, protected-principal paths, handle lifetime, and no mutation on
-preflight failure. The generated SQLite cascade consumer exercises persisted
-orphan removal, retained principals, added cancellation, reparenting, stored
-delete ordering, partial failure recovery, and rollback/retry.
-
-```sh
-scripts/neri.sh run --project experiments/neri-data --unit cascade-contract
-scripts/neri.sh run --project experiments/neri-data --unit cascade-contract --release
-scripts/neri.sh run --project experiments/neri-data/cascades --unit contract
-scripts/neri.sh run --project experiments/neri-data/cascades --unit contract --release
-```
+## References
 
 Primary references checked on 2026-09-22:
 
@@ -71,6 +58,6 @@ Primary references checked on 2026-09-22:
   removal through the explicit unlink operation.
 - Microsoft, [Cascade delete](https://learn.microsoft.com/en-us/ef/core/saving/cascade-delete):
   distinguishes orphan removal, where the principal remains, from removal
-  following deletion of the principal. The existing [cascade references](CASCADES.md#verification-and-sources)
+  following deletion of the principal. The [cascade references](CASCADES.md#references)
   document SQLite enforcement and Markowitz's *VLDB 1991* analysis of cascade
   paths, restrictions, and cycles, used by the shared dependency planner.

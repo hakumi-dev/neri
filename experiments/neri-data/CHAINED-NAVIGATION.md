@@ -69,26 +69,12 @@ cost; these limits are not a performance guarantee.
 
 Multiple statements do not automatically observe one database snapshot. Use an
 explicit context transaction when its isolation behavior is required. Automatic
-context-wide fixup, filtered/per-parent limited includes, loaded-state flags,
-composite relationship keys and automatic graph discovery are unsupported.
+context-wide fixup, loaded-state flags and composite relationship keys are
+unsupported. [Filtered navigation](FILTERED-NAVIGATION.md) configures per-parent
+collection selection; [graph registration](GRAPH-REGISTRATION.md) is an explicit
+operation for tracked writes, separate from loading.
 
-## Verification and references
-
-The native fixture verifies collection/reference paths and sibling branches,
-reverse traversal without duplicate identities, local scalar edit preservation,
-and rollback after a late malformed row from both empty and populated graphs.
-Retained array aliases check storage identity after rollback. Provider counters
-prove that the failure reached the last stage, reject incompatible contexts and
-trackers before root reads, and cover a 51-root batch boundary. The fixture
-passes in debug and release; the existing collection/reference contracts pass.
-
-```sh
-scripts/neri.sh run --project tooling/data --unit generator -- experiments/neri-data/chained-navigation/mapping.json
-scripts/neri.sh run --project experiments/neri-data/chained-navigation --unit contract
-scripts/neri.sh run --project experiments/neri-data/chained-navigation --unit contract --release
-scripts/neri.sh run --project experiments/neri-data --unit loading-contract
-scripts/neri.sh run --project experiments/neri-data --unit reference-loading-contract
-```
+## References
 
 Primary references verified on 2026-09-23:
 

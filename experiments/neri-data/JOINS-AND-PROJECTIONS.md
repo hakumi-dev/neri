@@ -106,25 +106,7 @@ For results that participate in further relational operations,
 [`pairShape` and projected relations](PROJECTED-RELATIONS.md) provide a fixed
 structural layout. Arbitrary quoted constructor bodies are outside this contract.
 
-## Verification
-
-```sh
-scripts/neri.sh run --project experiments/neri-data --unit join-contract
-scripts/neri.sh run --project experiments/neri-data --unit projection-contract
-scripts/neri.sh run --project experiments/neri-data/provider-contract --unit joins
-scripts/neri.sh run --project experiments/neri-data/provider-contract --unit joins --release
-scripts/neri.sh run --project experiments/neri-data/provider-contract --unit projections
-scripts/neri.sh run --project experiments/neri-data/provider-contract --unit projections --release
-```
-
-Contracts cover same-named columns, self-joins, nullable keys, present versus
-absent right rows, composed input limits, input data exceeding 1000 rows,
-provider mismatch, and PostgreSQL parameter numbering. Projection contracts
-cover nested DTOs, repeated fields, strict nullable decoding, one codec call
-per selected cell, and failure before DTO callbacks. Generated-context tests
-verify that an invalid unselected scalar does not force entity materialization.
-
-## Verified primary references
+## References
 
 - Cheney, Lindley and Wadler, [A Practical Theory of Language-Integrated
   Query](https://homepages.inf.ed.ac.uk/jcheney/publications/cheney13icfp.pdf),

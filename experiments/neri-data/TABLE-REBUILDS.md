@@ -60,14 +60,7 @@ when that occurrence is not a dependency. Plans involving an index-name transfer
 between tables and a rebuild are rejected before execution; coordinated index
 transfers are unsupported.
 
-## Verification and references
-
-```sh
-scripts/neri.sh run --project experiments/neri-data --unit migration-contract
-scripts/neri.sh run --project experiments/neri-data/providers/sqlite --unit schema-rebuild-contract
-scripts/neri.sh run --project experiments/neri-data/providers/sqlite --unit schema-rebuild-contract --release
-scripts/neri.sh run --project experiments/neri-data/providers/sqlite --unit schema-diff-contract
-```
+## References
 
 Primary references verified on 2026-09-23:
 

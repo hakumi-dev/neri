@@ -71,8 +71,8 @@ The complete query pipeline selects target keys, preserving filters after a
 limit, ordering, secondary ordering, offset, and distinct stages. The target
 keys are materialized inside the database before modification. Unbounded set
 writes have no implicit 1000-row cap; an explicit `take` retains its normal
-query limit. PostgreSQL placeholder ordering is covered by compilation tests;
-the real execution adapter is SQLite. Set writes require SQLite 3.35 or later
+query limit. PostgreSQL support is limited to SQL rendering;
+the execution adapter is SQLite. Set writes require SQLite 3.35 or later
 for the materialized target-key selection.
 
 Set writes leave tracked objects and snapshots unchanged. A later tracked save
@@ -134,27 +134,7 @@ report client-side decoding failures, intercepted queries, distributed traces,
 or asynchronous execution. Computed setters use the same completed-operation
 events and redact bound values in the same way as constant assignments.
 
-## Verification
-
-```sh
-scripts/neri.sh run --project experiments/neri-data --unit bulk-contract
-scripts/neri.sh run --project experiments/neri-data --unit diagnostics-contract
-scripts/neri.sh run --project experiments/neri-data/provider-contract --unit bulk
-scripts/neri.sh run --project experiments/neri-data/provider-contract --unit bulk --release
-scripts/neri.sh run --project experiments/neri-data/provider-contract --unit floats
-```
-
-The SQLite integration covers more than 1000 affected rows, composed selection,
-zero-row results, bound text and null values, key-update rejection, unchanged
-tracked objects, savepoint recovery after partial statement failure, outer
-rollback/commit, foreign-context lease rejection, and automatic rollback after
-an earlier tracked save. Computed assignments cover old-row swaps, mixed scalar
-types, optional values, parameter order, invalid targets, checked arithmetic
-failure and direct-copy storage validation. Diagnostic contracts exercise result forwarding,
-redaction, mixed returned rows, savepoint forwarding, and reentrant transaction
-and savepoint rejection.
-
-## Verified primary references
+## References
 
 - E. F. Codd, [A Relational Model of Data for Large Shared Data Banks](https://www.seas.upenn.edu/~zives/03f/cis550/codd.pdf),
   *Communications of the ACM* 13(6), 377–387, 1970. The original paper's relational

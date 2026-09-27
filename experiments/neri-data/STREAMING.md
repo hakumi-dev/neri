@@ -96,28 +96,7 @@ early stopping leave the provider available for subsequent operations.
 This API performs synchronous database work. Asynchronous I/O, asynchronous
 iteration, and cross-thread cancellation remain separate capabilities.
 
-## Verification
-
-```sh
-scripts/neri.sh run --project experiments/neri-data --unit streaming-contract
-scripts/neri.sh run --project experiments/neri-data --unit streaming-contract --release
-scripts/neri.sh run --project experiments/neri-data --unit diagnostics-contract
-scripts/neri.sh run --project experiments/neri-data/provider-contract --unit streaming
-scripts/neri.sh run --project experiments/neri-data/provider-contract --unit streaming --release
-```
-
-The core contract exercises unbounded offset/distinct plans, explicit bounds,
-providers that ignore a stop, decoding failure, cancellation before dispatch,
-invalid timeouts, and simultaneous cancellation and visitor stop. Projection
-and join contracts also exercise explicit provider overrides, invalid chained
-bounds, and a malformed late shape leaf after a successful delivery. SQLite
-integration checks generated consumers, untracked entity and join delivery,
-projection streams exceeding 1000 rows, join multiplicity beyond a bounded input,
-left-join absence, strict decoding, reentrancy rejection, native deadlines, and
-connection reuse. These tests establish observable behavior, not a throughput
-or memory benchmark.
-
-## Verified primary references
+## References
 
 The following references were checked on 2026-09-22. They motivate the design;
 they do not establish correctness or performance of the Neri implementation.

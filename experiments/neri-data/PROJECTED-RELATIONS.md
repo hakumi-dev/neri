@@ -79,18 +79,7 @@ they do not establish translation of arbitrary application constructors.
 A standalone scalar shape is still a terminal projection. Wrap scalar leaves
 in a pair to obtain the member paths required by a projected relation.
 
-## Verification
-
-```sh
-scripts/neri.sh run --project experiments/neri-data/provider-contract --unit projected-relations
-scripts/neri.sh run --project experiments/neri-data/provider-contract --unit projected-relations --release
-```
-
-The native contract combines nested pairs, optional leaves, captured join
-parameters, projected windows and grouping. It also verifies that uncertified
-materializers and transforming codecs cannot become relational inputs.
-
-## Verified primary references
+## References
 
 Verified on 2026-09-23:
 

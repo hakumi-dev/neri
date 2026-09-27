@@ -69,27 +69,8 @@ Failed or ambiguous cleanup blocks further writes until transaction state is
 resolved; it never reports a successfully recovered save. A verified outer
 rollback also discards any remaining per-save checkpoint.
 
-## Verification and references
+## References
 
-The SQLite provider contract checks nested ownership, stale identifiers, LIFO
-rejection, retained rollback targets, commit restrictions, and close cleanup.
-The generated relationship consumers check earlier successful saves, a later
-constraint failure after partial graph execution, generated-key recovery,
-retry and commit, later outer rollback, optional unlink/reassignment, and native
-whole-transaction abort. Independent contexts verify stored row and FK values.
-The diagnostic contract checks forwarding, failure classification, and
-observer reentrancy. Injected rollback-to/release failures and malformed control
-results verify that writes remain blocked until an explicit outer rollback,
-after which generated-key graph saves can be retried.
-
-```sh
-scripts/neri.sh run --project experiments/neri-data/providers/sqlite --unit contract
-scripts/neri.sh run --project experiments/neri-data/relationships --unit contract
-scripts/neri.sh run --project experiments/neri-data/scalar-relationships --unit contract
-scripts/neri.sh run --project experiments/neri-data --unit diagnostics-contract
-```
-
-Run the same contracts with `--release` to check native optimized execution.
 Primary references checked on 2026-09-22:
 
 - Microsoft, [Using transactions: savepoints](https://learn.microsoft.com/en-us/ef/core/saving/transactions#savepoints):

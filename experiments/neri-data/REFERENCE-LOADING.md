@@ -87,27 +87,7 @@ separate capabilities. Nullable integer and string foreign keys also support
 explicit [graph write links](RELATIONSHIPS.md); loading a reference does not
 register such a link automatically.
 
-## Verification
-
-`reference-loading-contract` verifies optional null keys, local scalar
-preservation, missing principals, pending relationship edits, and hidden
-conflicting inverse collections. The generated SQLite fixture covers optional
-integer and Unicode string keys, shared and self-referencing identity, partial
-inverse collections, 51 distinct keys across two batches, and late failures
-without navigation publication. Optional collection loads verify both key types
-and exclude unrelated null-key rows. The existing navigation fixture also loads a
-required reference before loading the complete inverse collection.
-
-```sh
-scripts/neri.sh run --project experiments/neri-data --unit reference-loading-contract
-scripts/neri.sh run --project experiments/neri-data --unit reference-loading-contract --release
-scripts/neri.sh run --project tooling/data --unit generator -- \
-  "$PWD/experiments/neri-data/reference-navigation/mapping.json"
-scripts/neri.sh run --project experiments/neri-data/reference-navigation --unit contract
-scripts/neri.sh run --project experiments/neri-data/reference-navigation --unit contract --release
-```
-
-## Verified primary references
+## References
 
 These sources were checked on 2026-09-22. They inform the contract without
 establishing full EF Core equivalence.

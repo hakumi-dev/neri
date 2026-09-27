@@ -67,7 +67,7 @@ lazy loading and automatic context-wide navigation fixup remain separate
 capabilities. Multiple statements do not imply a shared database snapshot;
 callers choose an explicit transaction when that isolation is needed.
 
-## Verified references
+## References
 
 Checked on 2026-09-23:
 

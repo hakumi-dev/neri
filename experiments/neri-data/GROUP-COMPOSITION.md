@@ -90,14 +90,7 @@ result leaf uses only mapped fields. Providers must advertise the required
 capability before dispatch. This does not extend the separate vocabulary for
 predicates applied to the resulting scalar metric.
 
-## Verification and references
-
-```sh
-scripts/neri.sh run --project experiments/neri-data --unit group-composition-contract
-scripts/neri.sh run --project experiments/neri-data --unit group-composition-contract --release
-scripts/neri.sh run --project experiments/neri-data/provider-contract --unit group-composition
-scripts/neri.sh run --project experiments/neri-data/provider-contract --unit group-composition --release
-```
+## References
 
 Primary references checked on 2026-09-22:
 
@@ -112,7 +105,7 @@ Primary references checked on 2026-09-22:
   FLOPS 2020: studies grouping and aggregation in language-integrated queries and
   motivates explicit nested query structure for composition. Its formal scope
   excludes SQL NULL and restricts output shape; Neri's null, ordering, and
-  pagination contracts are verified separately against SQL references and tests.
+  pagination contracts are separate implementation choices informed by SQL references.
   This implementation does not claim that paper's normalization guarantees.
 
 General predicates and projections over arbitrary application DTOs, exact

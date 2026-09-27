@@ -56,23 +56,6 @@ requires exclusive access to its context and entity graph. Handwritten callbacks
 must faithfully read and assign the declared fields; unrelated callback side
 effects and panics are outside recovery guarantees.
 
-## Verification
-
-The [SQLite consumer](graph-registration/manifest.json) covers generated-key
-chains, inverse cycles, shared and attached principals, duplicate-key rollback,
-contradictory navigations, dependency cycles, late link conflicts in an open
-transaction, and database failure/rollback followed by retry. Its staging
-contract also checks a setter that mutates the foreign key incorrectly, then
-verifies restoration and a successful retry with the original temporary-key
-sequence.
-
-```sh
-scripts/neri.sh run --project tooling/data --unit generator -- \
-  "$PWD/experiments/neri-data/graph-registration/mapping.json"
-scripts/neri.sh run --project experiments/neri-data/graph-registration --unit contract
-scripts/neri.sh run --project experiments/neri-data/graph-registration --unit contract --release
-```
-
 ## References
 
 Verified on 2026-09-23:

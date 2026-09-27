@@ -55,25 +55,14 @@ remain separate SQL stages; a later comparison does not move before a limit.
 The compiler recognizes the standard `String` equality operators in quotations;
 arbitrary operator implementations and method calls remain unsupported.
 
-SQLite is the verified execution adapter. PostgreSQL coverage verifies SQL
-compilation and parameters, rather than a running PostgreSQL adapter. Computed
-expressions, nullable ordered comparisons, mixed scalar types, post-join
-predicates, and general client-side evaluation remain outside this contract.
+SQLite is the execution adapter; PostgreSQL-style SQL rendering does not provide
+a PostgreSQL connection. [Computed predicates](COMPUTED-EXPRESSIONS.md#filters-and-ordering)
+extend comparisons to supported scalar expressions, and
+[join composition](JOIN-COMPOSITION.md) provides post-join predicates.
+Nullable ordered comparisons, mixed scalar types and general client-side
+evaluation remain unsupported.
 
-## Verification and primary references
-
-```sh
-scripts/neri.sh run --project experiments/neri-data --unit comparison-contract
-scripts/neri.sh run --project experiments/neri-data --unit comparison-contract --release
-scripts/neri.sh run --project experiments/neri-data/provider-contract --unit comparisons
-scripts/neri.sh run --project experiments/neri-data/provider-contract --unit comparisons --release
-```
-
-Core contracts check SQL operands, null guards, parameter order, and invalid
-mapping rejection. SQLite checks the nullable truth table for integer, text,
-and Boolean fields, required comparisons, negation, composed source stages,
-aggregate filters, and set-based writes. These are behavioral checks, not a
-formal correctness proof.
+## References
 
 Primary sources checked on 2026-09-22:
 
@@ -93,5 +82,5 @@ Primary sources checked on 2026-09-22:
   [A Practical Theory of Language-Integrated Query](https://homepages.inf.ed.ac.uk/slindley/papers/practical-theory-of-linq.pdf),
   ICFP 2013, sections 1–2: motivates typed quotation and composition followed by
   SQL translation. The null-compensation contract here is a Neri Data design
-  checked against the database references and tests; it does not inherit the
+  informed by the database references; it does not inherit the
   paper's normalization theorem.

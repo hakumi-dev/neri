@@ -149,15 +149,6 @@ as compilation output and does not establish a PostgreSQL execution adapter.
 
 ## References
 
-The integrated `provider-contract` unit `join-composition` covers stage order,
-left-join presence, projections, and streaming against SQLite. Core
-join/projection and SQLite join contracts cover compatibility.
-
-```sh
-scripts/neri.sh run --project experiments/neri-data/provider-contract --unit join-composition
-scripts/neri.sh run --project experiments/neri-data/provider-contract --unit join-composition --release
-```
-
 Primary sources checked on 2026-09-23:
 
 - Microsoft, [EF Core complex query operators](https://learn.microsoft.com/en-us/ef/core/querying/complex-query-operators):

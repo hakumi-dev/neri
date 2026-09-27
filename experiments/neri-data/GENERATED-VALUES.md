@@ -59,7 +59,7 @@ The context consumes those values and returns `WriteResult.Saved(count)`.
 Generated writes require the leased provider path; direct unleased SQLite
 batch execution rejects them before starting a transaction.
 
-## Boundaries and verification
+## Boundaries
 
 This contract describes integer key generation. [Generated scalar properties](GENERATED-PROPERTIES.md)
 extend RETURNING to non-key defaults and computed values; [relationship writes](RELATIONSHIPS.md)
@@ -67,19 +67,7 @@ propagate generated principal keys to explicitly linked dependents and recover
 those assignments on rollback. SQLite RETURNING does not include subsequent AFTER-trigger changes;
 schemas that rewrite generated keys in those triggers are outside this contract.
 
-The generated consumer in [generated-values](generated-values/manifest.json)
-tests unique-constraint rollback and retry, identity reuse, mixed update/insert
-batches, outer rollback after multiple saves, detached collision recovery,
-invalid generation schemas, and a deferred foreign-key failure at commit.
-
-```sh
-neri run --project tooling/data --unit generator -- \
-  "$PWD/experiments/neri-data/generated-values/mapping.json"
-neri run --project experiments/neri-data/generated-values --unit contract
-neri run --project experiments/neri-data/generated-values --unit contract --release
-```
-
-## Verified references
+## References
 
 Primary sources checked on 2026-09-22:
 
@@ -94,5 +82,5 @@ Primary sources checked on 2026-09-22:
   on an unspecified output ordering.
 - Gray, [The Transaction Concept](https://people.eecs.berkeley.edu/~kubitron/courses/cs262a-S16/handouts/papers/theTransactionConcept.pdf),
   VLDB 1981: atomicity motivates validating the whole result before commit and
-  testing failed commits alongside failed statements. Passing these contracts
-  is not a proof of all crash-recovery behavior.
+  handling failed commits as well as failed statements. The paper does not
+  establish this implementation's crash-recovery guarantees.

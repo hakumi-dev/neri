@@ -67,7 +67,10 @@ open provider returns the values confirmed from SQLite. Invalid options and
 unavailable requested modes fail the open operation. A read-only open never
 changes the journal mode; an explicitly requested mode must already match.
 WAL is unavailable for `:memory:` databases. Journal changes on a file can persist
-even if a later initialization step fails.
+even if a later initialization step fails. Writable WAL requires SQLite 3.51.3+
+or corrected backports 3.44.x >= 3.44.6 or 3.50.x >= 3.50.7; older writable
+opens reject requested or existing WAL before journal-mode mutation. See the
+[current compatibility bounds](../../docs/DATA.md#bounds-and-compatibility).
 
 Synchronization settings describe SQLite's operation; durability also depends on
 the journal mode, filesystem and storage. See SQLite's
@@ -217,17 +220,3 @@ placeholders. Placeholder rendering alone is not a PostgreSQL adapter or a
 claim of portability across every SQL engine. Provider-specific behavior must
 be covered against that engine when it is implemented. New capabilities need
 an explicit shared contract rather than SQLite types in the runtime.
-
-## Validation obligations
-
-The tests exercise provider binding through immutable query transformations and
-projections, missing-provider failure, explicit overrides, and the standalone
-plan API. SQLite tests exercise real files, parameter binding, strict scalar
-decoding, NULL, errors, and connection cleanup. Integration contracts use the
-generated `Customer` and `Order` mappings for queries, tracked changes,
-rollback/retry, optimistic conflicts, and reopening the file.
-
-These are behavioral checks, not a formal proof or a production performance
-claim. Test-only fixtures and the production migration API create isolated
-test schemas; application writes use generated
-parameterized commands from the change tracker.

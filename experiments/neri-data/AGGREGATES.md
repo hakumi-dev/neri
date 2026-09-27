@@ -177,18 +177,7 @@ Exact decimal aggregates, aggregate input ordering, arbitrary
 post-group DTO predicates/projections and grouping
 collections remain outside this contract.
 
-## Verification and references
-
-```sh
-scripts/neri.sh run --project experiments/neri-data --unit aggregate-contract
-scripts/neri.sh run --project experiments/neri-data --unit aggregate-contract --release
-scripts/neri.sh run --project experiments/neri-data/provider-contract --unit aggregates
-scripts/neri.sh run --project experiments/neri-data/provider-contract --unit aggregates --release
-scripts/neri.sh run --project experiments/neri-data/provider-contract --unit joined-aggregates
-scripts/neri.sh run --project experiments/neri-data/provider-contract --unit joined-aggregates --release
-scripts/neri.sh run --project experiments/neri-data/provider-contract --unit computed-aggregates
-scripts/neri.sh run --project experiments/neri-data/provider-contract --unit computed-aggregates --release
-```
+## References
 
 Primary references checked on 2026-09-23:
 
@@ -201,7 +190,6 @@ Primary references checked on 2026-09-23:
   and per-aggregate FILTER behavior.
 - SQLite, [`updateAccumulator` implementation](https://github.com/sqlite/sqlite/blob/master/src/select.c):
   checks the FILTER condition before evaluating the aggregate arguments.
-  The native contract exercises this ordering with checked division.
 - PostgreSQL, [aggregate expressions](https://www.postgresql.org/docs/current/sql-expressions.html#SYNTAX-AGGREGATES):
   defines DISTINCT and FILTER placement and their aggregate input semantics.
 - SQLite, [SELECT processing](https://sqlite.org/lang_select.html):

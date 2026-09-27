@@ -51,14 +51,7 @@ Deletion cycles retain the cascade planner's current rejection rule. The
 planner does not add an intermediate null update to an entity already selected
 for deletion to break a cycle.
 
-## Verification and references
-
-```sh
-scripts/neri.sh run --project experiments/neri-data --unit client-null-contract
-scripts/neri.sh run --project experiments/neri-data --unit client-null-contract --release
-scripts/neri.sh run --project experiments/neri-data/client-null --unit contract
-scripts/neri.sh run --project experiments/neri-data/client-null --unit contract --release
-```
+## References
 
 Primary references checked on 2026-09-22:
 

@@ -67,28 +67,6 @@ Automatic catalog discovery, removing the last migration, pending-model checks,
 SQL script generation, database inspection and reverse engineering remain
 outside this scaffolding contract.
 
-## Verification
-
-```sh
-scripts/neri.sh run --project tooling/data --unit migration-contract -- "$PWD"
-scripts/neri.sh run --project experiments/neri-data/migration-scaffold --unit contract
-scripts/neri.sh run --project experiments/neri-data/migration-scaffold --unit contract --release
-scripts/neri.sh run --project . --unit data-generation-contracts -- "$PWD"
-```
-
-The tooling contract checks snapshot round trips, malformed metadata, unchanged
-models, preservation of existing destinations, editable historical source and
-changed-snapshot rejection. The native consumer reconstructs every supported
-operation from generated source and compares signatures, including integer
-extrema, escaped text and logical identities containing NUL. Two CLI-generated
-bundles exercise upgrading existing SQLite rows, physical column renaming,
-default/index changes and both downgrade steps.
-
-To regenerate the operation matrix, pass the absolute path of
-`experiments/neri-data/migration-scaffold/all_ops/migration.hk` as the tooling
-contract's second argument. CLI-generated bundles require fresh output
-directories because existing migrations are preserved.
-
 ## References
 
 Primary references verified on 2026-09-23:

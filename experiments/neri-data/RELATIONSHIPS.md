@@ -110,39 +110,7 @@ requires explicit dependent removal; scalar entity-set `remove` stages one row.
 The implementation performs repeated dependency scans; it does not claim the
 linear-time complexity of a queue-based topological sorting implementation.
 
-## Verification and references
-
-The [generated SQLite consumer](relationships/manifest.json) declares dependents
-before principals and uses immediate foreign-key enforcement. Its contracts
-exercise generated-key propagation, a dependent constraint failure followed by
-retry, multiple saves followed by outer rollback, reverse delete order, and
-rejection of foreign-context handles. Runtime contracts cover cyclic links
-without beginning a database transaction.
-
-The [scalar relationship consumer](scalar-relationships/manifest.json) exercises
-required and nullable text keys, nullable integer foreign keys with generated
-principals, parameter-bound Unicode text, unlinked nulls, and rollback/retry.
-The `scalar-relationship-contract` runtime unit checks invalid scalar kinds,
-nullability, stale handles, and retained explicit-link intent.
-
-Relationship-change checks declare principals before dependents to force
-update-before-delete ordering under immediate SQLite foreign keys. They cover
-pending changes across empty commits, specific dependent CHECK failures,
-generated-key rollback/retry, and multiple saves followed by outer rollback.
-Runtime checks cover reassignment round trips, unlink/relink, identifying-key
-rejection, and single-row self-reference deletion.
-
-```sh
-scripts/bootstrap.sh
-scripts/neri.sh run --project tooling/data --unit generator -- \
-  "$PWD/experiments/neri-data/relationships/mapping.json"
-scripts/neri.sh run --project experiments/neri-data/relationships --unit contract
-scripts/neri.sh run --project experiments/neri-data/relationships --unit contract --release
-scripts/neri.sh run --project experiments/neri-data --unit scalar-relationship-contract
-scripts/neri.sh run --project experiments/neri-data/scalar-relationships --unit contract
-scripts/neri.sh run --project experiments/neri-data/scalar-relationships --unit contract --release
-```
-
+## References
 - Microsoft, [Saving related data](https://learn.microsoft.com/en-us/ef/core/saving/related-data):
   EF Core discovers new entities through navigations and saves related changes.
   This supplies the comparison contract; explicit Neri links implement a subset.
@@ -163,4 +131,4 @@ scripts/neri.sh run --project experiments/neri-data/scalar-relationships --unit 
   implementation or complexity match.
 - SQLite, [Foreign key support](https://sqlite.org/foreignkeys.html) and
   [transactions](https://sqlite.org/lang_transaction.html): enforcement and
-  all-or-nothing transaction behavior used by the integration fixtures.
+  all-or-nothing transaction behavior required by graph writes.

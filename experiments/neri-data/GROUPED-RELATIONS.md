@@ -42,12 +42,7 @@ terminal-only, as do custom codecs that may transform scalar values. Returning
 a pair from an arbitrary callback does not certify its field correspondence.
 Quoted application constructors and grouped collections are unsupported.
 
-## Verification and references
-
-```sh
-scripts/neri.sh run --project experiments/neri-data/provider-contract --unit query-composition
-scripts/neri.sh run --project experiments/neri-data/provider-contract --unit query-composition --release
-```
+## References
 
 Primary references verified on 2026-09-23:
 
