@@ -6,6 +6,8 @@ MODE=release
 BUILD_TYPE=Release
 SANITIZERS=OFF
 THREAD_SANITIZER=OFF
+RUN_TESTS=OFF
+if [[ "${1:-}" == --test ]]; then RUN_TESTS=ON; shift; fi
 if [[ $# -gt 1 ]]; then echo "Expected at most one native build mode." >&2; exit 2; fi
 case "${1:-}" in
   '') ;;
@@ -26,3 +28,6 @@ cmake -S "$ROOT_DIR" -B "$ROOT_DIR/build/native/native-$MODE" -G Ninja \
   "-DLLVM_DIR=$LLVM_PREFIX/lib/cmake/llvm" -DBUILD_TESTING=ON \
   "-DNERI_SANITIZERS=$SANITIZERS" "-DNERI_THREAD_SANITIZER=$THREAD_SANITIZER"
 cmake --build "$ROOT_DIR/build/native/native-$MODE"
+if [[ "$RUN_TESTS" == ON ]]; then
+  ctest --test-dir "$ROOT_DIR/build/native/native-$MODE" --output-on-failure --no-tests=error
+fi

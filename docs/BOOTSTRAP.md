@@ -7,12 +7,14 @@ contract. For dependency installation, use [Building](BUILDING.md) or
 | Task | Entry point | Result |
 | --- | --- | --- |
 | Build native components without a seed | `scripts/build-native.sh` | Native backend, runtime and host helper |
-| Bootstrap on macOS or Linux | `scripts/build.sh bootstrap` | Fixed-point compiler tuple selected by `build/current` |
+| Bootstrap on macOS or Linux | `scripts/build.sh bootstrap` | Stage1 compiler tuple selected by `build/current` |
+| Verify compiler self-reproduction | `scripts/build.sh bootstrap --stage 3` | Stage2 and Stage3 IR, object and executable equality |
+| Build a distribution | `scripts/build.sh package` | Stage2 compiler with native, language and installation contracts |
 | Validate before publishing a compiler tuple | `scripts/build.sh test` | Native and language contracts pass before publication |
 | Regenerate the canonical seed | `scripts/build.sh refresh-seed` | Validated seed candidate and provenance replace the previous set |
-| Build and test on Windows | `scripts/build.ps1 -Action test` | Windows fixed point and platform contracts |
+| Build and test on Windows | `scripts/build.ps1 -Action test` | Stage1 compiler and Windows platform contracts |
 
-The last four entries require the complete seed artifact set below. Native-only
+Compiler build commands require the complete seed artifact set below. Native-only
 compilation does not establish compiler or seed validation.
 
 ## Required seed artifacts
@@ -75,7 +77,18 @@ run that gate instead of adding another standalone full test invocation.
 Keep the ABI, feature, target and IR checks in place throughout this transition.
 Seed artifacts and their provenance are published by the refresh command.
 
-## Fixed point
+## Compiler stages
+
+Stage0 is the pinned seed materialized with the current native backend. Stage1
+is the current compiler built by Stage0 and is the default for development and
+language contracts. Stage2 is built by Stage1 and is the default for `package`
+and `install`. Stage3 is built by Stage2 and compares self-reproduction against
+Stage2. The supported-platform CI requests Stage3 explicitly.
+
+`--stage 1|2|3` selects the final generation and composes with build-mode options;
+`install` also accepts `--prefix <directory>`. Packages require Stage2 or Stage3.
+`refresh-seed` requires Stage3. Windows uses the corresponding `-Stage` option,
+with Stage1 for `build` and `test`, and Stage2 for `install`.
 
 The Unix flow is implemented by [the launcher](../scripts/build.sh) and
 [`Build.bootstrap`](../tooling/build.hk):
@@ -91,19 +104,32 @@ flowchart TD
   S1 -->|"Same sources"| S2["Stage2"]
   S2 -->|"Same sources"| S3["Stage3"]
   Stages -.-> S1
+  S1 --> Development["Select development toolchain"]
+  S2 --> Package["Validate and assemble distribution"]
   S3 --> Verify["Compare IR, objects and executables"]
   Verify --> Publish["Publish only after required checks pass"]
 ```
 
 `scripts/build.sh bootstrap` builds the native components, materializes Stage0
 and uses it to compile the Neri build driver through the root `manifest.json`.
-The driver performs three generations in an isolated `build/work.*` directory:
+The driver builds only the requested generations in an isolated `build/work.*`
+directory:
 
 1. Stage0 compiles the current compiler unit into Stage1.
 2. Stage1 compiles the same sources into Stage2.
 3. Stage2 compiles the same sources into Stage3.
-4. Stage1 and Stage2 must emit byte-identical serialized NIR envelopes and objects, and
-   Stage2 and Stage3 executables must match byte for byte.
+4. When Stage3 is requested, Stage2 and Stage3 must contain byte-identical
+   serialized NIR envelopes, objects and executables.
+
+Each requested generation performs one compiler invocation. On Unix, Stage2 and
+Stage3 retain the object and NIR transport from that executable compilation
+using `--save-temps`; comparison does not repeat frontend or native generation.
+Retained files live in `OUTPUT.temps`, with `unit-<index>.o`, its NIR transport,
+and a manifest of unit identities and SHA-256 digests. This includes every
+partition actually compiled and linked. The executable cache validates and
+restores the complete retained set when that option is requested.
+Windows emits NIR once per generation and materializes that same NIR as COFF
+and PE through the native backend.
 
 Every generation uses the current project manifest, compiler sources and
 standard library. The NIR comparison uses the envelope's hexadecimal encoding;
@@ -116,11 +142,17 @@ The compiler executable basename is `neri` in each generation's directory.
 The macOS linker embeds that basename in its ad-hoc signing identifier, making
 it part of the reproducibility contract.
 
-The verified Stage3 compiler, codegen, runtime and manifest are copied together
+The selected compiler, codegen, runtime and manifest are copied together
 under `build/toolchains/<artifact-manifest-sha256>`. An atomic symlink replacement
 selects that immutable tuple at `build/current`. Failures preserve the last
 published tuple. Work directories retain comparisons and test output for
 inspection.
+
+Build commands use a private compiler cache under `build/cache/compiler`.
+Producer copies under `build/cache/producers` have content-addressed identities.
+Cache lookup still resolves the current source closure and validates native
+dependencies; an existing executable alone is insufficient. Stage messages
+distinguish execution from reuse and include elapsed milliseconds.
 
 `scripts/build.sh test` runs native probes and language contracts against the
 current native artifacts and candidate compiler, then publishes the tuple after
@@ -129,8 +161,8 @@ compiler, codegen and runtime with the standard-library sources from the same
 checkout. Packaged launchers use their toolchain's bundled standard library.
 
 Windows uses `scripts/build.ps1` to materialize the same seed, compile the
-current compiler unit, compare NIR, COFF and PE output, and run its platform
-contracts. See [Windows](WINDOWS.md) for dependencies and commands.
+current compiler unit and run its platform contracts. `-Stage 3` additionally
+compares NIR, COFF and PE output. See [Windows](WINDOWS.md) for dependencies and commands.
 
 ## Refreshing the seed
 
@@ -180,6 +212,15 @@ completion; those claims require the corresponding validation output.
 
 ## References
 
+- [Rust compiler development guide: compiler stages](https://rustc-dev-guide.rust-lang.org/building/bootstrapping/what-bootstrapping-does.html)
+  separates the downloaded seed, the development compiler and the distribution
+  compiler. Neri applies this distinction to its verified IR seed and stages.
+- [GCC build procedure](https://gcc.gnu.org/install/build.html) describes the
+  Stage2/Stage3 comparison used to check compiler self-reproduction.
+- [Mokhov, Mitchell and Peyton Jones, *Build Systems à la Carte* (2018)](https://www.microsoft.com/en-us/research/wp-content/uploads/2018/03/build-systems.pdf)
+  separates dependency scheduling from deciding which results require rebuilding.
+  Neri stage selection controls scheduling; the compiler cache validates inputs
+  before deciding whether an executable can be reused.
 - [Zig's portable bootstrap seed](https://ziglang.org/news/goodbye-cpp/) describes
   a checked-in WebAssembly compiler seed materialized using the system toolchain.
   Neri applies that portable-artifact approach using its own canonical IR and

@@ -12,12 +12,15 @@ class IncrementalProjectCache
   public project: NeriProject?
   public symbolTool: String = ""
   public enabled: Bool = false
+  public saveTemps: Bool = false
+  private artifactsDigest: String = ""
   private checkedHit: Bool = false
 
-  def prepare(firstSource: BootstrapSourceInput?, sourceIds: StringBuffer, sourceOwners: StringBuffer, target: readonly TargetPlatform, release: Bool, configurationInputs: String, noCache: Bool, project: NeriProject): Void
+  def prepare(firstSource: BootstrapSourceInput?, sourceIds: StringBuffer, sourceOwners: StringBuffer, target: readonly TargetPlatform, release: Bool, configurationInputs: String, noCache: Bool, project: NeriProject, saveTemps: Bool = false): Void
     if noCache || firstSource == null
       return
     end
+    this.saveTemps = saveTemps
     let customSymbols = host::environment("NERI_DSYMUTIL")
 
     if !release && customSymbols != null && customSymbols != ""
@@ -40,6 +43,7 @@ class IncrementalProjectCache
     var configuration = configurationInputs
 
     configuration = configuration + runCacheFrame(libraryPath) if libraryPath != null
+    configuration = configuration + runCacheFrame("save-temps") if saveTemps
     var identity = runCacheFrame("neri-project-artifact-v1") + runCacheFrame(configuration)
     var index = 0
 
@@ -77,7 +81,7 @@ class IncrementalProjectCache
     if compilerDigest == ""
       return
     end
-    identity = identity + runCacheFrame(compiler) + runCacheFrame(compilerDigest)
+    identity = identity + runCacheFrame("compiler") + runCacheFrame(compilerDigest)
     let sourceDigest = sha256FastText(identity)
     let probe = new RunCache()
     let module = new IrModule("incremental-probe", "")
@@ -128,6 +132,14 @@ class IncrementalProjectCache
     if !incrementalNativeInputsMatch(nativeFiles, missingFiles)
       return false
     end
+    if this.saveTemps
+      let saved = record.get("artifactsDigest")
+
+      if !saved.isString() || saved.scalarText() == "" || savedArtifactsDigest(this.cache.directory + "/program.temps") != saved.scalarText()
+        return false
+      end
+      this.artifactsDigest = saved.scalarText()
+    end
     let target = this.target
 
     if target != null && !this.release && target.isMacOS() && !incrementalSymbolsValid(this.cache.directory)
@@ -149,7 +161,9 @@ class IncrementalProjectCache
       let target = this.target
 
       if target == null || this.release || !target.isMacOS() || incrementalSymbolsEquivalent(this.cache.directory, output)
-        return true
+        if !this.saveTemps || savedArtifactsDigest(output + ".temps") == this.artifactsDigest
+          return true
+        end
       end
     end
     let directory = bootstrapTemporaryDirectory(bootstrapDirectory(output), "incremental-restore")
@@ -159,6 +173,10 @@ class IncrementalProjectCache
     end
     let staged = directory + "/program"
     var succeeded = files::copyFile(this.cache.executable, staged).failure == null
+
+    if succeeded && this.saveTemps
+      succeeded = savedArtifactsCopy(this.cache.directory + "/program.temps", staged + ".temps", this.artifactsDigest)
+    end
 
     if succeeded
       let status = files::status(staged)
@@ -174,6 +192,10 @@ class IncrementalProjectCache
     if succeeded
       succeeded = files::move(staged, output).failure == null
     end
+    if succeeded && this.saveTemps
+      files::removeTree(output + ".temps")
+      succeeded = files::move(staged + ".temps", output + ".temps").failure == null && savedArtifactsDigest(output + ".temps") == this.artifactsDigest
+    end
     bootstrapRemoveRunDirectory(directory)
     return succeeded
   end
@@ -187,10 +209,14 @@ class IncrementalProjectCache
     if executableDigest == ""
       return false
     end
-    let receipt = incrementalNativeReceipt(nativeDepPaths, missingPaths, nativeDigests, this.contentDigest, executableDigest)
+    var artifactsDigest = ""
 
-    if receipt == null
-      return false
+    if this.saveTemps
+      artifactsDigest = savedArtifactsDigest(output + ".temps")
+
+      if artifactsDigest == ""
+        return false
+      end
     end
     let directory = bootstrapTemporaryDirectory(bootstrapDirectory(this.cache.directory), "incremental-artifact")
 
@@ -199,6 +225,17 @@ class IncrementalProjectCache
     end
     let staged = directory + "/program"
     var succeeded = files::copyFile(output, staged).failure == null
+
+    if succeeded && this.saveTemps
+      succeeded = savedArtifactsCopy(output + ".temps", staged + ".temps", artifactsDigest)
+    end
+
+    let receipt = incrementalNativeReceipt(nativeDepPaths, missingPaths, nativeDigests, this.contentDigest, executableDigest, artifactsDigest)
+
+    if receipt == null
+      bootstrapRemoveRunDirectory(directory)
+      return false
+    end
 
     if succeeded
       let status = files::status(staged)
@@ -381,7 +418,7 @@ def incrementalToolchainDigest(paths: String[]): String
   return sha256FastText(identity)
 end
 
-def incrementalNativeReceipt(nativeDepPaths: StringBuffer, missingPaths: StringBuffer, nativeDigests: StringBuffer, contentDigest: String, executableDigest: String): String?
+def incrementalNativeReceipt(nativeDepPaths: StringBuffer, missingPaths: StringBuffer, nativeDigests: StringBuffer, contentDigest: String, executableDigest: String, artifactsDigest: String = ""): String?
   if nativeDepPaths.size != nativeDigests.size
     return null
   end
@@ -411,7 +448,9 @@ def incrementalNativeReceipt(nativeDepPaths: StringBuffer, missingPaths: StringB
     result = result + (index == 0 ? "" : ",") + lspQuote(path)
     index = index + 1
   end
-  return result + "]}\n"
+  result = result + "]"
+  result = result + ",\"artifactsDigest\":" + lspQuote(artifactsDigest) if artifactsDigest != ""
+  return result + "}\n"
 end
 
 def incrementalNativeInputsMatch(nativeFiles: LspJson, missingFiles: LspJson): Bool

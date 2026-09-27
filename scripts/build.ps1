@@ -5,10 +5,14 @@ param(
   [ValidateSet('Release','Debug')][string]$Configuration = 'Release',
   [string]$Prefix = "$env:USERPROFILE/.neri",
   [string]$LLVM,
+  [ValidateRange(1,3)][int]$Stage,
   [switch]$NoPath
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+if (!$PSBoundParameters.ContainsKey('Stage')) { $Stage = if ($Action -eq 'install') { 2 } else { 1 } }
+if ($Action -eq 'install' -and $Stage -lt 2) { throw 'install requires -Stage 2 or -Stage 3' }
+if ($PSBoundParameters.ContainsKey('Stage') -and $Action -in 'doctor','native') { throw '-Stage requires a compiler build action' }
 function Invoke-Checked([string]$Program, [string[]]$Arguments) {
   & $Program @Arguments
   if ($LASTEXITCODE -ne 0) { throw "$Program failed with exit code $LASTEXITCODE" }
@@ -100,26 +104,29 @@ try {
     Invoke-Checked $env:NERI_LINKER @("$Stage/compiler.obj","$native/neri-runtime.lib",'-o',"$Stage/neri.exe",'-lws2_32','-lbcrypt','-lshell32','-Wl,/Brepro')
   }
   Materialize "$work/seed.nir" 'binary' "$work/stage0"
-  for ($generation = 1; $generation -le 3; $generation++) {
-    $stage = "$work/stage$generation"
-    New-Item -ItemType Directory -Force $stage | Out-Null
+  for ($generation = 1; $generation -le $Stage; $generation++) {
+    $stageDirectory = "$work/stage$generation"
+    New-Item -ItemType Directory -Force $stageDirectory | Out-Null
     $previous = "$work/stage$($generation - 1)/neri.exe"
     Write-Host "Compiling generation $generation on Windows..."
     $buildArguments = @('build','--project',"$root/manifest.json",'--unit','compiler','--source-root',"$root/compiler")
-    Invoke-Checked $previous ($buildArguments + @('--module','neri-compiler','--emit=neri-ir-hex','--output',"$stage/compiler.nir.hex"))
-    Materialize "$stage/compiler.nir.hex" 'hex' $stage
+    Invoke-Checked $previous ($buildArguments + @('--module','neri-compiler','--emit=neri-ir-hex','--output',"$stageDirectory/compiler.nir.hex"))
+    Materialize "$stageDirectory/compiler.nir.hex" 'hex' $stageDirectory
   }
-  foreach ($artifact in @('compiler.nir.hex','compiler.obj','neri.exe')) {
-    Assert-Hash "$work/stage3/$artifact" (Get-FileHash "$work/stage2/$artifact").Hash
+  if ($Stage -eq 3) {
+    foreach ($artifact in @('compiler.nir.hex','compiler.obj','neri.exe')) {
+      Assert-Hash "$work/stage3/$artifact" (Get-FileHash "$work/stage2/$artifact").Hash
+    }
+    Write-Host 'Verified native Windows compiler fixed point (IR, COFF and PE).'
   }
   $after = @(Compiler-Inventory)
   if (Compare-Object $inventory $after) { throw 'Compiler sources changed during bootstrap' }
-  Write-Host 'Verified native Windows compiler fixed point (IR, COFF and PE).'
+  Write-Host "Built Windows Stage$Stage compiler from unchanged sources."
 
   $tree = "$work/toolchain"
   New-Item -ItemType Directory -Force "$tree/bin","$tree/libexec","$tree/lib" | Out-Null
   Copy-Item "$native/neri.exe" "$tree/bin/neri.exe"
-  Copy-Item "$work/stage3/neri.exe" "$tree/libexec/neri-compiler.exe"
+  Copy-Item "$work/stage$Stage/neri.exe" "$tree/libexec/neri-compiler.exe"
   Copy-Item "$native/neri-codegen.exe","$native/neri-host.exe" "$tree/libexec"
   Copy-Item "$native/neri-runtime.lib","$native/neri-runtime-windows-x86_64.json" "$tree/lib"
   New-Item -ItemType Directory -Force "$tree/include/neri" | Out-Null
@@ -156,6 +163,16 @@ try {
   Invoke-Checked "$tree/bin/neri.exe" @('run','--project',"$root/tests/native/cabi-exports/manifest.json",'--unit','driver','--',"$tree/bin/neri.exe",$root,$native,"$env:LLVM_PREFIX/bin",'windows-x86_64',"$work/cabi-exports")
   & "$root/tests/windows-launcher.ps1" -Compiler "$tree/bin/neri.exe"
   [IO.File]::WriteAllText("$work/VALIDATED", "Windows native, language, UTF-8 paths and LSP contracts passed.`n")
+  $verification = if ($Stage -eq 3) { 'fixed-point-and-windows-contracts' } else { "stage$Stage-and-windows-contracts" }
+  $provenance = [ordered]@{
+    schemaVersion = 1
+    target = 'windows-x86_64'
+    compilerStage = $Stage
+    verification = $verification
+    sourceManifestSha256 = (Get-FileHash "$work/SOURCE-MANIFEST.sha256").Hash.ToLowerInvariant()
+    seedProvenanceSha256 = (Get-FileHash "$root/bootstrap/seed.json").Hash.ToLowerInvariant()
+  }
+  [IO.File]::WriteAllText("$tree/PROVENANCE.json", ($provenance | ConvertTo-Json) + "`n")
   if ($Action -eq 'test') { Write-Host "Validated toolchain: $tree/bin/neri.exe"; return }
 
   # Keep previous installations intact; publish a small pointer only after validation.

@@ -21,8 +21,10 @@ The [C interoperability reference](C-INTEROP.md) documents exported functions,
 generated declarations, host linking, and runtime ownership.
 
 `scripts/build.sh package` produces a Release toolchain archive for the bootstrap
-host. The command builds the current native components, reaches the compiler
-fixed point, and passes the native and language contracts before packaging.
+host. The command builds the current native components and Stage2 compiler,
+and passes the native and language contracts before packaging. Pass `--stage 3`
+to additionally verify identical Stage2 and Stage3 IR, objects and executables;
+supported-platform CI selects this option explicitly.
 
 The archive contains a `bin/neri` launcher, native codegen, compiler executable,
 an `install.sh` launcher and Neri-native installer with its filesystem helper,
@@ -37,8 +39,11 @@ records:
 - `ARTIFACTS.sha256` hashes packaged executables, libraries, documentation, examples and the
   source manifest.
 - `PROVENANCE.json` schema 2 records the target, LLVM version, the packaged
-  `runtimeManifest` with ABI/IR versions and feature bits, validation gate,
+  `runtimeManifest` with ABI/IR versions and feature bits, `compilerStage`, validation gate,
   source/artifact manifest digests and trusted seed provenance digest.
+
+A Stage2 package records `stage2-and-native-language-contracts`. Only a Stage3
+package records `fixed-point-and-native-language-contracts`.
 
 The package includes and hashes `stdlib/manifest.json` and every `.hk` library
 source recursively under `stdlib/`, discovered in sorted order. Relative paths

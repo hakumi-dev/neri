@@ -2,6 +2,10 @@
 set -euo pipefail
 
 ROOT_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+case "${1:-}" in
+  native) shift; exec "$ROOT_DIR/scripts/build-native.sh" "$@" ;;
+  native-test) shift; exec "$ROOT_DIR/scripts/build-native.sh" --test "$@" ;;
+esac
 case "$(uname -s):$(uname -m)" in
   Darwin:arm64)
     TARGET=macos-arm64
@@ -23,6 +27,10 @@ NATIVE_DIR="$ROOT_DIR/build/native/native-release"
 LAUNCH_DIR="$(mktemp -d "$ROOT_DIR/build/launcher.XXXXXX")"
 trap 'rm -rf "$LAUNCH_DIR"' EXIT
 mkdir -p "$LAUNCH_DIR/bin"
+(
+  cd "$NATIVE_DIR"
+  shasum -a 256 neri-codegen neri-host libneri-runtime.a "neri-runtime-$TARGET.json"
+) > "$LAUNCH_DIR/native.sha256"
 cp "$ROOT_DIR/bootstrap/seed.json" "$LAUNCH_DIR/PROVENANCE.json"
 
 seed_digest() {
@@ -54,13 +62,17 @@ verify_digest "$ROOT_DIR/bootstrap/SOURCE-MANIFEST.sha256" "$(seed_digest source
 verify_digest "$ROOT_DIR/bootstrap/VALIDATION-SOURCE-MANIFEST.sha256" "$(seed_digest validationSourceManifestSha256)"
 gzip -dc "$ROOT_DIR/bootstrap/compiler.nir.gz" > "$LAUNCH_DIR/compiler.nir"
 verify_digest "$LAUNCH_DIR/compiler.nir" "$(seed_digest irSha256)"
+echo '[bootstrap] Materializing Stage0 from verified seed'
 "$NATIVE_DIR/neri-codegen" --input "$LAUNCH_DIR/compiler.nir" --input-format binary \
   --target "$TARGET" --optimization release --emit object --output "$LAUNCH_DIR/compiler.o"
 LINK_ARGUMENTS=("$LAUNCH_DIR/compiler.o" "$NATIVE_DIR/libneri-runtime.a" -o "$LAUNCH_DIR/bin/neri")
 if [[ "$TARGET" == linux-x86_64 ]]; then LINK_ARGUMENTS+=(-lcrypto); fi
 "$LLVM_PREFIX/bin/clang++" "${LINK_ARGUMENTS[@]}"
 
+echo '[bootstrap] Preparing Neri build driver'
+(umask 077; mkdir -p "$ROOT_DIR/build/cache/compiler")
 env -i "PATH=$PATH" "HOME=$HOME" LC_ALL=C LANG=C TZ=UTC "SDKROOT=$SDKROOT" "DEVELOPER_DIR=${DEVELOPER_DIR:-}" \
+  "NERI_CACHE_DIR=$ROOT_DIR/build/cache/compiler" \
   "NERI_STDLIB=$ROOT_DIR/stdlib" "NERI_LIBRARY_PATH=$NATIVE_DIR" \
   "NERI_HOST=$NATIVE_DIR/neri-host" "NERI_CODEGEN=$NATIVE_DIR/neri-codegen" \
   "NERI_RUNTIME_MANIFEST=$NATIVE_DIR/neri-runtime-$TARGET.json" \
@@ -70,4 +82,5 @@ env -i "PATH=$PATH" "HOME=$HOME" LC_ALL=C LANG=C TZ=UTC "SDKROOT=$SDKROOT" "DEVE
   --output "$LAUNCH_DIR/neri-build"
 env -i "PATH=$PATH" "HOME=$HOME" LC_ALL=C LANG=C TZ=UTC "SDKROOT=$SDKROOT" "DEVELOPER_DIR=${DEVELOPER_DIR:-}" \
   "NERI_ROOT=$ROOT_DIR" "NERI_SEED_DIR=$LAUNCH_DIR" "LLVM_PREFIX=$LLVM_PREFIX" "NERI_TARGET=$TARGET" \
+  "NERI_NATIVE_READY=$ROOT_DIR|release" "NERI_NATIVE_READY_MANIFEST=$LAUNCH_DIR/native.sha256" \
   "$LAUNCH_DIR/neri-build" "$@"

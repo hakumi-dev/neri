@@ -1,4 +1,5 @@
 use console
+use files
 use host
 use process
 
@@ -284,7 +285,7 @@ def bootstrapReportCodegenMetrics(path: String, prefix: String): Void
   end
 end
 
-def bootstrapInvokeCodegen(module: IrModule, emit: readonly EmissionKind, output: String, target: readonly TargetPlatform, release: Bool, debugSources: BootstrapSourceInput? = null, metricsPath: String = "", serializedInput: String = "", progress: (fn(String, Int, Int, String, Int): Void)? = null): Bool
+def bootstrapInvokeCodegen(module: IrModule, emit: readonly EmissionKind, output: String, target: readonly TargetPlatform, release: Bool, debugSources: BootstrapSourceInput? = null, metricsPath: String = "", serializedInput: String = "", progress: (fn(String, Int, Int, String, Int): Void)? = null, preserveTransport: Bool = false): Bool
   let codegenEmit = emit.codegenName()
 
   if codegenEmit == null
@@ -363,7 +364,7 @@ def bootstrapInvokeCodegen(module: IrModule, emit: readonly EmissionKind, output
 
   codegenMilliseconds = runCacheTime() - codegenStarted if metricsPath != ""
 
-  host::removeFile(transport)
+  host::removeFile(transport) if !preserveTransport
   host::removeFile(progressPath) if progress != null
   if metricsPath != ""
     let measured = host::readText(nativeMetrics)
@@ -374,6 +375,7 @@ def bootstrapInvokeCodegen(module: IrModule, emit: readonly EmissionKind, output
     host::writeText(metricsPath, "{\"schemaVersion\":1,\"serializeMs\":" + (serializeMilliseconds as String) + ",\"writeMs\":" + (writeMilliseconds as String) + ",\"codegenProcessMs\":" + (codegenMilliseconds as String) + ",\"native\":" + nativeMetricsText + "}\n")
     host::removeFile(nativeMetrics)
   end
+  host::removeFile(transport) if preserveTransport && !succeeded
   return succeeded
 end
 
@@ -560,14 +562,42 @@ def bootstrapLinkObjects(module: IrModule, objects: StringBuffer, output: String
   return succeeded
 end
 
-def bootstrapEmitNative(module: IrModule, emit: readonly EmissionKind, output: String, target: readonly TargetPlatform, release: Bool, timings: Bool = false, debugSources: BootstrapSourceInput? = null, references: ReferenceInputs? = null, linkInputs: NativeLinkInputs? = null, progress: (fn(String, Int, Int): Void)? = null, nativeProgress: (fn(String, Int, Int, String, Int): Void)? = null): Bool
+def bootstrapSaveReferences(saved: SavedArtifacts, references: ReferenceInputs?): Bool
+  if references == null
+    return true
+  end
+  if references.savedObjects.size != references.savedTransports.size || references.savedObjects.size != references.savedKeys.size
+    return false
+  end
+  var index = 0
+
+  while index < references.savedObjects.size
+    if !saved.add(references.savedKeys.get(index), references.savedObjects.get(index), references.savedTransports.get(index))
+      return false
+    end
+    index = index + 1
+  end
+  return true
+end
+
+def bootstrapEmitNative(module: IrModule, emit: readonly EmissionKind, output: String, target: readonly TargetPlatform, release: Bool, timings: Bool = false, debugSources: BootstrapSourceInput? = null, references: ReferenceInputs? = null, linkInputs: NativeLinkInputs? = null, progress: (fn(String, Int, Int): Void)? = null, nativeProgress: (fn(String, Int, Int, String, Int): Void)? = null, saveTemps: Bool = false): Bool
   if !emit.isExecutable()
     return bootstrapInvokeCodegen(module, emit, output, target, release, null, "", "", nativeProgress)
+  end
+  let temps = output + ".temps"
+  let saved = new SavedArtifacts(temps)
+
+  if saveTemps
+    if !saved.create() || !bootstrapSaveReferences(saved, references)
+      files::removeTree(temps)
+      return false
+    end
   end
   let objectPath = output + ".o"
   let codegenStarted = runCacheTime()
 
-  if !bootstrapInvokeCodegen(module, emit, objectPath, target, release, debugSources, "", "", nativeProgress)
+  if !bootstrapInvokeCodegen(module, emit, objectPath, target, release, debugSources, "", "", nativeProgress, saveTemps)
+    files::removeTree(temps) if saveTemps
     return false
   end
   runCacheReport(timings, "codegen", codegenStarted)
@@ -581,8 +611,25 @@ def bootstrapEmitNative(module: IrModule, emit: readonly EmissionKind, output: S
   runCacheReport(timings, "link", linkStarted)
   let symbols = !linked || bootstrapExecutableSymbols(output, target, release)
 
-  host::removeFile(objectPath)
-  return linked && symbols
+  if !linked || !symbols
+    host::removeFile(objectPath)
+    host::removeFile(objectPath + ".nir.hex")
+    files::removeTree(temps) if saveTemps
+    return false
+  end
+  if saveTemps
+    let retained = saved.add("monolithic", objectPath, objectPath + ".nir.hex") && saved.finish()
+
+    host::removeFile(objectPath)
+    host::removeFile(objectPath + ".nir.hex")
+    if !retained
+      files::removeTree(temps)
+      return false
+    end
+  else
+    host::removeFile(objectPath)
+  end
+  return true
 end
 
 def bootstrapExecutableSymbols(output: String, target: readonly TargetPlatform, release: Bool): Bool
@@ -631,7 +678,7 @@ def bootstrapUnitSources(module: IrModule, sources: BootstrapSourceInput?): Boot
   return first
 end
 
-def bootstrapCompileUnit(unit: IrCompilationUnit, target: readonly TargetPlatform, release: Bool, timings: Bool, noCache: Bool, sources: BootstrapSourceInput?, temporaryDirectories: StringBuffer, progress: (fn(String, Int, Int): Void)? = null, nativeProgress: (fn(String, Int, Int, String, Int): Void)? = null): String?
+def bootstrapCompileUnit(unit: IrCompilationUnit, target: readonly TargetPlatform, release: Bool, timings: Bool, noCache: Bool, sources: BootstrapSourceInput?, temporaryDirectories: StringBuffer, progress: (fn(String, Int, Int): Void)? = null, nativeProgress: (fn(String, Int, Int, String, Int): Void)? = null, preserveTransport: Bool = false): String?
   let started = runCacheTime()
   let payload = irSerializePayload(unit.module)
   let payloadDigest = sha256FastWire(payload.bytes)
@@ -667,7 +714,7 @@ def bootstrapCompileUnit(unit: IrCompilationUnit, target: readonly TargetPlatfor
   let codegenStarted = runCacheTime()
   let serialized = irSerializeEnvelopePayloadHex(unit.module, payload, payloadDigest)
 
-  if !bootstrapInvokeCodegen(unit.module, EmissionKind.object(), path, target, release, unitSources, "", serialized, nativeProgress)
+  if !bootstrapInvokeCodegen(unit.module, EmissionKind.object(), path, target, release, unitSources, "", serialized, nativeProgress, preserveTransport)
     bootstrapRemoveRunDirectory(directory)
     return null
   end
@@ -683,19 +730,31 @@ def bootstrapCompileUnit(unit: IrCompilationUnit, target: readonly TargetPlatfor
   return path
 end
 
-def bootstrapEmitCompilationUnits(module: IrModule, units: IrCompilationUnit, output: String, target: readonly TargetPlatform, release: Bool, timings: Bool, noCache: Bool, sources: BootstrapSourceInput?, linkInputs: NativeLinkInputs? = null, progress: (fn(String, Int, Int): Void)? = null, nativeProgress: (fn(String, Int, Int, String, Int): Void)? = null, references: ReferenceInputs? = null): Bool
+def bootstrapEmitCompilationUnits(module: IrModule, units: IrCompilationUnit, output: String, target: readonly TargetPlatform, release: Bool, timings: Bool, noCache: Bool, sources: BootstrapSourceInput?, linkInputs: NativeLinkInputs? = null, progress: (fn(String, Int, Int): Void)? = null, nativeProgress: (fn(String, Int, Int, String, Int): Void)? = null, references: ReferenceInputs? = null, saveTemps: Bool = false): Bool
   let objects = new StringBuffer()
   let temporaryDirectories = new StringBuffer()
+  let temps = output + ".temps"
+  let saved = new SavedArtifacts(temps)
   var unit: IrCompilationUnit? = units
   var succeeded = true
 
+  if saveTemps
+    if !saved.create() || !bootstrapSaveReferences(saved, references)
+      files::removeTree(temps)
+      return false
+    end
+  end
+
   while unit != null && succeeded
-    let object = bootstrapCompileUnit(unit, target, release, timings, noCache, sources, temporaryDirectories, progress, nativeProgress)
+    let object = bootstrapCompileUnit(unit, target, release, timings, noCache || saveTemps, sources, temporaryDirectories, progress, nativeProgress, saveTemps)
 
     if object == null
       succeeded = false
     else
       objects.add(object)
+      if saveTemps
+        succeeded = saved.add(unit.key, object, object + ".nir.hex")
+      end
     end
     unit = unit.next
   end
@@ -707,11 +766,15 @@ def bootstrapEmitCompilationUnits(module: IrModule, units: IrCompilationUnit, ou
     runCacheReport(timings, "link", started)
     succeeded = bootstrapExecutableSymbols(output, target, release) if succeeded
   end
+  if succeeded && saveTemps
+    succeeded = saved.finish()
+  end
   var temporary = temporaryDirectories.first.nextNode
 
   while temporary != null
     bootstrapRemoveRunDirectory(temporary.value)
     temporary = temporary.nextNode
   end
+  files::removeTree(temps) if !succeeded && saveTemps
   return succeeded
 end

@@ -9,9 +9,13 @@ class DependencyLibrary
   public declarations: IrModule?
   public objectPath: String = ""
   public objectDigest: String = ""
+  public transportPath: String = ""
+  public transportDigest: String = ""
+  private saveTemps: Bool = false
   private metadataPath: String = ""
 
-  def prepare(dependency: BatchDependency, target: readonly TargetPlatform, release: Bool, debugIdentity: String): Void
+  def prepare(dependency: BatchDependency, target: readonly TargetPlatform, release: Bool, debugIdentity: String, saveTemps: Bool = false): Void
+    this.saveTemps = saveTemps
     let disabled = host::environment("NERI_LIBRARY_CACHE")
 
     if disabled != null && disabled == "0"
@@ -29,10 +33,11 @@ class DependencyLibrary
     end
     let cache = new SemanticSnapshotCache()
 
-    cache.prepare(runCacheFrame("dependency-library-v1") + runCacheFrame(dependency.identity) + runCacheFrame(dependency.importScope) + runCacheFrame(target.name()) + runCacheFrame(release ? "release" : "debug") + runCacheFrame(digest) + runCacheFrame(debugIdentity))
+    cache.prepare(runCacheFrame(saveTemps ? "dependency-library-retained-v1" : "dependency-library-v1") + runCacheFrame(dependency.identity) + runCacheFrame(dependency.importScope) + runCacheFrame(target.name()) + runCacheFrame(release ? "release" : "debug") + runCacheFrame(digest) + runCacheFrame(debugIdentity))
     if cache.path != ""
       this.metadataPath = cache.path + ".nlib"
       this.objectPath = cache.path + ".o"
+      this.transportPath = saveTemps ? this.objectPath + ".nir.hex" : ""
     end
   end
 
@@ -45,6 +50,16 @@ class DependencyLibrary
 
     if !before.owned || before.kind != 1 || !objectBefore.owned || objectBefore.kind != 1
       return false
+    end
+    var transportBefore = ""
+
+    if this.saveTemps
+      let status = new RunCacheFile(this.transportPath, false)
+
+      if !status.owned || status.kind != 1
+        return false
+      end
+      transportBefore = status.fingerprint
     end
     let read = files::readBytes(this.metadataPath, 67108929)
     let bytes = read.bytes
@@ -66,8 +81,10 @@ class DependencyLibrary
     let version = reader.string()
     let digest = reader.string()
     let encoded = reader.string()
+    let transportDigest = this.saveTemps ? reader.string() : ""
+    let expectedVersion = this.saveTemps ? "neri-dependency-library-retained-v1" : "neri-dependency-library-v1"
 
-    if !reader.complete() || version != "neri-dependency-library-v1" || host::stringByteLength(digest) != 64 || digest != referenceFileDigest(this.objectPath)
+    if !reader.complete() || version != expectedVersion || host::stringByteLength(digest) != 64 || digest != referenceFileDigest(this.objectPath)
       return false
     end
     let decoded = libraryDeclarationsDecode(encoded, moduleName, domains)
@@ -77,12 +94,20 @@ class DependencyLibrary
     if decoded == null || !after.owned || after.kind != 1 || !objectAfter.owned || objectAfter.kind != 1 || before.fingerprint != after.fingerprint || objectBefore.fingerprint != objectAfter.fingerprint
       return false
     end
+    if this.saveTemps
+      let transportAfter = new RunCacheFile(this.transportPath, false)
+
+      if !transportAfter.owned || transportAfter.kind != 1 || transportBefore != transportAfter.fingerprint || host::stringByteLength(transportDigest) != 64 || referenceFileDigest(this.transportPath) != transportDigest
+        return false
+      end
+    end
+    this.transportDigest = transportDigest
     this.declarations = decoded
     this.objectDigest = digest
     return true
   end
 
-  def materialize(dependency: BatchDependency, combined: String, ids: StringBuffer, texts: StringBuffer, starts: IntBuffer, moduleName: String, target: readonly TargetPlatform, release: Bool, sources: BootstrapSourceInput?, timings: Bool, progress: (fn(String, Int, Int): Void)? = null, nativeProgress: (fn(String, Int, Int, String, Int): Void)? = null): Bool
+  def materialize(dependency: BatchDependency, combined: String, ids: StringBuffer, texts: StringBuffer, starts: IntBuffer, moduleName: String, target: readonly TargetPlatform, release: Bool, sources: BootstrapSourceInput?, timings: Bool, progress: (fn(String, Int, Int): Void)? = null, nativeProgress: (fn(String, Int, Int, String, Int): Void)? = null, saveTemps: Bool = false): Bool
     let providerIds = new StringTable<Bool>()
     var sourceIndex = 0
 
@@ -99,7 +124,7 @@ class DependencyLibrary
       end
       source = source.nextInput
     end
-    this.prepare(dependency, target, release, debugIdentity)
+    this.prepare(dependency, target, release, debugIdentity, saveTemps)
     if this.metadataPath == ""
       return false
     end
@@ -153,7 +178,7 @@ class DependencyLibrary
 
     progress("codegen", 0, 0) if progress != null
     let providerSources = bootstrapUnitSources(module, sources)
-    var succeeded = bootstrapInvokeCodegen(module, EmissionKind.object(), stagedObject, target, release, providerSources, metricsPath, "", nativeProgress)
+    var succeeded = bootstrapInvokeCodegen(module, EmissionKind.object(), stagedObject, target, release, providerSources, metricsPath, "", nativeProgress, saveTemps)
 
     runCacheReport(timings, "dependency-codegen", codegenStarted)
     bootstrapReportCodegenMetrics(metricsPath, "dependency-") if timings
@@ -162,18 +187,26 @@ class DependencyLibrary
       let digest = referenceFileDigest(stagedObject)
       let writer = new SemanticSnapshotWriter()
 
-      writer.string("neri-dependency-library-v1")
+      writer.string(saveTemps ? "neri-dependency-library-retained-v1" : "neri-dependency-library-v1")
       writer.string(digest)
       writer.string(encoded)
+      let transportDigest = saveTemps ? referenceFileDigest(stagedObject + ".nir.hex") : ""
+
+      if saveTemps
+        writer.string(transportDigest)
+      end
       let payload = writer.finish()
 
-      succeeded = digest != "" && payload != null
+      succeeded = digest != "" && payload != null && (!saveTemps || transportDigest != "")
       if payload != null && succeeded
         succeeded = host::writeText(temporary + "/library.nlib", sha256FastText(payload) + "\n" + payload)
       end
     end
     if succeeded
       succeeded = files::move(stagedObject, this.objectPath).failure == null
+      if succeeded && saveTemps
+        succeeded = files::move(stagedObject + ".nir.hex", this.transportPath).failure == null
+      end
       succeeded = files::move(temporary + "/library.nlib", this.metadataPath).failure == null if succeeded
     end
     bootstrapRemoveRunDirectory(temporary)
@@ -201,6 +234,11 @@ class DependencyLibrary
       imported = imported.nextImport
     end
     references.addObject(this.objectPath, this.objectDigest)
+    if this.saveTemps
+      references.savedObjects.add(this.objectPath)
+      references.savedTransports.add(this.transportPath)
+      references.savedKeys.add("dependency-prefix")
+    end
     references.runtimeMinor = bootstrapRequiredRuntimeMinor(declarations)
     references.runtimeFeatures = bootstrapRequiredRuntimeFeatures(declarations)
     references.runtimeFeatureBits = references.runtimeFeatures.bits()

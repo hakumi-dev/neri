@@ -1,3 +1,5 @@
+use clock
+
 def packageParentDirectory(path: String): String
   var slash = -1
   var index = 0
@@ -22,6 +24,9 @@ class Build
   public caseNumber: Int = 0
   public lastCase: String = ""
   public packagedTree: String = ""
+  public stage: Int = 1
+  public preparedStage: Int = 0
+  public nativeReady: Bool = false
 
   def standardLibrarySources(): String[]
     let directory = this.root + "/stdlib"
@@ -102,6 +107,7 @@ class Build
       "NERI_HOST=" + this.nativeDirectory() + "/neri-host",
       "NERI_CODEGEN=" + this.nativeDirectory() + "/neri-codegen",
       "NERI_RUNTIME_MANIFEST=" + this.nativeDirectory() + "/neri-runtime-" + this.target.name() + ".json",
+      "NERI_CACHE_DIR=" + this.root + "/build/cache/compiler",
       "NERI_TEMPLATE_CATALOG=" + envOr("NERI_TEMPLATE_CATALOG", this.root + "/share/neri/templates/declarations.json"),
       "NERI_LINKER=" + this.llvm + "/bin/clang++"]
   end
@@ -120,9 +126,34 @@ class Build
   end
 
   def nativeBuild(): Void
+    if this.nativeReady
+      return
+    end
+    let prepared = envOr("NERI_NATIVE_READY", "")
+
+    if prepared == this.root + "|" + this.mode.name()
+      let receipt = envOr("NERI_NATIVE_READY_MANIFEST", "")
+
+      if receipt == ""
+        fail("prepared native components require a checksum manifest")
+      end
+      let nativeHashes = requiredText(receipt)
+
+      execute("/usr/bin/env", ["-C", this.nativeDirectory(), "shasum", "-a", "256", "-c", receipt])
+      for name in ["neri-codegen", "neri-host", "libneri-runtime.a", "neri-runtime-" + this.target.name() + ".json"]
+        if !contains(nativeHashes, "  " + name + "\n")
+          fail("prepared native manifest omits " + name)
+        end
+        execute("test", ["-f", this.nativeDirectory() + "/" + name])
+      end
+      execute("cmake", ["--build", this.nativeDirectory()])
+      this.nativeReady = true
+      return
+    end
     console::println("[native] Building current checkout (" + this.mode.name() + ")")
     this.configureNative()
     execute("cmake", ["--build", this.nativeDirectory()])
+    this.nativeReady = true
   end
 
   def configureNative(): Void
@@ -142,6 +173,9 @@ class Build
   end
 
   def startWork(): Void
+    if this.work != ""
+      return
+    end
     execute("mkdir", ["-p", this.root + "/build"])
     let directory = bootstrapTemporaryDirectory(this.root + "/build", "work")
 
@@ -169,45 +203,85 @@ class Build
     return sources
   end
 
-  def compile(compiler: String, emit: String, output: String): Void
+  def compile(compiler: String, emit: String, output: String, saveTemps: Bool = false): Bool
     var arguments = this.environment()
+
+    # The compiler owns dependency discovery, output verification and atomic cache publication.
+    # Every stage still runs build and restores into this invocation's isolated workspace.
+    toolingPrivateCacheDirectory(this.root + "/build/cache/compiler")
 
     for option in [compiler, "build", "--project", this.root + "/manifest.json", "--unit", "compiler"]
       arguments = host::appendString(arguments, option)
     end
     let options = ["--source-root", this.root + "/compiler", "--module", "neri-compiler",
-      "--target", this.target.name(), "--release", "--emit=" + emit, "--output", output]
+      "--target", this.target.name(), "--release", "--timings", "--emit=" + emit, "--output", output]
 
     for option in options arguments = host::appendString(arguments, option) end
-    execute("/usr/bin/env", arguments)
+    if saveTemps
+      arguments = host::appendString(arguments, "--save-temps")
+    end
+    let status = this.capture(arguments, "stage-compile", 1800)
+    let outputText = requiredText(this.work + "/stage-compile.stdout")
+    let errorText = requiredText(this.work + "/stage-compile.stderr")
+
+    console::print(outputText)
+    console::print(errorText)
+    if status != 0
+      fail("compiler stage failed with exit " + (status as String))
+    end
+    return contains(outputText, "neri timing incremental-hit ") || contains(errorText, "neri timing incremental-hit ")
   end
 
   def bootstrap(publish: Bool): Void
-    this.nativeBuild()
-    this.startWork()
-    execute("mkdir", [this.work + "/stage1", this.work + "/stage2", this.work + "/stage3"])
-    let stage1 = this.work + "/stage1/neri"
-    let stage2 = this.work + "/stage2/neri"
-    let stage3 = this.work + "/stage3/neri"
-
-    console::println("[bootstrap] Trusted seed -> Stage1")
-    this.compile(this.seedCompiler(), "executable", stage1)
-    console::println("[bootstrap] Stage1 -> Stage2")
-    this.compile(stage1, "executable", stage2)
-    console::println("[bootstrap] Stage2 -> Stage3")
-    this.compile(stage2, "executable", stage3)
-    for emit in ["neri-ir-hex", "obj"]
-      this.compile(stage1, emit, this.work + "/stage1." + emit)
-      this.compile(stage2, emit, this.work + "/stage2." + emit)
-      execute("cmp", [this.work + "/stage1." + emit, this.work + "/stage2." + emit])
-    end
-    execute("cmp", [stage2, stage3])
-    this.compiler = stage3
-    this.checkAbiCatalog()
+    this.prepareCompiler()
     if publish
       this.publishCompiler()
     end
-    console::println("[bootstrap] Fixed point verified against current native components")
+  end
+
+  def prepareCompiler(): Void
+    this.nativeBuild()
+    this.startWork()
+    if this.preparedStage >= this.stage
+      return
+    end
+    let stageInputs = seedSourceManifest(this)
+    var next = this.preparedStage + 1
+
+    while next <= this.stage
+      let directory = this.work + "/stage" + (next as String)
+      let output = directory + "/neri"
+      let original = next == 1 ? this.seedCompiler() : this.compiler
+      let hash: fn(String): String = fn(path: String): String
+        return this.digest(path)
+      end
+      let input = toolingCachedProducer(this.root + "/build/cache/producers", original, hash)
+      let started = clock::milliseconds()
+
+      execute("mkdir", ["-p", directory])
+      console::println("[bootstrap] Building Stage" + (next as String))
+      let reused = this.compile(input, "executable", output, next > 1)
+      let finished = clock::milliseconds()
+
+      if started != null && finished != null
+        console::println("[bootstrap] " + (reused ? "Reused Stage" : "Executed Stage") + (next as String) + " in " + ((finished - started) as String) + " ms")
+      end
+      this.compiler = output
+      this.preparedStage = next
+      next = next + 1
+    end
+    if seedSourceManifest(this) != stageInputs
+      fail("compiler inputs changed during staged bootstrap")
+    end
+    if this.preparedStage == 3
+      let stage2 = this.work + "/stage2/neri"
+      let stage3 = this.work + "/stage3/neri"
+
+      execute("cmp", [stage2, stage3])
+      execute("diff", ["-r", stage2 + ".temps", stage3 + ".temps"])
+      console::println("[bootstrap] Stage3 fixed point verified against current native components")
+    end
+    this.checkAbiCatalog()
   end
 
   def copyRuntimeHeaders(tree: String): Void
@@ -245,9 +319,11 @@ class Build
     for artifact in this.standardLibraryArtifacts()
       files = host::appendString(files, "stdlib/" + artifact)
     end
-    var manifest = ""
+    var paths: String[] = []
 
-    for file in files manifest = manifest + this.digest(tree + "/" + file) + "  " + file + "\n" end
+    for file in files paths = host::appendString(paths, tree + "/" + file) end
+    let manifest = this.fileManifest(paths, tree)
+
     if !host::writeText(tree + "/ARTIFACTS.sha256", manifest)
       fail("cannot record verified toolchain")
     end
@@ -520,6 +596,69 @@ class Build
     return host::stringSlice(text, 0, 64)
   end
 
+  def fileManifest(paths: String[], relativeRoot: String): String
+    let result = new ToolingTextBuffer()
+    var index = 0
+
+    while index < paths.Length
+      var arguments = ["-C", relativeRoot, "shasum", "-a", "256", "--"]
+      var names: String[] = []
+      var bytes = 256
+
+      while index < paths.Length && names.Length < 128
+        let path = paths[index]
+        let prefix = relativeRoot + "/"
+
+        if !bytesEqualAt(path, prefix, 0)
+          fail("manifest input is outside its relative root: " + path)
+        end
+        let name = host::stringSlice(path, host::stringByteLength(prefix), host::stringByteLength(path) - host::stringByteLength(prefix))
+        let size = host::stringByteLength(name) + 1
+
+        if size > 16384 || name == "" || name == "-" || contains(name, "\n") || contains(name, "\r") || contains(name, "\\")
+          fail("manifest input cannot be represented without escaping: " + path)
+        end
+        if bytes + size > 16384 && names.Length > 0
+          break
+        end
+        arguments = host::appendString(arguments, name)
+        names = host::appendString(names, name)
+        bytes = bytes + size
+        index = index + 1
+      end
+      if this.capture(arguments, "manifest-hashes", 60) != 0
+        fail("manifest hash batch failed")
+      end
+      let hashes = lines(requiredText(this.work + "/manifest-hashes.stdout"))
+
+      if hashes.Length != names.Length
+        fail("manifest hash batch returned an unexpected row count")
+      end
+      var row = 0
+
+      while row < names.Length
+        let line = hashes[row]
+
+        if host::stringByteLength(line) != 66 + host::stringByteLength(names[row]) || !bytesEqualAt(line, "  " + names[row], 64)
+          fail("manifest hash batch returned an unexpected path or ordering")
+        end
+        var digit = 0
+
+        while digit < 64
+          let value = host::stringByteAt(line, digit) as Int
+
+          if !((value >= 48 && value <= 57) || (value >= 97 && value <= 102))
+            fail("manifest hash batch returned an invalid SHA-256")
+          end
+          digit = digit + 1
+        end
+        result.add(line + "\n")
+        row = row + 1
+      end
+    end
+    return toolingText(result)
+  end
+
   def sourceManifest(): String
     let files = new ToolingTextBuffer()
 
@@ -549,16 +688,15 @@ class Build
         path = cursor.next()
       end
     end
-    let entries = new ToolingTextBuffer()
-
+    var paths: String[] = []
     let cursor = new ToolingLineCursor(toolingText(files))
     var file = cursor.next()
 
     while file != null
-      entries.add(this.digest(this.root + "/" + file) + "  " + file + "\n")
+      paths = host::appendString(paths, this.root + "/" + file)
       file = cursor.next()
     end
-    return toolingText(entries)
+    return this.fileManifest(paths, this.root)
   end
 
   def copySessionProject(tree: String): Void
@@ -613,14 +751,7 @@ class Build
 
   def artifactDirectoryHashes(tree: String, relative: String): String
     execute(this.nativeDirectory() + "/neri-host", ["list", tree + "/" + relative, "", this.work + "/artifact-inventory"])
-    let hashes = new ToolingTextBuffer()
-
-    for path in lines(requiredText(this.work + "/artifact-inventory"))
-      let member = host::stringSlice(path, host::stringByteLength(tree) + 1, host::stringByteLength(path) - host::stringByteLength(tree) - 1)
-
-      hashes.add(this.digest(path) + "  " + member + "\n")
-    end
-    return toolingText(hashes)
+    return this.fileManifest(lines(requiredText(this.work + "/artifact-inventory")), tree)
   end
 
   def packageTree(directory: String, name: String, sources: String): String
@@ -665,36 +796,42 @@ class Build
       fail("cannot write source manifest")
     end
     let hashes = new ToolingTextBuffer()
+    var paths: String[] = []
 
     for artifact in this.standardLibraryArtifacts()
-      hashes.add(this.digest(tree + "/stdlib/" + artifact) + "  stdlib/" + artifact + "\n")
+      paths = host::appendString(paths, tree + "/stdlib/" + artifact)
     end
-    hashes.add(this.digest(tree + "/stdlib/documentation.json") + "  stdlib/documentation.json\n")
+    paths = host::appendString(paths, tree + "/stdlib/documentation.json")
     for example in ["README.md", "hello.hk", "functions.hk", "arguments.hk", "http.hk", "generics.hk"]
       execute("cp", [this.root + "/examples/" + example, tree + "/examples/" + example])
-      hashes.add(this.digest(tree + "/examples/" + example) + "  examples/" + example + "\n")
+      paths = host::appendString(paths, tree + "/examples/" + example)
     end
+    hashes.add(this.fileManifest(paths, tree))
+    paths = []
     hashes.add(this.artifactDirectoryHashes(tree, "share/neri"))
     hashes.add(this.artifactDirectoryHashes(tree, "include/neri"))
     hashes.add(this.artifactDirectoryHashes(tree, "examples/session-consumer"))
     hashes.add(this.artifactDirectoryHashes(tree, "examples/data-consumer"))
     for doc in documents
-      hashes.add(this.digest(tree + "/docs/" + doc) + "  docs/" + doc + "\n")
+      paths = host::appendString(paths, tree + "/docs/" + doc)
     end
     for artifact in ["bin/neri", "bin/neri-launcher-common.sh", "bin/neri-session", "bin/neri-data-generate", "bin/neri-data-migration", "bin/neri-codegen", "libexec/neri", "libexec/neri-session-console", "libexec/neri-data-generate", "libexec/neri-data-migration", "libexec/neri-install", "libexec/neri-host", "install.sh", "lib/libneri-runtime.a", "lib/neri-runtime.json", "SOURCE-MANIFEST.sha256"]
-      hashes.add(this.digest(tree + "/" + artifact) + "  " + artifact + "\n")
+      paths = host::appendString(paths, tree + "/" + artifact)
     end
     if this.target.isMacOS()
       let artifact = "lib/libneri-session-object-linker.dylib"
 
-      hashes.add(this.digest(tree + "/" + artifact) + "  " + artifact + "\n")
+      paths = host::appendString(paths, tree + "/" + artifact)
     end
+    hashes.add(this.fileManifest(paths, tree))
     let artifactHashes = toolingText(hashes)
 
     if !host::writeText(tree + "/ARTIFACTS.sha256", artifactHashes)
       fail("cannot write artifact manifest")
     end
-    let provenance = "{\n  \"schemaVersion\": 2,\n  \"target\": \"" + this.target.name() + "\",\n  \"llvmVersion\": \"22.1.8\",\n  \"runtimeManifest\": " + requiredText(tree + "/lib/neri-runtime.json") + ",\n  \"verification\": \"fixed-point-and-native-language-contracts\",\n  \"sourceManifestSha256\": \"" + this.digest(tree + "/SOURCE-MANIFEST.sha256") + "\",\n  \"artifactManifestSha256\": \"" + this.digest(tree + "/ARTIFACTS.sha256") + "\",\n  \"seedProvenanceSha256\": \"" + this.digest(this.seed + "/PROVENANCE.json") + "\"\n}\n"
+    let verification = this.preparedStage == 3 ? "fixed-point-and-native-language-contracts" : "stage2-and-native-language-contracts"
+
+    let provenance = "{\n  \"schemaVersion\": 2,\n  \"target\": \"" + this.target.name() + "\",\n  \"llvmVersion\": \"22.1.8\",\n  \"runtimeManifest\": " + requiredText(tree + "/lib/neri-runtime.json") + ",\n  \"compilerStage\": " + (this.preparedStage as String) + ",\n  \"verification\": \"" + verification + "\",\n  \"sourceManifestSha256\": \"" + this.digest(tree + "/SOURCE-MANIFEST.sha256") + "\",\n  \"artifactManifestSha256\": \"" + this.digest(tree + "/ARTIFACTS.sha256") + "\",\n  \"seedProvenanceSha256\": \"" + this.digest(this.seed + "/PROVENANCE.json") + "\"\n}\n"
 
     if !host::writeText(tree + "/PROVENANCE.json", provenance)
       fail("cannot write provenance")
@@ -1039,7 +1176,7 @@ class Build
     if !this.mode.isRelease()
       fail("benchmarks require Release mode")
     end
-    this.bootstrap(false)
+    this.prepareCompiler()
     let binary = this.work + "/collections"
     var arguments = this.environment()
     let options = [this.compiler, "build", "--project", this.root + "/manifest.json",
@@ -1678,7 +1815,7 @@ class Build
   end
 
   def test(): Void
-    this.bootstrap(false)
+    this.prepareCompiler()
     this.checkCodeStyle()
     this.abiCatalogContracts()
     var lspArguments = this.environment()
@@ -2148,7 +2285,7 @@ class Build
   end
 
   def selectedTest(command: String): Void
-    this.bootstrap(false)
+    this.prepareCompiler()
     if command == "smoke-test"
       this.languageCase("examples/hello.hk", 0, "Hello, Neri!\n", true)
       this.runContract()
@@ -2164,7 +2301,7 @@ class Build
     if !this.target.isMacOS()
       fail("debugger-test currently requires macOS LLDB")
     end
-    this.bootstrap(false)
+    this.prepareCompiler()
     let directory = this.work + "/debugger-contract"
     let source = this.root + "/tests/debugger/fixture.hk"
 
@@ -2210,31 +2347,64 @@ def main(): Void
   if first != null
     command = first
   end
-  var second = ""
-  let supplied = host::argumentAt(1)
+  var stage = command == "package" || command == "install" ? 2 : 1
 
-  if supplied != null
-    second = supplied
-  end
-  if second == "--prefix"
-    let value = host::argumentAt(2)
+  stage = 3 if command == "refresh-seed"
+  var stageSpecified = false
+  var modeSpecified = false
+  var prefixSpecified = false
+  var index = 1
 
-    if command != "install" || value == null || host::argumentCount() != 3
-      fail("--prefix requires a directory and the install command")
-    else
-      prefix = value
-    end
-  else if second != ""
-    let selected = BuildMode.fromOption(second)
+  while index < host::argumentCount()
+    let option = host::argumentAt(index)
 
-    if selected == null
-      fail("unknown build option: " + second)
+    if option == null
+      fail("missing build option")
       return
     end
-    mode = selected
+    if option == "--stage" || option == "--prefix"
+      let value = host::argumentAt(index + 1)
+
+      if value == null
+        fail(option + " requires a value")
+        return
+      end
+      if option == "--stage"
+        if stageSpecified || (value != "1" && value != "2" && value != "3")
+          fail("--stage requires exactly one value: 1, 2 or 3")
+          return
+        end
+        stage = value == "1" ? 1 : (value == "2" ? 2 : 3)
+        stageSpecified = true
+      else
+        if command != "install" || prefixSpecified || value == ""
+          fail("--prefix requires one directory and the install command")
+          return
+        end
+        prefix = value
+        prefixSpecified = true
+      end
+      index = index + 2
+    else
+      let selected = BuildMode.fromOption(option)
+
+      if selected == null || modeSpecified
+        fail("unknown or duplicate build mode: " + option)
+        return
+      end
+      mode = selected
+      modeSpecified = true
+      index = index + 1
+    end
   end
-  if host::argumentCount() > 2 && second != "--prefix"
-    fail("too many build arguments")
+  if (command == "package" || command == "install") && stage < 2
+    fail("package and install require --stage 2 or --stage 3")
+  end
+  if command == "refresh-seed" && stage != 3
+    fail("refresh-seed requires --stage 3")
+  end
+  if stageSpecified && (command == "native" || command == "native-test" || command == "doctor")
+    fail("--stage requires a compiler build command")
   end
   let target = TargetPlatform.parse(envOr("NERI_TARGET", "macos-arm64"))
 
@@ -2243,6 +2413,8 @@ def main(): Void
     return
   end
   let build = new Build(root, seed, llvm, target, mode)
+
+  build.stage = stage
 
   if mode.usesSanitizer() && command != "native" && command != "native-test" && command != "doctor"
     fail("sanitizers instrument native targets; use native-test with the selected sanitizer")

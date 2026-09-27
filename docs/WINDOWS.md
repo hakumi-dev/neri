@@ -26,9 +26,11 @@ the .NET gzip API before the native backend materializes the host compiler.
 | `pwsh -File scripts/build.ps1 install` | Build, validate and activate a toolchain from the repository root. |
 | `-Prefix <directory>` | Select the installation root. |
 | `-NoPath` | Preserve the current per-user `PATH`. |
+| `-Stage 1\|2\|3` | Select the last compiler generation; installation requires Stage2 or Stage3. |
 
-The command configures and builds the native components, bootstraps three
-compiler generations, and checks byte-identical Neri IR, COFF and PE output.
+Installation configures and builds the native components and bootstraps through
+Stage2. `build` and `test` default to Stage1. `-Stage 3` additionally checks
+byte-identical Stage2 and Stage3 Neri IR, COFF and PE output; CI selects it explicitly.
 Validation includes Windows CLI cases, UTF-8 paths, and LSP
 framing and diagnostics. The native CTest suite runs as part of the build.
 

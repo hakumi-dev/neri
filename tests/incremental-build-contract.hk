@@ -2,6 +2,7 @@ use host
 use process
 use test
 use console
+use files
 
 @cabiImport("neri_rt_v1_cache_supported")
 unsafe def cacheSupported(): Int
@@ -62,10 +63,11 @@ def directory(path: String): Void
   test::assertTrue(status != null && status == 0)
 end
 
-def invoke(executable: String, arguments: String[], cache: String, libraryPath: String = ""): process::PollResult
+def invoke(executable: String, arguments: String[], cache: String, libraryPath: String = "", workingDirectory: String = ""): process::PollResult
   let options = new process::SpawnOptions(executable)
 
   options.arguments = arguments
+  options.workingDirectory = workingDirectory if workingDirectory != ""
   if libraryPath != ""
     options.environment = [new process::EnvironmentEntry("NERI_CACHE_DIR", cache),
       new process::EnvironmentEntry("NERI_LIBRARY_PATH", libraryPath)]
@@ -112,7 +114,7 @@ def exited(result: process::PollResult, expected: Int): Void
   end
 end
 
-def build(compiler: String, manifest: String, output: String, cache: String, release: Bool = true, noCache: Bool = false): process::PollResult
+def build(compiler: String, manifest: String, output: String, cache: String, release: Bool = true, noCache: Bool = false, saveTemps: Bool = false): process::PollResult
   var arguments = ["build", "--project", manifest, "--unit", "app", "--timings", "--output", output]
 
   if release
@@ -121,11 +123,19 @@ def build(compiler: String, manifest: String, output: String, cache: String, rel
   if noCache
     arguments = host::appendString(arguments, "--no-cache")
   end
+  if saveTemps
+    arguments = host::appendString(arguments, "--save-temps")
+  end
   return invoke(compiler, arguments, cache)
 end
 
-def buildNativeApp(compiler: String, manifest: String, output: String, cache: String, libraryPath: String): process::PollResult
-  return invoke(compiler, ["build", "--project", manifest, "--unit", "app", "--release", "--timings", "--output", output], cache, libraryPath)
+def buildNativeApp(compiler: String, manifest: String, output: String, cache: String, libraryPath: String, saveTemps: Bool = false): process::PollResult
+  var arguments = ["build", "--project", manifest, "--unit", "app", "--release", "--timings", "--output", output]
+
+  if saveTemps
+    arguments = host::appendString(arguments, "--save-temps")
+  end
+  return invoke(compiler, arguments, cache, libraryPath)
 end
 
 def createNativeExport(compiler: String, manifest: String, object: String, cache: String): process::PollResult
@@ -186,6 +196,12 @@ def main(): Void
   let protectedCache = host::run("chmod", ["700", cache])
 
   test::assertTrue(protectedCache != null && protectedCache == 0)
+  let standalone = root + "/standalone.hk"
+
+  write(standalone, "def main(): Void\nend\n")
+  exited(invoke(compiler, ["build", standalone, "--release", "--save-temps", "--output", "relative-bin"], cache, "", root), 0)
+
+  test::assertTrue(host::readText(root + "/relative-bin.temps/manifest.json") != null)
   directory(appSources)
   directory(librarySources)
   write(provider, "namespace support\n\nclass Box<T>\n  public value: T\n\n  def init(value: T): Void\n    this.value = value\n  end\n\n  def item(): T\n    return this.value\n  end\nend\n\ndef amount(): Int\n  return 2\nend\n")
@@ -198,6 +214,46 @@ def main(): Void
 
   test::assertTrue(coldObjectMisses > 0)
   assertBuildOutput(build(compiler, manifest, output, cache), 1)
+  let partitionTemps = root + "/partitioned-bin"
+
+  assertBuildOutput(build(compiler, manifest, partitionTemps, cache, true, false, true), 0)
+
+  test::assertTrue(host::readText(partitionTemps + ".temps/manifest.json") != null)
+  let removedPartitionObject = host::run("rm", [partitionTemps + ".temps/unit-1.o", partitionTemps + ".temps/unit-1.o.nir.hex"])
+
+  test::assertTrue(removedPartitionObject != null && removedPartitionObject == 0)
+  assertBuildOutput(build(compiler, manifest, partitionTemps, cache, true, false, true), 1)
+
+  test::assertTrue(host::readText(partitionTemps + ".temps/unit-1.o.nir.hex") != null)
+  test::assertTrue(host::writeText(partitionTemps + ".temps/unit-1.o", "corrupt"))
+  assertBuildOutput(build(compiler, manifest, partitionTemps, cache, true, false, true), 1)
+  let savedManifest = host::readText(partitionTemps + ".temps/manifest.json")
+  let cacheDirectory = files::Root.open(cache).root
+
+  test::assertTrue(savedManifest != null && cacheDirectory != null)
+  if cacheDirectory != null
+    let entries = cacheDirectory.list("", 4096)
+    let closed = cacheDirectory.close()
+
+    test::assertTrue(entries.failure == null && closed == null)
+    var corrupted = 0
+
+    for entry in entries.entries
+      let retained = cache + "/" + entry.name + "/program.temps"
+
+      if entry.kind.isDirectory() && host::readText(retained + "/manifest.json") == savedManifest
+        write(retained + "/unit-1.o", "corrupt cached object")
+        corrupted = corrupted + 1
+      end
+    end
+
+    test::assertEqual(corrupted, 1)
+  end
+  assertBuildOutput(build(compiler, manifest, partitionTemps, cache, true, false, true), 0)
+  assertBuildOutput(build(compiler, manifest, partitionTemps, cache, true, false, true), 1)
+  directory(root + "/relocated")
+  assertBuildOutput(build(compiler, manifest, root + "/relocated/app-bin", cache), 1)
+  assertBuildOutput(build(compiler, manifest, root + "/relocated/other-bin", cache), 0)
   let originalManifest = host::readText(manifest)
 
   test::assertTrue(originalManifest != null)
@@ -283,6 +339,27 @@ def main(): Void
   assertBuildOutput(buildNativeApp(compiler, nativeManifest, nativeOutput, cache, nativeLibraryPath), 0)
   assertRuns(nativeOutput, "4\n")
   assertBuildOutput(buildNativeApp(compiler, nativeManifest, nativeOutput, cache, nativeLibraryPath), 1)
+  assertBuildOutput(buildNativeApp(compiler, nativeManifest, nativeOutput, cache, nativeLibraryPath, true), 0)
+
+  test::assertTrue(host::readText(nativeOutput + ".temps/unit-0.o.nir.hex") != null)
+  let savedObject = host::run("test", ["-f", nativeOutput + ".temps/unit-0.o"])
+
+  test::assertTrue(savedObject != null && savedObject == 0)
+  assertBuildOutput(buildNativeApp(compiler, nativeManifest, nativeOutput, cache, nativeLibraryPath, true), 1)
+  let removedSidecars = host::run("rm", ["-rf", nativeOutput + ".temps"])
+
+  test::assertTrue(removedSidecars != null && removedSidecars == 0)
+  assertBuildOutput(buildNativeApp(compiler, nativeManifest, nativeOutput, cache, nativeLibraryPath, true), 1)
+
+  test::assertTrue(host::readText(nativeOutput + ".temps/unit-0.o.nir.hex") != null)
+  let restoredObject = host::run("test", ["-f", nativeOutput + ".temps/unit-0.o"])
+
+  test::assertTrue(restoredObject != null && restoredObject == 0)
+  let invalidTemps = invoke(compiler, ["build", "--project", nativeManifest, "--unit", "app", "--emit=obj", "--save-temps", "--output", root + "/invalid.o"], cache, nativeLibraryPath)
+
+  exited(invalidTemps, 2)
+
+  test::assertTrue(containsText(text(invalidTemps.stdout) + text(invalidTemps.stderr), "--save-temps requires build --emit=executable"))
   write(exportedSource, "@cabiExport(\"incremental_dependency_value\")\nunsafe def dependencyValue(): Int32\n  return 8 as Int32\nend\n")
   exited(createNativeExport(compiler, exportManifest, exportedObject, cache), 0)
   let replacedArchive = host::run("ar", ["rcs", nativeArchive, exportedObject])

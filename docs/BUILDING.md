@@ -59,7 +59,10 @@ compiler generation uses the current compiler unit and standard library.
 | Command | Contract |
 | --- | --- |
 | `scripts/build.sh doctor` | Check native build prerequisites. |
+| `scripts/build.sh build` | Build and select the current Stage1 development compiler. |
 | `scripts/build.sh test` | Build and validate the checkout; select the verified toolchain at `build/current`. |
+| `scripts/build.sh package` | Build and validate a Stage2 distribution. |
+| `--stage 3` | Add a generation and verify the compiler fixed point. |
 | `scripts/build.sh debugger-test` | Opt-in LLDB contract on macOS; see [debugging](DEBUGGING.md). |
 | `scripts/neri.sh <arguments>` | Use the selected checkout toolchain without changing the installed compiler. |
 
