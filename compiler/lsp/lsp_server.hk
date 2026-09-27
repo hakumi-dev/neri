@@ -16,8 +16,8 @@ class LspServer
   public nextAnalysisRevision: Int = 1
   public control: AnalysisControl?
   public stdlibDocumentation: LspJson?
-  public initialized: Bool = false
-  public shutdown: Bool = false
+  private lifecycle: readonly LspLifecycle = LspLifecycle.awaitingInitialization()
+
   public documents: LspDocument?
   public workspaceSymbols: LspWorkspaceSymbol?
   public workspaceSymbolsReady: Bool = false
@@ -285,7 +285,7 @@ class LspServer
   def invalidate(document: LspDocument): Void
     document.analysisPending = true
     document.sourcesReady = false
-    document.analysisStatus = "unavailable"
+    document.analysisStatus = AnalysisStatus.unavailable()
     document.lastDiagnostics = null
     document.lastPublishedDiagnostics = "[]"
     document.semantic = null
@@ -355,7 +355,7 @@ class LspServer
     end
   end
 
-  def sendError(id: String, code: Int, message: String): Void
+  def sendError(id: String, code: readonly LspErrorCode, message: String): Void
     if this.continueAnalysis()
       lspError(id, code, message)
     end
@@ -409,7 +409,7 @@ class LspServer
     document.analysisPending = false
     document.sourcesReady = false
     # A failed parse or library load must not expose a previous version's model.
-    document.analysisStatus = "unavailable"
+    document.analysisStatus = AnalysisStatus.unavailable()
     document.lastDiagnostics = null
     document.lastPublishedDiagnostics = "[]"
     document.semantic = null
@@ -438,7 +438,7 @@ class LspServer
     document.generatedOrigins = null
 
     if filePath != null && !neriSourceNameValid(filePath)
-      document.analysisStatus = "invalid"
+      document.analysisStatus = AnalysisStatus.invalid()
       this.publish(document, "[{\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":0,\"character\":0}},\"severity\":1,\"code\":\"NR_FILE_NAME\",\"source\":\"neri\",\"message\":\".hk file names must not contain whitespace.\"}]")
       return
     end
@@ -770,7 +770,7 @@ class LspServer
       diagnostics = semantic.diagnostics
     end
     document.lastDiagnostics = diagnostics
-    document.analysisStatus = diagnostics.count() == 0 ? "valid" : "invalid"
+    document.analysisStatus = diagnostics.count() == 0 ? AnalysisStatus.valid() : AnalysisStatus.invalid()
     var result = "["
     var separator = ""
 
@@ -831,19 +831,21 @@ class LspServer
     else if requestId.isNumber() && host::parseInt(requestId.scalarText()) != null
       id = requestId.scalarText()
     else if request
-      this.sendError("null", -32600, "Invalid request id")
+      this.sendError("null", LspErrorCode.invalidRequest(), "Invalid request id")
       return true
     end
     if !message.isObject() || message.get("jsonrpc").scalarText() != "2.0" || !method.isString()
-      this.sendError(id, -32600, "Invalid request")
+      this.sendError(id, LspErrorCode.invalidRequest(), "Invalid request")
       return true
     end
-    if method.scalarText() == "exit"
-      host::exit(this.shutdown ? 0 : 1)
+    let decodedMethod = LspMethod.decode(method.scalarText())
+
+    if decodedMethod.isExit()
+      host::exit(this.lifecycle.isStopped() ? 0 : 1)
       return false
     end
-    if method.scalarText() == "initialize" && request && !this.initialized
-      this.initialized = true
+    if decodedMethod.isInitialize() && request && this.lifecycle.isAwaitingInitialization()
+      this.lifecycle = LspLifecycle.active()
       let params = message.get("params")
       let root = lspPath(params.get("rootUri").scalarText())
 
@@ -884,28 +886,28 @@ class LspServer
       end
       return true
     end
-    if !this.initialized || this.shutdown
+    if this.lifecycle.isAwaitingInitialization() || this.lifecycle.isStopped()
       if request
-        this.sendError(id, this.shutdown ? -32600 : -32002, this.shutdown ? "Server has shut down" : "Server not initialized")
+        this.sendError(id, this.lifecycle.isStopped() ? LspErrorCode.invalidRequest() : LspErrorCode.notInitialized(), this.lifecycle.isStopped() ? "Server has shut down" : "Server not initialized")
       end
       return true
     end
-    if method.scalarText() == "shutdown" && request
-      this.shutdown = true
+    if decodedMethod.isShutdown() && request
+      this.lifecycle = LspLifecycle.stopped()
       this.sendResult(id, "null")
       return true
     end
-    if method.scalarText() == "workspace/symbol" && request
+    if decodedMethod.isWorkspaceSymbol() && request
       let query = message.get("params").get("query")
 
       if !query.isString()
-        this.sendError(id, -32602, "Expected a symbol query")
+        this.sendError(id, LspErrorCode.invalidParams(), "Expected a symbol query")
       else
         this.sendResult(id, lspWorkspaceSymbols(this, query.scalarText()))
       end
       return true
     end
-    if method.scalarText() == "textDocument/onTypeFormatting" && request
+    if decodedMethod.isOnTypeFormatting() && request
       let params = message.get("params")
       let document = this.find(params.get("textDocument").get("uri").scalarText())
       let tabSizeValue = params.get("options").get("tabSize")
@@ -919,13 +921,13 @@ class LspServer
       let position = lspByteOffset(document.text, params.get("position"))
 
       if position < 0 || !tabSizeValue.isNumber() || tabSize == null || tabSize <= 0 || tabSize > 32 || !spaces.isBoolean()
-        this.sendError(id, -32602, "Invalid on-type formatting position or options")
+        this.sendError(id, LspErrorCode.invalidParams(), "Invalid on-type formatting position or options")
       else
         this.sendResult(id, lspOnEnter(document.text, position, tabSize, spaces.isTrue()))
       end
       return true
     end
-    if method.scalarText() == "textDocument/formatting" && request
+    if decodedMethod.isFormatting() && request
       let document = this.find(message.get("params").get("textDocument").get("uri").scalarText())
 
       if document == null
@@ -935,7 +937,7 @@ class LspServer
       end
       return true
     end
-    if method.scalarText() == "textDocument/codeAction" && request
+    if decodedMethod.isCodeAction() && request
       let params = message.get("params")
       let document = this.find(params.get("textDocument").get("uri").scalarText())
 
@@ -949,7 +951,7 @@ class LspServer
       let finish = lspByteOffset(document.text, params.get("range").get("end"))
 
       if start < 0 || finish < start
-        this.sendError(id, -32602, "Invalid document range")
+        this.sendError(id, LspErrorCode.invalidParams(), "Invalid document range")
         return true
       end
       let only = params.get("context").get("only")
@@ -965,7 +967,7 @@ class LspServer
       this.sendResult(id, lspJoinActionArrays(imports, style))
       return true
     end
-    if (method.scalarText() == "textDocument/prepareRename" || method.scalarText() == "textDocument/rename") && request
+    if (decodedMethod.isPrepareRename() || decodedMethod.isRename()) && request
       let params = message.get("params")
       let document = this.find(params.get("textDocument").get("uri").scalarText())
 
@@ -978,28 +980,28 @@ class LspServer
       let offset = lspByteOffset(document.text, params.get("position"))
 
       if offset < 0
-        this.sendError(id, -32602, "Invalid document position")
+        this.sendError(id, LspErrorCode.invalidParams(), "Invalid document position")
         return true
       end
       let position = (new IrSourceMap(host::stringSlice(document.text, 0, offset))).utf16Length()
       let snapshot = lspNavigationSnapshot(document)
       var result = lspPrepareRename(snapshot, position)
 
-      if method.scalarText() == "textDocument/rename"
+      if decodedMethod.isRename()
         if !params.get("newName").isString()
-          this.sendError(id, -32602, "Expected a new identifier")
+          this.sendError(id, LspErrorCode.invalidParams(), "Expected a new identifier")
           return true
         end
         result = lspRename(snapshot, position, params.get("newName").scalarText())
       end
       if result.error != ""
-        this.sendError(id, -32803, result.error)
+        this.sendError(id, LspErrorCode.requestFailed(), result.error)
       else
         this.sendResult(id, result.value)
       end
       return true
     end
-    if method.scalarText() == "textDocument/documentSymbol" && request
+    if decodedMethod.isDocumentSymbol() && request
       let document = this.find(message.get("params").get("textDocument").get("uri").scalarText())
 
       this.ensureAnalyzed(document)
@@ -1011,7 +1013,7 @@ class LspServer
       end
       return true
     end
-    if method.scalarText() == "completionItem/resolve" && request
+    if decodedMethod.isResolveCompletion() && request
       let item = message.get("params")
       let uri = item.get("data").get("uri")
       var document: LspDocument? = null
@@ -1022,7 +1024,7 @@ class LspServer
       this.sendResult(id, lspResolveCompletion(document, item, this.documentationEnabled, this.completionMarkdown))
       return true
     end
-    if (method.scalarText() == "textDocument/hover" || method.scalarText() == "textDocument/definition" || method.scalarText() == "neri/sourceOrigin" || method.scalarText() == "textDocument/typeDefinition" || method.scalarText() == "textDocument/references" || method.scalarText() == "textDocument/documentHighlight" || method.scalarText() == "textDocument/completion" || method.scalarText() == "textDocument/signatureHelp") && request
+    if (decodedMethod.isHover() || decodedMethod.isDefinition() || decodedMethod.isSourceOrigin() || decodedMethod.isTypeDefinition() || decodedMethod.isReferences() || decodedMethod.isDocumentHighlight() || decodedMethod.isCompletion() || decodedMethod.isSignatureHelp()) && request
       let params = message.get("params")
       let document = this.find(params.get("textDocument").get("uri").scalarText())
 
@@ -1032,11 +1034,11 @@ class LspServer
         let offset = lspByteOffset(document.text, params.get("position"))
 
         if offset < 0
-          this.sendError(id, -32602, "Invalid document position")
+          this.sendError(id, LspErrorCode.invalidParams(), "Invalid document position")
         else
           let position = (new IrSourceMap(host::stringSlice(document.text, 0, offset))).utf16Length()
 
-          if method.scalarText() == "textDocument/completion"
+          if decodedMethod.isCompletion()
             if !lspCompletionTriggerApplies(document, position, params.get("context"), this.declarationCatalog)
               this.sendResult(id, "[]")
               return true
@@ -1048,46 +1050,46 @@ class LspServer
               return true
             end
           end
-          if method.scalarText() == "textDocument/completion"
+          if decodedMethod.isCompletion()
             this.ensureQueryPrepared(document)
           else
             this.ensureAnalyzed(document)
           end
-          if method.scalarText() == "textDocument/references"
+          if decodedMethod.isReferences()
             this.sendResult(id, lspReferences(document, position, params.get("context").get("includeDeclaration").isTrue()))
-          else if method.scalarText() == "neri/sourceOrigin"
+          else if decodedMethod.isSourceOrigin()
             this.sendResult(id, lspSourceOrigin(document, position))
-          else if method.scalarText() == "textDocument/typeDefinition"
+          else if decodedMethod.isTypeDefinition()
             this.sendResult(id, lspTypeDefinition(document, position))
-          else if method.scalarText() == "textDocument/documentHighlight"
+          else if decodedMethod.isDocumentHighlight()
             this.sendResult(id, lspHighlights(document, position))
-          else if method.scalarText() == "textDocument/completion"
+          else if decodedMethod.isCompletion()
             this.sendResult(id, !document.sourcesReady ? "[]" : lspCompletion(document, position, this.completionSnippets))
-          else if method.scalarText() == "textDocument/signatureHelp"
+          else if decodedMethod.isSignatureHelp()
             this.sendResult(id, lspSignatureHelp(document, position))
           else
-            this.sendResult(id, method.scalarText() == "textDocument/hover" ? lspHover(document, position, this.documentationEnabled, this.hoverMarkdown) : lspDefinition(document, position))
+            this.sendResult(id, decodedMethod.isHover() ? lspHover(document, position, this.documentationEnabled, this.hoverMarkdown) : lspDefinition(document, position))
           end
         end
       end
       return true
     end
     if request
-      this.sendError(id, -32601, "Method not found")
+      this.sendError(id, LspErrorCode.methodNotFound(), "Method not found")
       return true
     end
     let params = message.get("params")
     let item = params.get("textDocument")
     let uri = item.get("uri")
 
-    if method.scalarText() == "workspace/didChangeWatchedFiles"
+    if decodedMethod.isWatchedFiles()
       this.workspaceSymbolsReady = false
       this.workspaceSymbols = null
       this.stdlibDocumentation = lspLoadStdlibDocumentation()
       this.reanalyze()
       return true
     end
-    if method.scalarText() == "textDocument/didClose"
+    if decodedMethod.isClose()
       this.workspaceSymbolsReady = false
       this.workspaceSymbols = null
       var previous: LspDocument? = null
@@ -1108,7 +1110,7 @@ class LspServer
         previous = current
         current = current.next
       end
-    else if method.scalarText() == "textDocument/didOpen" || method.scalarText() == "textDocument/didChange"
+    else if decodedMethod.isOpen() || decodedMethod.isChange()
       if !uri.isString() || uri.scalarText() == ""
         return true
       end
@@ -1121,7 +1123,7 @@ class LspServer
       var document = this.find(uri.scalarText())
       var text = item.get("text")
 
-      if method.scalarText() == "textDocument/didChange"
+      if decodedMethod.isChange()
         if document == null || version <= document.version
           return true
         end
@@ -1152,7 +1154,7 @@ class LspServer
         this.priorityDocument = current
         let changedPath = this.resolveDocumentPath(current)
 
-        if method.scalarText() == "textDocument/didOpen" && changedPath != ""
+        if decodedMethod.isOpen() && changedPath != ""
           this.reanalyze()
         else if changedPath == ""
           this.invalidate(current)

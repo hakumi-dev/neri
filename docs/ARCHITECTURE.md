@@ -39,6 +39,19 @@ The compiler, native backend/runtime, and build tooling have separate ownership.
 - `semantic/` binds symbols, types, control flow, and diagnostics;
 - `ir/` lowers bound programs to canonical Neri IR and provides the command-line driver.
 
+Syntax nodes carry explicit program counts, child-group partitions and type
+syntax payloads. Parsing, specialization, editor queries and semantic snapshots
+share these representations. Editor lifecycle, analysis outcomes and protocol
+errors also use named types; strings and numeric error codes are produced at
+the protocol boundary.
+
+IR values and declarations carry immutable `IrType` structures interned by an
+`IrTypePool`. Semantic type names enter through `fromSemantic`; lowering and
+verification inspect type kinds and components directly. Declaration images
+encode these structures with tagged, bounded decoding. Semantic snapshots and
+declaration images accept only their current format; older cached images must
+be regenerated from source.
+
 Generic declarations, specialization, and inference live in separate semantic
 components. `GenericInference` owns the type-variable bindings for one application.
 The binder registers templates before resolving signatures, then processes newly
