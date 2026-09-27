@@ -10,6 +10,7 @@ class NativeLinkToolchain
   public lto: String = ""
   public identity: String = ""
   public cryptexPrefix: String = ""
+  public failureReason: String = ""
   private attempted: Bool = false
   private metadata: String = ""
 
@@ -21,12 +22,14 @@ class NativeLinkToolchain
     let configured = host::environment("NERI_LINKER")
 
     if !target.isMacOS() || !runCacheSupportedHost() || configured == null || !bootstrapStartsWith(configured, "/") || !semanticEndsWith(configured, "/bin/clang++")
+      this.failureReason = "unsupported host, target or linker configuration"
       return false
     end
     for variable in ["LIBRARY_PATH", "COMPILER_PATH", "GCC_EXEC_PREFIX", "CCC_OVERRIDE_OPTIONS", "DYLD_INSERT_LIBRARIES", "DYLD_LIBRARY_PATH", "DYLD_FRAMEWORK_PATH", "DYLD_FALLBACK_LIBRARY_PATH", "DYLD_FALLBACK_FRAMEWORK_PATH", "DYLD_VERSIONED_LIBRARY_PATH", "DYLD_VERSIONED_FRAMEWORK_PATH", "DYLD_ROOT_PATH", "DYLD_IMAGE_SUFFIX"]
       let value = host::environment(variable)
 
       if value != null && value != ""
+        this.failureReason = "link environment override: " + variable
         return false
       end
     end
@@ -34,14 +37,24 @@ class NativeLinkToolchain
     let driverBefore = this.fileMetadata(configured)
 
     if driverBefore == ""
+      this.failureReason = "cannot observe driver metadata: " + configured
       return false
     end
     this.linker = this.query("/usr/bin/xcrun", ["--find", "ld"])
     let linkerBefore = this.fileMetadata(this.linker)
+
+    if linkerBefore == ""
+      this.failureReason = "cannot resolve linker metadata: " + this.linker
+      return false
+    end
     let driverTrace = this.observe(configured, ["--no-default-config", "--version"])
+
+    return false if driverTrace == null
     let linkerTrace = this.observe(this.linker, ["-v"])
 
-    if linkerBefore == "" || driverTrace == null || linkerTrace == null || driverTrace.cryptexPrefix != linkerTrace.cryptexPrefix || this.fileMetadata(this.linker) != linkerBefore
+    return false if linkerTrace == null
+    if driverTrace.cryptexPrefix != linkerTrace.cryptexPrefix || this.fileMetadata(this.linker) != linkerBefore
+      this.failureReason = "inconsistent loader search prefixes or changed linker metadata"
       return false
     end
     this.cryptexPrefix = driverTrace.cryptexPrefix
@@ -49,12 +62,16 @@ class NativeLinkToolchain
 
     while loaded != null
       if semanticEndsWith(loaded.value, "/libLTO.dylib")
-        return false if this.lto != ""
+        if this.lto != ""
+          this.failureReason = "multiple loaded LTO libraries"
+          return false
+        end
         this.lto = loaded.value
       end
       loaded = loaded.nextNode
     end
     if this.linker == "" || this.lto == "" || this.fileMetadata(configured) != driverBefore
+      this.failureReason = this.lto == "" ? "linker version query did not load libLTO.dylib" : "driver metadata changed during observation"
       return false
     end
     # Hash contents once per compilation, bracketed by metadata for the whole
@@ -62,23 +79,33 @@ class NativeLinkToolchain
     let before = this.snapshot()
     var identity = runCacheFrame("darwin-link-tools-v2") + runCacheFrame(this.cryptexPrefix)
 
-    if before == "" || !nativeLinkProfile(this.driver) || !nativeLinkProfile(this.linker)
+    if before == ""
+      this.failureReason = "cannot snapshot link tool metadata"
       return false
+    end
+    for tool in [this.driver, this.linker]
+      if !nativeLinkProfile(tool)
+        this.failureReason = "unsupported Mach-O executable profile: " + tool
+        return false
+      end
     end
     for path in [this.driver, this.linker, this.lto]
       let canonical = neriCanonicalPath(path)
       let digest = referenceFileDigest(path)
 
       if canonical == null || digest == ""
+        this.failureReason = "cannot resolve or hash link tool: " + path
         return false
       end
       identity = identity + runCacheFrame(path) + runCacheFrame(runCacheFrame(canonical) + runCacheFrame(digest))
     end
     if this.snapshot() != before || this.fileMetadata(configured) != driverBefore || this.fileMetadata(this.linker) != linkerBefore
+      this.failureReason = "link tools changed while hashing"
       return false
     end
     this.metadata = before
     this.identity = identity
+    this.failureReason = ""
     return true
   end
 
@@ -124,6 +151,7 @@ class NativeLinkToolchain
   end
 
   private def observe(executable: String, arguments: String[]): NativeLinkTrace?
+    this.failureReason = "loader observation failed: " + executable
     let options = new process::SpawnOptions(executable)
 
     options.arguments = arguments
@@ -149,7 +177,16 @@ class NativeLinkToolchain
     end
     let trace = new NativeLinkTrace()
 
-    trace.parse(text, executable, "")
+    let diagnostics = trace.parse(text, executable, "")
+
+    if !trace.valid || trace.cryptexPrefix == ""
+      this.failureReason = "loader trace rejected: " + executable + (trace.cryptexPrefix == "" ? " (no cryptex search prefix)" : "")
+      let length = host::stringByteLength(diagnostics)
+
+      if length > 0
+        this.failureReason = this.failureReason + "\n" + host::stringSlice(diagnostics, 0, length > 1024 ? 1024 : length)
+      end
+    end
     return trace.valid && trace.cryptexPrefix != "" ? trace : null
   end
 
