@@ -149,11 +149,36 @@ automatically. Streaming deadlines bound cooperative execution and lock waits,
 but cannot preempt an operating-system call. Resource close reports
 `result::Failure` with native details in `nativeError`.
 
+Writable WAL connections require SQLite 3.51.3 or newer, or the patched 3.44
+(3.44.6+) and 3.50 (3.50.7+) branches. This applies both to requesting WAL and
+preserving an existing WAL database. Use a patched SQLite build to convert an
+existing WAL database to DELETE; opening it for that conversion also requires
+the fix. DELETE databases retain the 3.37.2 minimum. See the
+[SQLite WAL-reset fix](https://sqlite.org/wal.html#walreset_bug).
+
+The default journal policy preserves the existing mode and uses `Full`
+synchronization; durability still depends on the journal mode and filesystem.
+With DELETE, `Full` can lose the last commit after a power failure; `Extra` also
+synchronizes the directory after journal deletion. WAL with `Full` or `Extra`
+synchronizes commits, while WAL with `Normal` can lose commits after an OS or
+power failure. Process-termination recovery tests do not simulate power loss.
+
 Keep the database and its backup files outside build output. Use SQLite's online
-backup mechanism for a live database, verify the snapshot, then restore at a
-fresh path with all application connections closed. Copying only the main file
-of a live WAL database can omit committed changes. See SQLite's
-[online backup API](https://sqlite.org/backup.html) and
+backup mechanism for a live database. Normalize the offline backup destination
+to DELETE journal mode before closing it so the snapshot can be reopened without
+WAL sidecars. Before restoring, require `PRAGMA integrity_check` to return exactly
+one `ok` row on the snapshot. Restore
+to a fresh path with all application connections closed, then require the same
+integrity result on the restored database. Also run
+`PRAGMA foreign_key_check` when the schema has foreign keys, because integrity
+checking does not detect their violations. Verify application records and write
+reuse before promoting the restored database. The recovery contract exercises
+this restore path with both DELETE and WAL journals after an interrupted writer.
+Copying only the main file of a live WAL database can omit committed changes.
+See SQLite's
+[online backup API](https://sqlite.org/backup.html),
+[integrity checks](https://sqlite.org/pragma.html#pragma_integrity_check),
+[read-only WAL requirements](https://sqlite.org/wal.html#read_only_databases), and
 [synchronization settings](https://sqlite.org/pragma.html#pragma_synchronous).
 
 This separation follows [EF Core's context and connection lifetime](https://learn.microsoft.com/en-us/ef/core/dbcontext-configuration/)

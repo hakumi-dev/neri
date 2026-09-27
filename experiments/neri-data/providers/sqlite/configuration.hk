@@ -93,6 +93,18 @@ def sqliteJournalValue(value: readonly SQLiteJournalMode): String?
   end
 end
 
+## SQLite's WAL-reset race can corrupt databases on affected versions. The fix is
+## in 3.51.3 and the 3.50.7/3.44.6 backports; DELETE remains supported at the
+## provider minimum of 3.37.2.
+## https://sqlite.org/wal.html#walreset_bug
+def sqliteWalResetSafeVersion(version: Int32): Bool
+  return version >= (3051003 as Int32) || (version >= (3050007 as Int32) && version < (3051000 as Int32)) || (version >= (3044006 as Int32) && version < (3045000 as Int32))
+end
+
+def sqliteWalResetFailure(): neri_data::ProviderFailure
+  return neri_data::ProviderFailure.State("Writable SQLite WAL requires 3.44.x >= 3.44.6, 3.50.x >= 3.50.7, or >= 3.51.3 for the WAL-reset fix")
+end
+
 enum SQLiteConfigurationResult
   case Configured(value: SQLiteConfiguration)
   case Failure(error: neri_data::ProviderFailure)
@@ -165,24 +177,32 @@ unsafe def sqliteConfigure(database: Void*, options: SQLiteOptions, writable: Bo
   if busyStatus != (0 as Int32)
     return SQLiteConfigurationResult.Failure(sqliteFailure(database, "configuration.busy_timeout", busyStatus))
   end
+  # Read the current mode before changing journal mode. A
+  # writable WAL connection on an affected SQLite version is unsafe.
+  var currentJournal = ""
+
+  match sqliteConfigurationScalar(database, "PRAGMA main.journal_mode")
+    case result::Result.Error(error)
+      return SQLiteConfigurationResult.Failure(error)
+    case result::Result.Ok(current)
+      currentJournal = current
+      if writable && (journal == "wal" || current == "wal") && !sqliteWalResetSafeVersion(sqliteVersionNumber())
+        return SQLiteConfigurationResult.Failure(sqliteWalResetFailure())
+      end
+  end
   if journal != null
-    match sqliteConfigurationScalar(database, "PRAGMA main.journal_mode")
-      case result::Result.Error(error)
-        return SQLiteConfigurationResult.Failure(error)
-      case result::Result.Ok(current)
-        if current != journal
-          if !writable
-            return SQLiteConfigurationResult.Failure(neri_data::ProviderFailure.State("Read-only SQLite journal does not match requested mode"))
+    if currentJournal != journal
+      if !writable
+        return SQLiteConfigurationResult.Failure(neri_data::ProviderFailure.State("Read-only SQLite journal does not match requested mode"))
+      end
+      match sqliteConfigurationScalar(database, "PRAGMA main.journal_mode=" + journal)
+        case result::Result.Error(error)
+          return SQLiteConfigurationResult.Failure(error)
+        case result::Result.Ok(actual)
+          if actual != journal
+            return SQLiteConfigurationResult.Failure(neri_data::ProviderFailure.State("SQLite did not apply requested journal mode"))
           end
-          match sqliteConfigurationScalar(database, "PRAGMA main.journal_mode=" + journal)
-            case result::Result.Error(error)
-              return SQLiteConfigurationResult.Failure(error)
-            case result::Result.Ok(actual)
-              if actual != journal
-                return SQLiteConfigurationResult.Failure(neri_data::ProviderFailure.State("SQLite did not apply requested journal mode"))
-              end
-          end
-        end
+      end
     end
   end
   let syncStatus = sqliteExecuteLiteral(database, "PRAGMA main.synchronous=" + (synchronous as String))
@@ -197,6 +217,9 @@ unsafe def sqliteConfigure(database: Void*, options: SQLiteOptions, writable: Bo
       return SQLiteConfigurationResult.Failure(error)
     case result::Result.Ok(actual)
       effectiveJournal = actual
+  end
+  if writable && effectiveJournal == "wal" && !sqliteWalResetSafeVersion(sqliteVersionNumber())
+    return SQLiteConfigurationResult.Failure(sqliteWalResetFailure())
   end
   if journal != null && effectiveJournal != journal
     return SQLiteConfigurationResult.Failure(neri_data::ProviderFailure.State("SQLite effective journal does not match requested mode"))
