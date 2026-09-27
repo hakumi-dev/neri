@@ -2,7 +2,11 @@
 #define NERI_CODEGEN_OBJECT_CACHE_H
 #include "neri/codegen/emitter.h"
 #include <memory>
+#include <string>
 namespace neri::codegen {
+// Returns an empty identity when the loaded native closure cannot be verified.
+std::string cache_identity();
+
 // Bootstrap-only cache; failures always leave normal emission available.
 class object_cache final {
 public:

@@ -56,7 +56,8 @@ void print_usage(std::ostream &stream) {
             "--optimization <debug|release> "
             "--emit <llvm-ir|assembly|object> --output <path|-> "
             "[--metrics <path>] [--progress <path>] [--debug-source <id> <path>] "
-            "[--object-cache <absolute-private-directory>]\n";
+            "[--object-cache <absolute-private-directory>]\n"
+            "       neri-codegen --cache-identity\n";
 }
 
 arguments parse_arguments(int argc, char **argv) {
@@ -303,6 +304,15 @@ int main(int argc, char **argv) {
 #endif
     if (argc == 2 && std::string_view(argv[1]) == "--version") {
       std::cout << NERI_TOOLCHAIN_VERSION << '\n';
+      return 0;
+    }
+    if (argc == 2 && std::string_view(argv[1]) == "--cache-identity") {
+      const auto identity = neri::codegen::cache_identity();
+      if (identity.empty()) {
+        std::cerr << "Native cache identity unavailable.\n";
+        return 2;
+      }
+      std::cout << identity << '\n';
       return 0;
     }
     const auto options = parse_arguments(argc, argv);

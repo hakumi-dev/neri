@@ -168,6 +168,14 @@ Cache lookup still resolves the current source closure and validates native
 dependencies; an existing executable alone is insufficient. Stage messages
 distinguish execution from reuse and include elapsed milliseconds.
 
+Compiler artifact caches and source dependency libraries also bind their
+entries to the generator's loaded-image identity. The compiler queries
+`neri-codegen --cache-identity` before lookup and rechecks it before accepting
+or publishing an artifact. The command returns a SHA-256 identity on supported
+hosts; an unavailable identity disables these caches while preserving normal
+compilation. This identity covers code generation, independently of the native
+link-input checks required for executable reuse.
+
 On macOS and Linux, Stage0 object generation uses the private cache at
 `build/cache/bootstrap-objects`. Its identity includes the decoded seed, target,
 optimization mode and the native generator's loaded executable and libraries.

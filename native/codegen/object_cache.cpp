@@ -336,6 +336,18 @@ void write_entry(int dir, const char *name,
 }
 #endif
 } // namespace
+std::string cache_identity() {
+#if defined(__APPLE__) || defined(__linux__)
+  try {
+    return closure();
+  } catch (...) {
+    return {};
+  }
+#else
+  return {};
+#endif
+}
+
 struct object_cache::state {
 #if defined(__APPLE__) || defined(__linux__)
   fd root;
