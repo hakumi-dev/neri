@@ -16,6 +16,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #if defined(__APPLE__)
+#include <CommonCrypto/CommonDigest.h>
 #include <crt_externs.h>
 #include <libproc.h>
 #include <mach-o/dyld.h>
@@ -90,7 +91,12 @@ std::string file_digest(const std::string &path, const struct stat &expected) {
   struct stat before{}, after{}, named{};
   require(fstat(file.value, &before) == 0 && S_ISREG(before.st_mode) &&
           same(before, expected));
+#if defined(__APPLE__)
+  CC_SHA256_CTX hash{};
+  require(CC_SHA256_Init(&hash) == 1);
+#else
   llvm::SHA256 hash;
+#endif
   std::array<std::uint8_t, 65536> bytes;
   for (;;) {
     auto count = read(file.value, bytes.data(), bytes.size());
@@ -99,12 +105,22 @@ std::string file_digest(const std::string &path, const struct stat &expected) {
     require(count >= 0);
     if (!count)
       break;
+#if defined(__APPLE__)
+    require(CC_SHA256_Update(&hash, bytes.data(), static_cast<CC_LONG>(count)) == 1);
+#else
     hash.update(llvm::ArrayRef<std::uint8_t>(bytes.data(),
                                              static_cast<std::size_t>(count)));
+#endif
   }
   require(fstat(file.value, &after) == 0 && stat(path.c_str(), &named) == 0 &&
           same(before, after) && same(before, named));
+#if defined(__APPLE__)
+  std::array<std::uint8_t, CC_SHA256_DIGEST_LENGTH> result;
+  require(CC_SHA256_Final(result.data(), &hash) == 1);
+  return hex(result);
+#else
   return hex(hash.final());
+#endif
 }
 void mapped_identity(std::uintptr_t address, const struct stat &expected) {
 #if defined(__APPLE__)
