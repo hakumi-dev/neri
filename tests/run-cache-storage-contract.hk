@@ -1,0 +1,160 @@
+use host
+use files
+use process
+use test
+
+def storageKey(): String
+  return "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+end
+
+def storageStage(root: String, value: String, blockPromotion: Bool = false): String
+  let staging = bootstrapTemporaryDirectory(root, "staging")
+
+  test::assertTrue(staging != null)
+  if staging == null
+    return ""
+  end
+
+  test::assertTrue(host::writeText(staging + "/program", value))
+  test::assertTrue(host::writeText(staging + "/receipt", "fixture receipt\n"))
+  if blockPromotion
+    test::assertTrue(files::createDirectory(staging + "/selection.pending").failure == null)
+  end
+  return staging
+end
+
+def storageWait(path: String): Void
+  let deadline = runCacheTime() + 5000
+
+  while host::readText(path) == null && runCacheTime() < deadline
+    host::run("/bin/sleep", ["0.01"])
+  end
+
+  test::assertTrue(host::readText(path) != null)
+end
+
+def storageWorker(root: String, name: String): Void
+  let storage = new RunCacheStorage()
+
+  test::assertTrue(storage.setup(root, storageKey()))
+  test::assertTrue(host::writeText(root + "/ready-" + name, "ready"))
+  storageWait(root + "/start")
+  var index = 0
+
+  while index < 3
+    test::assertTrue(storage.reserve())
+    let staged = storageStage(root, name)
+
+    test::assertTrue(storage.publish(staged))
+    test::assertTrue(host::readText(storage.directory + "/program") == name)
+    index = index + 1
+  end
+end
+
+def storageStart(executable: String, root: String, name: String): process::Child?
+  let options = new process::SpawnOptions(executable)
+
+  options.arguments = [root, name]
+  let started = process::spawn(options)
+  let child = started.child()
+
+  test::assertTrue(started.failure() == null && child != null)
+  return child
+end
+
+def main(): Void
+  if !runCacheSupportedHost()
+    return
+  end
+  let work = host::argumentAt(0)
+  let worker = host::argumentAt(1)
+
+  test::assertTrue(work != null)
+  if work == null
+    return
+  end
+  if worker != null
+    storageWorker(work, worker)
+    return
+  end
+  let root = bootstrapTemporaryDirectory(work, "cache-storage")
+
+  test::assertTrue(root != null)
+  if root == null
+    return
+  end
+  let storage = new RunCacheStorage()
+
+  test::assertTrue(storage.setup(root, storageKey()))
+  test::assertTrue(storage.reserve())
+  let reserved = storage.directory
+
+  test::assertTrue(storage.reserve())
+  test::assertEqual(storage.directory, reserved)
+  let reservedStatus = files::status(reserved).status
+
+  test::assertTrue(reservedStatus != null && !reservedStatus.exists)
+  let staged = storageStage(root, "original")
+
+  test::assertTrue(storage.publish(staged))
+  let pinned = storage.selected()
+
+  test::assertEqual(pinned, reserved)
+  test::assertTrue(storage.reserve())
+  let failedPromotion = storageStage(root, "unselected", true)
+
+  test::assertTrue(storage.publish(failedPromotion))
+  test::assertTrue(host::readText(storage.directory + "/program") == "unselected")
+  test::assertEqual(storage.selected(), pinned)
+  test::assertTrue(host::readText(pinned + "/program") == "original")
+  let executable = host::executablePath()
+
+  test::assertTrue(executable != null)
+  if executable == null
+    return
+  end
+  let first = storageStart(executable, root, "first")
+  let second = storageStart(executable, root, "second")
+
+  if first == null || second == null
+    return
+  end
+  storageWait(root + "/ready-first")
+  storageWait(root + "/ready-second")
+
+  test::assertTrue(host::writeText(root + "/start", "start"))
+  var one = first.poll()
+  var two = second.poll()
+  let deadline = runCacheTime() + 15000
+
+  while (one.running || two.running) && runCacheTime() < deadline
+    let selected = storage.selected()
+
+    if selected != ""
+      let value = host::readText(selected + "/program")
+
+      test::assertTrue(value == "original" || value == "first" || value == "second")
+    end
+
+    test::assertTrue(host::readText(pinned + "/program") == "original")
+    one = first.wait(10)
+    two = second.wait(10)
+  end
+  if one.running || one.failure != null
+    first.cancel()
+    first.wait(5000)
+  end
+  if two.running || two.failure != null
+    second.cancel()
+    second.wait(5000)
+  end
+  let disposedFirst = first.dispose()
+  let disposedSecond = second.dispose()
+  let firstExit = one.exit
+  let secondExit = two.exit
+
+  test::assertTrue(disposedFirst && disposedSecond && !one.running && !two.running)
+  test::assertTrue(firstExit != null && firstExit.isExited() && firstExit.value() == 0)
+  test::assertTrue(secondExit != null && secondExit.isExited() && secondExit.value() == 0)
+  test::assertTrue(host::readText(pinned + "/program") == "original")
+end

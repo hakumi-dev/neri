@@ -153,6 +153,10 @@ digests and the compilation identity. Source dependency libraries publish their
 declarations, object and transport as one bundle. Invalid entries are cache
 misses. Ordinary builds keep these auxiliary files inside the cache;
 `--save-temps` copies the verified artifacts into the requested output tree.
+Object identities bind the consumed NIR, target, code-generation options,
+debug source mappings, generator identity and explicit object dependencies.
+Runtime, SDK and linker choices belong to executable identities and do not
+invalidate otherwise reusable objects.
 Windows emits NIR once per generation and materializes that same NIR as COFF
 and PE through the native backend.
 
@@ -184,6 +188,18 @@ Producer copies under `build/cache/producers` have content-addressed identities.
 Cache lookup still resolves the current source closure and validates native
 dependencies; an existing executable alone is insufficient. Stage messages
 distinguish execution from reuse and include elapsed milliseconds.
+
+Compiler artifacts use immutable generations under
+`artifacts-v2/<key>/generation.<id>` within their private cache. Publication first
+renames a complete staging directory, then atomically replaces the key's
+`selected` record. Readers retain their selected generation while a repair or
+concurrent writer publishes another. Corrupt entries cause fresh publication;
+repair preserves existing generations and their active readers. If selector
+publication fails, the producing invocation can still use its completed artifact.
+This relies on [POSIX atomic rename](https://pubs.opengroup.org/onlinepubs/9799919799/functions/rename.html)
+for visibility; integrity checks reject incomplete or damaged artifacts after
+an interruption. Cache cleanup must occur when no compiler or dynamic session
+is using the cache.
 
 Project cache identities include the selected units and their ordered reference
 graph, source contents, generated inputs and source mappings. Unselected units,

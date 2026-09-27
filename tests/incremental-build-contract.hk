@@ -8,6 +8,28 @@ use files
 unsafe def cacheSupported(): Int
 end
 
+def selectedBundle(cache: String, key: String): String
+  let directory = cache + "/artifacts-v2/" + key
+  let record = host::readText(directory + "/selected")
+
+  if record == null
+    return ""
+  end
+
+  test::assertEqual(host::stringByteLength(record), 44)
+  test::assertEqual(host::stringSlice(record, 0, 11), "generation.")
+  test::assertEqual(host::stringByteAt(record, 43), 10 as Byte)
+  var index = 11
+
+  while index < 43
+    let byte = host::stringByteAt(record, index) as Int
+
+    test::assertTrue((byte >= 48 && byte <= 57) || (byte >= 97 && byte <= 102))
+    index = index + 1
+  end
+  return directory + "/" + host::stringSlice(record, 0, 43)
+end
+
 def containsText(text: String, part: String): Bool
   var offset = 0
 
@@ -164,6 +186,15 @@ def assertRuns(path: String, expected: String): Void
   test::assertEqual(text(result.stdout), expected)
 end
 
+def assertNativeObjectReuse(result: process::PollResult): Void
+  assertBuildOutput(result, 0)
+  let timings = text(result.stderr)
+
+  test::assertTrue(!containsText(timings, "incremental-hit"))
+  test::assertTrue(countText(timings, "object-cache-hit") > 0)
+  test::assertEqual(countText(timings, "object-cache-miss"), 0)
+end
+
 def assertRetainedPairEqual(left: String, right: String): Void
   let manifest = host::readText(left + "/manifest.json")
 
@@ -241,7 +272,7 @@ def main(): Void
 
   write(otherSource, "def main(): Void\n  let value = 1\nend\n")
   exited(invoke(compiler, ["build", otherSource, "--release", "--output", "other-bin"], cache, "", root), 0)
-  let objects = files::Root.open(cache).root
+  let objects = files::Root.open(cache + "/artifacts-v2").root
 
   test::assertTrue(objects != null)
   if objects != null
@@ -252,7 +283,11 @@ def main(): Void
     var otherBundle = ""
 
     for entry in entries.entries
-      let bundle = cache + "/" + entry.name
+      let bundle = selectedBundle(cache, entry.name)
+
+      if bundle == ""
+        continue
+      end
       let transport = host::readText(bundle + "/program.nir.hex")
 
       if entry.kind.isDirectory() && transport != null && transport != actualTransport
@@ -264,13 +299,14 @@ def main(): Void
     var damaged = 0
 
     for entry in entries.entries
-      let bundle = cache + "/" + entry.name
+      var bundle = selectedBundle(cache, entry.name)
+
+      if bundle == ""
+        continue
+      end
 
       if entry.kind.isDirectory() && host::readText(bundle + "/program.nir.hex") == actualTransport
         exited(invoke("cmp", [bundle + "/program", root + "/relative-bin.temps/unit-0.o"], ""), 0)
-        let originalReceipt = host::readText(bundle + "/receipt")
-
-        test::assertTrue(originalReceipt != null)
         for name in ["program", "program.nir.hex", "receipt"]
           exited(invoke("cp", [otherBundle + "/" + name, bundle + "/" + name], ""), 0)
         end
@@ -281,10 +317,7 @@ def main(): Void
         test::assertEqual(countText(text(substituted.stderr), "object-cache-hit"), 0)
         test::assertEqual(countText(text(substituted.stderr), "object-cache-miss"), 1)
         test::assertTrue(host::readText(root + "/relative-bin.temps/manifest.json") == monolithicManifest)
-        exited(invoke("cp", [root + "/relative-bin.temps/unit-0.o", bundle + "/program"], ""), 0)
-        if originalReceipt != null
-          write(bundle + "/receipt", originalReceipt)
-        end
+        bundle = selectedBundle(cache, entry.name)
         write(bundle + "/program.nir.hex", "corrupt consumed transport")
         let fallback = invoke(compiler, retainedArguments, cache, "", root)
 
@@ -375,7 +408,7 @@ def main(): Void
   test::assertTrue(host::writeText(partitionTemps + ".temps/unit-1.o", "corrupt"))
   assertBuildOutput(build(compiler, manifest, partitionTemps, cache, true, false, true), 1)
   let savedManifest = host::readText(partitionTemps + ".temps/manifest.json")
-  let cacheDirectory = files::Root.open(cache).root
+  let cacheDirectory = files::Root.open(cache + "/artifacts-v2").root
 
   test::assertTrue(savedManifest != null && cacheDirectory != null)
   if cacheDirectory != null
@@ -386,7 +419,12 @@ def main(): Void
     var corrupted = 0
 
     for entry in entries.entries
-      let retained = cache + "/" + entry.name + "/program.temps"
+      let selected = selectedBundle(cache, entry.name)
+
+      if selected == ""
+        continue
+      end
+      let retained = selected + "/program.temps"
 
       if entry.kind.isDirectory() && host::readText(retained + "/manifest.json") == savedManifest
         write(retained + "/unit-1.o", "corrupt cached object")
@@ -411,8 +449,8 @@ def main(): Void
 
     exited(manifestRotation, 0)
 
-    test::assertTrue(containsText(rotatedTimings, "incremental-miss"))
-    test::assertEqual(countText(rotatedTimings, "object-cache-hit"), coldObjectMisses)
+    test::assertTrue(containsText(rotatedTimings, "incremental-hit"))
+    test::assertEqual(countText(rotatedTimings, "object-cache-hit"), 0)
     test::assertEqual(countText(rotatedTimings, "object-cache-miss"), 0)
   end
 
@@ -485,18 +523,18 @@ def main(): Void
   write(nativeManifest, "{\"version\":2,\"defaultUnit\":\"app\",\"units\":{\"app\":{\"kind\":\"executable\",\"sources\":[\"src\"]}}}\n")
   assertBuildOutput(buildNativeApp(compiler, nativeManifest, nativeOutput, cache, nativeLibraryPath), 0)
   assertRuns(nativeOutput, "4\n")
-  assertBuildOutput(buildNativeApp(compiler, nativeManifest, nativeOutput, cache, nativeLibraryPath), 1)
-  assertBuildOutput(buildNativeApp(compiler, nativeManifest, nativeOutput, cache, nativeLibraryPath, true), 0)
+  assertNativeObjectReuse(buildNativeApp(compiler, nativeManifest, nativeOutput, cache, nativeLibraryPath))
+  assertNativeObjectReuse(buildNativeApp(compiler, nativeManifest, nativeOutput, cache, nativeLibraryPath, true))
 
   test::assertTrue(host::readText(nativeOutput + ".temps/unit-0.o.nir.hex") != null)
   let savedObject = host::run("test", ["-f", nativeOutput + ".temps/unit-0.o"])
 
   test::assertTrue(savedObject != null && savedObject == 0)
-  assertBuildOutput(buildNativeApp(compiler, nativeManifest, nativeOutput, cache, nativeLibraryPath, true), 1)
+  assertNativeObjectReuse(buildNativeApp(compiler, nativeManifest, nativeOutput, cache, nativeLibraryPath, true))
   let removedSidecars = host::run("rm", ["-rf", nativeOutput + ".temps"])
 
   test::assertTrue(removedSidecars != null && removedSidecars == 0)
-  assertBuildOutput(buildNativeApp(compiler, nativeManifest, nativeOutput, cache, nativeLibraryPath, true), 1)
+  assertNativeObjectReuse(buildNativeApp(compiler, nativeManifest, nativeOutput, cache, nativeLibraryPath, true))
 
   test::assertTrue(host::readText(nativeOutput + ".temps/unit-0.o.nir.hex") != null)
   let restoredObject = host::run("test", ["-f", nativeOutput + ".temps/unit-0.o"])
@@ -512,9 +550,9 @@ def main(): Void
   let replacedArchive = host::run("ar", ["rcs", nativeArchive, exportedObject])
 
   test::assertTrue(replacedArchive != null && replacedArchive == 0)
-  assertBuildOutput(buildNativeApp(compiler, nativeManifest, nativeOutput, cache, nativeLibraryPath), 0)
+  assertNativeObjectReuse(buildNativeApp(compiler, nativeManifest, nativeOutput, cache, nativeLibraryPath))
   assertRuns(nativeOutput, "8\n")
-  assertBuildOutput(buildNativeApp(compiler, nativeManifest, nativeOutput, cache, nativeLibraryPath), 1)
+  assertNativeObjectReuse(buildNativeApp(compiler, nativeManifest, nativeOutput, cache, nativeLibraryPath))
   let shadowLibrary = nativeLibraryPath + "/libneri-incremental.dylib"
 
   write(shadowLibrary, "invalid shadow library\n")

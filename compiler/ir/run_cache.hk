@@ -70,6 +70,7 @@ class RunCache
   private cacheKey: String = ""
   private codegenIdentity: CodegenIdentity = new CodegenIdentity()
   private linkToolchain: NativeLinkToolchain?
+  private storage: RunCacheStorage = new RunCacheStorage()
 
   def privateDirectory(path: String): Bool
     let info = new RunCacheFile(path, false)
@@ -96,7 +97,7 @@ class RunCache
   def prepare(module: IrModule, target: readonly TargetPlatform, release: Bool, debugSources: BootstrapSourceInput? = null, purpose: String = "neri-run-cache-v1", configurationInputs: String = "", additionalDependencies: String[] = [], canonicalDigest: String = "", nativeObject: Bool = false, nativeReceipt: Bool = false, linkToolchain: NativeLinkToolchain? = null): Void
     this.objectBundle = nativeObject
     this.nativeReceipt = nativeReceipt && !nativeObject
-    if !nativeObject && (nativeReceipt || purpose == "neri-project-artifact-v1")
+    if !nativeObject
       if linkToolchain == null || !linkToolchain.matches()
         return
       end
@@ -109,61 +110,12 @@ class RunCache
     if !target.isMacOS() || (module.requiredFeatures.hasNativeLibraries() && !nativeObject) || !runCacheSupportedHost()
       return
     end
-    let manifestPath = host::environment("NERI_RUNTIME_MANIFEST")
-    let codegen = host::environment("NERI_CODEGEN")
-    let linker = host::environment("NERI_LINKER")
-    let sdk = host::environment("SDKROOT")
+    let descriptor = new RunCacheDependencies()
 
-    if manifestPath == null || codegen == null || linker == null || sdk == null
+    if !descriptor.capture(target, nativeObject, additionalDependencies, linkToolchain)
       return
     end
-    if !bootstrapStartsWith(linker, "/") || !semanticEndsWith(linker, "/bin/clang++") || !bootstrapStartsWith(sdk, "/")
-      return
-    end
-    # Custom linker search/injection environments cannot be represented by the
-    # system-library dependency set below.
-    for variable in ["LIBRARY_PATH", "COMPILER_PATH", "GCC_EXEC_PREFIX", "CCC_OVERRIDE_OPTIONS", "DYLD_INSERT_LIBRARIES", "DYLD_LIBRARY_PATH", "DYLD_FRAMEWORK_PATH", "DYLD_FALLBACK_LIBRARY_PATH", "DYLD_FALLBACK_FRAMEWORK_PATH", "DYLD_VERSIONED_LIBRARY_PATH", "DYLD_VERSIONED_FRAMEWORK_PATH", "DYLD_ROOT_PATH", "DYLD_IMAGE_SUFFIX"]
-      let value = host::environment(variable)
-
-      if value != null && value != ""
-        return
-      end
-    end
-    let manifest = host::readText(manifestPath)
-
-    if manifest == null || bootstrapManifestString(manifest, "target") != target.name()
-      return
-    end
-    let artifact = bootstrapManifestString(manifest, "artifact")
-
-    if !bootstrapArtifactNameValid(artifact)
-      return
-    end
-    let runtime = bootstrapDirectory(manifestPath) + "/" + artifact
-    let prefix = bootstrapDirectory(bootstrapDirectory(linker))
-
-    this.dependencies = [codegen, linker, runtime, manifestPath,
-      prefix + "/lib/libLLVM.dylib", prefix + "/lib/libc++.1.dylib",
-      sdk, sdk + "/SDKSettings.json", sdk + "/usr/lib/libSystem.tbd", sdk + "/usr/lib/libc++.tbd"]
-    if this.linkToolchain != null && linkToolchain != null
-      this.dependencies = host::appendString(this.dependencies, linkToolchain.linker)
-      this.dependencies = host::appendString(this.dependencies, linkToolchain.lto)
-    else
-      for dependency in ["/usr/bin/ld", "/usr/bin/xcrun", "/var/db/xcode_select_link", prefix + "/bin/ld", prefix + "/bin/ld64.lld"]
-        this.dependencies = host::appendString(this.dependencies, dependency)
-      end
-    end
-    for dependency in additionalDependencies
-      if (new RunCacheFile(dependency, true)).fingerprint == ""
-        return
-      end
-      this.dependencies = host::appendString(this.dependencies, dependency)
-    end
-    for path in [codegen, linker, runtime, sdk + "/usr/lib/libSystem.tbd", sdk + "/usr/lib/libc++.tbd"]
-      if (new RunCacheFile(path, true)).fingerprint == ""
-        return
-      end
-    end
+    this.dependencies = descriptor.paths
     var root = ""
     let configured = host::environment("NERI_CACHE_DIR")
     let homeDirectory = host::environment("HOME")
@@ -187,19 +139,12 @@ class RunCache
     if this.inputs == ""
       return
     end
-    var configuration = runCacheFrame(purpose) + runCacheFrame(configurationInputs) + runCacheFrame(target.name()) + runCacheFrame(release ? "release" : "debug") + runCacheFrame(manifest) + runCacheFrame(this.inputs) + runCacheFrame(this.codegenIdentity.digest)
+    var configuration = runCacheFrame(purpose) + runCacheFrame(configurationInputs) + runCacheFrame(target.name()) + runCacheFrame(release ? "release" : "debug") + runCacheFrame(descriptor.configuration) + runCacheFrame(this.inputs) + runCacheFrame(this.codegenIdentity.digest)
 
     configuration = configuration + runCacheFrame(linkToolchain.identity) if this.linkToolchain != null && linkToolchain != null
 
     configuration = configuration + runCacheFrame("native-object") if nativeObject
 
-    for variable in ["SDKROOT", "DEVELOPER_DIR", "MACOSX_DEPLOYMENT_TARGET", "PATH", "NERI_DSYMUTIL"]
-      let value = host::environment(variable)
-
-      if value != null
-        configuration = configuration + runCacheFrame(variable) + runCacheFrame(value)
-      end
-    end
     let workingDirectory = host::pathAbsolute(".")
 
     if workingDirectory != null
@@ -215,11 +160,42 @@ class RunCache
     let key = sha256FastText(runCacheFrame(configuration) + runCacheFrame(contentIdentity))
 
     this.cacheKey = key
-    this.directory = root + "/" + key
-    this.executable = this.directory + "/program"
+    this.setupStorage(root, key)
+  end
+
+  def setupStorage(root: String, key: String): Void
+    this.directory = ""
+    this.executable = ""
+    if !this.storage.setup(root, key)
+      return
+    end
+    this.directory = this.storage.selected()
+    if this.directory == ""
+      this.reserveGeneration()
+    else
+      this.executable = this.directory + "/program"
+    end
+  end
+
+  def reserveGeneration(): Void
+    if this.storage.reserve()
+      this.directory = this.storage.directory
+      this.executable = this.directory + "/program"
+    else
+      this.directory = ""
+      this.executable = ""
+    end
   end
 
   def hit(): Bool
+    if this.selectedHit()
+      return true
+    end
+    this.reserveGeneration()
+    return false
+  end
+
+  private def selectedHit(): Bool
     if this.directory == "" || !this.privateDirectory(this.directory) || this.inputs != this.snapshot()
       return false
     end
@@ -364,6 +340,6 @@ class RunCache
     if this.nativeReceipt && (this.nativeExecutableReceipt(staging, observed) != receipt || this.inputs != this.snapshot())
       return false
     end
-    return this.codegenIdentity.matches() && files::move(staging, this.directory).failure == null
+    return this.codegenIdentity.matches() && this.directory == this.storage.directory && this.storage.publish(staging)
   end
 end
