@@ -108,11 +108,26 @@ are outside this release's loading contract. Callers explicitly reload the
 selection they need. Multiple queries share a consistent database snapshot only
 when the caller selects suitable transaction isolation.
 
-The initial scalar mapping supports the documented integer, Boolean, text and
-finite floating-point forms, including supported nullable variants. Primary keys
-are single integer or required text fields. Composite/alternate keys, exact
-decimal, arbitrary application-constructor query translation, asynchronous I/O
-and additional real database adapters remain outside this release's scope.
+The generated scalar mapping accepts the following types. Decoding checks the
+SQLite storage class before extracting a value; it does not coerce text into
+numbers or integers into booleans other than `0` and `1`.
+
+| Entity field | SQLite storage | Value contract |
+| --- | --- | --- |
+| `Int`, `Int?` | INTEGER | Integer values. |
+| `Bool`, `Bool?` | INTEGER | Only `0` and `1`. |
+| `String`, `String?` | TEXT | Valid UTF-8, copied before advancing the statement. |
+| `Float`, `Float?` | REAL | Finite binary64 values; NaN and infinity are rejected. |
+
+Optional fields additionally accept SQL NULL. Required fields reject NULL.
+Declare Float columns with REAL affinity; see the
+[floating-point contract](../experiments/neri-data/FLOATS.md).
+Each entity has one required `Int` or `String` primary key. Foreign keys use the
+matching key type, with an optional form for nullable relationships. Other Neri
+field types, including narrower integer types and binary buffers, are not scalar
+mappings in this release. Composite/alternate keys, exact decimal,
+arbitrary application-constructor query translation, asynchronous I/O and
+additional real database adapters remain outside this release's scope.
 PostgreSQL placeholder rendering is a SQL compilation contract, not a PostgreSQL
 database adapter.
 
