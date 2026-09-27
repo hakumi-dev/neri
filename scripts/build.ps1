@@ -23,6 +23,22 @@ function Assert-Hash([string]$File, [string]$Expected) {
   if ((Get-FileHash -LiteralPath $File -Algorithm SHA256).Hash -ine $Expected) { throw "SHA-256 mismatch: $File" }
 }
 function Forward-Path([string]$Value) { return $Value.Replace('\','/') }
+function Copy-TarMember([string]$Archive, [string]$Member, [string]$Destination) {
+  $start = [Diagnostics.ProcessStartInfo]::new('tar')
+  $start.UseShellExecute = $false
+  $start.RedirectStandardOutput = $true
+  $start.RedirectStandardError = $true
+  foreach ($argument in @('--ignore-zeros','-xOf',$Archive,$Member)) { $start.ArgumentList.Add($argument) }
+  $child = [Diagnostics.Process]::Start($start)
+  try {
+    $errors = $child.StandardError.ReadToEndAsync()
+    $output = [IO.File]::Create($Destination)
+    try { $child.StandardOutput.BaseStream.CopyTo($output) } finally { $output.Dispose() }
+    $child.WaitForExit()
+    $errorText = $errors.GetAwaiter().GetResult()
+    if ($child.ExitCode -ne 0) { throw "Cannot read bootstrap bundle member ${Member}: $errorText" }
+  } finally { $child.Dispose() }
+}
 
 $root = Split-Path $PSScriptRoot
 Push-Location $root
@@ -61,24 +77,64 @@ try {
   if ($Action -eq 'native') { return }
 
   $seed = Get-Content "$root/bootstrap/seed.json" -Raw | ConvertFrom-Json
-  if ($seed.schemaVersion -ne 1 -or $seed.format -ne 'neri-ir-binary-gzip' -or
-      $seed.artifact -ne 'compiler.nir.gz' -or $seed.sourceManifest -ne 'SOURCE-MANIFEST.sha256') {
+  if (($seed.schemaVersion -isnot [long] -and $seed.schemaVersion -isnot [int]) -or
+      $seed.schemaVersion -ne 2 -or $seed.format -cne 'neri-ir-bundle-gzip' -or
+      $seed.artifact -cne 'compiler.nir.tar.gz' -or $seed.sourceManifest -cne 'SOURCE-MANIFEST.sha256') {
     throw 'Unsupported canonical bootstrap seed metadata'
   }
-  Assert-Hash "$root/bootstrap/compiler.nir.gz" $seed.artifactSha256
+  if (($seed.unitCount -isnot [long] -and $seed.unitCount -isnot [int]) -or $seed.unitCount -lt 1 -or $seed.unitCount -gt 1024) {
+    throw 'Invalid bootstrap unit count'
+  }
+  foreach ($field in @('artifactSha256','unitManifestSha256','sourceManifestSha256','validationSourceManifestSha256')) {
+    if ($seed.$field -isnot [string] -or $seed.$field -cnotmatch '^[0-9a-f]{64}$') { throw "Invalid bootstrap digest: $field" }
+  }
+  $bundle = "$root/bootstrap/compiler.nir.tar.gz"
   Assert-Hash "$root/bootstrap/SOURCE-MANIFEST.sha256" $seed.sourceManifestSha256
   Assert-Hash "$root/bootstrap/VALIDATION-SOURCE-MANIFEST.sha256" $seed.validationSourceManifestSha256
   $work = Join-Path $root ("build/windows/work-" + [Guid]::NewGuid().ToString('N'))
   New-Item -ItemType Directory -Force $work | Out-Null
-  $compressed = [IO.File]::OpenRead("$root/bootstrap/compiler.nir.gz")
   try {
-    $gzip = [IO.Compression.GZipStream]::new($compressed, [IO.Compression.CompressionMode]::Decompress)
+    Copy-Item -LiteralPath $bundle -Destination "$work/compiler.nir.tar.gz"
+    $bundle = "$work/compiler.nir.tar.gz"
+    Assert-Hash $bundle $seed.artifactSha256
+    $compressed = [IO.File]::OpenRead($bundle)
     try {
-      $binary = [IO.File]::Create("$work/seed.nir")
-      try { $gzip.CopyTo($binary) } finally { $binary.Dispose() }
-    } finally { $gzip.Dispose() }
-  } finally { $compressed.Dispose() }
-  Assert-Hash "$work/seed.nir" $seed.irSha256
+      $gzip = [IO.Compression.GZipStream]::new($compressed, [IO.Compression.CompressionMode]::Decompress)
+      try {
+        $archive = [IO.File]::Create("$work/compiler.nir.tar")
+        try { $gzip.CopyTo($archive) } finally { $archive.Dispose() }
+      } finally { $gzip.Dispose() }
+    } finally { $compressed.Dispose() }
+    $bundle = "$work/compiler.nir.tar"
+    $entries = @(& tar --ignore-zeros -tf $bundle)
+    if ($LASTEXITCODE -ne 0 -or $entries.Count -ne $seed.unitCount + 1 -or $entries[0] -cne 'UNITS.sha256') {
+      throw 'Bootstrap bundle entries do not match the unit count'
+    }
+    for ($unit = 0; $unit -lt $seed.unitCount; $unit++) {
+      if ($entries[$unit + 1] -cne "unit-$unit.nir") { throw 'Unexpected bootstrap bundle member' }
+    }
+    $details = @(& tar --ignore-zeros -tvf $bundle)
+    if ($LASTEXITCODE -ne 0 -or $details.Count -ne $entries.Count) { throw 'Invalid bootstrap bundle member types' }
+    foreach ($entry in $details) {
+      if (!$entry.StartsWith('-',[StringComparison]::Ordinal)) { throw 'Bootstrap bundle members must be regular files' }
+    }
+    Copy-TarMember $bundle 'UNITS.sha256' "$work/UNITS.sha256"
+    Assert-Hash "$work/UNITS.sha256" $seed.unitManifestSha256
+    if ((Get-Item -LiteralPath "$work/UNITS.sha256").Length -gt 80 * $seed.unitCount) { throw 'Oversized bootstrap unit manifest' }
+    $encoding = [Text.UTF8Encoding]::new($false,$true)
+    $unitText = $encoding.GetString([IO.File]::ReadAllBytes("$work/UNITS.sha256"))
+    $rows = $unitText -split "`n"
+    if ($rows.Count -ne $seed.unitCount + 1 -or $rows[$seed.unitCount] -cne '') { throw 'Invalid bootstrap unit manifest' }
+    for ($unit = 0; $unit -lt $seed.unitCount; $unit++) {
+      if ($rows[$unit] -cnotmatch "^([0-9a-f]{64})  unit-$unit[.]nir$") { throw 'Invalid bootstrap unit manifest' }
+      $digest = $Matches[1]
+      Copy-TarMember $bundle "unit-$unit.nir" "$work/unit-$unit.nir"
+      Assert-Hash "$work/unit-$unit.nir" $digest
+    }
+  } catch {
+    Remove-Item -LiteralPath $work -Recurse -Force
+    throw
+  }
   $env:NERI_STDLIB = Forward-Path "$root/stdlib"
   $env:NERI_HOST = Forward-Path "$native/neri-host.exe"
   $env:NERI_CODEGEN = Forward-Path "$native/neri-codegen.exe"
@@ -108,7 +164,14 @@ try {
     Invoke-Checked $env:NERI_CODEGEN @('--input',$IR,'--input-format',$Format,'--target','windows-x86_64','--optimization','release','--emit','object','--output',"$Stage/compiler.obj")
     Invoke-Checked $env:NERI_LINKER @("$Stage/compiler.obj","$native/neri-runtime.lib",'-o',"$Stage/neri.exe",'-lws2_32','-lbcrypt','-lshell32','-Wl,/Brepro')
   }
-  Materialize "$work/seed.nir" 'binary' "$work/stage0"
+  New-Item -ItemType Directory -Force "$work/stage0" | Out-Null
+  $seedObjects = @()
+  for ($unit = 0; $unit -lt $seed.unitCount; $unit++) {
+    $object = "$work/stage0/unit-$unit.obj"
+    Invoke-Checked $env:NERI_CODEGEN @('--input',"$work/unit-$unit.nir",'--input-format','binary','--target','windows-x86_64','--optimization','release','--emit','object','--output',$object)
+    $seedObjects += $object
+  }
+  Invoke-Checked $env:NERI_LINKER ($seedObjects + @("$native/neri-runtime.lib",'-o',"$work/stage0/neri.exe",'-lws2_32','-lbcrypt','-lshell32','-Wl,/Brepro'))
   for ($generation = 1; $generation -le $Stage; $generation++) {
     $stageDirectory = "$work/stage$generation"
     New-Item -ItemType Directory -Force $stageDirectory | Out-Null

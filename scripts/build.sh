@@ -50,23 +50,80 @@ verify_digest() {
   actual="$(shasum -a 256 "$1" | awk '{print $1}')"
   if [[ "$actual" != "$2" ]]; then echo "Bootstrap checksum mismatch: $1" >&2; exit 2; fi
 }
-if [[ "$(sed -nE 's/^[[:space:]]*"schemaVersion"[[:space:]]*:[[:space:]]*([0-9]+),?$/\1/p' "$LAUNCH_DIR/PROVENANCE.json")" != 1 ||
-      "$(seed_string format)" != neri-ir-binary-gzip ||
-      "$(seed_string artifact)" != compiler.nir.gz ||
+if [[ "$(sed -nE 's/^[[:space:]]*"schemaVersion"[[:space:]]*:[[:space:]]*([0-9]+),?$/\1/p' "$LAUNCH_DIR/PROVENANCE.json")" != 2 ||
+      "$(seed_string format)" != neri-ir-bundle-gzip ||
+      "$(seed_string artifact)" != compiler.nir.tar.gz ||
       "$(seed_string sourceManifest)" != SOURCE-MANIFEST.sha256 ]]; then
   echo "Unsupported canonical bootstrap seed metadata." >&2
   exit 2
 fi
-verify_digest "$ROOT_DIR/bootstrap/compiler.nir.gz" "$(seed_digest artifactSha256)"
+UNIT_COUNT="$(sed -nE 's/^[[:space:]]*"unitCount"[[:space:]]*:[[:space:]]*([0-9]+),?$/\1/p' "$LAUNCH_DIR/PROVENANCE.json")"
+if [[ ! "$UNIT_COUNT" =~ ^[1-9][0-9]{0,3}$ ]] || (( UNIT_COUNT > 1024 )); then
+  echo "Invalid bootstrap unit count." >&2
+  exit 2
+fi
+BUNDLE="$LAUNCH_DIR/compiler.nir.tar.gz"
+cp "$ROOT_DIR/bootstrap/compiler.nir.tar.gz" "$BUNDLE"
+verify_digest "$BUNDLE" "$(seed_digest artifactSha256)"
 verify_digest "$ROOT_DIR/bootstrap/SOURCE-MANIFEST.sha256" "$(seed_digest sourceManifestSha256)"
 verify_digest "$ROOT_DIR/bootstrap/VALIDATION-SOURCE-MANIFEST.sha256" "$(seed_digest validationSourceManifestSha256)"
-gzip -dc "$ROOT_DIR/bootstrap/compiler.nir.gz" > "$LAUNCH_DIR/compiler.nir"
-verify_digest "$LAUNCH_DIR/compiler.nir" "$(seed_digest irSha256)"
+gzip -dc "$BUNDLE" > "$LAUNCH_DIR/compiler.nir.tar"
+BUNDLE="$LAUNCH_DIR/compiler.nir.tar"
+printf '%s\n' UNITS.sha256 > "$LAUNCH_DIR/expected.entries"
+for ((unit = 0; unit < UNIT_COUNT; unit++)); do
+  printf 'unit-%s.nir\n' "$unit" >> "$LAUNCH_DIR/expected.entries"
+done
+tar --ignore-zeros -tf "$BUNDLE" > "$LAUNCH_DIR/actual.entries"
+if ! cmp -s "$LAUNCH_DIR/expected.entries" "$LAUNCH_DIR/actual.entries"; then
+  echo "Bootstrap bundle entries do not match the unit count." >&2
+  exit 2
+fi
+tar --ignore-zeros -tvf "$BUNDLE" > "$LAUNCH_DIR/entry.types"
+entries=0
+while IFS= read -r entry; do
+  if [[ "$entry" != -* ]]; then
+    echo "Bootstrap bundle members must be regular files." >&2
+    exit 2
+  fi
+  entries=$((entries + 1))
+done < "$LAUNCH_DIR/entry.types"
+if (( entries != UNIT_COUNT + 1 )); then
+  echo "Invalid bootstrap bundle member types." >&2
+  exit 2
+fi
+tar --ignore-zeros -xOf "$BUNDLE" UNITS.sha256 > "$LAUNCH_DIR/UNITS.sha256"
+verify_digest "$LAUNCH_DIR/UNITS.sha256" "$(seed_digest unitManifestSha256)"
+: > "$LAUNCH_DIR/checked.units"
+unit=0
+while IFS= read -r row; do
+  if (( unit >= UNIT_COUNT )) || [[ ! "$row" =~ ^([0-9a-f]{64})\ \ unit-([0-9]+)\.nir$ ]] ||
+      [[ "${BASH_REMATCH[2]}" != "$unit" ]]; then
+    echo "Invalid bootstrap unit manifest." >&2
+    exit 2
+  fi
+  digest="${BASH_REMATCH[1]}"
+  printf '%s  unit-%s.nir\n' "$digest" "$unit" >> "$LAUNCH_DIR/checked.units"
+  tar --ignore-zeros -xOf "$BUNDLE" "unit-$unit.nir" > "$LAUNCH_DIR/unit-$unit.nir"
+  unit=$((unit + 1))
+done < "$LAUNCH_DIR/UNITS.sha256"
+if (( unit != UNIT_COUNT )) || ! cmp -s "$LAUNCH_DIR/UNITS.sha256" "$LAUNCH_DIR/checked.units"; then
+  echo "Invalid bootstrap unit manifest." >&2
+  exit 2
+fi
+if ! (cd "$LAUNCH_DIR" && shasum -a 256 -c UNITS.sha256) > "$LAUNCH_DIR/unit-verification.log" 2>&1; then
+  echo "Bootstrap unit checksum mismatch." >&2
+  cat "$LAUNCH_DIR/unit-verification.log" >&2
+  exit 2
+fi
 echo '[bootstrap] Materializing Stage0 from verified seed'
-"$NATIVE_DIR/neri-codegen" --input "$LAUNCH_DIR/compiler.nir" --input-format binary \
-  --target "$TARGET" --optimization release --emit object --output "$LAUNCH_DIR/compiler.o" \
-  --object-cache "$ROOT_DIR/build/cache/bootstrap-objects"
-LINK_ARGUMENTS=("$LAUNCH_DIR/compiler.o" "$NATIVE_DIR/libneri-runtime.a" -o "$LAUNCH_DIR/bin/neri")
+LINK_ARGUMENTS=()
+for ((unit = 0; unit < UNIT_COUNT; unit++)); do
+  "$NATIVE_DIR/neri-codegen" --input "$LAUNCH_DIR/unit-$unit.nir" --input-format binary \
+    --target "$TARGET" --optimization release --emit object --output "$LAUNCH_DIR/unit-$unit.o" \
+    --object-cache "$ROOT_DIR/build/cache/bootstrap-objects"
+  LINK_ARGUMENTS+=("$LAUNCH_DIR/unit-$unit.o")
+done
+LINK_ARGUMENTS+=("$NATIVE_DIR/libneri-runtime.a" -o "$LAUNCH_DIR/bin/neri")
 if [[ "$TARGET" == linux-x86_64 ]]; then LINK_ARGUMENTS+=(-lcrypto); fi
 "$LLVM_PREFIX/bin/clang++" "${LINK_ARGUMENTS[@]}"
 

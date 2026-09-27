@@ -24,10 +24,10 @@ file is absent or a digest does not match.
 
 | File under `bootstrap/` | Contract |
 | --- | --- |
-| `compiler.nir.gz` | Canonical binary Neri IR, compressed with `gzip -n` |
+| `compiler.nir.tar.gz` | Flat ustar bundle of canonical binary Neri IR units, compressed with `gzip -n` |
 | `SOURCE-MANIFEST.sha256` | Exact compiler, standard-library, manifest and template inputs |
 | `VALIDATION-SOURCE-MANIFEST.sha256` | Broader source snapshot used by the validation run |
-| `seed.json` | Artifact, IR and manifest hashes; producer identity, arguments and validation record |
+| `seed.json` | Archive and unit-manifest hashes; Stage2 producer and Stage3 compiler identities, arguments and validation record |
 
 [`scripts/build.sh`](../scripts/build.sh) and
 [`scripts/build.ps1`](../scripts/build.ps1) require these files and verify their
@@ -35,24 +35,34 @@ hashes. They do not fetch an alternate compiler when a file is missing.
 
 ## Trust root
 
-The seed format is canonical binary compiler IR in `bootstrap/compiler.nir.gz`, compressed
-with gzip's filename and timestamp metadata disabled. The same seed is used on
-macOS ARM64, Linux x86-64 and Windows x86-64. The host's C++ toolchain builds
-Neri's native backend and runtime, which materialize this IR as the Stage0
-compiler.
+The seed is a flat ustar archive in `bootstrap/compiler.nir.tar.gz`, compressed
+with gzip's filename and timestamp metadata disabled. Its first member is
+`UNITS.sha256`; the following members are `unit-0.nir` through
+`unit-(count-1).nir` in ordinal order. The manifest records the SHA-256 digest
+of each decoded binary IR unit. The archive contains between one and 1024 units,
+with no directories or other members. Its ustar entries use mode 0644, epoch
+modification times, numeric owner and group zero, and empty owner names.
 
-The `bootstrap/seed.json` schema records SHA-256 digests for the compressed artifact, its
-uncompressed IR and `bootstrap/SOURCE-MANIFEST.sha256`. That source manifest
-records repository-relative paths and exact content hashes for the seed's
-inputs. Generated seed artifacts are excluded from their own source inventory.
-The provenance identifies the producing compiler and compilation arguments.
+Before code generation, the launcher copies the archive into a private staging
+directory and validates the complete member list, unit count, manifest and every
+unit digest. It then materializes each unit as an object and links the objects
+with the current runtime in one link operation. The native backend and runtime
+are built by the host's C++ toolchain.
+
+The `bootstrap/seed.json` schema records SHA-256 digests for the compressed
+archive, its decoded-unit manifest and `bootstrap/SOURCE-MANIFEST.sha256`. That
+source manifest records repository-relative paths and exact content hashes for
+the seed's inputs. Generated seed artifacts are excluded from their own source
+inventory. The provenance records the Stage2 producer compiler digest, the
+Stage3 compiler digest and the actual Stage3 executable-build arguments that
+produced the retained transports.
 `bootstrap/VALIDATION-SOURCE-MANIFEST.sha256` identifies the broader source tree
 used for verification, including native code, tooling and tests. Its digest is
 also recorded in the seed metadata. It records the bootstrap inputs present
 during that verification run.
 
-The launcher verifies the seed's artifact, IR and source-manifest digests before
-executing it. Ordinary builds can compile changed sources using the fixed seed;
+The launcher verifies the seed archive, every IR unit and both source manifests
+before invoking code generation. Ordinary builds can compile changed sources using the fixed seed;
 the current checkout need not match the seed's source inventory. Refreshing the
 seed verifies source identity throughout generation and validation.
 
@@ -99,7 +109,7 @@ The Unix flow is implemented by [the launcher](../scripts/build.sh) and
 
 ```mermaid
 flowchart TD
-  Native["Current C++ backend and runtime"] --> Materialize["Verify and materialize canonical seed IR"]
+  Native["Current C++ backend and runtime"] --> Materialize["Verify bundle, materialize units and link Stage0"]
   Seed["Seed artifact set"] --> Materialize
   Materialize --> S0["Stage0 compiler"]
   S0 --> Driver["Compile current Neri build driver"]
@@ -145,6 +155,13 @@ misses. Ordinary builds keep these auxiliary files inside the cache;
 `--save-temps` copies the verified artifacts into the requested output tree.
 Windows emits NIR once per generation and materializes that same NIR as COFF
 and PE through the native backend.
+
+Seed refresh requires the Stage3 fixed point and the full language contract
+suite. It verifies the retained Stage2 and Stage3 object and transport manifests,
+then builds the seed archive directly from Stage3's retained unit transports.
+It does not run additional frontend compilations. The archive is reproducibly
+created from the ordinal unit files and their decoded-binary SHA-256 manifest;
+the metadata records the Stage2 producer digest and Stage3 build arguments.
 
 Every generation uses the current project manifest, compiler sources and
 standard library. The NIR comparison uses the envelope's hexadecimal encoding;

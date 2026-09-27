@@ -294,11 +294,15 @@ compiler source list, build graph or language expectations.
 
 ## Trusted seed
 
-The bootstrap contract uses `bootstrap/compiler.nir.gz` for canonical binary IR
-and `bootstrap/seed.json` for its artifact and source-inventory hashes. The
-current native backend and runtime materialize the seed on each host. Every
-generation compiles current sources through the root manifest; verification
-compares canonical IR, objects and binaries to a fixed point. See the
+The bootstrap contract uses `bootstrap/compiler.nir.tar.gz` for a gzip-compressed
+ustar bundle of ordinal compiler IR units, and `bootstrap/seed.json` for its
+archive, unit-manifest and source-inventory hashes. The launcher validates every
+archive member and unit digest in private staging before code generation, emits
+an object for each unit, then links those objects with the current runtime once.
+Seed refresh packages Stage3's retained transports after verifying their object
+and transport manifests against Stage2's fixed-point outputs and the full
+language contract suite. This reuses the validated frontend outputs instead of
+running additional seed-generation compilations. See the
 [required seed artifacts in the source checkout](../docs/BOOTSTRAP.md#required-seed-artifacts).
 
 ## Execution and optimization boundaries
