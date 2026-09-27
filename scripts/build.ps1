@@ -84,6 +84,7 @@ try {
   $env:NERI_CODEGEN = Forward-Path "$native/neri-codegen.exe"
   $env:NERI_RUNTIME_MANIFEST = Forward-Path "$native/neri-runtime-windows-x86_64.json"
   $env:NERI_LINKER = Forward-Path "$env:LLVM_PREFIX/bin/clang++.exe"
+  $previousTmpDir = $env:TMPDIR
   $env:TMPDIR = Forward-Path $work
   function Compiler-Sources {
     @(Get-ChildItem -LiteralPath "$root/compiler" -Recurse -Filter '*.hk' -File |
@@ -228,6 +229,10 @@ try {
     $result = [UIntPtr]::Zero
     [void][NeriSetup.EnvironmentBroadcast]::SendMessageTimeout([IntPtr]65535,26,[UIntPtr]::Zero,'Environment',2,2000,[ref]$result)
   }
+  # Installation, activation and PATH setup have consumed the staged toolchain
+  # and rollback copy. Build/test return earlier and keep their reported output.
+  $env:TMPDIR = $previousTmpDir
+  Remove-Item -LiteralPath $work -Recurse -Force
   Write-Host "Installed: $prefixPath/bin/neri.exe"
   Write-Host 'Open a new terminal (and restart Rider) to pick up PATH changes.'
 } finally { Pop-Location }

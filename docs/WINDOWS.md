@@ -43,6 +43,10 @@ toolchain. The installer adds the bin directory to the per-user `PATH`. Open a
 new terminal, and restart Rider, after installation. Use `-Prefix` to select a
 different installation directory or `-NoPath` to leave `PATH` unchanged.
 
+Successful installations remove their own bootstrap workspace after activation
+and PATH setup. Build and test commands retain their reported toolchain outputs;
+failed installations retain their workspace for diagnosis.
+
 An install copies the runtime LLVM subset it needs into
 `<prefix>\dependencies\llvm-22.1.8-<clang-sha256>`: `clang++.exe`, `lld-link.exe`
 and the `lib\clang` resources. This keeps the installed compiler independent of
