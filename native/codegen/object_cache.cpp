@@ -149,16 +149,8 @@ void safe_environment() {
             !v.starts_with("SHLIB_PATH="));
   }
 }
-std::string closure() {
-  safe_environment();
-  struct image {
-    std::string name;
-    bool cached;
-    std::uintptr_t address;
-  };
-  std::vector<image> images;
-  std::string shared;
 #if defined(__APPLE__)
+const dyld_all_image_infos *active_shared_cache() {
   task_dyld_info_data_t info{};
   mach_msg_type_number_t count = TASK_DYLD_INFO_COUNT;
   require(task_info(mach_task_self(), TASK_DYLD_INFO,
@@ -174,9 +166,23 @@ std::string closure() {
   require(std::any_of(std::begin(all->sharedCacheUUID),
                       std::end(all->sharedCacheUUID),
                       [](auto b) { return b != 0; }));
-  shared = hex(all->sharedCacheUUID);
   require(all->dyldPath && all->dyldPath[0] == '/' &&
           all->dyldImageLoadAddress);
+  return all;
+}
+#endif
+std::string closure() {
+  safe_environment();
+  struct image {
+    std::string name;
+    bool cached;
+    std::uintptr_t address;
+  };
+  std::vector<image> images;
+  std::string shared;
+#if defined(__APPLE__)
+  const auto *all = active_shared_cache();
+  shared = hex(all->sharedCacheUUID);
   images.push_back(
       {all->dyldPath,
        (all->dyldImageLoadAddress->flags & MH_DYLIB_IN_CACHE) != 0,
@@ -344,6 +350,44 @@ std::string cache_identity() {
     return {};
   }
 #else
+  return {};
+#endif
+}
+
+std::string shared_cache_identity(std::span<const std::string> paths) {
+#if defined(__APPLE__)
+  try {
+    safe_environment();
+    require(!paths.empty() && paths.size() <= 4096);
+    std::size_t bytes = 0;
+    for (const auto &path : paths) {
+      require(!path.empty() && path.front() == '/' &&
+              path.size() <= 1048576U - bytes &&
+              std::none_of(path.begin(), path.end(), [](unsigned char c) {
+                return c < 32 || c == 127;
+              }));
+      bytes += path.size();
+    }
+    const auto shared = hex(active_shared_cache()->sharedCacheUUID);
+    std::vector<std::string> names(paths.begin(), paths.end());
+    std::sort(names.begin(), names.end());
+    names.erase(std::unique(names.begin(), names.end()), names.end());
+    llvm::SHA256 hash;
+    hash_field(hash, "neri-shared-cache-paths-v1");
+    hash_field(hash, shared);
+    for (const auto &path : names) {
+      struct stat st{};
+      require(stat(path.c_str(), &st) != 0 && errno == ENOENT &&
+              _dyld_shared_cache_contains_path(path.c_str()));
+      hash_field(hash, path);
+    }
+    require(hex(active_shared_cache()->sharedCacheUUID) == shared);
+    return hex(hash.final());
+  } catch (...) {
+    return {};
+  }
+#else
+  static_cast<void>(paths);
   return {};
 #endif
 }

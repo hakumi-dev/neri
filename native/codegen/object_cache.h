@@ -6,6 +6,8 @@
 namespace neri::codegen {
 // Returns an empty identity when the loaded native closure cannot be verified.
 std::string cache_identity();
+// Verifies absent paths against the active Darwin shared cache without loading them.
+std::string shared_cache_identity(std::span<const std::string> paths);
 
 // Bootstrap-only cache; failures always leave normal emission available.
 class object_cache final {

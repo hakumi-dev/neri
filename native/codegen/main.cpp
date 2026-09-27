@@ -57,7 +57,8 @@ void print_usage(std::ostream &stream) {
             "--emit <llvm-ir|assembly|object> --output <path|-> "
             "[--metrics <path>] [--progress <path>] [--debug-source <id> <path>] "
             "[--object-cache <absolute-private-directory>]\n"
-            "       neri-codegen --cache-identity\n";
+            "       neri-codegen --cache-identity\n"
+            "       neri-codegen --shared-cache-identity <absolute-path>...\n";
 }
 
 arguments parse_arguments(int argc, char **argv) {
@@ -310,6 +311,26 @@ int main(int argc, char **argv) {
       const auto identity = neri::codegen::cache_identity();
       if (identity.empty()) {
         std::cerr << "Native cache identity unavailable.\n";
+        return 2;
+      }
+      std::cout << identity << '\n';
+      return 0;
+    }
+    if (argc >= 2 && std::string_view(argv[1]) == "--shared-cache-identity") {
+      if (argc < 3 || argc > 4098)
+        usage_error("Shared cache identity requires 1 to 4096 paths.");
+      std::vector<std::string> paths;
+      std::size_t bytes = 0;
+      for (int i = 2; i < argc; ++i) {
+        const std::string_view path(argv[i]);
+        if (path.size() > 1048576U - bytes)
+          usage_error("Shared cache identity paths exceed 1 MiB.");
+        bytes += path.size();
+        paths.emplace_back(path);
+      }
+      const auto identity = neri::codegen::shared_cache_identity(paths);
+      if (identity.empty()) {
+        std::cerr << "Shared cache identity unavailable.\n";
         return 2;
       }
       std::cout << identity << '\n';
