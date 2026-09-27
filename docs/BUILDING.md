@@ -42,6 +42,34 @@ For Linux dependencies and full source installation, follow
 
 ## Build and test
 
+### Build storage and cleanup
+
+`build/current` selects the active compiler from `build/toolchains`. Native
+components live in `build/native`, reusable compilation artifacts in
+`build/cache`, distributable archives in `build/packages`, and temporary build
+and launcher directories in `build/tmp`.
+
+On macOS and Linux, `scripts/build.sh clean --dry-run` previews abandoned
+temporary directories and unused toolchains. `scripts/build.sh clean` removes
+that selection, preserving the current compiler, native components, caches,
+packages and paths used by running processes. Build launchers register process
+leases; cleanup refuses live leases and blocks new cooperating launchers until
+it finishes. Stop independently launched build tools before cleaning. `lsof` is
+required to inspect open files.
+
+To retain an offline snapshot or experiment, add its absolute path under `build/`
+to `build/.clean-keep`, one path per line. These pins also apply to `--legacy` and
+`--cache`; invalid pins stop cleanup before removal.
+
+`--legacy` additionally removes unprotected artifacts left directly in `build/`
+by older commands and manual experiments. `--cache` also removes the compilation
+cache and requires local compiler, editor and console processes to be stopped.
+Unknown entries are preserved by default. Neither mode removes `build/current`,
+native components or packaged archives. Cleanup uses the existing compiler and
+does not bootstrap or run validation suites.
+
+### Commands
+
 The root `manifest.json` defines the compiler and tooling units. The `build` and
 `install` executables reference the shared `tooling` library, which references
 process support. Library directories discover new `.hk` files automatically;

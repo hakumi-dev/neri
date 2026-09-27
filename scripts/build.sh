@@ -3,9 +3,11 @@ set -euo pipefail
 
 ROOT_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 case "${1:-}" in
+  clean) shift; exec bash "$ROOT_DIR/scripts/clean.sh" "$@" ;;
   native) shift; exec "$ROOT_DIR/scripts/build-native.sh" "$@" ;;
   native-test) shift; exec "$ROOT_DIR/scripts/build-native.sh" --test "$@" ;;
 esac
+source "$ROOT_DIR/scripts/build-lease.sh"
 case "$(uname -s):$(uname -m)" in
   Darwin:arm64)
     TARGET=macos-arm64
@@ -24,7 +26,8 @@ export SDKROOT
 # Native components materialize the same canonical seed on every host.
 LLVM_PREFIX="$LLVM_PREFIX" "$ROOT_DIR/scripts/build-native.sh"
 NATIVE_DIR="$ROOT_DIR/build/native/native-release"
-LAUNCH_DIR="$(mktemp -d "$ROOT_DIR/build/launcher.XXXXXX")"
+mkdir -p "$ROOT_DIR/build/tmp"
+LAUNCH_DIR="$(mktemp -d "$ROOT_DIR/build/tmp/launcher.XXXXXX")"
 trap 'rm -rf "$LAUNCH_DIR"' EXIT
 mkdir -p "$LAUNCH_DIR/bin"
 (
@@ -138,7 +141,7 @@ env -i "PATH=$PATH" "HOME=$HOME" LC_ALL=C LANG=C TZ=UTC "SDKROOT=$SDKROOT" "DEVE
   "$LAUNCH_DIR/bin/neri" build --project "$ROOT_DIR/manifest.json" --unit build \
   --source-root "$ROOT_DIR" --module neri-build --target "$TARGET" --release --timings \
   --output "$LAUNCH_DIR/neri-build"
-env -i "PATH=$PATH" "HOME=$HOME" LC_ALL=C LANG=C TZ=UTC "SDKROOT=$SDKROOT" "DEVELOPER_DIR=${DEVELOPER_DIR:-}" \
+neri_run_leased env -i "PATH=$PATH" "HOME=$HOME" LC_ALL=C LANG=C TZ=UTC "SDKROOT=$SDKROOT" "DEVELOPER_DIR=${DEVELOPER_DIR:-}" \
   "NERI_ROOT=$ROOT_DIR" "NERI_SEED_DIR=$LAUNCH_DIR" "LLVM_PREFIX=$LLVM_PREFIX" "NERI_TARGET=$TARGET" \
   "NERI_NATIVE_READY=$ROOT_DIR|release" "NERI_NATIVE_READY_MANIFEST=$LAUNCH_DIR/native.sha256" \
   "$LAUNCH_DIR/neri-build" "$@"

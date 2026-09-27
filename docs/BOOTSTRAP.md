@@ -126,7 +126,7 @@ flowchart TD
 
 `scripts/build.sh bootstrap` builds the native components, materializes Stage0
 and uses it to compile the Neri build driver through the root `manifest.json`.
-The driver builds only the requested generations in an isolated `build/work.*`
+The driver builds only the requested generations in an isolated `build/tmp/work.*`
 directory:
 
 1. Stage0 compiles the current compiler unit into Stage1.

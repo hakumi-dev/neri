@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 if [[ ! -x "$ROOT_DIR/build/current/bin/neri" ]]; then "$ROOT_DIR/scripts/bootstrap.sh"; fi
+source "$ROOT_DIR/scripts/build-lease.sh"
 TOOLCHAIN_DIR="$(CDPATH= cd -- "$ROOT_DIR/build/current" && pwd -P)"
 case "$(uname -s)" in
   Darwin)

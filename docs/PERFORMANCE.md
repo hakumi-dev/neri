@@ -398,7 +398,7 @@ once during that load.
 compiler and runtime. It compares flat-array append with the compiler's actual
 `IntBuffer`, using 2048, 4096 and 8192 elements. Each process performs 16 complete
 append-and-traverse rounds and must print the expected sum. One warmup process
-precedes five measured processes per case. The report is `build/work.*/collections.jsonl`;
+precedes five measured processes per case. The report is `build/tmp/work.*/collections.jsonl`;
 process sidecars retain wall time, user/system CPU time and peak RSS from `wait4`.
 
 The workload enforces exact results and a 30-second process deadline. CPU/RSS
