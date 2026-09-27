@@ -79,7 +79,7 @@ env -i "PATH=$PATH" "HOME=$HOME" LC_ALL=C LANG=C TZ=UTC "SDKROOT=$SDKROOT" "DEVE
   "NERI_RUNTIME_MANIFEST=$NATIVE_DIR/neri-runtime-$TARGET.json" \
   "NERI_LINKER=$LLVM_PREFIX/bin/clang++" \
   "$LAUNCH_DIR/bin/neri" build --project "$ROOT_DIR/manifest.json" --unit build \
-  --source-root "$ROOT_DIR" --module neri-build --target "$TARGET" --release \
+  --source-root "$ROOT_DIR" --module neri-build --target "$TARGET" --release --timings \
   --output "$LAUNCH_DIR/neri-build"
 env -i "PATH=$PATH" "HOME=$HOME" LC_ALL=C LANG=C TZ=UTC "SDKROOT=$SDKROOT" "DEVELOPER_DIR=${DEVELOPER_DIR:-}" \
   "NERI_ROOT=$ROOT_DIR" "NERI_SEED_DIR=$LAUNCH_DIR" "LLVM_PREFIX=$LLVM_PREFIX" "NERI_TARGET=$TARGET" \
