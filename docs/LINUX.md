@@ -36,6 +36,15 @@ build environment and the deployed application's environment. The runtime checks
 the loaded library, not the `sqlite3` command's version. See the
 [Data compatibility and durability contract](DATA.md#bounds-and-compatibility).
 
+The Linux Release CI job provisions SQLite 3.53.4 from the official amalgamation,
+verifies its pinned SHA3-256 before compilation, and installs matching headers,
+shared library and pkg-config metadata under `/opt/sqlite-3.53.4`. Its loader
+configuration in `/etc/ld.so.conf.d/neri-test-sqlite.conf` makes that library
+available to package validation with an empty environment. A compiled probe
+checks the header/runtime version and thread-safety setting with `env -i`;
+`ldd` confirms the selected library path. The distribution library files remain
+intact. The complete provisioning commands are in the [Linux CI job](../.github/workflows/ci.yml).
+
 ## Get the source
 
 Source: [hakumi-dev/neri](https://github.com/hakumi-dev/neri).
