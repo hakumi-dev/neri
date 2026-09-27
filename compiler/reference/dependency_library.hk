@@ -13,6 +13,15 @@ class DependencyLibrary
   public transportDigest: String = ""
   private saveTemps: Bool = false
   private metadataPath: String = ""
+  private directory: String = ""
+  private cacheIdentity: String = ""
+
+  private def selectDirectory(directory: String): Void
+    this.directory = directory
+    this.metadataPath = directory + "/library.nlib"
+    this.objectPath = directory + "/library.o"
+    this.transportPath = this.objectPath + ".nir.hex"
+  end
 
   def prepare(dependency: BatchDependency, target: readonly TargetPlatform, release: Bool, debugIdentity: String, saveTemps: Bool = false): Void
     this.saveTemps = saveTemps
@@ -33,16 +42,15 @@ class DependencyLibrary
     end
     let cache = new SemanticSnapshotCache()
 
-    cache.prepare(runCacheFrame(saveTemps ? "dependency-library-retained-v1" : "dependency-library-v1") + runCacheFrame(dependency.identity) + runCacheFrame(dependency.importScope) + runCacheFrame(target.name()) + runCacheFrame(release ? "release" : "debug") + runCacheFrame(digest) + runCacheFrame(debugIdentity))
+    cache.prepare(runCacheFrame("dependency-library-v2") + runCacheFrame(dependency.identity) + runCacheFrame(dependency.importScope) + runCacheFrame(target.name()) + runCacheFrame(release ? "release" : "debug") + runCacheFrame(digest) + runCacheFrame(debugIdentity))
     if cache.path != ""
-      this.metadataPath = cache.path + ".nlib"
-      this.objectPath = cache.path + ".o"
-      this.transportPath = saveTemps ? this.objectPath + ".nir.hex" : ""
+      this.cacheIdentity = sha256FastText(cache.path)
+      this.selectDirectory(cache.path + ".library")
     end
   end
 
   private def load(moduleName: String, domains: IrDomainCatalog): Bool
-    if this.metadataPath == ""
+    if this.metadataPath == "" || !(new RunCache()).privateDirectory(this.directory)
       return false
     end
     let before = new RunCacheFile(this.metadataPath, false)
@@ -51,15 +59,10 @@ class DependencyLibrary
     if !before.owned || before.kind != 1 || !objectBefore.owned || objectBefore.kind != 1
       return false
     end
-    var transportBefore = ""
+    let transportBefore = new RunCacheFile(this.transportPath, false)
 
-    if this.saveTemps
-      let status = new RunCacheFile(this.transportPath, false)
-
-      if !status.owned || status.kind != 1
-        return false
-      end
-      transportBefore = status.fingerprint
+    if !transportBefore.owned || transportBefore.kind != 1
+      return false
     end
     let read = files::readBytes(this.metadataPath, 67108929)
     let bytes = read.bytes
@@ -79,27 +82,24 @@ class DependencyLibrary
     end
     let reader = new SemanticSnapshotReader(payload)
     let version = reader.string()
+    let identity = reader.string()
     let digest = reader.string()
     let encoded = reader.string()
-    let transportDigest = this.saveTemps ? reader.string() : ""
-    let expectedVersion = this.saveTemps ? "neri-dependency-library-retained-v1" : "neri-dependency-library-v1"
+    let transportDigest = reader.string()
 
-    if !reader.complete() || version != expectedVersion || host::stringByteLength(digest) != 64 || digest != referenceFileDigest(this.objectPath)
+    if !reader.complete() || version != "neri-dependency-library-v2" || identity != this.cacheIdentity || host::stringByteLength(digest) != 64 || digest != referenceFileDigest(this.objectPath) || host::stringByteLength(transportDigest) != 64 || referenceFileDigest(this.transportPath) != transportDigest
       return false
     end
     let decoded = libraryDeclarationsDecode(encoded, moduleName, domains)
     let after = new RunCacheFile(this.metadataPath, false)
     let objectAfter = new RunCacheFile(this.objectPath, false)
+    let transportAfter = new RunCacheFile(this.transportPath, false)
 
     if decoded == null || !after.owned || after.kind != 1 || !objectAfter.owned || objectAfter.kind != 1 || before.fingerprint != after.fingerprint || objectBefore.fingerprint != objectAfter.fingerprint
       return false
     end
-    if this.saveTemps
-      let transportAfter = new RunCacheFile(this.transportPath, false)
-
-      if !transportAfter.owned || transportAfter.kind != 1 || transportBefore != transportAfter.fingerprint || host::stringByteLength(transportDigest) != 64 || referenceFileDigest(this.transportPath) != transportDigest
-        return false
-      end
+    if !transportAfter.owned || transportAfter.kind != 1 || transportBefore.fingerprint != transportAfter.fingerprint
+      return false
     end
     this.transportDigest = transportDigest
     this.declarations = decoded
@@ -167,7 +167,8 @@ class DependencyLibrary
     if encoded == null
       return false
     end
-    let temporary = bootstrapTemporaryDirectory(bootstrapDirectory(this.metadataPath), "library")
+    let destination = this.directory
+    let temporary = bootstrapTemporaryDirectory(bootstrapDirectory(destination), "library")
 
     if temporary == null
       return false
@@ -178,7 +179,7 @@ class DependencyLibrary
 
     progress("codegen", 0, 0) if progress != null
     let providerSources = bootstrapUnitSources(module, sources)
-    var succeeded = bootstrapInvokeCodegen(module, EmissionKind.object(), stagedObject, target, release, providerSources, metricsPath, "", nativeProgress, saveTemps)
+    var succeeded = bootstrapInvokeCodegen(module, EmissionKind.object(), stagedObject, target, release, providerSources, metricsPath, "", nativeProgress, true)
 
     runCacheReport(timings, "dependency-codegen", codegenStarted)
     bootstrapReportCodegenMetrics(metricsPath, "dependency-") if timings
@@ -187,33 +188,32 @@ class DependencyLibrary
       let digest = referenceFileDigest(stagedObject)
       let writer = new SemanticSnapshotWriter()
 
-      writer.string(saveTemps ? "neri-dependency-library-retained-v1" : "neri-dependency-library-v1")
+      writer.string("neri-dependency-library-v2")
+      writer.string(this.cacheIdentity)
       writer.string(digest)
       writer.string(encoded)
-      let transportDigest = saveTemps ? referenceFileDigest(stagedObject + ".nir.hex") : ""
+      let transportDigest = referenceFileDigest(stagedObject + ".nir.hex")
 
-      if saveTemps
-        writer.string(transportDigest)
-      end
+      writer.string(transportDigest)
       let payload = writer.finish()
 
-      succeeded = digest != "" && payload != null && (!saveTemps || transportDigest != "")
+      succeeded = digest != "" && payload != null && transportDigest != ""
       if payload != null && succeeded
         succeeded = host::writeText(temporary + "/library.nlib", sha256FastText(payload) + "\n" + payload)
       end
     end
     if succeeded
-      succeeded = files::move(stagedObject, this.objectPath).failure == null
-      if succeeded && saveTemps
-        succeeded = files::move(stagedObject + ".nir.hex", this.transportPath).failure == null
-      end
-      succeeded = files::move(temporary + "/library.nlib", this.metadataPath).failure == null if succeeded
+      this.selectDirectory(temporary)
+      succeeded = this.load(moduleName, dependency.model.irDomains)
+    end
+    if succeeded
+      # A complete immutable directory becomes visible in one rename. A losing
+      # publisher accepts only a fully verified winner, never a partial pair.
+      files::move(temporary, destination)
+      this.selectDirectory(destination)
+      succeeded = this.load(moduleName, dependency.model.irDomains)
     end
     bootstrapRemoveRunDirectory(temporary)
-    if succeeded && !this.load(moduleName, dependency.model.irDomains)
-      this.error = "Dependency library declaration or implementation validation failed."
-      return false
-    end
     return succeeded
   end
 

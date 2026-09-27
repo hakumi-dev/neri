@@ -164,6 +164,25 @@ def assertRuns(path: String, expected: String): Void
   test::assertEqual(text(result.stdout), expected)
 end
 
+def assertRetainedPairEqual(left: String, right: String): Void
+  let manifest = host::readText(left + "/manifest.json")
+
+  test::assertTrue(manifest != null && manifest == host::readText(right + "/manifest.json"))
+  let directory = files::Root.open(left).root
+
+  test::assertTrue(directory != null)
+  if directory != null
+    let listed = directory.list("", 4096)
+    let closed = directory.close()
+
+    test::assertTrue(listed.failure == null && closed == null && listed.entries.Length >= 3)
+    for entry in listed.entries
+      test::assertTrue(entry.kind.isFile())
+      exited(invoke("cmp", [left + "/" + entry.name, right + "/" + entry.name], ""), 0)
+    end
+  end
+end
+
 def main(): Void
   unsafe
     if cacheSupported() != 1
@@ -199,14 +218,138 @@ def main(): Void
   let standalone = root + "/standalone.hk"
 
   write(standalone, "def main(): Void\nend\n")
-  exited(invoke(compiler, ["build", standalone, "--release", "--save-temps", "--output", "relative-bin"], cache, "", root), 0)
+  exited(invoke("rm", ["-rf", root + "/relative-bin.temps"], ""), 0)
+  let monolithicArguments = ["build", standalone, "--release", "--timings", "--output", "relative-bin"]
+  let monolithicCold = invoke(compiler, monolithicArguments, cache, "", root)
 
-  test::assertTrue(host::readText(root + "/relative-bin.temps/manifest.json") != null)
+  exited(monolithicCold, 0)
+
+  test::assertEqual(countText(text(monolithicCold.stderr), "object-cache-miss"), 1)
+  test::assertTrue(host::readText(root + "/relative-bin.temps/manifest.json") == null)
+  let retainedArguments = host::appendString(monolithicArguments, "--save-temps")
+  let monolithicWarm = invoke(compiler, retainedArguments, cache, "", root)
+
+  exited(monolithicWarm, 0)
+
+  test::assertEqual(countText(text(monolithicWarm.stderr), "object-cache-hit"), 1)
+  test::assertEqual(countText(text(monolithicWarm.stderr), "object-cache-miss"), 0)
+  let monolithicManifest = host::readText(root + "/relative-bin.temps/manifest.json")
+  let actualTransport = host::readText(root + "/relative-bin.temps/unit-0.o.nir.hex")
+
+  test::assertTrue(monolithicManifest != null && actualTransport != null)
+  let otherSource = root + "/other.hk"
+
+  write(otherSource, "def main(): Void\n  let value = 1\nend\n")
+  exited(invoke(compiler, ["build", otherSource, "--release", "--output", "other-bin"], cache, "", root), 0)
+  let objects = files::Root.open(cache).root
+
+  test::assertTrue(objects != null)
+  if objects != null
+    let entries = objects.list("", 4096)
+    let closed = objects.close()
+
+    test::assertTrue(entries.failure == null && closed == null)
+    var otherBundle = ""
+
+    for entry in entries.entries
+      let bundle = cache + "/" + entry.name
+      let transport = host::readText(bundle + "/program.nir.hex")
+
+      if entry.kind.isDirectory() && transport != null && transport != actualTransport
+        otherBundle = bundle
+      end
+    end
+
+    test::assertTrue(otherBundle != "")
+    var damaged = 0
+
+    for entry in entries.entries
+      let bundle = cache + "/" + entry.name
+
+      if entry.kind.isDirectory() && host::readText(bundle + "/program.nir.hex") == actualTransport
+        exited(invoke("cmp", [bundle + "/program", root + "/relative-bin.temps/unit-0.o"], ""), 0)
+        let originalReceipt = host::readText(bundle + "/receipt")
+
+        test::assertTrue(originalReceipt != null)
+        for name in ["program", "program.nir.hex", "receipt"]
+          exited(invoke("cp", [otherBundle + "/" + name, bundle + "/" + name], ""), 0)
+        end
+        let substituted = invoke(compiler, retainedArguments, cache, "", root)
+
+        exited(substituted, 0)
+
+        test::assertEqual(countText(text(substituted.stderr), "object-cache-hit"), 0)
+        test::assertEqual(countText(text(substituted.stderr), "object-cache-miss"), 1)
+        test::assertTrue(host::readText(root + "/relative-bin.temps/manifest.json") == monolithicManifest)
+        exited(invoke("cp", [root + "/relative-bin.temps/unit-0.o", bundle + "/program"], ""), 0)
+        if originalReceipt != null
+          write(bundle + "/receipt", originalReceipt)
+        end
+        write(bundle + "/program.nir.hex", "corrupt consumed transport")
+        let fallback = invoke(compiler, retainedArguments, cache, "", root)
+
+        exited(fallback, 0)
+
+        test::assertEqual(countText(text(fallback.stderr), "object-cache-hit"), 0)
+        test::assertEqual(countText(text(fallback.stderr), "object-cache-miss"), 1)
+        test::assertTrue(host::readText(root + "/relative-bin.temps/manifest.json") == monolithicManifest)
+        test::assertTrue(host::readText(root + "/relative-bin.temps/unit-0.o.nir.hex") == actualTransport)
+        damaged = damaged + 1
+      end
+    end
+
+    test::assertEqual(damaged, 1)
+  end
+  let monolithicBypass = invoke(compiler, host::appendString(retainedArguments, "--no-cache"), cache, "", root)
+
+  exited(monolithicBypass, 0)
+
+  test::assertEqual(countText(text(monolithicBypass.stderr), "object-cache-hit"), 0)
+  test::assertTrue(host::readText(root + "/relative-bin.temps/manifest.json") == monolithicManifest)
   directory(appSources)
   directory(librarySources)
   write(provider, "namespace support\n\nclass Box<T>\n  public value: T\n\n  def init(value: T): Void\n    this.value = value\n  end\n\n  def item(): T\n    return this.value\n  end\nend\n\ndef amount(): Int\n  return 2\nend\n")
   write(app, "use console\nuse support\n\ndef main(): Void\n  let box = new Box<Int>(amount())\n  console::println((box.item() + 1) as String)\nend\n")
   write(manifest, "{\"version\":2,\"defaultUnit\":\"app\",\"units\":{\"app\":{\"kind\":\"executable\",\"sources\":[\"app\"],\"references\":[\"library\"]},\"library\":{\"kind\":\"library\",\"sources\":[\"lib\"]}}}\n")
+  let parallelCache = root + "/parallel-cache"
+
+  exited(invoke("rm", ["-rf", parallelCache], ""), 0)
+  exited(invoke("mkdir", ["-m", "700", parallelCache], ""), 0)
+  let leftOutput = root + "/parallel-left"
+  let rightOutput = root + "/parallel-right"
+  let leftOptions = new process::SpawnOptions(compiler)
+  let rightOptions = new process::SpawnOptions(compiler)
+
+  leftOptions.arguments = ["build", "--project", manifest, "--unit", "app", "--release", "--save-temps", "--output", leftOutput]
+  rightOptions.arguments = ["build", "--project", manifest, "--unit", "app", "--release", "--save-temps", "--output", rightOutput]
+  leftOptions.environment = [new process::EnvironmentEntry("NERI_CACHE_DIR", parallelCache)]
+  rightOptions.environment = [new process::EnvironmentEntry("NERI_CACHE_DIR", parallelCache)]
+  let left = process::spawn(leftOptions).child()
+  let right = process::spawn(rightOptions).child()
+
+  test::assertTrue(left != null && right != null)
+  if left != null && right != null
+    let leftResult = left.wait(60000)
+    let rightResult = right.wait(60000)
+
+    test::assertTrue(leftResult.failure == null && !leftResult.running && rightResult.failure == null && !rightResult.running)
+    exited(leftResult, 0)
+    exited(rightResult, 0)
+
+    test::assertTrue(left.dispose() && right.dispose())
+  end
+  assertRuns(leftOutput, "3\n")
+  assertRuns(rightOutput, "3\n")
+  assertRetainedPairEqual(leftOutput + ".temps", rightOutput + ".temps")
+  let parallelWarmOutput = root + "/parallel-warm"
+  let parallelWarm = build(compiler, manifest, parallelWarmOutput, parallelCache, true, false, true)
+
+  exited(parallelWarm, 0)
+
+  test::assertTrue(containsText(text(parallelWarm.stderr), "dependency-native-hit"))
+  test::assertTrue(countText(text(parallelWarm.stderr), "object-cache-hit") > 0)
+  test::assertEqual(countText(text(parallelWarm.stderr), "object-cache-miss"), 0)
+  assertRetainedPairEqual(leftOutput + ".temps", parallelWarmOutput + ".temps")
   let cold = build(compiler, manifest, output, cache)
 
   assertBuildOutput(cold, 0)
@@ -215,9 +358,13 @@ def main(): Void
   test::assertTrue(coldObjectMisses > 0)
   assertBuildOutput(build(compiler, manifest, output, cache), 1)
   let partitionTemps = root + "/partitioned-bin"
+  let retainedWarm = build(compiler, manifest, partitionTemps, cache, true, false, true)
 
-  assertBuildOutput(build(compiler, manifest, partitionTemps, cache, true, false, true), 0)
+  assertBuildOutput(retainedWarm, 0)
 
+  test::assertEqual(countText(text(retainedWarm.stderr), "object-cache-hit"), coldObjectMisses)
+  test::assertEqual(countText(text(retainedWarm.stderr), "object-cache-miss"), 0)
+  test::assertTrue(containsText(text(retainedWarm.stderr), "dependency-native-hit"))
   test::assertTrue(host::readText(partitionTemps + ".temps/manifest.json") != null)
   let removedPartitionObject = host::run("rm", [partitionTemps + ".temps/unit-1.o", partitionTemps + ".temps/unit-1.o.nir.hex"])
 

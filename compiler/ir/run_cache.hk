@@ -65,6 +65,8 @@ class RunCache
   public executable: String = ""
   public inputs: String = ""
   public dependencies: String[] = []
+  private objectBundle: Bool = false
+  private cacheKey: String = ""
 
   def privateDirectory(path: String): Bool
     let info = new RunCacheFile(path, false)
@@ -84,6 +86,7 @@ class RunCache
   end
 
   def prepare(module: IrModule, target: readonly TargetPlatform, release: Bool, debugSources: BootstrapSourceInput? = null, purpose: String = "neri-run-cache-v1", configurationInputs: String = "", additionalDependencies: String[] = [], canonicalDigest: String = "", nativeObject: Bool = false): Void
+    this.objectBundle = nativeObject
     # External link inputs and other host ABIs are uncached until their complete
     # dependency discovery is available. Failures always use the normal run path.
     # Object files record native import signatures; their library binaries are
@@ -181,6 +184,7 @@ class RunCache
     let contentIdentity = canonicalDigest == "" ? irSerializeEnvelopeHex(module) : canonicalDigest
     let key = sha256FastText(runCacheFrame(configuration) + runCacheFrame(contentIdentity))
 
+    this.cacheKey = key
     this.directory = root + "/" + key
     this.executable = this.directory + "/program"
   end
@@ -190,9 +194,48 @@ class RunCache
       return false
     end
     let info = new RunCacheFile(this.executable, false)
+
+    if this.objectBundle
+      let receiptInfo = new RunCacheFile(this.directory + "/receipt", false)
+
+      if !receiptInfo.owned || receiptInfo.kind != 1
+        return false
+      end
+      let read = files::readBytes(this.directory + "/receipt", 512)
+      let bytes = read.bytes
+
+      if read.failure != null || read.closeFailure != null || bytes == null
+        return false
+      end
+      let receipt = host::stringFromBytes(bytes)
+      let expected = this.objectReceipt(this.directory)
+      let receiptAfter = new RunCacheFile(this.directory + "/receipt", false)
+
+      return expected != "" && receipt == expected && receiptAfter.owned && receiptAfter.kind == 1 && receiptInfo.fingerprint == receiptAfter.fingerprint && this.inputs == this.snapshot()
+    end
     let receipt = host::readText(this.directory + "/receipt")
 
     return info.owned && info.kind == 1 && receipt != null && receipt == info.fingerprint
+  end
+
+  private def objectReceipt(directory: String): String
+    let object = directory + "/program"
+    let transport = object + ".nir.hex"
+    let before = new RunCacheFile(object, false)
+    let transportBefore = new RunCacheFile(transport, false)
+
+    if !this.privateDirectory(directory) || !before.owned || before.kind != 1 || !transportBefore.owned || transportBefore.kind != 1
+      return ""
+    end
+    let objectDigest = referenceFileDigest(object)
+    let transportDigest = referenceFileDigest(transport)
+    let after = new RunCacheFile(object, false)
+    let transportAfter = new RunCacheFile(transport, false)
+
+    if objectDigest == "" || transportDigest == "" || before.fingerprint != after.fingerprint || transportBefore.fingerprint != transportAfter.fingerprint
+      return ""
+    end
+    return "neri-object-bundle-v1\n" + this.cacheKey + "\n" + objectDigest + "\n" + transportDigest + "\n"
   end
 
   def publish(staging: String): Bool
@@ -202,8 +245,12 @@ class RunCache
     # Publish a complete directory with one atomic rename. Concurrent builders
     # never overwrite or execute each other's partially linked artifacts.
     let info = new RunCacheFile(staging + "/program", false)
+    let receipt = this.objectBundle ? this.objectReceipt(staging) : info.fingerprint
 
-    if !host::writeText(staging + "/receipt", info.fingerprint)
+    if receipt == "" || !host::writeText(staging + "/receipt", receipt)
+      return false
+    end
+    if this.objectBundle && (this.objectReceipt(staging) != receipt || this.inputs != this.snapshot())
       return false
     end
     return files::move(staging, this.directory).failure == null

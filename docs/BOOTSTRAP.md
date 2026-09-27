@@ -137,6 +137,12 @@ Retained files live in `OUTPUT.temps`, with `unit-<index>.o`, its NIR transport,
 and a manifest of unit identities and SHA-256 digests. This includes every
 partition actually compiled and linked. The executable cache validates and
 restores the complete retained set when that option is requested.
+On hosts with object caching, each cached unit keeps its object and the exact
+NIR transport consumed by code generation together. Reuse verifies both content
+digests and the compilation identity. Source dependency libraries publish their
+declarations, object and transport as one bundle. Invalid entries are cache
+misses. Ordinary builds keep these auxiliary files inside the cache;
+`--save-temps` copies the verified artifacts into the requested output tree.
 Windows emits NIR once per generation and materializes that same NIR as COFF
 and PE through the native backend.
 
