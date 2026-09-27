@@ -1,0 +1,144 @@
+use host
+use files
+use crypto
+
+# Hash the exact file byte stream, using bounded storage and an explicit limit.
+def cacheFileDigest(path: String, limit: Int): CacheFileDigestResult
+  let result = new CacheFileDigestResult()
+  let length = host::stringByteLength(path)
+
+  if length == 0 || length > cacheFileMaxPathBytes()
+    result.failure = CacheFileFailure.InvalidPath()
+    return result
+  end
+  if limit < 0 || limit > cacheFileMaxBytes()
+    result.failure = CacheFileFailure.InvalidLimit()
+    return result
+  end
+  var index = 0
+
+  while index < length
+    if host::stringByteAt(path, index) == 0 as Byte
+      result.failure = CacheFileFailure.InvalidPath()
+      return result
+    end
+    index = index + 1
+  end
+  unsafe
+    let name = native::alloc<Byte>(length)
+
+    index = 0
+    while index < length
+      name[index] = host::stringByteAt(path, index)
+      index = index + 1
+    end
+    let fd = files::openFile(name, length)
+
+    native::free(name)
+    if fd < 0
+      result.failure = CacheFileFailure.OpenFailed()
+      return result
+    end
+    let size = files::fileSize(fd)
+    let firstIdentity = stackalloc Byte[64]
+    let finalIdentity = stackalloc Byte[64]
+
+    if size < 0
+      result.failure = CacheFileFailure.SizeUnavailable()
+    else if size > limit
+      result.failure = CacheFileFailure.LimitExceeded()
+    else if files::fileIdentity(fd, firstIdentity) != 0
+      result.failure = CacheFileFailure.MetadataFailed()
+    else
+      let buffer = native::alloc<Byte>(cacheFileChunkBytes())
+      let digest = stackalloc Byte[32]
+      let context = crypto::nativeSha256Begin()
+
+      if context == null
+        result.failure = CacheFileFailure.DigestFailed()
+      end
+      while result.failure == null && result.bytesRead < size
+        let remaining = size - result.bytesRead
+        let wanted = remaining < cacheFileChunkBytes() ? remaining : cacheFileChunkBytes()
+        var consumed = 0
+
+        while result.failure == null && consumed < wanted
+          let count = files::readFile(fd, buffer + consumed, wanted - consumed)
+
+          if count == -2
+            continue
+          end
+          if count < 0 || count > wanted - consumed
+            result.failure = CacheFileFailure.ReadFailed()
+          else if count == 0
+            result.failure = CacheFileFailure.ChangedSize()
+          else
+            consumed = consumed + count
+            result.bytesRead = result.bytesRead + count
+          end
+        end
+        if result.failure == null
+          if context != null && crypto::nativeSha256Update(context, buffer, consumed) != 0
+            result.failure = CacheFileFailure.DigestFailed()
+          end
+        end
+      end
+      if result.failure == null
+        var extra = files::readFile(fd, buffer, 1)
+
+        while extra == -2
+          extra = files::readFile(fd, buffer, 1)
+        end
+        if extra < 0 || extra > 1
+          result.failure = CacheFileFailure.ReadFailed()
+        else if extra != 0 || files::fileSize(fd) != size
+          result.failure = CacheFileFailure.ChangedSize()
+        else if files::fileIdentity(fd, finalIdentity) != 0
+          result.failure = CacheFileFailure.MetadataFailed()
+        else if !cacheFileIdentityEqual(firstIdentity, finalIdentity)
+          result.failure = CacheFileFailure.ChangedFile()
+        else if context != null
+          if crypto::nativeSha256Finish(context, digest) != 0
+            result.failure = CacheFileFailure.DigestFailed()
+          else
+            result.digest = cacheFileHexDigest(digest)
+          end
+        end
+      end
+      if context != null && crypto::nativeSha256Dispose(context) != 0
+        result.failure = CacheFileFailure.DigestFailed() if result.failure == null
+        result.digest = ""
+      end
+      native::free(buffer)
+    end
+    if files::closeFile(fd) != 0
+      result.closeFailed = true
+      result.failure = CacheFileFailure.CloseFailed() if result.failure == null
+      result.digest = ""
+    end
+    return result
+  end
+end
+
+unsafe def cacheFileIdentityEqual(left: Byte*, right: Byte*): Bool
+  var index = 0
+
+  while index < 64
+    return false if left[index] != right[index]
+    index = index + 1
+  end
+  return true
+end
+
+unsafe def cacheFileHexDigest(digest: Byte*): String
+  var result = ""
+  var index = 0
+
+  while index < 32
+    let value = digest[index] as Int
+
+    result = result + host::stringSlice("0123456789abcdef", value / 16, 1) + host::stringSlice("0123456789abcdef", value - (value / 16) * 16, 1)
+    index = index + 1
+  end
+  return result
+end

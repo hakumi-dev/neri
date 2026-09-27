@@ -65,12 +65,28 @@ class RunCache
   public executable: String = ""
   public inputs: String = ""
   public dependencies: String[] = []
+  public outcome: CacheOutcome = CacheOutcome.NotRequested()
+  public detail: String = ""
   private objectBundle: Bool = false
   private nativeReceipt: Bool = false
   private cacheKey: String = ""
   private codegenIdentity: CodegenIdentity = new CodegenIdentity()
   private linkToolchain: NativeLinkToolchain?
   private storage: RunCacheStorage = new RunCacheStorage()
+
+  def report(enabled: Bool): Void
+    if !enabled || this.detail == ""
+      return
+    end
+    let text = "neri cache " + cacheOutcomeName(this.outcome) + ": " + this.detail + "\n"
+    let bytes = runCacheBytes(text)
+
+    unsafe
+      borrow bytes as pointer
+        runCacheWrite(pointer, host::stringByteLength(text))
+      end
+    end
+  end
 
   def privateDirectory(path: String): Bool
     let info = new RunCacheFile(path, false)
@@ -94,11 +110,26 @@ class RunCache
     return result
   end
 
-  def prepare(module: IrModule, target: readonly TargetPlatform, release: Bool, debugSources: BootstrapSourceInput? = null, purpose: String = "neri-run-cache-v1", configurationInputs: String = "", additionalDependencies: String[] = [], canonicalDigest: String = "", nativeObject: Bool = false, nativeReceipt: Bool = false, linkToolchain: NativeLinkToolchain? = null): Void
+  def prepare(module: IrModule, target: readonly TargetPlatform, release: Bool, debugSources: BootstrapSourceInput? = null, purpose: readonly CacheDomain = CacheDomain.runExecutable(), configurationInputs: String = "", additionalDependencies: String[] = [], canonicalDigest: String = "", nativeObject: Bool = false, nativeReceipt: Bool = false, linkToolchain: NativeLinkToolchain? = null): Void
+    this.directory = ""
+    this.executable = ""
+    this.inputs = ""
+    this.dependencies = []
+    this.cacheKey = ""
+    this.linkToolchain = null
+    this.storage = new RunCacheStorage()
+    this.codegenIdentity = new CodegenIdentity()
+    this.outcome = CacheOutcome.Unsupported()
+    this.detail = "target or native-library dependency tracking is unsupported"
     this.objectBundle = nativeObject
     this.nativeReceipt = nativeReceipt && !nativeObject
+    if !target.isMacOS() || (module.requiredFeatures.hasNativeLibraries() && !nativeObject) || !runCacheSupportedHost()
+      return
+    end
     if !nativeObject
       if linkToolchain == null || !linkToolchain.matches()
+        this.outcome = CacheOutcome.DependencyUnavailable()
+        this.detail = linkToolchain == null ? "native link identity is unavailable" : linkToolchain.failureReason
         return
       end
       this.linkToolchain = linkToolchain
@@ -107,12 +138,11 @@ class RunCache
     # dependency discovery is available. Failures always use the normal run path.
     # Object files record native import signatures; their library binaries are
     # resolved by the final link on every build.
-    if !target.isMacOS() || (module.requiredFeatures.hasNativeLibraries() && !nativeObject) || !runCacheSupportedHost()
-      return
-    end
     let descriptor = new RunCacheDependencies()
 
     if !descriptor.capture(target, nativeObject, additionalDependencies, linkToolchain)
+      this.outcome = CacheOutcome.DependencyUnavailable()
+      this.detail = descriptor.failureReason
       return
     end
     this.dependencies = descriptor.paths
@@ -126,20 +156,28 @@ class RunCache
       root = homeDirectory + "/.neri-run-cache"
     end
     if !bootstrapStartsWith(root, "/") || root == "/"
+      this.outcome = CacheOutcome.InvalidConfiguration()
+      this.detail = "cache root must be an absolute non-root directory"
       return
     end
     files::createDirectory(root)
     if !this.privateDirectory(root)
+      this.outcome = CacheOutcome.StorageUnavailable()
+      this.detail = "cache root must be an owned directory with mode 0700"
       return
     end
     if !this.codegenIdentity.capture()
+      this.outcome = CacheOutcome.DependencyUnavailable()
+      this.detail = "code generator identity is unavailable"
       return
     end
     this.inputs = this.snapshot()
     if this.inputs == ""
+      this.outcome = CacheOutcome.InputsChanged()
+      this.detail = "native dependencies changed during observation"
       return
     end
-    var configuration = runCacheFrame(purpose) + runCacheFrame(configurationInputs) + runCacheFrame(target.name()) + runCacheFrame(release ? "release" : "debug") + runCacheFrame(descriptor.configuration) + runCacheFrame(this.inputs) + runCacheFrame(this.codegenIdentity.digest)
+    var configuration = runCacheFrame(configurationInputs) + runCacheFrame(target.name()) + runCacheFrame(release ? "release" : "debug") + runCacheFrame(descriptor.configuration) + runCacheFrame(this.inputs)
 
     configuration = configuration + runCacheFrame(linkToolchain.identity) if this.linkToolchain != null && linkToolchain != null
 
@@ -157,9 +195,12 @@ class RunCache
       source = source.nextInput
     end
     let contentIdentity = canonicalDigest == "" ? irSerializeEnvelopeHex(module) : canonicalDigest
-    let key = sha256FastText(runCacheFrame(configuration) + runCacheFrame(contentIdentity))
+    let format = nativeObject ? "object-bundle" : (this.nativeReceipt ? "native-receipt" : "metadata-receipt")
+    let key = cacheIdentity(purpose, this.codegenIdentity.digest, format, [configuration, contentIdentity])
 
     this.cacheKey = key
+    this.outcome = CacheOutcome.Ready()
+    this.detail = ""
     this.setupStorage(root, key)
   end
 
@@ -167,6 +208,8 @@ class RunCache
     this.directory = ""
     this.executable = ""
     if !this.storage.setup(root, key)
+      this.outcome = CacheOutcome.StorageUnavailable()
+      this.detail = "cache storage cannot be opened safely"
       return
     end
     this.directory = this.storage.selected()
@@ -184,26 +227,50 @@ class RunCache
     else
       this.directory = ""
       this.executable = ""
+      this.outcome = CacheOutcome.StorageUnavailable()
+      this.detail = "a private cache generation cannot be reserved"
     end
   end
 
   def hit(): Bool
     if this.selectedHit()
+      this.outcome = CacheOutcome.Hit()
+      this.detail = ""
       return true
     end
-    this.reserveGeneration()
+    this.reserveGeneration() if this.cacheKey != ""
     return false
   end
 
   private def selectedHit(): Bool
-    if this.directory == "" || !this.privateDirectory(this.directory) || this.inputs != this.snapshot()
+    if this.directory == ""
+      return false
+    end
+    if this.inputs != this.snapshot()
+      this.outcome = CacheOutcome.InputsChanged()
+      this.detail = "dependencies changed since cache preparation"
+      return false
+    end
+    this.outcome = CacheOutcome.InvalidEntry()
+    this.detail = "cache artifact or receipt failed integrity validation"
+    if (new RunCacheFile(this.directory, false)).kind == 0
+      this.outcome = CacheOutcome.Missing()
+      this.detail = ""
+      return false
+    end
+    if !this.privateDirectory(this.directory)
       return false
     end
     let info = new RunCacheFile(this.executable, false)
 
+    if info.kind == 0
+      this.outcome = CacheOutcome.Missing()
+      this.detail = ""
+      return false
+    end
     if this.nativeReceipt
       let before = new RunCacheFile(this.directory + "/receipt", false)
-      let read = files::readBytes(this.directory + "/receipt", 4194304)
+      let read = files::readBytes(this.directory + "/receipt", NativeLinkLimits.traceBytes())
       let bytes = read.bytes
 
       if !before.owned || before.kind != 1 || read.failure != null || read.closeFailure != null || bytes == null
@@ -212,15 +279,17 @@ class RunCache
       let payload = host::stringFromBytes(bytes)
 
       return false if payload == null
-      let reader = new SemanticSnapshotReader(payload)
+      let reader = new CacheRecordReader(payload)
 
-      if reader.string() != "neri-run-native-v2" || reader.string() != this.cacheKey
+      if reader.string() != "neri-native-receipt" || reader.string() != cacheFormatIdentity(CacheDomain.nativeReceipt(), this.cacheKey) || reader.string() != this.cacheKey
+        this.outcome = CacheOutcome.IncompatibleFormat()
+        this.detail = "native receipt belongs to a different cache identity"
         return false
       end
       let digest = reader.string()
       let expected = reader.string()
       let observed = new NativeLinkInputs()
-      let count = reader.count(4096)
+      let count = reader.count(NativeLinkLimits.dependencyCount())
       var index = 0
 
       while index < count && !reader.failed
@@ -230,7 +299,7 @@ class RunCache
         observed.inputs.add(path)
         index = index + 1
       end
-      let missing = reader.count(4096)
+      let missing = reader.count(NativeLinkLimits.dependencyCount())
 
       index = 0
       while index < missing && !reader.failed
@@ -240,7 +309,7 @@ class RunCache
         observed.missing.add(path)
         index = index + 1
       end
-      let shared = reader.count(4096)
+      let shared = reader.count(NativeLinkLimits.dependencyCount())
 
       index = 0
       while index < shared && !reader.failed
@@ -273,7 +342,7 @@ class RunCache
     end
     let receipt = host::readText(this.directory + "/receipt")
 
-    return info.owned && info.kind == 1 && receipt != null && receipt == info.fingerprint && this.codegenIdentity.matches()
+    return info.owned && info.kind == 1 && receipt != null && receipt == info.fingerprint && this.inputs == this.snapshot() && this.codegenIdentity.matches()
   end
 
   private def objectReceipt(directory: String): String
@@ -293,11 +362,11 @@ class RunCache
     if objectDigest == "" || transportDigest == "" || before.fingerprint != after.fingerprint || transportBefore.fingerprint != transportAfter.fingerprint
       return ""
     end
-    return "neri-object-bundle-v1\n" + this.cacheKey + "\n" + objectDigest + "\n" + transportDigest + "\n"
+    return cacheFormatIdentity(CacheDomain.objectReceipt(), this.cacheKey) + "\n" + this.cacheKey + "\n" + objectDigest + "\n" + transportDigest + "\n"
   end
 
   private def nativeExecutableReceipt(staging: String, observed: NativeLinkInputs?): String
-    if observed == null || !observed.valid || observed.inputs.size == 0 || observed.inputs.size > 4096 || observed.missing.size > 4096 || observed.inputs.size != observed.digests.size
+    if observed == null || !observed.valid || observed.inputs.size == 0 || observed.inputs.size > NativeLinkLimits.dependencyCount() || observed.missing.size > NativeLinkLimits.dependencyCount() || observed.inputs.size != observed.digests.size
       return ""
     end
     let expected = observed.expectedSnapshot()
@@ -308,9 +377,10 @@ class RunCache
     if expected == "" || !this.privateDirectory(staging) || !before.owned || before.kind != 1 || before.fingerprint != after.fingerprint || digest == "" || observed.snapshot() != expected
       return ""
     end
-    let writer = new SemanticSnapshotWriter()
+    let writer = new CacheRecordWriter()
 
-    writer.string("neri-run-native-v2")
+    writer.string("neri-native-receipt")
+    writer.string(cacheFormatIdentity(CacheDomain.nativeReceipt(), this.cacheKey))
     writer.string(this.cacheKey)
     writer.string(digest)
     writer.string(expected)
@@ -319,7 +389,7 @@ class RunCache
     writer.stringBuffer(observed.shared)
     let receipt = writer.finish()
 
-    return receipt != null && host::stringByteLength(receipt) <= 4194304 ? receipt : ""
+    return receipt != null && host::stringByteLength(receipt) <= NativeLinkLimits.traceBytes() ? receipt : ""
   end
 
   def publish(staging: String, observed: NativeLinkInputs? = null): Bool

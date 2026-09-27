@@ -1,0 +1,376 @@
+use clock
+use console
+use files
+use host
+use json
+
+def main(): Void
+  let command = host::argumentAt(0)
+  var platform = ""
+  var jobId = ""
+  var regenerate = false
+  var index = 1
+
+  while index < host::argumentCount()
+    let flag = host::argumentAt(index)
+
+    if flag == "--snapshot" && !regenerate
+      regenerate = true
+      index = index + 1
+      continue
+    end
+    let value = host::argumentAt(index + 1)
+
+    if flag == null || value == null
+      console::println("invalid arguments")
+      host::exit(2)
+      return
+    end
+    if flag == "--platform" && platform == "" && (value == "macos" || value == "linux" || value == "windows")
+      platform = value
+    else if flag == "--job" && jobId == "" && safeId(value)
+      jobId = value
+    else
+      console::println("invalid arguments")
+      host::exit(2)
+      return
+    end
+    index = index + 2
+  end
+  if command != "doctor" && command != "plan" && command != "provision" && command != "run" && command != "snapshot"
+    console::println("usage: neri-local-ci doctor|plan|provision|run|snapshot [--platform macos|linux|windows] [--job id] [--snapshot]")
+    host::exit(2)
+    return
+  end
+  let assetDir = host::environment("NERI_CI_ASSET_DIR")
+  let stateDir = host::environment("NERI_CI_STATE_DIR")
+
+  if assetDir == null || stateDir == null || !absolute(assetDir) || !absolute(stateDir)
+    console::println("NERI_CI_ASSET_DIR and NERI_CI_STATE_DIR must be absolute")
+    host::exit(2)
+    return
+  end
+  if files::createDirectory(stateDir, true).failure != null
+    console::println("cannot create local CI state directory")
+    host::exit(2)
+    return
+  end
+  var localPath = stateDir + "/config.json"
+  let localStatus = files::status(localPath)
+  let localFile = localStatus.status
+
+  if localStatus.failure != null || localFile == null
+    console::println("cannot inspect local CI configuration")
+    host::exit(2)
+    return
+  end
+  if !localFile.exists
+    localPath = assetDir + "/local-ci.json"
+  end
+  let matrix = readObject(assetDir + "/matrix.json")
+  let providersDocument = readObject(assetDir + "/providers.json")
+  let localConfig = readObject(localPath)
+
+  if matrix == null || providersDocument == null || localConfig == null || integer(matrix, "schemaVersion") != 1 || integer(providersDocument, "schemaVersion") != 1 || integer(localConfig, "schemaVersion") != 1 || field(matrix, "schedule") != "sequential"
+    console::println("invalid CI configuration")
+    host::exit(2)
+    return
+  end
+  let provisionTimeout = infrastructureTimeout(localConfig, "provisionTimeoutSeconds")
+  let bootTimeout = infrastructureTimeout(localConfig, "bootTimeoutSeconds")
+
+  if provisionTimeout == null || bootTimeout == null
+    console::println("invalid infrastructure timeouts")
+    host::exit(2)
+    return
+  end
+  let jobs = matrix.get("jobs")
+  let providers = providersDocument.get("providers")
+  let localProviders = localConfig.get("providers")
+
+  if jobs == null || jobs.kind() != "array" || jobs.count() == 0 || jobs.count() > 128 || providers == null || providers.kind() != "object" || localProviders == null || localProviders.kind() != "object"
+    console::println("invalid CI catalog")
+    host::exit(2)
+    return
+  end
+  var count = 0
+  var passed = 0
+  var failed = 0
+  var pending = 0
+  let matrixDigest = digest(assetDir + "/matrix.json")
+  let providerDigest = digest(assetDir + "/providers.json")
+  let localDigest = digest(localPath)
+
+  if matrixDigest == null || providerDigest == null || localDigest == null
+    console::println("cannot hash CI inputs")
+    host::exit(2)
+    return
+  end
+  console::println("matrix sha256=" + matrixDigest + " providers sha256=" + providerDigest + " config sha256=" + localDigest)
+  let archive = command == "provision" || command == "run" || command == "snapshot" || regenerate ? archiveReady(stateDir) : ""
+  let archiveHash = archive == null || archive == "" ? "" : snapshotFileSha256(archive)
+
+  if command == "snapshot"
+    if archive == null || archiveHash == null
+      console::println("FAIL snapshot: source archive unavailable or changed")
+      host::exit(1)
+    else
+      console::println("SNAPSHOT " + archive + " sha256=" + archiveHash)
+    end
+    return
+  end
+
+  var allIds: String[] = []
+  var providerOrder: String[] = []
+  var lastProvider = ""
+
+  index = 0
+  while index < jobs.count()
+    let job = jobs.at(index)
+
+    if job == null || job.kind() != "object"
+      console::println("invalid job record")
+      host::exit(2)
+      return
+    end
+    let problem = validateJob(job, providers)
+    let id = field(job, "id")
+    let provider = field(job, "provider")
+
+    if problem != "" || id == null || provider == null || containsString(allIds, id) || localProviders.get(provider) == null
+      console::println("invalid or duplicate job: " + problem)
+      host::exit(2)
+      return
+    end
+    if provider != lastProvider
+      if containsString(providerOrder, provider)
+        console::println("provider jobs must be contiguous in the shared matrix")
+        host::exit(2)
+        return
+      end
+      providerOrder = host::appendString(providerOrder, provider)
+      lastProvider = provider
+    end
+    allIds = host::appendString(allIds, id)
+    index = index + 1
+  end
+  var provisioned: String[] = []
+  var activeProvider = ""
+  var activeInstance = ""
+  var activeIdentity = ""
+  var activeJob: json::Value? = null
+  var blockedProvider = ""
+
+  index = 0
+  while index < jobs.count()
+    let job = jobs.at(index)
+
+    if job == null || !selected(job, platform, jobId)
+      index = index + 1
+      continue
+    end
+    let id = field(job, "id")
+    let provider = field(job, "provider")
+    let minutes = integer(job, "timeoutMinutes")
+
+    if id == null || provider == null || minutes == null
+      host::exit(2)
+      return
+    end
+    count = count + 1
+    if command == "plan"
+      console::println("PLAN " + id + " provider=" + provider + " deadline=" + (minutes as String) + "m")
+      index = index + 1
+      continue
+    end
+    if command == "run" && activeProvider != "" && activeProvider != provider
+      if activeJob == null || !cleanupProvider(assetDir, stateDir, localPath, activeProvider, activeJob, archive == null ? "" : archive, archiveHash == null ? "" : archiveHash, activeInstance) || !clearPrepared(stateDir, activeProvider, activeIdentity, activeInstance)
+        console::println("FAIL cleanup " + activeProvider)
+        failed = failed + 1
+      end
+      activeProvider = ""
+      activeInstance = ""
+      activeIdentity = ""
+      activeJob = null
+    end
+    if blockedProvider == provider
+      console::println("PENDING " + id + " provider unavailable after prior lifecycle failure")
+      pending = pending + 1
+      index = index + 1
+      continue
+    end
+    if command == "provision" && containsString(provisioned, provider)
+      console::println("READY " + id + " shared provider base")
+      index = index + 1
+      continue
+    end
+    let deadline = minutes * 60000
+
+    if command != "run" || activeProvider != provider
+      let doctor = providerRequest(assetDir, stateDir, localPath, provider, "doctor", job, "", "", 60000, "")
+      let doctorStatus = actionStatus(doctor)
+
+      if doctorStatus != "ready" && doctorStatus != "completed"
+        console::println((doctorStatus == "pending" ? "PENDING " : "FAIL ") + id + " doctor: " + actionReason(doctor))
+        if doctorStatus == "pending"
+          pending = pending + 1
+        else
+          failed = failed + 1
+        end
+        blockedProvider = provider
+        index = index + 1
+        continue
+      end
+    end
+    if command == "doctor"
+      console::println("READY " + id)
+      index = index + 1
+      continue
+    end
+    if archive == null || archiveHash == null
+      console::println("PENDING " + id + " source archive absent or SHA-256 mismatch")
+      pending = pending + 1
+      index = index + 1
+      continue
+    end
+    if command != "run" || activeProvider != provider
+      let identity = provisionIdentity(assetDir, provider, localDigest, providers)
+
+      if identity == null
+        console::println("FAIL " + id + " cannot hash provisioning inputs")
+        failed = failed + 1
+        blockedProvider = provider
+        index = index + 1
+        continue
+      end
+      let receiptPath = preparedPath(stateDir, provider)
+      let receiptStatus = files::status(receiptPath)
+      let receiptFile = receiptStatus.status
+
+      if receiptStatus.failure != null || receiptFile == null
+        console::println("FAIL " + id + " cannot inspect prepared provider receipt")
+        failed = failed + 1
+        blockedProvider = provider
+        index = index + 1
+        continue
+      end
+      let savedToken = receiptFile.exists ? preparedToken(stateDir, provider, identity) : ""
+
+      if savedToken == null
+        console::println("FAIL " + id + " prepared provider receipt invalid or configuration changed: " + receiptPath)
+        failed = failed + 1
+        blockedProvider = provider
+        index = index + 1
+        continue
+      end
+      if command == "provision" && savedToken != ""
+        provisioned = host::appendString(provisioned, provider)
+        console::println("READY " + id + " prepared instance=" + savedToken)
+        index = index + 1
+        continue
+      end
+      let token = savedToken == "" ? newInstanceId() : savedToken
+
+      if token == null
+        console::println("FAIL " + id + " cannot create a unique instance ID")
+        failed = failed + 1
+        index = index + 1
+        continue
+      end
+      if savedToken == ""
+        let provision = providerRequest(assetDir, stateDir, localPath, provider, "provision", job, archive, archiveHash, provisionTimeout, "", token)
+        let provisionStatus = actionStatus(provision)
+
+        if provisionStatus != "ready" && provisionStatus != "completed"
+          let cleaned = cleanupProvider(assetDir, stateDir, localPath, provider, job, archive, archiveHash, token)
+
+          console::println((provisionStatus == "pending" ? "PENDING " : "FAIL ") + id + " provision: " + actionReason(provision) + " cleanup=" + (cleaned ? "complete" : "failed"))
+          if provisionStatus == "pending" && cleaned
+            pending = pending + 1
+          else
+            failed = failed + 1
+          end
+          blockedProvider = provider
+          index = index + 1
+          continue
+        end
+      end
+      provisioned = host::appendString(provisioned, provider)
+      if command == "provision"
+        if !savePrepared(stateDir, provider, identity, token)
+          let cleaned = cleanupProvider(assetDir, stateDir, localPath, provider, job, archive, archiveHash, token)
+
+          console::println("FAIL " + id + " cannot persist prepared provider receipt cleanup=" + (cleaned ? "complete" : "failed"))
+          failed = failed + 1
+          blockedProvider = provider
+          index = index + 1
+          continue
+        end
+        console::println("READY " + id + " prepared instance=" + token)
+        index = index + 1
+        continue
+      end
+      let started = providerRequest(assetDir, stateDir, localPath, provider, "start", job, archive, archiveHash, bootTimeout, "", token)
+      let startStatus = actionStatus(started)
+
+      if startStatus != "ready" && startStatus != "completed"
+        let cleaned = cleanupProvider(assetDir, stateDir, localPath, provider, job, archive, archiveHash, token)
+        let cleared = cleaned && clearPrepared(stateDir, provider, identity, token)
+
+        console::println((startStatus == "pending" ? "PENDING " : "FAIL ") + id + " start: " + actionReason(started) + " cleanup=" + (cleared ? "complete" : "failed"))
+        if startStatus == "pending" && cleared
+          pending = pending + 1
+        else
+          failed = failed + 1
+        end
+        blockedProvider = provider
+        index = index + 1
+        continue
+      end
+      activeProvider = provider
+      activeInstance = token
+      activeIdentity = identity
+    end
+    activeJob = job
+    let jobStart = clock::milliseconds()
+
+    if jobStart == null
+      console::println("FAIL " + id + " monotonic clock unavailable")
+      failed = failed + 1
+      index = index + 1
+      continue
+    end
+    let outcome = runGuestJob(assetDir, stateDir, localPath, provider, job, archive, archiveHash, activeInstance, jobStart, deadline)
+
+    if outcome == "passed"
+      console::println("PASS " + id)
+      passed = passed + 1
+    else if outcome == "pending"
+      console::println("PENDING " + id)
+      pending = pending + 1
+    else
+      console::println("FAIL " + id)
+      failed = failed + 1
+    end
+    index = index + 1
+  end
+  if command == "run" && activeProvider != ""
+    if activeJob == null || !cleanupProvider(assetDir, stateDir, localPath, activeProvider, activeJob, archive == null ? "" : archive, archiveHash == null ? "" : archiveHash, activeInstance) || !clearPrepared(stateDir, activeProvider, activeIdentity, activeInstance)
+      console::println("FAIL cleanup " + activeProvider)
+      failed = failed + 1
+    end
+  end
+  if count == 0
+    console::println("no selected jobs")
+    host::exit(2)
+    return
+  end
+  if command == "plan"
+    console::println("summary planned=" + (count as String) + " executed=0")
+  else if command == "run"
+    console::println("summary selected=" + (count as String) + " passed=" + (passed as String) + " failed=" + (failed as String) + " pending=" + (pending as String))
+  else
+    console::println("summary selected=" + (count as String) + " failed=" + (failed as String) + " pending=" + (pending as String))
+  end
+  host::exit(failed == 0 && pending == 0 ? 0 : 1)
+end

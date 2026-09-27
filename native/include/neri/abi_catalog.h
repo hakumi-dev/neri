@@ -6,7 +6,7 @@
 #include <string.h>
 
 #define NERI_RUNTIME_ABI_MAJOR UINT16_C(1)
-#define NERI_RUNTIME_ABI_MINOR UINT16_C(33)
+#define NERI_RUNTIME_ABI_MINOR UINT16_C(34)
 
 enum neri_ir_effect_v1 {
   NERI_IR_EFFECT_READ_V1 = UINT32_C(1),
@@ -57,10 +57,15 @@ static inline uint16_t neri_abi_symbol_minimum_minor(const char *link_name) {
   uint16_t result = UINT16_C(0);
   if (link_name == NULL) return result;
   if (strncmp(link_name, "neri_rt_v1_file_", sizeof("neri_rt_v1_file_") - 1U) == 0 && result < UINT16_C(11)) result = UINT16_C(11);
+  if (strcmp(link_name, "neri_rt_v1_file_identity") == 0 && result < UINT16_C(34)) result = UINT16_C(34);
   if (strcmp(link_name, "neri_rt_v1_file_wait_readable") == 0 && result < UINT16_C(25)) result = UINT16_C(25);
   if (strncmp(link_name, "neri_rt_v1_interrupt_", sizeof("neri_rt_v1_interrupt_") - 1U) == 0 && result < UINT16_C(12)) result = UINT16_C(12);
   if (strncmp(link_name, "neri_rt_v1_clock_wall_", sizeof("neri_rt_v1_clock_wall_") - 1U) == 0 && result < UINT16_C(13)) result = UINT16_C(13);
   if (strncmp(link_name, "neri_rt_v1_crypto_", sizeof("neri_rt_v1_crypto_") - 1U) == 0 && result < UINT16_C(14)) result = UINT16_C(14);
+  if (strcmp(link_name, "neri_rt_v1_crypto_sha256_begin") == 0 && result < UINT16_C(34)) result = UINT16_C(34);
+  if (strcmp(link_name, "neri_rt_v1_crypto_sha256_update") == 0 && result < UINT16_C(34)) result = UINT16_C(34);
+  if (strcmp(link_name, "neri_rt_v1_crypto_sha256_finish") == 0 && result < UINT16_C(34)) result = UINT16_C(34);
+  if (strcmp(link_name, "neri_rt_v1_crypto_sha256_dispose") == 0 && result < UINT16_C(34)) result = UINT16_C(34);
   if (strncmp(link_name, "neri_rt_v1_file_root_", sizeof("neri_rt_v1_file_root_") - 1U) == 0 && result < UINT16_C(15)) result = UINT16_C(15);
   if (strncmp(link_name, "neri_rt_v1_process_", sizeof("neri_rt_v1_process_") - 1U) == 0 && result < UINT16_C(16)) result = UINT16_C(16);
   if (strcmp(link_name, "neri_rt_v1_process_spawn_input") == 0 && result < UINT16_C(22)) result = UINT16_C(22);

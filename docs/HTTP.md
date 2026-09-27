@@ -139,10 +139,10 @@ caller, which decides how to report them.
 
 ```ruby
 let options = new http::Options()
-options.onListening = fn(address)
+options.onListening = fn(address) do
   console::println("Listening on http://" + address)
 end
-options.log = fn(message)
+options.log = fn(message) do
   console::println(message)
 end
 ```

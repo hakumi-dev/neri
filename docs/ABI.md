@@ -1,9 +1,18 @@
 # Runtime and IR boundary
 
 The canonical exported declarations and layouts are in
-[`runtime_abi.h`](../native/include/neri/runtime_abi.h). Runtime ABI 1.33 uses a
+[`runtime_abi.h`](../native/include/neri/runtime_abi.h). Runtime ABI 1.34 uses a
 C calling convention on macOS ARM64, Linux x86-64 and Windows x86-64. Generated programs negotiate
 major version, minimum minor version and required feature bits before execution.
+
+ABI 1.34 adds the incremental SHA-256 `begin`, `update`, `finish` and `dispose`
+entries under `neri_rt_v1_crypto_sha256_`, and `neri_rt_v1_file_identity`.
+Successful hash creation transfers an opaque context to the caller: finish it
+at most once and dispose it exactly once, including after an update failure.
+Finish writes 32 digest bytes without releasing the context. File identity writes
+64 opaque observation bytes for an open descriptor; compare them within one
+process to detect file changes, not as a portable or persistent identifier.
+These entries require minor 34 and their existing `CRYPTO` or `FILES` capability.
 
 Checked C entry uses `neri_rt_v1_foreign_enter` and
 `neri_rt_v1_foreign_leave`. Each stack token records heap ownership and the

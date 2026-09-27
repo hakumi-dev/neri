@@ -1,0 +1,141 @@
+use crypto
+use files
+use host
+use json
+use result
+use text
+
+def safeProvisionAsset(path: String): Bool
+  if path == "" || path.byteLength() > 256
+    return false
+  end
+  var previous = 0
+  var index = 0
+
+  while index < path.byteLength()
+    let byte = path.byteAt(index)
+
+    if byte == null
+      return false
+    end
+    let code = byte as Int
+
+    if !((code >= 97 && code <= 122) || (code >= 65 && code <= 90) || (code >= 48 && code <= 57) || code == 45 || code == 95 || code == 46 || code == 47)
+      return false
+    end
+    if (code == 46 && (index == 0 || previous == 46 || previous == 47)) || (code == 47 && (index == 0 || previous == 47))
+      return false
+    end
+    previous = code
+    index = index + 1
+  end
+  return previous != 47
+end
+
+def provisionIdentity(assetDir: String, provider: String, localDigest: String, providers: json::Value): String?
+  let metadata = providers.get(provider)
+
+  if metadata == null || metadata.kind() != "object"
+    return null
+  end
+  let assets = metadata.get("provisioningAssets")
+
+  if assets == null || assets.kind() != "array" || assets.count() < 1 || assets.count() > 16
+    return null
+  end
+  var metadataText = ""
+
+  match json::stringify(metadata)
+    case result::Result.Error(failure)
+      return null
+    case result::Result.Ok(body)
+      metadataText = body
+  end
+  var identity = "local-ci-provision-v1\n" + provider + "\nconfig:" + localDigest + "\nmetadata:" + metadataText + "\n"
+  var index = 0
+
+  while index < assets.count()
+    let item = assets.at(index)
+
+    if item == null || item.kind() != "string"
+      return null
+    end
+    let path = item.text()
+
+    if path == null || !safeProvisionAsset(path)
+      return null
+    end
+    let observed = files::status(assetDir + "/" + path)
+    let status = observed.status
+
+    if observed.failure != null || status == null || !status.exists || !status.kind.isFile() || status.symlink
+      return null
+    end
+    let hashed = digest(assetDir + "/" + path)
+
+    if hashed == null
+      return null
+    end
+    identity = identity + path + ":" + hashed + "\n"
+    index = index + 1
+  end
+  let bytes = crypto::sha256(text::bytes(identity)).bytes()
+
+  return bytes == null ? null : crypto::encodeHex(bytes)
+end
+
+def preparedPath(stateDir: String, provider: String): String
+  return stateDir + "/prepared/" + provider + ".json"
+end
+
+def preparedToken(stateDir: String, provider: String, configDigest: String): String?
+  let receipt = readObject(preparedPath(stateDir, provider))
+
+  if receipt == null || integer(receipt, "schemaVersion") != 1 || field(receipt, "provider") != provider || field(receipt, "configSha256") != configDigest
+    return null
+  end
+  let token = field(receipt, "instanceId")
+
+  return token != null && token.byteLength() == 35 && host::stringSlice(token, 0, 3) == "ci-" && safeId(token) ? token : null
+end
+
+def savePrepared(stateDir: String, provider: String, configDigest: String, token: String): Bool
+  let directory = stateDir + "/prepared"
+
+  if files::createDirectory(directory, true).failure != null
+    return false
+  end
+  let receipt = json::Value.object()
+  let version = json::Value.number("1")
+
+  if version == null
+    return false
+  end
+  receipt.put("schemaVersion", version)
+  receipt.put("provider", json::Value.string(provider))
+  receipt.put("configSha256", json::Value.string(configDigest))
+  receipt.put("instanceId", json::Value.string(token))
+  match json::stringify(receipt)
+    case result::Result.Error(failure)
+      return false
+    case result::Result.Ok(body)
+      return host::writeText(preparedPath(stateDir, provider), body)
+  end
+end
+
+def clearPrepared(stateDir: String, provider: String, configDigest: String, token: String): Bool
+  let path = preparedPath(stateDir, provider)
+  let checked = files::status(path)
+  let status = checked.status
+
+  if checked.failure != null || status == null
+    return false
+  end
+  if !status.exists
+    return true
+  end
+  if preparedToken(stateDir, provider, configDigest) != token
+    return false
+  end
+  return files::removeFile(path).failure == null
+end

@@ -1,0 +1,200 @@
+use crypto
+use files
+use host
+use json
+use result
+
+def field(object: json::Value, key: String): String?
+  let value = object.get(key)
+
+  return value == null || value.kind() != "string" ? null : value.text()
+end
+
+def integer(object: json::Value, key: String): Int?
+  let value = object.get(key)
+
+  if value == null || value.kind() != "number"
+    return null
+  end
+  let textValue = value.text()
+
+  return textValue == null ? null : host::parseInt(textValue)
+end
+
+def infrastructureTimeout(config: json::Value, key: String): Int?
+  let settings = config.get("orchestration")
+
+  if settings == null
+    return 7200000
+  end
+  if settings.kind() != "object"
+    return null
+  end
+  let seconds = integer(settings, key)
+
+  if seconds == null
+    return 7200000
+  end
+  return seconds >= 60 && seconds <= 21600 ? seconds * 1000 : null
+end
+
+def readObject(path: String): json::Value?
+  let read = files::readBytes(path, 1048576)
+  let bytes = read.bytes
+
+  if read.failure != null || read.closeFailure != null || bytes == null
+    return null
+  end
+  match json::parseBytes(bytes)
+    case result::Result.Ok(value)
+      return value.kind() == "object" ? value : null
+    case result::Result.Error(failure)
+      return null
+  end
+end
+
+def digest(path: String): String?
+  let read = files::readBytes(path, 1048576)
+  let bytes = read.bytes
+
+  if read.failure != null || read.closeFailure != null || bytes == null
+    return null
+  end
+  let value = crypto::sha256(bytes).bytes()
+
+  return value == null ? null : crypto::encodeHex(value)
+end
+
+def safeId(value: String): Bool
+  if value == "" || value.byteLength() > 96
+    return false
+  end
+  var index = 0
+
+  while index < value.byteLength()
+    let byte = value.byteAt(index)
+
+    if byte == null
+      return false
+    end
+    let code = byte as Int
+
+    if !((code >= 97 && code <= 122) || (code >= 48 && code <= 57) || code == 45)
+      return false
+    end
+    index = index + 1
+  end
+  return true
+end
+
+def absolute(path: String): Bool
+  if path == "" || path.byteLength() > 4096
+    return false
+  end
+  if path.byteAt(0) == (47 as Byte)
+    return true
+  end
+  return path.byteLength() >= 3 && path.byteAt(1) == (58 as Byte) && (path.byteAt(2) == (47 as Byte) || path.byteAt(2) == (92 as Byte))
+end
+
+def validArguments(value: json::Value?): Bool
+  if value == null || value.kind() != "array" || value.count() < 1 || value.count() > 64
+    return false
+  end
+  var index = 0
+
+  while index < value.count()
+    let entry = value.at(index)
+
+    if entry == null || entry.kind() != "string"
+      return false
+    end
+    let token = entry.text()
+
+    if token == null || token.byteLength() > 4096
+      return false
+    end
+    var offset = 0
+
+    while offset < token.byteLength()
+      if token.byteAt(offset) == (0 as Byte)
+        return false
+      end
+      offset = offset + 1
+    end
+    index = index + 1
+  end
+  return true
+end
+
+def argument(value: json::Value, index: Int): String?
+  let entry = value.at(index)
+
+  return entry == null || entry.kind() != "string" ? null : entry.text()
+end
+
+def providerPlatform(provider: String): String
+  return "macos" if provider == "macos-tart"
+  return "linux" if provider == "linux-lima-qemu"
+  return "windows" if provider == "windows-qemu-tcg"
+  return ""
+end
+
+def selected(job: json::Value, platform: String, jobId: String): Bool
+  let id = field(job, "id")
+  let provider = field(job, "provider")
+
+  if id == null || provider == null
+    return false
+  end
+  return (platform == "" || platform == providerPlatform(provider)) && (jobId == "" || jobId == id)
+end
+
+def validateJob(job: json::Value, providers: json::Value): String
+  let id = field(job, "id")
+  let provider = field(job, "provider")
+  let platform = provider == null ? "" : providerPlatform(provider)
+  let operatingSystem = field(job, "os")
+  let architecture = field(job, "architecture")
+  let setup = field(job, "setup")
+  let timeout = integer(job, "timeoutMinutes")
+
+  if id == null || !safeId(id) || provider == null || platform == "" || providers.get(provider) == null
+    return "invalid job identity or provider"
+  end
+  if operatingSystem == null || architecture == null || setup == null || !safeId(setup) || timeout == null || timeout < 1 || timeout > 180
+    return "invalid job platform, setup or timeout"
+  end
+  let argv = job.get("argv")
+
+  if !validArguments(argv)
+    return "invalid job argv"
+  end
+  let post = job.get("postArgv")
+
+  if post != null && !validArguments(post)
+    return "invalid post argv"
+  end
+  if platform == "macos" && (operatingSystem != "macOS 15" || architecture != "arm64")
+    return "provider target mismatch"
+  end
+  if platform == "linux" && (operatingSystem != "Ubuntu 24.04" || architecture != "x86_64")
+    return "provider target mismatch"
+  end
+  if platform == "windows" && (operatingSystem != "Windows Server 2025" || architecture != "x86_64")
+    return "provider target mismatch"
+  end
+  if argv == null
+    return "missing job argv"
+  end
+  if platform == "windows"
+    if argv.count() != 8 || argument(argv, 0) != "pwsh" || argument(argv, 1) != "-NoProfile" || argument(argv, 2) != "-File" || argument(argv, 3) != "scripts/ci/jobs.ps1" || argument(argv, 4) != "-Action" || argument(argv, 5) != "run" || argument(argv, 6) != "-Job" || argument(argv, 7) != id
+      return "job command does not match the shared guest wrapper"
+    end
+  else
+    if argv.count() != 4 || argument(argv, 0) != "bash" || argument(argv, 1) != "scripts/ci/jobs.sh" || argument(argv, 2) != "run" || argument(argv, 3) != id
+      return "job command does not match the shared guest wrapper"
+    end
+  end
+  return ""
+end

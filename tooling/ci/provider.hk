@@ -1,0 +1,244 @@
+use clock
+use console
+use crypto
+use files
+use host
+use json
+use process
+use result
+use text
+
+def outputText(bytes: Byte[]): String
+  let decoded = text::fromBytes(bytes)
+
+  return decoded == null ? "" : decoded
+end
+
+def pendingResponse(provider: String, action: String, reason: String): json::Value
+  let value = json::Value.object()
+  let version = json::Value.number("1")
+
+  if version != null
+    value.put("schemaVersion", version)
+  end
+  value.put("provider", json::Value.string(provider))
+  value.put("action", json::Value.string(action))
+  value.put("status", json::Value.string("pending"))
+  value.put("reason", json::Value.string(reason))
+  return value
+end
+
+def remaining(start: Int, limit: Int): Int
+  let now = clock::milliseconds()
+
+  if now == null || now < start || now - start >= limit
+    return 0
+  end
+  return limit - (now - start)
+end
+
+def newInstanceId(): String?
+  let random = crypto::randomBytes(16).bytes()
+
+  if random == null
+    return null
+  end
+  let encoded = crypto::encodeHex(random)
+
+  return encoded == null ? null : "ci-" + encoded
+end
+
+def existingEvidence(path: String?, directory: String): Bool
+  if path == null || !absolute(path) || path.byteLength() <= directory.byteLength() || host::stringSlice(path, 0, directory.byteLength() + 1) != directory + "/"
+    return false
+  end
+  let checked = files::status(path)
+  let value = checked.status
+
+  return checked.failure == null && value != null && value.exists && value.kind.isFile() && !value.symlink
+end
+
+def runProcess(executable: String, arguments: String[], timeoutMilliseconds: Int, outputLimit: Int = 1048576): process::PollResult?
+  let options = new process::SpawnOptions(executable)
+
+  options.arguments = arguments
+  options.stdoutLimit = outputLimit
+  options.stderrLimit = 1048576
+  let started = process::spawn(options)
+  let child = started.child()
+
+  if started.failure() != null || child == null
+    return null
+  end
+  let began = clock::milliseconds()
+
+  if began == null
+    child.cancel()
+    child.dispose()
+    return null
+  end
+  var result = child.wait(1000)
+
+  while result.running && result.failure == null
+    let now = clock::milliseconds()
+
+    if now == null || now - began >= timeoutMilliseconds
+      child.cancel()
+      child.wait(5000)
+      child.dispose()
+      return null
+    end
+    let remaining = timeoutMilliseconds - (now - began)
+
+    result = child.wait(remaining < 60000 ? remaining : 60000)
+  end
+  return child.dispose() ? result : null
+end
+
+def providerRequest(assetDir: String, stateDir: String, configPath: String, provider: String, action: String, job: json::Value?, archive: String, sourceHash: String, timeout: Int, phase: String, instance: String = ""): json::Value?
+  let adapter = assetDir + "/providers/" + provider + ".sh"
+  let checked = files::status(adapter)
+  let status = checked.status
+
+  if timeout <= 0
+    return null
+  end
+  if checked.failure != null || status == null || !status.exists || !status.kind.isFile()
+    return pendingResponse(provider, action, "provider adapter is unavailable: " + adapter)
+  end
+  let request = json::Value.object()
+  let version = json::Value.number("1")
+  let timeoutValue = json::Value.number((timeout / 1000) as String)
+
+  if version == null || timeoutValue == null
+    return null
+  end
+  request.put("schemaVersion", version)
+  request.put("provider", json::Value.string(provider))
+  request.put("configPath", json::Value.string(configPath))
+  request.put("stateRoot", json::Value.string(stateDir))
+  request.put("sourceArchive", json::Value.string(archive))
+  request.put("sourceSha256", json::Value.string(sourceHash))
+  request.put("timeoutSeconds", timeoutValue)
+  if instance != ""
+    request.put("instanceId", json::Value.string(instance))
+  end
+  if job != null
+    let id = field(job, "id")
+
+    if id == null
+      return null
+    end
+    request.put("jobId", json::Value.string(id))
+    let resultDirectory = stateDir + "/results/" + id
+
+    if files::createDirectory(resultDirectory, true).failure != null
+      return null
+    end
+    request.put("resultDirectory", json::Value.string(resultDirectory))
+  end
+  if action == "exec" && job != null
+    let id = field(job, "id")
+    let declared = job.get("argv")
+
+    if id == null || declared == null
+      return null
+    end
+    let argv = json::Value.array()
+    var index = 0
+
+    while index < declared.count()
+      let token = argument(declared, index)
+
+      if token == null
+        return null
+      end
+      var selectedToken = token
+
+      if phase == "prepare" && ((provider == "windows-qemu-tcg" && index == 5) || (provider != "windows-qemu-tcg" && index == 2))
+        selectedToken = "prepare"
+      end
+      argv.add(json::Value.string(selectedToken))
+      index = index + 1
+    end
+    request.put("argv", argv)
+  end
+  let serialized = json::stringify(request)
+
+  match serialized
+    case result::Result.Error(failure)
+      return null
+    case result::Result.Ok(body)
+      let requestDirectory = stateDir + "/requests"
+
+      if files::createDirectory(requestDirectory, true).failure != null
+        return null
+      end
+      let path = requestDirectory + "/" + provider + "-" + action + "-" + phase + ".json"
+
+      if !host::writeText(path, body)
+        return null
+      end
+      let completed = runProcess("/bin/bash", [adapter, action, "--request-json", path], timeout)
+
+      if completed == null || completed.failure != null || completed.stdoutTruncated || completed.stderrTruncated
+        return null
+      end
+      let exit = completed.exit
+
+      if exit == null || !exit.isExited()
+        return null
+      end
+      match json::parse(outputText(completed.stdout))
+        case result::Result.Error(problem)
+          return null
+        case result::Result.Ok(response)
+          if response.kind() != "object" || integer(response, "schemaVersion") != 1 || field(response, "provider") != provider || field(response, "action") != action
+            return null
+          end
+          let state = field(response, "status")
+
+          if state != "ready" && state != "completed" && state != "pending" && state != "failed"
+            return null
+          end
+          if exit.value() != 0 && state != "failed"
+            return null
+          end
+          let observedInstance = field(response, "instanceId")
+
+          if instance != "" && observedInstance != null && observedInstance != instance
+            return null
+          end
+          if instance != "" && action == "start" && (state == "ready" || state == "completed") && observedInstance != instance
+            return null
+          end
+          if action == "exec" && state == "completed"
+            let id = job == null ? null : field(job, "id")
+
+            if id == null || integer(response, "exitCode") != 0
+              return null
+            end
+            let resultDirectory = stateDir + "/results/" + id
+
+            if !existingEvidence(field(response, "stdoutPath"), resultDirectory) || !existingEvidence(field(response, "stderrPath"), resultDirectory) || !existingEvidence(field(response, "evidencePath"), resultDirectory)
+              return null
+            end
+          end
+          return response
+      end
+  end
+end
+
+def actionStatus(response: json::Value?): String
+  return "failed" if response == null
+  let value = field(response, "status")
+
+  return value == null ? "failed" : value
+end
+
+def actionReason(response: json::Value?): String
+  return "provider adapter failed or returned an invalid response" if response == null
+  let reason = field(response, "reason")
+
+  return reason == null ? "" : reason
+end

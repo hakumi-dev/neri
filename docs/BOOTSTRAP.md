@@ -190,7 +190,7 @@ dependencies; an existing executable alone is insufficient. Stage messages
 distinguish execution from reuse and include elapsed milliseconds.
 
 Compiler artifacts use immutable generations under
-`artifacts-v2/<key>/generation.<id>` within their private cache. Publication first
+`artifacts/<key>/generation.<id>` within their private cache. Publication first
 renames a complete staging directory, then atomically replaces the key's
 `selected` record. Readers retain their selected generation while a repair or
 concurrent writer publishes another. Corrupt entries cause fresh publication;

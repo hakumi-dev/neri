@@ -121,7 +121,7 @@ static void completion_contract(void) {
   open_document("file:///completion-callback.hk",
     "def main(): Void\n"
     "  let captured = \"outer\"\n"
-    "  let callback: fn(): Void = fn()\n"
+    "  let callback: fn(): Void = fn() do\n"
     "    let nested = 1\n"
     "    let copy = captured\n"
     "  end\n"

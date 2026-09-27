@@ -12,10 +12,11 @@ For a generated context bound to a provider:
 
 ```neri
 let options = new StreamOptions(timeoutMilliseconds: 5000)
-let result = db.customers.where(active: true).stream(fn(customer: Customer): Bool
+let visitor: fn(Customer): Bool = fn(customer: Customer): Bool do
   consumeCustomer(customer)
   return true
-end, options)
+end
+let result = db.customers.where(active: true).stream(visitor, options)
 ```
 
 `stream(visitor, options)` selects the bound provider.
@@ -36,10 +37,11 @@ source entity's unselected fields.
 let customerName = quote do |customer: Customer|: String
   return customer.name
 end
-let result = select(db.customers, textScalar(), customerName).stream(fn(name: String): Bool
+let visitor: fn(String): Bool = fn(name: String): Bool do
   consumeName(name)
   return true
-end)
+end
+let result = select(db.customers, textScalar(), customerName).stream(visitor)
 ```
 
 Join streams deliver `Joined<L, R>` or `LeftJoined<L, R>` pairs. A left join's

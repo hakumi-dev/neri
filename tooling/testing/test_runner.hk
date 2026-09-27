@@ -1,0 +1,396 @@
+use host
+use files
+use json
+use result
+use console
+use process
+use buffers
+use clock
+
+class TestRunner
+  public config: RunnerConfig
+  public catalog: TestCatalog
+  public passed: Int = 0
+  public failed: Int = 0
+  public unsupported: Int = 0
+  public filtered: Int = 0
+  public requiredUnavailable: Int = 0
+  public executed: Int = 0
+  private unitRecords: String[] = []
+  private unitBuildError: String = ""
+  private resultsBuffer: buffers::TextBuffer?
+  private reportError: String = ""
+
+  def init(config: RunnerConfig, catalog: TestCatalog): Void
+    this.config = config
+    this.catalog = catalog
+  end
+
+  private def selected(item: CatalogCase): Bool
+    return this.config.filter == "" || catalogContains(item.id, this.config.filter)
+  end
+
+  private def missing(item: CatalogCase): String
+    if item.targets.Length > 0 && !catalogIncludes(item.targets, this.config.target)
+      return "target " + this.config.target + " is not applicable"
+    end
+    for capability in item.capabilities
+      if !catalogIncludes(this.config.capabilities, capability)
+        return "capability " + capability + " is unavailable"
+      end
+    end
+    if item.kind == "external" && this.config.adapterPath(item.adapter) == ""
+      return "adapter " + item.adapter + " is unavailable"
+    end
+    return ""
+  end
+
+  private def requiredUnits(): String[]
+    var names: String[] = []
+
+    for item in this.catalog.cases
+      if item.kind == "unit" && this.selected(item) && this.missing(item) == "" && !catalogIncludes(names, item.unit)
+        names = host::appendString(names, item.unit)
+      end
+    end
+    return names
+  end
+
+  private def prepareUnits(): Void
+    let names = this.requiredUnits()
+
+    if names.Length == 0
+      return
+    end
+    let suite = json::Value.object()
+    let units = json::Value.array()
+    let version = json::Value.number("1")
+
+    if version == null
+      this.unitBuildError = "cannot create unit suite"
+      return
+    end
+    for name in names
+      units.add(json::Value.string(name))
+    end
+    suite.put("version", version)
+    suite.put("units", units)
+    var suiteText = ""
+
+    match json::stringify(suite)
+      case result::Result.Ok(value)
+        suiteText = value
+      case result::Result.Error(failure)
+        this.unitBuildError = "cannot encode unit suite"
+        return
+    end
+    let suitePath = this.config.work + "/selected-units.json"
+    let project = this.config.root + "/manifest.json"
+
+    if !host::writeText(suitePath, suiteText)
+      this.unitBuildError = "cannot write unit suite"
+      return
+    end
+    let inventory = new RunnerProcess(this.config.compiler, ["project-units", "--project", project, "--test-suite", suitePath], this.config.root, [], 60000)
+
+    if inventory.error != "" || inventory.exitCode != 0
+      this.unitBuildError = "cannot resolve unit metadata: " + inventory.error + " " + inventory.stderr
+      return
+    end
+    this.unitRecords = lines(inventory.stdout)
+    if this.unitRecords.Length != names.Length
+      this.unitBuildError = "unit inventory count differs from catalog selection"
+      return
+    end
+    let directory = this.config.work + "/units"
+
+    if files::createDirectory(directory, true).failure != null
+      this.unitBuildError = "cannot create unit output directory"
+      return
+    end
+    var arguments: String[] = ["build-batch", "--project", project, "--output-dir", directory]
+
+    for name in names
+      arguments = host::appendString(arguments, "--unit")
+      arguments = host::appendString(arguments, name)
+    end
+    let build = new RunnerProcess(this.config.compiler, arguments, this.config.root, [], 3600000)
+
+    if build.error != "" || build.exitCode != 0
+      this.unitBuildError = "unit batch build failed: " + build.error + " " + build.stderr
+    end
+  end
+
+  private def unitRecord(name: String): ToolingTestCase?
+    for record in this.unitRecords
+      let parsed = new ToolingTestCase(record)
+
+      if parsed.name == name
+        return parsed
+      end
+    end
+    return null
+  end
+
+  private def expand(value: String): String
+    return this.config.root if value == "{root}"
+    return this.config.root if value == "{project}"
+    return this.config.compiler if value == "{compiler}"
+    return this.config.nativeDirectory if value == "{native}"
+    return this.config.work if value == "{work}"
+    return this.config.target if value == "{target}"
+    return value
+  end
+
+  private def execute(item: CatalogCase): RunnerResult
+    let result = new RunnerResult(item.id)
+    var executable = this.config.compiler
+    var arguments: String[] = []
+
+    if item.kind == "language"
+      arguments = host::appendString(arguments, item.command)
+      for source in item.sources
+        arguments = host::appendString(arguments, this.config.root + "/" + source)
+      end
+      arguments = host::appendString(arguments, "--target")
+      arguments = host::appendString(arguments, this.config.target)
+      if item.releaseMode == "always" || (item.releaseMode == "inherit" && this.config.release)
+        arguments = host::appendString(arguments, "--release")
+      end
+    else if item.kind == "unit"
+      if this.unitBuildError != ""
+        result.status = "failed"
+        result.reason = this.unitBuildError
+        return result
+      end
+      let metadata = this.unitRecord(item.unit)
+
+      if metadata == null
+        result.status = "failed"
+        result.reason = "unit metadata is absent"
+        return result
+      end
+      let suffix = this.config.target == "windows-x86_64" ? ".exe" : ""
+
+      executable = this.config.work + "/units/" + item.unit + suffix
+      arguments = metadata.resolveArguments(this.config.root, this.config.compiler, this.config.work + "/units")
+    else
+      executable = this.config.adapterPath(item.adapter)
+      arguments = ["--id", item.id, "--root", this.config.root, "--compiler", this.config.compiler, "--native", this.config.nativeDirectory, "--work", this.config.work, "--target", this.config.target]
+    end
+    for argument in item.arguments
+      arguments = host::appendString(arguments, this.expand(argument))
+    end
+    result.executed = true
+    let run = new RunnerProcess(executable, arguments, this.config.root, [], item.timeoutMs)
+
+    result.exitCode = run.exitCode
+    result.durationMs = run.durationMs
+    result.stdout = run.stdout
+    result.stderr = run.stderr
+    if run.error != ""
+      result.status = "failed"
+      result.reason = run.error
+      return result
+    end
+    if result.exitCode != item.expectedExit
+      result.status = "failed"
+      result.reason = "exit code differs from expected " + (item.expectedExit as String)
+      return result
+    end
+    if item.stdoutExact != null && result.stdout != item.stdoutExact
+      result.status = "failed"
+      result.reason = "stdout differs"
+      return result
+    end
+    if item.stderrExact != null && result.stderr != item.stderrExact
+      result.status = "failed"
+      result.reason = "stderr differs"
+      return result
+    end
+    let expectedOutput = item.outputContains
+
+    if expectedOutput != null && !catalogContains(result.stdout + result.stderr, expectedOutput)
+      result.status = "failed"
+      result.reason = "expected output is absent"
+      return result
+    end
+    let assertions = item.assertions
+
+    if assertions != null
+      var index = 0
+
+      while index < assertions.count()
+        let assertion = assertions.at(index)
+
+        if assertion == null
+          result.status = "failed"
+          result.reason = "invalid assertion"
+          return result
+        end
+        let kind = catalogString(assertion, "kind")
+
+        if kind == "stdoutContains"
+          if !catalogContains(result.stdout, catalogString(assertion, "text"))
+            result.status = "failed"
+            result.reason = "stdout assertion is absent"
+            return result
+          end
+        else if kind == "stdoutLineCountContains"
+          if catalogLineCount(result.stdout, [catalogString(assertion, "needle")]) != catalogInteger(assertion, "count", -1)
+            result.status = "failed"
+            result.reason = "stdout line count differs"
+            return result
+          end
+        else if kind == "stdoutLineCountContainsAny"
+          let needles = catalogStrings(assertion, "needles")
+
+          if needles == null || catalogLineCount(result.stdout, needles) != catalogInteger(assertion, "count", -1)
+            result.status = "failed"
+            result.reason = "stdout alternative line count differs"
+            return result
+          end
+        else
+          result.status = "failed"
+          result.reason = "unknown assertion kind: " + kind
+          return result
+        end
+        index = index + 1
+      end
+    end
+    result.status = "passed"
+    return result
+  end
+
+  private def record(item: CatalogCase, result: RunnerResult, index: Int): Void
+    let label = this.config.work + "/case-" + (index as String)
+
+    if result.executed
+      if !host::writeText(label + ".stdout", result.stdout) || !host::writeText(label + ".stderr", result.stderr)
+        this.reportError = "cannot write case output"
+      end
+    end
+    let line = result.jsonLine()
+
+    if line == ""
+      this.reportError = "cannot encode case result"
+    end
+    let buffer = this.resultsBuffer
+
+    if buffer == null || !buffer.append(line)
+      this.reportError = "cannot buffer case results"
+    end
+    console::println(result.status + " " + item.id + (result.reason == "" ? "" : " — " + result.reason))
+    if result.status == "passed"
+      this.passed = this.passed + 1
+    else if result.status == "failed"
+      this.failed = this.failed + 1
+    else if result.status == "filtered"
+      this.filtered = this.filtered + 1
+    else
+      this.unsupported = this.unsupported + 1
+      this.requiredUnavailable = this.requiredUnavailable + 1 if item.required(this.config.target, this.config.release)
+    end
+    this.executed = this.executed + 1 if result.executed
+  end
+
+  def run(): Bool
+    let startedAt = clock::milliseconds()
+
+    if startedAt == null
+      console::println("Monotonic clock unavailable.")
+      return false
+    end
+    if files::createDirectory(this.config.work, true).failure != null
+      console::println("Cannot create runner work directory.")
+      return false
+    end
+    this.resultsBuffer = buffers::TextBuffer.create(8388608, 65536)
+
+    if this.resultsBuffer == null
+      console::println("Cannot allocate results buffer.")
+      return false
+    end
+    this.prepareUnits()
+    var index = 0
+
+    for item in this.catalog.cases
+      var result = new RunnerResult(item.id)
+
+      if !this.selected(item)
+        result.status = "filtered"
+        result.reason = "excluded by filter"
+      else
+        let missing = this.missing(item)
+
+        if missing != ""
+          result.status = "unsupported"
+          result.reason = missing
+        else
+          result = this.execute(item)
+        end
+      end
+      this.record(item, result, index)
+      index = index + 1
+    end
+    let results = this.resultsBuffer
+    let resultsText = results == null ? null : results.snapshot()
+
+    if resultsText == null || !host::writeText(this.config.work + "/results.jsonl", resultsText)
+      this.reportError = "cannot write case results"
+    end
+    let endedAt = clock::milliseconds()
+    let durationMs = endedAt == null || endedAt < startedAt ? 0 : endedAt - startedAt
+    let summary = json::Value.object()
+
+    summary.put("catalogSha256", json::Value.string(this.catalog.digest))
+    summary.put("target", json::Value.string(this.config.target))
+    summary.put("release", json::Value.boolean(this.config.release))
+    summary.put("complete", json::Value.boolean(this.filtered == 0 && this.requiredUnavailable == 0))
+    runnerNumber(summary, "total", this.catalog.cases.Length)
+    runnerNumber(summary, "passed", this.passed)
+    runnerNumber(summary, "failed", this.failed)
+    runnerNumber(summary, "unsupported", this.unsupported)
+    runnerNumber(summary, "filtered", this.filtered)
+    runnerNumber(summary, "requiredUnavailable", this.requiredUnavailable)
+    runnerNumber(summary, "selected", this.catalog.cases.Length - this.filtered)
+    runnerNumber(summary, "executed", this.executed)
+    runnerNumber(summary, "durationMs", durationMs)
+    var summaryText = ""
+
+    match json::stringify(summary)
+      case result::Result.Ok(value)
+        summaryText = value + "\n"
+      case result::Result.Error(failure)
+        console::println("Cannot encode runner summary.")
+        return false
+    end
+    if !host::writeText(this.config.work + "/summary.json", summaryText)
+      console::println("Cannot write runner summary.")
+      return false
+    end
+    console::println("Catalog " + this.catalog.digest + " total=" + (this.catalog.cases.Length as String) + " passed=" + (this.passed as String) + " failed=" + (this.failed as String) + " unsupported=" + (this.unsupported as String) + " filtered=" + (this.filtered as String))
+    return this.reportError == "" && this.failed == 0 && this.requiredUnavailable == 0 && (!this.config.release || this.filtered == 0)
+  end
+end
+
+def runnerNumber(value: json::Value, name: String, number: Int): Void
+  let encoded = json::Value.number(number as String)
+
+  value.put(name, encoded) if encoded != null
+end
+
+def catalogLineCount(value: String, needles: String[]): Int
+  let lines = lines(value)
+  var count = 0
+
+  for line in lines
+    for needle in needles
+      if catalogContains(line, needle)
+        count = count + 1
+        break
+      end
+    end
+  end
+  return count
+end

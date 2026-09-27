@@ -277,7 +277,9 @@ std::string closure() {
                            }),
                images.end());
   llvm::SHA256 hash;
-  hash_field(hash, "neri-bootstrap-object-cache-v1");
+  // The closure includes this executable's bytes, so producer changes invalidate
+  // entries automatically. The label only separates this identity's purpose.
+  hash_field(hash, "neri-native-codegen-closure");
   hash_field(hash, shared);
   for (const auto &[name, cached, address] : images) {
     hash_field(hash, name);
@@ -389,7 +391,7 @@ std::string shared_cache_identity(std::span<const std::string> paths) {
     std::sort(names.begin(), names.end());
     names.erase(std::unique(names.begin(), names.end()), names.end());
     llvm::SHA256 hash;
-    hash_field(hash, "neri-shared-cache-paths-v2");
+    hash_field(hash, "neri-native-shared-cache-paths");
     hash_field(hash, shared);
     for (const auto &path : names) {
       struct stat st{};

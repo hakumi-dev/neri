@@ -592,7 +592,7 @@ def apply(value: Int, operation: fn(Int): Int): Int
 end
 
 def offsetBy(offset: Int): fn(Int): Int
-  return fn(value)
+  return fn(value) do
     return value + offset
   end
 end
@@ -621,17 +621,20 @@ Assign its call result to a local binding before passing that result elsewhere.
 Nested calls with their own `do` blocks inside the body are supported. `return`
 returns from the callback, not from the function enclosing the call.
 
-`fn(parameters) ... end` creates a standalone closure for a binding, field,
+`fn(parameters) do ... end` creates a standalone closure for a binding, field,
 return or array element. Inline `fn` closures inside call arguments are rejected
 with `NR009`; use `do` or pass a named callback instead. `NR009` also rejects a
 block attached to a non-call or an invalid block ending. The function type syntax
 remains `fn(Int): Int`.
 
+The closure's `do` follows its parameter list or explicit return type on the
+same line. Its body starts on the next line, and `end` occupies its own line.
+
 An expected function type supplies
 omitted parameter and return annotations in trailing blocks, returns, annotated
 initializers, assignments and typed array elements. Explicit annotations must
 match that contract. Without an expected type, annotate every parameter and the
-return type, such as `fn(value: Int): Int ... end`. Every non-Void callback must
+return type, such as `fn(value: Int): Int do ... end`. Every non-Void callback must
 return on all statically recognized paths, just like a named function.
 
 Parentheses apply a suffix to the whole function type: `(fn(Int): Int)?` is an

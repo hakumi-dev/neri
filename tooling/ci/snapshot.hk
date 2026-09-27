@@ -1,0 +1,215 @@
+use buffers
+use console
+use crypto
+use files
+use host
+use process
+use text
+
+def snapshotCommand(executable: String, arguments: String[], timeoutMilliseconds: Int, outputLimit: Int = 1048576): process::PollResult?
+  return runProcess(executable, arguments, timeoutMilliseconds, outputLimit)
+end
+
+def snapshotSuccess(value: process::PollResult?): Bool
+  if value == null || value.failure != null || value.stdoutTruncated || value.stderrTruncated
+    return false
+  end
+  let exit = value.exit
+
+  return exit != null && exit.isExited() && exit.value() == 0
+end
+
+def snapshotDigestBytes(bytes: Byte[]): String?
+  let raw = crypto::sha256(bytes).bytes()
+
+  return raw == null ? null : crypto::encodeHex(raw)
+end
+
+def snapshotFileSha256(path: String): String?
+  let result = snapshotCommand("shasum", ["-a", "256", path], 60000)
+
+  if result == null || !snapshotSuccess(result)
+    return null
+  end
+  let decoded = text::fromBytes(result.stdout)
+
+  if decoded == null || decoded.byteLength() < 65 || decoded.byteAt(64) != (32 as Byte)
+    return null
+  end
+  return host::stringSlice(decoded, 0, 64)
+end
+
+def snapshotSize(path: String): Int?
+  let result = snapshotCommand("stat", ["-f", "%z", path], 30000)
+
+  if result == null || !snapshotSuccess(result)
+    return null
+  end
+  let decoded = text::fromBytes(result.stdout)
+
+  if decoded == null || decoded.byteLength() == 0
+    return null
+  end
+  let last = decoded.byteAt(decoded.byteLength() - 1)
+  let digits = last == (10 as Byte) ? host::stringSlice(decoded, 0, decoded.byteLength() - 1) : decoded
+
+  return host::parseInt(digits)
+end
+
+def snapshotSafePath(path: String): Bool
+  if path == "" || path.byteLength() > 4096 || path.byteAt(0) == (45 as Byte) || path.byteAt(0) == (47 as Byte)
+    return false
+  end
+  if path == ".git" || path == ".." || path == "."
+    return false
+  end
+  var start = 0
+  var offset = 0
+
+  while offset <= path.byteLength()
+    if offset == path.byteLength() || path.byteAt(offset) == (47 as Byte)
+      let part = host::stringSlice(path, start, offset - start)
+
+      if part == "" || part == "." || part == ".." || part == ".git"
+        return false
+      end
+      start = offset + 1
+    end
+    offset = offset + 1
+  end
+  return true
+end
+
+def snapshotManifest(sourceRoot: String, listPath: String = ""): String?
+  let listed = snapshotCommand("git", ["-C", sourceRoot, "ls-files", "--cached", "--others", "--exclude-standard", "-z"], 60000, 67108864)
+
+  if listed == null || !snapshotSuccess(listed)
+    return null
+  end
+  let names = listed.stdout
+
+  if names.Length == 0 || names.Length > 67108864
+    return null
+  end
+  let filtered = buffers::ByteBuffer.create(67108864, names.Length)
+  let manifest = buffers::TextBuffer.create(67108864, 4096)
+
+  if filtered == null || manifest == null
+    return null
+  end
+  var start = 0
+  var count = 0
+  var missing = 0
+  var totalBytes = 0
+  var index = 0
+
+  while index < names.Length
+    if names[index] == (0 as Byte)
+      if index == start || count >= 20000
+        return null
+      end
+      let segment = buffers::ByteBuffer.create(4096, index - start)
+
+      if segment == null || !segment.appendSlice(names, start, index - start)
+        return null
+      end
+      let path = segment.text()
+
+      if path == null || !snapshotSafePath(path)
+        return null
+      end
+      let full = sourceRoot + "/" + path
+      let checked = files::status(full)
+      let status = checked.status
+
+      if checked.failure != null || status == null
+        return null
+      end
+      if !manifest.append((path.byteLength() as String) + ":" + path)
+        return null
+      end
+      if !status.exists
+        if !manifest.append(":deleted\n")
+          return null
+        end
+        missing = missing + 1
+      else
+        if !status.kind.isFile() || status.symlink
+          return null
+        end
+        let read = files::readBytes(full, 16777216)
+        let bytes = read.bytes
+
+        if read.failure != null || read.closeFailure != null || bytes == null
+          return null
+        end
+        let size = bytes.Length
+
+        if totalBytes > 4294967296 - size
+          return null
+        end
+        totalBytes = totalBytes + size
+        let fileHash = snapshotDigestBytes(bytes)
+
+        if fileHash == null
+          return null
+        end
+        let executable = status.executable ? "x" : "-"
+
+        if !manifest.append(":" + (size as String) + ":" + executable + ":" + fileHash + "\n") || !filtered.appendSlice(names, start, index - start + 1)
+          return null
+        end
+      end
+      count = count + 1
+      start = index + 1
+    end
+    index = index + 1
+  end
+  if start != names.Length
+    return null
+  end
+  let listBytes = filtered.snapshot()
+
+  if listPath != "" && !host::writeBytes(listPath, listBytes)
+    return null
+  end
+  console::println("snapshot files=" + (count as String) + " deleted=" + (missing as String) + " bytes=" + (totalBytes as String))
+  let content = manifest.snapshot()
+
+  return content == null ? null : snapshotDigestBytes(text::bytes(content))
+end
+
+def snapshotCreate(sourceRoot: String, destination: String): String?
+  let list = destination + ".paths"
+  let temporary = destination + ".tmp"
+  let before = snapshotManifest(sourceRoot, list)
+
+  if before == null
+    return null
+  end
+  let packed = snapshotCommand("tar", ["-C", sourceRoot, "--null", "-T", list, "-cf", temporary], 60000)
+
+  if !snapshotSuccess(packed)
+    return null
+  end
+  let after = snapshotManifest(sourceRoot)
+
+  if after == null || before != after
+    console::println("source changed during snapshot")
+    return null
+  end
+  let archivedSize = snapshotSize(temporary)
+
+  if archivedSize == null || archivedSize <= 0 || archivedSize > 4294967296
+    return null
+  end
+  let digest = snapshotFileSha256(temporary)
+
+  if digest == null || files::move(temporary, destination).failure != null
+    return null
+  end
+  if !host::writeText(destination + ".sha256", digest + "\n")
+    return null
+  end
+  return digest
+end
