@@ -1,8 +1,10 @@
 # SQLite resource lifetime
 
-The `contract` unit repeats 512 isolated in-memory connection lifetimes. Each
-cycle performs a buffered read, a failed statement preparation, pre-cancelled
-streaming, a successful stream, and two idempotent closes. A retained query and
+The `contract` unit repeats 512 connection lifetimes over one temporary SQLite
+database containing 64 text rows. Each cycle materializes all 64 rows through a
+bounded read, checks a failed statement preparation, cancels streaming after the
+first materialized row, completes another stream, and closes twice idempotently.
+Both complete reads verify the row count and text values. A retained query and
 provider alias must reject reads after close. Successful `sqlite3_close` on every
 cycle verifies that no prepared statement remains outstanding on that connection.
 Only one connection is open at a time in this contract.
@@ -23,5 +25,5 @@ establishes stable retained allocations for this workload, not universal absence
 of leaks.
 
 Build the `contract` unit from this manifest in Release and run the resulting
-executable without arguments. It creates no database files and requires no
-application configuration.
+executable without arguments. It creates its database in a temporary directory,
+verifies directory cleanup, and requires no application configuration.
