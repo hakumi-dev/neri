@@ -28,22 +28,13 @@ required patch version; Neri's version check remains mandatory. Version probes
 are `cmake --version`, `ninja --version`, `clang-22 --version` and
 `llvm-config-22 --version`.
 
-The SQLite recovery contracts exercise concurrent WAL connections. They require
+Writable SQLite WAL connections require
 SQLite 3.51.3 or newer, or the corrected 3.44.x (3.44.6+) or 3.50.x (3.50.7+)
 branches; a distribution's `libsqlite3-dev` package may be older. Install a
 corrected native library and ensure the system loader resolves it in both the
 build environment and the deployed application's environment. The runtime checks
 the loaded library, not the `sqlite3` command's version. See the
 [Data compatibility and durability contract](DATA.md#bounds-and-compatibility).
-
-The Linux Release CI job provisions SQLite 3.53.4 from the official amalgamation,
-verifies its pinned SHA3-256 before compilation, and installs matching headers,
-shared library and pkg-config metadata under `/opt/sqlite-3.53.4`. Its loader
-configuration in `/etc/ld.so.conf.d/neri-test-sqlite.conf` makes that library
-available to package validation with an empty environment. A compiled probe
-checks the header/runtime version and thread-safety setting with `env -i`;
-`ldd` confirms the selected library path. The distribution library files remain
-intact. The complete provisioning commands are in the [Linux CI job](../.github/workflows/ci.yml).
 
 ## Get the source
 

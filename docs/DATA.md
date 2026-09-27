@@ -161,7 +161,8 @@ synchronization; durability still depends on the journal mode and filesystem.
 With DELETE, `Full` can lose the last commit after a power failure; `Extra` also
 synchronizes the directory after journal deletion. WAL with `Full` or `Extra`
 synchronizes commits, while WAL with `Normal` can lose commits after an OS or
-power failure. Process-termination recovery tests do not simulate power loss.
+power failure. Durability requires a filesystem and storage device that honor
+SQLite's synchronization requests.
 
 Keep the database and its backup files outside build output. Use SQLite's online
 backup mechanism for a live database. Normalize the offline backup destination
@@ -172,8 +173,7 @@ to a fresh path with all application connections closed, then require the same
 integrity result on the restored database. Also run
 `PRAGMA foreign_key_check` when the schema has foreign keys, because integrity
 checking does not detect their violations. Verify application records and write
-reuse before promoting the restored database. The recovery contract exercises
-this restore path with both DELETE and WAL journals after an interrupted writer.
+reuse before promoting the restored database.
 Copying only the main file of a live WAL database can omit committed changes.
 See SQLite's
 [online backup API](https://sqlite.org/backup.html),

@@ -67,31 +67,6 @@ compiler generation uses the current compiler unit and standard library.
 its verified toolchain at `build/current`. See [bootstrapping](BOOTSTRAP.md) for
 generation checks and [testing](../tests/README.md) for suite composition.
 
-### Run focused compiler contracts locally
-
-With a compiler compatible with the checkout, build the affected test units
-together and run their executables directly. For example, parser and binding
-contracts for field packs and quotations share the compiler-core library:
-
-```sh
-mkdir -p build/contracts
-neri build-batch --project manifest.json --output-dir build/contracts \
-  --unit field-pack-parser-contracts --unit field-pack-binding-contracts \
-  --unit quotation-parser-contracts --unit quotation-binding-contracts \
-  --unit named-argument-parser-contracts
-for unit in field-pack-parser-contracts field-pack-binding-contracts \
-  quotation-parser-contracts quotation-binding-contracts named-argument-parser-contracts; do
-  "build/contracts/$unit" "$PWD" || exit "$?"
-done
-```
-
-This compiles the current test and library sources without bootstrapping the
-compiler or creating a distribution. Test arguments and timeouts are declared
-in `manifest.json`; the complete compiler-tooling inventory is
-`tooling/compiler-contracts.json`. Use the matching checkout compiler when
-testing changes to compilation itself. Package validation additionally checks
-the bootstrap fixed point, native components and installed distribution.
-
 ## Build native components
 
 ### Linux editor setup

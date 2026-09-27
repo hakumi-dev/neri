@@ -96,10 +96,13 @@ its replacement has completed, and check the backup operation's exit status.
 
 ```sh
 sqlite3 -readonly application.sqlite ".backup 'snapshot.sqlite'"
-sqlite3 -readonly snapshot.sqlite "PRAGMA quick_check; PRAGMA foreign_key_check;"
+sqlite3 snapshot.sqlite "PRAGMA journal_mode=DELETE;"
+sqlite3 -readonly snapshot.sqlite "PRAGMA integrity_check; PRAGMA foreign_key_check;"
 ```
 
-The integrity result must be `ok` and the foreign-key check must return no rows;
+The offline snapshot's journal-mode result must be `delete`, so the backup can
+be reopened without WAL sidecars. The integrity result must be exactly one `ok`
+row and the foreign-key check must return no rows;
 a zero process exit status alone does not establish these results. Verify
 application-specific invariants and migration history with the matching release.
 To restore, stop writers, close every session and start the application against
@@ -107,12 +110,6 @@ the verified snapshot at a fresh database path. Preserve the previous database
 and its sidecars together until recovery has been verified. Never replace a
 database file underneath live connections or mix an old WAL with a restored
 main file. Keep persistent databases and backups outside application build output.
-
-The isolated recovery contract exercises the native backup API with DELETE and
-WAL journals while another process holds an uncommitted write. It forcibly
-terminates that process and checks reopening and writing to both source and
-snapshot. This covers process termination; it does not simulate storage failure
-or prove power-loss durability.
 
 ## Streaming lifetime
 
