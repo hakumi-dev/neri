@@ -1,0 +1,139 @@
+use host
+use test
+use console
+
+def nativeLibraryContains(text: String, fragment: String): Bool
+  var offset = 0
+
+  while offset + host::stringByteLength(fragment) <= host::stringByteLength(text)
+    var equal = true
+    var index = 0
+
+    while index < host::stringByteLength(fragment)
+      if host::stringByteAt(text, offset + index) != host::stringByteAt(fragment, index)
+        equal = false
+      end
+      index = index + 1
+    end
+    if equal
+      return true
+    end
+    offset = offset + 1
+  end
+  return false
+end
+
+def nativeLibrarySource(): String
+  return "@library(\"sqlite3\")\n@cabiImport(\"sqlite3_libversion_number\")\nunsafe def sqliteVersion(): Int32\nend\n\ndef currentSQLiteVersion(): Int\n  unsafe\n    return sqliteVersion() as Int\n  end\nend\n\nclass NativeLibraryService\n  public version: Int\n\n  def init(version: Int): Void\n    this.version = version\n  end\nend\n\ndef createNativeLibraryService(): NativeLibraryService\n  return new NativeLibraryService(currentSQLiteVersion())\nend\n"
+end
+
+def nativeLibraryObjectBackendEnabled(target: readonly TargetPlatform): Bool
+  if !target.isMacOS()
+    return false
+  end
+  let manifest = host::environment("NERI_RUNTIME_MANIFEST")
+  let configuredBridge = host::environment("NERI_SESSION_OBJECT_LINKER")
+  var bridge = ""
+
+  if configuredBridge != null
+    if configuredBridge == ""
+      return false
+    end
+    bridge = configuredBridge
+  else if manifest != null && manifest != ""
+    bridge = bootstrapDirectory(manifest) + "/libneri-session-object-linker.dylib"
+  else
+    return false
+  end
+  let exists = host::run("test", ["-f", bridge])
+
+  return exists != null && exists == 0
+end
+
+def nativeLibraryCacheEnabled(toolchain: SessionToolchain, objectBackend: Bool): Bool
+  if !objectBackend || !toolchain.cacheEnabled || !runCacheSupportedHost()
+    return false
+  end
+  let linker = host::environment("NERI_LINKER")
+
+  return linker != null && linker == toolchain.linker
+end
+
+def main(): Void
+  let compiler = host::argumentAt(0)
+  let work = host::argumentAt(1)
+  let linker = host::environment("NERI_LINKER")
+  var targetName = host::environment("NERI_TARGET")
+  let runtimeManifest = host::environment("NERI_RUNTIME_MANIFEST")
+
+  if targetName == null && runtimeManifest != null
+    let manifest = host::readText(runtimeManifest)
+
+    if manifest != null
+      targetName = bootstrapManifestString(manifest, "target")
+    end
+  end
+
+  test::assertTrue(compiler != null && work != null && linker != null && targetName != null)
+  if compiler == null || work == null || linker == null || targetName == null
+    return
+  end
+  let target = TargetPlatform.parse(targetName)
+
+  test::assertTrue(target != null)
+  if target == null
+    return
+  end
+  let root = work + "/session-native-library"
+  let project = root + "/manifest.json"
+  let fixture = root + "/app.hk"
+  let created = host::run("mkdir", ["-p", root])
+
+  test::assertTrue(created != null && created == 0)
+  test::assertTrue(host::writeText(fixture, nativeLibrarySource()))
+  test::assertTrue(host::writeText(project, "{\"version\":2,\"defaultUnit\":\"app\",\"units\":{\"app\":{\"kind\":\"library\",\"sources\":[\"app.hk\"]}}}\n"))
+
+  let toolchain = new SessionToolchain(compiler, linker, target, root)
+  let objectBackend = nativeLibraryObjectBackendEnabled(target)
+  let cacheEnabled = nativeLibraryCacheEnabled(toolchain, objectBackend)
+  let first = new ExecutableSession(toolchain)
+  let firstInitialization = first.initializeProject(project, "app", "createNativeLibraryService", "service")
+
+  test::assertTrue(firstInitialization.succeeded())
+  let firstCall = first.submit("currentSQLiteVersion()\n")
+  let firstVersion = host::parseInt(firstCall.execution.resultText)
+
+  test::assertTrue(firstCall.execution.succeeded())
+  test::assertTrue(firstVersion != null && firstVersion > 0)
+  test::assertTrue(first.dispose().succeeded())
+
+  let second = new ExecutableSession(toolchain)
+  let secondInitialization = second.initializeProject(project, "app", "createNativeLibraryService", "service")
+
+  test::assertTrue(secondInitialization.succeeded())
+  if cacheEnabled
+    test::assertTrue(secondInitialization.cacheHit)
+  end
+  let secondCall = second.submit("currentSQLiteVersion()\n")
+
+  test::assertTrue(secondCall.execution.succeeded())
+  test::assertEqual(secondCall.execution.resultText, firstCall.execution.resultText)
+  let missing = second.submit("@library(\"neri-session-contract-missing\")\n@cabiImport(\"neri_session_contract_missing_symbol\")\nunsafe def missingNativeValue(): Int32\nend\nunsafe\n  missingNativeValue()\nend\n")
+
+  test::assertTrue(!missing.execution.succeeded())
+  if cacheEnabled
+    test::assertTrue(secondCall.execution.cacheHit)
+  end
+  if objectBackend
+    test::assertTrue(missing.execution.status.isLoadFailed())
+    test::assertTrue(nativeLibraryContains(missing.execution.message, "neri-session-contract-missing"))
+  else
+    test::assertTrue(missing.execution.status.isCompilationFailed() || missing.execution.status.isLoadFailed())
+  end
+  let retained = second.submit("service.version\n")
+
+  test::assertTrue(retained.execution.succeeded())
+  test::assertEqual(retained.execution.resultText, firstCall.execution.resultText)
+  test::assertTrue(second.dispose().succeeded())
+  console::println("Session native library contracts passed")
+end

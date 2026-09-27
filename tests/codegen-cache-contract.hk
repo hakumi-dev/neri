@@ -1,0 +1,284 @@
+use host
+use console
+use process
+use test
+use files
+use resources
+use result
+
+def invoke(executable: String, arguments: String[]): process::PollResult
+  let options = new process::SpawnOptions(executable)
+
+  options.arguments = arguments
+  let started = process::spawn(options)
+  let child = started.child()
+
+  test::assertTrue(started.failure() == null && child != null)
+  if child == null
+    return new process::PollResult()
+  end
+  let completed = child.wait(60000)
+
+  test::assertTrue(completed.failure == null && !completed.running)
+  test::assertTrue(child.dispose())
+  return completed
+end
+
+def exited(value: process::PollResult, expected: Int): Void
+  let status = value.exit
+
+  if status == null || !status.isExited() || status.value() != expected
+    console::println("Unexpected exit; stdout: " + output(value.stdout) + " stderr: " + output(value.stderr))
+  end
+
+  test::assertTrue(status != null)
+  if status != null
+    test::assertTrue(status.isExited())
+    test::assertEqual(status.value(), expected)
+  end
+end
+
+def output(bytes: Byte[]): String
+  let value = host::stringFromBytes(bytes)
+
+  test::assertTrue(value != null)
+  return value == null ? "" : value
+end
+
+def command(program: String, arguments: String[]): Void
+  exited(invoke(program, arguments), 0)
+end
+
+def options(input: String, target: String, object: String, cache: String): String[]
+  return ["--input", input, "--input-format", "hex", "--target", target, "--optimization", "release", "--emit", "object", "--output", object, "--object-cache", cache]
+end
+
+def check(codegen: String, arguments: String[], expected: String): Void
+  let result = invoke(codegen, arguments)
+
+  exited(result, 0)
+  if output(result.stderr) != "neri codegen object-cache " + expected + "\n"
+    console::println("Expected cache " + expected + "; received: " + output(result.stderr))
+  end
+
+  test::assertEqual(output(result.stderr), "neri codegen object-cache " + expected + "\n")
+end
+
+def sharedCacheContract(codegen: String, target: String): Void
+  for arguments in [["--shared-cache-identity"], ["--shared-cache-identity", "relative"], ["--shared-cache-identity", codegen], ["--shared-cache-identity", "/neri-missing-cache-contract-library.dylib"], ["--shared-cache-identity", "/usr/lib/libSystem.B.dylib\n"]]
+    let rejected = invoke(codegen, arguments)
+
+    exited(rejected, 2)
+
+    test::assertEqual(output(rejected.stdout), "")
+  end
+  let system = "/usr/lib/libSystem.B.dylib"
+  let objc = "/usr/lib/libobjc.A.dylib"
+
+  if target != "macos-arm64"
+    let unavailable = invoke(codegen, ["--shared-cache-identity", system])
+
+    exited(unavailable, 2)
+
+    test::assertEqual(output(unavailable.stdout), "")
+  else
+    # The kernel shim can also exist on disk; membership is independent of it.
+    let kernel = "/usr/lib/system/libsystem_kernel.dylib"
+    let first = invoke(codegen, ["--shared-cache-identity", system, objc, kernel])
+    let repeated = invoke(codegen, ["--shared-cache-identity", kernel, objc, system, objc])
+
+    exited(first, 0)
+    exited(repeated, 0)
+    let digest = output(first.stdout)
+
+    test::assertEqual(host::stringByteLength(digest), 65)
+    test::assertEqual(host::stringByteAt(digest, 64), 10 as Byte)
+    test::assertEqual(output(repeated.stdout), digest)
+    var index = 0
+
+    while index < 64
+      let byte = host::stringByteAt(digest, index) as Int
+
+      test::assertTrue((byte >= 48 && byte <= 57) || (byte >= 97 && byte <= 102))
+      index = index + 1
+    end
+  end
+end
+
+def isolated(codegen: String, fixtures: String, target: String): resources::Outcome<Int, result::Failure>
+  sharedCacheContract(codegen, target)
+  let identity = invoke(codegen, ["--cache-identity"])
+
+  exited(identity, 0)
+  let digest = output(identity.stdout)
+
+  test::assertEqual(host::stringByteLength(digest), 65)
+  test::assertEqual(host::stringByteAt(digest, 64), 10 as Byte)
+  var index = 0
+
+  while index < 64
+    let byte = host::stringByteAt(digest, index) as Int
+
+    test::assertTrue((byte >= 48 && byte <= 57) || (byte >= 97 && byte <= 102))
+    index = index + 1
+  end
+  let repeated = invoke(codegen, ["--cache-identity"])
+
+  exited(repeated, 0)
+
+  test::assertEqual(output(repeated.stdout), digest)
+  let combined = invoke(codegen, ["--cache-identity", "--version"])
+
+  exited(combined, 2)
+
+  test::assertEqual(output(combined.stdout), "")
+  using temporary <- files::TemporaryDirectory.create("neri-codegen-cache-")
+    let canonical = invoke("realpath", [temporary.path()])
+
+    exited(canonical, 0)
+    let canonicalText = output(canonical.stdout)
+
+    test::assertTrue(host::stringByteLength(canonicalText) > 1)
+    let root = host::stringSlice(canonicalText, 0, host::stringByteLength(canonicalText) - 1)
+    let cache = root + "/cache"
+    let input = fixtures + "/ir-minimal-v1.0.nir.hex"
+    let first = root + "/first.o"
+    let second = root + "/second.o"
+
+    command("mkdir", ["-m", "700", cache])
+    check(codegen, options(input, target, first, cache), "miss")
+    check(codegen, options(input, target, second, cache), "hit")
+    command("cmp", [first, second])
+    let located = invoke("find", [cache, "-type", "f", "-name", "object"])
+
+    exited(located, 0)
+    let found = output(located.stdout)
+
+    test::assertTrue(host::stringByteLength(found) > 1)
+    let cachedObject = host::stringSlice(found, 0, host::stringByteLength(found) - 1)
+    let receipt = host::stringSlice(cachedObject, 0, host::stringByteLength(cachedObject) - 6) + "receipt"
+
+    for corrupt in [cachedObject, receipt]
+      test::assertTrue(host::writeText(corrupt, "broken"))
+      check(codegen, options(input, target, second, cache), "miss")
+      command("cmp", [first, second])
+      check(codegen, options(input, target, second, cache), "hit")
+    end
+    check(codegen, options(fixtures + "/ir-codegen-primitives.nir.hex", target, root + "/changed.o", cache), "miss")
+    check(codegen, options(input, target, second, cache), "hit")
+    let invalidInput = root + "/invalid.nir.hex"
+
+    test::assertTrue(host::writeText(invalidInput, "00"))
+    exited(invoke(codegen, options(invalidInput, target, root + "/invalid.o", cache)), 2)
+    let invalidOutput = files::status(root + "/invalid.o").status
+
+    test::assertTrue(invalidOutput != null && !invalidOutput.exists)
+
+    let parallel = root + "/parallel"
+
+    command("mkdir", ["-m", "700", parallel])
+    let leftOptions = new process::SpawnOptions(codegen)
+    let rightOptions = new process::SpawnOptions(codegen)
+
+    leftOptions.arguments = options(input, target, root + "/left.o", parallel)
+    rightOptions.arguments = options(input, target, root + "/right.o", parallel)
+    let left = process::spawn(leftOptions).child()
+    let right = process::spawn(rightOptions).child()
+
+    test::assertTrue(left != null && right != null)
+    if left != null && right != null
+      exited(left.wait(60000), 0)
+      exited(right.wait(60000), 0)
+
+      test::assertTrue(left.dispose())
+      test::assertTrue(right.dispose())
+    end
+    command("cmp", [root + "/left.o", root + "/right.o"])
+    check(codegen, options(input, target, second, parallel), "hit")
+
+    test::assertTrue(host::writeText(root + "/file", "not a directory"))
+    command("ln", ["-s", cache, root + "/link"])
+    command("mkdir", ["-m", "755", root + "/public"])
+    for invalid in [root + "/file", root + "/link", root + "/public"]
+      check(codegen, options(input, target, second, invalid), "unavailable")
+      command("cmp", [first, second])
+    end
+    let loaderDirectory = root + "/loader-search"
+
+    command("mkdir", [loaderDirectory])
+    let loader = new process::SpawnOptions(codegen)
+
+    loader.arguments = options(input, target, second, cache)
+    loader.environment = [new process::EnvironmentEntry(target == "macos-arm64" ? "DYLD_LIBRARY_PATH" : "LD_LIBRARY_PATH", loaderDirectory)]
+    let loaderChild = process::spawn(loader).child()
+
+    test::assertTrue(loaderChild != null)
+    if loaderChild != null
+      let completed = loaderChild.wait(60000)
+
+      exited(completed, 0)
+
+      test::assertTrue(loaderChild.dispose())
+      test::assertEqual(output(completed.stderr), "neri codegen object-cache unavailable\n")
+    end
+    command("cmp", [first, second])
+    loader.arguments = ["--cache-identity"]
+    let identityChild = process::spawn(loader).child()
+
+    test::assertTrue(identityChild != null)
+    if identityChild != null
+      let unavailable = identityChild.wait(60000)
+
+      exited(unavailable, 2)
+
+      test::assertTrue(identityChild.dispose())
+      test::assertEqual(output(unavailable.stdout), "")
+    end
+    loader.arguments = ["--shared-cache-identity", "/usr/lib/libSystem.B.dylib"]
+    let sharedChild = process::spawn(loader).child()
+
+    test::assertTrue(sharedChild != null)
+    if sharedChild != null
+      let unavailable = sharedChild.wait(60000)
+
+      exited(unavailable, 2)
+
+      test::assertTrue(sharedChild.dispose())
+      test::assertEqual(output(unavailable.stdout), "")
+    end
+    for flag in ["--metrics", "--progress"]
+      var arguments = options(input, target, second, cache)
+
+      arguments = host::appendString(arguments, flag)
+      arguments = host::appendString(arguments, root + "/forbidden-output")
+      exited(invoke(codegen, arguments), 2)
+    end
+    var debug = options(input, target, second, cache)
+
+    debug = host::appendString(debug, "--debug-source")
+    debug = host::appendString(debug, "serialization-tests")
+    debug = host::appendString(debug, input)
+    exited(invoke(codegen, debug), 2)
+    return 0
+  end
+  return 1
+end
+
+def main(): Void
+  let codegen = host::argumentAt(0)
+  let fixtures = host::argumentAt(1)
+  let target = host::argumentAt(2)
+
+  test::assertTrue(codegen != null && fixtures != null && target != null)
+  if codegen != null && fixtures != null && target != null
+    let outcome = isolated(codegen, fixtures, target)
+
+    test::assertEqual(outcome.closeFailures.count(), 0)
+    match outcome.completion
+      case resources::Completion.Value(value)
+        test::assertEqual(value, 0)
+      case resources::Completion.Failure(error)
+        test::assertTrue(false)
+    end
+  end
+end

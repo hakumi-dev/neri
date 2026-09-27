@@ -1,5 +1,15 @@
 use host
 
+def sessionPrepareTimingWrite(path: String, record: String): Void
+  let previous = host::readText(path)
+
+  if previous == null
+    host::writeText(path, record)
+  else if host::stringByteLength(previous) + host::stringByteLength(record) <= 8388608
+    host::writeText(path, previous + record)
+  end
+end
+
 class SessionEnvironment
   private identity: String
   private environmentIdentity: Int
@@ -8,6 +18,7 @@ class SessionEnvironment
   private initializationError: String = ""
   private nextCandidateId: Int = 1
   private firstBinding: SessionBinding?
+  private frameName: String = ""
   private generation: Int = 0
   private declarationsUsed: Int = 0
   private bindingsUsed: Int = 0
@@ -35,6 +46,16 @@ class SessionEnvironment
 
   def prepare(source: String): PreparedSubmission
     let prepared = new PreparedSubmission(this.generation, this.identity, this.environmentIdentity, this.nextCandidateId)
+    let timingPath = host::environment("NERI_SESSION_PREPARE_TIMINGS")
+    let timingEnabled = timingPath != null && timingPath != ""
+    var phaseStarted = timingEnabled ? runCacheTime() : 0
+    var submissionParseMs = 0
+    var snapshotMs = 0
+    var analysisParseMs = 0
+    var analysisBindMs = 0
+    var inspectionMs = 0
+    var executionParseMs = 0
+    var executionBindMs = 0
 
     this.nextCandidateId = this.nextCandidateId + 1
     if this.disposed
@@ -76,6 +97,10 @@ class SessionEnvironment
     prepared.declarations = submissionParts(source, submission.declarationStarts, submission.declarationLengths)
     prepared.statements = submissionParts(source, submission.statementStarts, submission.statementLengths)
     prepared.declarationCount = submission.declarationCount
+    if timingEnabled
+      submissionParseMs = runCacheTime() - phaseStarted
+      phaseStarted = runCacheTime()
+    end
     if this.declarationsUsed + prepared.declarationCount > 1024
       prepared.status = SubmissionStatus.invalid()
       prepared.addDiagnostic("NR_SESSION_LIMIT", 0, 1, "Session declaration count exceeds 1024.")
@@ -100,7 +125,7 @@ class SessionEnvironment
       end
     end
     let declarationOffset = sourceOffset + utf16Length(contextSource)
-    let prefix = contextSource + prepared.declarations + entryPrefix(this.generation, referencedBindings)
+    let prefix = contextSource + prepared.declarations + entryPrefix(this.generation, this.frameName, referencedBindings)
     let analysisProgram = prefix + indentSubmission(prepared.statements) + "end\n"
     var candidateSnapshot = new SessionSourceSnapshot()
     let currentSnapshot = this.snapshot
@@ -114,8 +139,12 @@ class SessionEnvironment
       prepared.addDiagnostic("NR_SESSION_PROJECT", 0, 1, candidateSnapshot.error)
       return prepared
     end
-    let librarySource = candidateSnapshot.librarySuffix(firstLibrary)
+    var librarySource = candidateSnapshot.librarySuffix(firstLibrary)
 
+    if timingEnabled
+      snapshotMs = runCacheTime() - phaseStarted
+      phaseStarted = runCacheTime()
+    end
     prepared.analysisSource = analysisProgram + librarySource
     let analysisLexer = new BootstrapLexer(analysisProgram + librarySource)
 
@@ -131,6 +160,10 @@ class SessionEnvironment
     end
     let root = analysisParser.parseProgram()
 
+    if timingEnabled
+      analysisParseMs = runCacheTime() - phaseStarted
+      phaseStarted = runCacheTime()
+    end
     if analysisParser.diagnostics.count() > 0
       prepared.status = SubmissionStatus.invalid()
       copyMappedDiagnostics(analysisParser.diagnostics, prepared, source, submission,
@@ -141,14 +174,29 @@ class SessionEnvironment
 
     binder.requireEntryPoint = false
     binder.allowSessionEntryReplacement = true
+    binder.inferSessionTryError = true
     candidateSnapshot.applyLibrarySources(binder, sourceOffset + utf16Length(analysisProgram), firstLibrary)
     let model = binder.bind()
 
+    if timingEnabled
+      analysisBindMs = runCacheTime() - phaseStarted
+      phaseStarted = runCacheTime()
+    end
     if model.diagnostics.count() > 0
       prepared.status = SubmissionStatus.invalid()
       copyMappedDiagnostics(model.diagnostics, prepared, source, submission,
         declarationOffset, sourceOffset + utf16Length(prefix))
       return prepared
+    end
+    prepared.propagatedErrorType = binder.sessionTryErrorType
+    if prepared.propagatedErrorType != ""
+      candidateSnapshot.captureLibraries("use result\n")
+      if candidateSnapshot.error != ""
+        prepared.status = SubmissionStatus.invalid()
+        prepared.addDiagnostic("NR_SESSION_PROJECT", 0, 1, candidateSnapshot.error)
+        return prepared
+      end
+      librarySource = candidateSnapshot.librarySuffix(firstLibrary)
     end
     let entry = model.findFunction(prepared.entryName)
 
@@ -195,8 +243,40 @@ class SessionEnvironment
       prepared.bindingCount = 0
       return prepared
     end
-    prepared.frameSource = sessionFrameSource(this.generation, prepared.firstBinding)
-    prepared.executionSource = contextSource + prepared.declarations + prepared.frameSource + executionEntrySource(this.generation, referencedBindings, prepared.firstBinding, executionStatements, prepared.resultType)
+    prepared.frameSource = sessionFrameSource(this.generation, prepared.frameName, this.frameName, prepared.firstBinding)
+    var inspectionSource = ""
+    var inspectionExpression = ""
+    var errorInspectionExpression = ""
+    var inspector: SessionInspection? = null
+
+    if prepared.resultType != "Void" && prepared.resultType != "String" && prepared.resultType != "Int" && prepared.resultType != "Byte" && prepared.resultType != "Float" && prepared.resultType != "Bool" && !semanticIsPointer(prepared.resultType) && !semanticContainsResource(model, prepared.resultType)
+      let created = new SessionInspection(model, analysisParser.arena, prepared.uniqueId)
+
+      inspector = created
+      inspectionExpression = created.inspect(prepared.resultType, "__neri_session_result")
+    end
+    if prepared.propagatedErrorType != ""
+      if inspector == null
+        let created = new SessionInspection(model, analysisParser.arena, prepared.uniqueId)
+
+        inspector = created
+        errorInspectionExpression = created.inspect(prepared.propagatedErrorType, "__neri_session_error")
+      else
+        let active = inspector
+
+        errorInspectionExpression = active.inspect(prepared.propagatedErrorType, "__neri_session_error")
+      end
+    end
+    if inspector != null
+      let active = inspector
+
+      inspectionSource = active.source
+    end
+    prepared.executionSource = contextSource + prepared.declarations + inspectionSource + prepared.frameSource + executionEntrySource(this.generation, prepared.frameName, this.frameName, prepared.uniqueId, referencedBindings, prepared.firstBinding, executionStatements, prepared.resultType, inspectionExpression, prepared.propagatedErrorType, errorInspectionExpression)
+    if timingEnabled
+      inspectionMs = runCacheTime() - phaseStarted
+      phaseStarted = runCacheTime()
+    end
     let executionProgram = prepared.executionSource
     let executionAnalysisSource = executionProgram + librarySource
     let executionLexer = new BootstrapLexer(executionProgram + librarySource)
@@ -212,10 +292,14 @@ class SessionEnvironment
     end
     let executionRoot = executionParser.parseProgram()
 
+    if timingEnabled
+      executionParseMs = runCacheTime() - phaseStarted
+      phaseStarted = runCacheTime()
+    end
     if executionParser.diagnostics.count() > 0
       prepared.status = SubmissionStatus.invalid()
       copyMappedDiagnostics(executionParser.diagnostics, prepared, source, submission,
-        declarationOffset, sourceOffset + utf16Length(contextSource + prepared.declarations + prepared.frameSource + executionEntryPrefix(this.generation, referencedBindings)))
+        declarationOffset, sourceOffset + utf16Length(contextSource + prepared.declarations + inspectionSource + prepared.frameSource + executionEntryPrefix(this.generation, prepared.frameName, this.frameName, referencedBindings, prepared.propagatedErrorType == "" ? prepared.frameName : "result::Result<" + prepared.frameName + ", " + semanticNamespaceDisplay(prepared.propagatedErrorType) + ">", prepared.propagatedErrorType == "" ? "__neri_session_entry" : "__neri_session_evaluate_" + (prepared.uniqueId as String))))
       return prepared
     end
     let executionBinder = new BootstrapBinder(executionParser.arena, executionRoot, executionTokens.startAt(executionTokens.count() - 1), retainedModel)
@@ -225,16 +309,26 @@ class SessionEnvironment
     candidateSnapshot.applyLibrarySources(executionBinder, sourceOffset + utf16Length(executionProgram), firstLibrary)
     let executionModel = executionBinder.bind()
 
+    if timingEnabled
+      executionBindMs = runCacheTime() - phaseStarted
+      phaseStarted = runCacheTime()
+    end
     if executionModel.diagnostics.count() > 0
       prepared.status = SubmissionStatus.invalid()
       copyMappedDiagnostics(executionModel.diagnostics, prepared, source, submission,
-        declarationOffset, sourceOffset + utf16Length(contextSource + prepared.declarations + prepared.frameSource + executionEntryPrefix(this.generation, referencedBindings)))
+        declarationOffset, sourceOffset + utf16Length(contextSource + prepared.declarations + inspectionSource + prepared.frameSource + executionEntryPrefix(this.generation, prepared.frameName, this.frameName, referencedBindings, prepared.propagatedErrorType == "" ? prepared.frameName : "result::Result<" + prepared.frameName + ", " + semanticNamespaceDisplay(prepared.propagatedErrorType) + ">", prepared.propagatedErrorType == "" ? "__neri_session_entry" : "__neri_session_evaluate_" + (prepared.uniqueId as String))))
       return prepared
     end
     prepared.status = SubmissionStatus.complete()
     if !this.register(prepared, candidateSnapshot, new SessionCompilation(executionModel, executionParser.arena, executionAnalysisSource, retained))
       prepared.status = SubmissionStatus.invalid()
       prepared.addDiagnostic("NR_SESSION_LIMIT", 0, 1, "Session has 1024 active prepared submissions.")
+    end
+    if timingEnabled && timingPath != null
+      let registerMs = runCacheTime() - phaseStarted
+      let record = "{\"generation\":" + (this.generation as String) + ",\"resultType\":" + lspQuote(prepared.resultType) + ",\"submissionParseMs\":" + (submissionParseMs as String) + ",\"snapshotMs\":" + (snapshotMs as String) + ",\"analysisParseMs\":" + (analysisParseMs as String) + ",\"analysisBindMs\":" + (analysisBindMs as String) + ",\"inspectionMs\":" + (inspectionMs as String) + ",\"executionParseMs\":" + (executionParseMs as String) + ",\"executionBindMs\":" + (executionBindMs as String) + ",\"registerMs\":" + (registerMs as String) + "}\n"
+
+      sessionPrepareTimingWrite(timingPath, record)
     end
     return prepared
   end
@@ -273,6 +367,7 @@ class SessionEnvironment
     end
     prepared.consumed = true
     this.compilation = pending.compilation
+    this.frameName = pending.frameName
     var existing = this.firstBinding
 
     while existing != null
@@ -442,6 +537,7 @@ class SessionEnvironment
     this.compilation = null
     this.snapshot = null
     this.baseSource = ""
+    this.frameName = ""
   end
 
   def validateInitializer(snapshot: SessionSourceSnapshot, name: String, bindingName: String = "service", imports: String = ""): PreparedSubmission
@@ -498,32 +594,67 @@ class SessionEnvironment
       return prepared
     end
     let analysisSource = source + contextImports + candidateSnapshot.librarySource()
-    let lexer = new BootstrapLexer(analysisSource)
-    let tokens = lexer.lex()
+    let semanticCache = new SemanticSnapshotCache()
+    var cacheContext = runCacheFrame("session-initializer-v1") + candidateSnapshot.cacheInputs() + runCacheFrame(contextImports)
+    var sourceIndex = 0
 
-    if rejectReservedSessionNames(tokens, prepared)
+    while sourceIndex < candidateSnapshot.count()
+      cacheContext = cacheContext + runCacheFrame(candidateSnapshot.sourceAt(sourceIndex))
+      sourceIndex = sourceIndex + 1
+    end
+    sourceIndex = 0
+    while sourceIndex < candidateSnapshot.libraryCount()
+      cacheContext = cacheContext + runCacheFrame(candidateSnapshot.libraryNameAt(sourceIndex)) + runCacheFrame(candidateSnapshot.librarySourceAt(sourceIndex))
+      sourceIndex = sourceIndex + 1
+    end
+    let semanticStarted = runCacheTime()
+
+    semanticCache.prepare(cacheContext)
+    var checked = semanticCache.load()
+
+    if checked == null
+      let lexer = new BootstrapLexer(analysisSource)
+      let tokens = lexer.lex()
+
+      if rejectReservedSessionNames(tokens, prepared)
+        return prepared
+      end
+      let parser = new BootstrapParser(tokens)
+
+      candidateSnapshot.applyBoundaries(parser, utf16Length(contextImports))
+      let root = parser.parseProgram()
+
+      if parser.diagnostics.count() > 0
+        copySessionDiagnostics(parser.diagnostics, prepared, 0, 0, false)
+        return prepared
+      end
+      let binder = new BootstrapBinder(parser.arena, root, tokens.startAt(tokens.count() - 1))
+
+      binder.requireEntryPoint = false
+      candidateSnapshot.applyLibrarySources(binder, utf16Length(source + contextImports), 0)
+      let analyzed = binder.bind()
+
+      if analyzed.diagnostics.count() > 0
+        copySessionDiagnostics(analyzed.diagnostics, prepared, 0, 0, false)
+        return prepared
+      end
+      semanticCache.store(analyzed, root)
+      checked = new SemanticSnapshot(analyzed, parser.arena, root)
+    end
+    let semanticTiming = host::environment("NERI_SEMANTIC_METRICS")
+
+    if semanticTiming != null && semanticTiming != ""
+      sessionPrepareTimingWrite(semanticTiming, "{\"phase\":\"initializer-analysis\",\"cache\":" + lspQuote(semanticCache.status) + ",\"durationMs\":" + ((runCacheTime() - semanticStarted) as String) + "}\n")
+    end
+    if checked == null
+      prepared.addDiagnostic("NR_SESSION_INITIALIZER", 0, 1, "Initializer analysis did not produce a semantic model.")
       return prepared
     end
-    let parser = new BootstrapParser(tokens)
+    let model = checked.model
+    let syntax = checked.syntax
+    let root = checked.root
 
-    candidateSnapshot.applyBoundaries(parser, utf16Length(contextImports))
-    let root = parser.parseProgram()
-
-    if parser.diagnostics.count() > 0
-      copySessionDiagnostics(parser.diagnostics, prepared, 0, 0, false)
-      return prepared
-    end
-    let binder = new BootstrapBinder(parser.arena, root, tokens.startAt(tokens.count() - 1))
-
-    binder.requireEntryPoint = false
-    candidateSnapshot.applyLibrarySources(binder, utf16Length(source + contextImports), 0)
-    let model = binder.bind()
-
-    if model.diagnostics.count() > 0
-      copySessionDiagnostics(model.diagnostics, prepared, 0, 0, false)
-      return prepared
-    end
-    prepared.declarationCount = sessionSourceDeclarationCount(parser.arena, root, utf16Length(source))
+    prepared.declarationCount = sessionSourceDeclarationCount(syntax, root, utf16Length(source))
     if this.declarationsUsed + prepared.declarationCount > 1024
       prepared.addDiagnostic("NR_SESSION_LIMIT", 0, 1, "Session declaration count exceeds 1024.")
       return prepared
@@ -542,15 +673,15 @@ class SessionEnvironment
       prepared.bindingCount = 0
       return prepared
     end
-    prepared.frameSource = sessionFrameSource(this.generation, prepared.firstBinding)
-    prepared.executionSource = contextImports + prepared.frameSource + initializerEntrySource(this.generation, initializer.fullName, initializer.returnType, bindingName)
-    let executionFragment = prepared.frameSource + initializerEntrySource(this.generation, initializer.fullName, initializer.returnType, bindingName)
+    prepared.frameSource = sessionFrameSource(this.generation, prepared.frameName, this.frameName, prepared.firstBinding)
+    prepared.executionSource = contextImports + prepared.frameSource + initializerEntrySource(prepared.frameName, initializer.fullName, initializer.returnType, bindingName)
+    let executionFragment = prepared.frameSource + initializerEntrySource(prepared.frameName, initializer.fullName, initializer.returnType, bindingName)
     let executionSource = analysisSource + executionFragment
     let executionLexer = new BootstrapLexer(executionFragment)
 
     executionLexer.utf16Position = utf16Length(analysisSource)
     let executionTokens = executionLexer.lex()
-    let executionParser = new BootstrapParser(executionTokens, parser.arena)
+    let executionParser = new BootstrapParser(executionTokens, syntax)
     let executionRoot = executionParser.parseProgram()
 
     if executionParser.diagnostics.count() != 0
@@ -579,7 +710,7 @@ class SessionEnvironment
     if this.pendingCount >= 1024
       return false
     end
-    let item = new PendingSubmission(prepared, this.nextCandidateId - 1, snapshot.frozenCopy(), compilation, establishesProject)
+    let item = new PendingSubmission(prepared, prepared.uniqueId, snapshot.frozenCopy(), compilation, establishesProject)
 
     item.next = this.pending
     this.pending = item

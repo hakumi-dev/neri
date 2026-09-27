@@ -59,6 +59,9 @@ closes the connection and listener and returns normally. A request from
 `onListening` closes the idle listener before accepting a connection. A stop
 requested before serving skips socket acquisition after configuration validation.
 Stop objects remain requested and can be inspected with `isRequested()`.
+One `Stop` can belong to one active HTTP lifetime. A second attachment fails
+with `stop_unavailable`; closing the first lifetime releases the attachment so
+the same `Stop` can be reused. A requested `Stop` remains requested on reuse.
 
 This stop object is confined to the serving thread. It does not preempt an
 application handler. Handler execution remains synchronous; a fatal deadline
@@ -71,6 +74,24 @@ flag. Neri checks it between connections and waits at most 50 milliseconds per
 idle poll, preventing a signal between the check and poll from leaving the
 listener blocked indefinitely. Active request I/O retains its existing read and
 write deadlines before shutdown. This does not bound application handler time.
+
+`http::Lifetime.open(handleInterrupts, forceExitAfterStopMilliseconds, stop)`
+provides the same stop and drain scope to another synchronous server. Acquire its
+`Result<Lifetime, result::Failure>` with `using lifetime <- Lifetime.open(...)`
+inside a function returning `resources::Outcome<T, result::Failure>`. Keep the
+accept and request loop inside that scope, use `isStopping()` to check the stop
+or owned interrupt, and pass `pollMilliseconds()` to an idle socket poll. That
+value is 50 when the lifetime owns interrupt handling and -1 otherwise. Acquire
+the listener inside the lifetime scope so it closes before the lifetime. The
+outcome preserves cleanup failures. Explicit `close()` is idempotent; afterward
+`isStopping()` is false and `pollMilliseconds()` is -1. The lifetime keeps an
+optional forced-exit deadline active until `close()` completes.
+
+Call `lifetime.requestStop()` when the server begins shutdown after a listener
+error as well as for a deliberate stop. It marks the lifetime as stopping and
+starts the optional fatal deadline, including when no external `Stop` was
+provided. When a `Stop` is attached it is requested too. Repeated requests keep
+the original deadline, and requests after `close()` have no effect.
 
 Only one interrupt lease or interactive terminal lease may be active. POSIX
 acquisition also rejects existing nondefault signal actions. Failure to acquire
@@ -263,6 +284,30 @@ written response bytes, and response status. `ExchangeFailure` preserves the
 primary failure, any failure sending a rejection response, and an ordered
 `closeFailures` collection. Binary responses and response headers share one write deadline.
 `serveOutcome` exposes listener completion through `result::Result`.
+
+## Waiting for multiple descriptors
+
+`http::PollSet.create(capacity)` returns a reusable polling set or `null` when
+capacity is outside 0–4096. `unsafe add(descriptor, read: true, write: false)`
+returns the descriptor's slot or `null` for a negative descriptor or a full set.
+The set borrows descriptors; their owners must keep them open until each wait
+returns. `clear()` removes all slots, and `count()` reports the current count.
+
+`unsafe wait(milliseconds)` returns `Result<Int, result::Failure>` with the
+number of slots reporting events. The timeout is -1 for an indefinite wait or
+0–60000 milliseconds; timeout and interruption return zero. Inspect
+`readable(slot)`, `writable(slot)`, `failed(slot)`, `hungUp(slot)` and
+`invalid(slot)` afterward. Each wait clears earlier event flags, including when
+it fails. Readiness is advisory; the subsequent nonblocking I/O or worker poll
+remains authoritative. A coordinator owns its retry policy and absolute deadline.
+
+The set can combine sockets with a worker pool's borrowed `readinessHandle()`.
+Consume worker notifications with `pool.poll(0)`, and remove the descriptor from
+the set before closing the pool. Never read, write or close that notification
+descriptor directly. This API requires runtime ABI 1.33 and `MULTIPLEXED_IO`.
+POSIX accepts pipes and sockets; Windows accepts sockets and may report an OS
+error when every supplied socket is invalid. A set with no descriptors waits
+only for its timeout or interruption.
 
 ## Implementation boundary
 

@@ -1,13 +1,19 @@
 class IrVerifier
   public module: IrModule
   public result: IrVerification = new IrVerification()
-  public symbols: StringBuffer = new StringBuffer()
+  private symbols: StringTable<Bool> = new StringTable<Bool>()
+  private sources: StringTable<IrSource> = new StringTable<IrSource>()
+  private blocks: StringTable<IrBlock> = new StringTable<IrBlock>()
 
   def init(module: IrModule): Void
     this.module = module
   end
 
   def verify(): IrVerification
+    this.result = new IrVerification()
+    this.symbols = new StringTable<Bool>()
+    this.sources = new StringTable<IrSource>()
+    this.blocks = new StringTable<IrBlock>()
     if this.module.id == ""
       this.result.fail("module id is empty")
     end
@@ -71,26 +77,73 @@ class IrVerifier
       this.verifyFunction(function)
       function = function.nextFunction
     end
+    this.verifySessionExport()
     return this.result
+  end
+
+  def verifySessionExport(): Void
+    let entry = this.module.sessionEntry
+
+    if entry == null
+      return
+    end
+    var function = this.module.firstFunction
+
+    while function != null && (function.symbol.name != entry.name || function.symbol.moduleName != entry.moduleName || !function.symbol.kind.same(entry.kind))
+      function = function.nextFunction
+    end
+    if function == null || !entry.kind.isFunction() || entry.name != "__neri_session_entry"
+      this.result.fail("session export entry is missing")
+      return
+    end
+    let returned = function.resultType
+    let target = this.module.sessionTargetType
+    let source = this.module.sessionSourceType
+    let invalidResult = (!returned.same(target) && !(returned.kind().isOptional() && returned.element().same(target))) || !irTypeKind(target).isClass()
+    var invalidSource = function.parameterTypes.size > 1 || (function.parameterTypes.size == 0 && !source.kind().isVoid())
+
+    if function.parameterTypes.size == 1
+      invalidSource = !irTypeKind(function.parameterTypes.get(0)).isClass() || !function.parameterTypes.get(0).same(source)
+    end
+    if invalidResult || invalidSource
+      this.result.fail("session entry must return a managed frame or optional managed frame")
+    end
   end
 
   def verifySources(): Void
     if this.module.sourceCount == 0
       this.result.fail("module has no sources")
     end
+    let counts = new StringTable<Int>()
     var source = this.module.firstSource
+
+    while source != null
+      this.sources.add(source.id, source)
+      let entry = counts.find(source.id)
+
+      if entry == null
+        counts.add(source.id, 1)
+      else
+        entry.value = entry.value + 1
+      end
+      source = source.nextSource
+    end
+    source = this.module.firstSource
 
     while source != null
       if source.id == ""
         this.result.fail("source id is empty")
       end
-      var other = source.nextSource
+      let entry = counts.find(source.id)
 
-      while other != null
-        if source.id == other.id
+      if entry != null
+        entry.value = entry.value - 1
+        var remaining = entry.value
+
+        while remaining > 0
           this.result.fail("duplicate source '" + source.id + "'")
+          remaining = remaining - 1
         end
-        other = other.nextSource
       end
       source = source.nextSource
     end
@@ -103,20 +156,15 @@ class IrVerifier
     if symbol.name == ""
       this.result.fail("symbol name is empty")
     end
-    let key = symbol.moduleName + "|" + symbol.kind.displayName() + "|" + symbol.name
-    var index = 0
+    let kind = symbol.kind.displayName()
+    let key = (host::stringByteLength(symbol.moduleName) as String) + ":" + symbol.moduleName + (host::stringByteLength(kind) as String) + ":" + kind + (host::stringByteLength(symbol.name) as String) + ":" + symbol.name
 
-    while index < this.symbols.size
-      if this.symbols.get(index) == key
-        this.result.fail("duplicate symbol '" + symbol.name + "'")
-        return
-      end
-      index = index + 1
+    if !this.symbols.add(key, true)
+      this.result.fail("duplicate symbol '" + symbol.name + "'")
     end
-    this.symbols.add(key)
   end
 
-  def verifyTypeBuffer(types: StringBuffer): Void
+  def verifyTypeBuffer(types: IrTypeBuffer): Void
     var index = 0
 
     while index < types.size
@@ -125,28 +173,25 @@ class IrVerifier
     end
   end
 
-  def verifyType(typeName: String): Void
-    if irTypeTag(typeName) == 0
-      this.result.fail("invalid IR type '" + typeName + "'")
+  def verifyType(typeName: readonly IrType): Void
+    if typeName.kind().wireCode() == 0
+      this.result.fail("invalid IR type '" + irRenderType(typeName) + "'")
     end
-    if semanticIsCFunction(typeName)
+    if typeName.kind().isCFunction()
       if !this.module.requiredFeatures.hasCInterop() || !irCAbiType(typeName, false)
         this.result.fail("native callable requires c-interop-v1 and a C ABI signature")
       end
-      this.verifyTypeBuffer(semanticCFunctionComponents(typeName))
-    else if irIsOptional(typeName) || irIsPointer(typeName) || irTypeKind(typeName) == "array"
+      this.verifyTypeBuffer(irTypeComponents(typeName))
+    else if irIsOptional(typeName) || irIsPointer(typeName) || irTypeKind(typeName).isArray()
       this.verifyType(irTypeInner(typeName))
     end
   end
 
   def sourceFor(id: String): IrSource?
-    var source = this.module.firstSource
+    let entry = this.sources.find(id)
 
-    while source != null
-      if source.id == id
-        return source
-      end
-      source = source.nextSource
+    if entry != null
+      return entry.value
     end
     return null
   end
@@ -172,7 +217,7 @@ class IrVerifier
     end
   end
 
-  def defineValue(id: Int, typeName: String, defined: IntBuffer, types: StringBuffer, function: IrFunction): Void
+  def defineValue(id: Int, typeName: readonly IrType, defined: IntBuffer, types: IrTypeBuffer, function: IrFunction): Void
     if id < 0 || id >= function.nextValueId
       this.result.fail("value id is outside function range in '" + function.symbol.name + "'")
       return
@@ -192,20 +237,17 @@ class IrVerifier
     end
   end
 
-  def findBlock(function: IrFunction, id: Int): IrBlock?
-    var block = function.firstBlock
+  def findBlock(id: Int): IrBlock?
+    let entry = this.blocks.find(id as String)
 
-    while block != null
-      if block.id == id
-        return block
-      end
-      block = block.nextBlock
+    if entry != null
+      return entry.value
     end
     return null
   end
 
   def verifyEdge(function: IrFunction, targetId: Int, arguments: Int[], defined: IntBuffer): Void
-    let target = this.findBlock(function, targetId)
+    let target = this.findBlock(targetId)
 
     if target == null
       this.result.fail("branch targets unknown block in '" + function.symbol.name + "'")
@@ -217,7 +259,7 @@ class IrVerifier
     for argument in arguments this.verifyValueUse(argument, defined, function) end
   end
 
-  def verifyInstruction(function: IrFunction, instruction: IrInstruction, defined: IntBuffer, types: StringBuffer): Void
+  def verifyInstruction(function: IrFunction, instruction: IrInstruction, defined: IntBuffer, types: IrTypeBuffer): Void
     for operand in instruction.operands this.verifyValueUse(operand, defined, function) end
     for typeName in instruction.typeArguments this.verifyType(typeName) end
     this.verifyLocation(instruction.location)
@@ -226,7 +268,7 @@ class IrVerifier
         this.result.fail("native callable instructions require c-interop-v1")
       end
       if instruction.opcode.isCFunctionAddress()
-        if instruction.operands.Length != 0 || instruction.symbol == null || !semanticIsCFunction(instruction.resultType)
+        if instruction.operands.Length != 0 || instruction.symbol == null || !instruction.resultType.kind().isCFunction()
           this.result.fail("native function address has an invalid shape")
         end
       else if instruction.operands.Length < 2 || instruction.symbol != null
@@ -236,12 +278,12 @@ class IrVerifier
 
         if callee >= 0 && callee < types.size
           let signature = types.get(callee)
-          let components = semanticCFunctionComponents(signature)
+          let components = irTypeComponents(signature)
 
-          if !semanticIsCFunction(signature) || components.size + 1 != instruction.operands.Length
+          if !signature.kind().isCFunction() || components.size + 1 != instruction.operands.Length
             this.result.fail("indirect C call has an incompatible signature")
           else
-            if instruction.resultType != components.get(0)
+            if !instruction.resultType.same(components.get(0))
               this.result.fail("indirect C call has an incompatible result")
             end
             var index = 1
@@ -249,7 +291,7 @@ class IrVerifier
             while index < components.size
               let operand = instruction.operands[index + 1]
 
-              if operand >= 0 && operand < types.size && types.get(operand) != components.get(index)
+              if operand >= 0 && operand < types.size && !types.get(operand).same(components.get(index))
                 this.result.fail("indirect C call has an incompatible argument")
               end
               index = index + 1
@@ -272,17 +314,19 @@ class IrVerifier
       this.result.fail("non-comparison instruction carries a predicate")
     end
     if instruction.opcode.requiresUnsafeCapability()
-      if instruction.operands.Length == 0 || instruction.operands[0] < 0 || instruction.operands[0] >= function.nextValueId || types.get(instruction.operands[0]) != "!unsafe"
+      if instruction.operands.Length == 0 || instruction.operands[0] < 0 || instruction.operands[0] >= function.nextValueId || !types.get(instruction.operands[0]).kind().isUnsafeCapability()
         this.result.fail("unsafe instruction has no live unsafe capability in '" + function.symbol.name + "'")
       end
     end
     if instruction.opcode.isUnsafeBegin()
-      if instruction.resultType != "!unsafe" || instruction.operands.Length != 0
+      if !instruction.resultType.kind().isUnsafeCapability() || instruction.operands.Length != 0
         this.result.fail("unsafe.begin has an invalid shape")
       end
     end
     if instruction.opcode.isBorrowBegin()
-      if instruction.secondResultId < 0 || irTypeKind(instruction.secondResultType) != "borrow"
+      let secondType = instruction.secondResultType
+
+      if instruction.secondResultId < 0 || secondType == null || !secondType.kind().isBorrowCapability()
         this.result.fail("borrow.begin has no borrow token")
       end
     else if instruction.secondResultId >= 0
@@ -298,13 +342,15 @@ class IrVerifier
       if !this.module.requiredFeatures.hasCInterop() || !semanticPortableCSymbol(function.cExportSymbol) || !function.kind.isFunction() || !irCAbiType(function.resultType, true)
         this.result.fail("C export requires a portable name and a module C ABI function")
       end
-      var parameter = function.parameterTypes.first.nextNode
+      var parameterIndex = 0
 
-      while parameter != null
-        if !irCAbiType(parameter.value, false)
+      while parameterIndex < function.parameterTypes.size
+        let parameter = function.parameterTypes.get(parameterIndex)
+
+        if !irCAbiType(parameter, false)
           this.result.fail("C export has an incompatible parameter type")
         end
-        parameter = parameter.nextNode
+        parameterIndex = parameterIndex + 1
       end
     end
     if function.retained
@@ -319,23 +365,40 @@ class IrVerifier
     if function.blockCount == 0
       this.result.fail("function '" + function.symbol.name + "' has no blocks")
     end
-    let entry = this.findBlock(function, function.entryBlock)
+    this.blocks = new StringTable<IrBlock>()
+    let blockCounts = new StringTable<Int>()
+    var indexedBlock = function.firstBlock
+
+    while indexedBlock != null
+      let key = indexedBlock.id as String
+
+      this.blocks.add(key, indexedBlock)
+      let entry = blockCounts.find(key)
+
+      if entry == null
+        blockCounts.add(key, 1)
+      else
+        entry.value = entry.value + 1
+      end
+      indexedBlock = indexedBlock.nextBlock
+    end
+    let entry = this.findBlock(function.entryBlock)
 
     if entry == null
       this.result.fail("function '" + function.symbol.name + "' has no entry block")
       return
     end
     let defined = new IntBuffer()
-    let types = new StringBuffer()
+    let types = new IrTypeBuffer()
     var index = 0
 
     while index < function.nextValueId
       defined.add(0)
-      types.add("")
+      types.add(this.module.types.voidType())
       index = index + 1
     end
     if function.unsafeRootId >= 0
-      this.defineValue(function.unsafeRootId, "!unsafe", defined, types, function)
+      this.defineValue(function.unsafeRootId, this.module.types.unsafeType(), defined, types, function)
     end
     if function.unsafeCall != (function.unsafeRootId >= 0)
       this.result.fail("unsafe function root does not match unsafe-call flag")
@@ -360,13 +423,16 @@ class IrVerifier
     var block = function.firstBlock
 
     while block != null
-      var other = block.nextBlock
+      let countEntry = blockCounts.find(block.id as String)
 
-      while other != null
-        if block.id == other.id
+      if countEntry != null
+        countEntry.value = countEntry.value - 1
+        var remaining = countEntry.value
+
+        while remaining > 0
           this.result.fail("duplicate block id in '" + function.symbol.name + "'")
+          remaining = remaining - 1
         end
-        other = other.nextBlock
       end
       var parameter = block.firstParameter
 
@@ -382,8 +448,14 @@ class IrVerifier
         if instruction.resultId >= 0
           this.defineValue(instruction.resultId, instruction.resultType, defined, types, function)
         end
+        let secondType = instruction.secondResultType
+
         if instruction.secondResultId >= 0
-          this.defineValue(instruction.secondResultId, instruction.secondResultType, defined, types, function)
+          if secondType == null
+            this.result.fail("instruction has no second result type")
+          else
+            this.defineValue(instruction.secondResultId, secondType, defined, types, function)
+          end
         end
         instruction = instruction.nextInstruction
       end
@@ -420,7 +492,7 @@ class IrVerifier
 
     index = 0
     while entryParameter != null && index < function.parameterTypes.size
-      if entryParameter.typeName != function.parameterTypes.get(index)
+      if !entryParameter.typeName.same(function.parameterTypes.get(index))
         this.result.fail("entry parameter type does not match function signature")
       end
       entryParameter = entryParameter.nextParameter
@@ -445,21 +517,21 @@ class IrVerifier
           this.verifyEdge(function, terminator.firstTarget, terminator.firstArguments, defined)
         else if terminator.kind.isConditionalBranch()
           this.verifyValueUse(terminator.condition, defined, function)
-          if terminator.condition >= 0 && terminator.condition < function.nextValueId && types.get(terminator.condition) != "bool"
+          if terminator.condition >= 0 && terminator.condition < function.nextValueId && !types.get(terminator.condition).kind().isBool()
             this.result.fail("conditional branch condition is not bool")
           end
           this.verifyEdge(function, terminator.firstTarget, terminator.firstArguments, defined)
           this.verifyEdge(function, terminator.secondTarget, terminator.secondArguments, defined)
         else if terminator.kind.isReturn()
-          if function.resultType == "void" && terminator.value >= 0
+          if function.resultType.kind().isVoid() && terminator.value >= 0
             this.result.fail("void return carries a value")
           end
-          if function.resultType != "void" && terminator.value < 0
+          if !function.resultType.kind().isVoid() && terminator.value < 0
             this.result.fail("non-void return has no value")
           end
           if terminator.value >= 0
             this.verifyValueUse(terminator.value, defined, function)
-            if terminator.value < function.nextValueId && types.get(terminator.value) != function.resultType
+            if terminator.value < function.nextValueId && !types.get(terminator.value).same(function.resultType)
               this.result.fail("return value type does not match function result")
             end
           end

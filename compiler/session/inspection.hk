@@ -1,0 +1,224 @@
+use host
+
+def sessionInspectionTypeDisplay(typeName: String): String
+  if semanticIsReadonly(typeName)
+    return "readonly " + sessionInspectionTypeDisplay(semanticMutableType(typeName))
+  end
+  if semanticIsArray(typeName)
+    let element = semanticInnerType(typeName)
+
+    return (semanticIsReadonly(element) ? "(" + sessionInspectionTypeDisplay(element) + ")" : sessionInspectionTypeDisplay(element)) + "[]"
+  end
+  if semanticIsOptional(typeName)
+    let inner = semanticInnerType(typeName)
+
+    return (semanticIsReadonly(inner) ? "(" + sessionInspectionTypeDisplay(inner) + ")" : sessionInspectionTypeDisplay(inner)) + "?"
+  end
+  return semanticNamespaceDisplay(typeName)
+end
+
+class SessionInspection
+  private model: SemanticModel
+  private syntax: SyntaxArena
+  private generation: Int
+  private nextId: Int = 0
+  public source: String = ""
+
+  def init(model: SemanticModel, syntax: SyntaxArena, generation: Int): Void
+    this.model = model
+    this.syntax = syntax
+    this.generation = generation
+  end
+
+  def build(typeName: String): String
+    return this.inspect(typeName, "__neri_session_result")
+  end
+
+  def inspect(typeName: String, valueName: String): String
+    if this.source == ""
+      this.source = this.escapeSource() + this.limitSource()
+    end
+    let root = this.add(typeName, 0)
+
+    return "__neri_session_limit_" + (this.generation as String) + "(" + root + "(" + valueName + "))"
+  end
+
+  private def limitSource(): String
+    let name = "__neri_session_limit_" + (this.generation as String)
+    var result = "def " + name + "(value: String): String\n"
+
+    result = result + "  if value.byteLength() <= 4096\n    return value\n  end\n"
+    result = result + "  var finish = 4096\n"
+    result = result + "  while finish > 0 && !value.isScalarBoundary(finish)\n    finish = finish - 1\n  end\n"
+    result = result + "  let prefix = value.sliceBytes(0, finish)\n"
+    result = result + "  return (prefix == null ? \"\" : prefix) + \"...\"\nend\n"
+    return result
+  end
+
+  private def name(): String
+    let result = "__neri_session_inspect_" + (this.generation as String) + "_" + (this.nextId as String)
+
+    this.nextId = this.nextId + 1
+    return result
+  end
+
+  private def escapeSource(): String
+    let name = "__neri_session_escape_" + (this.generation as String)
+    var result = "def " + name + "(value: String): String\n"
+
+    result = result + "  var result = " + irQuote("\"") + "\n"
+    result = result + "  var index = 0\n"
+    result = result + "  while index < value.byteLength() && index < 256\n"
+    result = result + "    let item = value.byteAt(index)\n"
+    result = result + "    if item == null\n      return result + " + irQuote("\"") + "\n    end\n"
+    result = result + "    let code = item as Int\n"
+    result = result + "    if code == 34\n      result = result + " + irQuote("\\\"") + "\n"
+    result = result + "    else if code == 92\n      result = result + " + irQuote("\\\\") + "\n"
+    result = result + "    else if code == 10\n      result = result + " + irQuote("\\n") + "\n"
+    result = result + "    else if code == 13\n      result = result + " + irQuote("\\r") + "\n"
+    result = result + "    else if code == 9\n      result = result + " + irQuote("\\t") + "\n"
+    result = result + "    else if code < 32 || code == 127\n      result = result + " + irQuote("?") + "\n"
+    result = result + "    else\n      let width = code < 128 ? 1 : (code < 224 ? 2 : (code < 240 ? 3 : 4))\n"
+    result = result + "      if index + width > 256\n        break\n      end\n"
+    result = result + "      let part = value.sliceBytes(index, width)\n"
+    result = result + "      if part != null\n        result = result + part\n      end\n"
+    result = result + "      index = index + width - 1\n"
+    result = result + "    end\n"
+    result = result + "    index = index + 1\n"
+    result = result + "  end\n"
+    result = result + "  if index < value.byteLength()\n    result = result + " + irQuote("...") + "\n  end\n"
+    return result + "  return result + " + irQuote("\"") + "\nend\n"
+  end
+
+  private def add(typeName: String, depth: Int): String
+    let name = this.name()
+    let display = sessionInspectionTypeDisplay(typeName)
+    var body = ""
+
+    if semanticIsPointer(typeName)
+      body = "  return " + irQuote(typeName) + "\n"
+    else if semanticIsOptional(typeName)
+      let child = this.add(semanticInnerType(typeName), depth)
+
+      body = "  if value == null\n    return \"null\"\n  end\n  return " + child + "(value)\n"
+    else if typeName == "String"
+      body = "  return __neri_session_escape_" + (this.generation as String) + "(value)\n"
+    else if typeName == "Int" || typeName == "Byte" || typeName == "Float"
+      body = "  return value as String\n"
+    else if typeName == "Bool"
+      body = "  return value ? \"true\" : \"false\"\n"
+    else if depth >= 3
+      body = "  return " + irQuote(typeName) + "\n"
+    else if semanticIsArray(typeName)
+      let child = this.add(semanticInnerType(typeName), depth + 1)
+
+      body = "  var result = \"[\"\n  var index = 0\n"
+      body = body + "  while index < value.Length && index < 8\n"
+      body = body + "    result = result + (index == 0 ? \"\" : \", \") + " + child + "(value[index])\n"
+      body = body + "    index = index + 1\n  end\n"
+      body = body + "  if index < value.Length\n    result = result + \"...\"\n  end\n"
+      body = body + "  return result + \"]\"\n"
+    else
+      let symbol = this.model.findClass(semanticMutableType(typeName))
+
+      if symbol != null
+        if symbol.isAlternative
+          body = this.alternativeBody(symbol, typeName, depth)
+        else
+          body = this.classBody(symbol, typeName, depth)
+        end
+      else
+        body = "  return " + irQuote(typeName) + "\n"
+      end
+    end
+    this.source = this.source + "def " + name + "(value: " + display + "): String\n" + body + "end\n"
+    return name
+  end
+
+  private def classBody(symbol: SemanticClass, typeName: String, depth: Int): String
+    var result = "  var result = " + irQuote(symbol.name + "{") + "\n"
+    var field = symbol.firstField
+    var count = 0
+
+    while field != null && count < 8
+      if field.access.isPublic() && !textStartsWith(field.name, "__neri_session_")
+        let child = this.add(semanticViewMember(typeName, field.typeName), depth + 1)
+
+        result = result + "  result = result + " + irQuote((count == 0 ? "" : ", ") + field.name + ": ") + " + " + child + "(value." + field.name + ")\n"
+        count = count + 1
+      end
+      field = field.nextField
+    end
+    if field != null
+      result = result + "  result = result + \"...\"\n"
+    end
+    let items = this.inspectItems(symbol, semanticIsReadonly(typeName))
+
+    if items != ""
+      let child = this.add(items, depth + 1)
+
+      result = result + "  let entries = value.inspectItems(9)\n"
+      result = result + "  result = result + " + irQuote(count == 0 ? "items: " : ", items: ") + " + \"[\"\n"
+      result = result + "  var index = 0\n  while index < entries.Length && index < 8\n"
+      result = result + "    result = result + (index == 0 ? \"\" : \", \") + " + child + "(entries[index])\n"
+      result = result + "    index = index + 1\n  end\n"
+      result = result + "  if entries.Length > 8\n    result = result + \"...\"\n  end\n"
+      result = result + "  result = result + \"]\"\n"
+    end
+    return result + "  return result + \"}\"\n"
+  end
+
+  private def inspectItems(symbol: SemanticClass, readonlyReceiver: Bool): String
+    var method = symbol.firstMethod
+
+    while method != null
+      if method.name == "inspectItems" && method.access.isPublic() && !method.isStatic && !method.isUnsafe && (!readonlyReceiver || method.isReadonly) && method.parameterCount == 1 && semanticIsArray(method.returnType)
+        let parameter = method.firstParameter
+
+        if parameter != null && parameter.typeName == "Int"
+          return semanticInnerType(method.returnType)
+        end
+      end
+      method = method.nextCallable
+    end
+    return ""
+  end
+
+  private def alternativeBody(symbol: SemanticClass, typeName: String, depth: Int): String
+    var result = "  match value\n"
+    var caseIndex = 0
+    let genericStart = semanticFindByte(symbol.fullName, 60)
+    let caseOwner = semanticNamespaceDisplay(genericStart < 0 ? symbol.fullName : host::stringSlice(symbol.fullName, 0, genericStart))
+
+    while caseIndex < this.syntax.childCountAt(symbol.syntaxNode)
+      let caseNode = this.syntax.childAt(symbol.syntaxNode, caseIndex)
+      let caseName = this.syntax.dataAt(caseNode)
+      var bindings = ""
+      var body = "    return " + irQuote(symbol.name + "." + caseName)
+      var payload = 0
+
+      while payload < this.syntax.childCountAt(caseNode)
+        let binding = "item" + (payload as String)
+        let fieldName = "$alternative" + (caseIndex as String) + "_" + (payload as String)
+        var field = symbol.firstField
+
+        while field != null && field.name != fieldName
+          field = field.nextField
+        end
+        bindings = bindings + (payload == 0 ? "" : ", ") + binding
+        if field != null
+          let child = this.add(semanticViewMember(typeName, field.typeName), depth + 1)
+
+          body = body + " + " + irQuote((payload == 0 ? "(" : ", ") + this.syntax.dataAt(this.syntax.childAt(caseNode, payload)) + ": ") + " + " + child + "(" + binding + ")"
+        end
+        payload = payload + 1
+      end
+      if payload > 0
+        body = body + " + \")\""
+      end
+      result = result + "    case " + caseOwner + "." + caseName + "(" + bindings + ")\n  " + body + "\n"
+      caseIndex = caseIndex + 1
+    end
+    return result + "  end\n"
+  end
+end

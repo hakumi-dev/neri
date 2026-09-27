@@ -1,0 +1,235 @@
+use console
+use files
+use host
+use resources
+use result
+use test
+use neri_data
+
+
+def containsText(source: String, sought: String): Bool
+  let sourceLength = host::stringByteLength(source)
+  let soughtLength = host::stringByteLength(sought)
+  var start = 0
+
+  while start + soughtLength <= sourceLength
+    var offset = 0
+
+    while offset < soughtLength && host::stringByteAt(source, start + offset) == host::stringByteAt(sought, offset)
+      offset = offset + 1
+    end
+    if offset == soughtLength
+      return true
+    end
+    start = start + 1
+  end
+  return false
+end
+
+def assertMalformedSnapshot(source: String): Void
+  let snapshot = dataMigrationReadSnapshot(source)
+
+  test::assertTrue(snapshot.model == null)
+  test::assertTrue(snapshot.error != "")
+end
+
+def verifySnapshotRoundTrip(): Void
+  console::println("migration tooling: snapshot scalar fidelity, null distinction, and index order")
+  let maxInt = 9223372036854775807
+  let minInt = (-9223372036854775807) - 1
+  let fields = [
+    new SchemaField("pk", new SchemaColumn("id", SchemaType.Int(), primaryKey: true)),
+    new SchemaField("int-max", new SchemaColumn("upper", SchemaType.Int(), defaultValue: SchemaDefault.Int(maxInt))),
+    new SchemaField("int-min", new SchemaColumn("lower", SchemaType.Int(), defaultValue: SchemaDefault.Int(minInt))),
+    new SchemaField("ratio", new SchemaColumn("ratio", SchemaType.Float(), defaultValue: SchemaDefault.Float(1.25))),
+    new SchemaField("optional", new SchemaColumn("optional", SchemaType.Text(), nullable: true, defaultValue: SchemaDefault.Null())),
+    new SchemaField("absent", new SchemaColumn("absent", SchemaType.Text(), nullable: true)),
+    new SchemaField("escaped", new SchemaColumn("escaped", SchemaType.Text(), defaultValue: SchemaDefault.Text("quote \" slash \\ line\n tab\t 水")))
+  ]
+  let ordered = new SchemaModel([new SchemaTable("sample", "samples", fields, [new SchemaIndex("sample_pair", ["ratio", "escaped"], true)])])
+  let encoded = dataMigrationSnapshot(ordered)
+  let decoded = dataMigrationReadSnapshot(encoded)
+  let restored = decoded.model
+
+  test::assertTrue(encoded != "")
+  test::assertEqual(decoded.error, "")
+  if restored == null
+    test::assertTrue(false)
+    return
+  end
+
+  test::assertEqual(restored.signature(), ordered.signature())
+  test::assertTrue(containsText(encoded, "\"kind\":\"Null\""))
+  test::assertTrue(containsText(encoded, "\"value\":\"9223372036854775807\""))
+  test::assertTrue(containsText(encoded, "\"value\":\"-9223372036854775808\""))
+
+  let reversed = new SchemaModel([new SchemaTable("sample", "samples", fields, [new SchemaIndex("sample_pair", ["escaped", "ratio"], true)])])
+
+  test::assertTrue(ordered.signature() != reversed.signature())
+  assertMalformedSnapshot("")
+  assertMalformedSnapshot("{}")
+  assertMalformedSnapshot("{\"version\":2,\"signature\":\"x\",\"tables\":[]}")
+  assertMalformedSnapshot("{\"version\":1,\"signature\":\"wrong\",\"tables\":[]}")
+  assertMalformedSnapshot("{\"extra\":true," + host::stringSlice(encoded, 1, host::stringByteLength(encoded) - 1))
+  assertMalformedSnapshot("{\"version\":1," + host::stringSlice(encoded, 1, host::stringByteLength(encoded) - 1))
+end
+
+def baseSourceModel(): SchemaModel
+  let widgets = new SchemaTable("widgets", "widgets", [
+      new SchemaField("id", new SchemaColumn("id", SchemaType.Int(), primaryKey: true)),
+      new SchemaField("value", new SchemaColumn("value", SchemaType.Text())),
+      new SchemaField("gone", new SchemaColumn("gone", SchemaType.Text(), nullable: true))
+    ], [new SchemaIndex("old_idx", ["value"])])
+  let retired = new SchemaTable("retired", "retired", [new SchemaField("id", new SchemaColumn("id", SchemaType.Int(), primaryKey: true))])
+  let metrics = new SchemaTable("metrics", "metrics", [new SchemaField("id", new SchemaColumn("id", SchemaType.Int(), primaryKey: true)), new SchemaField("amount", new SchemaColumn("amount", SchemaType.Int()))])
+
+  return new SchemaModel([widgets, retired, metrics])
+end
+
+def evolvedSourceModel(): SchemaModel
+  let widgets = new SchemaTable("widgets", "things", [
+      new SchemaField("id", new SchemaColumn("id", SchemaType.Int(), primaryKey: true)),
+      new SchemaField("value", new SchemaColumn("label", SchemaType.Text())),
+      new SchemaField("note", new SchemaColumn("note", SchemaType.Text(), nullable: true))
+    ], [new SchemaIndex("new_idx", ["value", "id"], true)])
+  let metrics = new SchemaTable("metrics", "metrics", [new SchemaField("id", new SchemaColumn("id", SchemaType.Int(), primaryKey: true)), new SchemaField("amount", new SchemaColumn("amount", SchemaType.Text()))])
+  let fresh = new SchemaTable("fresh", "fresh", [
+      new SchemaField("id", new SchemaColumn("id", SchemaType.Int(), primaryKey: true)),
+      new SchemaField("max-int", new SchemaColumn("maximum", SchemaType.Int(), defaultValue: SchemaDefault.Int(9223372036854775807))),
+      new SchemaField("min-int", new SchemaColumn("minimum", SchemaType.Int(), defaultValue: SchemaDefault.Int((-9223372036854775807) - 1))),
+      new SchemaField("ratio", new SchemaColumn("ratio", SchemaType.Float(), defaultValue: SchemaDefault.Float(1.25))),
+      new SchemaField("enabled", new SchemaColumn("enabled", SchemaType.Bool(), defaultValue: SchemaDefault.Bool(true))),
+      new SchemaField("nullable", new SchemaColumn("nullable", SchemaType.Text(), nullable: true, defaultValue: SchemaDefault.Null())),
+      new SchemaField("absent", new SchemaColumn("absent", SchemaType.Text(), nullable: true)),
+      new SchemaField("escaped\0identity", new SchemaColumn("escaped", SchemaType.Text(), defaultValue: SchemaDefault.Text("quote \" slash \\ line\n tab\t 水")))
+    ])
+
+  return new SchemaModel([widgets, metrics, fresh])
+end
+
+def verifySourceOperations(): String
+  console::println("migration tooling: source includes every schema operation constructor")
+
+  match diffSchema("all_ops", baseSourceModel(), evolvedSourceModel())
+    case SchemaDiffResult.Unchanged()
+      test::assertTrue(false)
+      return ""
+    case SchemaDiffResult.Failure(error)
+      console::println("Could not create source-generation operation matrix")
+
+      test::assertTrue(false)
+      return ""
+    case SchemaDiffResult.Plan(plan)
+      let source = dataMigrationSource("all_ops", "contract_namespace.migrations", plan, evolvedSourceModel())
+
+      test::assertTrue(source != "")
+      test::assertTrue(containsText(source, "SchemaOp.CreateTable("))
+      test::assertTrue(containsText(source, "SchemaOp.DropTable("))
+      test::assertTrue(containsText(source, "SchemaOp.AddColumn("))
+      test::assertTrue(containsText(source, "SchemaOp.DropColumn("))
+      test::assertTrue(containsText(source, "SchemaOp.RenameTable("))
+      test::assertTrue(containsText(source, "SchemaOp.RenameColumn("))
+      test::assertTrue(containsText(source, "SchemaOp.CreateIndex("))
+      test::assertTrue(containsText(source, "SchemaOp.DropIndex("))
+      test::assertTrue(containsText(source, "SchemaOp.RebuildTable("))
+      return source + "\ndef expected_all_ops_signature(): String\n  return " + dataMigrationLiteral(plan.migration().signature()) + "\nend\n\ndef expected_all_ops_model(): String\n  return " + dataMigrationLiteral(evolvedSourceModel().signature()) + "\nend\n"
+  end
+  return ""
+end
+
+def verifyPrepareAndPublication(root: String): resources::Outcome<Int, result::Failure>
+  using temporary <- files::TemporaryDirectory.create("neri-migration-tooling-")
+    let mappingPath = root + "/experiments/neri-data/migration-scaffold/mapping.json"
+    let mapping = dataLoadMapping(mappingPath)
+
+    test::assertEqual(mapping.error, "")
+    let current = dataMigrationModel(mapping)
+    let currentModel = current.model
+
+    test::assertEqual(current.error, "")
+    if currentModel == null
+      test::assertTrue(false)
+      return 1
+    end
+    let unchanged = dataMigrationPrepare(mapping, currentModel, "unchanged")
+
+    test::assertTrue(unchanged.unchanged)
+    test::assertEqual(unchanged.error, "")
+    let initial = dataMigrationPrepare(mapping, new SchemaModel([]), "initial")
+
+    test::assertFalse(initial.unchanged)
+    test::assertEqual(initial.error, "")
+    test::assertTrue(initial.source != "")
+    test::assertTrue(initial.snapshot != "")
+    let destination = temporary.path() + "/existing"
+
+    test::assertTrue(files::createDirectory(destination).failure == null)
+    test::assertTrue(host::writeText(destination + "/sentinel", "preserve"))
+    test::assertFalse(dataMigrationPublish(mapping, initial, destination))
+    test::assertTrue(host::readText(destination + "/sentinel") == "preserve")
+
+    let bundle = temporary.path() + "/initial"
+    let publishMapping = dataLoadMapping(mappingPath)
+
+    test::assertEqual(publishMapping.error, "")
+    test::assertTrue(dataMigrationPublish(publishMapping, initial, bundle))
+    let historical = dataMigrationHistorical(publishMapping, bundle + "/snapshot.json")
+    let historicalModel = historical.model
+
+    test::assertEqual(historical.error, "")
+    if historicalModel == null
+      test::assertTrue(false)
+      return 1
+    end
+
+    test::assertEqual(historicalModel.signature(), currentModel.signature())
+    test::assertTrue(host::writeText(bundle + "/migration.hk", "edited historical migration source"))
+    let editedHistory = dataMigrationHistorical(mapping, bundle + "/snapshot.json")
+
+    test::assertEqual(editedHistory.error, "")
+    let afterMapping = dataLoadMapping(root + "/experiments/neri-data/migration-scaffold/mapping-after.json")
+
+    test::assertEqual(afterMapping.error, "")
+    let evolved = dataMigrationPrepare(afterMapping, historicalModel, "evolved")
+
+    test::assertEqual(evolved.error, "")
+    evolved.historicalPath = historical.sourcePath
+    evolved.historicalSnapshotText = historical.sourceText
+    evolved.historicalMarkerText = historical.markerText
+
+    test::assertTrue(host::writeText(bundle + "/snapshot.json", "{}"))
+    test::assertFalse(dataMigrationPublish(afterMapping, evolved, temporary.path() + "/rejected"))
+    let rejected = files::status(temporary.path() + "/rejected")
+
+    test::assertTrue(rejected.status != null && !rejected.status.exists)
+    test::assertTrue(dataMigrationHistorical(afterMapping, bundle + "/snapshot.json").error != "")
+    return 0
+  end
+  return 1
+end
+
+def main(): Void
+  let root = host::argumentAt(0)
+
+  if root == null
+    test::assertTrue(false)
+    return
+  end
+  verifySnapshotRoundTrip()
+  let generated = verifySourceOperations()
+  let outputPath = host::argumentAt(1)
+
+  if outputPath != null
+    test::assertTrue(files::createDirectory(bootstrapDirectory(outputPath), true).failure == null)
+    test::assertTrue(host::writeText(outputPath, generated))
+  end
+  let outcome = verifyPrepareAndPublication(root)
+
+  test::assertEqual(outcome.closeFailures.count(), 0)
+  match outcome.completion
+    case resources::Completion.Value(value)
+      test::assertEqual(value, 0)
+    case resources::Completion.Failure(problem)
+      test::assertTrue(false)
+  end
+end

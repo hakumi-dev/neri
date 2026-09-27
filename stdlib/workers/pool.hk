@@ -1,0 +1,158 @@
+use arrays
+use result
+namespace workers
+
+resource class Pool
+  private handle: Int
+  private maxInput: Int
+  private maxOutput: Int
+  private closed: Bool = false
+
+  private def init(handle: Int, maxInput: Int, maxOutput: Int): Void
+    this.handle = handle
+    this.maxInput = maxInput
+    this.maxOutput = maxOutput
+  end
+
+  # Only unsafe native ownership code may create a Pool with a raw handle.
+  public static unsafe def createOwned(handle: Int, maxInput: Int, maxOutput: Int): Pool
+    let owned = new Pool(handle, maxInput, maxOutput)
+
+    return transfer owned
+  end
+
+  public def submit(input: Byte[]): result::Result<Ticket, result::Failure>
+    if this.closed
+      return result::Result<Ticket, result::Failure>.Error(new result::Failure("closed", "workers.submit"))
+    end
+    if input.Length > this.maxInput
+      return result::Result<Ticket, result::Failure>.Error(new result::Failure("limit", "workers.submit"))
+    end
+    unsafe
+      let ticket = stackalloc UInt64[1]
+
+      borrow input as bytes
+        let status = nativeSubmit(this.handle, bytes, input.Length as UInt64, ticket)
+
+        if status != (0 as Int32)
+          return result::Result<Ticket, result::Failure>.Error(statusFailure(status, "workers.submit"))
+        end
+      end
+      return result::Result<Ticket, result::Failure>.Ok(Ticket.createOwned(this.handle, ticket[0]))
+    end
+  end
+
+  public def poll(waitMilliseconds: Int = 0): result::Result<Poll, result::Failure>
+    if this.closed
+      return result::Result<Poll, result::Failure>.Error(new result::Failure("closed", "workers.poll"))
+    end
+    if waitMilliseconds < 0 || waitMilliseconds > 60000
+      return result::Result<Poll, result::Failure>.Error(new result::Failure("invalid_timeout", "workers.poll"))
+    end
+    unsafe
+      let completion = stackalloc NativeCompletion[1]
+      let status = nativePoll(this.handle, waitMilliseconds as UInt32, completion)
+
+      if status == (1 as Int32)
+        return result::Result<Poll, result::Failure>.Ok(Poll.Empty())
+      end
+      if status == (2 as Int32)
+        return result::Result<Poll, result::Failure>.Ok(Poll.Stopped())
+      end
+      if status != (0 as Int32)
+        return result::Result<Poll, result::Failure>.Error(statusFailure(status, "workers.poll"))
+      end
+      if completion.payloadLength > (this.maxOutput as UInt64) || completion.kind > (2 as UInt32)
+        return result::Result<Poll, result::Failure>.Error(new result::Failure("invalid_completion", "workers.poll"))
+      end
+      let ticket = Ticket.createOwned(this.handle, completion.jobId)
+      var outcome = Outcome.Failed()
+
+      if completion.kind == (0 as UInt32)
+        let length = completion.payloadLength as Int
+        let payload: Byte[] = arrays::generate(length) do |index|
+          return 0 as Byte
+        end
+
+        borrow payload as output
+          let takeStatus = nativeTake(this.handle, completion.jobId, output, completion.payloadLength)
+
+          if takeStatus != (0 as Int32)
+            return result::Result<Poll, result::Failure>.Error(statusFailure(takeStatus, "workers.take"))
+          end
+        end
+        outcome = Outcome.Success(payload)
+      else
+        let takeStatus = nativeTake(this.handle, completion.jobId, null, 0 as UInt64)
+
+        if takeStatus != (0 as Int32)
+          return result::Result<Poll, result::Failure>.Error(statusFailure(takeStatus, "workers.take"))
+        end
+        outcome = Outcome.Cancelled() if completion.kind == (2 as UInt32)
+      end
+      return result::Result<Poll, result::Failure>.Ok(Poll.Completed(new Completion(ticket, outcome)))
+    end
+  end
+
+  public def cancel(ticket: Ticket): result::Result<Bool, result::Failure>
+    if this.closed
+      return result::Result<Bool, result::Failure>.Error(new result::Failure("closed", "workers.cancel"))
+    end
+    if !ticket.belongsTo(this.handle)
+      return result::Result<Bool, result::Failure>.Error(new result::Failure("foreign_ticket", "workers.cancel"))
+    end
+    unsafe
+      let status = nativeCancel(this.handle, ticket.id())
+
+      if status != (0 as Int32)
+        return result::Result<Bool, result::Failure>.Error(statusFailure(status, "workers.cancel"))
+      end
+    end
+    return result::Result<Bool, result::Failure>.Ok(true)
+  end
+
+  public def stop(): result::Result<Bool, result::Failure>
+    if this.closed
+      return result::Result<Bool, result::Failure>.Error(new result::Failure("closed", "workers.stop"))
+    end
+    unsafe
+      let status = nativeStop(this.handle)
+
+      if status != (0 as Int32)
+        return result::Result<Bool, result::Failure>.Error(statusFailure(status, "workers.stop"))
+      end
+    end
+    return result::Result<Bool, result::Failure>.Ok(true)
+  end
+
+  # Borrowed only for readiness polling. Never read, write, or close this handle.
+  # Its lifetime ends when this pool closes.
+  public unsafe def readinessHandle(): result::Result<Int, result::Failure>
+    if this.closed
+      return result::Result<Int, result::Failure>.Error(new result::Failure("closed", "workers.readiness"))
+    end
+    let descriptor = stackalloc Int[1]
+    let status = nativeReadiness(this.handle, descriptor)
+
+    if status != (0 as Int32)
+      return result::Result<Int, result::Failure>.Error(statusFailure(status, "workers.readiness"))
+    end
+    return result::Result<Int, result::Failure>.Ok(descriptor[0])
+  end
+
+  public def close(): result::Failure?
+    if this.closed
+      return null
+    end
+    unsafe
+      let report = stackalloc NativeCloseReport[1]
+      let status = nativeClose(this.handle, report)
+
+      if status != (0 as Int32)
+        return statusFailure(status, "workers.close")
+      end
+      this.closed = true
+      return workerReportFailure(report, "workers.close")
+    end
+  end
+end

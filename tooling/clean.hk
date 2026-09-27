@@ -1,0 +1,474 @@
+use console
+use files
+use host
+use process
+
+def cleanStartsWith(value: String, prefix: String): Bool
+  let valueLength = host::stringByteLength(value)
+  let prefixLength = host::stringByteLength(prefix)
+
+  if valueLength < prefixLength
+    return false
+  end
+  var index = 0
+
+  while index < prefixLength
+    if host::stringByteAt(value, index) != host::stringByteAt(prefix, index)
+      return false
+    end
+    index = index + 1
+  end
+  return true
+end
+
+def cleanFindText(text: String, pattern: String): Int
+  let length = host::stringByteLength(text)
+  let patternLength = host::stringByteLength(pattern)
+  var index = 0
+
+  while index + patternLength <= length
+    var offset = 0
+
+    while offset < patternLength && host::stringByteAt(text, index + offset) == host::stringByteAt(pattern, offset)
+      offset = offset + 1
+    end
+    if offset == patternLength
+      return index
+    end
+    index = index + 1
+  end
+  return -1
+end
+
+def cleanLastIndex(text: String, pattern: String): Int
+  let length = host::stringByteLength(text)
+  let patternLength = host::stringByteLength(pattern)
+  var index = 0
+  var found = -1
+
+  while index + patternLength <= length
+    var offset = 0
+
+    while offset < patternLength && host::stringByteAt(text, index + offset) == host::stringByteAt(pattern, offset)
+      offset = offset + 1
+    end
+    if offset == patternLength
+      found = index
+    end
+    index = index + 1
+  end
+  return found
+end
+
+def cleanSafeName(value: String): Bool
+  return value != "" && value != "." && value != ".." && cleanFindText(value, "/") < 0 && cleanFindText(value, "\\") < 0
+end
+
+def cleanHashName(value: String): Bool
+  if host::stringByteLength(value) != 64
+    return false
+  end
+  var index = 0
+
+  while index < 64
+    let byte = host::stringByteAt(value, index) as Int
+
+    if !((byte >= 48 && byte <= 57) || (byte >= 97 && byte <= 102))
+      return false
+    end
+    index = index + 1
+  end
+  return true
+end
+
+def cleanPathInside(root: String, path: String): Bool
+  return cleanStartsWith(path, root + "/")
+end
+
+def cleanCanonicalPath(path: String): Bool
+  let length = host::stringByteLength(path)
+
+  if length < 2 || !cleanStartsWith(path, "/") || host::stringByteAt(path, length - 1) == (47 as Byte) || cleanFindText(path, "//") >= 0 || cleanFindText(path, "/./") >= 0 || cleanFindText(path, "/../") >= 0 || cleanFindText(path, "/.") == length - 2 || cleanFindText(path, "/..") == length - 3
+    return false
+  end
+  var index = 0
+
+  while index < length
+    let byte = host::stringByteAt(path, index) as Int
+
+    if byte < 32 || byte == 127 || byte == 92
+      return false
+    end
+    index = index + 1
+  end
+  return true
+end
+
+def cleanCurrentTarget(buildRoot: String): String
+  let current = buildRoot + "/current"
+  let inspected = files::status(current)
+  let state = inspected.status
+
+  if inspected.failure != null || state == null
+    cleanFail("cannot inspect build/current")
+    return ""
+  end
+  if !state.exists
+    return ""
+  end
+  if !state.symlink
+    cleanFail("build/current must be a symlink when present")
+    return ""
+  end
+  let options = new process::SpawnOptions("readlink")
+
+  options.arguments = [current]
+  options.stdoutLimit = 4096
+  options.stderrLimit = 4096
+  let started = process::spawn(options)
+  let child = started.child()
+
+  if child == null
+    cleanFail("cannot resolve build/current")
+    return ""
+  end
+  let completed = child.wait(10000)
+
+  if completed.running || completed.failure != null
+    child.cancel()
+    child.dispose()
+    cleanFail("cannot resolve build/current")
+    return ""
+  end
+  let disposed = child.dispose()
+  let exit = completed.exit
+  let output = host::stringFromBytes(completed.stdout)
+
+  if !disposed || exit == null || !exit.isExited() || exit.value() != 0 || completed.stdoutTruncated || completed.stderrTruncated || output == null || host::stringByteLength(output) == 0 || host::stringByteAt(output, host::stringByteLength(output) - 1) != (10 as Byte)
+    cleanFail("cannot resolve build/current")
+    return ""
+  end
+  let target = host::stringSlice(output, 0, host::stringByteLength(output) - 1)
+  var hash = ""
+  let relativePrefix = "toolchains/"
+  let absolutePrefix = buildRoot + "/toolchains/"
+
+  if cleanStartsWith(target, relativePrefix)
+    hash = host::stringSlice(target, host::stringByteLength(relativePrefix), host::stringByteLength(target) - host::stringByteLength(relativePrefix))
+  else if cleanStartsWith(target, absolutePrefix)
+    hash = host::stringSlice(target, host::stringByteLength(absolutePrefix), host::stringByteLength(target) - host::stringByteLength(absolutePrefix))
+  else
+    cleanFail("build/current points outside the toolchain directory")
+    return ""
+  end
+  if !cleanHashName(hash)
+    cleanFail("build/current does not point to a canonical toolchain generation")
+    return ""
+  end
+  let resolved = absolutePrefix + hash
+
+  if !cleanDirectory(resolved)
+    cleanFail("build/current target is missing, unreadable, or a symlink")
+    return ""
+  end
+  return resolved
+end
+
+def cleanOverlaps(path: String, protectedPaths: String[]): Bool
+  for item in protectedPaths
+    if item == path || cleanPathInside(path, item) || cleanPathInside(item, path)
+      return true
+    end
+  end
+  return false
+end
+
+def cleanFail(message: String): Void
+  console::println("clean: " + message)
+  host::exit(2)
+end
+
+def cleanDirectory(path: String): Bool
+  let inspected = files::status(path)
+  let state = inspected.status
+
+  return inspected.failure == null && state != null && state.exists && !state.symlink && state.kind.isDirectory()
+end
+
+def cleanAdd(path: String, buildRoot: String, protectedPaths: String[], selected: String[]): String[]
+  if !cleanPathInside(buildRoot, path)
+    cleanFail("selected path escapes the build root")
+    return selected
+  end
+  if cleanOverlaps(path, protectedPaths)
+    return selected
+  end
+  let inspected = files::status(path)
+  let state = inspected.status
+
+  if inspected.failure != null || state == null || !state.exists || state.symlink
+    cleanFail("selected entry is missing, unreadable, or a symlink: " + path)
+    return selected
+  end
+  for existing in selected
+    if existing == path
+      return selected
+    end
+  end
+  return host::appendString(selected, path)
+end
+
+def cleanAddDirectory(path: String, buildRoot: String, protectedPaths: String[], selected: String[]): String[]
+  if cleanOverlaps(path, protectedPaths)
+    return selected
+  end
+  if !cleanDirectory(path)
+    cleanFail("selected directory is missing, unreadable, or a symlink: " + path)
+    return selected
+  end
+  return cleanAdd(path, buildRoot, protectedPaths, selected)
+end
+
+def cleanList(root: String, relative: String): files::ListResult
+  let opened = files::Root.open(root)
+  let scoped = opened.root
+
+  if opened.failure != null || scoped == null
+    cleanFail("cannot open directory without following symlinks: " + root)
+    return new files::ListResult()
+  end
+  let result = scoped.list(relative, 4096)
+  let closed = scoped.close()
+
+  if result.failure != null || result.closeFailure != null || closed != null
+    cleanFail("cannot inspect directory entries: " + (relative == "" ? root : root + "/" + relative))
+  end
+  return result
+end
+
+def cleanInventory(path: String, buildRoot: String): String[]
+  let inspected = files::status(path)
+  let state = inspected.status
+
+  if inspected.failure != null || state == null || !state.exists || state.symlink || !state.kind.isFile() || !cleanCanonicalPath(path) || cleanPathInside(buildRoot, path)
+    cleanFail("protected-path inventory must be a regular file outside the build root")
+    return []
+  end
+  let separator = cleanLastIndex(path, "/")
+
+  if separator <= 0 || separator + 1 >= host::stringByteLength(path)
+    cleanFail("invalid protected-path inventory path")
+    return []
+  end
+  let parentPath = host::stringSlice(path, 0, separator)
+  let name = host::stringSlice(path, separator + 1, host::stringByteLength(path) - separator - 1)
+  let opened = files::Root.open(parentPath)
+  let root = opened.root
+
+  if opened.failure != null || root == null
+    cleanFail("cannot open protected-path inventory parent")
+    return []
+  end
+  let read = root.readBytes(name, 1048576)
+  let closed = root.close()
+
+  if read.failure != null || read.closeFailure != null || closed != null
+    cleanFail("cannot read bounded protected-path inventory")
+    return []
+  end
+  let bytes = read.bytes
+
+  if bytes == null
+    cleanFail("cannot read bounded protected-path inventory")
+    return []
+  end
+  let text = host::stringFromBytes(bytes)
+
+  if text == null
+    cleanFail("protected-path inventory is not UTF-8 text")
+    return []
+  end
+  var paths: String[] = []
+  var start = 0
+  var index = 0
+  let length = host::stringByteLength(text)
+
+  while index < length
+    if host::stringByteAt(text, index) == (10 as Byte)
+      let item = host::stringSlice(text, start, index - start)
+
+      if item != ""
+        if !cleanPathInside(buildRoot, item) || host::stringByteLength(item) > 4096 || !cleanCanonicalPath(item)
+          cleanFail("inventory contains a noncanonical or out-of-root path")
+          return []
+        end
+        paths = host::appendString(paths, item)
+      end
+      start = index + 1
+    end
+    index = index + 1
+  end
+  if start != length
+    cleanFail("protected-path inventory must end with a newline")
+  end
+  return paths
+end
+
+def cleanReserved(name: String): Bool
+  return name == "cache" || name == "native" || name == "packages" || name == "current" || name == "toolchains" || name == "tmp" || name == ".maintenance" || name == ".leases" || name == ".clean-keep"
+end
+
+def main(): Void
+  if host::argumentCount() < 2
+    cleanFail("usage: neri-clean <absolute-build-root> <protected-paths-file> [--dry-run] [--cache] [--legacy]")
+    return
+  end
+  let buildRoot = host::argumentAt(0)
+  let inventoryPath = host::argumentAt(1)
+
+  if buildRoot == null || inventoryPath == null
+    cleanFail("build root must be an absolute canonical build directory")
+    return
+  end
+  let buildName = host::pathFileName(buildRoot)
+
+  if host::stringByteLength(buildRoot) > 4096 || !cleanCanonicalPath(buildRoot) || buildRoot == "/" || buildName == null || buildName != "build"
+    cleanFail("build root must be an absolute canonical build directory")
+    return
+  end
+  if !cleanDirectory(buildRoot)
+    cleanFail("build root is missing, unreadable, or a symlink")
+    return
+  end
+  let openedRoot = files::Root.open(buildRoot)
+  let rootHandle = openedRoot.root
+
+  if openedRoot.failure != null || rootHandle == null
+    cleanFail("cannot open build root without following symlinks")
+    return
+  end
+  let closeRoot = rootHandle.close()
+
+  if closeRoot != null
+    cleanFail("cannot close build root")
+    return
+  end
+  var dryRun = false
+  var includeCache = false
+  var legacy = false
+  var index = 2
+
+  while index < host::argumentCount()
+    let option = host::argumentAt(index)
+
+    if option == "--dry-run" && !dryRun
+      dryRun = true
+    else if option == "--cache" && !includeCache
+      includeCache = true
+    else if option == "--legacy" && !legacy
+      legacy = true
+    else
+      cleanFail("unknown or repeated option")
+      return
+    end
+    index = index + 1
+  end
+  let protectedPaths = cleanInventory(inventoryPath, buildRoot)
+  let currentTarget = cleanCurrentTarget(buildRoot)
+  var allProtected = protectedPaths
+
+  allProtected = host::appendString(allProtected, currentTarget) if currentTarget != ""
+  var selected: String[] = []
+  let top = cleanList(buildRoot, "")
+
+  for entry in top.entries
+    if !cleanSafeName(entry.name)
+      cleanFail("build root contains an invalid entry name")
+      return
+    end
+    let path = buildRoot + "/" + entry.name
+    let recognized = cleanStartsWith(entry.name, "work.") || cleanStartsWith(entry.name, "launcher.")
+
+    if recognized
+      selected = cleanAddDirectory(path, buildRoot, allProtected, selected)
+    else if legacy && !cleanReserved(entry.name)
+      let inspected = files::status(path)
+
+      if inspected.failure != null || inspected.status == null
+        cleanFail("cannot inspect legacy build entry: " + path)
+        return
+      end
+      if inspected.status.symlink
+        console::println("preserving symlink " + path)
+      else
+        selected = cleanAdd(path, buildRoot, allProtected, selected)
+      end
+    end
+  end
+  let temporary = buildRoot + "/tmp"
+  let temporaryStatus = files::status(temporary)
+
+  if temporaryStatus.failure != null || temporaryStatus.status == null
+    cleanFail("cannot inspect build/tmp")
+    return
+  end
+  if temporaryStatus.status.exists
+    if temporaryStatus.status.symlink || !temporaryStatus.status.kind.isDirectory()
+      cleanFail("build/tmp must be a real directory")
+      return
+    end
+    let contents = cleanList(buildRoot, "tmp")
+
+    for entry in contents.entries
+      if !cleanSafeName(entry.name)
+        cleanFail("build/tmp contains an invalid entry name")
+        return
+      end
+      selected = cleanAdd(temporary + "/" + entry.name, buildRoot, allProtected, selected)
+    end
+  end
+  let toolchains = buildRoot + "/toolchains"
+  let toolchainStatus = files::status(toolchains)
+
+  if toolchainStatus.failure != null || toolchainStatus.status == null
+    cleanFail("cannot inspect build/toolchains")
+    return
+  end
+  if toolchainStatus.status.exists
+    if toolchainStatus.status.symlink || !toolchainStatus.status.kind.isDirectory()
+      cleanFail("build/toolchains must be a real directory")
+      return
+    end
+    let generations = cleanList(buildRoot, "toolchains")
+
+    for entry in generations.entries
+      if cleanHashName(entry.name)
+        selected = cleanAddDirectory(toolchains + "/" + entry.name, buildRoot, allProtected, selected)
+      end
+    end
+  end
+  if includeCache
+    let cache = buildRoot + "/cache"
+    let cacheStatus = files::status(cache)
+
+    if cacheStatus.failure != null || cacheStatus.status == null || !cacheStatus.status.exists || cacheStatus.status.symlink || !cacheStatus.status.kind.isDirectory()
+      cleanFail("--cache requires a real build/cache directory")
+      return
+    end
+    selected = cleanAddDirectory(cache, buildRoot, allProtected, selected)
+  end
+  for path in selected
+    console::println((dryRun ? "would remove " : "removing ") + path)
+  end
+  if dryRun
+    return
+  end
+  for path in selected
+    let removed = files::removeTree(path)
+
+    if removed.failure != null
+      cleanFail("removal failed: " + path)
+      return
+    end
+  end
+end

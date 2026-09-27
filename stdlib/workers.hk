@@ -1,0 +1,274 @@
+use arrays
+use buffers
+use host
+use result
+namespace workers
+
+@cabiImport("neri_rt_v1_worker_pool_open")
+unsafe def nativeOpen(options: NativeOptions*, entry: cabi fn(Byte*, UInt64): Void, config: Byte*, configLength: UInt64, handle: Int*, report: NativeCloseReport*): Int32
+end
+
+@cabiImport("neri_rt_v1_worker_pool_submit")
+unsafe def nativeSubmit(handle: Int, input: Byte*, length: UInt64, ticket: UInt64*): Int32
+end
+
+@cabiImport("neri_rt_v1_worker_pool_poll")
+unsafe def nativePoll(handle: Int, milliseconds: UInt32, completion: NativeCompletion*): Int32
+end
+
+@cabiImport("neri_rt_v1_worker_pool_take")
+unsafe def nativeTake(handle: Int, ticket: UInt64, output: Byte*?, capacity: UInt64): Int32
+end
+
+@cabiImport("neri_rt_v1_worker_pool_cancel")
+unsafe def nativeCancel(handle: Int, ticket: UInt64): Int32
+end
+
+@cabiImport("neri_rt_v1_worker_pool_stop")
+unsafe def nativeStop(handle: Int): Int32
+end
+
+@cabiImport("neri_rt_v1_worker_pool_readiness")
+unsafe def nativeReadiness(handle: Int, descriptor: Int*): Int32
+end
+
+@cabiImport("neri_rt_v1_worker_pool_close")
+unsafe def nativeClose(handle: Int, report: NativeCloseReport*): Int32
+end
+
+@cabiImport("neri_rt_v1_worker_ready")
+unsafe def nativeReady(): Int32
+end
+
+@cabiImport("neri_rt_v1_worker_receive")
+unsafe def nativeReceive(length: UInt64*): Int32
+end
+
+@cabiImport("neri_rt_v1_worker_read")
+unsafe def nativeRead(output: Byte*, capacity: UInt64): Int32
+end
+
+@cabiImport("neri_rt_v1_worker_reply")
+unsafe def nativeReply(output: Byte*, length: UInt64): Int32
+end
+
+@cabiImport("neri_rt_v1_worker_cancelled")
+unsafe def nativeCancelled(): Int32
+end
+
+@cabiImport("neri_rt_v1_worker_fail")
+unsafe def nativeFail(detail: Byte*, length: UInt64): Int32
+end
+
+# The compiler lowers this safe source entry to the bare C callback bridge.
+@operation("workers.start", startNative)
+def start(entry: fn(Byte[]): Void, config: Byte[], options: Options): result::Result<Pool, result::Failure>
+end
+
+# This bridge is unsafe because it receives the compiler-created C callback.
+# Pool owns all raw-handle construction so safe source cannot forge a handle.
+unsafe def startNative(entry: cabi fn(Byte*, UInt64): Void, config: Byte[], options: Options): result::Result<Pool, result::Failure>
+  let optionFailure = validOptions(options)
+
+  if optionFailure != null
+    return result::Result<Pool, result::Failure>.Error(optionFailure)
+  end
+  if config.Length > 1048576
+    return result::Result<Pool, result::Failure>.Error(new result::Failure("limit", "workers.start"))
+  end
+  let nativeOptions = stackalloc NativeOptions[1]
+  let report = stackalloc NativeCloseReport[1]
+  let handle = stackalloc Int[1]
+
+  nativeOptions.structSize = native::sizeOf<NativeOptions>() as UInt32
+  nativeOptions.workerCount = options.workers as UInt32
+  nativeOptions.maxOutstanding = options.maxOutstanding as UInt64
+  nativeOptions.maxInputBytes = options.maxInputBytes as UInt64
+  nativeOptions.maxOutputBytes = options.maxOutputBytes as UInt64
+  nativeOptions.maxReservedBytes = options.maxReservedBytes as UInt64
+  report.failures = 0 as UInt32
+  report.errorLength = 0 as UInt32
+  var index = 0
+
+  while index < 4096
+    report.firstError[index] = 0 as Byte
+    index = index + 1
+  end
+  borrow config as bytes
+    let status = nativeOpen(nativeOptions, entry, bytes, config.Length as UInt64, handle, report)
+
+    if status != (0 as Int32)
+      let failure = statusFailure(status, "workers.start")
+      let reported = workerReportFailure(report, "workers.start")
+
+      if reported != null
+        failure.detail = reported.detail
+      end
+      return result::Result<Pool, result::Failure>.Error(failure)
+    end
+  end
+  let pool = Pool.createOwned(handle[0], options.maxInputBytes, options.maxOutputBytes)
+
+  return result::Result<Pool, result::Failure>.Ok(transfer pool)
+end
+
+def statusFailure(status: Int32, operation: String): result::Failure
+  if status == (2 as Int32)
+    return new result::Failure("stopped", operation)
+  else if status == (3 as Int32)
+    return new result::Failure("full", operation)
+  else if status == (4 as Int32)
+    return new result::Failure("invalid", operation)
+  else if status == (5 as Int32)
+    return new result::Failure("limit", operation)
+  else if status == (6 as Int32)
+    return new result::Failure("startup_failed", operation)
+  else if status == (7 as Int32)
+    return new result::Failure("no_memory", operation)
+  else if status == (8 as Int32)
+    return new result::Failure("unavailable", operation)
+  end
+  return new result::Failure("native_failed", operation)
+end
+
+unsafe def workerReportFailure(report: NativeCloseReport*, operation: String): result::Failure?
+  if report.failures == (0 as UInt32)
+    return null
+  end
+  let reported = report.errorLength
+  var length = 0
+
+  length = reported as Int if reported <= (4096 as UInt32)
+  let copied = buffers::ByteBuffer.create(length, length)
+
+  if copied == null
+    return new result::Failure("worker_failed", operation, "worker failures=" + (report.failures as Int as String) + "; diagnostic allocation failed")
+  end
+  var index = 0
+
+  while index < length
+    copied.append(report.firstError[index])
+    index = index + 1
+  end
+  let bytes = copied.snapshot()
+  let decoded = host::stringFromBytes(bytes)
+  var detail = "worker failures=" + (report.failures as Int as String)
+
+  if reported > (4096 as UInt32)
+    detail = detail + "; invalid diagnostic length=" + (reported as Int as String)
+  else if decoded != null && decoded != ""
+    detail = detail + "; " + decoded
+  else if length > 0
+    let encoded = buffers::ByteBuffer.create(length * 2, length * 2)
+
+    if encoded == null
+      return new result::Failure("worker_failed", operation, detail + "; diagnostic encoding failed")
+    end
+    index = 0
+    while index < length
+      let value = bytes[index] as Int
+
+      encoded.append(hexDigit(value / 16))
+      encoded.append(hexDigit(value - (value / 16) * 16))
+      index = index + 1
+    end
+    let hexadecimal = encoded.text()
+
+    if hexadecimal != null
+      detail = detail + "; diagnostic_hex=" + hexadecimal
+    else
+      detail = detail + "; diagnostic encoding failed"
+    end
+  end
+  return new result::Failure("worker_failed", operation, detail)
+end
+
+def hexDigit(value: Int): Byte
+  return (value < 10 ? value + 48 : value + 87) as Byte
+end
+
+def validOptions(options: Options): result::Failure?
+  if options.workers < 1 || options.workers > 64 || options.maxOutstanding < 1 || options.maxOutstanding > 65536 || options.maxInputBytes < 0 || options.maxInputBytes > 134217728 || options.maxOutputBytes < 0 || options.maxOutputBytes > 134217728 || options.maxReservedBytes < 0 || options.maxReservedBytes > 1073741824
+    return new result::Failure("invalid_options", "workers.start")
+  end
+  return null
+end
+
+def ready(): result::Result<Bool, result::Failure>
+  unsafe
+    let status = nativeReady()
+
+    if status != (0 as Int32)
+      return result::Result<Bool, result::Failure>.Error(statusFailure(status, "workers.ready"))
+    end
+  end
+  return result::Result<Bool, result::Failure>.Ok(true)
+end
+
+def receive(): result::Result<Byte[]?, result::Failure>
+  unsafe
+    let nativeLength = stackalloc UInt64[1]
+    let status = nativeReceive(nativeLength)
+
+    if status == (2 as Int32)
+      return result::Result<Byte[]?, result::Failure>.Ok(null)
+    end
+    if status != (0 as Int32)
+      return result::Result<Byte[]?, result::Failure>.Error(statusFailure(status, "workers.receive"))
+    end
+    if nativeLength[0] > (134217728 as UInt64)
+      return result::Result<Byte[]?, result::Failure>.Error(new result::Failure("limit", "workers.receive"))
+    end
+    let length = nativeLength[0] as Int
+    let input: Byte[] = arrays::generate(length) do |index|
+      return 0 as Byte
+    end
+
+    borrow input as output
+      let readStatus = nativeRead(output, nativeLength[0])
+
+      if readStatus != (0 as Int32)
+        return result::Result<Byte[]?, result::Failure>.Error(statusFailure(readStatus, "workers.read"))
+      end
+    end
+    return result::Result<Byte[]?, result::Failure>.Ok(input)
+  end
+end
+
+def reply(output: Byte[]): result::Result<Bool, result::Failure>
+  if output.Length > 134217728
+    return result::Result<Bool, result::Failure>.Error(new result::Failure("limit", "workers.reply"))
+  end
+  unsafe
+    borrow output as bytes
+      let status = nativeReply(bytes, output.Length as UInt64)
+
+      if status != (0 as Int32)
+        return result::Result<Bool, result::Failure>.Error(statusFailure(status, "workers.reply"))
+      end
+    end
+  end
+  return result::Result<Bool, result::Failure>.Ok(true)
+end
+
+def cancelled(): Bool
+  unsafe
+    return nativeCancelled() != (0 as Int32)
+  end
+end
+
+def fail(diagnostic: Byte[]): result::Result<Bool, result::Failure>
+  if diagnostic.Length > 4096
+    return result::Result<Bool, result::Failure>.Error(new result::Failure("limit", "workers.fail"))
+  end
+  unsafe
+    borrow diagnostic as bytes
+      let status = nativeFail(bytes, diagnostic.Length as UInt64)
+
+      if status != (0 as Int32)
+        return result::Result<Bool, result::Failure>.Error(statusFailure(status, "workers.fail"))
+      end
+    end
+  end
+  return result::Result<Bool, result::Failure>.Ok(true)
+end

@@ -232,12 +232,27 @@ including aliases declared in `imports`. Binding names are single identifiers
 outside the reserved session namespace. `imports` contains only declarations.
 Reset discards the instance and allows initialization of a fresh one.
 
+Two optional callbacks follow `imports`: `progress(phase, projectSources,
+librarySources)` reports startup phases, and `nativeProgress(phase, completed,
+total, detail)` reports native generation. Lowering events identify the current
+function and available source filename, with actual completed and total function
+counts. Verification, optimization, and emission are separate phases. Updates
+are sampled; `end` clears frontend status before compiler diagnostics. Without a
+native callback, code generation keeps its ordinary subprocess path. Progress
+does not participate in the compilation cache key.
+
 `SessionTerminal` is a small frontend over this API. It accepts optional
 context before the first prompt, collects multiline input through a line
 containing only `.`, formats preparation and execution diagnostics, handles
 `:reset`, and disposes the session on EOF. The `session-console` unit reads its
 compiler, linker, target and work directory from the documented `NERI_SESSION_*`
 environment variables.
+
+Top-level `try expression` uses Neri's [typed propagation contract](TRY.md).
+The generated evaluator has an explicit result type; its entry adapter reports
+an inspected failure without committing a new frame. The console remains
+available after failure. Changes to existing heap objects or external systems
+are not rolled back.
 
 ## Installed session API
 
@@ -336,9 +351,19 @@ code to serve independent sessions.
 evaluated once into a typed temporary. Its display text is retained in the new
 frame and copied into runtime-owned storage after execution. Returned text remains
 valid after reset or disposal. Strings and numeric values display their values;
-booleans display `true` or `false`; other values display a type summary, with
-`null` for a null optional. Formatting invokes no user conversion or `toString`
-method. Numeric formatting uses explicit generated casts and does not enable
+booleans display `true` or `false`. Structured inspection displays public fields,
+enum payloads and array elements, with `null` for an absent optional. Nested text
+is quoted and escapes terminal controls. Previews bound depth, fields, items and
+string length; an ellipsis denotes omitted items. Private fields, raw pointers
+and resource internals are not inspected.
+
+A collection can explicitly opt into inspection with a public safe instance
+`inspectItems(limit: Int): T[]` or `inspectItems(limit: Int): (readonly T)[]`
+method. A readonly receiver requires a readonly method. It returns a bounded snapshot of already
+materialized values and must not execute queries or perform I/O. Neri Data's
+`TypedRows<T>` implements this contract. Ordinary inspection invokes no user
+conversion, `toString`, getters or query operations. Numeric formatting uses
+explicit generated casts and does not enable
 implicit conversions in source programs. Public candidate metadata cannot change
 the privately accepted expression or its result type.
 
@@ -351,6 +376,16 @@ expression results belong to the live session. A fresh session starts with empty
 state; reset restores empty state. Each successful initialization executes the
 initializer, including when its native code comes from the cache.
 
+Within a session, resolved standard-library names and their captured sources are
+reused until a submission introduces a new import. Cache lookup hashes the binary
+IR payload and transport version without building a hexadecimal transport; a
+miss reuses that payload for code generation.
+
+Session state remains a persistent GC root. Ordinary submissions use the
+runtime's allocation-triggered collection policy; they do not force a full
+collection after each expression. Reset clears the root and collects before
+unloading code generations, whose tracing functions may still be needed.
+
 Keys cover canonical IR, source and project configuration identities, the
 compiler, code generator, linker, runtime manifest and artifact, target,
 optimization mode, SDK configuration, object-linker artifact when selected, and
@@ -361,8 +396,10 @@ receipts validate file identity, ownership, mode, size, mtime and ctime. Publica
 uses a private staging directory and atomic rename after input fingerprints are
 checked again. A miss or unavailable cache follows normal compilation.
 
-The cache uses the existing Darwin file-identity boundary. Other host ABIs and
-custom native-library dependencies use uncached compilation. `cacheEnabled =
+The cache uses the existing Darwin file-identity boundary. Object modules with
+shared native dependencies can reuse compiled code; dependencies are loaded for
+each session. Other host ABIs and native dependencies in shared-module compilation
+use uncached compilation. `cacheEnabled =
 false` also selects uncached compilation. A cache hit still prepares and checks
 the candidate; opening a new project session analyzes its captured project.
 
@@ -372,6 +409,12 @@ Let `A` be the application, `d_i` the new submission, `Q_i` the retained type an
 signature metadata, and `k_i` the retained module dependency count. The executable
 path separates new-source analysis and body compilation from metadata lookup,
 cache validation and linking:
+
+`NERI_SESSION_PREPARE_TIMINGS=<path>` records successful submission preparation
+phases as JSONL: parsing, snapshot capture, analysis binding, inspection,
+execution binding and registration. It is disabled by default and bounds the
+diagnostic file to 8 MiB. `NERI_SESSION_METRICS=<directory>` separately records
+lowering, cache lookup, code generation and native loading/execution.
 
 ```
 T_i = analyze(d_i) + metadata(Q_i) + cache_check(i)
@@ -402,6 +445,8 @@ consistent with [JShell's execution interface](https://docs.oracle.com/en/java/j
 The native object loader follows LLVM's
 [JITLink object-linking contract](https://llvm.org/docs/JITLink.html#jit-linking)
 and [ORC resource ownership](https://llvm.org/docs/ORCv2.html#how-to-remove-code).
+Allocation-triggered collection and heap-growth tradeoffs are discussed in
+[Boehm's collector algorithm overview](https://hboehm.info/gc/gcdescr.html).
 
 ## Ownership and execution failures
 

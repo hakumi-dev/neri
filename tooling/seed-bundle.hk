@@ -1,0 +1,375 @@
+use host
+use files
+use crypto
+use json
+use result
+
+# Validates retained compiler outputs without interpreting their owner keys as
+# paths. Seed payload names are derived solely from the verified ordinal.
+# Limits: 1024 units, 128 MiB per retained file (64 MiB decoded hex),
+# 4 MiB manifest, and 1 GiB total decoded IR.
+class SeedBundle
+  public directory: String
+  public count: Int = 0
+  public manifest: String = ""
+  public unitManifest: String = ""
+  private objectDigests: String[] = []
+  private transportDigests: String[] = []
+  private binaryDigests: String[] = []
+
+  def init(directory: String): Void
+    this.directory = directory
+  end
+
+  private def read(name: String, limit: Int): Byte[]?
+    let opened = files::Root.open(this.directory)
+    let root = opened.root
+
+    if root == null
+      return null
+    end
+    let read = root.readBytes(name, limit)
+    let closed = root.close()
+
+    if read.failure != null || read.closeFailure != null || closed != null
+      return null
+    end
+    return read.bytes
+  end
+
+  private def exactFiles(): Bool
+    let info = files::status(this.directory)
+    let state = info.status
+
+    if info.failure != null || state == null || state.symlink || !state.kind.isDirectory()
+      return false
+    end
+    let opened = files::Root.open(this.directory)
+    let root = opened.root
+
+    if root == null
+      return false
+    end
+    let listed = root.list("", this.count * 2 + 2)
+    let closed = root.close()
+
+    if listed.failure != null || listed.closeFailure != null || closed != null || listed.entries.Length != this.count * 2 + 1
+      return false
+    end
+    let names = json::Value.object()
+
+    names.put("manifest.json", json::Value.boolean(true))
+    var index = 0
+
+    while index < this.count
+      let name = "unit-" + (index as String) + ".o"
+
+      names.put(name, json::Value.boolean(true))
+      names.put(name + ".nir.hex", json::Value.boolean(true))
+      index = index + 1
+    end
+    for entry in listed.entries
+      if !entry.kind.isFile() || names.get(entry.name) == null
+        return false
+      end
+    end
+    return true
+  end
+
+  def load(): Bool
+    this.count = 0
+    this.manifest = ""
+    this.unitManifest = ""
+    this.binaryDigests = []
+    this.objectDigests = []
+    this.transportDigests = []
+    let bytes = this.read("manifest.json", 4194304)
+
+    if bytes == null
+      return false
+    end
+    let text = host::stringFromBytes(bytes)
+    let options = new json::Options()
+
+    options.maxInputBytes = 4194304
+    options.maxDepth = 8
+    options.maxNodes = 16384
+    var record = json::Value.nullValue()
+
+    match json::parseBytes(bytes, options)
+      case result::Result.Ok(value)
+        record = value
+      case result::Result.Error(error)
+        return false
+    end
+    let version = record.get("schemaVersion")
+    let units = record.get("units")
+
+    if text == null || record.kind() != "object" || record.count() != 2 || version == null || version.kind() != "number" || version.text() != "1" || units == null || units.kind() != "array" || units.count() < 1 || units.count() > 1024
+      return false
+    end
+    let keys = json::Value.object()
+    var index = 0
+
+    while index < units.count()
+      let entry = units.at(index)
+
+      if entry == null || entry.kind() != "object" || entry.count() != 5
+        return false
+      end
+      let key = seedBundleString(entry, "key")
+      let object = seedBundleString(entry, "object")
+      let transport = seedBundleString(entry, "transport")
+      let objectDigest = seedBundleString(entry, "objectDigest")
+      let transportDigest = seedBundleString(entry, "transportDigest")
+      let name = "unit-" + (index as String) + ".o"
+
+      if key == null || key == "" || host::stringByteLength(key) > 16384 || object != name || transport != name + ".nir.hex" || objectDigest == null || transportDigest == null || !seedBundleDigestValid(objectDigest) || !seedBundleDigestValid(transportDigest) || keys.get(key) != null
+        return false
+      end
+      keys.put(key, json::Value.boolean(true))
+      this.objectDigests = host::appendString(this.objectDigests, objectDigest)
+      this.transportDigests = host::appendString(this.transportDigests, transportDigest)
+      index = index + 1
+    end
+    this.count = units.count()
+    this.manifest = text
+    return this.verify()
+  end
+
+  def verify(): Bool
+    if this.count < 1 || this.count > 1024 || !this.exactFiles()
+      return false
+    end
+    var index = 0
+
+    while index < this.count
+      let name = "unit-" + (index as String) + ".o"
+      let object = this.read(name, 134217728)
+      let transport = this.read(name + ".nir.hex", 134217728)
+
+      if object == null || transport == null || seedBundleDigest(object) != this.objectDigests[index] || seedBundleDigest(transport) != this.transportDigests[index]
+        return false
+      end
+      index = index + 1
+    end
+    let after = this.read("manifest.json", 4194304)
+
+    return after != null && host::stringFromBytes(after) == this.manifest && this.exactFiles()
+  end
+
+  def copyBinary(destination: String): Bool
+    this.binaryDigests = []
+    if !this.verify()
+      return false
+    end
+    let inspected = files::status(destination)
+    let state = inspected.status
+
+    if inspected.failure != null || state == null || state.symlink || !state.kind.isDirectory()
+      return false
+    end
+    let opened = files::Root.open(destination)
+    let root = opened.root
+
+    if root == null
+      return false
+    end
+    let empty = root.list("", 1)
+    let closed = root.close()
+
+    if empty.failure != null || empty.closeFailure != null || closed != null || empty.entries.Length != 0
+      return false
+    end
+    var index = 0
+    var total = 0
+    let manifest = new ToolingTextBuffer()
+
+    while index < this.count
+      let original = "unit-" + (index as String) + ".o.nir.hex"
+      let name = "unit-" + (index as String) + ".nir"
+      let transport = this.read(original, 134217728)
+
+      if transport == null || seedBundleDigest(transport) != this.transportDigests[index]
+        return false
+      end
+      let copied = destination + "/transport.pending"
+
+      if !host::writeBytes(copied, transport)
+        return false
+      end
+      let copiedBytes = seedBundleRead(copied, 134217728)
+
+      if copiedBytes == null || seedBundleDigest(copiedBytes) != this.transportDigests[index]
+        return false
+      end
+      let hex = host::stringFromBytes(copiedBytes)
+
+      if hex == null
+        return false
+      end
+      let binary = crypto::decodeHex(hex, 67108864).bytes()
+
+      if binary == null || binary.Length == 0 || total > 1073741824 - binary.Length
+        return false
+      end
+      total = total + binary.Length
+      let digest = seedBundleDigest(binary)
+
+      if digest == "" || !host::writeBytes(destination + "/" + name, binary)
+        return false
+      end
+      let checked = seedBundleRead(destination + "/" + name, 134217728)
+
+      if checked == null || seedBundleDigest(checked) != digest || files::removeFile(copied).failure != null
+        return false
+      end
+      manifest.add(digest + "  " + name + "\n")
+      this.binaryDigests = host::appendString(this.binaryDigests, digest)
+      index = index + 1
+    end
+    this.unitManifest = toolingText(manifest)
+    if !host::writeText(destination + "/UNITS.sha256", this.unitManifest) || !this.verify()
+      return false
+    end
+    let checked = seedBundleRead(destination + "/UNITS.sha256", 1048576)
+
+    return checked != null && host::stringFromBytes(checked) == this.unitManifest && this.verifyBinary(destination)
+  end
+
+  def verifyBinary(destination: String): Bool
+    if this.count < 1 || this.count > 1024 || this.binaryDigests.Length != this.count
+      return false
+    end
+    let opened = files::Root.open(destination)
+    let root = opened.root
+
+    if root == null
+      return false
+    end
+    let listing = root.list("", this.count + 2)
+    let closed = root.close()
+
+    if listing.failure != null || listing.closeFailure != null || closed != null || listing.entries.Length != this.count + 1
+      return false
+    end
+    for entry in listing.entries
+      if !entry.kind.isFile()
+        return false
+      end
+    end
+    var index = 0
+
+    while index < this.count
+      let bytes = seedBundleRead(destination + "/unit-" + (index as String) + ".nir", 134217728)
+
+      if bytes == null || seedBundleDigest(bytes) != this.binaryDigests[index]
+        return false
+      end
+      index = index + 1
+    end
+    let bytes = seedBundleRead(destination + "/UNITS.sha256", 1048576)
+
+    return bytes != null && host::stringFromBytes(bytes) == this.unitManifest
+  end
+
+  # Explicit ordinal ordering and flat ustar metadata exclude host-specific
+  # extended headers. Relative member arguments also bound the command size.
+  def archive(payload: String, output: String, target: readonly TargetPlatform): Bool
+    if (!target.isMacOS() && target.name() != "linux-x86_64") || !this.verifyBinary(payload)
+      return false
+    end
+    let absolute = host::pathAbsolute(output)
+
+    if absolute == null
+      return false
+    end
+    var names = ["UNITS.sha256"]
+    var index = 0
+
+    while index < this.count
+      names = host::appendString(names, "unit-" + (index as String) + ".nir")
+      index = index + 1
+    end
+    var touch = ["-C", payload, "-i", "PATH=/usr/bin:/bin", "LC_ALL=C", "TZ=UTC", "touch", "-t", "197001010000.00"]
+    var permissions = ["-C", payload, "-i", "PATH=/usr/bin:/bin", "LC_ALL=C", "TZ=UTC", "chmod", "644"]
+
+    for name in names
+      touch = host::appendString(touch, name)
+      permissions = host::appendString(permissions, name)
+    end
+    let touched = host::run("/usr/bin/env", touch)
+
+    if touched == null || touched != 0
+      return false
+    end
+    let changed = host::run("/usr/bin/env", permissions)
+
+    if changed == null || changed != 0
+      return false
+    end
+    var arguments = ["-C", payload, "-i", "PATH=/usr/bin:/bin", "LC_ALL=C", "TZ=UTC", "COPYFILE_DISABLE=1", "tar", "-c", "-f", absolute, "--format=ustar", "-b", "1"]
+
+    if target.isMacOS()
+      for option in ["--uid", "0", "--gid", "0", "--uname", "", "--gname", "", "--no-acls", "--no-xattrs", "--no-mac-metadata"]
+        arguments = host::appendString(arguments, option)
+      end
+    else
+      for option in ["--owner=0", "--group=0", "--numeric-owner", "--no-acls", "--no-xattrs"]
+        arguments = host::appendString(arguments, option)
+      end
+    end
+    for name in names
+      arguments = host::appendString(arguments, name)
+    end
+    let archived = host::run("/usr/bin/env", arguments)
+
+    return archived != null && archived == 0 && this.verifyBinary(payload)
+  end
+end
+
+def seedBundleRead(path: String, limit: Int): Byte[]?
+  let inspected = files::status(path)
+  let state = inspected.status
+
+  if inspected.failure != null || state == null || state.symlink || !state.kind.isFile()
+    return null
+  end
+  let read = files::readBytes(path, limit)
+
+  return read.failure == null && read.closeFailure == null ? read.bytes : null
+end
+
+def seedBundleString(value: json::Value, key: String): String?
+  let field = value.get(key)
+
+  return field != null && field.kind() == "string" ? field.text() : null
+end
+
+def seedBundleDigest(bytes: Byte[]): String
+  let digest = crypto::sha256(bytes).bytes()
+
+  if digest == null
+    return ""
+  end
+  let text = crypto::encodeHex(digest)
+
+  return text == null ? "" : text
+end
+
+def seedBundleDigestValid(value: String): Bool
+  if host::stringByteLength(value) != 64
+    return false
+  end
+  var index = 0
+
+  while index < 64
+    let byte = host::stringByteAt(value, index) as Int
+
+    if !((byte >= 48 && byte <= 57) || (byte >= 97 && byte <= 102))
+      return false
+    end
+    index = index + 1
+  end
+  return true
+end

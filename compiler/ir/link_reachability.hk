@@ -1,0 +1,130 @@
+# This graph chooses native link inputs. Native section collection removes
+# unreachable implementation code without changing reusable library objects.
+class IrLinkReachability
+  public nativeLibraries: StringTable<Bool> = new StringTable<Bool>()
+  public exportedSymbols: StringBuffer = new StringBuffer()
+  public runtimeFeatures: RuntimeFeatures = new RuntimeFeatures()
+  public error: String = ""
+  private functions: StringTable<IrFunction> = new StringTable<IrFunction>()
+  private classes: StringTable<IrClass> = new StringTable<IrClass>()
+  private imports: StringTable<IrImport> = new StringTable<IrImport>()
+  private exportNames: StringTable<Bool> = new StringTable<Bool>()
+  private pending: StringBuffer = new StringBuffer()
+  private seen: StringTable<Bool> = new StringTable<Bool>()
+
+  private def add(name: String): Void
+    this.pending.add(name) if name != "" && this.seen.add(name, true)
+  end
+
+  private def takeImport(imported: IrImport): Void
+    if imported.nativeLibrary != ""
+      this.nativeLibraries.add(imported.nativeLibrary, true)
+    end
+    this.runtimeFeatures = this.runtimeFeatures.mergedWith(abiRuntimeSymbolFeatures(imported.linkName))
+    if imported.kind.isRuntime()
+      this.runtimeFeatures = this.runtimeFeatures.mergedWith(imported.runtimeFeatures)
+    end
+  end
+
+  def analyze(module: IrModule): Void
+    var current: IrModule? = module
+
+    while current != null
+      var function = current.firstFunction
+
+      while function != null
+        let existing = this.functions.find(function.symbol.name)
+
+        if existing == null
+          this.functions.add(function.symbol.name, function)
+        else if existing.value.retained && (function.linkReferences != null || !function.retained)
+          existing.value = function
+        end
+        if function.cExportSymbol != ""
+          this.add(function.symbol.name)
+          if this.exportNames.add(function.cExportSymbol, true)
+            this.exportedSymbols.add(function.cExportSymbol)
+          end
+        end
+        function = function.nextFunction
+      end
+      var classValue = current.firstClass
+
+      while classValue != null
+        this.classes.add(classValue.symbol.name, classValue)
+        classValue = classValue.nextClass
+      end
+      var imported = current.firstImport
+
+      while imported != null
+        this.imports.add(imported.symbol.name, imported)
+        imported = imported.nextImport
+      end
+      current = current.retainedParent
+    end
+    this.add("main")
+    let session = module.sessionEntry
+
+    this.add(session.name) if session != null
+    var pending = this.pending.first.nextNode
+
+    while pending != null
+      let function = this.functions.find(pending.value)
+
+      if function != null
+        let value = function.value
+
+        if value.blockCount == 0 && value.linkReferences == null
+          this.error = "Missing implementation reachability metadata for '" + value.symbol.name + "'."
+          return
+        end
+        this.runtimeFeatures = this.runtimeFeatures.mergedWith(value.linkRuntimeFeatures)
+        var edge = irFunctionLinkReferences(value).first.nextNode
+
+        while edge != null
+          this.add(edge.value)
+          edge = edge.nextNode
+        end
+      end
+      let classValue = this.classes.find(pending.value)
+
+      if classValue != null
+        let value = classValue.value
+        let base = value.baseSymbol
+
+        this.add(base.name) if base != null
+        # A live descriptor retains its virtual table, including callbacks and
+        # overrides. Direct/static methods become live through call edges only.
+        var method = value.firstMethod
+
+        while method != null
+          if method.dispatch.isVirtual()
+            this.add(method.functionSymbol.name)
+            let slot = method.dispatchSlot
+
+            this.add(slot.name) if slot != null
+          end
+          method = method.nextMethod
+        end
+      end
+      let imported = this.imports.find(pending.value)
+
+      this.takeImport(imported.value) if imported != null
+      pending = pending.nextNode
+    end
+    # Interactive hosts can execute future source outside the initial entry
+    # graph, so all of their imports must remain available.
+    if this.runtimeFeatures.hasSessionModules() || module.sessionEntry != null
+      current = module
+      while current != null
+        var imported = current.firstImport
+
+        while imported != null
+          this.takeImport(imported)
+          imported = imported.nextImport
+        end
+        current = current.retainedParent
+      end
+    end
+  end
+end

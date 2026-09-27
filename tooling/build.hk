@@ -1,3 +1,5 @@
+use clock
+
 def packageParentDirectory(path: String): String
   var slash = -1
   var index = 0
@@ -22,6 +24,12 @@ class Build
   public caseNumber: Int = 0
   public lastCase: String = ""
   public packagedTree: String = ""
+  public stage: Int = 1
+  public preparedStage: Int = 0
+  public fullValidation: Bool = false
+  public contractsPassed: Bool = false
+  public fixedPointVerified: Bool = false
+  public nativeReady: Bool = false
 
   def standardLibrarySources(): String[]
     let directory = this.root + "/stdlib"
@@ -102,6 +110,7 @@ class Build
       "NERI_HOST=" + this.nativeDirectory() + "/neri-host",
       "NERI_CODEGEN=" + this.nativeDirectory() + "/neri-codegen",
       "NERI_RUNTIME_MANIFEST=" + this.nativeDirectory() + "/neri-runtime-" + this.target.name() + ".json",
+      "NERI_CACHE_DIR=" + this.root + "/build/cache/compiler",
       "NERI_TEMPLATE_CATALOG=" + envOr("NERI_TEMPLATE_CATALOG", this.root + "/share/neri/templates/declarations.json"),
       "NERI_LINKER=" + this.llvm + "/bin/clang++"]
   end
@@ -120,9 +129,34 @@ class Build
   end
 
   def nativeBuild(): Void
+    if this.nativeReady
+      return
+    end
+    let prepared = envOr("NERI_NATIVE_READY", "")
+
+    if prepared == this.root + "|" + this.mode.name()
+      let receipt = envOr("NERI_NATIVE_READY_MANIFEST", "")
+
+      if receipt == ""
+        fail("prepared native components require a checksum manifest")
+      end
+      let nativeHashes = requiredText(receipt)
+
+      execute("/usr/bin/env", ["-C", this.nativeDirectory(), "shasum", "-a", "256", "-c", receipt])
+      for name in ["neri-codegen", "neri-host", "libneri-runtime.a", "neri-runtime-" + this.target.name() + ".json"]
+        if !contains(nativeHashes, "  " + name + "\n")
+          fail("prepared native manifest omits " + name)
+        end
+        execute("test", ["-f", this.nativeDirectory() + "/" + name])
+      end
+      execute("cmake", ["--build", this.nativeDirectory()])
+      this.nativeReady = true
+      return
+    end
     console::println("[native] Building current checkout (" + this.mode.name() + ")")
     this.configureNative()
     execute("cmake", ["--build", this.nativeDirectory()])
+    this.nativeReady = true
   end
 
   def configureNative(): Void
@@ -142,14 +176,32 @@ class Build
   end
 
   def startWork(): Void
-    execute("mkdir", ["-p", this.root + "/build"])
-    let directory = bootstrapTemporaryDirectory(this.root + "/build", "work")
+    if this.work != ""
+      return
+    end
+    execute("mkdir", ["-p", this.root + "/build/tmp"])
+    let directory = bootstrapTemporaryDirectory(this.root + "/build/tmp", "work")
 
     if directory == null
       fail("cannot create isolated build directory")
     else
       this.work = directory
     end
+  end
+
+  def finishWork(): Void
+    if this.work == ""
+      return
+    end
+    # Only the directory created by this invocation belongs to this driver.
+    # Failed commands exit before cleanup so their diagnostics remain available.
+    if packageParentDirectory(this.work) != this.root + "/build/tmp" || !contains(this.work, "/work.")
+      fail("refusing to remove an unexpected build workspace")
+    end
+    if files::removeTree(this.work).failure != null
+      fail("cannot remove completed build workspace: " + this.work)
+    end
+    this.work = ""
   end
 
   def sourceFiles(): String[]
@@ -169,46 +221,88 @@ class Build
     return sources
   end
 
-  def compile(compiler: String, emit: String, output: String): Void
+  def compile(compiler: String, emit: String, output: String, saveTemps: Bool = false): Bool
     var arguments = this.environment()
+
+    # The compiler owns dependency discovery, output verification and atomic cache publication.
+    # Every stage still runs build and restores into this invocation's isolated workspace.
+    toolingPrivateCacheDirectory(this.root + "/build/cache/compiler")
 
     for option in [compiler, "build", "--project", this.root + "/manifest.json", "--unit", "compiler"]
       arguments = host::appendString(arguments, option)
     end
     let options = ["--source-root", this.root + "/compiler", "--module", "neri-compiler",
-      "--target", this.target.name(), "--release", "--emit=" + emit, "--output", output]
+      "--target", this.target.name(), "--release", "--timings", "--emit=" + emit, "--output", output]
 
     for option in options arguments = host::appendString(arguments, option) end
-    execute("/usr/bin/env", arguments)
+    if saveTemps
+      arguments = host::appendString(arguments, "--save-temps")
+    end
+    let status = this.capture(arguments, "stage-compile", 1800)
+    let outputText = requiredText(this.work + "/stage-compile.stdout")
+    let errorText = requiredText(this.work + "/stage-compile.stderr")
+
+    console::print(outputText)
+    console::print(errorText)
+    if status != 0
+      fail("compiler stage failed with exit " + (status as String))
+    end
+    return contains(outputText, "neri timing incremental-hit ") || contains(errorText, "neri timing incremental-hit ")
   end
 
   def bootstrap(publish: Bool): Void
-    this.nativeBuild()
-    this.startWork()
-    this.sourceFiles()
-    execute("mkdir", [this.work + "/stage1", this.work + "/stage2", this.work + "/stage3"])
-    let stage1 = this.work + "/stage1/neri"
-    let stage2 = this.work + "/stage2/neri"
-    let stage3 = this.work + "/stage3/neri"
-
-    console::println("[bootstrap] Trusted seed -> Stage1")
-    this.compile(this.seedCompiler(), "executable", stage1)
-    console::println("[bootstrap] Stage1 -> Stage2")
-    this.compile(stage1, "executable", stage2)
-    console::println("[bootstrap] Stage2 -> Stage3")
-    this.compile(stage2, "executable", stage3)
-    for emit in ["neri-ir-hex", "obj"]
-      this.compile(stage1, emit, this.work + "/stage1." + emit)
-      this.compile(stage2, emit, this.work + "/stage2." + emit)
-      execute("cmp", [this.work + "/stage1." + emit, this.work + "/stage2." + emit])
-    end
-    execute("cmp", [stage2, stage3])
-    this.compiler = stage3
-    this.checkAbiCatalog()
+    this.prepareCompiler()
     if publish
       this.publishCompiler()
     end
-    console::println("[bootstrap] Fixed point verified against current native components")
+  end
+
+  def prepareCompiler(): Void
+    this.nativeBuild()
+    this.startWork()
+    if this.preparedStage >= this.stage
+      return
+    end
+    let stageInputs = seedSourceManifest(this)
+    var next = this.preparedStage + 1
+
+    this.fixedPointVerified = false
+
+    while next <= this.stage
+      let directory = this.work + "/stage" + (next as String)
+      let output = directory + "/neri"
+      let original = next == 1 ? this.seedCompiler() : this.compiler
+      let hash: fn(String): String = fn(path: String): String
+        return this.digest(path)
+      end
+      let input = toolingCachedProducer(this.root + "/build/cache/producers", original, hash)
+      let started = clock::milliseconds()
+
+      execute("mkdir", ["-p", directory])
+      console::println("[bootstrap] Building Stage" + (next as String))
+      let reused = this.compile(input, "executable", output, next > 1)
+      let finished = clock::milliseconds()
+
+      if started != null && finished != null
+        console::println("[bootstrap] " + (reused ? "Reused Stage" : "Executed Stage") + (next as String) + " in " + ((finished - started) as String) + " ms")
+      end
+      this.compiler = output
+      this.preparedStage = next
+      next = next + 1
+    end
+    if seedSourceManifest(this) != stageInputs
+      fail("compiler inputs changed during staged bootstrap")
+    end
+    if this.preparedStage == 3
+      let stage2 = this.work + "/stage2/neri"
+      let stage3 = this.work + "/stage3/neri"
+
+      execute("cmp", [stage2, stage3])
+      execute("diff", ["-r", stage2 + ".temps", stage3 + ".temps"])
+      this.fixedPointVerified = true
+      console::println("[bootstrap] Stage3 fixed point verified against current native components")
+    end
+    this.checkAbiCatalog()
   end
 
   def copyRuntimeHeaders(tree: String): Void
@@ -246,9 +340,11 @@ class Build
     for artifact in this.standardLibraryArtifacts()
       files = host::appendString(files, "stdlib/" + artifact)
     end
-    var manifest = ""
+    var paths: String[] = []
 
-    for file in files manifest = manifest + this.digest(tree + "/" + file) + "  " + file + "\n" end
+    for file in files paths = host::appendString(paths, tree + "/" + file) end
+    let manifest = this.fileManifest(paths, tree)
+
     if !host::writeText(tree + "/ARTIFACTS.sha256", manifest)
       fail("cannot record verified toolchain")
     end
@@ -380,6 +476,45 @@ class Build
     end
   end
 
+  def genericBudgetCase(name: String, firstCount: Int, secondCount: Int, expectedStatus: Int): Void
+    let source = this.work + "/" + name + ".hk"
+    var code = "def first<T>(value: T): Int\n  return 1\nend\ndef second<T>(value: T): Int\n  return 2\nend\n"
+    var index = 0
+
+    while index < firstCount + secondCount
+      code = code + "class BudgetType" + (index as String) + "\nend\n"
+      index = index + 1
+    end
+    code = code + "def main(): Void\n"
+    index = 0
+
+    while index < firstCount + secondCount
+      let functionName = index < firstCount ? "first" : "second"
+      let typeName = "BudgetType" + (index as String)
+
+      code = code + "  let result_" + (index as String) + " = " + functionName + "<" + typeName + ">(new " + typeName + "())\n"
+      index = index + 1
+    end
+    code = code + "end\n"
+    if !host::writeText(source, code)
+      fail("cannot write generic budget fixture")
+    end
+    var arguments = this.environment()
+
+    arguments = host::appendString(arguments, this.compiler)
+    arguments = host::appendString(arguments, "check")
+    arguments = host::appendString(arguments, source)
+    arguments = host::appendString(arguments, "--target")
+    arguments = host::appendString(arguments, this.target.name())
+    let status = this.capture(arguments, name, 30)
+    let output = requiredText(this.work + "/" + name + ".stdout") + requiredText(this.work + "/" + name + ".stderr")
+
+    if status != expectedStatus || (expectedStatus == 1 && !contains(output, "error NR222:"))
+      console::print(output)
+      fail(name + " violated the generic specialization budget")
+    end
+  end
+
   def runContract(): Void
     let temporary = this.work + "/run-temporary"
 
@@ -482,6 +617,69 @@ class Build
     return host::stringSlice(text, 0, 64)
   end
 
+  def fileManifest(paths: String[], relativeRoot: String): String
+    let result = new ToolingTextBuffer()
+    var index = 0
+
+    while index < paths.Length
+      var arguments = ["-C", relativeRoot, "shasum", "-a", "256", "--"]
+      var names: String[] = []
+      var bytes = 256
+
+      while index < paths.Length && names.Length < 128
+        let path = paths[index]
+        let prefix = relativeRoot + "/"
+
+        if !bytesEqualAt(path, prefix, 0)
+          fail("manifest input is outside its relative root: " + path)
+        end
+        let name = host::stringSlice(path, host::stringByteLength(prefix), host::stringByteLength(path) - host::stringByteLength(prefix))
+        let size = host::stringByteLength(name) + 1
+
+        if size > 16384 || name == "" || name == "-" || contains(name, "\n") || contains(name, "\r") || contains(name, "\\")
+          fail("manifest input cannot be represented without escaping: " + path)
+        end
+        if bytes + size > 16384 && names.Length > 0
+          break
+        end
+        arguments = host::appendString(arguments, name)
+        names = host::appendString(names, name)
+        bytes = bytes + size
+        index = index + 1
+      end
+      if this.capture(arguments, "manifest-hashes", 60) != 0
+        fail("manifest hash batch failed")
+      end
+      let hashes = lines(requiredText(this.work + "/manifest-hashes.stdout"))
+
+      if hashes.Length != names.Length
+        fail("manifest hash batch returned an unexpected row count")
+      end
+      var row = 0
+
+      while row < names.Length
+        let line = hashes[row]
+
+        if host::stringByteLength(line) != 66 + host::stringByteLength(names[row]) || !bytesEqualAt(line, "  " + names[row], 64)
+          fail("manifest hash batch returned an unexpected path or ordering")
+        end
+        var digit = 0
+
+        while digit < 64
+          let value = host::stringByteAt(line, digit) as Int
+
+          if !((value >= 48 && value <= 57) || (value >= 97 && value <= 102))
+            fail("manifest hash batch returned an invalid SHA-256")
+          end
+          digit = digit + 1
+        end
+        result.add(line + "\n")
+        row = row + 1
+      end
+    end
+    return toolingText(result)
+  end
+
   def sourceManifest(): String
     let files = new ToolingTextBuffer()
 
@@ -497,6 +695,7 @@ class Build
       while path != null
         let referenceOutput = bytesEqualAt(path, this.root + "/benchmarks/reference-dotnet/bin/", 0) || bytesEqualAt(path, this.root + "/benchmarks/reference-dotnet/obj/", 0)
         let localLessons = bytesEqualAt(path, this.root + "/docs/lessons/", 0)
+        let dataPublicationState = contains(path, "/.neri-data-")
         var generatedExperiment = false
 
         if directory == "experiments"
@@ -504,22 +703,21 @@ class Build
             generatedExperiment = true if contains(path, "/" + generated + "/")
           end
         end
-        if !endsWith(path, "/.DS_Store") && !referenceOutput && !localLessons && !generatedExperiment
+        if !endsWith(path, "/.DS_Store") && !referenceOutput && !localLessons && !generatedExperiment && !dataPublicationState
           files.add(host::stringSlice(path, host::stringByteLength(this.root) + 1, host::stringByteLength(path) - host::stringByteLength(this.root) - 1) + "\n")
         end
         path = cursor.next()
       end
     end
-    let entries = new ToolingTextBuffer()
-
+    var paths: String[] = []
     let cursor = new ToolingLineCursor(toolingText(files))
     var file = cursor.next()
 
     while file != null
-      entries.add(this.digest(this.root + "/" + file) + "  " + file + "\n")
+      paths = host::appendString(paths, this.root + "/" + file)
       file = cursor.next()
     end
-    return toolingText(entries)
+    return this.fileManifest(paths, this.root)
   end
 
   def copySessionProject(tree: String): Void
@@ -533,37 +731,71 @@ class Build
       execute("mkdir", ["-p", packageParentDirectory(output)])
       execute("cp", [source, output])
     end
-    execute("cp", [this.root + "/tooling/session-package.json", destination + "/manifest.json"])
+    var arguments = this.environment()
+
+    for argument in [this.work + "/neri-session-package", this.root + "/manifest.json", "session", destination + "/manifest.json"]
+      arguments = host::appendString(arguments, argument)
+    end
+    execute("/usr/bin/env", arguments)
+  end
+
+  def copyDataProject(tree: String): Void
+    let source = this.root + "/experiments/neri-data"
+    let destination = tree + "/share/neri/data"
+    let runtimeManifest = this.root + "/tooling/data-package-runtime.json"
+    let sqliteManifest = this.root + "/tooling/data-package-sqlite.json"
+    let runtime = dataPackageUnit(runtimeManifest, "runtime")
+    let sqlite = dataPackageUnit(sqliteManifest, "sqlite")
+    let runtimeSources = dataPackageSources(runtime)
+    let sqliteSources = dataPackageSources(sqlite)
+    let versions = lines(requiredText(this.root + "/VERSION"))
+
+    if versions.Length != 1 || versions[0] == ""
+      fail("invalid VERSION for Data package metadata")
+    end
+
+    execute("mkdir", ["-p", destination + "/sqlite"])
+    for file in runtimeSources
+      execute("cp", [source + "/" + file, destination + "/" + file])
+    end
+    for file in sqliteSources
+      execute("cp", [source + "/providers/sqlite/" + file, destination + "/sqlite/" + file])
+    end
+    execute("cp", [runtimeManifest, destination + "/manifest.json"])
+    execute("cp", [sqliteManifest, destination + "/sqlite/manifest.json"])
+    let metadata = dataPackageMetadata(versions[0], dataPackageLibrary(runtime, runtimeSources, ""), dataPackageLibrary(sqlite, sqliteSources, "sqlite/"))
+
+    if !host::writeText(destination + "/package.json", metadata)
+      fail("Cannot write Data package metadata")
+    end
   end
 
   def artifactDirectoryHashes(tree: String, relative: String): String
     execute(this.nativeDirectory() + "/neri-host", ["list", tree + "/" + relative, "", this.work + "/artifact-inventory"])
-    let hashes = new ToolingTextBuffer()
-
-    for path in lines(requiredText(this.work + "/artifact-inventory"))
-      let member = host::stringSlice(path, host::stringByteLength(tree) + 1, host::stringByteLength(path) - host::stringByteLength(tree) - 1)
-
-      hashes.add(this.digest(path) + "  " + member + "\n")
-    end
-    return toolingText(hashes)
+    return this.fileManifest(lines(requiredText(this.work + "/artifact-inventory")), tree)
   end
 
   def packageTree(directory: String, name: String, sources: String): String
     let tree = directory + "/" + name
     let documents = packagedDocumentsVerified(this.root)
 
-    execute("mkdir", ["-p", tree + "/bin", tree + "/lib", tree + "/libexec", tree + "/docs", tree + "/examples/session-consumer", tree + "/stdlib", tree + "/share/neri"])
+    execute("mkdir", ["-p", tree + "/bin", tree + "/lib", tree + "/libexec", tree + "/docs", tree + "/examples/session-consumer", tree + "/examples/data-consumer", tree + "/stdlib", tree + "/share/neri"])
     this.copyTemplateAssets(tree)
     this.copyStandardLibrary(tree + "/stdlib")
     this.copyRuntimeHeaders(tree)
     this.documentationIndex(tree)
     execute("cp", [this.compiler, tree + "/libexec/neri"])
+    execute("cp", [this.root + "/tooling/neri-launcher-common.sh", tree + "/bin/neri-launcher-common.sh"])
     execute("cp", [this.root + "/tooling/package-launcher.sh", tree + "/bin/neri"])
     execute("cp", [this.root + "/tooling/session-launcher.sh", tree + "/bin/neri-session"])
+    execute("cp", [this.root + "/tooling/data-generate-launcher.sh", tree + "/bin/neri-data-generate"])
+    execute("cp", [this.root + "/tooling/data-migration-launcher.sh", tree + "/bin/neri-data-migration"])
     execute("cp", [this.root + "/tooling/install-launcher.sh", tree + "/install.sh"])
     execute("cp", [this.work + "/neri-install", tree + "/libexec/neri-install"])
     execute("cp", [this.nativeDirectory() + "/neri-host", tree + "/libexec/neri-host"])
     execute("cp", [this.work + "/neri-session-console", tree + "/libexec/neri-session-console"])
+    execute("cp", [this.work + "/neri-data-generate", tree + "/libexec/neri-data-generate"])
+    execute("cp", [this.work + "/neri-data-migration", tree + "/libexec/neri-data-migration"])
     execute("cp", [this.nativeDirectory() + "/neri-codegen", tree + "/bin/neri-codegen"])
     execute("cp", [this.nativeDirectory() + "/libneri-runtime.a", tree + "/lib/libneri-runtime.a"])
     execute("cp", [this.nativeDirectory() + "/neri-runtime-" + this.target.name() + ".json", tree + "/lib/neri-runtime.json"])
@@ -571,8 +803,12 @@ class Build
       execute("cp", [this.nativeDirectory() + "/libneri-session-object-linker.dylib", tree + "/lib/libneri-session-object-linker.dylib"])
     end
     this.copySessionProject(tree)
+    this.copyDataProject(tree)
     for file in ["manifest.json", "main.hk", "service.hk"]
       execute("cp", [this.root + "/tests/session-package-consumer/" + file, tree + "/examples/session-consumer/" + file])
+    end
+    for file in ["manifest.json", "entities.hk", "mapping.json", "main.hk"]
+      execute("cp", [this.root + "/tests/data-package-consumer/" + file, tree + "/examples/data-consumer/" + file])
     end
     for doc in documents
       execute("cp", [this.root + "/docs/" + doc, tree + "/docs/" + doc])
@@ -581,41 +817,48 @@ class Build
       fail("cannot write source manifest")
     end
     let hashes = new ToolingTextBuffer()
+    var paths: String[] = []
 
     for artifact in this.standardLibraryArtifacts()
-      hashes.add(this.digest(tree + "/stdlib/" + artifact) + "  stdlib/" + artifact + "\n")
+      paths = host::appendString(paths, tree + "/stdlib/" + artifact)
     end
-    hashes.add(this.digest(tree + "/stdlib/documentation.json") + "  stdlib/documentation.json\n")
+    paths = host::appendString(paths, tree + "/stdlib/documentation.json")
     for example in ["README.md", "hello.hk", "functions.hk", "arguments.hk", "http.hk", "generics.hk"]
       execute("cp", [this.root + "/examples/" + example, tree + "/examples/" + example])
-      hashes.add(this.digest(tree + "/examples/" + example) + "  examples/" + example + "\n")
+      paths = host::appendString(paths, tree + "/examples/" + example)
     end
+    hashes.add(this.fileManifest(paths, tree))
+    paths = []
     hashes.add(this.artifactDirectoryHashes(tree, "share/neri"))
     hashes.add(this.artifactDirectoryHashes(tree, "include/neri"))
     hashes.add(this.artifactDirectoryHashes(tree, "examples/session-consumer"))
+    hashes.add(this.artifactDirectoryHashes(tree, "examples/data-consumer"))
     for doc in documents
-      hashes.add(this.digest(tree + "/docs/" + doc) + "  docs/" + doc + "\n")
+      paths = host::appendString(paths, tree + "/docs/" + doc)
     end
-    for artifact in ["bin/neri", "bin/neri-session", "bin/neri-codegen", "libexec/neri", "libexec/neri-session-console", "libexec/neri-install", "libexec/neri-host", "install.sh", "lib/libneri-runtime.a", "lib/neri-runtime.json", "SOURCE-MANIFEST.sha256"]
-      hashes.add(this.digest(tree + "/" + artifact) + "  " + artifact + "\n")
+    for artifact in ["bin/neri", "bin/neri-launcher-common.sh", "bin/neri-session", "bin/neri-data-generate", "bin/neri-data-migration", "bin/neri-codegen", "libexec/neri", "libexec/neri-session-console", "libexec/neri-data-generate", "libexec/neri-data-migration", "libexec/neri-install", "libexec/neri-host", "install.sh", "lib/libneri-runtime.a", "lib/neri-runtime.json", "SOURCE-MANIFEST.sha256"]
+      paths = host::appendString(paths, tree + "/" + artifact)
     end
     if this.target.isMacOS()
       let artifact = "lib/libneri-session-object-linker.dylib"
 
-      hashes.add(this.digest(tree + "/" + artifact) + "  " + artifact + "\n")
+      paths = host::appendString(paths, tree + "/" + artifact)
     end
+    hashes.add(this.fileManifest(paths, tree))
     let artifactHashes = toolingText(hashes)
 
     if !host::writeText(tree + "/ARTIFACTS.sha256", artifactHashes)
       fail("cannot write artifact manifest")
     end
-    let provenance = "{\n  \"schemaVersion\": 2,\n  \"target\": \"" + this.target.name() + "\",\n  \"llvmVersion\": \"22.1.8\",\n  \"runtimeManifest\": " + requiredText(tree + "/lib/neri-runtime.json") + ",\n  \"verification\": \"fixed-point-and-native-language-contracts\",\n  \"sourceManifestSha256\": \"" + this.digest(tree + "/SOURCE-MANIFEST.sha256") + "\",\n  \"artifactManifestSha256\": \"" + this.digest(tree + "/ARTIFACTS.sha256") + "\",\n  \"seedProvenanceSha256\": \"" + this.digest(this.seed + "/PROVENANCE.json") + "\"\n}\n"
+    let verification = (this.fixedPointVerified ? "fixed-point-and-" : "stage2-and-") + (this.contractsPassed ? "native-language-and-package-installation-contracts" : "package-installation-contracts")
+
+    let provenance = "{\n  \"schemaVersion\": 2,\n  \"target\": \"" + this.target.name() + "\",\n  \"llvmVersion\": \"22.1.8\",\n  \"runtimeManifest\": " + requiredText(tree + "/lib/neri-runtime.json") + ",\n  \"compilerStage\": " + (this.preparedStage as String) + ",\n  \"verification\": \"" + verification + "\",\n  \"sourceManifestSha256\": \"" + this.digest(tree + "/SOURCE-MANIFEST.sha256") + "\",\n  \"artifactManifestSha256\": \"" + this.digest(tree + "/ARTIFACTS.sha256") + "\",\n  \"seedProvenanceSha256\": \"" + this.digest(this.seed + "/PROVENANCE.json") + "\"\n}\n"
 
     if !host::writeText(tree + "/PROVENANCE.json", provenance)
       fail("cannot write provenance")
     end
     execute("chmod", ["-R", "u=rwX,go=rX", tree])
-    execute("chmod", ["755", tree + "/bin/neri", tree + "/bin/neri-session", tree + "/bin/neri-codegen", tree + "/libexec/neri", tree + "/libexec/neri-session-console", tree + "/libexec/neri-install", tree + "/libexec/neri-host", tree + "/install.sh"])
+    execute("chmod", ["755", tree + "/bin/neri", tree + "/bin/neri-session", tree + "/bin/neri-data-generate", tree + "/bin/neri-data-migration", tree + "/bin/neri-codegen", tree + "/libexec/neri", tree + "/libexec/neri-session-console", tree + "/libexec/neri-data-generate", tree + "/libexec/neri-data-migration", tree + "/libexec/neri-install", tree + "/libexec/neri-host", tree + "/install.sh"])
     execute(this.nativeDirectory() + "/neri-host", ["stamp", tree, "0"])
     execute(this.nativeDirectory() + "/neri-host", ["list", tree, "", this.work + "/members"])
     var members = ""
@@ -669,7 +912,19 @@ class Build
     this.startWork()
     let sources = this.sourceManifest()
 
-    this.test()
+    if this.fullValidation
+      this.test()
+    else
+      this.prepareCompiler()
+      this.buildHttpProgram("client", "/tests/http/client.hk")
+    end
+    var sessionPackage = this.environment()
+
+    for option in [this.compiler, "build", "--project", this.root + "/manifest.json", "--unit", "session-package-generator",
+      "--target", this.target.name(), "--release", "--output", this.work + "/neri-session-package"]
+      sessionPackage = host::appendString(sessionPackage, option)
+    end
+    execute("/usr/bin/env", sessionPackage)
     var installer = this.environment()
 
     for option in [this.compiler, "build", "--project", this.root + "/manifest.json", "--unit", "install",
@@ -686,6 +941,22 @@ class Build
       sessionConsole = host::appendString(sessionConsole, option)
     end
     execute("/usr/bin/env", sessionConsole)
+    var dataGenerator = this.environment()
+
+    for option in [this.compiler, "build", "--project", this.root + "/tooling/data/manifest.json", "--unit", "generator",
+      "--source-root", this.root, "--module", "neri-data-generate",
+      "--target", this.target.name(), "--release", "--output", this.work + "/neri-data-generate"]
+      dataGenerator = host::appendString(dataGenerator, option)
+    end
+    execute("/usr/bin/env", dataGenerator)
+    var dataMigration = this.environment()
+
+    for option in [this.compiler, "build", "--project", this.root + "/tooling/data/manifest.json", "--unit", "migration-scaffold",
+      "--source-root", this.root, "--module", "neri-data-migration",
+      "--target", this.target.name(), "--release", "--output", this.work + "/neri-data-migration"]
+      dataMigration = host::appendString(dataMigration, option)
+    end
+    execute("/usr/bin/env", dataMigration)
     if this.sourceManifest() != sources
       fail("sources changed during package validation")
     end
@@ -779,9 +1050,18 @@ class Build
     let sessionConsumerProject = documentedToolchain + "/examples/session-consumer/manifest.json"
     let sessionConsumer = this.work + "/installed-session-consumer"
     let sessionBuild = ["-i", "PATH=" + envOr("PATH", "/usr/bin:/bin"), "LC_ALL=C", "LLVM_PREFIX=" + this.llvm,
-      launcher, "build", "--project", sessionConsumerProject, "--unit", "consumer", "--release", "--output", sessionConsumer]
+      launcher, "build", "--project", sessionConsumerProject, "--unit", "consumer", "--release", "--timings", "--output", sessionConsumer]
 
-    if this.capture(sessionBuild, "installed-session-build", 60) != 0
+    # This consumer compiles the session service and its compiler dependencies.
+    # A cold release build needs a compilation budget, not a smoke-run budget.
+    let sessionBuildStatus = this.capture(sessionBuild, "installed-session-build", 300)
+
+    if sessionBuildStatus != 0
+      console::print(requiredText(this.work + "/installed-session-build.stdout"))
+      console::print(requiredText(this.work + "/installed-session-build.stderr"))
+      if sessionBuildStatus == 124
+        fail("installed session consumer compilation exceeded 300 seconds")
+      end
       fail("installed package session library cannot build an independent consumer")
     end
     let sessionRun = ["-i", "PATH=" + envOr("PATH", "/usr/bin:/bin"), "LC_ALL=C", "TZ=UTC",
@@ -797,6 +1077,60 @@ class Build
     if this.capture(sessionRun, "installed-session-run", 60) != 0 || requiredText(this.work + "/installed-session-run.stdout") != "18\n"
       fail("installed package session library cannot initialize and submit")
     end
+    let sessionLauncher = ["-i", "PATH=" + envOr("PATH", "/usr/bin:/bin"), "LC_ALL=C", "TZ=UTC", "LLVM_PREFIX=" + this.llvm,
+      "NERI_SESSION_WORK=" + this.work, prefix + "/bin/neri-session"]
+
+    if this.captureInput(sessionLauncher, "installed-session-console", 60, "1 + 2\n.\n") != 0 || !contains(requiredText(this.work + "/installed-session-console.stdout"), "3\n")
+      fail("installed session launcher cannot evaluate a submission")
+    end
+    execute("test", ["-x", prefix + "/bin/neri-data-generate"])
+    execute("test", ["-x", prefix + "/bin/neri-data-migration"])
+    let dataExample = this.work + "/examples/data-consumer"
+
+    execute("mkdir", ["-p", this.work + "/examples", this.work + "/share/neri"])
+    execute("cp", ["-R", documentedToolchain + "/examples/data-consumer", dataExample])
+    execute("cp", ["-R", documentedToolchain + "/share/neri/data", this.work + "/share/neri/data"])
+    execute("mkdir", ["-p", dataExample + "/scaffold"])
+    let dataMapping = dataExample + "/mapping.json"
+    let installedEnvironment = ["-i", "PATH=" + envOr("PATH", "/usr/bin:/bin"), "LC_ALL=C", "TZ=UTC", "LLVM_PREFIX=" + this.llvm]
+    var generate = installedEnvironment
+
+    for argument in [prefix + "/bin/neri-data-generate", dataMapping]
+      generate = host::appendString(generate, argument)
+    end
+    if this.capture(generate, "installed-data-generate", 60) != 0
+      fail("installed Data generator cannot generate a consumer")
+    end
+    var migration = installedEnvironment
+
+    for argument in [prefix + "/bin/neri-data-migration", dataMapping, "empty", "initial", dataExample + "/scaffold/initial"]
+      migration = host::appendString(migration, argument)
+    end
+    if this.capture(migration, "installed-data-migration", 60) != 0
+      fail("installed Data migration tool cannot scaffold a migration")
+    end
+    for artifact in ["migration.hk", "snapshot.json", "scaffold.json"]
+      execute("test", ["-s", dataExample + "/scaffold/initial/" + artifact])
+    end
+    var dataBuild = installedEnvironment
+
+    for argument in [launcher, "build", "--project", dataExample + "/manifest.json", "--unit", "consumer", "--release", "--output", this.work + "/data-consumer"]
+      dataBuild = host::appendString(dataBuild, argument)
+    end
+    if this.capture(dataBuild, "installed-data-build", 60) != 0
+      fail("installed Data libraries cannot build an independent consumer")
+    end
+    let dataRun = ["-i", "PATH=" + envOr("PATH", "/usr/bin:/bin"), "LC_ALL=C", "TZ=UTC",
+      "NERI_HOST=" + documentedToolchain + "/libexec/neri-host",
+      "NERI_CODEGEN=" + documentedToolchain + "/bin/neri-codegen",
+      "NERI_RUNTIME_MANIFEST=" + documentedToolchain + "/lib/neri-runtime.json",
+      "NERI_STDLIB=" + documentedToolchain + "/stdlib", "NERI_LIBRARY_PATH=" + documentedToolchain + "/lib",
+      "NERI_LINKER=" + this.llvm + "/bin/clang++",
+      this.work + "/data-consumer", this.work + "/data-consumer.sqlite", dataExample + "/scaffold/initial"]
+
+    if this.capture(dataRun, "installed-data-run", 60) != 0 || !contains(requiredText(this.work + "/installed-data-run.stdout"), "Installed Neri Data consumer passed\n")
+      fail("installed Data consumer failed")
+    end
     execute(this.packagedTree + "/install.sh", ["--no-doc", "--prefix", prefix])
     let noDocumentationToolchain = this.installedToolchain(prefix, "installed-no-documentation-link")
 
@@ -810,6 +1144,9 @@ class Build
     end
     if !contains(noDocumentationManifest, "  share/neri/templates/declarations.json\n") || !contains(noDocumentationManifest, "  share/neri/templates/declarations.schema.json\n")
       fail("--no-doc installation omitted template assets")
+    end
+    if !contains(noDocumentationManifest, "  share/neri/data/manifest.json\n") || !contains(noDocumentationManifest, "  share/neri/data/sqlite/manifest.json\n") || !contains(noDocumentationManifest, "  share/neri/data/package.json\n")
+      fail("--no-doc installation omitted Data libraries")
     end
     let packageManifest = requiredText(this.packagedTree + "/ARTIFACTS.sha256")
     let installation = requiredText(noDocumentationToolchain + "/INSTALLATION.json")
@@ -874,7 +1211,7 @@ class Build
     if !this.mode.isRelease()
       fail("benchmarks require Release mode")
     end
-    this.bootstrap(false)
+    this.prepareCompiler()
     let binary = this.work + "/collections"
     var arguments = this.environment()
     let options = [this.compiler, "build", "--project", this.root + "/manifest.json",
@@ -974,13 +1311,105 @@ class Build
           end
           arguments = host::appendString(arguments, "--release") if configuration.isRelease()
           if this.capture(arguments, name + "-build-" + unit, 30) != 0
+            console::print(requiredText(this.work + "/" + name + "-build-" + unit + ".stdout"))
+            console::print(requiredText(this.work + "/" + name + "-build-" + unit + ".stderr"))
             fail(project + " " + unit + " build failed in " + configuration.name())
           end
         end
         if this.capture([directory + "/driver", directory + "/data", directory + "/fixture", this.target.name()], name + "-run", 30) != 0
+          console::print(requiredText(this.work + "/" + name + "-run.stdout"))
+          console::print(requiredText(this.work + "/" + name + "-run.stderr"))
           fail(project + " runtime contract failed in " + configuration.name())
         end
       end
+    end
+  end
+
+  def dataEnvironmentContract(): Void
+    console::println("[test] Checking SQLite runtime prerequisites")
+    let output = this.work + "/sqlite-environment"
+    var arguments = this.environment()
+
+    for argument in [this.compiler, "build", "--project", this.root + "/experiments/neri-data/recovery/manifest.json", "--unit", "environment", "--output", output]
+      arguments = host::appendString(arguments, argument)
+    end
+    if this.capture(arguments, "sqlite-environment-build", 120) != 0
+      console::print(requiredText(this.work + "/sqlite-environment-build.stdout"))
+      console::print(requiredText(this.work + "/sqlite-environment-build.stderr"))
+      fail("SQLite environment check could not be compiled")
+    end
+    let status = this.capture(["-i", "PATH=/usr/bin:/bin", output], "sqlite-environment-run", 30)
+
+    console::print(requiredText(this.work + "/sqlite-environment-run.stdout"))
+    if status != 0
+      console::print(requiredText(this.work + "/sqlite-environment-run.stderr"))
+      fail("SQLite runtime must support safe WAL and threading before full validation")
+    end
+  end
+
+  def dataRuntimeContracts(): Void
+    console::println("[test] SQLite lifecycle, persistence and worker isolation")
+    for configuration in [BuildMode.debug(), BuildMode.release()]
+      for project in ["provider-contract", "providers/sqlite", "concurrency-tokens", "resource-lifetime", "storage-failures"]
+        var units = ["sqlite-connection", "persistence", "streaming"]
+
+        units = ["contract", "workers-contract"] if project == "concurrency-tokens"
+        units = ["contract"] if project == "resource-lifetime" || project == "storage-failures"
+        if project == "providers/sqlite"
+          units = ["contract", "configuration-contract", "materialization-contract", "migration-contract", "schema-diff-contract", "schema-rebuild-contract", "schema-inspection-contract"]
+        end
+        let projectName = project == "providers/sqlite" ? "sqlite-provider" : project
+        let name = "data-" + projectName + "-" + configuration.name()
+        let directory = this.work + "/" + name
+
+        execute("mkdir", ["-p", directory])
+        var arguments = this.environment()
+
+        for argument in [this.compiler, "build-batch", "--project", this.root + "/experiments/neri-data/" + project + "/manifest.json", "--output-dir", directory]
+          arguments = host::appendString(arguments, argument)
+        end
+        for unit in units
+          arguments = host::appendString(arguments, "--unit")
+          arguments = host::appendString(arguments, unit)
+        end
+        arguments = host::appendString(arguments, "--release") if configuration.isRelease()
+        if this.capture(arguments, name + "-build", 120) != 0
+          console::print(requiredText(this.work + "/" + name + "-build.stdout"))
+          console::print(requiredText(this.work + "/" + name + "-build.stderr"))
+          fail("SQLite contract build failed: " + name)
+        end
+        for unit in units
+          if this.capture([directory + "/" + unit], name + "-" + unit, 30) != 0
+            console::print(requiredText(this.work + "/" + name + "-" + unit + ".stdout"))
+            console::print(requiredText(this.work + "/" + name + "-" + unit + ".stderr"))
+            fail("SQLite contract failed: " + name + "/" + unit)
+          end
+        end
+      end
+      this.dataRecoveryContract(configuration)
+    end
+  end
+
+  def dataRecoveryContract(configuration: BuildMode): Void
+    let name = "data-recovery-" + configuration.name()
+    let directory = this.work + "/" + name
+
+    execute("mkdir", ["-p", directory])
+    var arguments = this.environment()
+
+    for argument in [this.compiler, "build-batch", "--project", this.root + "/experiments/neri-data/recovery/manifest.json", "--output-dir", directory, "--unit", "worker", "--unit", "driver"]
+      arguments = host::appendString(arguments, argument)
+    end
+    arguments = host::appendString(arguments, "--release") if configuration.isRelease()
+    if this.capture(arguments, name + "-build", 120) != 0
+      console::print(requiredText(this.work + "/" + name + "-build.stdout"))
+      console::print(requiredText(this.work + "/" + name + "-build.stderr"))
+      fail("SQLite recovery contract build failed: " + name)
+    end
+    if this.capture([directory + "/driver", directory + "/worker"], name + "-run", 30) != 0
+      console::print(requiredText(this.work + "/" + name + "-run.stdout"))
+      console::print(requiredText(this.work + "/" + name + "-run.stderr"))
+      fail("SQLite recovery contract failed: " + name)
     end
   end
 
@@ -1029,9 +1458,16 @@ class Build
 
     for line in lines(requiredText(this.work + "/effects.nir"))
       if bytesEqualAt(line, "func ", 0)
-        for name in ["cycleFirst", "cycleSecond", "dispatch", "invoke", "untouched"]
+        for name in ["cycleFirst", "cycleSecond", "dispatch", "invoke", "untouched", "releaseOnly"]
           if contains(line, "function, \"" + name + "\"]")
-            let expected = name == "untouched" ? "effects=[]" : "effects=[write, may-panic, safepoint]"
+            var expected = "effects=[write, may-panic, safepoint]"
+
+            if name == "untouched"
+              expected = "effects=[]"
+            end
+            if name == "releaseOnly"
+              expected = "effects=[write, unsafe]"
+            end
 
             if !contains(line, expected)
               fail("incorrect transitive effects for " + name)
@@ -1041,7 +1477,7 @@ class Build
         end
       end
     end
-    if checked != 5
+    if checked != 6
       fail("effect contract functions were not emitted")
     end
   end
@@ -1143,62 +1579,50 @@ class Build
       runArguments = host::appendString(runArguments, argument)
     end
     if this.capture(runArguments, "project-manifest-contract", 60) != 0
+      console::print(requiredText(this.work + "/project-manifest-contract.stdout"))
+      console::print(requiredText(this.work + "/project-manifest-contract.stderr"))
       fail("project manifest contract failed")
     end
-    # The current compiler enumerates declared executable units. File names do
-    # not imply a unit name.
     let manifest = this.root + "/manifest.json"
-    let inventory = directory + "/compiler-tooling-units.txt"
     var listed = this.environment()
 
-    for argument in [this.compiler, "project-units", "--project", manifest]
+    for argument in [this.compiler, "project-units", "--project", manifest, "--test-suite", this.root + "/tooling/compiler-contracts.json"]
       listed = host::appendString(listed, argument)
     end
-    if this.capture(listed, "compiler-tooling-units", 30) != 0 || !host::writeText(inventory, requiredText(this.work + "/compiler-tooling-units.stdout"))
-      fail("cannot list compiler tooling units")
+    if this.capture(listed, "compiler-tooling-units", 30) != 0
+      fail("cannot list compiler tooling tests")
     end
-    var completed: String[] = []
+    let records = lines(requiredText(this.work + "/compiler-tooling-units.stdout"))
 
-    for entry in lines(requiredText(inventory))
-      let separator = toolingFind(entry, "\t", 0)
-      let unit = separator < 0 ? "" : host::stringSlice(entry, 0, separator)
-      let source = separator < 0 ? "" : host::stringSlice(entry, separator + 1, host::stringByteLength(entry) - separator - 1)
-      var selected = false
-      var seen = false
-
-      for completedUnit in completed
-        seen = true if completedUnit == unit
-      end
-
-      if (bytesEqualAt(source, this.root + "/tests/abi-", 0) || bytesEqualAt(source, this.root + "/tests/agent-", 0) || bytesEqualAt(source, this.root + "/tests/lsp-", 0) || bytesEqualAt(source, this.root + "/tests/codestyle-", 0) || bytesEqualAt(source, this.root + "/tests/named-argument-", 0) || bytesEqualAt(source, this.root + "/tests/quotation-", 0) || bytesEqualAt(source, this.root + "/tests/field-pack-", 0) || bytesEqualAt(source, this.root + "/tests/stdlib-", 0) || source == this.root + "/tests/data-generation-contract.hk" || source == this.root + "/tests/generated-source-contract.hk") && !seen
-        selected = true
-      end
-      if selected
-        completed = host::appendString(completed, unit)
-      end
-    end
-    if completed.Length == 0
-      fail("Project manifest must register compiler tooling contract executables")
+    if records.Length == 0
+      fail("Project manifest must register compiler tooling tests")
     end
     var arguments = this.environment()
 
     for argument in [this.compiler, "build-batch", "--project", manifest, "--output-dir", directory, "--timings"]
       arguments = host::appendString(arguments, argument)
     end
-    for unit in completed
+    for record in records
+      let selected = new ToolingTestCase(record)
+
       arguments = host::appendString(arguments, "--unit")
-      arguments = host::appendString(arguments, unit)
+      arguments = host::appendString(arguments, selected.name)
     end
     execute("/usr/bin/env", arguments)
-    for unit in completed
+    for record in records
+      let selected = new ToolingTestCase(record)
       var run = this.environment()
 
-      run = host::appendString(run, directory + "/" + unit)
-      run = host::appendString(run, this.root)
-      run = host::appendString(run, this.compiler)
-      run = host::appendString(run, directory)
-      if this.capture(run, unit, 30) != 0
-        fail("Compiler tooling contract failed: " + unit)
+      run = host::appendString(run, directory + "/" + selected.name)
+      for argument in selected.resolveArguments(this.root, this.compiler, directory)
+        run = host::appendString(run, argument)
+      end
+      # The host capture interface takes whole seconds; round up the declared
+      # millisecond budget rather than silently shortening it.
+      if this.capture(run, selected.name, (selected.timeoutMs + 999) / 1000) != 0
+        console::print(requiredText(this.work + "/" + selected.name + ".stdout"))
+        console::print(requiredText(this.work + "/" + selected.name + ".stderr"))
+        fail("Compiler tooling contract failed: " + selected.name)
       end
     end
   end
@@ -1220,6 +1644,19 @@ class Build
     end
     if this.capture(runArguments, "aot-cache-contract", 120) != 0
       fail("AOT compilation and cache contract failed")
+    end
+  end
+
+  def codegenCacheContracts(): Void
+    var arguments = this.environment()
+
+    for argument in [this.compiler, "run", "--project", this.root + "/manifest.json", "--unit", "codegen-cache-contracts", "--release", "--", this.nativeDirectory() + "/neri-codegen", this.root + "/tests/golden", this.target.name()]
+      arguments = host::appendString(arguments, argument)
+    end
+    if this.capture(arguments, "codegen-cache-contract", 120) != 0
+      console::print(requiredText(this.work + "/codegen-cache-contract.stdout"))
+      console::print(requiredText(this.work + "/codegen-cache-contract.stderr"))
+      fail("Native object cache contract failed")
     end
   end
 
@@ -1317,6 +1754,28 @@ class Build
     if this.capture(run, "session-contracts", 180) != 0
       fail("session contracts failed")
     end
+    let nativeLibraryDriver = directory + "/native-library-driver"
+    var nativeLibraryBuild = this.environment()
+
+    for argument in [this.compiler, "build", "--project", this.root + "/manifest.json", "--unit", "session-native-library-contracts", "--output", nativeLibraryDriver]
+      nativeLibraryBuild = host::appendString(nativeLibraryBuild, argument)
+    end
+    execute("/usr/bin/env", nativeLibraryBuild)
+    var nativeLibraryRun = this.environment()
+
+    nativeLibraryRun = host::appendString(nativeLibraryRun, "NERI_TARGET=" + this.target.name())
+    nativeLibraryRun = host::appendString(nativeLibraryRun, "NERI_RUNTIME_MANIFEST=" + runtimeManifest)
+    nativeLibraryRun = host::appendString(nativeLibraryRun, "NERI_STDLIB=" + directory + "/stdlib")
+    if this.target.isMacOS()
+      nativeLibraryRun = host::appendString(nativeLibraryRun, "NERI_SESSION_OBJECT_LINKER=" + objectLinker)
+    end
+    nativeLibraryRun = host::appendString(nativeLibraryRun, "NERI_CACHE_DIR=" + cacheDirectory)
+    for argument in [nativeLibraryDriver, this.compiler, directory]
+      nativeLibraryRun = host::appendString(nativeLibraryRun, argument)
+    end
+    if this.capture(nativeLibraryRun, "session-native-library-contracts", 180) != 0
+      fail("session native-library contracts failed")
+    end
     this.sessionTerminalContracts()
   end
 
@@ -1363,7 +1822,7 @@ class Build
     let generator = this.work + "/abi-catalog-generator"
     var arguments = this.environment()
 
-    for argument in [this.compiler, "build", "--project", this.root + "/tooling/abi/manifest.json", "--output", generator]
+    for argument in [this.compiler, "build", "--project", this.root + "/tooling/abi/manifest.json", "--target", this.target.name(), "--release", "--output", generator]
       arguments = host::appendString(arguments, argument)
     end
     execute("/usr/bin/env", arguments)
@@ -1381,7 +1840,7 @@ class Build
     let generator = this.work + "/kind-catalog-generator"
     var arguments = this.environment()
 
-    for argument in [this.compiler, "build", "--project", this.root + "/tooling/kinds/manifest.json", "--output", generator]
+    for argument in [this.compiler, "build", "--project", this.root + "/tooling/kinds/manifest.json", "--target", this.target.name(), "--release", "--output", generator]
       arguments = host::appendString(arguments, argument)
     end
     execute("/usr/bin/env", arguments)
@@ -1411,7 +1870,7 @@ class Build
 
   def checkCodeStyle(): Void
     console::println("[style] Checking owned project sources and the standard library")
-    for project in ["manifest.json", "stdlib/manifest.json", "tooling/abi/manifest.json", "tooling/kinds/manifest.json", "tooling/data/manifest.json", "experiments/neri-data/manifest.json", "experiments/neri-data/verification/manifest.json", "experiments/neri-data/generated-example/manifest.json"]
+    for project in ["manifest.json", "stdlib/manifest.json", "tooling/abi/manifest.json", "tooling/kinds/manifest.json", "tooling/data/manifest.json", "experiments/neri-data/manifest.json", "experiments/neri-data/verification/manifest.json", "experiments/neri-data/generated-example/manifest.json", "experiments/neri-data/float-values/manifest.json", "experiments/neri-data/providers/sqlite/manifest.json", "experiments/neri-data/provider-contract/manifest.json", "experiments/neri-data/navigation/manifest.json", "experiments/neri-data/reference-navigation/manifest.json", "experiments/neri-data/scalar-relationships/manifest.json"]
       var arguments = this.environment()
 
       for argument in [this.compiler, "format", "--check", "--project", this.root + "/" + project]
@@ -1428,7 +1887,12 @@ class Build
   end
 
   def test(): Void
-    this.bootstrap(false)
+    this.nativeBuild()
+    this.startWork()
+    let validationInputs = this.sourceManifest()
+
+    this.prepareCompiler()
+    this.dataEnvironmentContract()
     this.checkCodeStyle()
     this.abiCatalogContracts()
     var lspArguments = this.environment()
@@ -1449,6 +1913,7 @@ class Build
     this.unicodeProjectContracts()
     this.projectManifestContracts()
     this.aotCacheContracts()
+    this.codegenCacheContracts()
     this.sessionContracts()
     this.standardLibraryContracts()
     this.fileContracts()
@@ -1461,10 +1926,22 @@ class Build
     this.languageCase("tests/neri-tests/floats.hk", 0, "", true)
     this.languageCase("tests/native/cabi.hk", 0, "", true)
     this.languageCase("tests/contracts/optional.hk", 0, "", true)
+    this.languageCase("tests/contracts/optional-scalar-arrays.hk", 0, "", true)
     this.languageCase("tests/contracts/method-defaults.hk", 0, "", true)
+    this.languageCase("tests/contracts/unsafe-default-errors.hk", 1, "error NR189:", false)
+    var rejectedUnsafeDefaults = 0
+
+    for line in lines(requiredText(this.work + "/" + this.lastCase + ".stdout"))
+      rejectedUnsafeDefaults = rejectedUnsafeDefaults + 1 if contains(line, "error NR189:")
+    end
+    fail("unsafe default arguments escaped the call boundary") if rejectedUnsafeDefaults != 2
     this.languageCase("tests/contracts/callbacks.hk", 0, "", true)
     this.languageCase("tests/contracts/quotation-tree.hk", 0, "", true)
     this.languageCase("tests/contracts/typed-quotations.hk", 0, "", true)
+    this.languageCase("tests/contracts/ternary-nullable-errors.hk", 1, "error NR124: Ternary branches must have the same or matching optional type", false)
+    this.languageCase("tests/contracts/ternary-flow-errors.hk", 1, "error NR169:", false)
+    this.languageCase("tests/contracts/member-flow.hk", 0, "", true)
+    this.languageCase("tests/contracts/member-flow-errors.hk", 1, "error NR169:", false)
     this.languageCase("tests/contracts/fields.hk", 0, "", true)
     this.effectContracts()
     this.languageCase("tests/contracts/readonly.hk", 0, "", true)
@@ -1472,6 +1949,20 @@ class Build
     this.languageCase("tests/contracts/shared-callbacks.hk", 0, "", true)
     this.languageCase("tests/contracts/parallel-callbacks.hk", 0, "", true)
     this.languageCase("tests/contracts/task-generation.hk", 0, "", true)
+    this.languageCase("tests/runtime-contracts/workers/fixture.hk", 0, "", true, ["tests/runtime-contracts/workers/entries.hk"])
+    this.languageCase("tests/contracts/worker-entry-errors.hk", 1, "error NR249:", false)
+    var rejectedWorkerEntries = 0
+
+    for line in lines(requiredText(this.work + "/" + this.lastCase + ".stdout"))
+      rejectedWorkerEntries = rejectedWorkerEntries + 1 if contains(line, "error NR249:")
+    end
+    fail("worker entry binding accepted a capture, indirect callable, or incompatible signature") if rejectedWorkerEntries != 8
+    this.languageCase("tests/contracts/worker-ownership-errors.hk", 1, "error NR153:", false)
+    let workerOwnershipErrors = requiredText(this.work + "/" + this.lastCase + ".stdout")
+
+    fail("worker handle construction escaped the unsafe boundary") if !contains(workerOwnershipErrors, "error NR189:")
+    this.languageCase("tests/contracts/array-generation.hk", 0, "", true)
+    this.languageCase("tests/contracts/array-generation-negative.hk", 70, "invalid sequential array generation contract", false)
     this.languageCase("tests/contracts/gc-roots.hk", 0, "", true)
     this.languageCase("tests/contracts/postfix-if.hk", 0, "", true)
     this.languageCase("tests/contracts/console.hk", 0, "value=42\n", true)
@@ -1480,7 +1971,16 @@ class Build
     this.languageCase("tests/contracts/exact-arguments.hk", 0, "", true)
     this.languageCase("tests/contracts/library-declarations.hk", 0, "", true)
     this.languageCase("tests/contracts/generic-equality.hk", 0, "", true)
+    this.languageCase("tests/contracts/generic-equality-mixed-errors.hk", 1, "error NR118:", false)
     this.languageCase("tests/contracts/generic-equality-errors.hk", 1, "error NR250:", false)
+    this.languageCase("tests/contracts/reference-identity.hk", 0, "", true)
+    this.languageCase("tests/contracts/reference-identity-errors.hk", 1, "error NR220:", false)
+    var rejectedReferenceScalars = 0
+
+    for line in lines(requiredText(this.work + "/" + this.lastCase + ".stdout"))
+      rejectedReferenceScalars = rejectedReferenceScalars + 1 if contains(line, "error NR220:")
+    end
+    fail("reference identity accepted scalar specialization or a renamed intrinsic") if rejectedReferenceScalars != 2
     this.languageCase("tests/contracts/source-contracts.hk", 0, "", true)
     this.languageCase("tests/contracts/source-contract-errors.hk", 1, "error NR251:", false)
     this.languageCase("tests/contracts/exact-arguments-errors.hk", 1, "error NR112:", false)
@@ -1488,6 +1988,19 @@ class Build
     this.languageCase("tests/contracts/library-operators.hk", 0, "", true)
     this.languageCase("tests/contracts/any-class.hk", 0, "", true)
     this.languageCase("tests/contracts/generics.hk", 0, "Generic contracts passed\n", true, ["tests/contracts/generic-library.hk"])
+    this.languageCase("tests/contracts/generic-methods.hk", 0, "", true, ["tests/contracts/generic-method-library.hk"])
+    this.languageCase("tests/contracts/generic-method-errors.hk", 1, "error NR220:", false)
+    let genericMethodErrors = requiredText(this.work + "/" + this.lastCase + ".stdout")
+
+    if !contains(genericMethodErrors, "error NR221:")
+      fail("generic method inference accepted an uninferred method type parameter")
+    end
+    if !contains(genericMethodErrors, "error NR153:")
+      fail("generic method visibility was not preserved")
+    end
+    if !contains(genericMethodErrors, "error NR112:")
+      fail("generic method argument types were not validated")
+    end
     this.negativeContracts()
     this.runContract()
     this.httpContracts()
@@ -1495,6 +2008,7 @@ class Build
     this.posixLanguageCase("tests/http/interrupts.hk", 0, "", true)
     this.valueContracts()
     this.runtimeContracts()
+    this.dataRuntimeContracts()
     this.terminalContracts()
     this.scalarContracts()
     this.cAbiExportContracts()
@@ -1504,6 +2018,10 @@ class Build
     if this.capture(["/bin/cat"], "stdin", 1) != 0 || requiredText(this.work + "/stdin.stdout") != ""
       fail("test stdin must be EOF")
     end
+    if this.sourceManifest() != validationInputs
+      fail("sources changed during checkout validation")
+    end
+    this.contractsPassed = true
     this.publishCompiler()
     console::println("[test] Current native and language contracts passed")
   end
@@ -1701,9 +2219,18 @@ class Build
       end
     end
     this.languageCase("tests/contracts/generic-limit.hk", 1, "error NR222:", false)
+    this.genericBudgetCase("generic-budget-across-templates", 70, 70, 0)
+    this.genericBudgetCase("generic-budget-one-template", 129, 0, 1)
     this.languageCase("tests/contracts/alternatives-errors.hk", 1, "error NR260:", false)
     if !contains(requiredText(this.work + "/" + this.lastCase + ".stdout"), "error NR261:")
       fail("alternative payload mismatch was not rejected")
+    end
+    this.languageCase("tests/contracts/propagation.hk", 0, "", true)
+    this.languageCase("tests/contracts/propagation-errors.hk", 1, "error NR284:", false)
+    let propagationErrors = requiredText(this.work + "/" + this.lastCase + ".stdout")
+
+    if !contains(propagationErrors, "error NR283:") || !contains(propagationErrors, "error NR245:") || !contains(propagationErrors, "error NR205:")
+      fail("malformed propagation declarations were not rejected")
     end
     this.languageCase("tests/contracts/resources-errors.hk", 1, "error NR262:", false)
     let resourceErrors = requiredText(this.work + "/" + this.lastCase + ".stdout")
@@ -1745,6 +2272,16 @@ class Build
         fail("missing quotation diagnostic " + diagnostic)
       end
     end
+    this.languageCase("tests/contracts/quotation-operator-errors.hk", 1, "error NR276:", false)
+    let quotationOperatorErrors = requiredText(this.work + "/" + this.lastCase + ".stdout")
+    var quotationOperatorRejections = 0
+
+    for line in lines(quotationOperatorErrors)
+      quotationOperatorRejections = quotationOperatorRejections + 1 if contains(line, "error NR276:")
+    end
+    if quotationOperatorRejections != 4 || !contains(quotationOperatorErrors, "quotation-operator-errors.hk:24:27 error NR276: Quoted expression contains unsupported bound operation 'InstanceCall'.") || !contains(quotationOperatorErrors, "quotation-operator-errors.hk:30:26 error NR276: Quoted expression contains unsupported bound operation 'InstanceCall'.")
+      fail("quotation accepted a user operator or direct String method call")
+    end
     this.languageCase("tests/contracts/inline-callback-error.hk", 1, "Inline fn arguments are not supported", false)
     this.languageCase("tests/contracts/legacy-console-error.hk", 1, "error NR101A:", false)
     this.languageCase("tests/contracts/do-target-error.hk", 1, "A do block must follow a call", false)
@@ -1763,6 +2300,7 @@ class Build
   end
 
   def scalarContracts(): Void
+    this.languageCase("tests/contracts/native-pointer-namespaces.hk", 0, "", false)
     this.languageCase("tests/contracts/native-record-errors.hk", 1, "error NR232:", false)
     for diagnostic in ["NR230", "NR231", "NR233", "NR141", "NR142"]
       if !contains(requiredText(this.work + "/" + this.lastCase + ".stdout"), "error " + diagnostic + ":")
@@ -1828,10 +2366,47 @@ class Build
     end
   end
 
-  def selectedTest(command: String): Void
-    this.bootstrap(false)
+  def selectExistingCompiler(path: String): Void
+    this.startWork()
+    # Contract drivers need the current native host; runtime contracts also need codegen/runtime.
+    this.nativeBuild()
+    if this.capture(["realpath", path], "selected-compiler-path", 30) != 0
+      fail("cannot resolve selected compiler: " + path)
+    end
+    let resolved = lines(requiredText(this.work + "/selected-compiler-path.stdout"))
+
+    if resolved.Length != 1
+      fail("selected compiler must resolve to one executable path")
+    end
+    this.compiler = resolved[0]
+    execute("test", ["-f", this.compiler])
+    execute("test", ["-x", this.compiler])
+    var version = this.environment()
+
+    version = host::appendString(version, this.compiler)
+    version = host::appendString(version, "--version")
+    if this.capture(version, "selected-compiler-version", 30) != 0
+      fail("selected compiler version probe failed")
+    end
+    let expected = lines(requiredText(this.root + "/VERSION"))
+
+    if expected.Length != 1 || requiredText(this.work + "/selected-compiler-version.stdout") != "neri " + expected[0] + "\n"
+      fail("selected compiler version does not match this checkout")
+    end
+    # A successful native compile/run checks the selected target and runtime ABI together.
+    this.languageCase("examples/hello.hk", 0, "Hello, Neri!\n", true)
+  end
+
+  def selectedTest(command: String, existingCompiler: String = ""): Void
+    if existingCompiler == ""
+      this.prepareCompiler()
+    else
+      this.selectExistingCompiler(existingCompiler)
+    end
     if command == "smoke-test"
-      this.languageCase("examples/hello.hk", 0, "Hello, Neri!\n", true)
+      if existingCompiler == ""
+        this.languageCase("examples/hello.hk", 0, "Hello, Neri!\n", true)
+      end
       this.runContract()
     else if command == "cabi-test"
       this.cAbiExportContracts()
@@ -1845,7 +2420,7 @@ class Build
     if !this.target.isMacOS()
       fail("debugger-test currently requires macOS LLDB")
     end
-    this.bootstrap(false)
+    this.prepareCompiler()
     let directory = this.work + "/debugger-contract"
     let source = this.root + "/tests/debugger/fixture.hk"
 
@@ -1886,36 +2461,87 @@ def main(): Void
   var command = "doctor"
   var mode = BuildMode.release()
   var prefix = ""
+  var existingCompiler = ""
+  var fullValidation = false
   let first = host::argumentAt(0)
 
   if first != null
     command = first
   end
-  var second = ""
-  let supplied = host::argumentAt(1)
+  var stage = command == "package" || command == "install" ? 2 : 1
 
-  if supplied != null
-    second = supplied
-  end
-  if second == "--prefix"
-    let value = host::argumentAt(2)
+  stage = 3 if command == "refresh-seed"
+  var stageSpecified = false
+  var modeSpecified = false
+  var prefixSpecified = false
+  var index = 1
 
-    if command != "install" || value == null || host::argumentCount() != 3
-      fail("--prefix requires a directory and the install command")
-    else
-      prefix = value
-    end
-  else if second != ""
-    let selected = BuildMode.fromOption(second)
+  while index < host::argumentCount()
+    let option = host::argumentAt(index)
 
-    if selected == null
-      fail("unknown build option: " + second)
+    if option == null
+      fail("missing build option")
       return
     end
-    mode = selected
+    if option == "--full-validation"
+      if fullValidation || (command != "package" && command != "install")
+        fail("--full-validation is only valid once with package or install")
+        return
+      end
+      fullValidation = true
+      index = index + 1
+    else if option == "--stage" || option == "--prefix" || option == "--compiler"
+      let value = host::argumentAt(index + 1)
+
+      if value == null
+        fail(option + " requires a value")
+        return
+      end
+      if option == "--stage"
+        if stageSpecified || (value != "1" && value != "2" && value != "3")
+          fail("--stage requires exactly one value: 1, 2 or 3")
+          return
+        end
+        stage = value == "1" ? 1 : (value == "2" ? 2 : 3)
+        stageSpecified = true
+      else if option == "--compiler"
+        if existingCompiler != "" || value == ""
+          fail("--compiler requires exactly one executable path")
+          return
+        end
+        existingCompiler = value
+      else
+        if command != "install" || prefixSpecified || value == ""
+          fail("--prefix requires one directory and the install command")
+          return
+        end
+        prefix = value
+        prefixSpecified = true
+      end
+      index = index + 2
+    else
+      let selected = BuildMode.fromOption(option)
+
+      if selected == null || modeSpecified
+        fail("unknown or duplicate build mode: " + option)
+        return
+      end
+      mode = selected
+      modeSpecified = true
+      index = index + 1
+    end
   end
-  if host::argumentCount() > 2 && second != "--prefix"
-    fail("too many build arguments")
+  if existingCompiler != "" && (stageSpecified || (command != "smoke-test" && command != "negative-test" && command != "cabi-test"))
+    fail("--compiler is only valid for smoke-test, negative-test or cabi-test without --stage")
+  end
+  if (command == "package" || command == "install") && stage < 2
+    fail("package and install require --stage 2 or --stage 3")
+  end
+  if command == "refresh-seed" && stage != 3
+    fail("refresh-seed requires --stage 3")
+  end
+  if stageSpecified && (command == "native" || command == "native-test" || command == "doctor")
+    fail("--stage requires a compiler build command")
   end
   let target = TargetPlatform.parse(envOr("NERI_TARGET", "macos-arm64"))
 
@@ -1924,6 +2550,9 @@ def main(): Void
     return
   end
   let build = new Build(root, seed, llvm, target, mode)
+
+  build.stage = stage
+  build.fullValidation = fullValidation
 
   if mode.usesSanitizer() && command != "native" && command != "native-test" && command != "doctor"
     fail("sanitizers instrument native targets; use native-test with the selected sanitizer")
@@ -1939,7 +2568,7 @@ def main(): Void
   else if command == "check" || command == "test"
     build.test()
   else if command == "smoke-test" || command == "negative-test" || command == "cabi-test"
-    build.selectedTest(command)
+    build.selectedTest(command, existingCompiler)
   else if command == "debugger-test"
     build.debuggerTest()
   else if command == "package"
@@ -1952,5 +2581,8 @@ def main(): Void
     build.benchmark()
   else
     fail("unknown command: " + command)
+  end
+  if command != "benchmark"
+    build.finishWork()
   end
 end

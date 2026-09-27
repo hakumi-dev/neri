@@ -1,6 +1,7 @@
 use crypto
 use files
-use process
+use json
+use result
 
 # The producer inventory includes compiler and standard-library inputs.
 # Generated bootstrap artifacts belong to the separate validation inventory.
@@ -16,59 +17,13 @@ def seedSourceManifest(build: Build): String
   for asset in build.templateAssets()
     paths = host::appendString(paths, build.root + "/share/neri/templates/" + asset)
   end
-  let manifest = new ToolingTextBuffer()
-
-  for path in paths
-    let relative = host::stringSlice(path, host::stringByteLength(build.root) + 1, host::stringByteLength(path) - host::stringByteLength(build.root) - 1)
-
-    manifest.add(build.digest(path) + "  " + relative + "\n")
-  end
-  return toolingText(manifest)
-end
-
-def seedCompileIR(build: Build, compiler: String, output: String): Void
-  let options = new process::SpawnOptions("/usr/bin/env")
-  var arguments = build.environment()
-
-  for argument in [compiler, "build", "--project", "manifest.json", "--unit", "compiler", "--source-root", "compiler",
-    "--module", "neri-compiler", "--target", build.target.name(), "--release", "--emit=neri-ir-hex", "--output", output]
-    arguments = host::appendString(arguments, argument)
-  end
-  options.arguments = arguments
-  options.workingDirectory = build.root
-  let started = process::spawn(options)
-  let child = started.child()
-
-  if child == null || started.failure() != null
-    fail("cannot start canonical seed compiler")
-    return
-  end
-  var completed = child.wait(60000)
-  var attempts = 1
-
-  while completed.running && completed.failure == null && attempts < 30
-    completed = child.wait(60000)
-    attempts = attempts + 1
-  end
-  let status = completed.exit
-
-  if completed.failure != null || completed.running || status == null || !status.isExited() || status.value() != 0
-    let errors = host::stringFromBytes(completed.stderr)
-
-    console::println(errors) if errors != null
-    child.dispose()
-    fail("canonical seed compiler failed")
-    return
-  end
-  if !child.dispose()
-    fail("cannot release canonical seed compiler")
-  end
+  return build.fileManifest(paths, build.root)
 end
 
 # Each replacement is atomic; the metadata pin is published last. A launcher
 # rejects mixed generations, and detected publication failures restore backups.
-def seedPublish(build: Build, directory: String, validationInputs: String): Void
-  let names = ["compiler.nir.gz", "SOURCE-MANIFEST.sha256", "VALIDATION-SOURCE-MANIFEST.sha256", "seed.json"]
+def seedPublish(build: Build, directory: String, inputs: String, validationInputs: String, metadata: json::Value, metadataText: String): Void
+  let names = ["compiler.nir.tar.gz", "SOURCE-MANIFEST.sha256", "VALIDATION-SOURCE-MANIFEST.sha256", "seed.json"]
   let lock = build.root + "/build/seed-refresh.lock"
 
   if files::createDirectory(lock).failure != null
@@ -104,6 +59,27 @@ def seedPublish(build: Build, directory: String, validationInputs: String): Void
       end
     end
     index = index + 1
+  end
+  # Validate the exact generation under the publication lock, after backups
+  # and immediately before the first promotion. Hash failures reject it.
+  let artifactDigest = seedBundleString(metadata, "artifactSha256")
+  let sourceDigest = seedBundleString(metadata, "sourceManifestSha256")
+  let validationDigest = seedBundleString(metadata, "validationSourceManifestSha256")
+  let unitDigest = seedBundleString(metadata, "unitManifestSha256")
+
+  if artifactDigest == null || !seedBundleDigestValid(artifactDigest) || sourceDigest == null || !seedBundleDigestValid(sourceDigest) || validationDigest == null || !seedBundleDigestValid(validationDigest) || unitDigest == null || !seedBundleDigestValid(unitDigest)
+    files::removeDirectory(lock)
+    fail("staged seed metadata contains an invalid digest")
+    return
+  end
+  let archiveMatches = seedPublicationDigest(build, directory + "/compiler.nir.tar.gz") == artifactDigest && seedPublicationDigest(build, directory + "/compiler.repeat.tar.gz") == artifactDigest
+  let sourceMatches = seedPublicationDigest(build, directory + "/SOURCE-MANIFEST.sha256") == sourceDigest && seedPublicationDigest(build, directory + "/VALIDATION-SOURCE-MANIFEST.sha256") == validationDigest && seedPublicationDigest(build, directory + "/units/UNITS.sha256") == unitDigest
+  let textMatches = seedPublicationText(directory + "/SOURCE-MANIFEST.sha256", inputs) && seedPublicationText(directory + "/VALIDATION-SOURCE-MANIFEST.sha256", validationInputs) && seedPublicationText(directory + "/seed.json", metadataText)
+
+  if !archiveMatches || !sourceMatches || !textMatches || build.sourceManifest() != validationInputs
+    files::removeDirectory(lock)
+    fail("staged seed generation changed before publication")
+    return
   end
   index = 0
   while index < names.Length
@@ -142,45 +118,116 @@ def seedFromValidatedBuild(build: Build, inputs: String, validationInputs: Strin
     fail("source tree changed during seed validation")
   end
   let directory = build.work + "/seed-refresh"
-  let relative = host::stringSlice(directory, host::stringByteLength(build.root) + 1, host::stringByteLength(directory) - host::stringByteLength(build.root) - 1)
 
-  execute("mkdir", ["-p", directory])
-  seedCompileIR(build, build.work + "/stage2/neri", relative + "/compiler.stage2.nir.hex")
-  seedCompileIR(build, build.compiler, relative + "/compiler.nir.hex")
-  execute("cmp", [directory + "/compiler.stage2.nir.hex", directory + "/compiler.nir.hex"])
-  let decoded = crypto::decodeHex(requiredText(directory + "/compiler.nir.hex"), 134217728).bytes()
-
-  if decoded == null || !host::writeBytes(directory + "/compiler.nir", decoded)
-    fail("cannot decode canonical seed IR")
+  if !build.fixedPointVerified || !build.contractsPassed || build.preparedStage != 3
+    fail("seed refresh requires the validated Stage3 fixed point")
     return
   end
-  let irDigest = build.digest(directory + "/compiler.nir")
+  let producerDigest = build.digest(build.work + "/stage2/neri")
+  let compilerDigest = build.digest(build.work + "/stage3/neri")
+  let workingDirectory = host::pathAbsolute(".")
 
-  execute("cp", [directory + "/compiler.nir", directory + "/compiler.repeat.nir"])
-  execute("gzip", ["-n", "-f", directory + "/compiler.nir"])
-  execute("gzip", ["-n", "-f", directory + "/compiler.repeat.nir"])
-  execute("cmp", [directory + "/compiler.nir.gz", directory + "/compiler.repeat.nir.gz"])
+  if workingDirectory == null || !seedBundleDigestValid(producerDigest) || !seedBundleDigestValid(compilerDigest) || producerDigest != compilerDigest
+    fail("validated compiler executables no longer match")
+    return
+  end
+  execute("mkdir", ["-p", directory])
+  let stage2 = new SeedBundle(build.work + "/stage2/neri.temps")
+  let stage3 = new SeedBundle(build.work + "/stage3/neri.temps")
+
+  if !stage2.load() || !stage3.load() || stage2.manifest != stage3.manifest
+    fail("retained Stage2 and Stage3 artifacts do not match")
+    return
+  end
+  let payload = directory + "/units"
+
+  if files::createDirectory(payload).failure != null || !stage3.copyBinary(payload)
+    fail("cannot prepare canonical seed units from retained IR")
+    return
+  end
+  if !stage3.archive(payload, directory + "/compiler.nir.tar", build.target)
+    fail("cannot archive canonical seed units")
+  end
+  if !stage3.verifyBinary(payload) || !stage2.verify() || !stage3.verify()
+    fail("retained seed artifacts changed during archive creation")
+  end
+  if !stage3.archive(payload, directory + "/compiler.repeat.tar", build.target)
+    fail("cannot reproduce canonical seed archive")
+  end
+  execute("/usr/bin/env", ["-i", "PATH=/usr/bin:/bin", "LC_ALL=C", "TZ=UTC", "gzip", "-n", "-f", directory + "/compiler.nir.tar"])
+  execute("/usr/bin/env", ["-i", "PATH=/usr/bin:/bin", "LC_ALL=C", "TZ=UTC", "gzip", "-n", "-f", directory + "/compiler.repeat.tar"])
+  execute("cmp", [directory + "/compiler.nir.tar.gz", directory + "/compiler.repeat.tar.gz"])
+  if !stage3.verifyBinary(payload) || !stage2.verify() || !stage3.verify()
+    fail("retained seed artifacts changed during compression")
+  end
   if seedSourceManifest(build) != inputs || build.sourceManifest() != validationInputs
     fail("compiler inputs changed during seed generation")
   end
   if !host::writeText(directory + "/SOURCE-MANIFEST.sha256", inputs) || !host::writeText(directory + "/VALIDATION-SOURCE-MANIFEST.sha256", validationInputs)
     fail("cannot record canonical seed source hashes")
   end
-  let metadata = new ToolingTextBuffer()
+  let artifactDigest = seedPublicationDigest(build, directory + "/compiler.nir.tar.gz")
 
-  metadata.add("{\n  \"schemaVersion\": 1,\n  \"format\": \"neri-ir-binary-gzip\",\n  \"artifact\": \"compiler.nir.gz\",\n")
-  metadata.add("  \"artifactSha256\": \"" + build.digest(directory + "/compiler.nir.gz") + "\",\n")
-  metadata.add("  \"irSha256\": \"" + irDigest + "\",\n  \"sourceManifest\": \"SOURCE-MANIFEST.sha256\",\n")
-  metadata.add("  \"sourceManifestSha256\": \"" + build.digest(directory + "/SOURCE-MANIFEST.sha256") + "\",\n")
-  metadata.add("  \"validationSourceManifestSha256\": \"" + build.digest(directory + "/VALIDATION-SOURCE-MANIFEST.sha256") + "\",\n")
-  metadata.add("  \"producerCompilerSha256\": \"" + build.digest(build.compiler) + "\",\n  \"workingDirectory\": \"repository-root\",\n")
-  metadata.add("  \"compilerArguments\": [\"build\", \"--project\", \"manifest.json\", \"--unit\", \"compiler\", \"--source-root\", \"compiler\", \"--module\", \"neri-compiler\", \"--target\", \"" + build.target.name() + "\", \"--release\", \"--emit=neri-ir-hex\", \"--output\", \"" + relative + "/compiler.nir.hex\"],\n")
-  metadata.add("  \"binaryDecoding\": \"crypto.decodeHex\",\n  \"compressionArguments\": [\"gzip\", \"-n\", \"-f\", \"" + relative + "/compiler.nir\"],\n")
-  metadata.add("  \"verification\": {\n    \"fixedPoint\": true,\n    \"languageContracts\": true,\n    \"testSuite\": \"tooling/build.hk:Build.test\",\n    \"reproducibleCompression\": true\n  }\n}\n")
-  if !host::writeText(directory + "/seed.json", toolingText(metadata))
+  if !seedBundleDigestValid(artifactDigest)
+    fail("cannot hash canonical seed archive")
+  end
+  let metadata = json::Value.object()
+
+  metadata.put("schemaVersion", seedNumber(2))
+  metadata.put("format", json::Value.string("neri-ir-bundle-gzip"))
+  metadata.put("artifact", json::Value.string("compiler.nir.tar.gz"))
+  metadata.put("artifactSha256", json::Value.string(artifactDigest))
+  metadata.put("unitManifestSha256", json::Value.string(build.digest(payload + "/UNITS.sha256")))
+  metadata.put("unitCount", seedNumber(stage3.count))
+  metadata.put("sourceManifest", json::Value.string("SOURCE-MANIFEST.sha256"))
+  metadata.put("sourceManifestSha256", json::Value.string(build.digest(directory + "/SOURCE-MANIFEST.sha256")))
+  metadata.put("validationSourceManifestSha256", json::Value.string(build.digest(directory + "/VALIDATION-SOURCE-MANIFEST.sha256")))
+  metadata.put("producerCompilerSha256", json::Value.string(producerDigest))
+  metadata.put("compilerSha256", json::Value.string(compilerDigest))
+  metadata.put("workingDirectory", json::Value.string(workingDirectory))
+  metadata.put("consumedArtifacts", json::Value.string(build.work + "/stage3/neri.temps"))
+  metadata.put("retainedManifestSha256", json::Value.string(build.digest(build.work + "/stage3/neri.temps/manifest.json")))
+  let arguments = json::Value.array()
+
+  for argument in ["build", "--project", build.root + "/manifest.json", "--unit", "compiler", "--source-root", build.root + "/compiler", "--module", "neri-compiler", "--target", build.target.name(), "--release", "--timings", "--emit=executable", "--output", build.work + "/stage3/neri", "--save-temps"]
+    arguments.add(json::Value.string(argument))
+  end
+  metadata.put("compilerArguments", arguments)
+  metadata.put("binaryDecoding", json::Value.string("crypto.decodeHex of retained per-unit transport"))
+  metadata.put("archiveFormat", json::Value.string("ustar: ordinal files, mode 0644, epoch mtime, uid/gid 0, empty owner names"))
+  let compression = json::Value.array()
+
+  for argument in ["gzip", "-n", "-f", directory + "/compiler.nir.tar"]
+    compression.add(json::Value.string(argument))
+  end
+  metadata.put("compressionArguments", compression)
+  let verification = json::Value.object()
+
+  verification.put("fixedPoint", json::Value.boolean(true))
+  verification.put("languageContracts", json::Value.boolean(true))
+  verification.put("testSuite", json::Value.string("tooling/build.hk:Build.test"))
+  verification.put("reproducibleCompression", json::Value.boolean(true))
+  metadata.put("verification", verification)
+  let encoded = new ToolingTextBuffer()
+
+  encoded.add("{\n")
+  metadata.each() do |key, value|
+    if key == null
+      fail("canonical seed metadata must contain named fields")
+      return
+    end
+    encoded.add("  " + seedJson(json::Value.string(key)) + ": " + seedJson(value) + (encoded.count < metadata.count() ? ",\n" : "\n"))
+  end
+  encoded.add("}\n")
+  let metadataText = toolingText(encoded)
+
+  if !host::writeText(directory + "/seed.json", metadataText)
     fail("cannot record canonical seed provenance")
   end
-  seedPublish(build, directory, validationInputs)
+  if build.digest(build.work + "/stage2/neri") != producerDigest || build.digest(build.work + "/stage3/neri") != compilerDigest || !stage2.verify() || !stage3.verify() || !stage3.verifyBinary(payload)
+    fail("validated compiler artifacts changed before seed publication")
+  end
+  seedPublish(build, directory, inputs, validationInputs, metadata, metadataText)
   console::println("[seed] Refreshed canonical compiler IR with verified source and artifact hashes")
 end
 
@@ -192,4 +239,48 @@ def refreshSeed(build: Build): Void
 
   build.test()
   seedFromValidatedBuild(build, inputs, validationInputs)
+end
+
+def seedNumber(value: Int): json::Value
+  let number = json::Value.number(value as String)
+
+  if number == null
+    fail("cannot encode canonical seed integer")
+    return json::Value.nullValue()
+  end
+  return number
+end
+
+def seedJson(value: json::Value): String
+  match json::stringify(value)
+    case result::Result.Ok(text)
+      return text
+    case result::Result.Error(error)
+      fail("cannot encode canonical seed provenance")
+  end
+  return ""
+end
+
+def seedPublicationText(path: String, expected: String): Bool
+  let bytes = seedBundleRead(path, host::stringByteLength(expected))
+
+  return bytes != null && host::stringFromBytes(bytes) == expected
+end
+
+def seedPublicationDigest(build: Build, path: String): String
+  let inspected = files::status(path)
+  let state = inspected.status
+
+  if inspected.failure != null || state == null || state.symlink || !state.kind.isFile() || build.capture(["shasum", "-a", "256", "--", path], "seed-publication-hash", 60) != 0
+    return ""
+  end
+  let bytes = seedBundleRead(build.work + "/seed-publication-hash.stdout", 65536)
+  let text = bytes == null ? null : host::stringFromBytes(bytes)
+
+  if text == null || host::stringByteLength(text) != 67 + host::stringByteLength(path) || !bytesEqualAt(text, "  " + path + "\n", 64)
+    return ""
+  end
+  let digest = host::stringSlice(text, 0, 64)
+
+  return seedBundleDigestValid(digest) ? digest : ""
 end

@@ -1,0 +1,254 @@
+use files
+use resources
+use result
+use test
+use console
+use float_data
+use float_model
+use neri_data
+use neri_data_sqlite
+
+def saved(result: WriteResult, expected: Int): Void
+  match result
+    case WriteResult.Saved(count)
+      test::assertEqual(count, expected)
+    case WriteResult.SavedWithValues(count, values)
+      test::assertTrue(false)
+    case WriteResult.Failure(error)
+      console::println(writeFailureMessage(error))
+
+      test::assertTrue(false)
+  end
+end
+
+def failed(result: WriteResult): Void
+  match result
+    case WriteResult.Saved(count)
+      test::assertTrue(false)
+    case WriteResult.SavedWithValues(count, values)
+      test::assertTrue(false)
+    case WriteResult.Failure(error)
+      test::assertTrue(writeFailureMessage(error) != "")
+  end
+end
+
+def stored(provider: SQLiteProvider, id: Int, amount: Float, optional: Float?): Void
+  let fresh = new FloatDatabase(provider)
+
+  match fresh.records.where(id: id).single()
+    case QueryValue.Value(row)
+      test::assertEqual(row.amount, amount)
+      test::assertTrue(row.optionalAmount == optional)
+    case QueryValue.Failure(error)
+      test::assertTrue(false)
+  end
+end
+
+def countRows(query: Query<Record>, expected: Int): Void
+  match query.count()
+    case QueryValue.Value(count)
+      test::assertEqual(count, expected)
+    case QueryValue.Failure(error)
+      test::assertTrue(false)
+  end
+end
+
+def amountField(): quote fn(Record): Float
+  return quote do |row: Record|: Float
+    return row.amount
+  end
+end
+
+def optionalAmountField(): quote fn(Record): Float?
+  return quote do |row: Record|: Float?
+    return row.optionalAmount
+  end
+end
+
+def aggregateValue(query: Query<Record>, shape: AggregateShape<Record, Float?>, expected: Float?): Void
+  match aggregateRows(query, shape).value()
+    case QueryValue.Value(value)
+      test::assertTrue(value == expected)
+    case QueryValue.Failure(error)
+      test::assertTrue(false)
+  end
+end
+
+def verifyAggregates(db: FloatDatabase): Void
+  let amount = amountField()
+  let optional = optionalAmountField()
+  let id = quote do |row: Record|: Int
+    return row.id
+  end
+  let allNull = db.records.where(id: 1)
+  let empty = db.records.where(id: 999)
+  let positive = quote do |row: Record|: Bool
+    return row.amount > 0.0
+  end
+
+  aggregateValue(db.records, average(floatScalar(), amount), -0.625)
+  aggregateValue(db.records, average(intScalar(), id), 1.5)
+  aggregateValue(db.records, average(optionalFloatScalar(), optional), 3.75)
+  aggregateValue(db.records, sumFloat(floatScalar(), amount), -1.25)
+  aggregateValue(db.records, minFloat(floatScalar(), amount), -2.5)
+  aggregateValue(db.records, maxFloat(floatScalar(), amount), 1.25)
+  aggregateValue(db.records, sumFloat(floatScalar(), amount).distinct().where(positive), 1.25)
+  aggregateValue(empty, average(floatScalar(), amount), null)
+  aggregateValue(empty, sumFloat(floatScalar(), amount), null)
+  aggregateValue(allNull, average(optionalFloatScalar(), optional), null)
+  aggregateValue(allNull, sumFloat(optionalFloatScalar(), optional), null)
+
+  match aggregateRows(empty, sumFloatOrZero(floatScalar(), amount)).value()
+    case QueryValue.Value(value)
+      test::assertEqual(value, 0.0)
+    case QueryValue.Failure(error)
+      test::assertTrue(false)
+  end
+
+  let totals = sumFloatOrZero(floatScalar(), amount)
+  let metric = groupMetric(totals)
+  let positiveTotal = quote do |total: Float|: Bool
+    return total > 0.0
+  end
+  let grouped = selectGroups(groupBy(db.records, fieldShape(intScalar(), id)), totals) do |key: Int, total: Float|: Float
+    return total
+  end
+
+  match grouped.having(metric.where(positiveTotal)).orderByAggregate(metric.descending()).take(2).all()
+    case QueryResult.Rows(rows)
+      test::assertEqual(rows.count(), 1)
+      let head = rows.first()
+
+      test::assertTrue(head != null)
+      if head != null
+        test::assertEqual(head.value, 1.25)
+      end
+    case QueryResult.Failure(error)
+      test::assertTrue(false)
+  end
+end
+
+def verifyFloats(provider: SQLiteProvider): Void
+  let db = new FloatDatabase(provider)
+  let first = new Record(1, 1.25)
+  let second = new Record(2, -2.5, 3.75)
+
+  test::assertTrue(db.records.add(first) == null)
+  test::assertTrue(db.records.add(second) == null)
+  saved(db.saveChanges(), 2)
+  saved(db.saveChanges(), 0)
+  stored(provider, 1, 1.25, null)
+  stored(provider, 2, -2.5, 3.75)
+  countRows(db.records.where(amount: 1.25), 1)
+
+  let positive = quote do |row: Record|: Bool
+    return row.amount > 0.0
+  end
+  let threshold = 1.0
+  let overThreshold = quote do |row: Record|: Bool
+    return row.amount >= threshold
+  end
+  let optionalValue: Float? = 3.75
+  let optionalMatches = quote do |row: Record|: Bool
+    return row.optionalAmount == optionalValue
+  end
+
+  countRows(db.records.matching(positive), 1)
+  countRows(db.records.matching(overThreshold), 1)
+  countRows(db.records.matching(optionalMatches), 1)
+  verifyAggregates(db)
+
+  match select(db.records.orderByFloat(amountField()).take(2), floatScalar(), amountField()).all()
+    case QueryResult.Rows(rows)
+      test::assertEqual(rows.count(), 2)
+      let head = rows.first()
+
+      test::assertTrue(head != null)
+      if head != null
+        test::assertEqual(head.value, -2.5)
+      end
+    case QueryResult.Failure(error)
+      test::assertTrue(false)
+  end
+
+  first.amount = 1.5
+  first.optionalAmount = 0.5
+  saved(db.saveChanges(), 1)
+  stored(provider, 1, 1.5, 0.5)
+  saved(db.beginTransaction(), 0)
+  first.amount = 2.5
+  first.optionalAmount = null
+  saved(db.saveChanges(), 1)
+  stored(provider, 1, 2.5, null)
+  saved(db.rollbackTransaction(), 0)
+  stored(provider, 1, 1.5, 0.5)
+  saved(db.saveChanges(), 1)
+  stored(provider, 1, 2.5, null)
+
+  first.amount = 1.0 / 0.0
+  failed(db.saveChanges())
+  stored(provider, 1, 2.5, null)
+  first.amount = 4.25
+  first.optionalAmount = 0.0 / 0.0
+  failed(db.saveChanges())
+  stored(provider, 1, 2.5, null)
+  first.optionalAmount = -0.0
+  saved(db.saveChanges(), 1)
+  stored(provider, 1, 4.25, 0.0)
+
+  var large = 1.0
+  var exponent = 0
+
+  while exponent < 308
+    large = large * 10.0
+    exponent = exponent + 1
+  end
+  first.amount = large
+  second.amount = large
+  saved(db.saveChanges(), 2)
+
+  match aggregateRows(db.records, sumFloat(floatScalar(), amountField())).value()
+    case QueryValue.Value(value)
+      test::assertTrue(false)
+    case QueryValue.Failure(error)
+      test::assertTrue(true)
+  end
+end
+
+def verifyFile(): resources::Outcome<Int, result::Failure>
+  using temporary <- files::TemporaryDirectory.create("neri-float-values-")
+    let path = temporary.path() + "/data.sqlite"
+    let columns = [new SchemaColumn("id", SchemaType.Int(), primaryKey: true), new SchemaColumn("amount", SchemaType.Float(), defaultValue: SchemaDefault.Float(1.125)), new SchemaColumn("optional_amount", SchemaType.Float(), nullable: true)]
+    let initial = new Migration("float_initial", [SchemaOp.CreateTable("float_records", columns)], [SchemaOp.DropTable("float_records")])
+    let migrations = new MigrationSet([initial])
+
+    match SQLiteProvider.createWritable(path)
+      case SQLiteOpenResult.Failure(message)
+        test::assertTrue(false)
+      case SQLiteOpenResult.Opened(provider)
+        match provider.migrate(migrations)
+          case MigrationResult.Applied(count)
+            test::assertEqual(count, 1)
+          case MigrationResult.Failure(error)
+            test::assertTrue(false)
+        end
+        verifyFloats(provider)
+
+        test::assertTrue(provider.close())
+    end
+    return 0
+  end
+  return 1
+end
+
+def main(): Void
+  let result = verifyFile()
+
+  test::assertEqual(result.closeFailures.count(), 0)
+  match result.completion
+    case resources::Completion.Value(value)
+      test::assertEqual(value, 0)
+    case resources::Completion.Failure(problem)
+      test::assertTrue(false)
+  end
+end

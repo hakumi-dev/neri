@@ -1,0 +1,144 @@
+use files
+use host
+
+def nativeLinkObjectWord(bytes: Byte[], offset: Int): Int
+  return (bytes[offset] as Int) + (bytes[offset + 1] as Int) * 256 + (bytes[offset + 2] as Int) * 65536 + (bytes[offset + 3] as Int) * 16777216
+end
+
+def nativeLinkMachO(bytes: Byte[], start: Int, size: Int, archiveMember: Bool = false): Bool
+  if start < 0 || size < 32 || start > bytes.Length || size > bytes.Length - start
+    return false
+  end
+  if nativeLinkObjectWord(bytes, start) != 4277009103 || nativeLinkObjectWord(bytes, start + 4) != 16777228
+    return false
+  end
+  let kind = nativeLinkObjectWord(bytes, start + 12)
+
+  return false if kind != 1 && (archiveMember || kind != 6)
+  let count = nativeLinkObjectWord(bytes, start + 16)
+  let commandBytes = nativeLinkObjectWord(bytes, start + 20)
+
+  return false if count == 0 || commandBytes > size - 32 || count > commandBytes / 8
+  var cursor = start + 32
+  let finish = cursor + commandBytes
+  var index = 0
+
+  while index < count
+    return false if finish - cursor < 8
+    # LC_LINKER_OPTION can add libraries outside the explicit native input set.
+    return false if nativeLinkObjectWord(bytes, cursor) == 45
+    let commandSize = nativeLinkObjectWord(bytes, cursor + 4)
+
+    return false if commandSize < 8 || commandSize > finish - cursor || (commandSize / 8) * 8 != commandSize
+    cursor = cursor + commandSize
+    index = index + 1
+  end
+  return cursor == finish
+end
+
+def nativeLinkArchiveNumber(bytes: Byte[], start: Int, size: Int): Int
+  var value = 0
+  var index = 0
+  var digits = false
+  var padding = false
+
+  while index < size
+    let byte = bytes[start + index] as Int
+
+    if byte == 32
+      padding = true
+    else if byte >= 48 && byte <= 57 && !padding
+      value = value * 10 + byte - 48
+      digits = true
+      return -1 if value > 134217728
+    else
+      return -1
+    end
+    index = index + 1
+  end
+  return digits ? value : -1
+end
+
+def nativeLinkArchiveName(bytes: Byte[], start: Int, size: Int): String
+  var length = size
+
+  while length > 0 && (bytes[start + length - 1] == (0 as Byte) || bytes[start + length - 1] == (32 as Byte))
+    length = length - 1
+  end
+  var name: Byte[] = []
+  var index = 0
+
+  while index < length
+    let byte = bytes[start + index] as Int
+
+    return "" if byte < 32 || byte == 127
+    name = host::appendByte(name, byte as Byte)
+    index = index + 1
+  end
+  let text = host::stringFromBytes(name)
+
+  return text == null ? "" : text
+end
+
+def nativeLinkObjectBytes(bytes: Byte[]): Bool
+  if bytes.Length > 134217728
+    return false
+  end
+  if bytes.Length < 8 || nativeLinkArchiveName(bytes, 0, 7) != "!<arch>" || bytes[7] != (10 as Byte)
+    return nativeLinkMachO(bytes, 0, bytes.Length)
+  end
+  var cursor = 8
+  var objects = 0
+
+  while cursor < bytes.Length
+    return false if bytes.Length - cursor < 60
+    return false if bytes[cursor + 58] != (96 as Byte) || bytes[cursor + 59] != (10 as Byte)
+    let size = nativeLinkArchiveNumber(bytes, cursor + 48, 10)
+
+    return false if size < 0 || size > bytes.Length - cursor - 60
+    var name = nativeLinkArchiveName(bytes, cursor, 16)
+    var payload = cursor + 60
+    var payloadSize = size
+
+    if bootstrapStartsWith(name, "#1/")
+      let nameSize = nativeLinkArchiveNumber(bytes, cursor + 3, 13)
+
+      return false if nameSize <= 0 || nameSize > 4096 || nameSize > size
+      name = nativeLinkArchiveName(bytes, payload, nameSize)
+      payload = payload + nameSize
+      payloadSize = payloadSize - nameSize
+    else if semanticEndsWith(name, "/")
+      name = host::stringSlice(name, 0, host::stringByteLength(name) - 1)
+    end
+    return false if name == "" || payloadSize == 0
+    if name == "__.SYMDEF" || name == "__.SYMDEF SORTED"
+      return false if payloadSize < 8
+      let symbolsSize = nativeLinkObjectWord(bytes, payload)
+
+      return false if (symbolsSize / 8) * 8 != symbolsSize || symbolsSize > payloadSize - 8
+      let stringsSize = nativeLinkObjectWord(bytes, payload + 4 + symbolsSize)
+
+      return false if stringsSize > payloadSize - symbolsSize - 8
+    else
+      return false if !nativeLinkMachO(bytes, payload, payloadSize, true)
+      objects = objects + 1
+    end
+    cursor = cursor + 60 + size
+    if (size / 2) * 2 != size
+      return false if cursor >= bytes.Length || bytes[cursor] != (10 as Byte)
+      cursor = cursor + 1
+    end
+  end
+  return cursor == bytes.Length && objects > 0
+end
+
+def nativeLinkObjectFile(path: String): Bool
+  let before = new RunCacheFile(path, true)
+
+  return false if before.kind != 1 || before.fingerprint == ""
+  let read = files::readBytes(path, 134217728)
+  let bytes = read.bytes
+  let after = new RunCacheFile(path, true)
+
+  return before.fingerprint == after.fingerprint && after.kind == 1 && read.failure == null && read.closeFailure == null && bytes != null && nativeLinkObjectBytes(bytes)
+end

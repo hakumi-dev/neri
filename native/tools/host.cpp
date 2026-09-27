@@ -1,4 +1,9 @@
 // OS services for Neri tooling. Build and test policy lives in Neri.
+#if defined(__APPLE__)
+#define _DARWIN_C_SOURCE
+#elif defined(__linux__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE
+#endif
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
@@ -21,8 +26,14 @@
 #include <sys/wait.h>
 #include <sys/resource.h>
 #include <unistd.h>
-
 extern char **environ;
+#if defined(__APPLE__)
+#include <stdio.h>
+#include <sys/stdio.h>
+#elif defined(__linux__)
+#include <linux/fs.h>
+#include <stdio.h>
+#endif
 #endif
 
 namespace {
@@ -125,6 +136,54 @@ void canonical_path(const char *path, const char *output) {
   if (error || canonical.empty())
     throw std::runtime_error("cannot canonicalize project path");
   write(output, neri::path_text(canonical));
+}
+
+void exchange_directories(const char *first, const char *second) {
+#if defined(_WIN32)
+  (void)first;
+  (void)second;
+  throw std::runtime_error("directory exchange is unsupported on Windows");
+#elif defined(__APPLE__) || defined(__linux__)
+  std::error_code error;
+  const auto first_path = std::filesystem::absolute(neri::host_path(first), error).lexically_normal();
+  if (error || first_path.empty())
+    throw std::runtime_error("cannot resolve the first directory path");
+  const auto second_path = std::filesystem::absolute(neri::host_path(second), error).lexically_normal();
+  if (error || second_path.empty())
+    throw std::runtime_error("cannot resolve the second directory path");
+
+  const auto first_status = std::filesystem::symlink_status(first_path, error);
+  if (error || !std::filesystem::is_directory(first_status) || std::filesystem::is_symlink(first_status))
+    throw std::runtime_error("first path must be an existing directory without a symlink");
+  const auto second_status = std::filesystem::symlink_status(second_path, error);
+  if (error || !std::filesystem::is_directory(second_status) || std::filesystem::is_symlink(second_status))
+    throw std::runtime_error("second path must be an existing directory without a symlink");
+
+  const auto first_canonical = std::filesystem::canonical(first_path, error);
+  if (error || first_canonical.empty())
+    throw std::runtime_error("cannot canonicalize the first directory");
+  const auto second_canonical = std::filesystem::canonical(second_path, error);
+  if (error || second_canonical.empty())
+    throw std::runtime_error("cannot canonicalize the second directory");
+  if (first_canonical == second_canonical)
+    throw std::runtime_error("directory paths must identify different directories");
+  if (first_canonical.parent_path() != second_canonical.parent_path())
+    throw std::runtime_error("directories must be siblings with the same parent");
+
+#if defined(__APPLE__)
+  if (::renamex_np(neri::path_text(first_canonical).c_str(),
+                   neri::path_text(second_canonical).c_str(), RENAME_SWAP) != 0)
+    throw std::runtime_error(std::string("cannot atomically exchange directories: ") + std::strerror(errno));
+#else
+  if (::renameat2(AT_FDCWD, neri::path_text(first_canonical).c_str(),
+                  AT_FDCWD, neri::path_text(second_canonical).c_str(), RENAME_EXCHANGE) != 0)
+    throw std::runtime_error(std::string("cannot atomically exchange directories: ") + std::strerror(errno));
+#endif
+#else
+  (void)first;
+  (void)second;
+  throw std::runtime_error("directory exchange is unsupported on this platform");
+#endif
 }
 
 void stamp(const char *root, const char *epoch) {
@@ -239,13 +298,14 @@ int main(int argc, char **argv) {
     else if (argc == 4 && std::string(argv[1]) == "canonical-path") canonical_path(argv[2], argv[3]);
     else if (argc == 4 && std::string(argv[1]) == "stamp") stamp(argv[2], argv[3]);
     else if (argc == 4 && std::string(argv[1]) == "replace") std::filesystem::rename(argv[2], argv[3]);
+    else if (argc == 4 && std::string(argv[1]) == "exchange-directories") exchange_directories(argv[2], argv[3]);
     else if (argc == 3 && std::string(argv[1]) == "remove-directory") {
       const auto directory = neri::host_path(argv[2]);
       if (!std::filesystem::is_directory(directory) || !std::filesystem::remove(directory))
         throw std::runtime_error("cannot remove empty directory");
     }
     else if (argc >= 7 && std::string(argv[1]) == "run") run(argc, argv);
-    else throw std::runtime_error("expected list <root> <suffix> <output>, or run");
+    else throw std::runtime_error("expected list <root> <suffix> <output>, run, or exchange-directories <first> <second>");
     return 0;
   } catch (const std::exception &error) {
     std::cerr << "neri-host: " << error.what() << '\n';

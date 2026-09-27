@@ -16,6 +16,8 @@ Geometric expansion is the dynamic-table method described by
 [Cormen, Leiserson, Rivest, and Stein](https://mitpress.mit.edu/9780262046305/introduction-to-algorithms/):
 the total existing bytes copied across uncapped expansions is less than twice
 the final capacity.
+Initial zero fill, capacity copies and snapshots run in index order on the
+calling thread. These operations do not create task heaps.
 
 `copyWithin(target, start, count)` copies inside the current content. Both ranges
 must already be within the logical length. Overlapping ranges behave like

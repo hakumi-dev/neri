@@ -2,6 +2,7 @@
 #include <winsock2.h>
 #include <windows.h>
 #include <limits.h>
+#include <stdlib.h>
 #include <string.h>
 
 static INIT_ONCE startup = INIT_ONCE_STATIC_INIT;
@@ -91,6 +92,57 @@ int64_t neri_rt_v1_net_poll(int64_t fd, int64_t writing, int64_t milliseconds) {
   int result = WSAPoll(&item, 1, (int)milliseconds);
   if (result > 0 && (item.revents & POLLNVAL)) { WSASetLastError(WSAENOTSOCK); return -1; }
   return io_result(result);
+}
+int64_t neri_rt_v1_net_poll_many(const int64_t *descriptors, const int64_t *interests,
+                               int64_t *events, int64_t count, int64_t timeout_ms) {
+  const int previous_error = WSAGetLastError();
+  if (count < 0 || count > 4096 || (count != 0 && events == NULL)) {
+    WSASetLastError(WSAEINVAL); return -1;
+  }
+  if (count != 0) memset(events, 0, (size_t)count * sizeof(*events));
+  if (timeout_ms < -1 || timeout_ms > 60000 ||
+      (count != 0 && (descriptors == NULL || interests == NULL))) {
+    WSASetLastError(WSAEINVAL); return -1;
+  }
+  for (int64_t index = 0; index < count; ++index) {
+    if (descriptors[index] < 0 || (uint64_t)descriptors[index] > UINTPTR_MAX ||
+        (SOCKET)descriptors[index] == INVALID_SOCKET ||
+        interests[index] < 0 || interests[index] > 3) {
+      WSASetLastError(WSAEINVAL); return -1;
+    }
+  }
+  // WSAPoll requires at least one socket; an empty set is a timed wait.
+  if (count == 0) {
+    SleepEx(timeout_ms < 0 ? INFINITE : (DWORD)timeout_ms, TRUE);
+    WSASetLastError(previous_error);
+    return 0;
+  }
+  WSAPOLLFD *items = malloc((size_t)count * sizeof(*items));
+  if (items == NULL) { WSASetLastError(WSAENOBUFS); return -1; }
+  for (int64_t index = 0; index < count; ++index) {
+    items[index].fd = (SOCKET)descriptors[index];
+    items[index].events = (short)(((interests[index] & 1) ? POLLRDNORM : 0) |
+                                  ((interests[index] & 2) ? POLLWRNORM : 0));
+    items[index].revents = 0;
+  }
+  const int result = WSAPoll(items, (ULONG)count, (int)timeout_ms);
+  const int poll_error = WSAGetLastError();
+  int64_t ready = 0;
+  if (result > 0) {
+    for (int64_t index = 0; index < count; ++index) {
+      const short flags = items[index].revents;
+      events[index] = ((flags & POLLRDNORM) ? 1 : 0) | ((flags & POLLWRNORM) ? 2 : 0) |
+          ((flags & POLLERR) ? 4 : 0) | ((flags & POLLHUP) ? 8 : 0) |
+          ((flags & POLLNVAL) ? 16 : 0);
+      if (events[index] != 0) ++ready;
+    }
+  }
+  free(items);
+  if (result == SOCKET_ERROR && poll_error != WSAEINTR) {
+    WSASetLastError(poll_error); return -1;
+  }
+  WSASetLastError(previous_error);
+  return ready;
 }
 int64_t neri_rt_v1_net_read(int64_t fd, uint8_t *bytes, int64_t length) {
   if (length < 0) { WSASetLastError(WSAEINVAL); return -1; }

@@ -69,7 +69,7 @@ def sessionSnapshotFromProject(project: NeriProject): SessionSourceSnapshot
       snapshot.error = "Cannot read project source: " + entry.value
       return snapshot
     end
-    snapshot.add(entry.value, source)
+    snapshot.add(project.identityPath(entry.value), source)
     entry = entry.nextNode
   end
   return snapshot
@@ -203,19 +203,13 @@ def collectSubmittedTypes(model: SemanticModel, syntax: SyntaxArena, prepared: P
   end
 end
 
-def initializerEntrySource(generation: Int, name: String, returnType: String, bindingName: String = "service"): String
-  let state = "__NeriSessionState" + (generation as String)
+def initializerEntrySource(frameName: String, name: String, returnType: String, bindingName: String = "service"): String
+  let state = frameName
   var result = "def __neri_session_entry("
 
-  if generation > 0
-    result = result + "__neri_session_previous: __NeriSessionState" + ((generation - 1) as String)
-  end
   result = result + "): " + state + "\n"
   result = result + "let " + bindingName + ": " + semanticNamespaceDisplay(returnType) + " = " + semanticNamespaceDisplay(name) + "()\n"
   result = result + "return new " + state + "("
-  if generation > 0
-    result = result + "__neri_session_previous, "
-  end
   return result + bindingName + ")\nend\n"
 end
 
@@ -275,11 +269,11 @@ def indentSubmission(source: String): String
   return source
 end
 
-def entryPrefix(generation: Int, bindings: SessionBinding?): String
+def entryPrefix(generation: Int, previousFrameName: String, bindings: SessionBinding?): String
   var result = "def __neri_session_entry("
 
   if generation > 0
-    result = result + "__neri_session_previous: __NeriSessionState" + ((generation - 1) as String)
+    result = result + "__neri_session_previous: " + previousFrameName
   end
   result = result + "): Void\n"
   var binding = bindings
@@ -291,10 +285,10 @@ def entryPrefix(generation: Int, bindings: SessionBinding?): String
   return result
 end
 
-def sessionFrameSource(generation: Int, bindings: SessionBinding?): String
-  let name = "__NeriSessionState" + (generation as String)
-  var fields = generation > 0 ? "  public __neri_session_previous: __NeriSessionState" + ((generation - 1) as String) + "\n" : ""
-  var parameters = generation > 0 ? "__neri_session_previous: __NeriSessionState" + ((generation - 1) as String) : ""
+def sessionFrameSource(generation: Int, frameName: String, previousFrameName: String, bindings: SessionBinding?): String
+  let name = frameName
+  var fields = generation > 0 ? "  public __neri_session_previous: " + previousFrameName + "\n" : ""
+  var parameters = generation > 0 ? "__neri_session_previous: " + previousFrameName : ""
   var assignments = generation > 0 ? "    this.__neri_session_previous = __neri_session_previous\n" : ""
   var binding = bindings
 
@@ -310,7 +304,7 @@ def sessionFrameSource(generation: Int, bindings: SessionBinding?): String
   return "class " + name + "\n" + fields + "\n  def init(" + parameters + "): Void\n" + assignments + "  end\nend\n"
 end
 
-def sessionDisplayExpression(typeName: String): String
+def sessionDisplayExpression(typeName: String, inspectionExpression: String = ""): String
   if typeName == "Void"
     return "\"\""
   else if typeName == "String"
@@ -319,14 +313,15 @@ def sessionDisplayExpression(typeName: String): String
     return "(__neri_session_result as String)"
   else if typeName == "Bool"
     return "(__neri_session_result ? \"true\" : \"false\")"
-  else if semanticEndsWith(typeName, "?")
-    return "(__neri_session_result == null ? \"null\" : " + irQuote(typeName) + ")"
   end
-  return irQuote(typeName)
+  return inspectionExpression == "" ? irQuote(typeName) : inspectionExpression
 end
 
-def executionEntrySource(generation: Int, previousBindings: SessionBinding?, newBindings: SessionBinding?, statements: String, resultType: String = "Void"): String
-  var result = executionEntryPrefix(generation, previousBindings)
+def executionEntrySource(generation: Int, frameName: String, previousFrameName: String, candidateId: Int, previousBindings: SessionBinding?, newBindings: SessionBinding?, statements: String, resultType: String = "Void", inspectionExpression: String = "", propagatedErrorType: String = "", errorInspectionExpression: String = ""): String
+  let evaluatorName = "__neri_session_evaluate_" + (candidateId as String)
+  let outputType = "result::Result<" + frameName + ", " + semanticNamespaceDisplay(propagatedErrorType) + ">"
+  let functionName = propagatedErrorType == "" ? "__neri_session_entry" : evaluatorName
+  var result = executionEntryPrefix(generation, frameName, previousFrameName, previousBindings, propagatedErrorType == "" ? frameName : outputType, functionName)
 
   result = result + statements
   var writeback = previousBindings
@@ -337,7 +332,11 @@ def executionEntrySource(generation: Int, previousBindings: SessionBinding?, new
     end
     writeback = writeback.next
   end
-  result = result + "return new __NeriSessionState" + (generation as String) + "("
+  if propagatedErrorType != ""
+    result = result + "return result::Result<" + frameName + ", " + semanticNamespaceDisplay(propagatedErrorType) + ">.Ok(new " + frameName + "("
+  else
+    result = result + "return new " + frameName + "("
+  end
   var separator = ""
 
   if generation > 0
@@ -351,17 +350,37 @@ def executionEntrySource(generation: Int, previousBindings: SessionBinding?, new
     separator = ", "
     argument = argument.next
   end
-  return result + separator + sessionDisplayExpression(resultType) + ")\nend\n"
-end
-
-def executionEntryPrefix(generation: Int, previousBindings: SessionBinding?): String
-  let state = "__NeriSessionState" + (generation as String)
-  var result = "def __neri_session_entry("
+  result = result + separator + sessionDisplayExpression(resultType, inspectionExpression) + ")"
+  if propagatedErrorType != ""
+    result = result + ")"
+  end
+  result = result + "\nend\n"
+  if propagatedErrorType == ""
+    return result
+  end
+  var adapter = "def __neri_session_entry("
 
   if generation > 0
-    result = result + "__neri_session_previous: __NeriSessionState" + ((generation - 1) as String)
+    adapter = adapter + "__neri_session_previous: " + previousFrameName
   end
-  result = result + "): " + state + "\n"
+  let failureFunction = "__neri_session_report_failure_" + (candidateId as String)
+
+  adapter = "@cabiImport(\"neri_rt_v1_session_fail\")\nunsafe def " + failureFunction + "(message: String): Void\nend\n" + adapter
+  adapter = adapter + "): " + frameName + "?\n  match " + evaluatorName + "("
+  if generation > 0
+    adapter = adapter + "__neri_session_previous"
+  end
+  adapter = adapter + ")\n    case result::Result.Ok(value)\n      return value\n    case result::Result.Error(__neri_session_error)\n      unsafe\n        " + failureFunction + "(" + errorInspectionExpression + ")\n      end\n      return null\n  end\nend\n"
+  return result + adapter
+end
+
+def executionEntryPrefix(generation: Int, frameName: String, previousFrameName: String, previousBindings: SessionBinding?, returnType: String, functionName: String): String
+  var result = "def " + functionName + "("
+
+  if generation > 0
+    result = result + "__neri_session_previous: " + previousFrameName
+  end
+  result = result + "): " + returnType + "\n"
   var materialized = previousBindings
 
   while materialized != null

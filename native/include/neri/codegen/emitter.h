@@ -5,7 +5,9 @@
 #include "neri/codegen/reader.h"
 
 #include <cstdint>
+#include <cstddef>
 #include <filesystem>
+#include <functional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -64,12 +66,17 @@ private:
 optimization_name(optimization_mode mode) noexcept;
 [[nodiscard]] std::string_view output_kind_name(output_kind kind) noexcept;
 
+using emission_progress = std::function<void(std::string_view, std::size_t,
+                                             std::size_t, std::string_view,
+                                             std::size_t)>;
+
 [[nodiscard]] artifact emit_module(const verified_module &input,
                                    target_platform target,
                                    optimization_mode optimization,
                                    output_kind kind,
                                    emission_metrics *metrics = nullptr,
-                                   const debug_source_paths &debug_sources = {});
+                                   const debug_source_paths &debug_sources = {},
+                                   const emission_progress &progress = {});
 
 void write_artifact_atomically(const std::filesystem::path &path,
                                std::span<const std::uint8_t> bytes);

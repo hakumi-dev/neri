@@ -5,10 +5,16 @@ param(
   [ValidateSet('Release','Debug')][string]$Configuration = 'Release',
   [string]$Prefix = "$env:USERPROFILE/.neri",
   [string]$LLVM,
+  [ValidateRange(1,3)][int]$Stage,
+  [switch]$FullValidation,
   [switch]$NoPath
 )
 $ErrorActionPreference = 'Stop'
+if ($FullValidation -and $Action -ne 'install') { throw '-FullValidation requires install' }
 Set-StrictMode -Version Latest
+if (!$PSBoundParameters.ContainsKey('Stage')) { $Stage = if ($Action -eq 'install') { 2 } else { 1 } }
+if ($Action -eq 'install' -and $Stage -lt 2) { throw 'install requires -Stage 2 or -Stage 3' }
+if ($PSBoundParameters.ContainsKey('Stage') -and $Action -in 'doctor','native') { throw '-Stage requires a compiler build action' }
 function Invoke-Checked([string]$Program, [string[]]$Arguments) {
   & $Program @Arguments
   if ($LASTEXITCODE -ne 0) { throw "$Program failed with exit code $LASTEXITCODE" }
@@ -17,6 +23,22 @@ function Assert-Hash([string]$File, [string]$Expected) {
   if ((Get-FileHash -LiteralPath $File -Algorithm SHA256).Hash -ine $Expected) { throw "SHA-256 mismatch: $File" }
 }
 function Forward-Path([string]$Value) { return $Value.Replace('\','/') }
+function Copy-TarMember([string]$Archive, [string]$Member, [string]$Destination) {
+  $start = [Diagnostics.ProcessStartInfo]::new('tar')
+  $start.UseShellExecute = $false
+  $start.RedirectStandardOutput = $true
+  $start.RedirectStandardError = $true
+  foreach ($argument in @('--ignore-zeros','-xOf',$Archive,$Member)) { $start.ArgumentList.Add($argument) }
+  $child = [Diagnostics.Process]::Start($start)
+  try {
+    $errors = $child.StandardError.ReadToEndAsync()
+    $output = [IO.File]::Create($Destination)
+    try { $child.StandardOutput.BaseStream.CopyTo($output) } finally { $output.Dispose() }
+    $child.WaitForExit()
+    $errorText = $errors.GetAwaiter().GetResult()
+    if ($child.ExitCode -ne 0) { throw "Cannot read bootstrap bundle member ${Member}: $errorText" }
+  } finally { $child.Dispose() }
+}
 
 $root = Split-Path $PSScriptRoot
 Push-Location $root
@@ -49,33 +71,76 @@ try {
   $native = Join-Path $root "build/native/windows-$mode"
   Invoke-Checked cmake @('-S',$root,'-B',$native,'-G','Ninja',"-DCMAKE_BUILD_TYPE=$Configuration",'-DCMAKE_C_COMPILER=clang','-DCMAKE_CXX_COMPILER=clang++',"-DLLVM_DIR=$env:LLVM_PREFIX/lib/cmake/llvm",'-DBUILD_TESTING=ON')
   Invoke-Checked cmake @('--build',$native,'--parallel','4')
-  Invoke-Checked ctest @('--test-dir',$native,'--output-on-failure','--no-tests=error')
+  if ($Action -in 'native','test' -or $FullValidation) {
+    Invoke-Checked ctest @('--test-dir',$native,'--output-on-failure','--no-tests=error')
+  }
   if ($Action -eq 'native') { return }
 
   $seed = Get-Content "$root/bootstrap/seed.json" -Raw | ConvertFrom-Json
-  if ($seed.schemaVersion -ne 1 -or $seed.format -ne 'neri-ir-binary-gzip' -or
-      $seed.artifact -ne 'compiler.nir.gz' -or $seed.sourceManifest -ne 'SOURCE-MANIFEST.sha256') {
+  if (($seed.schemaVersion -isnot [long] -and $seed.schemaVersion -isnot [int]) -or
+      $seed.schemaVersion -ne 2 -or $seed.format -cne 'neri-ir-bundle-gzip' -or
+      $seed.artifact -cne 'compiler.nir.tar.gz' -or $seed.sourceManifest -cne 'SOURCE-MANIFEST.sha256') {
     throw 'Unsupported canonical bootstrap seed metadata'
   }
-  Assert-Hash "$root/bootstrap/compiler.nir.gz" $seed.artifactSha256
+  if (($seed.unitCount -isnot [long] -and $seed.unitCount -isnot [int]) -or $seed.unitCount -lt 1 -or $seed.unitCount -gt 1024) {
+    throw 'Invalid bootstrap unit count'
+  }
+  foreach ($field in @('artifactSha256','unitManifestSha256','sourceManifestSha256','validationSourceManifestSha256')) {
+    if ($seed.$field -isnot [string] -or $seed.$field -cnotmatch '^[0-9a-f]{64}$') { throw "Invalid bootstrap digest: $field" }
+  }
+  $bundle = "$root/bootstrap/compiler.nir.tar.gz"
   Assert-Hash "$root/bootstrap/SOURCE-MANIFEST.sha256" $seed.sourceManifestSha256
   Assert-Hash "$root/bootstrap/VALIDATION-SOURCE-MANIFEST.sha256" $seed.validationSourceManifestSha256
   $work = Join-Path $root ("build/windows/work-" + [Guid]::NewGuid().ToString('N'))
   New-Item -ItemType Directory -Force $work | Out-Null
-  $compressed = [IO.File]::OpenRead("$root/bootstrap/compiler.nir.gz")
   try {
-    $gzip = [IO.Compression.GZipStream]::new($compressed, [IO.Compression.CompressionMode]::Decompress)
+    Copy-Item -LiteralPath $bundle -Destination "$work/compiler.nir.tar.gz"
+    $bundle = "$work/compiler.nir.tar.gz"
+    Assert-Hash $bundle $seed.artifactSha256
+    $compressed = [IO.File]::OpenRead($bundle)
     try {
-      $binary = [IO.File]::Create("$work/seed.nir")
-      try { $gzip.CopyTo($binary) } finally { $binary.Dispose() }
-    } finally { $gzip.Dispose() }
-  } finally { $compressed.Dispose() }
-  Assert-Hash "$work/seed.nir" $seed.irSha256
+      $gzip = [IO.Compression.GZipStream]::new($compressed, [IO.Compression.CompressionMode]::Decompress)
+      try {
+        $archive = [IO.File]::Create("$work/compiler.nir.tar")
+        try { $gzip.CopyTo($archive) } finally { $archive.Dispose() }
+      } finally { $gzip.Dispose() }
+    } finally { $compressed.Dispose() }
+    $bundle = "$work/compiler.nir.tar"
+    $entries = @(& tar --ignore-zeros -tf $bundle)
+    if ($LASTEXITCODE -ne 0 -or $entries.Count -ne $seed.unitCount + 1 -or $entries[0] -cne 'UNITS.sha256') {
+      throw 'Bootstrap bundle entries do not match the unit count'
+    }
+    for ($unit = 0; $unit -lt $seed.unitCount; $unit++) {
+      if ($entries[$unit + 1] -cne "unit-$unit.nir") { throw 'Unexpected bootstrap bundle member' }
+    }
+    $details = @(& tar --ignore-zeros -tvf $bundle)
+    if ($LASTEXITCODE -ne 0 -or $details.Count -ne $entries.Count) { throw 'Invalid bootstrap bundle member types' }
+    foreach ($entry in $details) {
+      if (!$entry.StartsWith('-',[StringComparison]::Ordinal)) { throw 'Bootstrap bundle members must be regular files' }
+    }
+    Copy-TarMember $bundle 'UNITS.sha256' "$work/UNITS.sha256"
+    Assert-Hash "$work/UNITS.sha256" $seed.unitManifestSha256
+    if ((Get-Item -LiteralPath "$work/UNITS.sha256").Length -gt 80 * $seed.unitCount) { throw 'Oversized bootstrap unit manifest' }
+    $encoding = [Text.UTF8Encoding]::new($false,$true)
+    $unitText = $encoding.GetString([IO.File]::ReadAllBytes("$work/UNITS.sha256"))
+    $rows = $unitText -split "`n"
+    if ($rows.Count -ne $seed.unitCount + 1 -or $rows[$seed.unitCount] -cne '') { throw 'Invalid bootstrap unit manifest' }
+    for ($unit = 0; $unit -lt $seed.unitCount; $unit++) {
+      if ($rows[$unit] -cnotmatch "^([0-9a-f]{64})  unit-$unit[.]nir$") { throw 'Invalid bootstrap unit manifest' }
+      $digest = $Matches[1]
+      Copy-TarMember $bundle "unit-$unit.nir" "$work/unit-$unit.nir"
+      Assert-Hash "$work/unit-$unit.nir" $digest
+    }
+  } catch {
+    Remove-Item -LiteralPath $work -Recurse -Force
+    throw
+  }
   $env:NERI_STDLIB = Forward-Path "$root/stdlib"
   $env:NERI_HOST = Forward-Path "$native/neri-host.exe"
   $env:NERI_CODEGEN = Forward-Path "$native/neri-codegen.exe"
   $env:NERI_RUNTIME_MANIFEST = Forward-Path "$native/neri-runtime-windows-x86_64.json"
   $env:NERI_LINKER = Forward-Path "$env:LLVM_PREFIX/bin/clang++.exe"
+  $previousTmpDir = $env:TMPDIR
   $env:TMPDIR = Forward-Path $work
   function Compiler-Sources {
     @(Get-ChildItem -LiteralPath "$root/compiler" -Recurse -Filter '*.hk' -File |
@@ -99,27 +164,37 @@ try {
     Invoke-Checked $env:NERI_CODEGEN @('--input',$IR,'--input-format',$Format,'--target','windows-x86_64','--optimization','release','--emit','object','--output',"$Stage/compiler.obj")
     Invoke-Checked $env:NERI_LINKER @("$Stage/compiler.obj","$native/neri-runtime.lib",'-o',"$Stage/neri.exe",'-lws2_32','-lbcrypt','-lshell32','-Wl,/Brepro')
   }
-  Materialize "$work/seed.nir" 'binary' "$work/stage0"
-  for ($generation = 1; $generation -le 3; $generation++) {
-    $stage = "$work/stage$generation"
-    New-Item -ItemType Directory -Force $stage | Out-Null
+  New-Item -ItemType Directory -Force "$work/stage0" | Out-Null
+  $seedObjects = @()
+  for ($unit = 0; $unit -lt $seed.unitCount; $unit++) {
+    $object = "$work/stage0/unit-$unit.obj"
+    Invoke-Checked $env:NERI_CODEGEN @('--input',"$work/unit-$unit.nir",'--input-format','binary','--target','windows-x86_64','--optimization','release','--emit','object','--output',$object)
+    $seedObjects += $object
+  }
+  Invoke-Checked $env:NERI_LINKER ($seedObjects + @("$native/neri-runtime.lib",'-o',"$work/stage0/neri.exe",'-lws2_32','-lbcrypt','-lshell32','-Wl,/Brepro'))
+  for ($generation = 1; $generation -le $Stage; $generation++) {
+    $stageDirectory = "$work/stage$generation"
+    New-Item -ItemType Directory -Force $stageDirectory | Out-Null
     $previous = "$work/stage$($generation - 1)/neri.exe"
     Write-Host "Compiling generation $generation on Windows..."
     $buildArguments = @('build','--project',"$root/manifest.json",'--unit','compiler','--source-root',"$root/compiler")
-    Invoke-Checked $previous ($buildArguments + @('--module','neri-compiler','--emit=neri-ir-hex','--output',"$stage/compiler.nir.hex"))
-    Materialize "$stage/compiler.nir.hex" 'hex' $stage
+    Invoke-Checked $previous ($buildArguments + @('--module','neri-compiler','--emit=neri-ir-hex','--output',"$stageDirectory/compiler.nir.hex"))
+    Materialize "$stageDirectory/compiler.nir.hex" 'hex' $stageDirectory
   }
-  foreach ($artifact in @('compiler.nir.hex','compiler.obj','neri.exe')) {
-    Assert-Hash "$work/stage3/$artifact" (Get-FileHash "$work/stage2/$artifact").Hash
+  if ($Stage -eq 3) {
+    foreach ($artifact in @('compiler.nir.hex','compiler.obj','neri.exe')) {
+      Assert-Hash "$work/stage3/$artifact" (Get-FileHash "$work/stage2/$artifact").Hash
+    }
+    Write-Host 'Verified native Windows compiler fixed point (IR, COFF and PE).'
   }
   $after = @(Compiler-Inventory)
   if (Compare-Object $inventory $after) { throw 'Compiler sources changed during bootstrap' }
-  Write-Host 'Verified native Windows compiler fixed point (IR, COFF and PE).'
+  Write-Host "Built Windows Stage$Stage compiler from unchanged sources."
 
   $tree = "$work/toolchain"
   New-Item -ItemType Directory -Force "$tree/bin","$tree/libexec","$tree/lib" | Out-Null
   Copy-Item "$native/neri.exe" "$tree/bin/neri.exe"
-  Copy-Item "$work/stage3/neri.exe" "$tree/libexec/neri-compiler.exe"
+  Copy-Item "$work/stage$Stage/neri.exe" "$tree/libexec/neri-compiler.exe"
   Copy-Item "$native/neri-codegen.exe","$native/neri-host.exe" "$tree/libexec"
   Copy-Item "$native/neri-runtime.lib","$native/neri-runtime-windows-x86_64.json" "$tree/lib"
   New-Item -ItemType Directory -Force "$tree/include/neri" | Out-Null
@@ -152,10 +227,27 @@ try {
   if ($Action -eq 'build') { Write-Host "Toolchain: $tree/bin/neri.exe"; return }
   Invoke-Checked "$tree/bin/neri.exe" @('run','--project',"$root/tooling/abi/manifest.json",'--','--check',$root)
   Invoke-Checked "$tree/bin/neri.exe" @('run','--project',"$root/tooling/kinds/manifest.json",'--','--check',$root)
-  Invoke-Checked node @("$PSScriptRoot/test-windows.mjs","$tree/bin/neri.exe",$native)
-  Invoke-Checked "$tree/bin/neri.exe" @('run','--project',"$root/tests/native/cabi-exports/manifest.json",'--unit','driver','--',"$tree/bin/neri.exe",$root,$native,"$env:LLVM_PREFIX/bin",'windows-x86_64',"$work/cabi-exports")
+  $contractsPassed = $false
+  if ($Action -eq 'test' -or $FullValidation) {
+    Invoke-Checked node @("$PSScriptRoot/test-windows.mjs","$tree/bin/neri.exe",$native)
+    Invoke-Checked "$tree/bin/neri.exe" @('run','--project',"$root/tests/native/cabi-exports/manifest.json",'--unit','driver','--',"$tree/bin/neri.exe",$root,$native,"$env:LLVM_PREFIX/bin",'windows-x86_64',"$work/cabi-exports")
+    $contractsPassed = $true
+  }
   & "$root/tests/windows-launcher.ps1" -Compiler "$tree/bin/neri.exe"
-  [IO.File]::WriteAllText("$work/VALIDATED", "Windows native, language, UTF-8 paths and LSP contracts passed.`n")
+  if ($contractsPassed) {
+    [IO.File]::WriteAllText("$work/VALIDATED", "Windows native, language, UTF-8 paths and LSP contracts passed.`n")
+  }
+  $scope = if ($Action -eq 'test') { 'windows-contracts' } elseif ($contractsPassed) { 'windows-and-installation-contracts' } else { 'installation-contracts' }
+  $verification = if ($Stage -eq 3) { "fixed-point-and-$scope" } else { "stage$Stage-and-$scope" }
+  $provenance = [ordered]@{
+    schemaVersion = 1
+    target = 'windows-x86_64'
+    compilerStage = $Stage
+    verification = $verification
+    sourceManifestSha256 = (Get-FileHash "$work/SOURCE-MANIFEST.sha256").Hash.ToLowerInvariant()
+    seedProvenanceSha256 = (Get-FileHash "$root/bootstrap/seed.json").Hash.ToLowerInvariant()
+  }
+  [IO.File]::WriteAllText("$tree/PROVENANCE.json", ($provenance | ConvertTo-Json) + "`n")
   if ($Action -eq 'test') { Write-Host "Validated toolchain: $tree/bin/neri.exe"; return }
 
   # Keep previous installations intact; publish a small pointer only after validation.
@@ -200,6 +292,10 @@ try {
     $result = [UIntPtr]::Zero
     [void][NeriSetup.EnvironmentBroadcast]::SendMessageTimeout([IntPtr]65535,26,[UIntPtr]::Zero,'Environment',2,2000,[ref]$result)
   }
+  # Installation, activation and PATH setup have consumed the staged toolchain
+  # and rollback copy. Build/test return earlier and keep their reported output.
+  $env:TMPDIR = $previousTmpDir
+  Remove-Item -LiteralPath $work -Recurse -Force
   Write-Host "Installed: $prefixPath/bin/neri.exe"
   Write-Host 'Open a new terminal (and restart Rider) to pick up PATH changes.'
 } finally { Pop-Location }

@@ -1,0 +1,170 @@
+use neri_data
+use neri_data_sqlite
+use test
+use console
+use neri_data_sqlite_fixture
+use files
+use resources
+use result
+
+@cabiImport("neri_rt_v1_gc_collect")
+unsafe def collectGarbage(): Void
+end
+
+@cabiImport("neri_rt_v1_gc_get_stats")
+unsafe def readGarbageCollectionStats(stats: Int*): Void
+end
+
+class CatalogRow
+  public name: String
+
+  def init(name: String): Void
+    this.name = name
+  end
+end
+
+def decodeCatalog(row: RawRow): DecodeResult<CatalogRow>
+  match decodeString(row, "name")
+    case DecodeResult.Value(value)
+      return DecodeResult<CatalogRow>.Value(new CatalogRow(value))
+    case DecodeResult.Failure(error)
+      return DecodeResult<CatalogRow>.Failure(error)
+  end
+end
+
+def cycle(path: String): Void
+  match SQLiteProvider.openWritable(path)
+    case SQLiteOpenResult.Failure(error)
+      console::println(providerFailureMessage(error))
+
+      test::assertTrue(false)
+    case SQLiteOpenResult.Opened(provider)
+      let columns = new ResultColumns([new ResultColumn("name", ResultColumnKind.Text())])
+      let catalog = new Query<CatalogRow>("records", new Decoder<CatalogRow>(decodeCatalog, columns), provider: provider)
+      let missing = new Query<CatalogRow>("absent_table", new Decoder<CatalogRow>(decodeCatalog, columns), provider: provider)
+      let visit: fn(CatalogRow): Bool = fn(row: CatalogRow): Bool
+        test::assertEqual(row.name, "record")
+        return true
+      end
+
+      match catalog.take(64).all()
+        case QueryResult.Rows(rows)
+          test::assertEqual(rows.count(), 64)
+          for row in rows.inspectItems(64)
+            test::assertEqual(row.name, "record")
+          end
+        case QueryResult.Failure(error)
+          test::assertTrue(false)
+      end
+      match missing.stream(visit)
+        case StreamResult.Failure(error, count)
+          test::assertEqual(count, 0)
+        case StreamResult.Completed(count)
+          test::assertTrue(false)
+        case StreamResult.Stopped(count)
+          test::assertTrue(false)
+        case StreamResult.Cancelled(count)
+          test::assertTrue(false)
+      end
+      let token = new CancellationToken()
+      let cancel: fn(CatalogRow): Bool = fn(row: CatalogRow): Bool
+        token.cancel()
+        return true
+      end
+
+      # Cancel after materialization so the statement and decoder must be released.
+      match catalog.stream(cancel, new StreamOptions(token: token))
+        case StreamResult.Cancelled(count)
+          test::assertEqual(count, 1)
+        case StreamResult.Completed(count)
+          test::assertTrue(false)
+        case StreamResult.Stopped(count)
+          test::assertTrue(false)
+        case StreamResult.Failure(error, count)
+          test::assertTrue(false)
+      end
+      # A completed stream after failure/cancellation checks reusable operation state.
+      match catalog.stream(visit)
+        case StreamResult.Completed(count)
+          test::assertEqual(count, 64)
+        case StreamResult.Stopped(count)
+          test::assertTrue(false)
+        case StreamResult.Cancelled(count)
+          test::assertTrue(false)
+        case StreamResult.Failure(error, count)
+          test::assertTrue(false)
+      end
+      let alias = provider
+
+      # sqlite3_close rejects outstanding prepared statements; each cycle must close.
+      test::assertTrue(provider.close())
+      test::assertTrue(alias.close())
+      match catalog.take(1).all(alias)
+        case QueryResult.Failure(error)
+          test::assertEqual(diagnosticQueryFailureKind(error), "provider")
+        case QueryResult.Rows(rows)
+          test::assertTrue(false)
+      end
+  end
+end
+
+def blockCycles(path: String): Void
+  var iteration = 0
+
+  while iteration < 64
+    cycle(path)
+    iteration = iteration + 1
+  end
+end
+
+def verifyLifetime(path: String): Void
+  var baselineObjects = 0
+  var baselineBytes = 0
+  var baselineNativeBytes = 0
+  var block = 0
+
+  while block < 8
+    blockCycles(path)
+    unsafe
+      let stats = stackalloc Int[5]
+
+      stats[0] = 40
+      collectGarbage()
+      readGarbageCollectionStats(stats)
+      if block == 0
+        baselineObjects = stats[1]
+        baselineBytes = stats[2]
+        baselineNativeBytes = stats[4]
+      else
+        test::assertEqual(stats[1], baselineObjects)
+        test::assertEqual(stats[2], baselineBytes)
+        test::assertEqual(stats[4], baselineNativeBytes)
+      end
+    end
+    block = block + 1
+  end
+  console::println("SQLite resource lifetime: 512 open/buffer/fail/cancel/stream/close cycles with 64 rows per complete read")
+end
+
+def isolatedLifetime(): resources::Outcome<Int, result::Failure>
+  using directory <- files::TemporaryDirectory.create("neri-resource-lifetime-")
+    let path = directory.path() + "/records.sqlite"
+
+    test::assertTrue(createSQLiteFixture(path, "CREATE TABLE records(name TEXT NOT NULL); WITH RECURSIVE seed(id) AS (VALUES(1) UNION ALL SELECT id + 1 FROM seed WHERE id < 64) INSERT INTO records SELECT 'record' FROM seed;"))
+    verifyLifetime(path)
+    return 0
+  end
+  return 1
+end
+
+def main(): Void
+  let outcome = isolatedLifetime()
+
+  test::assertEqual(outcome.closeFailures.count(), 0)
+  match outcome.completion
+    case resources::Completion.Value(value)
+      test::assertEqual(value, 0)
+    case resources::Completion.Failure(error)
+      test::assertTrue(false)
+  end
+end

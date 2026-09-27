@@ -1,0 +1,355 @@
+use arrays
+use neri_data
+use reference
+use test
+
+class LoadingParent
+  public id: Int
+  public children: LoadingChild[] = []
+
+  def init(id: Int): Void
+    this.id = id
+  end
+end
+
+class LoadingChild
+  public id: Int
+  public parentId: Int
+  public parent: LoadingParent? = null
+
+  def init(id: Int, parentId: Int): Void
+    this.id = id
+    this.parentId = parentId
+  end
+end
+
+class LoadingProvider: Provider
+  public children: Int = 1
+  public brokenChild: Bool = false
+  public brokenOnStream: Int = 0
+  public parentCount: Int = 1
+  public duplicateParent: Bool = false
+  public reads: Int = 0
+  public streams: Int = 0
+
+  public override readonly def supports(capability: ProviderCapability): Bool
+    return true
+  end
+
+  public override readonly def dialect(): SqlDialect
+    return SqlDialect.QuestionMark()
+  end
+
+  public override def execute(plan: readonly SqlPlan): ProviderResult
+    this.reads = this.reads + 1
+    let rows: RawRow[] = arrays::generate<RawRow>(this.parentCount) do |index|
+      return new RawRow([new RawColumn("id", Cell.Int(this.duplicateParent ? 1 : index + 1))])
+    end
+
+    return ProviderResult.Rows(rows)
+  end
+
+  public override def stream(plan: readonly StreamPlan, visit: fn(RawRow): Bool): StreamResult
+    this.streams = this.streams + 1
+    if this.parentCount > 1 && this.streams == 2
+      return StreamResult.Completed(0)
+    end
+    var count = 0
+
+    while count < this.children
+      let row = this.brokenChild || this.brokenOnStream == this.streams ? new RawRow([]) : new RawRow([new RawColumn("id", Cell.Int(10 + count)), new RawColumn("parent_id", Cell.Int(1))])
+      let keep = visit(row)
+
+      count = count + 1
+      if !keep
+        return StreamResult.Stopped(count)
+      end
+    end
+    return StreamResult.Completed(count)
+  end
+end
+
+def decodeLoadingParent(row: RawRow): DecodeResult<LoadingParent>
+  match decodeInt(row, "id")
+    case DecodeResult.Value(id)
+      return DecodeResult<LoadingParent>.Value(new LoadingParent(id))
+    case DecodeResult.Failure(error)
+      return DecodeResult<LoadingParent>.Failure(error)
+  end
+end
+
+def decodeLoadingChild(row: RawRow): DecodeResult<LoadingChild>
+  match decodeInt(row, "id")
+    case DecodeResult.Failure(error)
+      return DecodeResult<LoadingChild>.Failure(error)
+    case DecodeResult.Value(id)
+      match decodeInt(row, "parent_id")
+        case DecodeResult.Failure(error)
+          return DecodeResult<LoadingChild>.Failure(error)
+        case DecodeResult.Value(parentId)
+          return DecodeResult<LoadingChild>.Value(new LoadingChild(id, parentId))
+      end
+  end
+end
+
+def captureLoadingParent(value: LoadingParent): RawRow
+  return new RawRow([new RawColumn("id", Cell.Int(value.id))])
+end
+
+def captureLoadingChild(value: LoadingChild): RawRow
+  return new RawRow([new RawColumn("id", Cell.Int(value.id)), new RawColumn("parent_id", Cell.Int(value.parentId))])
+end
+
+def parentKey(value: LoadingParent): Cell
+  return Cell.Int(value.id)
+end
+
+def wrongParentKey(value: LoadingParent): Cell
+  return Cell.Int(value.id + 1)
+end
+
+def childKey(value: LoadingChild): Cell
+  return Cell.Int(value.id)
+end
+
+def childForeignKey(value: LoadingChild): Cell
+  return Cell.Int(value.parentId)
+end
+
+def getChildren(value: LoadingParent): LoadingChild[]
+  return value.children
+end
+
+def setChildren(value: LoadingParent, children: LoadingChild[]): Void
+  value.children = children
+end
+
+def getParent(value: LoadingChild): LoadingParent?
+  return value.parent
+end
+
+def setParent(value: LoadingChild, parent: LoadingParent?): Void
+  value.parent = parent
+end
+
+def expectRows(result: QueryResult<LoadingParent>): TypedRows<LoadingParent>?
+  match result
+    case QueryResult.Rows(rows)
+      return rows
+    case QueryResult.Failure(error)
+      test::assertTrue(false)
+      return null
+  end
+end
+
+def expectFailure(result: QueryResult<LoadingParent>): Void
+  match result
+    case QueryResult.Rows(rows)
+      test::assertTrue(false)
+    case QueryResult.Failure(error)
+      return
+  end
+end
+
+def main(): Void
+  let provider = new LoadingProvider()
+  let changes = new ChangeContext(provider)
+  let parentColumns = new ResultColumns([new ResultColumn("id", ResultColumnKind.Int())])
+  let childColumns = new ResultColumns([new ResultColumn("id", ResultColumnKind.Int()), new ResultColumn("parent_id", ResultColumnKind.Int())])
+  let parentTracker = new EntityTracker<LoadingParent>("parents", "id", parentColumns, captureLoadingParent)
+  let childTracker = new EntityTracker<LoadingChild>("children", "id", childColumns, captureLoadingChild)
+
+  changes.register(parentTracker.changeSet())
+  changes.register(childTracker.changeSet())
+  let parentMapping = new EntityMapping("LoadingParent", "parents", [new MappingColumn("LoadingParent.id", "Int", "id")], "id")
+  let childMapping = new EntityMapping("LoadingChild", "children", [new MappingColumn("LoadingChild.id", "Int", "id"), new MappingColumn("LoadingChild.parentId", "Int", "parent_id")], "id")
+  let parents = new Query<LoadingParent>("parents", new Decoder<LoadingParent>(decodeLoadingParent, parentColumns), mapping: parentMapping, provider: provider, tracker: parentTracker, changes: changes)
+  let children = new Query<LoadingChild>("children", new Decoder<LoadingChild>(decodeLoadingChild, childColumns), mapping: childMapping, provider: provider, tracker: childTracker, changes: changes)
+  let relation = new CollectionNavigation<LoadingParent, LoadingChild>(parentKey, childKey, childForeignKey, "parent_id", getChildren, setChildren, getParent, setParent)
+  let loaded = expectRows(include(parents.take(10), children, relation).all())
+
+  test::assertTrue(loaded != null)
+  if loaded == null
+    return
+  end
+  let node = loaded.first()
+
+  test::assertTrue(node != null)
+  if node == null
+    return
+  end
+  let parent = node.value
+
+  test::assertEqual(parent.children.Length, 1)
+  let inverse = parent.children[0].parent
+
+  test::assertTrue(inverse != null)
+  if inverse != null
+    test::assertTrue(reference::same(inverse, parent))
+  end
+  let original = parent.children[0]
+
+  let beforeInvalidParent = provider.streams
+
+  parent.id = 2
+  expectFailure(include(parents.take(10), children, relation).load(loaded))
+
+  test::assertEqual(provider.streams, beforeInvalidParent)
+  parent.id = 1
+
+  provider.brokenChild = true
+  expectFailure(include(parents.take(10), children, relation).load(loaded))
+
+  test::assertEqual(parent.children.Length, 1)
+  test::assertTrue(reference::same(parent.children[0], original))
+
+  provider.brokenChild = false
+  original.parentId = 2
+  expectFailure(include(parents.take(10), children, relation).load(loaded))
+
+  test::assertEqual(parent.children.Length, 1)
+  original.parentId = 1
+  original.parent = null
+  expectFailure(include(parents.take(10), children, relation).load(loaded))
+
+  test::assertEqual(parent.children.Length, 1)
+  original.parent = parent
+  let reparented = new LoadingChild(20, 2)
+
+  test::assertTrue(childTracker.attach(reparented) == null)
+  reparented.parentId = 1
+  reparented.parent = parent
+  parent.children = [original, reparented]
+  provider.children = 0
+  expectFailure(include(parents.take(10), children, relation).load(loaded))
+
+  test::assertEqual(parent.children.Length, 2)
+  test::assertTrue(reference::same(parent.children[1], reparented))
+  test::assertTrue(reparented.parent != null)
+  parent.children = [original]
+  reparented.parent = null
+  reparented.parentId = 2
+
+  test::assertTrue(childTracker.detach(reparented) == null)
+  parent.children = []
+  expectFailure(include(parents.take(10), children, relation).load(loaded))
+
+  test::assertEqual(parent.children.Length, 0)
+  test::assertTrue(original.parent != null)
+  parent.children = [original]
+  let emptied = expectRows(include(parents.take(10), children, relation).load(loaded))
+
+  test::assertTrue(emptied != null)
+  test::assertEqual(parent.children.Length, 0)
+  test::assertTrue(original.parent == null)
+  test::assertTrue(childTracker.detach(original) == null)
+  let detachedReload = expectRows(include(parents.take(10), children, relation).load(loaded))
+
+  test::assertTrue(detachedReload != null)
+  provider.children = 1
+  let pendingChild = new LoadingChild(10, 1)
+
+  test::assertTrue(childTracker.add(pendingChild) == null)
+  expectFailure(include(parents.take(10), children, relation).load(loaded))
+
+  test::assertEqual(parent.children.Length, 0)
+
+  let foreignProvider = new LoadingProvider()
+  let foreignChanges = new ChangeContext(foreignProvider)
+  let foreignTracker = new EntityTracker<LoadingParent>("parents", "id", parentColumns, captureLoadingParent)
+
+  foreignChanges.register(foreignTracker.changeSet())
+  let foreignQuery = new Query<LoadingParent>("parents", new Decoder<LoadingParent>(decodeLoadingParent, parentColumns), mapping: parentMapping, provider: foreignProvider, tracker: foreignTracker, changes: foreignChanges)
+  let rogue = expectRows(foreignQuery.take(1).all())
+
+  test::assertTrue(rogue != null)
+  if rogue == null
+    return
+  end
+  let previousStreams = provider.streams
+
+  expectFailure(include(parents.take(10), children, relation).load(rogue))
+  expectFailure(include(parents.take(10), children.take(1), relation).load(loaded))
+
+  test::assertEqual(provider.streams, previousStreams)
+
+  let wrongDescriptor = new CollectionNavigation<LoadingParent, LoadingChild>(wrongParentKey, childKey, childForeignKey, "parent_id", getChildren, setChildren, getParent, setParent)
+
+  expectFailure(include(parents.take(10), children, wrongDescriptor).load(loaded))
+
+  test::assertEqual(provider.streams, previousStreams)
+
+  let badForeignMapping = new EntityMapping("LoadingChild", "children", [new MappingColumn("LoadingChild.id", "Int", "id"), new MappingColumn("LoadingChild.parentId", "Bool", "parent_id")], "id")
+  let wrongForeignQuery = new Query<LoadingChild>("children", new Decoder<LoadingChild>(decodeLoadingChild, childColumns), mapping: badForeignMapping, provider: provider, tracker: childTracker, changes: changes)
+  let previousReads = provider.reads
+
+  expectFailure(include(parents.take(10), wrongForeignQuery, relation).all())
+
+  test::assertEqual(provider.reads, previousReads)
+
+  let manyProvider = new LoadingProvider()
+
+  manyProvider.parentCount = 51
+  let manyChanges = new ChangeContext(manyProvider)
+  let manyParentTracker = new EntityTracker<LoadingParent>("parents", "id", parentColumns, captureLoadingParent)
+  let manyChildTracker = new EntityTracker<LoadingChild>("children", "id", childColumns, captureLoadingChild)
+
+  manyChanges.register(manyParentTracker.changeSet())
+  manyChanges.register(manyChildTracker.changeSet())
+  let manyParents = new Query<LoadingParent>("parents", new Decoder<LoadingParent>(decodeLoadingParent, parentColumns), mapping: parentMapping, provider: manyProvider, tracker: manyParentTracker, changes: manyChanges)
+  let manyChildren = new Query<LoadingChild>("children", new Decoder<LoadingChild>(decodeLoadingChild, childColumns), mapping: childMapping, provider: manyProvider, tracker: manyChildTracker, changes: manyChanges)
+  let wide = expectRows(include(manyParents.take(100), manyChildren, relation).all())
+
+  test::assertTrue(wide != null)
+  test::assertEqual(manyProvider.streams, 2)
+  if wide == null
+    return
+  end
+  let firstWide = wide.first()
+
+  test::assertTrue(firstWide != null)
+  if firstWide == null
+    return
+  end
+  let linked = firstWide.value.children[0]
+
+  manyProvider.brokenOnStream = 4
+  expectFailure(include(manyParents.take(100), manyChildren, relation).load(wide))
+
+  test::assertEqual(manyProvider.streams, 4)
+  test::assertEqual(firstWide.value.children.Length, 1)
+  test::assertTrue(reference::same(firstWide.value.children[0], linked))
+  var wideNode = firstWide.next
+
+  while wideNode != null
+    test::assertEqual(wideNode.value.children.Length, 0)
+    wideNode = wideNode.next
+  end
+
+  manyProvider.parentCount = 2
+  manyProvider.duplicateParent = true
+  manyProvider.brokenOnStream = 0
+  let duplicated = expectRows(include(manyParents.take(100), manyChildren, relation).all())
+
+  test::assertTrue(duplicated != null)
+  if duplicated != null
+    test::assertEqual(duplicated.count(), 2)
+    let firstDuplicate = duplicated.first()
+
+    if firstDuplicate != null
+      let secondDuplicate = firstDuplicate.next
+
+      if secondDuplicate != null
+        test::assertTrue(reference::same(firstDuplicate.value, secondDuplicate.value))
+        test::assertEqual(firstDuplicate.value.children.Length, 1)
+      end
+    end
+  end
+
+  test::assertTrue(manyChildTracker.remove(linked) == null)
+  if duplicated != null
+    expectFailure(include(manyParents.take(100), manyChildren, relation).load(duplicated))
+  end
+
+  test::assertEqual(firstWide.value.children.Length, 1)
+end

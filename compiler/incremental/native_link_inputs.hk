@@ -1,0 +1,376 @@
+use host
+use files
+use process
+
+# Darwin linkers record actual inputs and unsuccessful library searches using
+# dependency_info records: opcode byte, UTF-8 path, then NUL. Missing candidates
+# matter because a newly created library can shadow a previously selected one.
+class NativeLinkInputs
+  public inputs: StringBuffer = new StringBuffer()
+  public missing: StringBuffer = new StringBuffer()
+  public digests: StringBuffer = new StringBuffer()
+  public valid: Bool = false
+  public shared: StringBuffer = new StringBuffer()
+  public sharedDigest: String = ""
+  private cachedMetadata: String = ""
+  private cachedSnapshot: String = ""
+
+  def appendLoaded(paths: StringBuffer, candidates: StringBuffer): Bool
+    let known = new StringTable<Bool>()
+    let absent = new StringTable<Bool>()
+    let cached = new StringTable<Bool>()
+    var node = this.inputs.first.nextNode
+
+    while node != null
+      known.add(node.value, true)
+      node = node.nextNode
+    end
+    node = this.missing.first.nextNode
+    while node != null
+      absent.add(node.value, true)
+      node = node.nextNode
+    end
+    node = this.shared.first.nextNode
+    while node != null
+      cached.add(node.value, true)
+      node = node.nextNode
+    end
+    for loaded in [true, false]
+      node = (loaded ? paths : candidates).first.nextNode
+      while node != null
+        let path = node.value
+        let status = files::status(path)
+        let info = status.status
+
+        if !this.absolute(path) || status.failure != null || info == null
+          this.valid = false
+          return false
+        end
+        if info.exists
+          if (new RunCacheFile(path, true)).kind != 1
+            this.valid = false
+            return false
+          end
+          this.inputs.add(path) if known.add(path, true)
+        else if loaded
+          this.shared.add(path) if cached.add(path, true)
+          this.missing.add(path) if absent.add(path, true)
+        else
+          this.missing.add(path) if absent.add(path, true)
+        end
+        node = node.nextNode
+      end
+    end
+    return this.valid
+  end
+
+  def expectedSnapshot(): String
+    if !this.valid || this.inputs.size == 0 || this.inputs.size > 4096 || this.missing.size > 4096 || this.shared.size > 4096 || this.inputs.size != this.digests.size || (this.shared.size > 0 && !this.digestValid(this.sharedDigest))
+      return ""
+    end
+    let result = new StringBuffer()
+    var input = this.inputs.first.nextNode
+    var digestNode = this.digests.first.nextNode
+
+    while input != null && digestNode != null
+      let path = input.value
+      let digest = digestNode.value
+
+      if !this.absolute(path) || !this.digestValid(digest)
+        return ""
+      end
+      result.add(runCacheFrame(path))
+      result.add(runCacheFrame(digest))
+      input = input.nextNode
+      digestNode = digestNode.nextNode
+    end
+    for absent in [true, false]
+      let paths = absent ? this.missing : this.shared
+
+      result.add(runCacheFrame(absent ? "missing" : "shared"))
+      var node = paths.first.nextNode
+
+      while node != null
+        return "" if !this.absolute(node.value)
+        result.add(runCacheFrame(node.value))
+        node = node.nextNode
+      end
+    end
+    result.add(runCacheFrame(this.sharedDigest))
+    return result.join()
+  end
+
+  def metadataSnapshot(): String
+    let metadata = this.pathMetadataSnapshot()
+
+    return "" if metadata == ""
+    let shared = this.sharedIdentity()
+
+    if shared == null || this.pathMetadataSnapshot() != metadata
+      return ""
+    end
+    return metadata + runCacheFrame(shared)
+  end
+
+  private def pathMetadataSnapshot(): String
+    if !this.valid
+      return ""
+    end
+    let result = new StringBuffer()
+    var node = this.inputs.first.nextNode
+
+    while node != null
+      let info = new RunCacheFile(node.value, true)
+      let canonical = neriCanonicalPath(node.value)
+
+      if !this.absolute(node.value) || info.kind != 1 || info.fingerprint == "" || canonical == null
+        return ""
+      end
+      result.add(runCacheFrame(node.value))
+      result.add(runCacheFrame(canonical))
+      result.add(runCacheFrame(info.fingerprint))
+      node = node.nextNode
+    end
+    for absent in [true, false]
+      let paths = absent ? this.missing : this.shared
+
+      result.add(runCacheFrame(absent ? "missing" : "shared"))
+      node = paths.first.nextNode
+      while node != null
+        let status = files::status(node.value)
+        let info = status.status
+
+        if !this.absolute(node.value) || status.failure != null || info == null || (absent && info.exists)
+          return ""
+        end
+        result.add(runCacheFrame(node.value))
+        node = node.nextNode
+      end
+    end
+    return result.join()
+  end
+
+  private def absolute(path: String): Bool
+    if !bootstrapStartsWith(path, "/") || host::stringByteLength(path) > 4096
+      return false
+    end
+    var index = 0
+
+    while index < host::stringByteLength(path)
+      let byte = host::stringByteAt(path, index) as Int
+
+      return false if byte < 32 || byte == 127
+      index = index + 1
+    end
+    return true
+  end
+
+  private def digestValid(digest: String): Bool
+    if host::stringByteLength(digest) != 64
+      return false
+    end
+    var index = 0
+
+    while index < 64
+      let byte = host::stringByteAt(digest, index) as Int
+
+      return false if !((byte >= 48 && byte <= 57) || (byte >= 97 && byte <= 102))
+      index = index + 1
+    end
+    return true
+  end
+
+  private def sharedIdentity(): String?
+    if this.shared.size == 0
+      return ""
+    end
+    let codegen = host::environment("NERI_CODEGEN")
+
+    return null if codegen == null || this.shared.size > 4096
+    let options = new process::SpawnOptions(codegen)
+
+    options.arguments = ["--shared-cache-identity"]
+    var node = this.shared.first.nextNode
+
+    while node != null
+      return null if !this.absolute(node.value)
+      options.arguments = host::appendString(options.arguments, node.value)
+      node = node.nextNode
+    end
+    options.stdoutLimit = 65
+    options.stderrLimit = 4096
+    let child = process::spawn(options).child()
+
+    return null if child == null
+    let completed = child.wait(10000)
+
+    if completed.running || completed.failure != null
+      child.cancel()
+      child.dispose()
+      return null
+    end
+    let released = child.dispose()
+    let exit = completed.exit
+    let output = host::stringFromBytes(completed.stdout)
+
+    if !released || exit == null || !exit.isExited() || exit.value() != 0 || completed.stdoutTruncated || output == null || host::stringByteLength(output) != 65 || host::stringByteAt(output, 64) != 10 as Byte
+      return null
+    end
+    let digest = host::stringSlice(output, 0, 64)
+
+    return this.digestValid(digest) ? digest : null
+  end
+
+  def snapshot(): String
+    if !this.valid || this.inputs.size == 0 || this.inputs.size > 4096 || this.missing.size > 4096 || this.shared.size > 4096
+      return ""
+    end
+    let paths = this.pathMetadataSnapshot()
+
+    if paths == ""
+      return ""
+    end
+    # Shared identity describes the active cache, not bytes read by the file
+    # hash pass. One fresh query suffices; path metadata brackets both operations.
+    let shared = this.sharedIdentity()
+
+    if shared == null
+      return ""
+    end
+    let metadata = paths + runCacheFrame(shared)
+
+    if this.cachedSnapshot != "" && this.expectedSnapshot() == this.cachedSnapshot && metadata == this.cachedMetadata
+      return this.pathMetadataSnapshot() == paths ? this.cachedSnapshot : ""
+    end
+    this.cachedMetadata = ""
+    this.cachedSnapshot = ""
+    this.digests = new StringBuffer()
+    let hashed = new StringTable<String>()
+    var node = this.inputs.first.nextNode
+
+    while node != null
+      let path = node.value
+      let before = new RunCacheFile(path, true)
+      let canonical = neriCanonicalPath(path)
+
+      if !this.absolute(path) || before.kind != 1 || before.fingerprint == "" || canonical == null
+        return ""
+      end
+      let key = runCacheFrame(canonical) + runCacheFrame(before.fingerprint)
+      let cached = hashed.find(key)
+      let digest = cached == null ? nativeLinkFileDigest(path) : cached.value
+
+      if digest == "" || (new RunCacheFile(path, true)).fingerprint != before.fingerprint || neriCanonicalPath(path) != canonical
+        return ""
+      end
+      hashed.add(key, digest) if cached == null
+      # Loader-relative dependencies follow the resolved image location, even
+      # when a retargeted alias still names byte-identical library contents.
+      this.digests.add(sha256FastText(runCacheFrame(canonical) + runCacheFrame(digest)))
+      node = node.nextNode
+    end
+    node = this.missing.first.nextNode
+    while node != null
+      let path = node.value
+      let status = files::status(path)
+
+      if status.failure != null || status.status == null || status.status.exists
+        return ""
+      end
+      node = node.nextNode
+    end
+    this.sharedDigest = shared
+    let snapshot = this.expectedSnapshot()
+
+    if snapshot == "" || this.pathMetadataSnapshot() != paths
+      return ""
+    end
+    this.cachedMetadata = metadata
+    this.cachedSnapshot = snapshot
+    return snapshot
+  end
+
+  def load(path: String, objects: StringBuffer, output: String): Bool
+    this.valid = false
+    this.cachedMetadata = ""
+    this.cachedSnapshot = ""
+    this.inputs = new StringBuffer()
+    this.missing = new StringBuffer()
+    this.shared = new StringBuffer()
+    this.sharedDigest = ""
+    let text = host::readText(path)
+
+    if text == null || host::stringByteLength(text) > 4194304
+      return false
+    end
+    let length = host::stringByteLength(text)
+    var cursor = 0
+    var version = false
+    var complete = false
+    let inputNames = new StringTable<Bool>()
+    let missingNames = new StringTable<Bool>()
+    let objectNames = new StringTable<Bool>()
+    var object = objects.first.nextNode
+
+    while object != null
+      let absolute = host::pathAbsolute(object.value)
+      let canonical = neriCanonicalPath(object.value)
+
+      objectNames.add(absolute, true) if absolute != null
+      objectNames.add(canonical, true) if canonical != null
+      object = object.nextNode
+    end
+    let expectedOutput = host::pathAbsolute(output)
+
+    while cursor < length
+      let opcode = host::stringByteAt(text, cursor) as Int
+
+      cursor = cursor + 1
+      let start = cursor
+
+      while cursor < length && host::stringByteAt(text, cursor) != (0 as Byte)
+        cursor = cursor + 1
+      end
+      if cursor == length || cursor == start || complete
+        return false
+      end
+      let value = host::stringSlice(text, start, cursor - start)
+
+      cursor = cursor + 1
+      if opcode == 0
+        if version || start != 1
+          return false
+        end
+        version = true
+      else if !version
+        return false
+      else if opcode == 64
+        let absolute = host::pathAbsolute(value)
+
+        if absolute == null || expectedOutput == null || absolute != expectedOutput
+          return false
+        end
+        complete = true
+      else if opcode == 16 || opcode == 17
+        let absolute = host::pathAbsolute(value)
+
+        if absolute == null
+          return false
+        end
+        if opcode == 16
+          let canonical = neriCanonicalPath(value)
+
+          if objectNames.find(absolute) == null && (canonical == null || objectNames.find(canonical) == null) && inputNames.add(absolute, true)
+            this.inputs.add(absolute)
+          end
+        else if missingNames.add(absolute, true)
+          this.missing.add(absolute)
+        end
+      else
+        return false
+      end
+    end
+    this.valid = version && complete && this.inputs.size > 0
+    return this.valid
+  end
+end

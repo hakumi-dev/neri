@@ -1,0 +1,485 @@
+use tasks
+namespace neri_data
+
+## A validated migration with both schema directions and explicit data-loss flags.
+class SchemaMigrationPlan
+  private storedMigration: Migration
+  private storedBeforeSignature: String
+  private storedAfterSignature: String
+  private storedUpDataLoss: Bool
+  private storedDownDataLoss: Bool
+
+  internal def init(migration: Migration, beforeSignature: String, afterSignature: String, upDataLoss: Bool, downDataLoss: Bool): Void
+    this.storedMigration = migration.copy()
+    this.storedBeforeSignature = beforeSignature
+    this.storedAfterSignature = afterSignature
+    this.storedUpDataLoss = upDataLoss
+    this.storedDownDataLoss = downDataLoss
+  end
+
+  public readonly def migration(): Migration
+    return this.storedMigration.copy()
+  end
+
+  public readonly def beforeSignature(): String
+    return this.storedBeforeSignature
+  end
+
+  public readonly def afterSignature(): String
+    return this.storedAfterSignature
+  end
+
+  public readonly def upDataLoss(): Bool
+    return this.storedUpDataLoss
+  end
+
+  public readonly def downDataLoss(): Bool
+    return this.storedDownDataLoss
+  end
+end
+
+enum SchemaDiffResult
+  case Unchanged()
+  case Plan(value: SchemaMigrationPlan)
+  case Failure(error: MigrationFailure)
+end
+
+class SchemaDiffOpNode
+  internal value: SchemaOp
+  internal next: SchemaDiffOpNode?
+
+  internal def init(value: SchemaOp): Void
+    this.value = value
+  end
+end
+
+class SchemaDiffOps
+  private first: SchemaDiffOpNode?
+  private last: SchemaDiffOpNode?
+  internal count: Int = 0
+  internal dataLoss: Bool = false
+
+  internal def add(value: SchemaOp, losesData: Bool = false): Void
+    let node = new SchemaDiffOpNode(value)
+    let last = this.last
+
+    if last == null
+      this.first = node
+    else
+      last.next = node
+    end
+    this.last = node
+    this.count = this.count + 1
+    this.dataLoss = this.dataLoss || losesData
+  end
+
+  internal readonly def at(index: Int): readonly SchemaOp?
+    var current = this.first
+    var position = 0
+
+    while current != null
+      if position == index
+        return current.value
+      end
+      current = current.next
+      position = position + 1
+    end
+    return null
+  end
+
+  internal def array(): SchemaOp[]
+    return tasks::generate(this.count, 1) do |index|
+      let value = this.at(index)
+
+      if value == null
+        return SchemaOp.DropTable("__neri_invalid")
+      end
+      return schemaCloneOp(value)
+    end
+  end
+end
+
+def schemaDiffObjectCount(model: SchemaModel): Int
+  var count = model.count()
+  var tableIndex = 0
+
+  while tableIndex < model.count()
+    let table = model.at(tableIndex)
+
+    if table != null
+      count = count + table.count() + table.indexCount()
+    end
+    tableIndex = tableIndex + 1
+  end
+  return count
+end
+
+def schemaDiffFieldEqual(left: readonly SchemaColumn, right: readonly SchemaColumn): Bool
+  return schemaTypeCode(left.type()) == schemaTypeCode(right.type()) && left.nullable() == right.nullable() && left.primaryKey() == right.primaryKey() && schemaDefaultCode(left.defaultValue()) == schemaDefaultCode(right.defaultValue())
+end
+
+def schemaDiffNeedsRebuild(before: readonly SchemaTable, after: readonly SchemaTable): Bool
+  var index = 0
+
+  while index < before.count()
+    let field = before.at(index)
+
+    if field != null && !field.column().primaryKey()
+      let other = after.find(field.identity())
+
+      if other != null && !schemaDiffFieldEqual(field.column(), other.column())
+        return true
+      end
+    end
+    index = index + 1
+  end
+  return false
+end
+
+def schemaDiffRebuildLosesData(before: readonly SchemaTable, after: readonly SchemaTable): Bool
+  var index = 0
+
+  while index < before.count()
+    let field = before.at(index)
+
+    if field != null
+      let other = after.find(field.identity())
+
+      if other == null || schemaTypeCode(field.column().type()) != schemaTypeCode(other.column().type())
+        return true
+      end
+    end
+    index = index + 1
+  end
+  return false
+end
+
+def schemaDiffIndexEqual(left: readonly SchemaIndex, right: readonly SchemaIndex): Bool
+  if left.unique() != right.unique() || left.count() != right.count()
+    return false
+  end
+  var index = 0
+
+  while index < left.count()
+    if left.at(index) != right.at(index)
+      return false
+    end
+    index = index + 1
+  end
+  return true
+end
+
+def schemaDiffIndexTable(model: SchemaModel, name: String): readonly SchemaTable?
+  var index = 0
+
+  while index < model.count()
+    let table = model.at(index)
+
+    if table != null && table.findIndex(name) != null
+      return table
+    end
+    index = index + 1
+  end
+  return null
+end
+
+def schemaDiffIndexOwner(model: SchemaModel, name: String): readonly SchemaTable?
+  var tableIndex = 0
+
+  while tableIndex < model.count()
+    let table = model.at(tableIndex)
+
+    if table != null
+      var index = 0
+
+      while index < table.indexCount()
+        let item = table.indexAt(index)
+
+        if item != null && schemaSameIdentifier(item.name(), name)
+          return table
+        end
+        index = index + 1
+      end
+    end
+    tableIndex = tableIndex + 1
+  end
+  return null
+end
+
+def schemaDiffRebuildIndexTransfer(before: SchemaModel, after: SchemaModel): Bool
+  var tableIndex = 0
+
+  while tableIndex < before.count()
+    let table = before.at(tableIndex)
+
+    if table != null
+      var index = 0
+
+      while index < table.indexCount()
+        let item = table.indexAt(index)
+
+        if item != null
+          let newOwner = schemaDiffIndexOwner(after, item.name())
+
+          if newOwner != null && newOwner.identity() != table.identity()
+            let oldTarget = after.find(table.identity())
+            let newPrevious = before.find(newOwner.identity())
+
+            if (oldTarget != null && schemaDiffNeedsRebuild(table, oldTarget)) || (newPrevious != null && schemaDiffNeedsRebuild(newPrevious, newOwner))
+              return true
+            end
+          end
+        end
+        index = index + 1
+      end
+    end
+    tableIndex = tableIndex + 1
+  end
+  return false
+end
+
+def schemaDiffIndexSurvives(to: SchemaModel, table: readonly SchemaTable, index: readonly SchemaIndex): Bool
+  let otherTable = schemaDiffIndexTable(to, index.name())
+
+  if otherTable == null || otherTable.identity() != table.identity()
+    return false
+  end
+  let other = otherTable.findIndex(index.name())
+
+  return other != null && other.name() == index.name() && schemaDiffIndexEqual(index, other)
+end
+
+def schemaDiffTableConflict(from: SchemaModel, to: SchemaModel): String?
+  var index = 0
+
+  while index < to.count()
+    let target = to.at(index)
+
+    if target != null
+      var prior = 0
+
+      while prior < from.count()
+        let existing = from.at(prior)
+
+        if existing != null && existing.identity() != target.identity() && schemaSameIdentifier(existing.name(), target.name())
+          return "table physical name is reused by another identity"
+        end
+        prior = prior + 1
+      end
+      let previous = from.find(target.identity())
+
+      if previous != null && previous.name() != target.name() && schemaSameIdentifier(previous.name(), target.name())
+        return "table case-only rename is unsupported"
+      end
+    end
+    index = index + 1
+  end
+  return null
+end
+
+def schemaDiffDirection(from: SchemaModel, to: SchemaModel, ops: SchemaDiffOps): String?
+  let tableConflict = schemaDiffTableConflict(from, to)
+
+  if tableConflict != null
+    return tableConflict
+  end
+  var tableIndex = 0
+
+  while tableIndex < from.count()
+    let table = from.at(tableIndex)
+
+    if table != null
+      var index = 0
+
+      while index < table.indexCount()
+        let definition = table.indexAt(index)
+
+        let target = to.find(table.identity())
+
+        if definition != null && (target == null || !schemaDiffNeedsRebuild(table, target)) && !schemaDiffIndexSurvives(to, table, definition)
+          ops.add(SchemaOp.DropIndex(definition.name()))
+        end
+        index = index + 1
+      end
+    end
+    tableIndex = tableIndex + 1
+  end
+  tableIndex = 0
+
+  while tableIndex < from.count()
+    let table = from.at(tableIndex)
+
+    if table != null && to.find(table.identity()) == null
+      ops.add(SchemaOp.DropTable(table.name()), true)
+    end
+    tableIndex = tableIndex + 1
+  end
+  tableIndex = 0
+
+  while tableIndex < from.count()
+    let table = from.at(tableIndex)
+
+    if table != null
+      let target = to.find(table.identity())
+
+      if target != null && !schemaDiffNeedsRebuild(table, target) && table.name() != target.name()
+        ops.add(SchemaOp.RenameTable(table.name(), target.name()))
+      end
+    end
+    tableIndex = tableIndex + 1
+  end
+  tableIndex = 0
+
+  while tableIndex < from.count()
+    let table = from.at(tableIndex)
+
+    if table != null
+      let target = to.find(table.identity())
+
+      if target != null
+        let keyError = schemaRebuildValidation(table, target)
+
+        if keyError != null
+          return keyError
+        end
+        var fieldIndex = 0
+
+        if schemaDiffNeedsRebuild(table, target)
+          ops.add(SchemaOp.RebuildTable(table.copy(), target.copy()), schemaDiffRebuildLosesData(table, target))
+        end
+
+        if !schemaDiffNeedsRebuild(table, target)
+          fieldIndex = 0
+
+          while fieldIndex < table.count()
+            let field = table.at(fieldIndex)
+
+            if field != null
+              let other = target.find(field.identity())
+
+              if other == null
+                if field.column().primaryKey()
+                  return "primary key removal is unsupported"
+                end
+                ops.add(SchemaOp.DropColumn(target.name(), field.column().name()), true)
+              else if !schemaDiffFieldEqual(field.column(), other.column())
+                return "column type, nullability, default, or primary key change is unsupported"
+              end
+            end
+            fieldIndex = fieldIndex + 1
+          end
+          fieldIndex = 0
+
+          while fieldIndex < table.count()
+            let field = table.at(fieldIndex)
+
+            if field != null
+              let other = target.find(field.identity())
+
+              if other != null && field.column().name() != other.column().name()
+                ops.add(SchemaOp.RenameColumn(target.name(), field.column().name(), other.column().name()))
+              end
+            end
+            fieldIndex = fieldIndex + 1
+          end
+          fieldIndex = 0
+
+          while fieldIndex < target.count()
+            let field = target.at(fieldIndex)
+
+            if field != null && table.find(field.identity()) == null
+              let column = field.column()
+
+              if column.primaryKey() || (!column.nullable() && column.defaultValue() == null)
+                return "added column requires nullable or defaulted non-primary-key definition"
+              end
+              ops.add(SchemaOp.AddColumn(target.name(), new SchemaColumn(column.name(), schemaCloneType(column.type()), column.nullable(), false, schemaCloneDefault(column.defaultValue()))))
+            end
+            fieldIndex = fieldIndex + 1
+          end
+        end
+      end
+    end
+    tableIndex = tableIndex + 1
+  end
+  tableIndex = 0
+
+  while tableIndex < to.count()
+    let table = to.at(tableIndex)
+
+    if table != null && from.find(table.identity()) == null
+      ops.add(schemaTableCreate(table))
+    end
+    tableIndex = tableIndex + 1
+  end
+  tableIndex = 0
+
+  while tableIndex < to.count()
+    let table = to.at(tableIndex)
+
+    if table != null
+      var index = 0
+
+      while index < table.indexCount()
+        let definition = table.indexAt(index)
+
+        let previous = from.find(table.identity())
+
+        if definition != null && (previous == null || !schemaDiffNeedsRebuild(previous, table)) && !schemaDiffIndexSurvives(from, table, definition)
+          ops.add(schemaIndexCreate(table, definition))
+        end
+        index = index + 1
+      end
+    end
+    tableIndex = tableIndex + 1
+  end
+  return null
+end
+
+## Computes an all-or-nothing migration and validates both directions.
+def diffSchema(id: String, before: SchemaModel, after: SchemaModel): SchemaDiffResult
+  if !identifierValid(id) || schemaReserved(id)
+    return SchemaDiffResult.Failure(MigrationFailure.Validation("invalid or reserved migration id"))
+  end
+  let beforeError = before.validate()
+
+  if beforeError != null
+    return SchemaDiffResult.Failure(MigrationFailure.Validation(beforeError))
+  end
+  let afterError = after.validate()
+
+  if afterError != null
+    return SchemaDiffResult.Failure(MigrationFailure.Validation(afterError))
+  end
+  if schemaDiffObjectCount(before) > 1000 || schemaDiffObjectCount(after) > 1000
+    return SchemaDiffResult.Failure(MigrationFailure.Unsupported("schema diff exceeds 1000 objects"))
+  end
+  if schemaDiffRebuildIndexTransfer(before, after)
+    return SchemaDiffResult.Failure(MigrationFailure.Unsupported("index name ownership transfer with table rebuild is unsupported"))
+  end
+  let beforeSignature = before.signature()
+  let afterSignature = after.signature()
+
+  if beforeSignature == afterSignature
+    return SchemaDiffResult.Unchanged()
+  end
+  let up = new SchemaDiffOps()
+  let upError = schemaDiffDirection(before, after, up)
+
+  if upError != null
+    return SchemaDiffResult.Failure(MigrationFailure.Unsupported(upError))
+  end
+  let down = new SchemaDiffOps()
+  let downError = schemaDiffDirection(after, before, down)
+
+  if downError != null
+    return SchemaDiffResult.Failure(MigrationFailure.Unsupported(downError))
+  end
+  let migration = new Migration(id, up.array(), down.array())
+  let invalid = new MigrationSet([migration]).validate()
+
+  if invalid != null
+    return SchemaDiffResult.Failure(MigrationFailure.Validation(invalid))
+  end
+  return SchemaDiffResult.Plan(new SchemaMigrationPlan(migration, beforeSignature, afterSignature, up.dataLoss, down.dataLoss))
+end

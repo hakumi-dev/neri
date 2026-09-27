@@ -32,9 +32,28 @@ its own source files, including helpers. Adding a case requires its project and
 assertions; the runner has no case-name registry. Diagnostic fixtures and tests
 requiring external processes or arguments use their corresponding harnesses.
 
+Applications can use `test::Suite` to report named cases. Register each case with
+`suite.add("name") do |context| ... end` and finish `main` with
+`host::exit(suite.run())`. The context supplies a unique `directory` for that
+case; the runner removes it after the child exits. Each case runs in a fresh copy
+of the test executable, so a fatal `test::assert*` panic fails only that case.
+The parent prints `RUN`, `PASS` or `FAIL` with elapsed milliseconds, forwards
+captured stdout and stderr under labels, then prints a count and duration summary.
+It continues after failed cases and exits 1 if any case fails. A child that exits
+zero before its callback returns fails because it did not write a completion
+receipt. Cases have a 60-second limit and 1 MiB capture limit per output stream;
+timeouts fail the case, while truncated output is reported. Empty suites and duplicate or
+nonprintable case names fail before execution. Registration order is stable, and
+test main must construct the same suite when reinvoked as a child.
+
 The hello and functions programs in `examples/` run as language cases. The package
 gate additionally checks the documented arguments example through the installed
 launcher. These checks keep the getting-started commands executable.
+The full gate also builds SQLite lifecycle, persistence, streaming and concurrency
+contracts in Debug and Release. Separate worker heaps exercise writer contention,
+stale updates, rollback on return or failure, cooperative job cancellation and
+interrupted reads against temporary databases. The installed Data consumer uses
+`SQLiteSession` to check that scoped connection ownership is packaged correctly.
 The run-cache sequence protects reuse, fresh arguments and exit status, source
 and toolchain invalidation, optimization-mode separation, bypass and diagnostics.
 It uses an isolated private cache and asserts behavior rather than timing.

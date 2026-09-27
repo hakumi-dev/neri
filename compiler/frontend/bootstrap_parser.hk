@@ -19,13 +19,12 @@ class BootstrapParser
   public blocks: SyntaxBlock?
   private activeBlock: SyntaxBlock?
 
-  def beginBlock(token: Int = -1): SyntaxBlock?
+  def beginBlock(kind: readonly BlockKind, token: Int = -1): SyntaxBlock?
     if !this.recordBlocks
       return null
     end
-    let block = new SyntaxBlock(this.tokens.kindAt(token < 0 ? this.currentIndex() : token))
+    let block = new SyntaxBlock(kind)
 
-    block.kind = this.tokens.kindAt(token < 0 ? this.currentIndex() : token)
     block.start = this.tokens.startAt(token < 0 ? this.currentIndex() : token)
     block.diagnosticsBefore = this.diagnostics.count()
     block.parent = this.activeBlock
@@ -94,8 +93,11 @@ class BootstrapParser
     return this.tokens.kindAt(this.currentIndex())
   end
 
-  def atContextualIdentifier(text: String): Bool
-    return this.currentKind().isIdentifier() && this.tokens.textAt(this.currentIndex()) == text
+  def contextualRole(offset: Int = 0): readonly ContextualRole
+    if !this.peekKind(offset).isIdentifier()
+      return this.arena.contextualRoles.getUnknown()
+    end
+    return this.arena.contextualRoles.recognizeSource(this.tokens.textAt(this.peekIndex(offset)))
   end
 
   def peekKind(offset: Int): readonly TokenKind
@@ -314,7 +316,7 @@ class BootstrapParser
 
       this.diagnostics.add("NR222", this.tokens.startAt(token), this.tokens.lengthAt(token), "Type nesting limit exceeded (64 levels).")
       this.skipToEndOfLine()
-      return this.leaf(this.arena.kinds.getType(), "<error>")
+      return this.arena.addType(TypeSyntax.form(this.arena, this.arena.typeKinds.getError()), [])
     end
     this.typeDepth = this.typeDepth + 1
     let result = this.parseTypeCore(allowFixedArray)
@@ -324,24 +326,33 @@ class BootstrapParser
   end
 
   def parseTypeCore(allowFixedArray: Bool): Int
-    if this.currentKind().isIdentifier() && this.tokens.textAt(this.currentIndex()) == "readonly"
+    if this.contextualRole().isReadonly()
       let keyword = this.next()
       let inner = this.parseTypeName(allowFixedArray)
 
-      return this.anchorToken(this.addNode(this.arena.kinds.getType(), "#readonly", [inner]), keyword)
+      return this.anchorToken(this.arena.addType(TypeSyntax.form(this.arena, this.arena.typeKinds.getReadonly()), [inner]), keyword)
     end
-    if this.currentKind().isIdentifier() && this.tokens.textAt(this.currentIndex()) == "fields" && this.peekKind(1).isIdentifier() && this.tokens.textAt(this.peekIndex(1)) == "of"
+    if this.contextualRole().isFields() && this.contextualRole(1).isOf()
       let keyword = this.next()
 
       this.next()
       let inner = this.parseTypeName(allowFixedArray)
 
-      return this.anchorToken(this.addNode(this.arena.kinds.getType(), "#fields", [inner]), keyword)
+      return this.anchorToken(this.arena.addType(TypeSyntax.form(this.arena, this.arena.typeKinds.getFields()), [inner]), keyword)
     end
-    var qualifier = ""
+    var flavor = this.arena.functionFlavors.getOrdinary()
+    let role = this.contextualRole()
 
-    if this.currentKind().isIdentifier() && (this.tokens.textAt(this.currentIndex()) == "shared" || this.tokens.textAt(this.currentIndex()) == "parallel" || this.tokens.textAt(this.currentIndex()) == "quote" || this.tokens.textAt(this.currentIndex()) == "cabi") && this.peekKind(1).isFn()
-      qualifier = this.tokens.textAt(this.currentIndex()) + " "
+    if (role.isShared() || role.isParallel() || role.isQuote() || role.isCabi()) && this.peekKind(1).isFn()
+      if role.isShared()
+        flavor = this.arena.functionFlavors.getShared()
+      else if role.isParallel()
+        flavor = this.arena.functionFlavors.getParallel()
+      else if role.isQuote()
+        flavor = this.arena.functionFlavors.getQuotation()
+      else
+        flavor = this.arena.functionFlavors.getCAbi()
+      end
       this.next()
     end
     if this.currentKind().isFn()
@@ -362,7 +373,7 @@ class BootstrapParser
       this.expect(this.tokens.kinds.getRParen())
       this.expect(this.tokens.kinds.getColon())
       types = host::appendInt(types, this.parseTypeName())
-      return this.anchorToken(this.addNode(this.arena.kinds.getType(), qualifier + "fn", types), keyword)
+      return this.anchorToken(this.arena.addType(TypeSyntax.function(this.arena, flavor), types), keyword)
     end
     var name = -1
     var grouped = false
@@ -383,14 +394,14 @@ class BootstrapParser
     var previousLength = this.lastTokenLength
     var pointerStart = -1
     var pointerLength = 0
-    var suffixes = ""
+    var suffixes: readonly TypeSuffix? = null
 
     while true
       if this.currentKind().isLBracket() && this.peekKind(1).isRBracket()
         this.next()
         let rightBracket = this.next()
 
-        suffixes = suffixes + "[]"
+        suffixes = new TypeSuffix(this.arena.typeSuffixes.getManagedArray(), suffixes)
         previousStart = this.tokens.startAt(rightBracket)
         previousLength = this.tokens.lengthAt(rightBracket)
       else if allowFixedArray && this.currentKind().isLBracket() && this.peekKind(1).isIntLiteral()
@@ -398,13 +409,13 @@ class BootstrapParser
         let count = this.next()
         let rightBracket = this.expect(this.tokens.kinds.getRBracket())
 
-        suffixes = suffixes + "[" + this.tokens.textAt(count) + "]"
+        suffixes = new TypeSuffix(this.arena.typeSuffixes.getFixedArray(), suffixes, this.tokens.textAt(count))
         previousStart = this.tokens.startAt(rightBracket)
         previousLength = this.tokens.lengthAt(rightBracket)
       else if this.currentKind().isQuestion()
         let question = this.next()
 
-        suffixes = suffixes + "?"
+        suffixes = new TypeSuffix(this.arena.typeSuffixes.getOptional(), suffixes)
         previousStart = this.tokens.startAt(question)
         previousLength = this.tokens.lengthAt(question)
       else
@@ -413,7 +424,7 @@ class BootstrapParser
         if this.currentKind().isStar() && adjacent
           let star = this.next()
 
-          suffixes = suffixes + "*"
+          suffixes = new TypeSuffix(this.arena.typeSuffixes.getPointer(), suffixes)
           previousStart = this.tokens.startAt(star)
           previousLength = this.tokens.lengthAt(star)
           if pointerStart < 0
@@ -426,12 +437,13 @@ class BootstrapParser
       end
     end
     let children = appendChild(emptyInts(), name)
-    let typeNode = this.anchorNode(this.addNode(this.arena.kinds.getType(), (grouped ? "#group" : this.arena.dataAt(name)) + suffixes, children), name)
+    let typeSyntax = grouped ? TypeSyntax.form(this.arena, this.arena.typeKinds.getGrouped(), suffixes) : TypeSyntax.named(this.arena, this.arena.dataAt(name), suffixes)
+    let typeNode = this.anchorNode(this.arena.addType(typeSyntax, children), name)
 
     this.arena.nodeAt(typeNode).typeArguments = typeArguments
     if pointerStart >= 0
       this.arena.setSecondaryAnchor(typeNode, pointerStart, pointerLength)
-    else if suffixes != ""
+    else if suffixes != null
       this.arena.setSecondaryAnchor(typeNode, previousStart, previousLength)
     end
     return typeNode
@@ -482,7 +494,7 @@ class BootstrapParser
       else if this.currentKind().isStruct() || this.currentKind().isUnion()
         records = host::appendInt(records, parseNativeRecord(this, currentNamespace))
         this.skipNewLines()
-      else if this.atContextualIdentifier("contract")
+      else if this.contextualRole().isContract()
         contracts = host::appendInt(contracts, this.parseContract(currentNamespace))
         this.skipNewLines()
       else
@@ -516,9 +528,9 @@ class BootstrapParser
     for item in namespaces
       children = host::appendInt(children, item)
     end
-    let data = (uses.Length as String) + "|" + (classes.Length as String) + "|" + (functions.Length as String) + "|" + (records.Length as String) + "|" + (contracts.Length as String) + "|" + (namespaces.Length as String)
+    let data = new SyntaxProgram(uses.Length, classes.Length, functions.Length, records.Length, contracts.Length, namespaces.Length)
 
-    return this.addNode(this.arena.kinds.getProgram(), data, children)
+    return this.arena.addProgram(data, children)
   end
 
   def parseSubmission(): SubmissionSyntax
@@ -561,7 +573,7 @@ class BootstrapParser
       else if this.currentKind().isStruct() || this.currentKind().isUnion()
         records = host::appendInt(records, parseNativeRecord(this, currentNamespace))
         declaration = true
-      else if this.atContextualIdentifier("contract")
+      else if this.contextualRole().isContract()
         contracts = host::appendInt(contracts, this.parseContract(currentNamespace))
         declaration = true
       else
@@ -584,7 +596,7 @@ class BootstrapParser
       end
     end
     var returnChildren: Int[] = []
-    let returnType = this.addNode(this.arena.kinds.getType(), "Void", emptyInts())
+    let returnType = this.arena.addType(TypeSyntax.named(this.arena, "Void"), [])
 
     returnChildren = host::appendInt(returnChildren, returnType)
     for statement in statements
@@ -601,7 +613,7 @@ class BootstrapParser
     for item in records children = host::appendInt(children, item) end
     for item in contracts children = host::appendInt(children, item) end
     for item in namespaces children = host::appendInt(children, item) end
-    result.root = this.addNode(this.arena.kinds.getProgram(), (uses.Length as String) + "|" + (classes.Length as String) + "|" + (functions.Length as String) + "|" + (records.Length as String) + "|" + (contracts.Length as String) + "|" + (namespaces.Length as String), children)
+    result.root = this.arena.addProgram(new SyntaxProgram(uses.Length, classes.Length, functions.Length, records.Length, contracts.Length, namespaces.Length), children)
     result.declarationCount = classes.Length + functions.Length + records.Length + contracts.Length - 1
     result.statementCount = statements.Length
     result.status = this.submissionStatus()
@@ -690,9 +702,13 @@ class BootstrapParser
         this.next()
         if !this.currentKind().isRParen()
           while true
-            let argument = this.expect(this.tokens.kinds.getStringLiteral())
+            if this.tokens.textAt(name) == "operation" && arguments.Length == 1 && this.currentKind().isIdentifier()
+              arguments = host::appendInt(arguments, this.parseQualifiedIdentifier(this.arena.kinds.getName()))
+            else
+              let argument = this.expect(this.tokens.kinds.getStringLiteral())
 
-            arguments = host::appendInt(arguments, this.leaf(this.arena.kinds.getStringLiteral(), this.tokens.textAt(argument)))
+              arguments = host::appendInt(arguments, this.leaf(this.arena.kinds.getStringLiteral(), this.tokens.textAt(argument)))
+            end
             if this.accept(this.tokens.kinds.getComma())
               this.skipNewLines()
             else
@@ -751,7 +767,7 @@ class BootstrapParser
   end
 
   def parseFunction(namespaceName: String, annotations: Int[], modifiers: Int[] = []): Int
-    let block = this.beginBlock()
+    let block = this.beginBlock(this.arena.blockKinds.getFunction())
     let prefix = modifiers.Length > 0 ? modifiers : this.parseDeclarationModifiers()
     let isStatic = syntaxModifierIn(this.arena, prefix, this.arena.modifiers.getStatic()) >= 0
     let isUnsafe = syntaxModifierIn(this.arena, prefix, this.arena.modifiers.getUnsafe()) >= 0
@@ -822,7 +838,7 @@ class BootstrapParser
       this.skipNewLines()
       var parameterMode = this.arena.parameterModes.getOrdinary()
 
-      if this.currentKind().isIdentifier() && this.tokens.textAt(this.currentIndex()) == "labels" && this.peekKind(1).isIdentifier() && this.peekKind(2).isColon()
+      if this.contextualRole().isLabels() && this.peekKind(1).isIdentifier() && this.peekKind(2).isColon()
         let labels = this.next()
 
         parameterMode = this.arena.parameterModes.getLabels()
@@ -881,7 +897,7 @@ class BootstrapParser
   end
 
   def parseClass(namespaceName: String, annotations: Int[] = []): Int
-    let block = this.beginBlock()
+    let block = this.beginBlock(this.arena.blockKinds.getType())
     let modifiers = this.parseDeclarationModifiers()
     let access = syntaxModifierAccess(this.arena, modifiers, this.arena.accesses.getInternal())
     let isResource = syntaxModifierIn(this.arena, modifiers, this.arena.modifiers.getResource()) >= 0
@@ -923,7 +939,7 @@ class BootstrapParser
     this.arena.nodeAt(result).classAnnotations = annotations
     this.arena.nodeAt(result).modifiers = modifiers
     if block != null
-      block.kind = this.tokens.kinds.getClass()
+      block.kind = this.arena.blockKinds.getType()
       block.syntaxNode = result
     end
     return result
@@ -931,7 +947,7 @@ class BootstrapParser
 
   # Alternatives use the class declaration family with explicit typed metadata.
   def parseEnum(namespaceName: String, annotations: Int[] = []): Int
-    let block = this.beginBlock()
+    let block = this.beginBlock(this.arena.blockKinds.getType())
     let modifiers = this.parseDeclarationModifiers()
     let access = syntaxModifierAccess(this.arena, modifiers, this.arena.accesses.getInternal())
 
@@ -967,7 +983,7 @@ class BootstrapParser
     this.arena.nodeAt(result).classAnnotations = annotations
     this.arena.nodeAt(result).modifiers = modifiers
     if block != null
-      block.kind = this.tokens.kinds.getClass()
+      block.kind = this.arena.blockKinds.getType()
       block.syntaxNode = result
     end
     return result
@@ -988,7 +1004,7 @@ class BootstrapParser
   end
 
   def parseContract(namespaceName: String): Int
-    let block = this.beginBlock()
+    let block = this.beginBlock(this.arena.blockKinds.getContract())
 
     this.next()
     let name = this.expect(this.tokens.kinds.getIdentifier())
@@ -1103,7 +1119,7 @@ class BootstrapParser
         this.diagnostics.add("NR007", this.tokens.startAt(unexpected), this.tokens.lengthAt(unexpected), "Postfix if ends at the newline; else, end, and chained modifiers are not allowed.")
         this.skipToEndOfLine()
       end
-      statement = this.anchorToken(this.addNode(this.arena.kinds.getIf(), "1|0", [condition, statement]), keyword)
+      statement = this.anchorToken(this.arena.addPartition(new SyntaxPartition(this.arena.kinds.getIf(), 1, 0), [condition, statement]), keyword)
     end
     if statement >= 0
       this.arena.setStatementStart(statement, this.tokens.startAt(statementStart))
@@ -1113,7 +1129,7 @@ class BootstrapParser
   end
 
   def parseMatch(): Int
-    let block = this.beginBlock()
+    let block = this.beginBlock(this.arena.blockKinds.getMatch())
     let keyword = this.expect(this.tokens.kinds.getMatch())
     let value = this.parseExpression(0)
 
@@ -1126,7 +1142,7 @@ class BootstrapParser
       if this.currentKind().isEnd() || this.currentKind().isEndOfFile()
         break
       end
-      let arm = this.beginBlock()
+      let arm = this.beginBlock(this.arena.blockKinds.getMatchCase())
       let caseKeyword = this.expect(this.tokens.kinds.getCase())
       let name = this.parseQualifiedName()
 
@@ -1172,7 +1188,7 @@ class BootstrapParser
       for statement in body
         children = host::appendInt(children, statement)
       end
-      cases = host::appendInt(cases, this.anchorToken(this.addNode(this.arena.kinds.getMatchCase(), (bindings.Length as String) + "|" + (body.Length as String), children), caseKeyword))
+      cases = host::appendInt(cases, this.anchorToken(this.arena.addPartition(new SyntaxPartition(this.arena.kinds.getMatchCase(), bindings.Length, body.Length), children), caseKeyword))
     end
     this.closeBlock(block)
     this.expect(this.tokens.kinds.getEnd())
@@ -1181,7 +1197,7 @@ class BootstrapParser
     for item in cases
       children = host::appendInt(children, item)
     end
-    return this.anchorToken(this.addNode(this.arena.kinds.getMatch(), cases.Length as String, children), keyword)
+    return this.anchorToken(this.addNode(this.arena.kinds.getMatch(), "", children), keyword)
   end
 
   def parseNamedStatementOrRecover(allowExpression: Bool = false): Int
@@ -1284,7 +1300,7 @@ class BootstrapParser
   end
 
   def parseIf(sharedEnd: SyntaxBlock? = null): Int
-    let block = this.beginBlock()
+    let block = this.beginBlock(this.arena.blockKinds.getIf())
     let keyword = this.expect(this.tokens.kinds.getIf())
     let condition = this.parseExpression(0)
 
@@ -1320,7 +1336,7 @@ class BootstrapParser
       let chained = this.currentKind().isIf()
 
       if !chained
-        let branch = this.beginBlock(this.currentIndex() - 1)
+        let branch = this.beginBlock(this.arena.blockKinds.getElse(), this.currentIndex() - 1)
 
         if branch != null
           branch.sharedEnd = block
@@ -1339,7 +1355,7 @@ class BootstrapParser
         for statement in elseBody
           nestedChildren = host::appendInt(nestedChildren, statement)
         end
-        return this.anchorToken(this.addNode(this.arena.kinds.getIf(), (thenBody.Length as String) + "|" + (elseBody.Length as String), nestedChildren), keyword)
+        return this.anchorToken(this.arena.addPartition(new SyntaxPartition(this.arena.kinds.getIf(), thenBody.Length, elseBody.Length), nestedChildren), keyword)
       end
       while !this.currentKind().isEnd() && !this.currentKind().isEndOfFile()
         elseBody = appendChild(elseBody, this.parseStatementOrRecover())
@@ -1360,11 +1376,11 @@ class BootstrapParser
     for statement in elseBody
       children = host::appendInt(children, statement)
     end
-    return this.anchorToken(this.addNode(this.arena.kinds.getIf(), (thenBody.Length as String) + "|" + (elseBody.Length as String), children), keyword)
+    return this.anchorToken(this.arena.addPartition(new SyntaxPartition(this.arena.kinds.getIf(), thenBody.Length, elseBody.Length), children), keyword)
   end
 
   def parseWhile(): Int
-    let block = this.beginBlock()
+    let block = this.beginBlock(this.arena.blockKinds.getWhile())
     let keyword = this.expect(this.tokens.kinds.getWhile())
     let condition = this.parseExpression(0)
 
@@ -1382,11 +1398,11 @@ class BootstrapParser
     for statement in body
       children = host::appendInt(children, statement)
     end
-    return this.anchorToken(this.addNode(this.arena.kinds.getWhile(), body.Length as String, children), keyword)
+    return this.anchorToken(this.addNode(this.arena.kinds.getWhile(), "", children), keyword)
   end
 
   def parseFor(): Int
-    let block = this.beginBlock()
+    let block = this.beginBlock(this.arena.blockKinds.getFor())
     let keyword = this.expect(this.tokens.kinds.getFor())
     let name = this.expect(this.tokens.kinds.getIdentifier())
     var typeNode = -1
@@ -1412,14 +1428,14 @@ class BootstrapParser
     for statement in body
       children = host::appendInt(children, statement)
     end
-    let node = this.anchorToken(this.addNode(this.arena.kinds.getFor(), this.tokens.textAt(name) + "|" + (body.Length as String), children), name)
+    let node = this.anchorToken(this.addNode(this.arena.kinds.getFor(), this.tokens.textAt(name), children), name)
 
     this.arena.setIrAnchor(node, this.tokens.startAt(keyword), this.tokens.lengthAt(keyword))
     return node
   end
 
   def parseUnsafeBlock(): Int
-    let block = this.beginBlock()
+    let block = this.beginBlock(this.arena.blockKinds.getUnsafe())
     let keyword = this.expect(this.tokens.kinds.getUnsafe())
 
     this.openBlock(block)
@@ -1431,11 +1447,11 @@ class BootstrapParser
     end
     this.closeBlock(block)
     this.expect(this.tokens.kinds.getEnd())
-    return this.anchorToken(this.addNode(this.arena.kinds.getUnsafeBlock(), body.Length as String, body), keyword)
+    return this.anchorToken(this.addNode(this.arena.kinds.getUnsafeBlock(), "", body), keyword)
   end
 
   def parseBorrowBlock(): Int
-    let block = this.beginBlock()
+    let block = this.beginBlock(this.arena.blockKinds.getBorrow())
     let keyword = this.expect(this.tokens.kinds.getBorrow())
     let owner = this.parseExpression(25)
 
@@ -1456,14 +1472,14 @@ class BootstrapParser
     for statement in body
       children = host::appendInt(children, statement)
     end
-    let node = this.anchorToken(this.addNode(this.arena.kinds.getBorrowBlock(), this.tokens.textAt(pointer) + "|" + (body.Length as String), children), pointer)
+    let node = this.anchorToken(this.addNode(this.arena.kinds.getBorrowBlock(), this.tokens.textAt(pointer), children), pointer)
 
     this.arena.setIrAnchor(node, this.tokens.startAt(keyword), this.tokens.lengthAt(keyword))
     return node
   end
 
   def parseUsingBlock(): Int
-    let block = this.beginBlock()
+    let block = this.beginBlock(this.arena.blockKinds.getUsing())
     let keyword = this.expect(this.tokens.kinds.getUsing())
     let name = this.expect(this.tokens.kinds.getIdentifier())
 
@@ -1485,7 +1501,7 @@ class BootstrapParser
     for statement in body
       children = appendChild(children, statement)
     end
-    return this.anchorToken(this.addNode(this.arena.kinds.getUsingBlock(), this.tokens.textAt(name) + "|" + (body.Length as String), children), keyword)
+    return this.anchorToken(this.addNode(this.arena.kinds.getUsingBlock(), this.tokens.textAt(name), children), keyword)
   end
 
   def parseExpression(parentPrecedence: Int): Int
@@ -1507,8 +1523,12 @@ class BootstrapParser
       let operation = this.next()
       let operand = this.parseExpression(unary)
 
-      left = this.anchorToken(this.addNode(this.arena.kinds.getUnary(), "", appendChild(emptyInts(), operand)), operation)
-      this.arena.nodeAt(left).operatorKind = this.tokens.kindAt(operation)
+      if this.tokens.kindAt(operation).isTry()
+        left = this.anchorToken(this.addNode(this.arena.kinds.getTry(), "", appendChild(emptyInts(), operand)), operation)
+      else
+        left = this.anchorToken(this.addNode(this.arena.kinds.getUnary(), "", appendChild(emptyInts(), operand)), operation)
+        this.arena.nodeAt(left).operatorKind = this.tokens.kindAt(operation)
+      end
     else
       left = this.parsePrimary()
     end
@@ -1558,7 +1578,7 @@ class BootstrapParser
     let kind = this.currentKind()
     var left = -1
 
-    if kind.isIdentifier() && this.tokens.textAt(this.currentIndex()) == "quote" && this.peekKind(1).isDo()
+    if this.contextualRole().isQuote() && this.peekKind(1).isDo()
       let keyword = this.next()
       let closure = this.parseClosure(true)
 
@@ -1636,7 +1656,7 @@ class BootstrapParser
         for argument in arguments
           children = host::appendInt(children, argument)
         end
-        left = this.anchorNode(this.addNode(this.arena.kinds.getCall(), arguments.Length as String, children), left)
+        left = this.anchorNode(this.addNode(this.arena.kinds.getCall(), "", children), left)
       else if this.currentKind().isDo()
         let token = this.currentIndex()
         let callable = this.arena.kindAt(left).isCall() || this.arena.kindAt(left).isNew()
@@ -1650,7 +1670,7 @@ class BootstrapParser
           let node = this.arena.nodeAt(left)
 
           node.children = host::appendInt(node.children, closure)
-          node.data = (node.children.Length - 1) as String
+          node.data = ""
         end
         if !this.currentKind().isNewLine() && !this.currentKind().isEndOfFile()
           let following = this.currentIndex()
@@ -1680,7 +1700,7 @@ class BootstrapParser
   end
 
   def parseClosure(block: Bool = false): Int
-    let syntaxBlock = this.beginBlock()
+    let syntaxBlock = this.beginBlock(this.arena.blockKinds.getClosure())
     var keyword = -1
     var terminator = this.tokens.kinds.getRParen()
     var hasParameters = true
@@ -1715,7 +1735,7 @@ class BootstrapParser
       this.skipNewLines()
       this.expect(terminator)
     end
-    var result = this.anchorToken(this.leaf(this.arena.kinds.getType(), ""), keyword)
+    var result = this.anchorToken(this.arena.addType(TypeSyntax.form(this.arena, this.arena.typeKinds.getInferred()), []), keyword)
 
     if this.accept(this.tokens.kinds.getColon())
       result = this.parseTypeName()
@@ -1738,13 +1758,13 @@ class BootstrapParser
     this.closeBlock(syntaxBlock)
     this.expect(this.tokens.kinds.getEnd())
     this.argumentDepth = outerArgumentDepth
-    return this.anchorToken(this.addNode(this.arena.kinds.getClosure(), parameters.Length as String, children), keyword)
+    return this.anchorToken(this.arena.addPartition(new SyntaxPartition(this.arena.kinds.getClosure(), parameters.Length, children.Length - parameters.Length - 1), children), keyword)
   end
 
   def parseMissingArgumentExpression(terminator: readonly TokenKind, anchor: Int): Int
     let kind = this.currentKind()
 
-    if kind.same(terminator) || kind.isComma() || kind.isNewLine() || kind.isEnd() || kind.isEndOfFile() || kind.isAt() || kind.isUse() || kind.isNamespace() || kind.isStruct() || kind.isUnion() || kind.isDef() || kind.isClass() || kind.isEnum() || this.atContextualIdentifier("contract")
+    if kind.same(terminator) || kind.isComma() || kind.isNewLine() || kind.isEnd() || kind.isEndOfFile() || kind.isAt() || kind.isUse() || kind.isNamespace() || kind.isStruct() || kind.isUnion() || kind.isDef() || kind.isClass() || kind.isEnum() || this.contextualRole().isContract()
       let index = this.currentIndex()
 
       this.diagnostics.add("NR001", this.diagnosticStart(index), this.atSourceBoundary(index) ? 1 : this.tokens.lengthAt(index), "Expected an expression after the named argument label.")
@@ -1810,7 +1830,7 @@ class BootstrapParser
 
     this.skipNewLines()
     this.expect(this.tokens.kinds.getRBracket())
-    return this.anchorToken(this.addNode(this.arena.kinds.getArrayLiteral(), elements.Length as String, elements), bracket)
+    return this.anchorToken(this.addNode(this.arena.kinds.getArrayLiteral(), "", elements), bracket)
   end
 
   def parseNewExpression(): Int
@@ -1828,7 +1848,7 @@ class BootstrapParser
     for argument in arguments
       children = host::appendInt(children, argument)
     end
-    return this.anchorToken(this.addNode(this.arena.kinds.getNew(), arguments.Length as String, children), keyword)
+    return this.anchorToken(this.addNode(this.arena.kinds.getNew(), "", children), keyword)
   end
 
   def parseStackAlloc(): Int
@@ -1866,7 +1886,7 @@ class BootstrapParser
     for argument in arguments
       children = host::appendInt(children, argument)
     end
-    let result = this.addNode(this.arena.kinds.getNativeIntrinsic(), this.tokens.textAt(operation) + "|" + (arguments.Length as String), children)
+    let result = this.addNode(this.arena.kinds.getNativeIntrinsic(), this.tokens.textAt(operation), children)
 
     this.arena.setAnchor(result, this.tokens.startAt(keyword), this.tokens.startAt(operation) + this.tokens.lengthAt(operation) - this.tokens.startAt(keyword))
     return result

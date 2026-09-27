@@ -29,7 +29,10 @@ def runCacheFrame(text: String): String
 end
 
 def runCacheReport(enabled: Bool, phase: String, started: Int): Void
-  let elapsed = runCacheTime() - started
+  runCacheReportDuration(enabled, phase, runCacheTime() - started)
+end
+
+def runCacheReportDuration(enabled: Bool, phase: String, elapsed: Int): Void
   let timingPath = host::environment("NERI_TIMING_OUTPUT")
 
   if enabled && timingPath != null && timingPath != "" && host::stringByteLength(timingPath) <= 4096
@@ -62,6 +65,12 @@ class RunCache
   public executable: String = ""
   public inputs: String = ""
   public dependencies: String[] = []
+  private objectBundle: Bool = false
+  private nativeReceipt: Bool = false
+  private cacheKey: String = ""
+  private codegenIdentity: CodegenIdentity = new CodegenIdentity()
+  private linkToolchain: NativeLinkToolchain?
+  private storage: RunCacheStorage = new RunCacheStorage()
 
   def privateDirectory(path: String): Bool
     let info = new RunCacheFile(path, false)
@@ -71,6 +80,11 @@ class RunCache
 
   def snapshot(): String
     var result = ""
+    let linkToolchain = this.linkToolchain
+
+    if linkToolchain != null && !linkToolchain.matches()
+      return ""
+    end
 
     for path in this.dependencies
       let info = new RunCacheFile(path, true)
@@ -80,7 +94,15 @@ class RunCache
     return result
   end
 
-  def prepare(module: IrModule, target: readonly TargetPlatform, release: Bool, debugSources: BootstrapSourceInput? = null, purpose: String = "neri-run-cache-v1", configurationInputs: String = "", additionalDependencies: String[] = [], canonicalDigest: String = "", nativeObject: Bool = false): Void
+  def prepare(module: IrModule, target: readonly TargetPlatform, release: Bool, debugSources: BootstrapSourceInput? = null, purpose: String = "neri-run-cache-v1", configurationInputs: String = "", additionalDependencies: String[] = [], canonicalDigest: String = "", nativeObject: Bool = false, nativeReceipt: Bool = false, linkToolchain: NativeLinkToolchain? = null): Void
+    this.objectBundle = nativeObject
+    this.nativeReceipt = nativeReceipt && !nativeObject
+    if !nativeObject
+      if linkToolchain == null || !linkToolchain.matches()
+        return
+      end
+      this.linkToolchain = linkToolchain
+    end
     # External link inputs and other host ABIs are uncached until their complete
     # dependency discovery is available. Failures always use the normal run path.
     # Object files record native import signatures; their library binaries are
@@ -88,54 +110,12 @@ class RunCache
     if !target.isMacOS() || (module.requiredFeatures.hasNativeLibraries() && !nativeObject) || !runCacheSupportedHost()
       return
     end
-    let manifestPath = host::environment("NERI_RUNTIME_MANIFEST")
-    let codegen = host::environment("NERI_CODEGEN")
-    let linker = host::environment("NERI_LINKER")
-    let sdk = host::environment("SDKROOT")
+    let descriptor = new RunCacheDependencies()
 
-    if manifestPath == null || codegen == null || linker == null || sdk == null
+    if !descriptor.capture(target, nativeObject, additionalDependencies, linkToolchain)
       return
     end
-    if !bootstrapStartsWith(linker, "/") || !semanticEndsWith(linker, "/bin/clang++") || !bootstrapStartsWith(sdk, "/")
-      return
-    end
-    # Custom linker search/injection environments cannot be represented by the
-    # system-library dependency set below.
-    for variable in ["LIBRARY_PATH", "COMPILER_PATH", "GCC_EXEC_PREFIX", "CCC_OVERRIDE_OPTIONS", "DYLD_INSERT_LIBRARIES", "DYLD_LIBRARY_PATH", "DYLD_FRAMEWORK_PATH", "DYLD_FALLBACK_LIBRARY_PATH", "DYLD_FALLBACK_FRAMEWORK_PATH", "DYLD_VERSIONED_LIBRARY_PATH", "DYLD_VERSIONED_FRAMEWORK_PATH", "DYLD_ROOT_PATH", "DYLD_IMAGE_SUFFIX"]
-      let value = host::environment(variable)
-
-      if value != null && value != ""
-        return
-      end
-    end
-    let manifest = host::readText(manifestPath)
-
-    if manifest == null || bootstrapManifestString(manifest, "target") != target.name()
-      return
-    end
-    let artifact = bootstrapManifestString(manifest, "artifact")
-
-    if !bootstrapArtifactNameValid(artifact)
-      return
-    end
-    let runtime = bootstrapDirectory(manifestPath) + "/" + artifact
-    let prefix = bootstrapDirectory(bootstrapDirectory(linker))
-
-    this.dependencies = [codegen, linker, runtime, manifestPath, "/usr/bin/ld", "/usr/bin/xcrun",
-      "/var/db/xcode_select_link", prefix + "/lib/libLLVM.dylib", prefix + "/lib/libc++.1.dylib",
-      prefix + "/bin/ld", prefix + "/bin/ld64.lld",
-      sdk, sdk + "/SDKSettings.json", sdk + "/usr/lib/libSystem.tbd", sdk + "/usr/lib/libc++.tbd"]
-    for dependency in additionalDependencies
-      if (new RunCacheFile(dependency, true)).fingerprint == ""
-        return
-      end
-      this.dependencies = host::appendString(this.dependencies, dependency)
-    end
-    for path in [codegen, linker, runtime, sdk + "/usr/lib/libSystem.tbd", sdk + "/usr/lib/libc++.tbd"]
-      if (new RunCacheFile(path, true)).fingerprint == ""
-        return
-      end
-    end
+    this.dependencies = descriptor.paths
     var root = ""
     let configured = host::environment("NERI_CACHE_DIR")
     let homeDirectory = host::environment("HOME")
@@ -152,18 +132,19 @@ class RunCache
     if !this.privateDirectory(root)
       return
     end
+    if !this.codegenIdentity.capture()
+      return
+    end
     this.inputs = this.snapshot()
-    var configuration = runCacheFrame(purpose) + runCacheFrame(configurationInputs) + runCacheFrame(target.name()) + runCacheFrame(release ? "release" : "debug") + runCacheFrame(manifest) + runCacheFrame(this.inputs)
+    if this.inputs == ""
+      return
+    end
+    var configuration = runCacheFrame(purpose) + runCacheFrame(configurationInputs) + runCacheFrame(target.name()) + runCacheFrame(release ? "release" : "debug") + runCacheFrame(descriptor.configuration) + runCacheFrame(this.inputs) + runCacheFrame(this.codegenIdentity.digest)
+
+    configuration = configuration + runCacheFrame(linkToolchain.identity) if this.linkToolchain != null && linkToolchain != null
 
     configuration = configuration + runCacheFrame("native-object") if nativeObject
 
-    for variable in ["SDKROOT", "DEVELOPER_DIR", "MACOSX_DEPLOYMENT_TARGET", "PATH", "NERI_DSYMUTIL"]
-      let value = host::environment(variable)
-
-      if value != null
-        configuration = configuration + runCacheFrame(variable) + runCacheFrame(value)
-      end
-    end
     let workingDirectory = host::pathAbsolute(".")
 
     if workingDirectory != null
@@ -172,37 +153,193 @@ class RunCache
     var source = debugSources
 
     while source != null && !release
-      configuration = configuration + runCacheFrame(source.id) + runCacheFrame(source.path)
+      configuration = configuration + runCacheFrame(source.id) + runCacheFrame(source.identityPath)
       source = source.nextInput
     end
     let contentIdentity = canonicalDigest == "" ? irSerializeEnvelopeHex(module) : canonicalDigest
     let key = sha256FastText(runCacheFrame(configuration) + runCacheFrame(contentIdentity))
 
-    this.directory = root + "/" + key
-    this.executable = this.directory + "/program"
+    this.cacheKey = key
+    this.setupStorage(root, key)
+  end
+
+  def setupStorage(root: String, key: String): Void
+    this.directory = ""
+    this.executable = ""
+    if !this.storage.setup(root, key)
+      return
+    end
+    this.directory = this.storage.selected()
+    if this.directory == ""
+      this.reserveGeneration()
+    else
+      this.executable = this.directory + "/program"
+    end
+  end
+
+  def reserveGeneration(): Void
+    if this.storage.reserve()
+      this.directory = this.storage.directory
+      this.executable = this.directory + "/program"
+    else
+      this.directory = ""
+      this.executable = ""
+    end
   end
 
   def hit(): Bool
+    if this.selectedHit()
+      return true
+    end
+    this.reserveGeneration()
+    return false
+  end
+
+  private def selectedHit(): Bool
     if this.directory == "" || !this.privateDirectory(this.directory) || this.inputs != this.snapshot()
       return false
     end
     let info = new RunCacheFile(this.executable, false)
+
+    if this.nativeReceipt
+      let before = new RunCacheFile(this.directory + "/receipt", false)
+      let read = files::readBytes(this.directory + "/receipt", 4194304)
+      let bytes = read.bytes
+
+      if !before.owned || before.kind != 1 || read.failure != null || read.closeFailure != null || bytes == null
+        return false
+      end
+      let payload = host::stringFromBytes(bytes)
+
+      return false if payload == null
+      let reader = new SemanticSnapshotReader(payload)
+
+      if reader.string() != "neri-run-native-v2" || reader.string() != this.cacheKey
+        return false
+      end
+      let digest = reader.string()
+      let expected = reader.string()
+      let observed = new NativeLinkInputs()
+      let count = reader.count(4096)
+      var index = 0
+
+      while index < count && !reader.failed
+        let path = reader.string()
+
+        return false if !bootstrapStartsWith(path, "/")
+        observed.inputs.add(path)
+        index = index + 1
+      end
+      let missing = reader.count(4096)
+
+      index = 0
+      while index < missing && !reader.failed
+        let path = reader.string()
+
+        return false if !bootstrapStartsWith(path, "/")
+        observed.missing.add(path)
+        index = index + 1
+      end
+      let shared = reader.count(4096)
+
+      index = 0
+      while index < shared && !reader.failed
+        observed.shared.add(reader.string())
+        index = index + 1
+      end
+      observed.valid = reader.complete() && count > 0
+      let after = new RunCacheFile(this.directory + "/receipt", false)
+
+      return info.owned && info.kind == 1 && digest != "" && digest == referenceFileDigest(this.executable) && info.fingerprint == (new RunCacheFile(this.executable, false)).fingerprint && expected != "" && observed.snapshot() == expected && before.fingerprint == after.fingerprint && after.owned && after.kind == 1 && this.inputs == this.snapshot() && this.codegenIdentity.matches()
+    end
+
+    if this.objectBundle
+      let receiptInfo = new RunCacheFile(this.directory + "/receipt", false)
+
+      if !receiptInfo.owned || receiptInfo.kind != 1
+        return false
+      end
+      let read = files::readBytes(this.directory + "/receipt", 512)
+      let bytes = read.bytes
+
+      if read.failure != null || read.closeFailure != null || bytes == null
+        return false
+      end
+      let receipt = host::stringFromBytes(bytes)
+      let expected = this.objectReceipt(this.directory)
+      let receiptAfter = new RunCacheFile(this.directory + "/receipt", false)
+
+      return expected != "" && receipt == expected && receiptAfter.owned && receiptAfter.kind == 1 && receiptInfo.fingerprint == receiptAfter.fingerprint && this.inputs == this.snapshot() && this.codegenIdentity.matches()
+    end
     let receipt = host::readText(this.directory + "/receipt")
 
-    return info.owned && info.kind == 1 && receipt != null && receipt == info.fingerprint
+    return info.owned && info.kind == 1 && receipt != null && receipt == info.fingerprint && this.codegenIdentity.matches()
   end
 
-  def publish(staging: String): Bool
+  private def objectReceipt(directory: String): String
+    let object = directory + "/program"
+    let transport = object + ".nir.hex"
+    let before = new RunCacheFile(object, false)
+    let transportBefore = new RunCacheFile(transport, false)
+
+    if !this.privateDirectory(directory) || !before.owned || before.kind != 1 || !transportBefore.owned || transportBefore.kind != 1
+      return ""
+    end
+    let objectDigest = referenceFileDigest(object)
+    let transportDigest = referenceFileDigest(transport)
+    let after = new RunCacheFile(object, false)
+    let transportAfter = new RunCacheFile(transport, false)
+
+    if objectDigest == "" || transportDigest == "" || before.fingerprint != after.fingerprint || transportBefore.fingerprint != transportAfter.fingerprint
+      return ""
+    end
+    return "neri-object-bundle-v1\n" + this.cacheKey + "\n" + objectDigest + "\n" + transportDigest + "\n"
+  end
+
+  private def nativeExecutableReceipt(staging: String, observed: NativeLinkInputs?): String
+    if observed == null || !observed.valid || observed.inputs.size == 0 || observed.inputs.size > 4096 || observed.missing.size > 4096 || observed.inputs.size != observed.digests.size
+      return ""
+    end
+    let expected = observed.expectedSnapshot()
+    let before = new RunCacheFile(staging + "/program", false)
+    let digest = referenceFileDigest(staging + "/program")
+    let after = new RunCacheFile(staging + "/program", false)
+
+    if expected == "" || !this.privateDirectory(staging) || !before.owned || before.kind != 1 || before.fingerprint != after.fingerprint || digest == "" || observed.snapshot() != expected
+      return ""
+    end
+    let writer = new SemanticSnapshotWriter()
+
+    writer.string("neri-run-native-v2")
+    writer.string(this.cacheKey)
+    writer.string(digest)
+    writer.string(expected)
+    writer.stringBuffer(observed.inputs)
+    writer.stringBuffer(observed.missing)
+    writer.stringBuffer(observed.shared)
+    let receipt = writer.finish()
+
+    return receipt != null && host::stringByteLength(receipt) <= 4194304 ? receipt : ""
+  end
+
+  def publish(staging: String, observed: NativeLinkInputs? = null): Bool
     if this.directory == "" || this.inputs != this.snapshot()
       return false
     end
     # Publish a complete directory with one atomic rename. Concurrent builders
     # never overwrite or execute each other's partially linked artifacts.
     let info = new RunCacheFile(staging + "/program", false)
+    let receipt = this.objectBundle ? this.objectReceipt(staging) : (this.nativeReceipt ? this.nativeExecutableReceipt(staging, observed) : info.fingerprint)
 
-    if !host::writeText(staging + "/receipt", info.fingerprint)
+    if receipt == "" || !host::writeText(staging + "/receipt", receipt)
       return false
     end
-    return files::move(staging, this.directory).failure == null
+    if this.objectBundle && (this.objectReceipt(staging) != receipt || this.inputs != this.snapshot())
+      return false
+    end
+    if this.nativeReceipt && (this.nativeExecutableReceipt(staging, observed) != receipt || this.inputs != this.snapshot())
+      return false
+    end
+    return this.codegenIdentity.matches() && this.directory == this.storage.directory && this.storage.publish(staging)
   end
 end

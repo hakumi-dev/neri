@@ -6,6 +6,10 @@ on:
   pull_request:
   workflow_dispatch:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
@@ -34,7 +38,7 @@ jobs:
           BUILD_MODE: ${{ matrix.mode }}
         run: |
           if ($env:BUILD_MODE -eq 'Release') {
-            ./scripts/build.ps1 install -Prefix "$env:RUNNER_TEMP/neri" -NoPath
+            ./scripts/build.ps1 install -Stage 3 -FullValidation -Prefix "$env:RUNNER_TEMP/neri" -NoPath
             # Exercise the installed launcher without the developer shell setup.
             & "$env:RUNNER_TEMP/neri/bin/neri.exe" examples/arguments.hk -- Ada 'Grace Hopper'
             if ($LASTEXITCODE -ne 0) { throw 'Installed launcher failed' }
@@ -89,10 +93,34 @@ jobs:
           test "$(uname -m)" = arm64
           brew install llvm@22 cmake ninja
           test "$("$(brew --prefix llvm@22)/bin/llvm-config" --version)" = 22.1.8
+      - name: Install corrected SQLite for WAL contracts
+        if: matrix.command == 'package'
+        run: |
+          brew install openssl@3
+          sqlite_work="$(mktemp -d)"
+          sqlite_prefix="$RUNNER_TEMP/sqlite-3.53.4"
+          curl --fail --location --retry 3 https://sqlite.org/2026/sqlite-amalgamation-3530400.zip -o "$sqlite_work/sqlite.zip"
+          test "$("$(brew --prefix openssl@3)/bin/openssl" dgst -sha3-256 "$sqlite_work/sqlite.zip" | awk '{print $NF}')" = 628a44cfe82c66aed1ccbbe85a562d2e33ebe64b3288981ed76285612227934e
+          tar -xf "$sqlite_work/sqlite.zip" -C "$sqlite_work"
+          mkdir -p "$sqlite_prefix/lib" build/native/native-release
+          cc -O2 -dynamiclib -DSQLITE_THREADSAFE=1 \
+            -Wl,-install_name,"$sqlite_prefix/lib/libsqlite3.dylib" \
+            "$sqlite_work/sqlite-amalgamation-3530400/sqlite3.c" \
+            -o "$sqlite_prefix/lib/libsqlite3.dylib"
+          # The validation driver resolves native libraries in this directory.
+          # An absolute install name also works for workers with an empty environment.
+          ln -s "$sqlite_prefix/lib/libsqlite3.dylib" build/native/native-release/libsqlite3.dylib
+          otool -D "$sqlite_prefix/lib/libsqlite3.dylib"
+          shasum -a 256 "$sqlite_prefix/lib/libsqlite3.dylib"
       - name: Run the local Neri entry point
         env:
           BUILD_COMMAND: ${{ matrix.command }}
-        run: scripts/build.sh $BUILD_COMMAND
+        run: |
+          if test "$BUILD_COMMAND" = package; then
+            scripts/build.sh package --stage 3 --full-validation
+          else
+            scripts/build.sh $BUILD_COMMAND
+          fi
       - name: Preserve validation evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -100,6 +128,12 @@ jobs:
           name: validation-${{ strategy.job-index }}
           path: |
             build/work.*/compiler-sources.txt
+            build/tmp/work.*/compiler-sources.txt
+            build/tmp/work.*/*.stdout
+            build/tmp/work.*/*.stderr
+            build/tmp/work.*/*.status
+            build/tmp/work.*/*.source
+            build/tmp/work.*/*.metrics.json
             build/work.*/*.stdout
             build/work.*/*.stderr
             build/work.*/*.status
@@ -126,12 +160,55 @@ jobs:
       - name: Install declared native tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y ca-certificates curl gnupg lsb-release software-properties-common cmake ninja-build build-essential zlib1g-dev libzstd-dev libedit-dev libffi-dev libxml2-dev libssl-dev
+          sudo apt-get install -y ca-certificates curl gnupg lsb-release software-properties-common cmake ninja-build build-essential zlib1g-dev libzstd-dev libedit-dev libffi-dev libxml2-dev libssl-dev libsqlite3-dev libarchive-tools
           curl --fail --location --retry 3 https://raw.githubusercontent.com/opencollab/llvm-jenkins.debian.net/cf853fefa308484749df8a87004c580a6c0fe830/llvm.sh -o /tmp/neri-llvm.sh
           echo '03878e08f47b66cc95bc4b544b0db3c6d9ce8d60e6cf2492ae357984330a9eae  /tmp/neri-llvm.sh' | sha256sum -c -
           sudo bash /tmp/neri-llvm.sh 22
           sudo apt-get install -y llvm-22-dev
           test "$(llvm-config-22 --version)" = 22.1.8
+      - name: Install corrected SQLite for WAL contracts
+        if: matrix.mode == 'Release'
+        run: |
+          sudo apt-get install -y openssl pkg-config
+          sqlite_work="$(mktemp -d)"
+          sqlite_prefix=/opt/sqlite-3.53.4
+          curl --fail --location --retry 3 https://sqlite.org/2026/sqlite-amalgamation-3530400.zip -o "$sqlite_work/sqlite.zip"
+          test "$(openssl dgst -sha3-256 "$sqlite_work/sqlite.zip" | awk '{print $NF}')" = 628a44cfe82c66aed1ccbbe85a562d2e33ebe64b3288981ed76285612227934e
+          bsdtar -xf "$sqlite_work/sqlite.zip" -C "$sqlite_work"
+          sqlite_source="$sqlite_work/sqlite-amalgamation-3530400"
+          cc -O2 -fPIC -shared -DSQLITE_THREADSAFE=1 -Wl,-soname,libsqlite3.so.0 \
+            "$sqlite_source/sqlite3.c" -o "$sqlite_work/libsqlite3.so.0" -pthread -ldl -lm
+          sudo install -d "$sqlite_prefix/lib/pkgconfig" "$sqlite_prefix/include"
+          sudo install -m 755 "$sqlite_work/libsqlite3.so.0" "$sqlite_prefix/lib/"
+          sudo ln -s libsqlite3.so.0 "$sqlite_prefix/lib/libsqlite3.so"
+          sudo install -m 644 "$sqlite_source/sqlite3.h" "$sqlite_source/sqlite3ext.h" "$sqlite_prefix/include/"
+          cat <<EOF | sudo tee "$sqlite_prefix/lib/pkgconfig/sqlite3.pc" >/dev/null
+          prefix=$sqlite_prefix
+          libdir=\${prefix}/lib
+          includedir=\${prefix}/include
+          Name: SQLite
+          Description: SQLite database engine
+          Version: 3.53.4
+          Libs: -L\${libdir} -lsqlite3
+          Libs.private: -pthread -ldl -lm
+          Cflags: -I\${includedir}
+          EOF
+          echo "$sqlite_prefix/lib" | sudo tee /etc/ld.so.conf.d/neri-test-sqlite.conf >/dev/null
+          sudo ldconfig
+          export PKG_CONFIG_PATH="$sqlite_prefix/lib/pkgconfig"
+          test "$(pkg-config --modversion sqlite3)" = 3.53.4
+          cat > "$sqlite_work/probe.c" <<'EOF'
+          #include <sqlite3.h>
+          #include <stdio.h>
+          int main(void) {
+              printf("SQLite headers=%d runtime=%s threadsafe=%d\n", SQLITE_VERSION_NUMBER, sqlite3_libversion(), sqlite3_threadsafe());
+              return SQLITE_VERSION_NUMBER != 3053004 || sqlite3_libversion_number() != SQLITE_VERSION_NUMBER || sqlite3_threadsafe() != 1;
+          }
+          EOF
+          cc $(pkg-config --cflags sqlite3) "$sqlite_work/probe.c" $(pkg-config --libs sqlite3) -o "$sqlite_work/probe"
+          env -i PATH=/usr/bin:/bin "$sqlite_work/probe"
+          env -i PATH=/usr/bin:/bin ldd "$sqlite_work/probe" | grep -F "libsqlite3.so.0 => $sqlite_prefix/lib/libsqlite3.so.0"
+          sha256sum "$sqlite_prefix/lib/libsqlite3.so.0"
       - name: Build and validate current native components
         if: matrix.mode != 'Release'
         env:
@@ -148,9 +225,9 @@ jobs:
             -DLLVM_DIR=/usr/lib/llvm-22/lib/cmake/llvm -DBUILD_TESTING=ON
           cmake --build build/linux-native --parallel 2
           ctest --test-dir build/linux-native --output-on-failure --no-tests=error
-      - name: Bootstrap and validate the language
+      - name: Build and validate the Linux toolchain package
         if: matrix.mode == 'Release'
-        run: scripts/build.sh test
+        run: scripts/build.sh package --stage 3 --full-validation
       - name: Preserve native validation evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -159,9 +236,10 @@ jobs:
           path: |
             build/linux-native/Testing/Temporary/
             build/native/*/Testing/Temporary/
-            build/work.*/compiler-sources.txt
-            build/work.*/*.stdout
-            build/work.*/*.stderr
-            build/work.*/*.status
-            build/work.*/*.metrics.json
+            build/tmp/work.*/compiler-sources.txt
+            build/tmp/work.*/*.stdout
+            build/tmp/work.*/*.stderr
+            build/tmp/work.*/*.status
+            build/tmp/work.*/*.metrics.json
+            build/packages/*.tar.gz
           if-no-files-found: ignore

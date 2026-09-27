@@ -1,0 +1,253 @@
+use files
+use resources
+use result
+use console
+use test
+use reference
+use neri_data
+use neri_data_sqlite
+use neri_data_sqlite_fixture
+use navigation_data
+use navigation_model
+
+class CountingProvider: Provider
+  private inner: SQLiteProvider
+  public reads: Int = 0
+  public streams: Int = 0
+
+  def init(inner: SQLiteProvider): Void
+    this.inner = inner
+  end
+
+  public override readonly def dialect(): SqlDialect
+    return this.inner.dialect()
+  end
+
+  public override readonly def supports(capability: ProviderCapability): Bool
+    return this.inner.supports(capability)
+  end
+
+  public override def execute(plan: readonly SqlPlan): ProviderResult
+    this.reads = this.reads + 1
+    return this.inner.execute(plan)
+  end
+
+  public override def stream(plan: readonly StreamPlan, visit: fn(RawRow): Bool): StreamResult
+    this.streams = this.streams + 1
+    return this.inner.stream(plan, visit)
+  end
+end
+
+def loaded(result: QueryResult<Author>): TypedRows<Author>?
+  match result
+    case QueryResult.Rows(rows)
+      return rows
+    case QueryResult.Failure(error)
+      test::assertTrue(false)
+      return null
+  end
+end
+
+def failed(result: QueryResult<Author>): Void
+  match result
+    case QueryResult.Failure(error)
+      return
+    case QueryResult.Rows(rows)
+      test::assertTrue(false)
+  end
+end
+
+def verify(provider: SQLiteProvider, path: String): Void
+  let db = new NavigationDatabase(provider)
+  var referencedBook: Book? = null
+
+  match db.includeReference_booksFor_Author_by_authorId(db.books.where(id: 10).take(1)).all()
+    case QueryResult.Failure(error)
+      test::assertTrue(false)
+    case QueryResult.Rows(books)
+      let firstBook = books.first()
+
+      test::assertTrue(firstBook != null)
+      if firstBook != null
+        referencedBook = firstBook.value
+        let author = firstBook.value.author
+
+        test::assertTrue(author != null)
+        if author != null
+          test::assertEqual(author.id, 2)
+          test::assertEqual(author.books.Length, 1)
+          test::assertTrue(reference::same(author.books[0], firstBook.value))
+        end
+      end
+  end
+  let tags = db.include_tagEntriesFor_Tag_by_tagCode(db.tags.where(code: "O'Reilly; DROP TABLE tags; -- 水").take(1)).all()
+
+  match tags
+    case QueryResult.Failure(error)
+      test::assertTrue(false)
+    case QueryResult.Rows(rows)
+      let first = rows.first()
+
+      test::assertTrue(first != null)
+      if first != null
+        test::assertEqual(first.value.entries.Length, 1)
+        let linked = first.value.entries[0].tag
+
+        test::assertTrue(linked != null)
+        if linked != null
+          test::assertTrue(reference::same(linked, first.value))
+        end
+      end
+  end
+  let rows = loaded(db.include_booksFor_Author_by_authorId(db.authors.take(10)).all())
+
+  test::assertTrue(rows != null)
+  if rows == null
+    return
+  end
+
+  test::assertEqual(rows.count(), 3)
+  var empty: Author? = null
+  var one: Author? = null
+  var many: Author? = null
+  var current = rows.first()
+
+  while current != null
+    if current.value.id == 1
+      empty = current.value
+    else if current.value.id == 2
+      one = current.value
+    else if current.value.id == 3
+      many = current.value
+    end
+    current = current.next
+  end
+
+  test::assertTrue(empty != null && one != null && many != null)
+  if empty == null || one == null || many == null
+    return
+  end
+
+  test::assertEqual(empty.books.Length, 0)
+  test::assertEqual(one.books.Length, 1)
+  test::assertEqual(many.books.Length, 2)
+  if referencedBook != null
+    test::assertTrue(reference::same(one.books[0], referencedBook))
+  end
+  let inverse = one.books[0].author
+
+  test::assertTrue(inverse != null)
+  if inverse != null
+    test::assertTrue(reference::same(inverse, one))
+  end
+  for book in many.books
+    let parent = book.author
+
+    test::assertTrue(parent != null)
+    if parent != null
+      test::assertTrue(reference::same(parent, many))
+    end
+  end
+  many.name = "pending local edit"
+  let originalBook = many.books[0]
+  let removedBook = many.books[0].id == 20 ? many.books[0] : many.books[1]
+  let reloaded = loaded(db.include_booksFor_Author_by_authorId(db.authors.take(10)).all())
+
+  test::assertTrue(reloaded != null)
+  test::assertEqual(many.name, "pending local edit")
+  test::assertTrue(reference::same(many.books[0], originalBook))
+  failed(db.include_booksFor_Author_by_authorId(db.authors.take(10)).maxChildren(1).all())
+
+  test::assertEqual(many.books.Length, 2)
+  test::assertTrue(reference::same(many.books[0], originalBook))
+  test::assertTrue(createSQLiteFixture(path, "INSERT INTO books VALUES(99,3,NULL);"))
+  failed(db.include_booksFor_Author_by_authorId(db.authors.take(10)).all())
+
+  test::assertEqual(many.books.Length, 2)
+  test::assertTrue(reference::same(many.books[0], originalBook))
+  test::assertTrue(createSQLiteFixture(path, "DELETE FROM books WHERE id IN (99,20);"))
+  let afterDelete = loaded(db.include_booksFor_Author_by_authorId(db.authors.take(10)).all())
+
+  test::assertTrue(afterDelete != null)
+  test::assertEqual(many.books.Length, 1)
+  test::assertTrue(removedBook.author == null)
+  let remaining = many.books[0]
+
+  remaining.authorId = 2
+  failed(db.include_booksFor_Author_by_authorId(db.authors.take(10)).all())
+
+  test::assertEqual(many.books.Length, 1)
+  test::assertTrue(reference::same(many.books[0], remaining))
+  remaining.authorId = 3
+  many.id = 300
+  failed(db.include_booksFor_Author_by_authorId(db.authors.take(10)).all())
+
+  test::assertEqual(many.books.Length, 1)
+  many.id = 3
+end
+
+def verifyBatch(provider: SQLiteProvider): Void
+  let counted = new CountingProvider(provider)
+  let db = new NavigationDatabase(counted)
+  let rows = loaded(db.include_booksFor_Author_by_authorId(db.authors.take(51)).all())
+
+  test::assertTrue(rows != null)
+  if rows != null
+    test::assertEqual(rows.count(), 51)
+  end
+
+  test::assertEqual(counted.reads, 1)
+  test::assertEqual(counted.streams, 2)
+  let empty = loaded(db.include_booksFor_Author_by_authorId(db.authors.where(id: 999).take(1)).all())
+
+  test::assertTrue(empty != null)
+  if empty != null
+    test::assertEqual(empty.count(), 0)
+  end
+
+  test::assertEqual(counted.reads, 2)
+  test::assertEqual(counted.streams, 2)
+end
+
+def verifyFile(): resources::Outcome<Int, result::Failure>
+  using temporary <- files::TemporaryDirectory.create("neri-navigation-")
+    let path = temporary.path() + "/navigation.sqlite"
+    let batchPath = temporary.path() + "/navigation-batch.sqlite"
+    let sql = "CREATE TABLE authors(id INTEGER PRIMARY KEY, name TEXT NOT NULL); CREATE TABLE books(id INTEGER PRIMARY KEY, author_id INTEGER NOT NULL, title TEXT); CREATE TABLE tags(code TEXT PRIMARY KEY); CREATE TABLE tag_entries(id INTEGER PRIMARY KEY, tag_code TEXT NOT NULL); INSERT INTO authors VALUES(1,'empty'),(2,'one'),(3,'many'); INSERT INTO books VALUES(10,2,'solo'),(20,3,'first'),(21,3,'second'); INSERT INTO tags VALUES('O''Reilly; DROP TABLE tags; -- 水'); INSERT INTO tag_entries VALUES(40,'O''Reilly; DROP TABLE tags; -- 水');"
+    let batchSql = "CREATE TABLE authors(id INTEGER PRIMARY KEY, name TEXT NOT NULL); CREATE TABLE books(id INTEGER PRIMARY KEY, author_id INTEGER NOT NULL, title TEXT NOT NULL); WITH RECURSIVE n(id) AS (VALUES(1) UNION ALL SELECT id + 1 FROM n WHERE id < 51) INSERT INTO authors SELECT id, 'parent' FROM n; INSERT INTO books VALUES(10,1,'first'),(20,51,'last');"
+
+    test::assertTrue(createSQLiteFixture(path, sql))
+    test::assertTrue(createSQLiteFixture(batchPath, batchSql))
+    match SQLiteProvider.open(path)
+      case SQLiteOpenResult.Failure(message)
+        test::assertTrue(false)
+      case SQLiteOpenResult.Opened(provider)
+        verify(provider, path)
+
+        test::assertTrue(provider.close())
+    end
+    match SQLiteProvider.open(batchPath)
+      case SQLiteOpenResult.Failure(message)
+        test::assertTrue(false)
+      case SQLiteOpenResult.Opened(provider)
+        verifyBatch(provider)
+
+        test::assertTrue(provider.close())
+    end
+    return 0
+  end
+  return 1
+end
+
+def main(): Void
+  let result = verifyFile()
+
+  test::assertEqual(result.closeFailures.count(), 0)
+  match result.completion
+    case resources::Completion.Value(value)
+      test::assertEqual(value, 0)
+    case resources::Completion.Failure(problem)
+      test::assertTrue(false)
+  end
+  console::println("Navigation loading contract passed")
+end

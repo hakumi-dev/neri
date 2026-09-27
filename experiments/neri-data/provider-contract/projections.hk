@@ -1,0 +1,185 @@
+use app_data
+use model
+use neri_data
+use neri_data_sqlite
+use neri_data_sqlite_fixture
+use files
+use resources
+use result
+use test
+
+class IdentityLabel
+  public id: Int
+  public name: String
+
+  def init(id: Int, name: String): Void
+    this.id = id
+    this.name = name
+  end
+end
+
+class Profile
+  public identity: IdentityLabel
+  public nickname: String?
+
+  def init(identity: IdentityLabel, nickname: String?): Void
+    this.identity = identity
+    this.nickname = nickname
+  end
+end
+
+class Summary
+  public profile: Profile
+  public repeatedId: Int
+
+  def init(profile: Profile, repeatedId: Int): Void
+    this.profile = profile
+    this.repeatedId = repeatedId
+  end
+end
+
+class ProjectionProbe: Provider
+  private inner: Provider
+  public columns: Int = 0
+  public calls: Int = 0
+
+  def init(inner: Provider): Void
+    this.inner = inner
+  end
+
+  public override readonly def dialect(): SqlDialect
+    return this.inner.dialect()
+  end
+  public override readonly def supports(capability: ProviderCapability): Bool
+    return this.inner.supports(capability)
+  end
+  public override def execute(plan: readonly SqlPlan): ProviderResult
+    this.columns = plan.columns().count()
+    this.calls = this.calls + 1
+    return this.inner.execute(plan)
+  end
+end
+
+class ProjectionCalls
+  public count: Int = 0
+end
+
+def summaryShape(calls: ProjectionCalls): RowShape<Customer, Summary>
+  let id = fieldShape(intScalar(), quote do |customer: Customer|: Int
+      return customer.id
+    end)
+  let name = fieldShape(textScalar(), quote do |customer: Customer|: String
+      return customer.name
+    end)
+  let nickname = fieldShape(optionalTextScalar(), quote do |customer: Customer|: String?
+      return customer.nickname
+    end)
+  let identity = combineShapes(id, name) do |id: Int, name: String|: IdentityLabel
+    calls.count = calls.count + 1
+    return new IdentityLabel(id, name)
+  end
+  let profile = combineShapes(identity, nickname) do |identity: IdentityLabel, nickname: String?|: Profile
+    calls.count = calls.count + 1
+    return new Profile(identity, nickname)
+  end
+
+  return combineShapes(profile, id) do |profile: Profile, repeatedId: Int|: Summary
+    calls.count = calls.count + 1
+    return new Summary(profile, repeatedId)
+  end
+end
+
+def verifyProjection(provider: SQLiteProvider): Void
+  let probe = new ProjectionProbe(provider)
+  let db = new Database(probe)
+  let calls = new ProjectionCalls()
+  let shape = summaryShape(calls)
+
+  # An invalid, unselected Bool must not force entity materialization.
+  match project(db.customers.where(id: 1).take(1), shape).all()
+    case QueryResult.Failure(error)
+      test::assertTrue(false)
+    case QueryResult.Rows(rows)
+      let first = rows.first()
+
+      test::assertEqual(rows.count(), 1)
+      test::assertTrue(first != null)
+
+      if first != null
+        test::assertEqual(first.value.profile.identity.name, "O'Reilly; SELECT 1;-- 水")
+        test::assertEqual(first.value.profile.identity.id, 1)
+        test::assertEqual(first.value.repeatedId, 1)
+        test::assertTrue(first.value.profile.nickname == null)
+      end
+  end
+
+  test::assertEqual(probe.columns, 4)
+  test::assertEqual(calls.count, 3)
+
+  let byId = quote do |customer: Customer|: Int
+    return customer.id
+  end
+
+  match project(db.customers.orderBy(byId).take(3).where(active: true), shape).all()
+    case QueryResult.Failure(error)
+      test::assertTrue(false)
+    case QueryResult.Rows(rows)
+      let first = rows.first()
+
+      test::assertEqual(rows.count(), 1)
+      test::assertTrue(first != null && first.value.repeatedId == 2)
+  end
+
+  # A failure in a later selected field must precede every DTO callback.
+  let before = calls.count
+
+  match project(db.customers.where(id: 4).take(1), shape).all()
+    case QueryResult.Rows(rows)
+      test::assertTrue(false)
+    case QueryResult.Failure(error)
+      test::assertEqual(calls.count, before)
+  end
+
+  let nameShape = fieldShape(textScalar(), quote do |customer: Customer|: String
+      return customer.name
+    end)
+
+  match project(db.customers.where(name: "Same").distinct().take(10), nameShape).all()
+    case QueryResult.Failure(error)
+      test::assertTrue(false)
+    case QueryResult.Rows(rows)
+      test::assertEqual(rows.count(), 2)
+  end
+end
+
+def verifyProjectionFile(): resources::Outcome<Int, result::Failure>
+  using temporary <- files::TemporaryDirectory.create("neri-shape-projection-")
+    let path = temporary.path() + "/data.sqlite"
+    let sql = "CREATE TABLE customers(id INTEGER, name TEXT, active INTEGER, nickname TEXT); INSERT INTO customers VALUES(1, 'O''Reilly; SELECT 1;-- 水', 2, NULL), (2, 'Same', 1, 'two'), (3, 'Same', 0, NULL), (4, 'BadNickname', 1, x'80');"
+
+    test::assertTrue(createSQLiteFixture(path, sql))
+
+    match SQLiteProvider.open(path)
+      case SQLiteOpenResult.Failure(message)
+        test::assertTrue(false)
+      case SQLiteOpenResult.Opened(provider)
+        verifyProjection(provider)
+
+        test::assertTrue(provider.close())
+    end
+    return 0
+  end
+  return 1
+end
+
+def main(): Void
+  let completed = verifyProjectionFile()
+
+  test::assertEqual(completed.closeFailures.count(), 0)
+  match completed.completion
+    case resources::Completion.Value(value)
+      test::assertEqual(value, 0)
+    case resources::Completion.Failure(problem)
+      test::assertTrue(false)
+  end
+end

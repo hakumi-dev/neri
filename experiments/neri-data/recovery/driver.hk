@@ -1,0 +1,235 @@
+use console
+use clock
+use files
+use host
+use process
+use result
+use resources
+use test
+use app_data
+use model
+use neri_data
+use neri_data_recovery
+use neri_data_sqlite
+
+def hasReadyLine(bytes: Byte[]): Bool
+  let text = host::stringFromBytes(bytes)
+
+  return text != null && text == "READY\n"
+end
+
+def rowCount(provider: SQLiteProvider): Int
+  match new Database(provider).customers.take(10).all()
+    case QueryResult.Rows(rows)
+      return rows.count()
+    case QueryResult.Failure(error)
+      test::assertTrue(false)
+      return -1
+  end
+end
+
+def customerExists(provider: SQLiteProvider, id: Int): Bool
+  match new Database(provider).customers.where(id: id).any()
+    case QueryValue.Value(value)
+      return value
+    case QueryValue.Failure(error)
+      test::assertTrue(false)
+      return false
+  end
+end
+
+class IntegrityRow
+  public integrity_check: String
+
+  def init(value: String): Void
+    this.integrity_check = value
+  end
+end
+
+def decodeIntegrity(row: RawRow): DecodeResult<IntegrityRow>
+  match decodeString(row, "integrity_check")
+    case DecodeResult.Value(value)
+      return DecodeResult<IntegrityRow>.Value(new IntegrityRow(value))
+    case DecodeResult.Failure(error)
+      return DecodeResult<IntegrityRow>.Failure(error)
+  end
+end
+
+def verifyIntegrity(provider: SQLiteProvider): Void
+  let columns = new ResultColumns([new ResultColumn("integrity_check", ResultColumnKind.Text())])
+  let query = new Query<IntegrityRow>("pragma_integrity_check", new Decoder<IntegrityRow>(decodeIntegrity, columns), provider: provider)
+
+  match query.all()
+    case QueryResult.Failure(error)
+      test::assertTrue(false)
+    case QueryResult.Rows(rows)
+      let first = rows.first()
+
+      test::assertEqual(rows.count(), 1)
+      test::assertTrue(first != null)
+      if first != null
+        test::assertEqual(first.value.integrity_check, "ok")
+      end
+  end
+end
+
+def verifyWritableSnapshot(path: String): Void
+  match SQLiteProvider.openWritable(path)
+    case SQLiteOpenResult.Failure(error)
+      test::assertTrue(false)
+    case SQLiteOpenResult.Opened(provider)
+      verifyIntegrity(provider)
+      let db = new Database(provider)
+
+      test::assertEqual(rowCount(provider), 1)
+      test::assertTrue(customerExists(provider, 1))
+      test::assertFalse(customerExists(provider, 2))
+      test::assertTrue(db.customers.add(new Customer(3, "write-reuse", true)) == null)
+      match db.saveChanges()
+        case WriteResult.Saved(count)
+          test::assertEqual(count, 1)
+        case WriteResult.SavedWithValues(count, outputs)
+          test::assertTrue(false)
+        case WriteResult.Failure(error)
+          test::assertTrue(false)
+      end
+
+      test::assertEqual(rowCount(provider), 2)
+      verifyIntegrity(provider)
+
+      test::assertTrue(provider.close())
+  end
+end
+
+def runRecovery(worker: String, directory: String, mode: String): resources::Outcome<Int, result::Failure>
+  let sourcePath = directory + "/source-" + mode + ".sqlite"
+  let snapshotPath = directory + "/snapshot-" + mode + ".sqlite"
+  let options = new process::SpawnOptions(worker)
+
+  options.arguments = [sourcePath, mode]
+  options.stdoutLimit = 4096
+  options.stderrLimit = 4096
+  using child <- process::ScopedChild.spawn(options)
+    var ready = false
+    let started = clock::milliseconds()
+
+    if started == null
+      test::assertTrue(false)
+      match child.cancel()
+        case result::Result.Ok(cancelled)
+          test::assertTrue(cancelled)
+        case result::Result.Error(error)
+          test::assertTrue(false)
+      end
+      let stopped = child.wait(5000)
+
+      test::assertTrue(!stopped.running && stopped.failure == null)
+      return 1
+    end
+
+    while !ready
+      let state = child.wait(20)
+
+      test::assertTrue(state.failure == null)
+      if !state.running
+        console::println("worker exited before READY")
+        let output = host::stringFromBytes(state.stdout)
+        let errors = host::stringFromBytes(state.stderr)
+
+        if output != null
+          console::println("worker stdout: " + output)
+        end
+        if errors != null
+          console::println("worker stderr: " + errors)
+        end
+
+        test::assertTrue(false)
+        return 1
+      end
+      ready = hasReadyLine(state.stdout)
+      let now = clock::milliseconds()
+
+      if now == null || now - started >= 10000
+        break
+      end
+    end
+
+    test::assertTrue(ready)
+    if !ready
+      match child.cancel()
+        case result::Result.Ok(cancelled)
+          test::assertTrue(cancelled)
+        case result::Result.Error(error)
+          test::assertTrue(false)
+      end
+      let stopped = child.wait(5000)
+
+      test::assertTrue(!stopped.running && stopped.failure == null)
+      return 1
+    end
+
+    test::assertTrue(recoveryBackup(sourcePath, snapshotPath))
+    match child.cancel()
+      case result::Result.Ok(cancelled)
+        test::assertTrue(cancelled)
+      case result::Result.Error(error)
+        test::assertTrue(false)
+        return 1
+    end
+    let stopped = child.wait(5000)
+
+    test::assertTrue(!stopped.running && stopped.failure == null)
+    let restoredPath = directory + "/restored-" + mode + ".sqlite"
+
+    test::assertTrue(recoveryBackup(snapshotPath, restoredPath))
+    verifyWritableSnapshot(sourcePath)
+    verifyWritableSnapshot(snapshotPath)
+    verifyWritableSnapshot(restoredPath)
+    return 0
+  end
+  return 1
+end
+
+def verifyFile(worker: String): resources::Outcome<Int, result::Failure>
+  using temporary <- files::TemporaryDirectory.create("neri-data-recovery-")
+    let deleteResult = runRecovery(worker, temporary.path(), "delete")
+
+    test::assertEqual(deleteResult.closeFailures.count(), 0)
+    match deleteResult.completion
+      case resources::Completion.Value(value)
+        test::assertEqual(value, 0)
+      case resources::Completion.Failure(problem)
+        test::assertTrue(false)
+    end
+    let walResult = runRecovery(worker, temporary.path(), "wal")
+
+    test::assertEqual(walResult.closeFailures.count(), 0)
+    match walResult.completion
+      case resources::Completion.Value(value)
+        test::assertEqual(value, 0)
+      case resources::Completion.Failure(problem)
+        test::assertTrue(false)
+    end
+    return 0
+  end
+  return 1
+end
+
+def main(): Void
+  let worker = host::argumentAt(0)
+
+  test::assertTrue(worker != null)
+  if worker == null
+    return
+  end
+  let completed = verifyFile(worker)
+
+  test::assertEqual(completed.closeFailures.count(), 0)
+  match completed.completion
+    case resources::Completion.Value(value)
+      test::assertEqual(value, 0)
+    case resources::Completion.Failure(problem)
+      test::assertTrue(false)
+  end
+  console::println("SQLite recovery and backup contracts passed")
+end

@@ -2,8 +2,10 @@
 #define _DARWIN_C_SOURCE
 // POSIX layouts and constants only. Ownership, retries and deadlines live in Neri.
 #include "neri/runtime_abi.h"
+#include "error_text.h"
 #include <errno.h>
 #include <limits.h>
+#include <stdlib.h>
 #include <string.h>
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -95,6 +97,49 @@ int64_t neri_rt_v1_net_poll(int64_t fd, int64_t writing, int64_t milliseconds) {
   if (result > 0 && (item.revents & POLLNVAL)) { errno = EBADF; return -1; }
   return io_result(result);
 }
+int64_t neri_rt_v1_net_poll_many(const int64_t *descriptors, const int64_t *interests,
+                               int64_t *events, int64_t count, int64_t timeout_ms) {
+  const int previous_error = errno;
+  if (count < 0 || count > 4096 || (count != 0 && events == NULL)) {
+    errno = EINVAL; return -1;
+  }
+  if (count != 0) memset(events, 0, (size_t)count * sizeof(*events));
+  if (timeout_ms < -1 || timeout_ms > 60000 ||
+      (count != 0 && (descriptors == NULL || interests == NULL))) {
+    errno = EINVAL; return -1;
+  }
+  for (int64_t index = 0; index < count; ++index) {
+    if (descriptors[index] < 0 || descriptors[index] > INT_MAX ||
+        interests[index] < 0 || interests[index] > 3) {
+      errno = EINVAL; return -1;
+    }
+  }
+  struct pollfd *items = count == 0 ? NULL : malloc((size_t)count * sizeof(*items));
+  if (count != 0 && items == NULL) { errno = ENOMEM; return -1; }
+  for (int64_t index = 0; index < count; ++index) {
+    items[index].fd = (int)descriptors[index];
+    items[index].events = (short)(((interests[index] & 1) ? POLLIN : 0) |
+                                  ((interests[index] & 2) ? POLLOUT : 0));
+    items[index].revents = 0;
+  }
+  const int result = poll(items, (nfds_t)count, (int)timeout_ms);
+  const int poll_error = errno;
+  int64_t ready = 0;
+  if (result > 0) {
+    for (int64_t index = 0; index < count; ++index) {
+      const short flags = items[index].revents;
+      events[index] = ((flags & POLLIN) ? 1 : 0) | ((flags & POLLOUT) ? 2 : 0) |
+          ((flags & POLLERR) ? 4 : 0) | ((flags & POLLHUP) ? 8 : 0) |
+          ((flags & POLLNVAL) ? 16 : 0);
+      if (events[index] != 0) ++ready;
+    }
+  }
+  free(items);
+  if (result < 0 && poll_error != EINTR) { errno = poll_error; return -1; }
+  // An interrupt returns control to the Neri lifecycle without restarting its wait.
+  errno = previous_error;
+  return ready;
+}
 int64_t neri_rt_v1_net_read(int64_t fd, uint8_t *bytes, int64_t length) {
   if (length < 0) { errno = EINVAL; return -1; }
   return io_result(recv((int)fd, bytes, (size_t)length, 0));
@@ -116,9 +161,12 @@ int64_t neri_rt_v1_net_milliseconds(void) {
   return now.tv_sec * INT64_C(1000) + now.tv_nsec / 1000000;
 }
 int64_t neri_rt_v1_net_error(uint8_t *bytes, int64_t capacity) {
-  const char *message = strerror(errno);
-  if (capacity < 0) return 0;
-  const size_t length = strlen(message) < (size_t)capacity ? strlen(message) : (size_t)capacity;
-  memcpy(bytes, message, length);
-  return (int64_t)length;
+  if (bytes == NULL || capacity <= 0) return 0;
+  const int error = errno;
+  char message[256];
+  const size_t length = neri_platform_error_text(error, message, sizeof(message));
+  const size_t copied = length < (size_t)capacity ? length : (size_t)capacity;
+  memcpy(bytes, message, copied);
+  errno = error;
+  return (int64_t)copied;
 }

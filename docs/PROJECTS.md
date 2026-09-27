@@ -60,6 +60,32 @@ References may target only library units. The complete reference closure is
 deterministic: missing units, cycles and overlapping ownership of a canonical
 source file are configuration errors. A diamond dependency is loaded once.
 
+## Source identity mapping
+
+A version-2 manifest may declare a top-level `sourceMap` when its source files
+are copied into another directory before compilation:
+
+```json
+"sourceMap": { "staging/revision-a": "../../app" }
+```
+
+Each key is a normalized relative physical directory prefix below the manifest
+directory. Each value is a relative directory path from that same directory;
+`..` segments are allowed in values. The longest matching key maps a source's
+path by directory boundary to its original path. Mapping applies only to sources
+owned by that manifest. Duplicate keys, invalid paths and two sources resolving
+to the same identity are project errors.
+
+Neri reads and verifies the declared physical files. The mapped path supplies
+source IDs, session identities and native debug paths, even when the original
+file is absent or has different contents. Without `sourceMap`, source identity
+uses the physical path as before.
+
+This separation of physical input paths and compiler-emitted source paths follows
+the approach documented for [C# PathMap](https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/compiler-options/advanced#pathmap).
+Neri also uses the mapped paths for source identity; source contents remain part
+of cache validation.
+
 ## Workspace members
 
 | Manifest field | Makes available | Effect on tests |
@@ -151,6 +177,17 @@ An executable unit may opt into project-wide test runs with a `test` object:
 to 120000 milliseconds. It accepts integers from 1 through 600000. A test may
 declare at most 64 arguments of at most 4096 bytes each and 65536 bytes in
 total. Test metadata on a library unit is a configuration error.
+
+`neri project-units --project manifest.json --test-suite tooling/compiler-contracts.json`
+selects registered tests by an explicit suite configuration, independently of
+source filenames. The configuration is a JSON object with `version: 1` and a
+`units` array of unique executable unit names carrying test metadata in the
+selected manifest. Unknown units and units without test metadata are errors.
+Each output record contains the unit name, timeout in milliseconds and zero or
+more UTF-8 hex-encoded arguments, separated by tabs. An empty argument is an
+empty field. The repository's compiler-tooling runner builds the selected units
+together and uses their declared arguments and budgets (rounded up to whole
+seconds by the host capture interface).
 
 The test runner passes arguments directly to the executable without a shell.
 An argument equal to `{project}`, `{compiler}`, or `{work}` resolves to the

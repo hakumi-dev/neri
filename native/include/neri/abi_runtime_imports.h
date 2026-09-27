@@ -156,6 +156,13 @@ static const struct neri_abi_type_v1 neri_abi_parameters_neri_rt_v1_session_load
   { NERI_IR_TYPE_STRING_V1, NULL },
   { NERI_IR_TYPE_STRING_V1, NULL },
 };
+static const struct neri_abi_type_v1 neri_abi_parameters_neri_rt_v1_session_load_execute_object_libraries[] = {
+  { NERI_IR_TYPE_INT_V1, NULL },
+  { NERI_IR_TYPE_STRING_V1, NULL },
+  { NERI_IR_TYPE_STRING_V1, NULL },
+  { NERI_IR_TYPE_STRING_V1, NULL },
+  { NERI_IR_TYPE_STRING_V1, NULL },
+};
 static const struct neri_abi_type_v1 neri_abi_parameters_neri_rt_v1_session_reset[] = {
   { NERI_IR_TYPE_INT_V1, NULL },
 };
@@ -167,6 +174,9 @@ static const struct neri_abi_type_v1 neri_abi_parameters_neri_rt_v1_session_erro
 };
 static const struct neri_abi_type_v1 neri_abi_parameters_neri_rt_v1_session_result[] = {
   { NERI_IR_TYPE_INT_V1, NULL },
+};
+static const struct neri_abi_type_v1 neri_abi_parameters_neri_rt_v1_session_fail[] = {
+  { NERI_IR_TYPE_STRING_V1, NULL },
 };
 
 static const struct neri_abi_runtime_import_v1 neri_abi_runtime_imports_v1[] = {
@@ -211,10 +221,12 @@ static const struct neri_abi_runtime_import_v1 neri_abi_runtime_imports_v1[] = {
   { "neri_rt_v1_session_load_execute", neri_abi_parameters_neri_rt_v1_session_load_execute, UINT32_C(2), { NERI_IR_TYPE_INT_V1, NULL }, UINT32_C(125), UINT16_C(19), UINT64_C(8388608) },
   { "neri_rt_v1_session_load_execute_retained", neri_abi_parameters_neri_rt_v1_session_load_execute_retained, UINT32_C(3), { NERI_IR_TYPE_INT_V1, NULL }, UINT32_C(125), UINT16_C(23), UINT64_C(8388608) },
   { "neri_rt_v1_session_load_execute_object", neri_abi_parameters_neri_rt_v1_session_load_execute_object, UINT32_C(4), { NERI_IR_TYPE_INT_V1, NULL }, UINT32_C(125), UINT16_C(24), UINT64_C(8388608) },
+  { "neri_rt_v1_session_load_execute_object_libraries", neri_abi_parameters_neri_rt_v1_session_load_execute_object_libraries, UINT32_C(5), { NERI_IR_TYPE_INT_V1, NULL }, UINT32_C(125), UINT16_C(30), UINT64_C(8388608) },
   { "neri_rt_v1_session_reset", neri_abi_parameters_neri_rt_v1_session_reset, UINT32_C(1), { NERI_IR_TYPE_INT_V1, NULL }, UINT32_C(125), UINT16_C(19), UINT64_C(8388608) },
   { "neri_rt_v1_session_destroy", neri_abi_parameters_neri_rt_v1_session_destroy, UINT32_C(1), { NERI_IR_TYPE_INT_V1, NULL }, UINT32_C(125), UINT16_C(19), UINT64_C(8388608) },
   { "neri_rt_v1_session_error", neri_abi_parameters_neri_rt_v1_session_error, UINT32_C(1), { NERI_IR_TYPE_STRING_V1, NULL }, UINT32_C(93), UINT16_C(19), UINT64_C(8388608) },
   { "neri_rt_v1_session_result", neri_abi_parameters_neri_rt_v1_session_result, UINT32_C(1), { NERI_IR_TYPE_STRING_V1, NULL }, UINT32_C(93), UINT16_C(23), UINT64_C(8388608) },
+  { "neri_rt_v1_session_fail", neri_abi_parameters_neri_rt_v1_session_fail, UINT32_C(1), { NERI_IR_TYPE_VOID_V1, NULL }, UINT32_C(87), UINT16_C(31), UINT64_C(8388608) },
 };
 
 static inline const struct neri_abi_runtime_import_v1 *neri_abi_runtime_import(const char *link_name) {

@@ -1,0 +1,146 @@
+use files
+use host
+
+class SavedArtifacts
+  public directory: String
+  private count: Int = 0
+  private entries: StringBuffer = new StringBuffer()
+
+  def init(directory: String): Void
+    this.directory = directory
+  end
+
+  def create(): Bool
+    files::removeTree(this.directory)
+    return files::createDirectory(this.directory, true).failure == null
+  end
+
+  def add(key: String, object: String, transport: String): Bool
+    let objectDigest = referenceFileDigest(object)
+    let transportDigest = referenceFileDigest(transport)
+    let name = "unit-" + (this.count as String) + ".o"
+    let destination = this.directory + "/" + name
+
+    if objectDigest == "" || transportDigest == "" || files::copyFile(object, destination).failure != null || files::copyFile(transport, destination + ".nir.hex").failure != null
+      return false
+    end
+    if referenceFileDigest(destination) != objectDigest || referenceFileDigest(destination + ".nir.hex") != transportDigest || referenceFileDigest(object) != objectDigest || referenceFileDigest(transport) != transportDigest
+      return false
+    end
+    this.entries.add((this.count == 0 ? "" : ",") + "{\"key\":" + lspQuote(key) + ",\"object\":" + lspQuote(name) + ",\"objectDigest\":" + lspQuote(objectDigest) + ",\"transport\":" + lspQuote(name + ".nir.hex") + ",\"transportDigest\":" + lspQuote(transportDigest) + "}")
+    this.count = this.count + 1
+    return true
+  end
+
+  def finish(): Bool
+    let text = "{\"schemaVersion\":1,\"units\":[" + this.entries.join() + "]}\n"
+
+    return host::writeText(this.directory + "/manifest.json", text) && savedArtifactsManifest(this.directory) == text
+  end
+end
+
+# The manifest is the identity of a complete, flat set of compiler outputs.
+# Filenames are derived from the ordinal, never interpreted as manifest paths.
+def savedArtifactsManifest(directory: String): String?
+  let status = files::status(directory).status
+
+  if status == null || status.symlink || !status.kind.isDirectory()
+    return null
+  end
+  let text = host::readText(directory + "/manifest.json")
+
+  if text == null || host::stringByteLength(text) > 4194304
+    return null
+  end
+  let parser = new LspJsonParser(text)
+  let record = parser.parse()
+
+  parser.spaces()
+  let units = record.get("units")
+
+  if parser.failed || parser.position != host::stringByteLength(text) || !record.isObject() || record.get("schemaVersion").scalarText() != "1" || !units.isArray()
+    return null
+  end
+  var unit = units.first
+  var count = 0
+  let keys = new StringTable<Bool>()
+
+  while unit != null
+    let name = "unit-" + (count as String) + ".o"
+    let key = unit.get("key")
+
+    if count >= 4096 || !unit.isObject() || !key.isString() || key.scalarText() == "" || !keys.add(key.scalarText(), true) || unit.get("object").scalarText() != name || unit.get("transport").scalarText() != name + ".nir.hex"
+      return null
+    end
+    let objectDigest = referenceFileDigest(directory + "/" + name)
+    let transportDigest = referenceFileDigest(directory + "/" + name + ".nir.hex")
+
+    if objectDigest == "" || transportDigest == "" || objectDigest != unit.get("objectDigest").scalarText() || transportDigest != unit.get("transportDigest").scalarText()
+      return null
+    end
+    count = count + 1
+    unit = unit.next
+  end
+  if count == 0
+    return null
+  end
+  let absolute = host::pathAbsolute(directory)
+
+  if absolute == null
+    return null
+  end
+  let opened = files::Root.open(absolute)
+  let root = opened.root
+
+  if root == null
+    return null
+  end
+  let listing = root.list("", count * 2 + 2)
+  let closed = root.close()
+
+  if listing.failure != null || listing.closeFailure != null || closed != null || listing.entries.Length != count * 2 + 1
+    return null
+  end
+  for entry in listing.entries
+    if !entry.kind.isFile()
+      return null
+    end
+  end
+  return host::readText(directory + "/manifest.json") == text ? text : null
+end
+
+def savedArtifactsDigest(directory: String): String
+  let manifest = savedArtifactsManifest(directory)
+
+  return manifest == null ? "" : sha256FastText(manifest)
+end
+
+def savedArtifactsCopy(source: String, destination: String, expectedDigest: String): Bool
+  let manifest = savedArtifactsManifest(source)
+
+  if expectedDigest == "" || manifest == null || sha256FastText(manifest) != expectedDigest || files::createDirectory(destination).failure != null
+    return false
+  end
+  let parser = new LspJsonParser(manifest)
+  let record = parser.parse()
+  var unit = record.get("units").first
+  var index = 0
+
+  while unit != null
+    let name = "unit-" + (index as String) + ".o"
+
+    for suffix in ["", ".nir.hex"]
+      if files::copyFile(source + "/" + name + suffix, destination + "/" + name + suffix).failure != null
+        files::removeTree(destination)
+        return false
+      end
+    end
+    index = index + 1
+    unit = unit.next
+  end
+  if !host::writeText(destination + "/manifest.json", manifest) || savedArtifactsDigest(destination) != expectedDigest || savedArtifactsDigest(source) != expectedDigest
+    files::removeTree(destination)
+    return false
+  end
+  return true
+end

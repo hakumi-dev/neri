@@ -1,0 +1,109 @@
+use host
+use test
+use neri_data
+use filtered_navigation_data
+
+def filteredSqlContains(sql: String, part: String): Bool
+  let length = host::stringByteLength(part)
+  var start = 0
+
+  while start + length <= host::stringByteLength(sql)
+    var index = 0
+
+    while index < length && host::stringByteAt(sql, start + index) == host::stringByteAt(part, index)
+      index = index + 1
+    end
+    if index == length
+      return true
+    end
+    start = start + 1
+  end
+  return false
+end
+
+class FilteredDialectProvider: Provider
+  private paged: Bool
+  public streams: Int = 0
+
+  def init(paged: Bool): Void
+    this.paged = paged
+  end
+
+  public override readonly def dialect(): SqlDialect
+    return SqlDialect.PostgreSql()
+  end
+
+  public override readonly def supports(capability: ProviderCapability): Bool
+    return true
+  end
+
+  public override def execute(plan: readonly SqlPlan): ProviderResult
+    return ProviderResult.Rows([new RawRow([new RawColumn("code", Cell.Text("parent")), new RawColumn("name", Cell.Text("parent name"))])])
+  end
+
+  public override def stream(plan: readonly StreamPlan, visit: fn(RawRow): Bool): StreamResult
+    this.streams = this.streams + 1
+    let expected = this.paged ? [4, 6, 8, 2, -1] : [2, -1, 4, 6, 8]
+    let parameters = plan.parameters()
+    var current = parameters.first()
+    var index = 0
+
+    test::assertEqual(parameters.count(), 5)
+    while current != null
+      match current.value()
+        case Parameter.Int(value)
+          test::assertEqual(value, expected[index])
+        case Parameter.Text(value)
+          test::assertEqual(expected[index], -1)
+          test::assertEqual(value, "parent")
+        case Parameter.Bool(value)
+          test::assertTrue(false)
+        case Parameter.Float(value)
+          test::assertTrue(false)
+      end
+      index = index + 1
+      current = current.next()
+    end
+    let sql = plan.sql()
+    let orderParameter = this.paged ? "$1" : "$3"
+    let filterParameter = this.paged ? "$4" : "$1"
+    let keyParameter = this.paged ? "$5" : "$2"
+
+    test::assertTrue(filteredSqlContains(sql, "\"entries\".\"rank\" > " + orderParameter))
+    test::assertTrue(filteredSqlContains(sql, "\"entries\".\"rank\" = " + filterParameter))
+    test::assertTrue(filteredSqlContains(sql, "\"entries\".\"account_code\" = " + keyParameter))
+    test::assertTrue(filteredSqlContains(sql, "\"entries\".\"id\" ASC"))
+    if this.paged
+      test::assertTrue(filteredSqlContains(sql, "ROW_NUMBER() OVER (PARTITION BY \"entries\".\"account_code\""))
+      test::assertTrue(filteredSqlContains(sql, "AS \"__neri_navigation_rank_1\""))
+    else
+      test::assertFalse(filteredSqlContains(sql, "ROW_NUMBER()"))
+    end
+    return StreamResult.Completed(0)
+  end
+end
+
+def verifyFilteredDialectContracts(): Void
+  for paged in [false, true]
+    let provider = new FilteredDialectProvider(paged)
+    let db = new FilteredNavigationDatabase(provider)
+    let threshold = 4
+    let preferred = 6
+    let fallback = 8
+    let order: quote fn(filtered_navigation_model::Entry): Int = quote do |entry: filtered_navigation_model::Entry|: Int
+      return entry.rank > threshold ? preferred : fallback
+    end
+    var children = db.entries.where(rank: 2).orderBy(order)
+
+    if paged
+      children = children.skip(1).take(2)
+    end
+    match db.include_entriesFor_Account_by_accountCode(db.accounts.take(1)).children(children).all()
+      case QueryResult.Failure(error)
+        test::assertTrue(false)
+      case QueryResult.Rows(rows)
+        test::assertEqual(rows.count(), 1)
+        test::assertEqual(provider.streams, 1)
+    end
+  end
+end

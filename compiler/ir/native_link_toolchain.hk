@@ -1,0 +1,239 @@
+use host
+use process
+
+# One resolved plan supplies both executable cache identity and link arguments.
+# Link receipts bind the loaded closure; this plan also observes the current
+# loader search prefix through tool version queries.
+class NativeLinkToolchain
+  public driver: String = ""
+  public linker: String = ""
+  public lto: String = ""
+  public identity: String = ""
+  public cryptexPrefix: String = ""
+  public failureReason: String = ""
+  private attempted: Bool = false
+  private metadata: String = ""
+
+  def capture(target: readonly TargetPlatform): Bool
+    if this.attempted
+      return this.identity != ""
+    end
+    this.attempted = true
+    let configured = host::environment("NERI_LINKER")
+
+    if !target.isMacOS() || !runCacheSupportedHost() || configured == null || !bootstrapStartsWith(configured, "/") || !semanticEndsWith(configured, "/bin/clang++")
+      this.failureReason = "unsupported host, target or linker configuration"
+      return false
+    end
+    for variable in ["LIBRARY_PATH", "COMPILER_PATH", "GCC_EXEC_PREFIX", "CCC_OVERRIDE_OPTIONS", "DYLD_INSERT_LIBRARIES", "DYLD_LIBRARY_PATH", "DYLD_FRAMEWORK_PATH", "DYLD_FALLBACK_LIBRARY_PATH", "DYLD_FALLBACK_FRAMEWORK_PATH", "DYLD_VERSIONED_LIBRARY_PATH", "DYLD_VERSIONED_FRAMEWORK_PATH", "DYLD_ROOT_PATH", "DYLD_IMAGE_SUFFIX"]
+      let value = host::environment(variable)
+
+      if value != null && value != ""
+        this.failureReason = "link environment override: " + variable
+        return false
+      end
+    end
+    this.driver = configured
+    let driverBefore = this.fileMetadata(configured)
+
+    if driverBefore == ""
+      this.failureReason = "cannot observe driver metadata: " + configured
+      return false
+    end
+    this.linker = this.query("/usr/bin/xcrun", ["--find", "ld"])
+    let linkerBefore = this.fileMetadata(this.linker)
+
+    if linkerBefore == ""
+      this.failureReason = "cannot resolve linker metadata: " + this.linker
+      return false
+    end
+    let driverTrace = this.observe(configured, ["--no-default-config", "--version"])
+
+    return false if driverTrace == null
+    let linkerTrace = this.observe(this.linker, ["-v"])
+
+    return false if linkerTrace == null
+    if driverTrace.cryptexPrefix != linkerTrace.cryptexPrefix || this.fileMetadata(this.linker) != linkerBefore
+      this.failureReason = "inconsistent loader search prefixes or changed linker metadata"
+      return false
+    end
+    this.cryptexPrefix = driverTrace.cryptexPrefix
+    var loaded = linkerTrace.paths.first.nextNode
+
+    while loaded != null
+      if semanticEndsWith(loaded.value, "/libLTO.dylib")
+        if this.lto != ""
+          this.failureReason = "multiple loaded LTO libraries"
+          return false
+        end
+        this.lto = loaded.value
+      end
+      loaded = loaded.nextNode
+    end
+    if this.linker == "" || this.lto == "" || this.fileMetadata(configured) != driverBefore
+      this.failureReason = this.lto == "" ? "linker version query did not load libLTO.dylib" : "driver metadata changed during observation"
+      return false
+    end
+    # Hash contents once per compilation, bracketed by metadata for the whole
+    # tool set. Only this in-process plan may reuse that content observation.
+    let before = this.snapshot()
+    var identity = runCacheFrame("darwin-link-tools-v3") + runCacheFrame(this.cryptexPrefix)
+
+    if before == ""
+      this.failureReason = "cannot snapshot link tool metadata"
+      return false
+    end
+    for tool in [this.driver, this.linker]
+      if !nativeLinkProfile(tool)
+        this.failureReason = "unsupported Mach-O executable profile: " + tool
+        return false
+      end
+    end
+    for path in [this.driver, this.linker, this.lto]
+      let canonical = neriCanonicalPath(path)
+      let digest = nativeLinkFileDigest(path)
+
+      if canonical == null || digest == ""
+        this.failureReason = "cannot resolve or hash link tool: " + path
+        return false
+      end
+      identity = identity + runCacheFrame(path) + runCacheFrame(runCacheFrame(canonical) + runCacheFrame(digest))
+    end
+    if this.snapshot() != before || this.fileMetadata(configured) != driverBefore || this.fileMetadata(this.linker) != linkerBefore
+      this.failureReason = "link tools changed while hashing"
+      return false
+    end
+    this.metadata = before
+    this.identity = identity
+    this.failureReason = ""
+    return true
+  end
+
+  def matches(): Bool
+    return this.identity != "" && this.metadata != "" && this.snapshot() == this.metadata
+  end
+
+  def arguments(arguments: String[]): String[]
+    var result = host::appendString(arguments, "--no-default-config")
+
+    result = host::appendString(result, "--ld-path=" + this.linker)
+    # Neri emits native objects. Use the selected linker's own loaded LTO
+    # library, avoiding a second loader launch with a temporary override path.
+    result = host::appendString(result, "-Xlinker")
+    result = host::appendString(result, "-lto_library")
+    result = host::appendString(result, "-Xlinker")
+    return host::appendString(result, this.lto)
+  end
+
+  private def snapshot(): String
+    var result = runCacheFrame("darwin-link-tools-v1")
+
+    for path in [this.driver, this.linker, this.lto]
+      let identity = this.fileMetadata(path)
+
+      if identity == ""
+        return ""
+      end
+      result = result + runCacheFrame(path) + runCacheFrame(identity)
+    end
+    return result
+  end
+
+  private def fileMetadata(path: String): String
+    let before = new RunCacheFile(path, true)
+    let canonical = neriCanonicalPath(path)
+    let after = new RunCacheFile(path, true)
+
+    if before.kind != 1 || canonical == null || before.fingerprint == "" || before.fingerprint != after.fingerprint || neriCanonicalPath(path) != canonical
+      return ""
+    end
+    return runCacheFrame(canonical) + runCacheFrame(before.fingerprint)
+  end
+
+  private def observe(executable: String, arguments: String[]): NativeLinkTrace?
+    this.failureReason = "loader observation failed: " + executable
+    let options = new process::SpawnOptions(executable)
+
+    options.arguments = arguments
+    options.stdoutLimit = 4096
+    options.stderrLimit = 4194304
+    options.environment = [new process::EnvironmentEntry("DYLD_PRINT_LIBRARIES", "1"), new process::EnvironmentEntry("DYLD_PRINT_SEARCHING", "1"), new process::EnvironmentEntry("DYLD_USE_CLOSURES", "0")]
+    let child = process::spawn(options).child()
+
+    return null if child == null
+    let completed = child.wait(10000)
+
+    if completed.running || completed.failure != null
+      child.cancel()
+      child.dispose()
+      return null
+    end
+    let released = child.dispose()
+    let exit = completed.exit
+    let text = host::stringFromBytes(completed.stderr)
+
+    if !released || exit == null || !exit.isExited() || exit.value() != 0 || completed.stdoutTruncated || completed.stderrTruncated || text == null
+      return null
+    end
+    let trace = new NativeLinkTrace()
+
+    let diagnostics = trace.parse(text, executable, "")
+
+    if !trace.valid || trace.cryptexPrefix == ""
+      this.failureReason = "loader trace rejected: " + executable + (trace.cryptexPrefix == "" ? " (no cryptex search prefix)" : "")
+      let length = host::stringByteLength(diagnostics)
+
+      if length > 0
+        this.failureReason = this.failureReason + "\n" + host::stringSlice(diagnostics, 0, length > 1024 ? 1024 : length)
+      end
+    end
+    return trace.valid && trace.cryptexPrefix != "" ? trace : null
+  end
+
+  private def query(executable: String, arguments: String[]): String
+    let options = new process::SpawnOptions(executable)
+
+    options.arguments = arguments
+    options.stdoutLimit = 4096
+    options.stderrLimit = 4096
+    let started = process::spawn(options)
+    let child = started.child()
+
+    if child == null
+      return ""
+    end
+    let completed = child.wait(10000)
+
+    if completed.running || completed.failure != null
+      child.cancel()
+      child.dispose()
+      return ""
+    end
+    let released = child.dispose()
+    let exit = completed.exit
+    let output = host::stringFromBytes(completed.stdout)
+
+    if !released || exit == null || !exit.isExited() || exit.value() != 0 || completed.stdoutTruncated || completed.stderrTruncated || output == null || !bootstrapStartsWith(output, "/")
+      return ""
+    end
+    let length = host::stringByteLength(output)
+
+    if length < 2 || host::stringByteAt(output, length - 1) != 10 as Byte
+      return ""
+    end
+    var index = 0
+
+    while index < length - 1
+      let byte = host::stringByteAt(output, index) as Int
+
+      if byte < 32 || byte == 127
+        return ""
+      end
+      index = index + 1
+    end
+    let path = host::stringSlice(output, 0, length - 1)
+    let canonical = neriCanonicalPath(path)
+
+    return canonical == null ? "" : canonical
+  end
+end

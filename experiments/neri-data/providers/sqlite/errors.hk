@@ -1,0 +1,160 @@
+use neri_data
+namespace neri_data_sqlite
+
+## Capture before finalize, rollback or close can replace SQLite's error state.
+unsafe def sqliteFailure(database: Void*, operation: String, status: Int32? = null): ProviderFailure
+  var extended = sqliteExtendedError(database) as Int
+
+  if status != null
+    let returned = status as Int
+
+    if extended == 0 || (extended - (extended / 256) * 256) != (returned - (returned / 256) * 256)
+      extended = returned
+    end
+  end
+  let primary = (extended - (extended / 256) * 256)
+  var kind = DriverErrorKind.Other()
+
+  if primary == 5 || primary == 6
+    kind = DriverErrorKind.Contention()
+  else if primary == 19
+    kind = DriverErrorKind.Constraint()
+  else if primary == 9
+    kind = DriverErrorKind.Interrupted()
+  else if primary == 8
+    kind = DriverErrorKind.ReadOnly()
+  else if primary == 13
+    kind = DriverErrorKind.StorageFull()
+  else if primary == 10
+    kind = DriverErrorKind.Io()
+  else if primary == 11 || primary == 26
+    kind = DriverErrorKind.Corrupt()
+  end
+  return ProviderFailure.Driver(new DriverError("sqlite", operation, kind, primary, extended, null, sqliteMessage(database)))
+end
+
+unsafe def sqliteFinalizeFailure(database: Void*, statement: Void*, primary: ProviderFailure): ProviderFailure
+  let status = sqliteFinalize(statement)
+
+  if status != (0 as Int32)
+    return sqliteMergeFinalize(database, primary, status)
+  end
+  return primary
+end
+
+unsafe def sqliteCloseFailure(database: Void*, primary: ProviderFailure): ProviderFailure
+  let status = sqliteClose(database)
+
+  if status != (0 as Int32)
+    return ProviderFailure.Cleanup(new ProviderCleanupFailure(primary, sqliteFailure(database, "close", status)))
+  end
+  return primary
+end
+
+unsafe def sqliteWriteFinalizeFailure(database: Void*, statement: Void*, primary: WriteFailure): WriteFailure
+  let status = sqliteFinalize(statement)
+
+  if status != (0 as Int32)
+    return sqliteMergeWriteFinalize(database, primary, status)
+  end
+  return primary
+end
+
+## finalize may repeat the last step error rather than report a second failure.
+def sqliteRepeatsFailure(primary: ProviderFailure, status: Int32): Bool
+  match primary
+    case ProviderFailure.Driver(driver)
+      return driver.extendedCode() == (status as Int) || driver.primaryCode() == (status as Int)
+    case ProviderFailure.State(message)
+      return false
+    case ProviderFailure.Cleanup(error)
+      return sqliteRepeatsFailure(error.primary(), status)
+  end
+end
+
+unsafe def sqliteMergeFinalize(database: Void*, primary: ProviderFailure, status: Int32): ProviderFailure
+  if status == (0 as Int32) || sqliteRepeatsFailure(primary, status)
+    return primary
+  end
+  return ProviderFailure.Cleanup(new ProviderCleanupFailure(primary, sqliteFailure(database, "finalize", status)))
+end
+
+unsafe def sqliteMergeWriteFinalize(database: Void*, primary: WriteFailure, status: Int32): WriteFailure
+  if status == (0 as Int32)
+    return primary
+  end
+  match primary
+    case WriteFailure.Provider(failure)
+      return WriteFailure.Provider(sqliteMergeFinalize(database, failure, status))
+    case WriteFailure.Validation(message)
+    case WriteFailure.Concurrency(message)
+    case WriteFailure.Constraint(message)
+    case WriteFailure.Transaction(message)
+    case WriteFailure.Unsupported(message)
+    case WriteFailure.Cleanup(error)
+  end
+  return WriteFailure.Cleanup(new WriteCleanupFailure(primary, WriteFailure.Provider(sqliteFailure(database, "finalize", status))))
+end
+
+def sqliteResourceFailure(error: ProviderFailure): result::Failure
+  match error
+    case ProviderFailure.State(message)
+      return new result::Failure("invalid_state", "sqlite", message)
+    case ProviderFailure.Driver(driver)
+      var code = "provider_error"
+
+      match driver.kind()
+        case DriverErrorKind.Contention()
+          code = "contention"
+        case DriverErrorKind.Constraint()
+          code = "constraint"
+        case DriverErrorKind.Interrupted()
+          code = "interrupted"
+        case DriverErrorKind.ReadOnly()
+          code = "read_only"
+        case DriverErrorKind.StorageFull()
+          code = "storage_full"
+        case DriverErrorKind.Io()
+          code = "io"
+        case DriverErrorKind.Corrupt()
+          code = "corrupt"
+        case DriverErrorKind.Other()
+      end
+      return new result::Failure(code, driver.operation(), driver.message(), nativeError: new result::NativeError(driver.provider(), driver.primaryCode(), driver.extendedCode(), driver.sqlState()))
+    case ProviderFailure.Cleanup(failure)
+      return new result::Failure("cleanup_failed", "sqlite", cause: sqliteResourceFailure(failure.primary()), closeFailure: sqliteResourceFailure(failure.cleanup()))
+  end
+end
+
+def sqliteCloseRead(result: ProviderResult, cleanup: ProviderFailure): ProviderResult
+  match result
+    case ProviderResult.Failure(primary)
+      return ProviderResult.Failure(ProviderFailure.Cleanup(new ProviderCleanupFailure(primary, cleanup)))
+    case ProviderResult.Rows(rows)
+      return ProviderResult.Failure(cleanup)
+  end
+end
+
+def sqliteCloseWrite(result: WriteResult, cleanup: ProviderFailure): WriteResult
+  match result
+    case WriteResult.Failure(primary)
+      return WriteResult.Failure(WriteFailure.Cleanup(new WriteCleanupFailure(primary, WriteFailure.Provider(cleanup))))
+    case WriteResult.Saved(count)
+      return WriteResult.Failure(WriteFailure.Provider(cleanup))
+    case WriteResult.SavedWithValues(count, outputs)
+      return WriteResult.Failure(WriteFailure.Provider(cleanup))
+  end
+end
+
+def sqliteCloseStream(result: StreamResult, cleanup: ProviderFailure): StreamResult
+  match result
+    case StreamResult.Completed(count)
+      return StreamResult.Failure(QueryFailure.Provider(cleanup), count)
+    case StreamResult.Stopped(count)
+      return StreamResult.Failure(QueryFailure.Provider(cleanup), count)
+    case StreamResult.Cancelled(count)
+      return StreamResult.Failure(QueryFailure.Provider(cleanup), count)
+    case StreamResult.Failure(error, count)
+      return StreamResult.Failure(QueryFailure.Cleanup(new QueryCleanupFailure(error, cleanup)), count)
+  end
+end

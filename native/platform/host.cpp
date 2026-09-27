@@ -1,4 +1,5 @@
 #include "host.h"
+#include "error_text.h"
 #include "neri/host_path.h"
 #include <algorithm>
 #include <atomic>
@@ -29,7 +30,14 @@ extern char **environ;
 #endif
 
 namespace neri::platform {
-namespace { std::atomic<uint64_t> temporary_file_counter{0}; }
+namespace {
+std::atomic<uint64_t> temporary_file_counter{0};
+
+std::string error_text(int error) {
+  char message[256];
+  return {message, neri_platform_error_text(error, message, sizeof(message))};
+}
+}
 std::optional<std::string> executable_path() {
   std::filesystem::path image;
 #if defined(_WIN32)
@@ -120,7 +128,8 @@ void deallocate(void *pointer) {
   struct stat previous{};
   const bool replacing = ::stat(std::string(path).c_str(), &previous) == 0;
   if (!replacing && errno != ENOENT) {
-    error = "cannot read existing file permissions: " + std::string(std::strerror(errno));
+    const int failure = errno;
+    error = "cannot read existing file permissions: " + error_text(failure);
     return false;
   }
 #endif
@@ -141,7 +150,8 @@ void deallocate(void *pointer) {
     }
   }
   if (descriptor < 0) {
-    error = "temporary file creation failed: " + std::string(std::strerror(errno));
+    const int failure = errno;
+    error = "temporary file creation failed: " + error_text(failure);
     return false;
   }
 
@@ -181,7 +191,7 @@ void deallocate(void *pointer) {
 #else
     static_cast<void>(::unlink(temporary.c_str()));
 #endif
-    error = "atomic file write failed: " + std::string(std::strerror(failure));
+    error = "atomic file write failed: " + error_text(failure);
     return false;
   }
   error.clear();
@@ -195,7 +205,11 @@ bool remove_file(std::string_view path, std::string &error) {
 #else
   const auto result = unlink(std::string(path).c_str());
 #endif
-  if (result != 0 && errno != ENOENT) { error = "file removal failed: " + std::string(std::strerror(errno)); return false; }
+  if (result != 0 && errno != ENOENT) {
+    const int failure = errno;
+    error = "file removal failed: " + error_text(failure);
+    return false;
+  }
   error.clear();
   return true;
 }
@@ -238,7 +252,7 @@ std::optional<int64_t> run(std::vector<std::string> &arguments, std::string &err
   for (char **item = environ; *item; ++item) options.environment.emplace_back(*item);
   int launch_error = 0;
   if (!posix_launch(options, process, launch_error)) {
-    error = "process start failed: " + std::string(std::strerror(launch_error));
+    error = "process start failed: " + error_text(launch_error);
     return std::nullopt;
   }
   int status = 0;
@@ -246,7 +260,8 @@ std::optional<int64_t> run(std::vector<std::string> &arguments, std::string &err
     if (errno == EINTR) {
       continue;
     }
-    error = "process wait failed: " + std::string(std::strerror(errno));
+    const int failure = errno;
+    error = "process wait failed: " + error_text(failure);
     return std::nullopt;
   }
   error.clear();

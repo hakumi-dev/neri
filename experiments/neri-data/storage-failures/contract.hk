@@ -1,0 +1,383 @@
+use console
+use files
+use host
+use model
+use resources
+use result
+use tasks
+use test
+use app_data
+use neri_data
+use neri_data_sqlite
+use neri_data_sqlite_fixture
+use neri_data_storage_failures
+
+def providerDriver(failure: ProviderFailure): DriverError?
+  match failure
+    case ProviderFailure.Driver(error)
+      return error
+    case ProviderFailure.State(message)
+      return null
+    case ProviderFailure.Cleanup(cleanup)
+      return null
+  end
+end
+
+def assertSqliteCode(error: DriverError, primaryCode: Int): Void
+  let primary = error.primaryCode()
+  let extended = error.extendedCode()
+
+  test::assertEqual(error.provider(), "sqlite")
+  test::assertTrue(primary != null && primary == primaryCode)
+  test::assertTrue(extended != null && (extended - (extended / 256) * 256) == primaryCode)
+end
+
+def assertFull(error: ProviderFailure): Void
+  let driver = providerDriver(error)
+
+  test::assertTrue(driver != null)
+  if driver != null
+    assertSqliteCode(driver, 13)
+    match driver.kind()
+      case DriverErrorKind.StorageFull()
+      case DriverErrorKind.Contention()
+        test::assertTrue(false)
+      case DriverErrorKind.Constraint()
+        test::assertTrue(false)
+      case DriverErrorKind.Interrupted()
+        test::assertTrue(false)
+      case DriverErrorKind.ReadOnly()
+        test::assertTrue(false)
+      case DriverErrorKind.Io()
+        test::assertTrue(false)
+      case DriverErrorKind.Corrupt()
+        test::assertTrue(false)
+      case DriverErrorKind.Other()
+        test::assertTrue(false)
+    end
+  end
+end
+
+def assertReadOnly(error: ProviderFailure): Void
+  let driver = providerDriver(error)
+
+  test::assertTrue(driver != null)
+  if driver != null
+    assertSqliteCode(driver, 8)
+    match driver.kind()
+      case DriverErrorKind.ReadOnly()
+      case DriverErrorKind.Contention()
+        test::assertTrue(false)
+      case DriverErrorKind.Constraint()
+        test::assertTrue(false)
+      case DriverErrorKind.Interrupted()
+        test::assertTrue(false)
+      case DriverErrorKind.StorageFull()
+        test::assertTrue(false)
+      case DriverErrorKind.Io()
+        test::assertTrue(false)
+      case DriverErrorKind.Corrupt()
+        test::assertTrue(false)
+      case DriverErrorKind.Other()
+        test::assertTrue(false)
+    end
+  end
+end
+
+def assertCorrupt(error: ProviderFailure): Void
+  let driver = providerDriver(error)
+
+  test::assertTrue(driver != null)
+  if driver != null
+    assertSqliteCode(driver, 26)
+    match driver.kind()
+      case DriverErrorKind.Corrupt()
+      case DriverErrorKind.Contention()
+        test::assertTrue(false)
+      case DriverErrorKind.Constraint()
+        test::assertTrue(false)
+      case DriverErrorKind.Interrupted()
+        test::assertTrue(false)
+      case DriverErrorKind.ReadOnly()
+        test::assertTrue(false)
+      case DriverErrorKind.StorageFull()
+        test::assertTrue(false)
+      case DriverErrorKind.Io()
+        test::assertTrue(false)
+      case DriverErrorKind.Other()
+        test::assertTrue(false)
+    end
+  end
+end
+
+def customerCount(provider: SQLiteProvider): Int
+  match new Database(provider).customers.take(10).all()
+    case QueryResult.Rows(rows)
+      return rows.count()
+    case QueryResult.Failure(error)
+      test::assertTrue(false)
+      return -1
+  end
+end
+
+def largeName(): String
+  let bytes: Byte[] = tasks::generate(16384, 1) do |index|
+    return 120 as Byte
+  end
+  let text = host::stringFromBytes(bytes)
+
+  if text == null
+    return ""
+  end
+  return text
+end
+
+def largeIOName(): String
+  let bytes: Byte[] = tasks::generate(131072, 1) do |index|
+    return 120 as Byte
+  end
+  let text = host::stringFromBytes(bytes)
+
+  if text == null
+    return ""
+  end
+  return text
+end
+
+def verifyFullAndRecovery(directory: String): Void
+  let path = directory + "/full.sqlite"
+  let schema = "PRAGMA page_size=512; CREATE TABLE customers(id INTEGER PRIMARY KEY, name TEXT NOT NULL, active INTEGER NOT NULL, nickname TEXT); INSERT INTO customers VALUES(1,'committed',1,NULL);"
+
+  test::assertTrue(createSQLiteFixture(path, schema))
+  var failure: ProviderFailure? = null
+
+  unsafe
+    failure = storageFullWrite(path, largeName())
+  end
+
+  test::assertTrue(failure != null)
+  if failure != null
+    assertFull(failure)
+  end
+
+  match SQLiteProvider.openWritable(path)
+    case SQLiteOpenResult.Failure(error)
+      test::assertTrue(false)
+    case SQLiteOpenResult.Opened(provider)
+      let db = new Database(provider)
+
+      test::assertEqual(customerCount(provider), 1)
+      test::assertTrue(db.customers.add(new Customer(3, "reused after SQLITE_FULL", true)) == null)
+      match db.saveChanges()
+        case WriteResult.Saved(count)
+          test::assertEqual(count, 1)
+        case WriteResult.SavedWithValues(count, outputs)
+          test::assertTrue(false)
+        case WriteResult.Failure(error)
+          test::assertTrue(false)
+      end
+
+      test::assertEqual(customerCount(provider), 2)
+      test::assertTrue(provider.close())
+  end
+end
+
+def verifyReadOnly(directory: String): Void
+  let path = directory + "/full.sqlite"
+  var failure: ProviderFailure? = null
+
+  unsafe
+    failure = storageReadOnlyInsert(path)
+  end
+
+  test::assertTrue(failure != null)
+  if failure != null
+    assertReadOnly(failure)
+  end
+end
+
+def verifyCorrupt(directory: String): Void
+  let path = directory + "/invalid.sqlite"
+
+  test::assertTrue(host::writeText(path, "not a SQLite database"))
+  match SQLiteProvider.openWritable(path)
+    case SQLiteOpenResult.Failure(error)
+      assertCorrupt(error)
+    case SQLiteOpenResult.Opened(provider)
+      provider.close()
+
+      test::assertTrue(false)
+  end
+end
+
+def assertIo(error: WriteFailure): Void
+  match error
+    case WriteFailure.Provider(failure)
+      match failure
+        case ProviderFailure.Driver(driver)
+          test::assertEqual(driver.provider(), "sqlite")
+          test::assertTrue(driver.primaryCode() == 10)
+          test::assertTrue(driver.extendedCode() == 778)
+          match driver.kind()
+            case DriverErrorKind.Io()
+            case DriverErrorKind.Contention()
+              test::assertTrue(false)
+            case DriverErrorKind.Constraint()
+              test::assertTrue(false)
+            case DriverErrorKind.Interrupted()
+              test::assertTrue(false)
+            case DriverErrorKind.ReadOnly()
+              test::assertTrue(false)
+            case DriverErrorKind.StorageFull()
+              test::assertTrue(false)
+            case DriverErrorKind.Corrupt()
+              test::assertTrue(false)
+            case DriverErrorKind.Other()
+              test::assertTrue(false)
+          end
+        case ProviderFailure.State(message)
+          test::assertTrue(false)
+        case ProviderFailure.Cleanup(cleanup)
+          test::assertTrue(false)
+      end
+    case WriteFailure.Cleanup(cleanup)
+      test::assertTrue(false)
+    case WriteFailure.Validation(message)
+      test::assertTrue(false)
+    case WriteFailure.Concurrency(message)
+      test::assertTrue(false)
+    case WriteFailure.Constraint(message)
+      test::assertTrue(false)
+    case WriteFailure.Unsupported(message)
+      test::assertTrue(false)
+    case WriteFailure.Transaction(message)
+      test::assertTrue(false)
+  end
+end
+
+def verifyIoError(directory: String): Void
+  let path = directory + "/ioerr.sqlite"
+
+  test::assertTrue(createSQLiteFixture(path, "CREATE TABLE customers(id INTEGER PRIMARY KEY, name TEXT NOT NULL, active INTEGER NOT NULL, nickname TEXT);"))
+  match SQLiteProvider.openWritable(path)
+    case SQLiteOpenResult.Failure(error)
+      test::assertTrue(false)
+    case SQLiteOpenResult.Opened(provider)
+      let db = new Database(provider)
+
+      test::assertTrue(db.customers.add(new Customer(1, "previous", true)) == null)
+      match db.saveChanges()
+        case WriteResult.Saved(count)
+          test::assertEqual(count, 1)
+        case WriteResult.SavedWithValues(count, outputs)
+          test::assertEqual(count, 1)
+        case WriteResult.Failure(error)
+          test::assertTrue(false)
+      end
+      let pending = new Customer(2, largeIOName(), true)
+
+      test::assertTrue(db.customers.add(pending) == null)
+      unsafe
+        let original = stackalloc StorageFileLimit[1]
+        let limited = stackalloc StorageFileLimit[1]
+        let resourceId = storageFileSizeResource()
+
+        test::assertEqual(getFileSizeLimit(resourceId, original), 0 as Int32)
+        test::assertTrue(original.hard >= (16384 as UInt64))
+        limited.soft = 16384 as UInt64
+        limited.hard = original.hard
+        setSignalHandler(storageFileSizeSignalNumber(), ignoreFileSizeSignal)
+
+        test::assertEqual(setFileSizeLimit(resourceId, limited), 0 as Int32)
+        let outcome = db.saveChanges()
+        let restored = setFileSizeLimit(resourceId, original)
+
+        test::assertEqual(restored, 0 as Int32)
+        match outcome
+          case WriteResult.Failure(error)
+            assertIo(error)
+          case WriteResult.Saved(count)
+            test::assertTrue(false)
+          case WriteResult.SavedWithValues(count, outputs)
+            test::assertTrue(false)
+        end
+      end
+
+      test::assertEqual(customerCount(provider), 1)
+      let persisted = new Database(provider)
+
+      match persisted.customers.where(id: 1).first()
+        case QueryValue.Value(customer)
+          test::assertTrue(customer != null)
+          if customer != null
+            test::assertEqual(customer.name, "previous")
+          end
+        case QueryValue.Failure(error)
+          test::assertTrue(false)
+      end
+      pending.name = "corrected after SQLITE_IOERR"
+      match db.saveChanges()
+        case WriteResult.Saved(count)
+          test::assertEqual(count, 1)
+        case WriteResult.SavedWithValues(count, outputs)
+          test::assertEqual(count, 1)
+        case WriteResult.Failure(error)
+          test::assertTrue(false)
+      end
+
+      test::assertEqual(customerCount(provider), 2)
+      test::assertTrue(provider.close())
+      match SQLiteProvider.openWritable(path)
+        case SQLiteOpenResult.Failure(error)
+          test::assertTrue(false)
+        case SQLiteOpenResult.Opened(reopened)
+          test::assertEqual(customerCount(reopened), 2)
+          let reopenedDb = new Database(reopened)
+
+          match reopenedDb.customers.where(id: 1).first()
+            case QueryValue.Value(customer)
+              test::assertTrue(customer != null)
+              if customer != null
+                test::assertEqual(customer.name, "previous")
+              end
+            case QueryValue.Failure(error)
+              test::assertTrue(false)
+          end
+          match reopenedDb.customers.where(id: 2).first()
+            case QueryValue.Value(customer)
+              test::assertTrue(customer != null)
+              if customer != null
+                test::assertEqual(customer.name, "corrected after SQLITE_IOERR")
+              end
+            case QueryValue.Failure(error)
+              test::assertTrue(false)
+          end
+
+          test::assertTrue(reopened.close())
+      end
+  end
+end
+
+def verifyStorage(): resources::Outcome<Int, result::Failure>
+  using temporary <- files::TemporaryDirectory.create("neri-data-storage-failures-")
+    verifyFullAndRecovery(temporary.path())
+    verifyReadOnly(temporary.path())
+    verifyCorrupt(temporary.path())
+    verifyIoError(temporary.path())
+    return 0
+  end
+  return 1
+end
+
+def main(): Void
+  let completed = verifyStorage()
+
+  test::assertEqual(completed.closeFailures.count(), 0)
+  match completed.completion
+    case resources::Completion.Value(value)
+      test::assertEqual(value, 0)
+    case resources::Completion.Failure(problem)
+      test::assertTrue(false)
+  end
+  console::println("SQLite storage failure contracts passed")
+end

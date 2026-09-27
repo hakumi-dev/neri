@@ -1,0 +1,224 @@
+use test
+use console
+use files
+use resources
+use result
+use generated_data
+use generated_model
+use neri_data
+use neri_data_sqlite
+use neri_data_sqlite_fixture
+
+def saved(result: WriteResult, expected: Int): Void
+  match result
+    case WriteResult.Saved(count)
+      test::assertEqual(count, expected)
+    case WriteResult.SavedWithValues(count, outputs)
+      test::assertTrue(false)
+    case WriteResult.Failure(error)
+      console::println(writeFailureMessage(error))
+
+      test::assertTrue(false)
+  end
+end
+
+def failed(result: WriteResult): Void
+  match result
+    case WriteResult.Saved(count)
+      test::assertTrue(false)
+    case WriteResult.SavedWithValues(count, outputs)
+      test::assertTrue(false)
+    case WriteResult.Failure(error)
+      test::assertTrue(writeFailureMessage(error) != "")
+  end
+end
+
+def count(provider: SQLiteProvider, expected: Int): Void
+  let db = new GeneratedDatabase(provider)
+
+  match db.records.count()
+    case QueryValue.Value(value)
+      test::assertEqual(value, expected)
+    case QueryValue.Failure(error)
+      test::assertTrue(false)
+  end
+end
+
+def verifyGeneratedKeys(provider: SQLiteProvider): Void
+  let db = new GeneratedDatabase(provider)
+  let first = new Record(0, "duplicate")
+  let second = new Record(0, "duplicate")
+
+  test::assertTrue(db.records.add(first) == null)
+  test::assertTrue(db.records.add(second) == null)
+  test::assertTrue(first.id < 0 && second.id < 0 && first.id != second.id)
+  let temporaryFirst = first.id
+  let temporarySecond = second.id
+
+  failed(db.saveChanges())
+
+  test::assertEqual(first.id, temporaryFirst)
+  test::assertEqual(second.id, temporarySecond)
+  count(provider, 0)
+  second.name = "second"
+  saved(db.saveChanges(), 2)
+
+  test::assertTrue(first.id > 0 && second.id > 0 && first.id != second.id)
+  saved(db.saveChanges(), 0)
+  first.name = "updated generated key"
+  saved(db.saveChanges(), 1)
+  match db.records.where(id: first.id).single()
+    case QueryValue.Value(value)
+      value.name = "identity reuse"
+    case QueryValue.Failure(error)
+      test::assertTrue(false)
+  end
+
+  test::assertEqual(first.name, "identity reuse")
+  saved(db.saveChanges(), 1)
+  saved(db.beginTransaction(), 0)
+  first.name = "retry local edit"
+  saved(db.saveChanges(), 1)
+  let provisional = new Record(0, "provisional")
+
+  test::assertTrue(db.records.add(provisional) == null)
+  let temporaryProvisional = provisional.id
+
+  saved(db.saveChanges(), 1)
+
+  test::assertTrue(provisional.id > 0)
+  provisional.name = "retry provisional insert"
+  saved(db.saveChanges(), 1)
+  saved(db.rollbackTransaction(), 0)
+
+  test::assertEqual(provisional.id, temporaryProvisional)
+  count(provider, 2)
+  saved(db.saveChanges(), 2)
+
+  test::assertTrue(provisional.id > 0)
+  count(provider, 3)
+
+  test::assertTrue(db.records.remove(second) == null)
+  saved(db.saveChanges(), 1)
+  count(provider, 2)
+end
+
+def verifyCollision(provider: SQLiteProvider): Void
+  let db = new GeneratedDatabase(provider)
+  let phantom = new Record(1, "locally attached key")
+  let added = new Record(0, "collision")
+
+  test::assertTrue(db.records.attach(phantom) == null)
+  test::assertTrue(db.records.add(added) == null)
+  let temporary = added.id
+
+  failed(db.saveChanges())
+  count(provider, 0)
+
+  test::assertEqual(added.id, temporary)
+  test::assertTrue(db.records.detach(phantom) == null)
+  saved(db.saveChanges(), 1)
+
+  test::assertEqual(added.id, 1)
+end
+
+def verifyInvalidSchema(provider: SQLiteProvider): Void
+  let db = new GeneratedDatabase(provider)
+  let added = new Record(0, "no database default")
+
+  test::assertTrue(db.records.add(added) == null)
+  let temporary = added.id
+
+  failed(db.saveChanges())
+  count(provider, 0)
+
+  test::assertEqual(added.id, temporary)
+end
+
+def verifyCommitFailure(provider: SQLiteProvider): Void
+  let db = new GeneratedDatabase(provider)
+  let added = new Record(0, "missing label")
+
+  test::assertTrue(db.records.add(added) == null)
+  let temporary = added.id
+
+  failed(db.saveChanges())
+
+  test::assertEqual(added.id, temporary)
+  count(provider, 0)
+  added.name = "permitted"
+  saved(db.saveChanges(), 1)
+
+  test::assertTrue(added.id > 0)
+  count(provider, 1)
+end
+
+def verifyFiles(): resources::Outcome<Int, result::Failure>
+  using temporary <- files::TemporaryDirectory.create("neri-generated-keys-")
+    let path = temporary.path() + "/keys.sqlite"
+    let schema = "CREATE TABLE records (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE);"
+
+    test::assertTrue(createSQLiteFixture(path, schema))
+    match SQLiteProvider.openWritable(path)
+      case SQLiteOpenResult.Failure(message)
+        test::assertTrue(false)
+      case SQLiteOpenResult.Opened(provider)
+        console::println("Verifying generated keys and outer rollback")
+        verifyGeneratedKeys(provider)
+
+        test::assertTrue(provider.close())
+    end
+    let collisionPath = temporary.path() + "/collision.sqlite"
+
+    test::assertTrue(createSQLiteFixture(collisionPath, schema))
+    match SQLiteProvider.openWritable(collisionPath)
+      case SQLiteOpenResult.Failure(message)
+        test::assertTrue(false)
+      case SQLiteOpenResult.Opened(provider)
+        console::println("Verifying generated-key collision recovery")
+        verifyCollision(provider)
+
+        test::assertTrue(provider.close())
+    end
+    let invalidPath = temporary.path() + "/invalid.sqlite"
+
+    test::assertTrue(createSQLiteFixture(invalidPath, "CREATE TABLE records (id INTEGER, name TEXT NOT NULL);"))
+    match SQLiteProvider.openWritable(invalidPath)
+      case SQLiteOpenResult.Failure(message)
+        test::assertTrue(false)
+      case SQLiteOpenResult.Opened(provider)
+        console::println("Verifying generated-key schema validation")
+        verifyInvalidSchema(provider)
+
+        test::assertTrue(provider.close())
+    end
+    let deferredPath = temporary.path() + "/deferred.sqlite"
+    let deferred = "CREATE TABLE labels (name TEXT PRIMARY KEY); INSERT INTO labels VALUES ('permitted'); CREATE TABLE records (id INTEGER PRIMARY KEY, name TEXT NOT NULL REFERENCES labels(name) DEFERRABLE INITIALLY DEFERRED);"
+
+    test::assertTrue(createSQLiteFixture(deferredPath, deferred))
+    match SQLiteProvider.openWritable(deferredPath)
+      case SQLiteOpenResult.Failure(message)
+        test::assertTrue(false)
+      case SQLiteOpenResult.Opened(provider)
+        console::println("Verifying generated-key commit failure")
+        verifyCommitFailure(provider)
+
+        test::assertTrue(provider.close())
+    end
+    return 0
+  end
+  return 1
+end
+
+def main(): Void
+  let completed = verifyFiles()
+
+  test::assertEqual(completed.closeFailures.count(), 0)
+  match completed.completion
+    case resources::Completion.Value(value)
+      test::assertEqual(value, 0)
+    case resources::Completion.Failure(problem)
+      test::assertTrue(false)
+  end
+  console::println("Generated key integration contracts passed")
+end

@@ -1,4 +1,5 @@
 #include "neri/runtime_abi.h"
+#include "worker_pool.h"
 #include <SDL3/SDL.h>
 #include <limits.h>
 #include <math.h>
@@ -18,6 +19,7 @@ static bool fail(const char *message) {
 }
 static bool valid(int64_t token) { return window && token == generation; }
 static void cleanup(void) {
+  if (neri_worker_thread_active()) return;
   if (renderer) SDL_DestroyRenderer(renderer);
   if (window) SDL_DestroyWindow(window);
   renderer = NULL;
@@ -28,6 +30,7 @@ static bool result(bool ok) { return ok || fail(SDL_GetError()); }
 static bool coordinate(double value) { return isfinite(value) && fabs(value) <= 1000000; }
 
 int64_t neri_rt_v1_window_open(const uint8_t *title, int64_t width, int64_t height) {
+  if (neri_worker_thread_active()) return 0;
   if (window) { fail("A window loop is already active"); return 0; }
   error[0] = 0;
   if (!title || width < 1 || width > 16384 || height < 1 || height > 16384 || generation == INT64_MAX) {
@@ -46,12 +49,18 @@ int64_t neri_rt_v1_window_open(const uint8_t *title, int64_t width, int64_t heig
   SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
   return ++generation;
 }
-void neri_rt_v1_window_close(int64_t token) { if (valid(token)) cleanup(); }
+void neri_rt_v1_window_close(int64_t token) {
+  if (neri_worker_thread_active()) return;
+  if (valid(token)) cleanup();
+}
 int64_t neri_rt_v1_window_error(uint8_t *buffer, int64_t capacity) {
   if (!buffer || capacity <= 0) return 0;
-  size_t length = strlen(error);
+  /* Worker rejection must not read or overwrite the coordinator's error. */
+  const char *message = neri_worker_thread_active()
+      ? "Window operations are unavailable in workers" : error;
+  size_t length = strlen(message);
   if (length > (uint64_t)capacity) length = (size_t)capacity;
-  memcpy(buffer, error, length);
+  memcpy(buffer, message, length);
   return (int64_t)length;
 }
 static int key(SDL_Scancode code) {
@@ -68,6 +77,7 @@ static int key(SDL_Scancode code) {
   }
 }
 int64_t neri_rt_v1_window_poll(int64_t token) {
+  if (neri_worker_thread_active()) return 1;
   if (!valid(token)) return 1;
   SDL_Event event;
   while (SDL_PollEvent(&event)) {
@@ -87,11 +97,13 @@ int64_t neri_rt_v1_window_poll(int64_t token) {
   return 0;
 }
 int64_t neri_rt_v1_window_size(int64_t token, int64_t axis) {
+  if (neri_worker_thread_active()) return 0;
   int width, height;
   if (!valid(token) || !SDL_GetRenderOutputSize(renderer, &width, &height)) return 0;
   return axis ? height : width;
 }
 double neri_rt_v1_window_mouse(int64_t token, int64_t axis) {
+  if (neri_worker_thread_active()) return 0;
   float x, y, output_x, output_y;
   if (!valid(token)) return 0;
   SDL_GetMouseState(&x, &y);
@@ -99,15 +111,18 @@ double neri_rt_v1_window_mouse(int64_t token, int64_t axis) {
   return axis ? output_y : output_x;
 }
 bool neri_rt_v1_window_color(int64_t token, int64_t red, int64_t green, int64_t blue, int64_t alpha) {
+  if (neri_worker_thread_active()) return false;
   if (!valid(token)) return fail("Window is closed");
   if (red < 0 || red > 255 || green < 0 || green > 255 || blue < 0 || blue > 255 || alpha < 0 || alpha > 255)
     return fail("Color channels must be between 0 and 255");
   return result(SDL_SetRenderDrawColor(renderer, (Uint8)red, (Uint8)green, (Uint8)blue, (Uint8)alpha));
 }
 bool neri_rt_v1_window_clear(int64_t token) {
+  if (neri_worker_thread_active()) return false;
   return valid(token) ? result(SDL_RenderClear(renderer)) : fail("Window is closed");
 }
 bool neri_rt_v1_window_rect(int64_t token, double x, double y, double width, double height) {
+  if (neri_worker_thread_active()) return false;
   if (!valid(token)) return fail("Window is closed");
   if (!coordinate(x) || !coordinate(y) || !coordinate(width) || !coordinate(height) || width < 0 || height < 0)
     return fail("Invalid rectangle");
@@ -115,18 +130,22 @@ bool neri_rt_v1_window_rect(int64_t token, double x, double y, double width, dou
   return result(SDL_RenderFillRect(renderer, &rect));
 }
 bool neri_rt_v1_window_line(int64_t token, double x1, double y1, double x2, double y2) {
+  if (neri_worker_thread_active()) return false;
   if (!valid(token)) return fail("Window is closed");
   if (!coordinate(x1) || !coordinate(y1) || !coordinate(x2) || !coordinate(y2)) return fail("Invalid line");
   return result(SDL_RenderLine(renderer, (float)x1, (float)y1, (float)x2, (float)y2));
 }
 bool neri_rt_v1_window_text(int64_t token, double x, double y, const uint8_t *text) {
+  if (neri_worker_thread_active()) return false;
   if (!valid(token)) return fail("Window is closed");
   if (!coordinate(x) || !coordinate(y) || !text) return fail("Invalid text");
   return result(SDL_RenderDebugText(renderer, (float)x, (float)y, (const char *)text));
 }
 bool neri_rt_v1_window_present(int64_t token) {
+  if (neri_worker_thread_active()) return false;
   return valid(token) ? result(SDL_RenderPresent(renderer)) : fail("Window is closed");
 }
 void neri_rt_v1_window_delay(int64_t milliseconds) {
+  if (neri_worker_thread_active()) return;
   if (milliseconds > 0 && milliseconds <= 1000) SDL_Delay((Uint32)milliseconds);
 }

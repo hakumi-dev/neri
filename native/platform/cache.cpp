@@ -4,7 +4,7 @@
 #include <cstring>
 #include <string>
 
-#if defined(__APPLE__) && defined(__aarch64__)
+#if (defined(__APPLE__) && defined(__aarch64__)) || defined(__linux__)
 #include <sys/stat.h>
 #include <unistd.h>
 #endif
@@ -30,7 +30,7 @@ extern "C" neri_int_v1 neri_rt_v1_cache_metadata(
   *permissions = 0;
   *owned = 0;
   std::memset(fingerprint32, 0, 32);
-#if defined(__APPLE__) && defined(__aarch64__)
+#if (defined(__APPLE__) && defined(__aarch64__)) || defined(__linux__)
   try {
     const std::string name(reinterpret_cast<const char *>(path),
                            static_cast<size_t>(length));
@@ -38,16 +38,23 @@ extern "C" neri_int_v1 neri_rt_v1_cache_metadata(
     const int result = follow ? stat(name.c_str(), &metadata)
                               : lstat(name.c_str(), &metadata);
     if (result != 0) return -1;
+#if defined(__APPLE__)
+    const auto modified = metadata.st_mtimespec;
+    const auto changed = metadata.st_ctimespec;
+#else
+    const auto modified = metadata.st_mtim;
+    const auto changed = metadata.st_ctim;
+#endif
     const std::array<uint64_t, 10> fields = {
         static_cast<uint64_t>(metadata.st_dev),
         static_cast<uint64_t>(metadata.st_ino),
         static_cast<uint64_t>(metadata.st_mode),
         static_cast<uint64_t>(metadata.st_uid),
         static_cast<uint64_t>(metadata.st_gid),
-        static_cast<uint64_t>(metadata.st_mtimespec.tv_sec),
-        static_cast<uint64_t>(metadata.st_mtimespec.tv_nsec),
-        static_cast<uint64_t>(metadata.st_ctimespec.tv_sec),
-        static_cast<uint64_t>(metadata.st_ctimespec.tv_nsec),
+        static_cast<uint64_t>(modified.tv_sec),
+        static_cast<uint64_t>(modified.tv_nsec),
+        static_cast<uint64_t>(changed.tv_sec),
+        static_cast<uint64_t>(changed.tv_nsec),
         static_cast<uint64_t>(metadata.st_size)};
     std::array<uint8_t, 80> serialized {};
     for (size_t field = 0; field < fields.size(); ++field) {

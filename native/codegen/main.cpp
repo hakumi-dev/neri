@@ -4,7 +4,9 @@
 #include "../platform/windows_support.h"
 #endif
 #include "neri/codegen/reader.h"
+#include "object_cache.h"
 
+#include <algorithm>
 #include <cctype>
 #include <chrono>
 #include <cstddef>
@@ -39,6 +41,8 @@ struct arguments final {
   neri::codegen::output_kind kind{};
   std::filesystem::path output;
   std::filesystem::path metrics;
+  std::filesystem::path progress;
+  std::filesystem::path object_cache;
   neri::codegen::debug_source_paths debug_sources;
 };
 
@@ -51,7 +55,10 @@ void print_usage(std::ostream &stream) {
             "<binary|hex> --target <macos-arm64|linux-x86_64|windows-x86_64> "
             "--optimization <debug|release> "
             "--emit <llvm-ir|assembly|object> --output <path|-> "
-            "[--metrics <path>] [--debug-source <id> <path>]\n";
+            "[--metrics <path>] [--progress <path>] [--debug-source <id> <path>] "
+            "[--object-cache <absolute-private-directory>]\n"
+            "       neri-codegen --cache-identity\n"
+            "       neri-codegen --shared-cache-identity <absolute-path>...\n";
 }
 
 arguments parse_arguments(int argc, char **argv) {
@@ -67,6 +74,8 @@ arguments parse_arguments(int argc, char **argv) {
   std::string emit;
   std::string output;
   std::string metrics;
+  std::string progress;
+  std::string object_cache;
   neri::codegen::debug_source_paths debug_sources;
   for (int index = 1; index < argc; index += 2) {
     const std::string_view option(argv[index]);
@@ -106,6 +115,12 @@ arguments parse_arguments(int argc, char **argv) {
       if (option == "--metrics") {
         return metrics;
       }
+      if (option == "--progress") {
+        return progress;
+      }
+      if (option == "--object-cache") {
+        return object_cache;
+      }
       usage_error("Unknown option '" + std::string(option) + "'.");
     }();
     if (!destination.empty()) {
@@ -123,6 +138,13 @@ arguments parse_arguments(int argc, char **argv) {
     usage_error("Input format must be binary or hex.");
   }
   const auto kind = neri::codegen::parse_output_kind(emit);
+  if (!object_cache.empty() &&
+      (!neri::host_path(object_cache).is_absolute() ||
+       kind != neri::codegen::output_kind::object || optimization != "release" ||
+       !metrics.empty() || !progress.empty() || !debug_sources.empty())) {
+    usage_error("Object cache requires an absolute private directory, release object output, "
+                "and no metrics, progress, or debug sources.");
+  }
   if (output == "-" && kind == neri::codegen::output_kind::object) {
     usage_error("Object output requires a file path.");
   }
@@ -140,7 +162,31 @@ arguments parse_arguments(int argc, char **argv) {
           kind,
           neri::host_path(output),
           neri::host_path(metrics),
+          neri::host_path(progress),
+          neri::host_path(object_cache),
           std::move(debug_sources)};
+}
+
+std::string progress_json_string(std::string_view value) {
+  std::string result = "\"";
+  auto limit = std::min<std::size_t>(value.size(), 160U);
+  if (limit < value.size()) {
+    while (limit > 0 && (static_cast<unsigned char>(value[limit]) & 0xC0U) == 0x80U)
+      --limit;
+  }
+  for (const auto character : value.substr(0, limit)) {
+    const auto byte = static_cast<unsigned char>(character);
+    if (character == '"' || character == '\\') {
+      result += '\\';
+      result += character;
+    } else if (byte < 32U || byte == 127U) {
+      result += '?';
+    } else {
+      result += character;
+    }
+  }
+  result += '"';
+  return result;
 }
 
 std::vector<std::uint8_t> read_file(const std::filesystem::path &path,
@@ -261,6 +307,35 @@ int main(int argc, char **argv) {
       std::cout << NERI_TOOLCHAIN_VERSION << '\n';
       return 0;
     }
+    if (argc == 2 && std::string_view(argv[1]) == "--cache-identity") {
+      const auto identity = neri::codegen::cache_identity();
+      if (identity.empty()) {
+        std::cerr << "Native cache identity unavailable.\n";
+        return 2;
+      }
+      std::cout << identity << '\n';
+      return 0;
+    }
+    if (argc >= 2 && std::string_view(argv[1]) == "--shared-cache-identity") {
+      if (argc < 3 || argc > 4098)
+        usage_error("Shared cache identity requires 1 to 4096 paths.");
+      std::vector<std::string> paths;
+      std::size_t bytes = 0;
+      for (int i = 2; i < argc; ++i) {
+        const std::string_view path(argv[i]);
+        if (path.size() > 1048576U - bytes)
+          usage_error("Shared cache identity paths exceed 1 MiB.");
+        bytes += path.size();
+        paths.emplace_back(path);
+      }
+      const auto identity = neri::codegen::shared_cache_identity(paths);
+      if (identity.empty()) {
+        std::cerr << "Shared cache identity unavailable.\n";
+        return 2;
+      }
+      std::cout << identity << '\n';
+      return 0;
+    }
     const auto options = parse_arguments(argc, argv);
     const auto input_started = std::chrono::steady_clock::now();
     const auto physical_size_limit = options.format == input_format::hex
@@ -270,15 +345,44 @@ int main(int argc, char **argv) {
     if (options.format == input_format::hex) {
       bytes = decode_hex(bytes);
     }
+    neri::codegen::object_cache cache(options.object_cache, bytes, options.target,
+                                     options.optimization);
+    neri::codegen::artifact artifact;
+    if (cache.restore(artifact)) {
+      // Only verified emission publishes entries. The key includes these exact
+      // IR bytes and this generator, so a hit already proves IR verification.
+      write_output(options.output, artifact);
+      return 0;
+    }
     const auto reader_started = std::chrono::steady_clock::now();
     const auto module = neri::codegen::read_verified_module(bytes);
     const auto emission_started = std::chrono::steady_clock::now();
     neri::codegen::emission_metrics metrics;
-    write_output(options.output,
-                 neri::codegen::emit_module(module, options.target,
+    std::ofstream progress_file;
+    std::size_t progress_bytes = 0;
+    if (!options.progress.empty())
+      progress_file.open(options.progress, std::ios::binary | std::ios::trunc);
+    const neri::codegen::emission_progress progress =
+        [&](std::string_view phase, std::size_t completed, std::size_t total,
+            std::string_view detail, std::size_t source_offset) {
+          if (!progress_file || progress_bytes >= 1048576U) return;
+          const auto line = "{\"schemaVersion\":1,\"phase\":" +
+                            progress_json_string(phase) +
+                            ",\"completed\":" + std::to_string(completed) +
+                            ",\"total\":" + std::to_string(total) +
+                            ",\"detail\":" + progress_json_string(detail) +
+                            ",\"sourceOffset\":" + std::to_string(source_offset) + "}\n";
+          if (progress_bytes + line.size() > 1048576U) return;
+          progress_file << line << std::flush;
+          progress_bytes += line.size();
+        };
+    artifact = neri::codegen::emit_module(module, options.target,
                                               options.optimization,
                                               options.kind, &metrics,
-                                              options.debug_sources));
+                                              options.debug_sources,
+                                              options.progress.empty() ? neri::codegen::emission_progress{} : progress);
+    cache.publish(artifact);
+    write_output(options.output, artifact);
     write_metrics(
         options.metrics,
         static_cast<std::uint64_t>(
