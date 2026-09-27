@@ -522,7 +522,45 @@ def bootstrapLinkObjects(module: IrModule, objects: StringBuffer, output: String
       imported = imported.nextImport
     end
   end
-  return bootstrapRunNativeLink(linker, arguments, objects, output, target, linkInputs, linkToolchain)
+  var nativeObjects = linkToolchain != null && target.isMacOS() && !module.requiredFeatures.hasNativeLibraries() && nativeLinkObjectFile(optionalRuntime)
+  var object = objects.first.nextNode
+
+  while nativeObjects && object != null
+    nativeObjects = nativeLinkObjectFile(object.value)
+    object = object.nextNode
+  end
+  return bootstrapRunNativeLink(linker, arguments, objects, output, target, linkInputs, nativeObjects ? linkToolchain : null)
+end
+
+def bootstrapObserveNativeLink(inputs: NativeLinkInputs, trace: NativeLinkTrace, plan: NativeLinkToolchain): Bool
+  if !trace.valid || trace.cryptexPrefix == "" || trace.cryptexPrefix != plan.cryptexPrefix || !inputs.appendLoaded(trace.paths, trace.candidates)
+    return false
+  end
+  # Prebuilt system loaders omit intermediate searches. Only shared-cache
+  # members are supported here; guard both normal absolute-path candidates.
+  let members = new StringTable<Bool>()
+  var node = inputs.shared.first.nextNode
+
+  while node != null
+    members.add(node.value, true)
+    node = node.nextNode
+  end
+  let candidates = new StringBuffer()
+
+  node = trace.prebuilt.first.nextNode
+  while node != null
+    inputs.shared.add(node.value) if members.add(node.value, true)
+    candidates.add(node.value)
+    candidates.add(trace.cryptexPrefix + node.value)
+    node = node.nextNode
+  end
+  node = trace.prebuiltMissing.first.nextNode
+  while node != null
+    candidates.add(node.value)
+    candidates.add(trace.cryptexPrefix + node.value)
+    node = node.nextNode
+  end
+  return inputs.appendLoaded(new StringBuffer(), candidates)
 end
 
 def bootstrapRunNativeLink(driver: String, linkArguments: String[], objects: StringBuffer, output: String, target: readonly TargetPlatform, linkInputs: NativeLinkInputs? = null, linkToolchain: NativeLinkToolchain? = null): Bool
@@ -531,6 +569,10 @@ def bootstrapRunNativeLink(driver: String, linkArguments: String[], objects: Str
   var dependencyDirectory: String? = null
   var dependencyPath = ""
   let pinned = linkToolchain != null && linkToolchain.matches()
+  let tracing = pinned && linkInputs != null && target.isMacOS()
+  let trace = new NativeLinkTrace()
+
+  linkInputs.valid = false if linkInputs != null
 
   if pinned && linkToolchain != null
     linker = linkToolchain.driver
@@ -547,22 +589,34 @@ def bootstrapRunNativeLink(driver: String, linkArguments: String[], objects: Str
       arguments = host::appendString(arguments, dependencyPath)
     end
   end
-  var succeeded = bootstrapRun(linker, arguments)
+  var succeeded = false
 
-  if succeeded && linkInputs != null && dependencyPath != ""
-    if linkInputs.load(dependencyPath, objects, output)
+  if tracing && linkToolchain != null
+    succeeded = trace.run(linker, arguments, linkToolchain.driver, linkToolchain.linker)
+  else
+    succeeded = bootstrapRun(linker, arguments)
+  end
+
+  if succeeded && tracing && trace.valid && linkInputs != null && linkToolchain != null && dependencyPath != ""
+    if linkInputs.load(dependencyPath, objects, output) && bootstrapObserveNativeLink(linkInputs, trace, linkToolchain)
       # Discover the linker graph, then bracket the published link with exact
       # input snapshots. Hashing only after linking could certify stale bytes.
+      let metadata = linkInputs.metadataSnapshot()
       let before = linkInputs.snapshot()
+      let stable = metadata != "" && before != "" && linkInputs.metadataSnapshot() == metadata
 
       linkInputs.valid = false
-      if before != ""
-        succeeded = bootstrapRun(linker, arguments)
-        if succeeded
+      if stable
+        let produced = new NativeLinkTrace()
+
+        succeeded = produced.run(linker, arguments, linkToolchain.driver, linkToolchain.linker)
+        if succeeded && produced.valid && produced.signature == trace.signature
           let observed = new NativeLinkInputs()
 
-          if observed.load(dependencyPath, objects, output)
-            linkInputs.valid = observed.snapshot() == before
+          if observed.load(dependencyPath, objects, output) && bootstrapObserveNativeLink(observed, produced, linkToolchain)
+            # The complete graph and file identities are unchanged across the
+            # producing link. Keep its already captured content digests.
+            linkInputs.valid = observed.metadataSnapshot() == metadata
           end
         end
       end

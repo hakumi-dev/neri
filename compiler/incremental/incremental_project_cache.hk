@@ -115,7 +115,7 @@ class IncrementalProjectCache
     let record = parser.parse()
 
     parser.spaces()
-    if parser.failed || parser.position != host::stringByteLength(receipt) || !record.isObject() || !record.get("schemaVersion").isNumber() || record.get("schemaVersion").scalarText() != "1"
+    if parser.failed || parser.position != host::stringByteLength(receipt) || !record.isObject() || !record.get("schemaVersion").isNumber() || record.get("schemaVersion").scalarText() != "2"
       return false
     end
     let content = record.get("contentDigest")
@@ -129,7 +129,7 @@ class IncrementalProjectCache
     if referenceFileDigest(this.cache.executable) != executable.scalarText()
       return false
     end
-    if !incrementalNativeInputsMatch(nativeFiles, missingFiles)
+    if !incrementalNativeInputsMatch(nativeFiles, missingFiles, record.get("sharedFiles"), record.get("sharedDigest"))
       return false
     end
     if this.saveTemps
@@ -200,7 +200,12 @@ class IncrementalProjectCache
     return succeeded
   end
 
-  def publish(output: String, nativeDepPaths: StringBuffer, missingPaths: StringBuffer, nativeDigests: StringBuffer): Bool
+  def publish(output: String, observed: NativeLinkInputs): Bool
+    let expectedInputs = observed.expectedSnapshot()
+
+    if expectedInputs == ""
+      return false
+    end
     if !this.enabled || !this.symbolToolMatch() || this.cache.inputs != this.cache.snapshot() || incrementalToolchainDigest(this.cache.dependencies) != this.toolchainDigest || !this.manifestsMatch()
       return false
     end
@@ -230,7 +235,7 @@ class IncrementalProjectCache
       succeeded = savedArtifactsCopy(output + ".temps", staged + ".temps", artifactsDigest)
     end
 
-    let receipt = incrementalNativeReceipt(nativeDepPaths, missingPaths, nativeDigests, this.contentDigest, executableDigest, artifactsDigest)
+    let receipt = incrementalNativeReceipt(observed, this.contentDigest, executableDigest, artifactsDigest)
 
     if receipt == null
       bootstrapRemoveRunDirectory(directory)
@@ -255,7 +260,7 @@ class IncrementalProjectCache
       files::removeTree(this.cache.directory)
     end
     if succeeded
-      succeeded = this.cache.publish(directory)
+      succeeded = observed.snapshot() == expectedInputs && this.manifestsMatch() && this.cache.publish(directory)
     end
     if !succeeded
       bootstrapRemoveRunDirectory(directory)
@@ -467,20 +472,22 @@ def incrementalToolchainDigest(paths: String[]): String
   return sha256FastText(identity)
 end
 
-def incrementalNativeReceipt(nativeDepPaths: StringBuffer, missingPaths: StringBuffer, nativeDigests: StringBuffer, contentDigest: String, executableDigest: String, artifactsDigest: String = ""): String?
-  if nativeDepPaths.size != nativeDigests.size
+def incrementalNativeReceipt(observed: NativeLinkInputs, contentDigest: String, executableDigest: String, artifactsDigest: String = ""): String?
+  let expected = observed.expectedSnapshot()
+
+  if expected == "" || observed.snapshot() != expected
     return null
   end
-  var result = "{\"schemaVersion\":1,\"contentDigest\":" + lspQuote(contentDigest) + ",\"executableDigest\":" + lspQuote(executableDigest) + ",\"nativeFiles\":["
+  let nativeDepPaths = observed.inputs
+  let missingPaths = observed.missing
+  let nativeDigests = observed.digests
+  var result = "{\"schemaVersion\":2,\"contentDigest\":" + lspQuote(contentDigest) + ",\"executableDigest\":" + lspQuote(executableDigest) + ",\"nativeFiles\":["
   var index = 0
 
   while index < nativeDepPaths.size
     let path = nativeDepPaths.get(index)
     let digest = nativeDigests.get(index)
 
-    if digest == "" || referenceFileDigest(path) != digest
-      return null
-    end
     result = result + (index == 0 ? "" : ",") + "{\"path\":" + lspQuote(path) + ",\"digest\":" + lspQuote(digest) + "}"
     index = index + 1
   end
@@ -497,21 +504,33 @@ def incrementalNativeReceipt(nativeDepPaths: StringBuffer, missingPaths: StringB
     result = result + (index == 0 ? "" : ",") + lspQuote(path)
     index = index + 1
   end
-  result = result + "]"
+  result = result + "],\"sharedFiles\":["
+  index = 0
+  while index < observed.shared.size
+    result = result + (index == 0 ? "" : ",") + lspQuote(observed.shared.get(index))
+    index = index + 1
+  end
+  result = result + "],\"sharedDigest\":" + lspQuote(observed.sharedDigest)
   result = result + ",\"artifactsDigest\":" + lspQuote(artifactsDigest) if artifactsDigest != ""
   return result + "}\n"
 end
 
-def incrementalNativeInputsMatch(nativeFiles: LspJson, missingFiles: LspJson): Bool
+def incrementalNativeInputsMatch(nativeFiles: LspJson, missingFiles: LspJson, sharedFiles: LspJson, sharedDigest: LspJson): Bool
+  if !nativeFiles.isArray() || !missingFiles.isArray() || !sharedFiles.isArray() || !sharedDigest.isString()
+    return false
+  end
+  let observed = new NativeLinkInputs()
   var item = nativeFiles.first
 
   while item != null
     let path = item.get("path")
     let digest = item.get("digest")
 
-    if !item.isObject() || !path.isString() || !digest.isString() || path.scalarText() == "" || referenceFileDigest(path.scalarText()) != digest.scalarText()
+    if !item.isObject() || !path.isString() || !digest.isString()
       return false
     end
+    observed.inputs.add(path.scalarText())
+    observed.digests.add(digest.scalarText())
     item = item.next
   end
   item = missingFiles.first
@@ -525,7 +544,18 @@ def incrementalNativeInputsMatch(nativeFiles: LspJson, missingFiles: LspJson): B
     if status.failure != null || fileStatus == null || fileStatus.exists
       return false
     end
+    observed.missing.add(item.scalarText())
     item = item.next
   end
-  return true
+  item = sharedFiles.first
+  while item != null
+    return false if !item.isString()
+    observed.shared.add(item.scalarText())
+    item = item.next
+  end
+  observed.sharedDigest = sharedDigest.scalarText()
+  observed.valid = true
+  let expected = observed.expectedSnapshot()
+
+  return expected != "" && observed.snapshot() == expected
 end

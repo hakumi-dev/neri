@@ -1,0 +1,387 @@
+use host
+use process
+use console
+
+# Parses observed dyld image and search records. The consumer establishes cache
+# completeness; a recognized prebuilt-loader record does not enumerate a search.
+class NativeLinkTrace
+  public paths: StringBuffer = new StringBuffer()
+  public candidates: StringBuffer = new StringBuffer()
+  public prebuilt: StringBuffer = new StringBuffer()
+  public prebuiltMissing: StringBuffer = new StringBuffer()
+  public cryptexPrefix: String = ""
+  public signature: String = ""
+  public valid: Bool = false
+  private images: StringTable<String> = new StringTable<String>()
+  private candidateNames: StringTable<Bool> = new StringTable<Bool>()
+  private ordered: IrOrderList<String> = new IrOrderList<String>()
+  private searching: StringTable<Bool> = new StringTable<Bool>()
+  private lastFind: StringTable<String> = new StringTable<String>()
+  private prebuiltNames: StringTable<Bool> = new StringTable<Bool>()
+  private prebuiltMissingNames: StringTable<Bool> = new StringTable<Bool>()
+  private cryptexProcesses: StringTable<Bool> = new StringTable<Bool>()
+  private driverProcesses: StringBuffer = new StringBuffer()
+  private linkerProcesses: StringBuffer = new StringBuffer()
+  private driver: String = ""
+  private linker: String = ""
+
+  private def safe(value: String): Bool
+    let length = host::stringByteLength(value)
+
+    return false if length == 0 || length > 4096
+    var index = 0
+
+    while index < length
+      let byte = host::stringByteAt(value, index) as Int
+
+      return false if byte < 32 || byte == 127 || byte == 34
+      index = index + 1
+    end
+    return true
+  end
+
+  private def absolute(value: String): Bool
+    return bootstrapStartsWith(value, "/") && this.safe(value)
+  end
+
+  private def quoted(value: String): String
+    let length = host::stringByteLength(value)
+
+    if length < 3 || host::stringByteAt(value, 0) != (34 as Byte) || host::stringByteAt(value, length - 1) != (34 as Byte)
+      return ""
+    end
+    let text = host::stringSlice(value, 1, length - 2)
+
+    return this.safe(text) ? text : ""
+  end
+
+  private def suffix(value: String, prefix: String): String
+    return host::stringSlice(value, host::stringByteLength(prefix), host::stringByteLength(value) - host::stringByteLength(prefix))
+  end
+
+  private def candidate(path: String): Bool
+    if !this.absolute(path)
+      return false
+    end
+    if this.candidateNames.add(path, true)
+      if this.candidates.size >= 4096
+        return false
+      end
+      this.candidates.add(path)
+      let record = "candidate" + runCacheFrame(path)
+
+      this.ordered.add(record, 1, record)
+    end
+    return true
+  end
+
+  private def image(body: String, pid: String): Bool
+    if host::stringByteLength(body) < 40 || host::stringSlice(body, 37, 2) != "> "
+      return false
+    end
+    let uuid = host::stringSlice(body, 1, 36)
+    var index = 0
+
+    while index < 36
+      let byte = host::stringByteAt(uuid, index) as Int
+
+      if index == 8 || index == 13 || index == 18 || index == 23
+        return false if byte != 45
+      else if !((byte >= 48 && byte <= 57) || (byte >= 65 && byte <= 70) || (byte >= 97 && byte <= 102))
+        return false
+      end
+      index = index + 1
+    end
+    let path = host::stringSlice(body, 39, host::stringByteLength(body) - 39)
+
+    return false if !this.absolute(path)
+    this.driverProcesses.add(pid) if path == this.driver
+    this.linkerProcesses.add(pid) if path == this.linker
+    let previous = this.images.find(path)
+
+    if previous != null
+      return previous.value == uuid
+    end
+    return false if this.paths.size >= 4096
+    this.images.add(path, uuid)
+    this.paths.add(path)
+    let record = "image" + runCacheFrame(path) + runCacheFrame(uuid)
+
+    this.ordered.add(record, 0, record)
+    return true
+  end
+
+  private def information(body: String, pid: String): Bool
+    if bootstrapStartsWith(body, "find path ")
+      let path = this.quoted(this.suffix(body, "find path "))
+
+      return false if path == ""
+      this.searching.add(pid, true)
+      let previous = this.lastFind.find(pid)
+
+      if previous == null
+        this.lastFind.add(pid, path)
+      else
+        previous.value = path
+      end
+      if bootstrapStartsWith(path, "/")
+        return this.candidate(path)
+      end
+      return bootstrapStartsWith(path, "@rpath/") || bootstrapStartsWith(path, "@loader_path/") || bootstrapStartsWith(path, "@executable_path/")
+    end
+    for kind in ["@path expansion", "original path on disk", "cryptex prefix", "original path"]
+      let prefix = "  possible path(" + kind + "): "
+
+      if bootstrapStartsWith(body, prefix)
+        this.searching.add(pid, true)
+        let path = this.quoted(this.suffix(body, prefix))
+
+        if kind == "cryptex prefix"
+          let find = this.lastFind.find(pid)
+
+          return false if find == null || !this.absolute(find.value) || !semanticEndsWith(path, find.value)
+          let prefixLength = host::stringByteLength(path) - host::stringByteLength(find.value)
+
+          return false if prefixLength <= 0
+          let inferred = host::stringSlice(path, 0, prefixLength)
+
+          return false if !this.absolute(inferred) || (this.cryptexPrefix != "" && this.cryptexPrefix != inferred)
+          this.cryptexPrefix = inferred
+          this.cryptexProcesses.add(pid, true)
+        end
+        return this.candidate(path)
+      end
+    end
+    if bootstrapStartsWith(body, "  LC_RPATH ")
+      let values = this.suffix(body, "  LC_RPATH ")
+      let separator = bootstrapFindText(values, " from ")
+
+      return false if separator < 0
+      let rpath = this.quoted(host::stringSlice(values, 0, separator))
+      let owner = this.quoted(host::stringSlice(values, separator + 6, host::stringByteLength(values) - separator - 6))
+
+      return rpath != "" && this.absolute(owner)
+    end
+    for prefix in ["  found: dylib-from-disk: ", "  found: already-loaded-by-inode-mtime: "]
+      if bootstrapStartsWith(body, prefix)
+        return this.absolute(this.quoted(this.suffix(body, prefix)))
+      end
+    end
+    if bootstrapStartsWith(body, "  found: prebuilt-dylib-from-cache: (0x")
+      let rest = this.suffix(body, "  found: prebuilt-dylib-from-cache: (0x")
+      let finish = bootstrapFindText(rest, ") ")
+
+      return false if finish < 1 || finish > 8
+      var index = 0
+
+      while index < finish
+        let byte = host::stringByteAt(rest, index) as Int
+
+        return false if !((byte >= 48 && byte <= 57) || (byte >= 65 && byte <= 70) || (byte >= 97 && byte <= 102))
+        index = index + 1
+      end
+      return this.absolute(this.quoted(host::stringSlice(rest, finish + 2, host::stringByteLength(rest) - finish - 2)))
+    end
+    if body == "  found: prebuilt-loader-dylib matching path" || body == "  not found: weak-linked and pre-built-as-missing dylib"
+      let find = this.lastFind.find(pid)
+
+      return false if find == null || !this.absolute(find.value)
+      if body == "  found: prebuilt-loader-dylib matching path" && this.prebuiltNames.add(find.value, true)
+        return false if this.prebuilt.size >= 4096
+        this.prebuilt.add(find.value)
+        let record = "prebuilt" + runCacheFrame(find.value)
+
+        this.ordered.add(record, 2, record)
+      end
+      if body == "  not found: weak-linked and pre-built-as-missing dylib" && this.prebuiltMissingNames.add(find.value, true)
+        return false if this.prebuiltMissing.size >= 4096
+        this.prebuiltMissing.add(find.value)
+        let record = "prebuilt-missing" + runCacheFrame(find.value)
+
+        this.ordered.add(record, 3, record)
+      end
+      return true
+    end
+    if bootstrapStartsWith(body, "move loaded to delayed: ")
+      let leaf = this.suffix(body, "move loaded to delayed: ")
+
+      return this.safe(leaf) && bootstrapFindText(leaf, "/") < 0
+    end
+    return false
+  end
+
+  private def line(line: String): Bool
+    if !bootstrapStartsWith(line, "dyld[")
+      return false
+    end
+    let finish = bootstrapFindText(line, "]: ")
+
+    return false if finish < 6 || finish > 15
+    let pid = host::stringSlice(line, 5, finish - 5)
+    var index = 0
+
+    while index < host::stringByteLength(pid)
+      let byte = host::stringByteAt(pid, index) as Int
+
+      return false if byte < 48 || byte > 57
+      index = index + 1
+    end
+    let number = host::parseInt(pid)
+
+    return false if number == null || number <= 0
+    let body = host::stringSlice(line, finish + 3, host::stringByteLength(line) - finish - 3)
+
+    return bootstrapStartsWith(body, "<") ? this.image(body, pid) : this.information(body, pid)
+  end
+
+  private def sorted(values: StringBuffer): StringBuffer
+    let order = new IrOrderList<String>()
+    var value = values.first.nextNode
+
+    while value != null
+      order.add(value.value, 0, value.value)
+      value = value.nextNode
+    end
+    let result = new StringBuffer()
+    var node = order.sorted()
+
+    while node != null
+      result.add(node.value)
+      node = node.next
+    end
+    return result
+  end
+
+  def parse(text: String, expectedDriver: String, expectedLinker: String): String
+    this.paths = new StringBuffer()
+    this.candidates = new StringBuffer()
+    this.prebuilt = new StringBuffer()
+    this.prebuiltMissing = new StringBuffer()
+    this.cryptexPrefix = ""
+    this.signature = ""
+    this.images = new StringTable<String>()
+    this.candidateNames = new StringTable<Bool>()
+    this.ordered = new IrOrderList<String>()
+    this.searching = new StringTable<Bool>()
+    this.lastFind = new StringTable<String>()
+    this.prebuiltNames = new StringTable<Bool>()
+    this.prebuiltMissingNames = new StringTable<Bool>()
+    this.cryptexProcesses = new StringTable<Bool>()
+    this.driverProcesses = new StringBuffer()
+    this.linkerProcesses = new StringBuffer()
+    let driver = neriCanonicalPath(expectedDriver)
+    let linker = expectedLinker == "" ? null : neriCanonicalPath(expectedLinker)
+
+    this.driver = driver == null ? "" : driver
+    this.linker = linker == null ? "" : linker
+    this.valid = this.absolute(this.driver) && (expectedLinker == "" || this.absolute(this.linker))
+    let length = host::stringByteLength(text)
+
+    if length > 4194304
+      this.valid = false
+      return text
+    end
+    let diagnostics = new StringBuffer()
+    var start = 0
+    var index = 0
+
+    while index < length
+      if host::stringByteAt(text, index) == (10 as Byte)
+        let line = host::stringSlice(text, start, index - start)
+        let recognized = this.line(line)
+
+        if !recognized
+          this.valid = false if bootstrapStartsWith(line, "dyld")
+          diagnostics.add(line + "\n")
+        end
+        start = index + 1
+      end
+      index = index + 1
+    end
+    if start != length
+      let tail = host::stringSlice(text, start, length - start)
+
+      this.valid = false if bootstrapStartsWith(tail, "dyld")
+      diagnostics.add(tail)
+    end
+    this.valid = this.valid && this.driverProcesses.size > 0 && (expectedLinker == "" || this.linkerProcesses.size > 0)
+    for processes in [this.driverProcesses, this.linkerProcesses]
+      var pid = processes.first.nextNode
+
+      while pid != null
+        this.valid = false if this.searching.find(pid.value) == null
+        this.valid = false if this.cryptexPrefix != "" && this.cryptexProcesses.find(pid.value) == null
+        pid = pid.nextNode
+      end
+    end
+    if this.valid
+      var record = this.ordered.sorted()
+      let signature = new StringBuffer()
+
+      signature.add("dyld-observed-v1")
+      while record != null
+        signature.add(runCacheFrame(record.value))
+        record = record.next
+      end
+      this.signature = signature.join()
+    end
+    this.paths = this.sorted(this.paths)
+    this.candidates = this.sorted(this.candidates)
+    this.prebuilt = this.sorted(this.prebuilt)
+    this.prebuiltMissing = this.sorted(this.prebuiltMissing)
+    return diagnostics.join()
+  end
+
+  def run(driver: String, arguments: String[], expectedDriver: String, expectedLinker: String): Bool
+    this.valid = false
+    this.signature = ""
+    let options = new process::SpawnOptions(driver)
+
+    options.arguments = arguments
+    options.stdoutLimit = 4194304
+    options.stderrLimit = 4194304
+    options.environment = [new process::EnvironmentEntry("DYLD_PRINT_LIBRARIES", "1"),
+      new process::EnvironmentEntry("DYLD_PRINT_SEARCHING", "1"),
+      new process::EnvironmentEntry("DYLD_USE_CLOSURES", "0")]
+    let started = process::spawn(options)
+    let child = started.child()
+
+    return false if child == null
+    var completed = child.wait(100)
+
+    while completed.running && completed.failure == null
+      completed = child.wait(100)
+    end
+    let stdout = host::stringFromBytes(completed.stdout)
+    let stderr = host::stringFromBytes(completed.stderr)
+
+    console::print(stdout) if stdout != null
+    var diagnostics = completed.stderr
+
+    if stderr != null
+      diagnostics = runCacheBytes(this.parse(stderr, expectedDriver, expectedLinker))
+      # runCacheBytes adds a terminating NUL for native pathname callers.
+      if diagnostics.Length > 1
+        unsafe
+          borrow diagnostics as pointer
+            runCacheWrite(pointer, diagnostics.Length - 1)
+          end
+        end
+      end
+    else if diagnostics.Length > 0
+      unsafe
+        borrow diagnostics as pointer
+          runCacheWrite(pointer, diagnostics.Length)
+        end
+      end
+    end
+    this.valid = this.valid && stdout != null && stderr != null && !completed.stdoutTruncated && !completed.stderrTruncated && completed.failure == null
+    child.cancel() if completed.failure != null
+    let disposed = child.dispose()
+    let status = completed.exit
+
+    this.valid = this.valid && disposed && status != null && status.isExited() && status.value() == 0
+    this.signature = "" if !this.valid
+    return disposed && completed.failure == null && status != null && status.isExited() && status.value() == 0
+  end
+end

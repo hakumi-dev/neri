@@ -2,12 +2,14 @@ use host
 use process
 
 # One resolved plan supplies both executable cache identity and link arguments.
-# This binds the selected tools, not their complete dynamically loaded closure.
+# Link receipts bind the loaded closure; this plan also observes the current
+# loader search prefix through tool version queries.
 class NativeLinkToolchain
   public driver: String = ""
   public linker: String = ""
   public lto: String = ""
   public identity: String = ""
+  public cryptexPrefix: String = ""
   private attempted: Bool = false
   private metadata: String = ""
 
@@ -35,16 +37,32 @@ class NativeLinkToolchain
       return false
     end
     this.linker = this.query("/usr/bin/xcrun", ["--find", "ld"])
-    this.lto = this.query(configured, ["--no-default-config", "-print-file-name=libLTO.dylib"])
+    let linkerBefore = this.fileMetadata(this.linker)
+    let driverTrace = this.observe(configured, ["--no-default-config", "--version"])
+    let linkerTrace = this.observe(this.linker, ["-v"])
+
+    if linkerBefore == "" || driverTrace == null || linkerTrace == null || driverTrace.cryptexPrefix != linkerTrace.cryptexPrefix || this.fileMetadata(this.linker) != linkerBefore
+      return false
+    end
+    this.cryptexPrefix = driverTrace.cryptexPrefix
+    var loaded = linkerTrace.paths.first.nextNode
+
+    while loaded != null
+      if semanticEndsWith(loaded.value, "/libLTO.dylib")
+        return false if this.lto != ""
+        this.lto = loaded.value
+      end
+      loaded = loaded.nextNode
+    end
     if this.linker == "" || this.lto == "" || this.fileMetadata(configured) != driverBefore
       return false
     end
     # Hash contents once per compilation, bracketed by metadata for the whole
     # tool set. Only this in-process plan may reuse that content observation.
     let before = this.snapshot()
-    var identity = runCacheFrame("darwin-link-tools-v1")
+    var identity = runCacheFrame("darwin-link-tools-v2") + runCacheFrame(this.cryptexPrefix)
 
-    if before == ""
+    if before == "" || !nativeLinkProfile(this.driver) || !nativeLinkProfile(this.linker)
       return false
     end
     for path in [this.driver, this.linker, this.lto]
@@ -56,7 +74,7 @@ class NativeLinkToolchain
       end
       identity = identity + runCacheFrame(path) + runCacheFrame(runCacheFrame(canonical) + runCacheFrame(digest))
     end
-    if this.snapshot() != before || this.fileMetadata(configured) != driverBefore
+    if this.snapshot() != before || this.fileMetadata(configured) != driverBefore || this.fileMetadata(this.linker) != linkerBefore
       return false
     end
     this.metadata = before
@@ -72,7 +90,8 @@ class NativeLinkToolchain
     var result = host::appendString(arguments, "--no-default-config")
 
     result = host::appendString(result, "--ld-path=" + this.linker)
-    # Clang emits its default earlier; Darwin ld's last -lto_library wins.
+    # Neri emits native objects. Use the selected linker's own loaded LTO
+    # library, avoiding a second loader launch with a temporary override path.
     result = host::appendString(result, "-Xlinker")
     result = host::appendString(result, "-lto_library")
     result = host::appendString(result, "-Xlinker")
@@ -104,6 +123,36 @@ class NativeLinkToolchain
     return runCacheFrame(canonical) + runCacheFrame(before.fingerprint)
   end
 
+  private def observe(executable: String, arguments: String[]): NativeLinkTrace?
+    let options = new process::SpawnOptions(executable)
+
+    options.arguments = arguments
+    options.stdoutLimit = 4096
+    options.stderrLimit = 4194304
+    options.environment = [new process::EnvironmentEntry("DYLD_PRINT_LIBRARIES", "1"), new process::EnvironmentEntry("DYLD_PRINT_SEARCHING", "1"), new process::EnvironmentEntry("DYLD_USE_CLOSURES", "0")]
+    let child = process::spawn(options).child()
+
+    return null if child == null
+    let completed = child.wait(10000)
+
+    if completed.running || completed.failure != null
+      child.cancel()
+      child.dispose()
+      return null
+    end
+    let released = child.dispose()
+    let exit = completed.exit
+    let text = host::stringFromBytes(completed.stderr)
+
+    if !released || exit == null || !exit.isExited() || exit.value() != 0 || completed.stdoutTruncated || completed.stderrTruncated || text == null
+      return null
+    end
+    let trace = new NativeLinkTrace()
+
+    trace.parse(text, executable, "")
+    return trace.valid && trace.cryptexPrefix != "" ? trace : null
+  end
+
   private def query(executable: String, arguments: String[]): String
     let options = new process::SpawnOptions(executable)
 
@@ -127,7 +176,7 @@ class NativeLinkToolchain
     let exit = completed.exit
     let output = host::stringFromBytes(completed.stdout)
 
-    if !released || exit == null || !exit.isExited() || exit.value() != 0 || completed.stdoutTruncated || output == null || !bootstrapStartsWith(output, "/")
+    if !released || exit == null || !exit.isExited() || exit.value() != 0 || completed.stdoutTruncated || completed.stderrTruncated || output == null || !bootstrapStartsWith(output, "/")
       return ""
     end
     let length = host::stringByteLength(output)

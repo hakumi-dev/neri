@@ -106,7 +106,8 @@ std::string file_digest(const std::string &path, const struct stat &expected) {
     if (!count)
       break;
 #if defined(__APPLE__)
-    require(CC_SHA256_Update(&hash, bytes.data(), static_cast<CC_LONG>(count)) == 1);
+    require(CC_SHA256_Update(&hash, bytes.data(),
+                             static_cast<CC_LONG>(count)) == 1);
 #else
     hash.update(llvm::ArrayRef<std::uint8_t>(bytes.data(),
                                              static_cast<std::size_t>(count)));
@@ -379,9 +380,8 @@ std::string shared_cache_identity(std::span<const std::string> paths) {
     for (const auto &path : paths) {
       require(!path.empty() && path.front() == '/' &&
               path.size() <= 1048576U - bytes &&
-              std::none_of(path.begin(), path.end(), [](unsigned char c) {
-                return c < 32 || c == 127;
-              }));
+              std::none_of(path.begin(), path.end(),
+                           [](unsigned char c) { return c < 32 || c == 127; }));
       bytes += path.size();
     }
     const auto shared = hex(active_shared_cache()->sharedCacheUUID);
@@ -389,11 +389,15 @@ std::string shared_cache_identity(std::span<const std::string> paths) {
     std::sort(names.begin(), names.end());
     names.erase(std::unique(names.begin(), names.end()), names.end());
     llvm::SHA256 hash;
-    hash_field(hash, "neri-shared-cache-paths-v1");
+    hash_field(hash, "neri-shared-cache-paths-v2");
     hash_field(hash, shared);
     for (const auto &path : names) {
       struct stat st{};
-      require(stat(path.c_str(), &st) != 0 && errno == ENOENT &&
+      const auto status = stat(path.c_str(), &st);
+      // Membership is independent of an on-disk override. The caller binds
+      // that file's contents or absence separately from the active cache UUID.
+      require(((status == 0 && S_ISREG(st.st_mode)) ||
+               (status != 0 && errno == ENOENT)) &&
               _dyld_shared_cache_contains_path(path.c_str()));
       hash_field(hash, path);
     }
