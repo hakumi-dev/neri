@@ -28,6 +28,14 @@ required patch version; Neri's version check remains mandatory. Version probes
 are `cmake --version`, `ninja --version`, `clang-22 --version` and
 `llvm-config-22 --version`.
 
+The SQLite recovery contracts exercise concurrent WAL connections. They require
+SQLite 3.51.3 or newer, or the corrected 3.44.x (3.44.6+) or 3.50.x (3.50.7+)
+branches; a distribution's `libsqlite3-dev` package may be older. Install a
+corrected native library and ensure the system loader resolves it in both the
+build environment and the deployed application's environment. The runtime checks
+the loaded library, not the `sqlite3` command's version. See the
+[Data compatibility and durability contract](DATA.md#bounds-and-compatibility).
+
 ## Get the source
 
 Source: [hakumi-dev/neri](https://github.com/hakumi-dev/neri).
