@@ -44,7 +44,7 @@ inline constexpr std::array<ir_feature_contract, 12> ir_feature_contracts{{
   {ir_feature::NativeStrings, "native-strings-v1", 1, 2, UINT64_C(64), "Native strings require IR transport 1.1."},
   {ir_feature::RetainedModules, "retained-modules-v1", 7, 1, UINT64_C(0), "Retained modules require IR transport 1.7."},
   {ir_feature::ScopedTasks, "scoped-tasks-v1", 4, 10, UINT64_C(16384), "Scoped tasks require IR transport 1.4."},
-  {ir_feature::SequentialArrays, "sequential-arrays-v1", 8, 29, UINT64_C(536870912), "Sequential array generation requires IR transport 1.8."},
+  {ir_feature::SequentialArrays, "sequential-arrays-v1", 8, 35, UINT64_C(536870912), "Sequential array generation requires IR transport 1.8."},
   {ir_feature::SessionModule, "session-module-v1", 5, 19, UINT64_C(8388608), "Session modules require transport 1.5."},
   {ir_feature::StringData, "string-data-v1", 1, 1, UINT64_C(0), "String data require IR transport 1.1."},
 }};

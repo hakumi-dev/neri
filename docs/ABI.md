@@ -1,9 +1,16 @@
 # Runtime and IR boundary
 
 The canonical exported declarations and layouts are in
-[`runtime_abi.h`](../native/include/neri/runtime_abi.h). Runtime ABI 1.34 uses a
+[`runtime_abi.h`](../native/include/neri/runtime_abi.h). Runtime ABI 1.35 uses a
 C calling convention on macOS ARM64, Linux x86-64 and Windows x86-64. Generated programs negotiate
 major version, minimum minor version and required feature bits before execution.
+
+ABI 1.35 adds `neri_rt_v1_array_alloc_uninitialized` for compiler-generated
+sequential arrays with reference-free elements. The descriptor must describe an
+array without reference flags or trace callbacks. The runtime initializes the
+header and length; the compiler initializes every element before exposing the
+array. Reference arrays retain zero initialization so collection during a callback
+can safely trace their unwritten slots.
 
 ABI 1.34 adds the incremental SHA-256 `begin`, `update`, `finish` and `dispose`
 entries under `neri_rt_v1_crypto_sha256_`, and `neri_rt_v1_file_identity`.
@@ -196,7 +203,9 @@ context; shutdown reclaims only the active context's allocations and requires it
 roots and borrows to have ended. Process-argument views belong to the context.
 
 Small managed reservations use heap-local 16 KiB slabs with reusable slots in
-64, 96, 128 and 256 byte size classes, including the private allocation prefix.
+16, 32, 48, 64, 128 and 256 byte size classes for public headers and payloads.
+A separate four-byte entry records each slot's size, allocation state and mark
+bit; the slab shares one owner identity across its objects.
 Larger reservations use individual native allocations. Sweep recycles dead
 slots and returns empty slabs; partially occupied slabs retain stable object
 addresses. Task-result adoption transfers the associated storage to the parent
@@ -231,7 +240,12 @@ are not implicit roots.
 The backend omits a function's root frame when its verified transitive effects
 exclude managed allocation, native allocation, safepoints and unsafe operations.
 With one mutator per active heap, such a function cannot trigger collection of
-its local values. Functions with those effects retain their frames. This follows
+its local values. Functions with those effects root managed SSA values live at
+each potentially collecting instruction. Backward dataflow includes control-flow
+edges and block arguments; frame slots are reused between collection points.
+Sequential array generation reserves a slot for its partially initialized result.
+Object addresses remain valid after collection, so SSA values need no root reload.
+This follows
 the [safepoint-rooting requirement](https://llvm.org/docs/GarbageCollection.html#identifying-gc-roots-on-the-stack);
 Neri uses its explicit root stack, not LLVM statepoints.
 
@@ -241,20 +255,21 @@ until the borrow ends. Raw pointers alone do not retain objects. Collection recl
 unreachable cycles. Shutdown requires all root frames and borrows to have ended.
 
 Mark bits are clear between collections. The collector completes reachability
-tracing before sweeping its allocation list, reclaiming unmarked objects and
+tracing before sweeping its slab tables and large-allocation list, reclaiming unmarked objects and
 clearing survivors in that same sweep. This is the mark-and-sweep discipline
 described in [McCarthy (1960), section 4c](https://www-formal.stanford.edu/jmc/recursive.pdf).
-Collection makes one full allocation-list traversal. For N owned allocations,
+Collection visits allocated slab slots and large allocations. For N owned slots,
 R root slots and E scanned reference edges, local tracing and sweeping take
 O(N + R + E) work. Validating ancestor references additionally walks the task
 ancestry. Child collectors leave suspended ancestor objects and their mark bits
 untouched.
 
-Each managed object and its private collector metadata share one zero-initialized
-native reservation. The prefix preserves the maximum supported payload alignment;
-the public object header and payload offsets follow the ABI layouts. Collection frees
-the reservation once. Managed-byte statistics count the public header and payload,
-while allocator metadata and alignment padding contribute to RSS separately.
+Ordinary managed allocations zero their public header and payload before
+initialization. Large allocations keep a private prefix; small allocations use
+side metadata. Both preserve supported payload alignment and the public ABI
+layouts. The runtime word is opaque collector state. Managed-byte statistics count
+the public header and payload, while metadata and alignment padding contribute to
+RSS separately.
 
 Collection runs before an allocation would exceed the heap threshold, on an
 explicit call, or on allocation retry after native reservation failure. The
@@ -263,8 +278,12 @@ managed bytes after each collection. This byte count includes object headers and
 payloads; metadata and native storage are separate. Managed and native allocation counters are available through
 `neri_rt_v1_gc_get_stats`.
 
-Trace callbacks run inside collection and must not allocate managed objects or
-reenter collection. Root/borrow bookkeeping and descriptor access allocate no
+Trace callbacks run inside collection, only read application memory, and report
+reference slots. They must not mutate payloads or roots, allocate managed objects,
+or reenter collection. Collection changes private allocator and collector state;
+the nonmoving visitor leaves reference slot contents unchanged. The backend uses
+this contract to preserve application-memory values across allocation calls.
+Root/borrow bookkeeping and descriptor access allocate no
 storage. Slot tracing performs no managed allocation; the collector's mark
 worklist can grow through the native allocator.
 Runtime contract failures panic; no exception unwinds into Neri code.

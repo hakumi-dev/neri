@@ -6,7 +6,7 @@
 #include <string.h>
 
 #define NERI_RUNTIME_ABI_MAJOR UINT16_C(1)
-#define NERI_RUNTIME_ABI_MINOR UINT16_C(34)
+#define NERI_RUNTIME_ABI_MINOR UINT16_C(35)
 
 enum neri_ir_effect_v1 {
   NERI_IR_EFFECT_READ_V1 = UINT32_C(1),
@@ -58,6 +58,7 @@ static inline uint16_t neri_abi_symbol_minimum_minor(const char *link_name) {
   if (link_name == NULL) return result;
   if (strncmp(link_name, "neri_rt_v1_file_", sizeof("neri_rt_v1_file_") - 1U) == 0 && result < UINT16_C(11)) result = UINT16_C(11);
   if (strcmp(link_name, "neri_rt_v1_file_identity") == 0 && result < UINT16_C(34)) result = UINT16_C(34);
+  if (strcmp(link_name, "neri_rt_v1_array_alloc_uninitialized") == 0 && result < UINT16_C(35)) result = UINT16_C(35);
   if (strcmp(link_name, "neri_rt_v1_file_wait_readable") == 0 && result < UINT16_C(25)) result = UINT16_C(25);
   if (strncmp(link_name, "neri_rt_v1_interrupt_", sizeof("neri_rt_v1_interrupt_") - 1U) == 0 && result < UINT16_C(12)) result = UINT16_C(12);
   if (strncmp(link_name, "neri_rt_v1_clock_wall_", sizeof("neri_rt_v1_clock_wall_") - 1U) == 0 && result < UINT16_C(13)) result = UINT16_C(13);

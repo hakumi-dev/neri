@@ -164,6 +164,10 @@ typedef struct neri_array_prefix_v1 {
 } neri_array_prefix_v1;
 
 typedef void (*neri_gc_visit_slot_fn_v1)(neri_ref_v1 *slot, void *context);
+/* Trace callbacks only read application memory and report reference slots.
+ * They must not mutate payloads or roots, allocate managed objects, or reenter
+ * collection. Each visitor call forwards the supplied context unchanged.
+ * The nonmoving visitor leaves reference slot contents unchanged. */
 typedef void (*neri_gc_trace_fn_v1)(neri_ref_v1 object,
                                       neri_gc_visit_slot_fn_v1 visit,
                                       void *context);
@@ -281,6 +285,13 @@ NERI_RT_API void neri_rt_v1_foreign_leave(neri_foreign_entry_v1 *entry);
 NERI_RT_API neri_ref_v1
 neri_rt_v1_gc_alloc(const neri_type_descriptor_v1 *type,
                       uint64_t payload_size, uint64_t payload_alignment);
+/* ABI 1.35: reference-free array construction. The header and length are
+ * initialized, but elements are not. The caller must initialize every element
+ * before exposing the array or reading it, and set its length explicitly.
+ * Descriptors with references or trace callbacks are rejected. */
+NERI_RT_API neri_ref_v1 neri_rt_v1_array_alloc_uninitialized(
+    const neri_type_descriptor_v1 *type, uint64_t payload_size,
+    uint64_t payload_alignment);
 NERI_RT_API void
 neri_rt_v1_gc_root_frame_enter(neri_gc_root_frame_v1 *frame);
 NERI_RT_API void

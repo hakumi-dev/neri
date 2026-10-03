@@ -400,8 +400,11 @@ Terminal leases and window state are process-wide, thread-confined services.
 Native integrations must preserve their operating-system resource ownership and
 synchronization requirements across runtime contexts.
 
-LLVM Release uses the O2 module pipeline and generic target CPU settings for
-ARM64 and x86-64. Checked arithmetic, bounds and strict floating-point semantics
+LLVM Release uses the O3 module pipeline and aggressive machine-code optimization.
+macOS ARM64 uses the Apple M1 CPU baseline; other targets use generic CPU settings.
+Closed executable modules give internal linkage to private definitions so LLVM can
+propagate values across calls. Retained modules and external entry points preserve
+their linkage. Checked arithmetic, bounds and strict floating-point semantics
 remain enabled. Native records describe C-compatible memory layouts; they do not
 provide a general ownership or cross-thread transfer contract. Native memory access
 through `unsafe` does not establish synchronization.
