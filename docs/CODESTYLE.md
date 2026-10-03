@@ -44,6 +44,7 @@ outside that guarantee.
 | `NRSTYLE005` | Indent parser-defined block bodies and parenthesized/bracketed continuations. | Enabled, warning |
 | `NRSTYLE006` | Normalize horizontal spacing around commas, colons, dots, delimiter interiors, assignments, casts and syntax-resolved unary/binary operators. | Enabled, warning |
 | `NRSTYLE007` | Report each class or enum declaration after the first top-level class or enum in a file. | Disabled, warning; enabled for `compiler/`, `tooling/` and `stdlib/` |
+| `NRSTYLE008` | Wrap long comma-separated argument, parameter and array lists, preserving tokens. | Enabled, warning; 120 columns |
 
 Consecutive declarations and consecutive assertions stay together. An assertion
 at the start of a body needs no leading blank line. Closing delimiters end a
@@ -80,6 +81,8 @@ neri_blank_line_before_assertions = true
 neri_indentation = true
 neri_token_spacing = true
 neri_one_class_per_file = false
+max_line_length = 120
+neri_line_length = true
 neri_diagnostic.NRSTYLE001.severity = warning
 neri_diagnostic.NRSTYLE002.severity = warning
 neri_assertion_helpers = test/assert*, assert
@@ -106,6 +109,15 @@ Severity `none` suppresses reporting while keeping the formatting preference.
 Set a rule's boolean option to `false` to disable its analysis and correction.
 NRSTYLE007 has no automatic correction because moving declarations can change
 source ownership and project structure.
+
+`max_line_length` accepts a positive column count, `off`, or `unset` (120 columns).
+The wrapping rule places entries of a long parenthesized or bracketed list on
+separate lines, with the closing delimiter at the enclosing indentation level.
+Nested lists can wrap independently. Literals and comments retain their content.
+The width is a layout target. Indivisible expressions, literals and single-line
+postfix guards retain their layout when whitespace edits cannot split them safely.
+Such expressions can be extracted into named values when needed. The configured width
+counts Unicode scalars and expands tabs according to `tab_width`.
 
 ## Source organization
 

@@ -361,7 +361,7 @@ already inside a task. Callbacks must not depend on sibling execution order or
 block waiting for siblings.
 
 Range calls include worker startup, queue access, task execution and joining.
-The [benchmark methodology](../benchmarks/README.md#analytical-foundations)
+The [measurement methodology](PERFORMANCE.md#local-measurements)
 distinguishes measured execution costs from theoretical work/span bounds.
 
 `tasks::generate` binds an index callback with a `parallel fn` signature. Shared
@@ -404,6 +404,6 @@ Capability boundaries relevant to performance:
 | Data modeling | Classes and native records. |
 | Machine targeting | Generic ARM64/x86-64 emission; no language-level SIMD or per-CPU feature selection. |
 
-The [compute benchmarks](../benchmarks/README.md) separate kernel throughput from
-run-loop latency and include an independent C# scaling reference. Native x86-64
+Local [compute measurements](PERFORMANCE.md#compute-and-scoped-tasks) separate kernel throughput from
+run-loop latency and compare equivalent reference workloads. Native x86-64
 ABI/codegen CI is a correctness gate, not evidence of Neri multicore scaling.

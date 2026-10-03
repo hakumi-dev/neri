@@ -83,6 +83,6 @@ See [editor configuration](BUILDING.md#linux-editor-setup) and
 
 ## Performance
 
-The [benchmark reference](../benchmarks/README.md) defines workloads and result
+The [measurement contract](PERFORMANCE.md#local-measurements) defines workloads and result
 metadata. Release measurements apply to their recorded host, target and revision;
 VM results do not characterize a different workstation.

@@ -79,7 +79,7 @@ def example(): Void
   end).orderBy(byId, true).take(20)
 
   let projected = select(query, intScalar(), byId)
-  let plan = projected.compile()
+  let plan = projected.buildPlan()
 end
 ```
 
@@ -134,7 +134,7 @@ select<T, R>(query: Query<T>, codec: ScalarCodec<R>, selector: quote fn(T): R): 
 
 `T` is inferred from the query and `R` from the scalar codec. `intScalar()`,
 `boolScalar()`, `textScalar()` and their nullable variants provide strict
-decoders and result-column metadata. `compile()` is the explicit plan terminal;
+decoders and result-column metadata. `buildPlan()` is the explicit plan terminal;
 `Query<T>.all(provider)` and its scalar and shape projections materialize the selected rows. Without a query bound execution collects
 a typed streaming read; `take(n).all(provider)` uses bounded buffered execution.
 Unbounded materialization requires a provider with `StreamingReads` support.
@@ -307,7 +307,7 @@ concatenation and conditional vocabulary. Arbitrary method calls, user-defined
 operators, indexing, casts and control-flow statements remain outside the Data
 translation contract. Unsupported query shapes fail explicitly.
 
-Buffered `compile()` requires a limit from 1 through 1000. An unbounded `all()`
+Buffered `buildPlan()` requires a limit from 1 through 1000. An unbounded `all()`
 uses streaming to materialize all selected rows, with memory proportional to the
 result; `stream(...)` avoids retaining that result. Joined and grouped terminals
 retain their explicit bounds. Generated entity decoding reports missing columns

@@ -622,6 +622,7 @@ void require_binary(const function_context &context, const instruction &value,
                                  ? target->kind == NERI_IR_FUNCTION_V1 ||
                                        target->kind == NERI_IR_STATIC_METHOD_V1 ||
                                        target->kind == NERI_IR_INSTANCE_METHOD_V1 ||
+                                       target->kind == NERI_IR_CONSTRUCTOR_V1 ||
                                        target->kind == NERI_IR_DEFAULT_ADAPTER_V1
                                  : require_method
                                  ? target->kind == NERI_IR_INSTANCE_METHOD_V1 ||

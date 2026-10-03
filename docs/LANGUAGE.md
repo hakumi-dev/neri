@@ -12,6 +12,7 @@ arithmetic, null, bounds, evaluation-order, and lifetime rules.
 | Declarations, visibility, inheritance | [Functions, modules and classes](#functions-modules-and-classes) |
 | Type parameters and constraints | [Generics](#generics), [generic contracts](#generic-contracts) |
 | Enumerated cases and matching | [Closed alternatives](#closed-alternatives) |
+| Compile-time field iteration and typed reads | [Field reflection](REFLECTION.md) |
 | `fn`, captures, shared callbacks and tasks | [Function values and closures](#function-values-and-closures) |
 | C scalar types, records, pointers and borrows | [Unsafe and memory boundary](#unsafe-and-memory-boundary) |
 | `@cabiImport`, `@cabiExport`, `cabi fn`, C headers | [C interoperability](C-INTEROP.md) |
@@ -21,6 +22,9 @@ arithmetic, null, bounds, evaluation-order, and lifetime rules.
 ## Source and expressions
 
 Names are case-sensitive Unicode identifiers. `#` introduces a line comment.
+Reserved words are defined by the [token catalog](../tooling/kinds/tokens.hk).
+`compile` is reserved and introduces [compile-time field iteration](REFLECTION.md)
+with `compile for`.
 Newlines separate statements, blocks end with `end`, and indentation is cosmetic.
 Delimited arguments and array literals may span lines. String literals support
 `\"`, `\\`, `\0`, `\n`, `\t`, and `\r` and contain canonical UTF-8.
@@ -394,9 +398,17 @@ An explicit `super(args)` occurs once, as the first statement of a derived
 A class without `init` has an implicit zero-argument constructor. Construction
 initializes its ancestors first, invoking the nearest declared initializer with
 its default arguments, then initializes the remaining fields in inheritance
-order. That initializer must be accessible from the derived class and accept
-zero supplied arguments. Intermediate classes cannot skip initialization or
-constructor visibility.
+order. That initializer must accept zero supplied arguments. Intermediate
+classes cannot skip initialization.
+
+Constructors are always public. Declare them as `def init(...): Void` with no
+access modifier. Explicit `public` is unnecessary; `private`, `protected`, and
+`internal` conflict with constructor access. All explicit constructor access
+modifiers produce `NR286`.
+An `unsafe def init` is also public, but its calls require an unsafe declaration
+or block (`NR189`). This requirement applies to explicit and implicit base
+initialization. Standard-library raw-handle and unchecked time-value constructors
+use this boundary; their validated factories remain safe entry points.
 
 ### Library operators and explicit conversions
 
@@ -526,7 +538,7 @@ on an ordinary or specialized generic class; for example,
 See [generic methods](GENERIC-METHODS.md) for inference, scope, and restrictions.
 Static methods accept an explicitly specialized class
 receiver, such as `Container<Int>.create(42)` or
-`library::Container<String>.create("value")`; constructor and method visibility
+`library::Container<String>.create("value")`; class and method visibility
 still apply. Classes can inherit from a concrete specialization, such as
 `class IntBox: Box<Int>`, and generic classes can pass their parameters to a base,
 such as `class NamedBox<T>: Box<T>`. Generic classes can also inherit from ordinary

@@ -1,0 +1,218 @@
+use host
+
+def reflectionError(body: BootstrapBodyBinder, node: Int, message: String): BoundValue
+  body.report("NR285", node, message)
+  return new BoundValue("Error", body.addBound(body.boundKinds().getErrorExpression(), "Error", "", node, []))
+end
+
+def reflectionField(body: BootstrapBodyBinder, node: Int): SemanticField?
+  if !body.syntax().kindAt(node).isName()
+    return null
+  end
+  let name = body.syntax().dataAt(node)
+  let local = body.findLocal(name)
+
+  if local != null
+    return local.reflectedField
+  end
+  let outer = body.enclosing
+
+  if outer != null && body.findVariableIdentity(name) == ""
+    return reflectionField(outer, node)
+  end
+  return null
+end
+
+def reflectionFieldsCall(syntax: SyntaxArena, node: Int): Int
+  if !syntax.kindAt(node).isCall() || syntax.childCountAt(node) != 1
+    return -1
+  end
+  let callee = syntax.childAt(node, 0)
+
+  if !syntax.kindAt(callee).isMember() || syntax.dataAt(callee) != "fields" || syntax.childCountAt(callee) != 1
+    return -1
+  end
+  let receiver = syntax.childAt(callee, 0)
+
+  if !syntax.kindAt(receiver).isName() || syntax.dataAt(receiver) != "reflect" || syntax.nodeAt(callee).typeArguments.Length != 1
+    return -1
+  end
+  return syntax.nodeAt(callee).typeArguments[0]
+end
+
+def bindReflectionExpression(body: BootstrapBodyBinder, node: Int): BoundValue?
+  let syntax = body.syntax()
+  let kind = syntax.kindAt(node)
+
+  if kind.isCall() && reflectionFieldsCall(syntax, node) >= 0
+    return reflectionError(
+      body,
+      node,
+      "'reflect.fields<T>()' is available only as the source of a compile for statement."
+    )
+  end
+  if kind.isName() && reflectionField(body, node) != null
+    return reflectionError(
+      body,
+      node,
+      "A reflected field is compile-time metadata; use its name, typeName, declaringType, or read(value)."
+    )
+  end
+  var member = node
+
+  if kind.isCall()
+    member = syntax.childAt(node, 0)
+  else if !kind.isMember()
+    return null
+  end
+  if !syntax.kindAt(member).isMember() || syntax.childCountAt(member) != 1
+    return null
+  end
+  let descriptor = syntax.childAt(member, 0)
+  let field = reflectionField(body, descriptor)
+
+  if field == null
+    return null
+  end
+  let name = syntax.dataAt(member)
+
+  if kind.isCall()
+    if name != "read" || syntax.childCountAt(node) != 2 || syntax.nodeAt(member).typeArguments.Length != 0 || semanticArgumentLabel(
+      syntax,
+      syntax.childAt(node, 1)
+    ) != ""
+      return reflectionError(
+        body,
+        node,
+        "A reflected field supports read(value) with one positional argument and no type arguments."
+      )
+    end
+    let value = body.bindExpression(syntax.childAt(node, 1), "")
+
+    if !semanticAssignable(body.model(), field.owner, semanticMutableType(value.typeName))
+      return reflectionError(
+        body,
+        node,
+        "Field '" + field.owner + "." + field.name + "' requires a non-optional receiver assignable to '" + field.owner + "', but got '" + value.typeName + "'."
+      )
+    end
+    if semanticIsReadonly(value.typeName) && semanticContainsPointer(field.typeName)
+      return reflectionError(body, node, "A readonly view cannot expose a raw pointer field.")
+    end
+    let typeName = semanticViewMember(value.typeName, field.typeName)
+
+    body.owner.recordOccurrence(
+      body.owner.fieldSourceIdentity(field),
+      member,
+      field.owner + "." + field.name + ": " + typeName
+    )
+    return new BoundValue(
+      typeName,
+      body.addBound(body.boundKinds().getMember(), typeName, field.owner + "." + field.name, node, [value.boundNode])
+    )
+  end
+  var value = ""
+
+  if name == "name"
+    value = field.name
+  else if name == "typeName"
+    value = field.typeName
+  else if name == "declaringType"
+    value = field.owner
+  else
+    return reflectionError(
+      body,
+      node,
+      "Unknown reflected field property '" + name + "'; expected name, typeName, declaringType, or read(value)."
+    )
+  end
+  return new BoundValue(
+    "String",
+    body.addBoundValue(body.boundKinds().getStringLiteral(), "String", "", "s:" + value, node, [])
+  )
+end
+
+def reflectionBlock(body: BootstrapBodyBinder, node: Int, statements: Int[]): Int
+  let condition = body.addBoundValue(body.boundKinds().getBoolLiteral(), "Bool", "", "b:true", node, [])
+  var children = [condition]
+
+  for statement in statements
+    children = host::appendInt(children, statement)
+  end
+  return body.addBound(body.boundKinds().getIf(), "Void", (statements.Length as String) + "|0", node, children)
+end
+
+def bindReflectedFields(body: BootstrapBodyBinder, node: Int, returnType: String): Int
+  let syntax = body.syntax()
+  let collection = syntax.childAt(node, 0)
+  let typeNode = reflectionFieldsCall(syntax, collection)
+
+  if typeNode < 0 || body.findVariableIdentity("reflect") != ""
+    reflectionError(
+      body,
+      node,
+      "Compile for requires 'field in reflect.fields<T>()' without an iterator type annotation."
+    )
+    return reflectionBlock(body, node, [])
+  end
+  let typeName = body.owner.resolveTypeNode(typeNode, body.owner.currentNamespace, "")
+  let symbol = body.model().findClass(typeName)
+
+  if symbol == null || symbol.isAlternative || symbol.isResource || symbol.representation != "" || symbol.isFunctionType || symbol.quotedFunctionType != "" || symbol.fieldPackEntityType != ""
+    reflectionError(
+      body,
+      typeNode,
+      "Field reflection requires a concrete class with declared instance fields, but got '" + typeName + "'."
+    )
+    return reflectionBlock(body, node, [])
+  end
+  let ancestors = new StringBuffer()
+  var current: SemanticClass? = symbol
+
+  while current != null && body.owner.checkpoint()
+    if ancestors.size >= 256
+      reflectionError(body, node, "Field reflection exceeds the 256-class inheritance traversal limit.")
+      return reflectionBlock(body, node, [])
+    end
+    ancestors.add(current.fullName)
+    current = body.model().findClass(current.baseName)
+  end
+  var statements: Int[] = []
+  var index = ancestors.size - 1
+  let previousIdentity = body.expansionIdentity
+  let previousLoopDepth = body.loopDepth
+
+  body.loopDepth = 0
+  while index >= 0 && body.owner.checkpoint()
+    let ancestor = body.model().findClass(ancestors.get(index))
+    var field = ancestor == null ? null : ancestor.firstField
+
+    while field != null && body.owner.checkpoint()
+      if field.access.isPublic()
+        if body.owner.reflectionExpansions >= 4096
+          reflectionError(body, node, "Field reflection exceeds the 4096-field expansion limit for this binding pass.")
+          body.expansionIdentity = previousIdentity
+          body.loopDepth = previousLoopDepth
+          return reflectionBlock(body, node, statements)
+        end
+        body.owner.reflectionExpansions = body.owner.reflectionExpansions + 1
+        body.expansionIdentity = previousIdentity + "/field" + (body.owner.reflectionExpansions as String)
+        body.enterScope()
+        body.flow.enterFlow()
+        let local = body.declareLocal(syntax.dataAt(node), "Error", false, node)
+
+        local.reflectedField = field
+        let expanded = body.bindBlock(node, 1, syntax.childCountAt(node) - 1, returnType, false)
+
+        body.flow.leaveFlow()
+        body.leaveScope()
+        statements = host::appendInt(statements, reflectionBlock(body, node, expanded))
+      end
+      field = field.nextField
+    end
+    index = index - 1
+  end
+  body.expansionIdentity = previousIdentity
+  body.loopDepth = previousLoopDepth
+  return reflectionBlock(body, node, statements)
+end
