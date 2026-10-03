@@ -246,6 +246,10 @@ directly. Registration sorts by bit value, and validation rejects repeated
 registrations, conflicting codes or names, and references outside the catalog.
 Reordering fields preserves emitted order; renaming a field changes its derived
 ABI names and requires reviewing and regenerating the public artifacts.
+`AbiRuntimeRequirements` declares named rules with an explicit `Exact` or
+`Prefix` match kind. Reflection derives runtime symbol spellings from field
+names. Generated `RuntimeSymbols` methods own the text comparisons at the
+link-name boundary; version and capability requirements share those methods.
 The compiler linker and native code generator combine all matching symbol rules;
 exact rules can raise the minimum version required by a broader prefix rule.
 The runtime and its package manifest obtain advertised capabilities from the
