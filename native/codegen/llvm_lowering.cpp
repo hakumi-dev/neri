@@ -1140,7 +1140,9 @@ private:
       auto *nonnegative = builder_.CreateICmpSGE(
           index, llvm::ConstantInt::get(builder_.getInt64Ty(), 0U),
           "array.index.nonnegative");
-      auto *inside = builder_.CreateICmpULT(index, length, "array.index.inside");
+      // Array lengths and indices are Neri Ints. Use the same signed comparison
+      // as a source-level index < array.Length guard so LLVM can reuse it.
+      auto *inside = builder_.CreateICmpSLT(index, length, "array.index.inside");
       emit_guard(builder_.CreateAnd(nonnegative, inside),
                  NERI_PANIC_BOUNDS_V1, "Array index is out of bounds.",
                  location);

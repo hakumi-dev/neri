@@ -175,7 +175,8 @@ instructions preserve their checked-conversion contract through native lowering.
 Bool and Byte occupy one byte; Int and Float occupy eight bytes; managed references
 and pointers occupy eight bytes on both targets. Object headers contain a descriptor
 pointer and a runtime-owned word, occupying 16 bytes. Strings and arrays append an
-eight-byte length. Strings count UTF-8 bytes; arrays count elements.
+eight-byte length. Strings count UTF-8 bytes; arrays count elements. Array lengths
+are in `0..INT64_MAX`, matching the nonnegative range of Neri's `Int`.
 
 Scalar optionals carry a presence tag and aligned payload. Optional managed
 references and optional native pointers use a null pointer for absence. Type descriptors specify payload
