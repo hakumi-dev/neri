@@ -186,6 +186,14 @@ entry points through the existing host services.
 
 `native/codegen/` is a narrow C++ LLVM consumer. It accepts only verified Neri IR and emits LLVM IR, assembly, or native objects.
 
+Sequential array generation lowers to a checked allocation and an LLVM loop in
+the caller. The callback and partially initialized array remain rooted across
+callback execution, and each result is stored before another safepoint. An
+allocation followed only by class upcasts proves the callback's exact dynamic
+type and permits a direct call; other callbacks retain virtual dispatch. This
+keeps known callback bodies and loop bounds visible to LLVM without changing
+callback order or the source-level API.
+
 `native/runtime/` implements the runtime and precise tracing garbage collector in
 C++. Generated programs link to its static archive through the versioned
 [runtime ABI](ABI.md).

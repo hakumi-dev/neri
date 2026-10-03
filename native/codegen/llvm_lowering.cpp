@@ -615,6 +615,7 @@ private:
         for (const auto &instruction : block.instructions) {
           for (const auto &result : instruction.results) {
             value_types_.try_emplace(result.id, &result.value_type);
+            definitions_.try_emplace(result.id, &instruction);
           }
         }
       }
@@ -1232,6 +1233,83 @@ private:
       return bytes;
     }
 
+    [[nodiscard]] const symbol_id *allocated_class(std::uint32_t id) const {
+      // Only allocation provenance proves an exact dynamic type. A declared
+      // class type may name a base class, and block parameters may merge types.
+      while (true) {
+        const auto found = definitions_.find(id);
+        if (found == definitions_.end()) break;
+        const auto &definition = *found->second;
+        if (definition.opcode == NERI_IR_OPCODE_OBJECT_ALLOC_V1)
+          return &*definition.symbol;
+        if (definition.opcode != NERI_IR_OPCODE_CLASS_UPCAST_V1) break;
+        id = definition.operands.front();
+      }
+      return nullptr;
+    }
+
+    [[nodiscard]] llvm::Value *generate_array(const instruction &instruction) {
+      const auto &element = instruction.type_arguments.front();
+      auto *count = value(instruction.operands[0]);
+      auto *callback = value(instruction.operands[1]);
+      emit_guard(builder_.CreateICmpSGE(count, builder_.getInt64(0)),
+                 NERI_PANIC_RUNTIME_CONTRACT_V1,
+                 "invalid sequential array generation contract", instruction.location);
+      const auto prefix = module_.array_payload_element_offset(element);
+      const auto maximum = (std::numeric_limits<std::size_t>::max() -
+          sizeof(neri_object_header_v1) - prefix) / module_.storage_size(element);
+      emit_guard(builder_.CreateICmpULE(count, builder_.getInt64(maximum)),
+                 NERI_PANIC_OUT_OF_MEMORY_V1,
+                 "array generation size overflow", instruction.location);
+      auto *bytes = builder_.CreateAdd(builder_.getInt64(prefix),
+          builder_.CreateMul(count, builder_.getInt64(module_.storage_size(element))));
+      auto *array = builder_.CreateCall(module_.gc_alloc_function(),
+          {module_.array_descriptor(element), bytes,
+           builder_.getInt64(module_.array_payload_alignment(element))}, "array.generated");
+      // Callback execution may collect. Publish the zeroed array to its normal
+      // SSA root before the first call; its unwritten reference slots are null.
+      root_value(instruction.results.front().id, array);
+      auto *length_slot = builder_.CreateInBoundsGEP(builder_.getInt8Ty(), array,
+          builder_.getInt64(sizeof(neri_object_header_v1)));
+      builder_.CreateAlignedStore(count, length_slot, llvm::Align(alignof(uint64_t)));
+
+      const auto &signature = module_.find_virtual_signature(*instruction.symbol);
+      llvm::Value *callee = nullptr;
+      if (const auto *exact = allocated_class(instruction.operands[1])) {
+        const auto &layout = module_.layout_for_class(*exact);
+        const auto index = layout.dispatch_slots.at(symbol_key(*instruction.symbol));
+        callee = module_.functions_.at(symbol_key(layout.virtual_methods.at(index)->id));
+      } else {
+        callee = module_.virtual_target(builder_, callback, *instruction.symbol);
+      }
+      auto *entry = builder_.GetInsertBlock();
+      auto *loop = llvm::BasicBlock::Create(module_.context_, "array.generate.loop", &output_);
+      auto *done = llvm::BasicBlock::Create(module_.context_, "array.generate.done", &output_);
+      builder_.CreateCondBr(builder_.CreateICmpEQ(count, builder_.getInt64(0)), done, loop);
+      builder_.SetInsertPoint(loop);
+      auto *index = builder_.CreatePHI(builder_.getInt64Ty(), 2, "array.generate.index");
+      index->addIncoming(builder_.getInt64(0), entry);
+      auto *slot = array_element_slot(array, index, element);
+      std::vector<llvm::Value *> arguments;
+      const bool indirect = is_indirect_optional(signature.result_type);
+      if (indirect) arguments.push_back(slot);
+      arguments.push_back(callback);
+      arguments.push_back(index);
+      auto *call = builder_.CreateCall(
+          module_.physical_function_type(signature.parameter_types, signature.result_type),
+          callee, arguments);
+      call->setCallingConv(llvm::CallingConv::C);
+      // As in the runtime adapter, no safepoint separates return from storing
+      // the result. Scalar optionals already write into their aligned slot.
+      if (!indirect)
+        builder_.CreateAlignedStore(call, slot, llvm::Align(module_.storage_alignment(element)));
+      auto *next = builder_.CreateAdd(index, builder_.getInt64(1), "array.generate.next");
+      index->addIncoming(next, loop);
+      builder_.CreateCondBr(builder_.CreateICmpULT(next, count), loop, done);
+      builder_.SetInsertPoint(done);
+      return array;
+    }
+
     [[nodiscard]] llvm::Value *compare_pointer(
         llvm::Value *left, llvm::Value *right, neri_ir_comparison_v1 predicate) {
       switch (predicate) {
@@ -1660,13 +1738,7 @@ private:
         break;
       }
       case NERI_IR_OPCODE_ARRAY_GENERATE_V1: {
-        const auto &element = instruction.type_arguments.front();
-        auto *call = builder_.CreateCall(module_.array_generate_function(),
-            {value(instruction.operands[0]), module_.array_descriptor(element),
-             value(instruction.operands[1]),
-             module_.task_adapter(*instruction.symbol)}, "array.generated");
-        call->setCallingConv(llvm::CallingConv::C);
-        result = call;
+        result = generate_array(instruction);
         break;
       }
       case NERI_IR_OPCODE_STACK_ALLOC_V1: {
@@ -1908,6 +1980,7 @@ private:
     std::map<std::uint32_t, llvm::PHINode *> phis_;
     std::map<std::uint32_t, llvm::Value *> root_slots_;
     std::unordered_map<std::uint32_t, const type *> value_types_;
+    std::unordered_map<std::uint32_t, const instruction *> definitions_;
     std::unordered_map<std::uint32_t, std::vector<const debug_local *>>
         debug_locals_by_value_;
     std::unordered_map<std::uint32_t, const block *> input_blocks_by_id_;
@@ -3218,13 +3291,6 @@ private:
     auto *integer = llvm::Type::getInt64Ty(context_);
     return runtime_function("neri_rt_v1_task_generate", pointer,
         {integer, integer, pointer, pointer, pointer});
-  }
-
-  [[nodiscard]] llvm::Function *array_generate_function() {
-    auto *pointer = llvm::PointerType::getUnqual(context_);
-    auto *integer = llvm::Type::getInt64Ty(context_);
-    return runtime_function("neri_rt_v1_array_generate", pointer,
-        {integer, pointer, pointer, pointer});
   }
 
   [[nodiscard]] llvm::Function *root_frame_leave_function() {
