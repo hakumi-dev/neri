@@ -527,8 +527,17 @@ See [generic methods](GENERIC-METHODS.md) for inference, scope, and restrictions
 Static methods accept an explicitly specialized class
 receiver, such as `Container<Int>.create(42)` or
 `library::Container<String>.create("value")`; constructor and method visibility
-still apply. Generic class inheritance,
-class bounds, multiple bounds, generic contracts, and higher-kinded types are
+still apply. Classes can inherit from a concrete specialization, such as
+`class IntBox: Box<Int>`, and generic classes can pass their parameters to a base,
+such as `class NamedBox<T>: Box<T>`. Generic classes can also inherit from ordinary
+classes. Each specialization substitutes its type arguments into the base type,
+fields, and method signatures. Inherited members, `super`, exact overrides, and
+abstract method obligations follow the ordinary class rules. Class type arguments
+are invariant: inheriting from `Box<Int>` does not make a class assignable to
+`Box<String>`. Generic inheritance is checked when the class is specialized,
+including base restrictions and inheritance cycles.
+
+Class bounds, multiple bounds, generic contracts, and higher-kinded types are
 outside this surface. Templates are supplied as source files in the same
 compilation invocation, including across namespaces. A compiled specialization is concrete; it is not a separately
 importable generic template or a package ABI promise.

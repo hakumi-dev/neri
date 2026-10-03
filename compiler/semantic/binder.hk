@@ -24,6 +24,7 @@ class BootstrapBinder
   public sessionTryErrorType: String = ""
   public forbiddenEntryPointSources: StringBuffer = new StringBuffer()
   public followingUses: String[] = []
+  private lastInheritanceValidated: SemanticClass?
 
   def checkpoint(): Bool
     let control = this.control
@@ -218,10 +219,6 @@ class BootstrapBinder
     return this.model if this.cancelled()
     this.resolveInheritance()
     return this.model if this.cancelled()
-    this.validateInheritedMembers()
-    return this.model if this.cancelled()
-    validateAbstractClasses(this)
-    return this.model if this.cancelled()
     this.registerFunctions()
     return this.model if this.cancelled()
     validateWorkerOperations(this)
@@ -229,6 +226,10 @@ class BootstrapBinder
     semanticValidateCDeclarations(this)
     return this.model if this.cancelled()
     registerContractRequirements(this)
+    return this.model if this.cancelled()
+    this.validateInheritedMembers()
+    return this.model if this.cancelled()
+    validateAbstractClasses(this)
     return this.model if this.cancelled()
     referenceGenericTemplateUses(this)
     return this.model
@@ -252,11 +253,17 @@ class BootstrapBinder
         break
       end
     end
+    this.validateInheritedMembers()
+    validateAbstractClasses(this)
     return this.model
   end
 
   def bindQuery(position: Int): SemanticQueryAnalysis
-    return semanticBindQuery(this, position)
+    let result = semanticBindQuery(this, position)
+
+    this.validateInheritedMembers()
+    validateAbstractClasses(this)
+    return result
   end
 
   # The parser root supplied to a child binder contains only newly parsed
@@ -1210,38 +1217,8 @@ class BootstrapBinder
     while index < this.classCount() && this.checkpoint()
       let node = this.classNodeAt(index)
       let symbol = this.classForNode(node)
-      let baseNode = this.classBaseNode(node)
 
-      if symbol != null && baseNode >= 0
-        let written = syntaxTypeDisplay(this.syntax, baseNode)
-
-        if semanticIsBuiltin(written) || semanticIsArray(written) || semanticIsOptional(written) || semanticIsPointer(written)
-          this.report("NR159", baseNode, "Base type '" + written + "' must be a class.")
-        else
-          let resolved = semanticResolveType(this.model, written, symbol.namespaceName)
-
-          if resolved == "Unknown"
-            this.report("NR158", baseNode, "Base class '" + written + "' was not found.")
-          else if resolved == symbol.fullName
-            this.report("NR160", baseNode, "Class '" + symbol.name + "' cannot inherit from itself.")
-          else
-            let base = this.model.findClass(resolved)
-
-            if base != null && base.isSealed
-              this.report("NR159", baseNode, "Sealed class '" + resolved + "' cannot be inherited.")
-            else if base != null && base.isAlternative
-              this.report("NR260", baseNode, "Closed alternative type '" + resolved + "' cannot be inherited.")
-            else if base != null && base.isResource
-              this.report("NR262", baseNode, "Resource classes cannot be inherited.")
-            else if symbol.isResource
-              this.report("NR262", baseNode, "A resource class cannot inherit from another class.")
-            else
-              symbol.baseName = resolved
-              this.recordTypeOccurrence(resolved, baseNode)
-            end
-          end
-        end
-      end
+      this.resolveClassInheritance(symbol) if symbol != null
       index = index + 1
     end
     var current = this.model.firstClass
@@ -1252,6 +1229,50 @@ class BootstrapBinder
         current.baseName = ""
       end
       current = current.nextClass
+    end
+  end
+
+  def resolveClassInheritance(symbol: SemanticClass): Void
+    let baseNode = this.classBaseNode(symbol.syntaxNode)
+
+    if baseNode < 0
+      return
+    end
+    let written = syntaxTypeDisplay(this.syntax, baseNode)
+
+    if semanticIsBuiltin(written) || semanticIsArray(written) || semanticIsOptional(written) || semanticIsPointer(written)
+      this.report("NR159", baseNode, "Base type '" + written + "' must be a class.")
+      return
+    end
+    let resolved = this.syntax.nodeAt(baseNode).typeArguments.Length > 0 ? this.resolveTypeNode(baseNode, symbol.namespaceName, "") : semanticResolveType(this.model, written, symbol.namespaceName)
+
+    if resolved == "Error"
+      return
+    else if resolved == "Unknown"
+      this.report("NR158", baseNode, "Base class '" + written + "' was not found.")
+    else if resolved == symbol.fullName
+      this.report("NR160", baseNode, "Class '" + symbol.name + "' cannot inherit from itself.")
+    else
+      let base = this.model.findClass(resolved)
+
+      if base == null
+        this.report("NR159", baseNode, "Base type '" + written + "' must be a class.")
+      else if base.isSealed
+        this.report("NR159", baseNode, "Sealed class '" + resolved + "' cannot be inherited.")
+      else if base.isAlternative
+        this.report("NR260", baseNode, "Closed alternative type '" + resolved + "' cannot be inherited.")
+      else if base.isResource
+        this.report("NR262", baseNode, "Resource classes cannot be inherited.")
+      else if symbol.isResource
+        this.report("NR262", baseNode, "A resource class cannot inherit from another class.")
+      else
+        symbol.baseName = resolved
+        this.recordTypeOccurrence(resolved, baseNode)
+        if this.hasInheritanceCycle(symbol)
+          this.report("NR161", symbol.syntaxNode, "Inheritance cycle detected for class '" + symbol.name + "'.")
+          symbol.baseName = ""
+        end
+      end
     end
   end
 
@@ -1312,6 +1333,11 @@ class BootstrapBinder
 
   def validateInheritedMembers(): Void
     var classSymbol = this.model.firstClass
+    let previous = this.lastInheritanceValidated
+
+    if previous != null
+      classSymbol = previous.nextClass
+    end
 
     while classSymbol != null && this.checkpoint()
       var field = classSymbol.firstField
@@ -1348,6 +1374,7 @@ class BootstrapBinder
         end
         method = method.nextCallable
       end
+      this.lastInheritanceValidated = classSymbol
       classSymbol = classSymbol.nextClass
     end
   end
@@ -1391,13 +1418,13 @@ class BootstrapBinder
 
   def isForbiddenEntryPoint(node: Int): Bool
     let source = this.sourceIdAt(this.syntax.irStartAt(node))
-    var entry = this.forbiddenEntryPointSources.first.nextNode
+    var entry = this.forbiddenEntryPointSources.cursor()
 
-    while entry != null
-      if entry.value == source
+    while entry.hasValue()
+      if entry.current() == source
         return true
       end
-      entry = entry.nextNode
+      entry.advance()
     end
     return false
   end
