@@ -226,6 +226,24 @@ std::optional<std::string> environment(std::string_view name) {
   return windows::utf8(value);
 #else
   const char *value = std::getenv(std::string(name).c_str());
+  if (name == "NERI_FEEDBACK_LOCK_FD" && value) {
+    char *end = nullptr;
+    errno = 0;
+    const long descriptor = std::strtol(value, &end, 10);
+    if (errno || end == value || *end || descriptor < 0 || descriptor > INT_MAX)
+      return std::nullopt;
+    const char *state = std::getenv("NERI_FEEDBACK_LOCK_STATE");
+    struct stat inherited{}, expected{};
+    if (!state || fstat(static_cast<int>(descriptor), &inherited) != 0 ||
+        stat((std::string(state) + ".lock").c_str(), &expected) != 0 ||
+        !S_ISREG(inherited.st_mode) || inherited.st_dev != expected.st_dev ||
+        inherited.st_ino != expected.st_ino)
+      return std::nullopt;
+    const int flags = fcntl(static_cast<int>(descriptor), F_GETFD);
+    // Keep the lock in this process without leaking its descriptor into tools.
+    if (flags < 0 || fcntl(static_cast<int>(descriptor), F_SETFD, flags | FD_CLOEXEC) < 0)
+      return std::nullopt;
+  }
   return value ? std::optional<std::string>(value) : std::nullopt;
 #endif
 }

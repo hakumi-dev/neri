@@ -353,6 +353,12 @@ the host session, turn and transcript identity. An unchanged invocation in that
 scope emits `{}`. A new scope receives feedback correlated with its current
 operation, reusing valid project analyses when their inputs match. Missing turn
 identity disables message deduplication while permitting project-analysis reuse.
+On macOS and Linux, invocations sharing a canonical state path serialize analysis
+with a process-owned OS lock. Each waiter reads the latest published cache after
+acquiring the lock and revalidates the graph before reusing unit results. The
+stable `FILE.lock` remains on disk; the OS releases ownership when the analyzing
+process exits or crashes. State publication is atomic and precedes delivery.
+Windows retains feedback and cache reuse without this serialization optimization.
 The input identity includes
 project and unit selection, compiler version and executable digest, the canonical standard-library
 location, its manifest and required sources, and observed project inputs.

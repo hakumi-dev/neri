@@ -8,6 +8,7 @@
 #include <cerrno>
 #include <chrono>
 #include <csignal>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -286,6 +287,36 @@ void run(int argc, char **argv) {
 #endif
 }
 
+// Record locks remain owned across exec and are released by the OS on exit.
+// The stable lock file must never be removed: waiters must share its inode.
+int feedback_lock(int, char **argv) {
+#if defined(_WIN32)
+  (void)argv;
+  throw std::runtime_error("feedback serialization is unavailable on this host");
+#else
+  const std::string path = std::string(argv[2]) + ".lock";
+  const int descriptor = open(path.c_str(), O_RDWR | O_CREAT, 0600);
+  if (descriptor < 0) throw std::runtime_error("cannot open feedback lock");
+  struct flock lock{};
+  lock.l_type = F_WRLCK;
+  lock.l_whence = SEEK_SET;
+  while (fcntl(descriptor, F_SETLKW, &lock) < 0) {
+    if (errno == EINTR) continue;
+    close(descriptor);
+    throw std::runtime_error("cannot acquire feedback lock");
+  }
+  const auto number = std::to_string(descriptor);
+  if (setenv("NERI_FEEDBACK_LOCK_FD", number.c_str(), 1) != 0 ||
+      setenv("NERI_FEEDBACK_LOCK_STATE", argv[2], 1) != 0) {
+    close(descriptor);
+    throw std::runtime_error("cannot prepare feedback lock");
+  }
+  execvp(argv[3], argv + 3);
+  close(descriptor);
+  throw std::runtime_error("cannot start feedback compiler");
+#endif
+}
+
 int main(int argc, char **argv) {
   try {
 #if defined(_WIN32)
@@ -293,7 +324,8 @@ int main(int argc, char **argv) {
     argc = static_cast<int>(arguments.storage.size());
     argv = arguments.pointers.data();
 #endif
-    if (argc == 5 && std::string(argv[1]) == "list") list_files(argv[2], argv[3], argv[4]);
+    if (argc >= 4 && std::string(argv[1]) == "feedback-lock") return feedback_lock(argc, argv);
+    else if (argc == 5 && std::string(argv[1]) == "list") list_files(argv[2], argv[3], argv[4]);
     else if (argc == 6 && std::string(argv[1]) == "list-project") list_project_files(argv[2], argv[3], argv[4], argv[5]);
     else if (argc == 4 && std::string(argv[1]) == "canonical-path") canonical_path(argv[2], argv[3]);
     else if (argc == 4 && std::string(argv[1]) == "stamp") stamp(argv[2], argv[3]);
