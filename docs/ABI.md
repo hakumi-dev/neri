@@ -195,6 +195,15 @@ host-error storage. Each native thread initializes and shuts down its base
 context; shutdown reclaims only the active context's allocations and requires its
 roots and borrows to have ended. Process-argument views belong to the context.
 
+Small managed reservations use heap-local 16 KiB slabs with reusable slots in
+64, 96, 128 and 256 byte size classes, including the private allocation prefix.
+Larger reservations use individual native allocations. Sweep recycles dead
+slots and returns empty slabs; partially occupied slabs retain stable object
+addresses. Task-result adoption transfers the associated storage to the parent
+heap. Managed-byte statistics count public headers and payloads; process RSS
+also includes private metadata, slot padding and retained slab capacity.
+AddressSanitizer builds poison unused slots and add gaps between live slots.
+
 Managed allocations carry a private owner identity. Runtime reference stores and
 tracing reject objects from unrelated heaps. The runtime's
 [private scoped-task boundary](ARCHITECTURE.md#execution-and-optimization-boundaries)

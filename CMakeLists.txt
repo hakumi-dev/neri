@@ -153,6 +153,7 @@ add_library(neri_runtime STATIC
   native/platform/session_loader.cpp
   native/runtime/entry.cpp
   native/runtime/math.cpp
+  native/runtime/managed_storage.cpp
   native/runtime/runtime.cpp
   native/runtime/task_executor.cpp
   native/runtime/worker_pool.cpp

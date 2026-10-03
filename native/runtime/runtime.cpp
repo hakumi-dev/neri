@@ -5,6 +5,7 @@
 #include "../platform/session_loader.h"
 #include "terminal.h"
 #include "task_heap.h"
+#include "managed_storage.h"
 #include "worker_pool.h"
 
 #include <algorithm>
@@ -56,8 +57,8 @@ struct managed_allocation final {
   [[nodiscard]] neri_ref_v1 object() const;
 };
 
-// One reservation per managed object. The private prefix preserves the public
-// object/payload alignment and is the address passed back to the allocator.
+// Each managed object has an adjacent private prefix, including objects in
+// shared slabs. It preserves alignment and identifies the storage reservation.
 constexpr size_t managed_prefix_size =
     (sizeof(managed_allocation) + alignof(std::max_align_t) - 1) &
     ~(alignof(std::max_align_t) - 1);
@@ -83,6 +84,7 @@ struct native_allocation final {
 enum class heap_phase { uninitialized, active, collecting, suspended };
 
 struct runtime_state final {
+  neri::runtime::managed_storage storage;
   managed_allocation *managed_head;
   native_allocation *native_head;
   neri_gc_root_frame_v1 *root_frame;
@@ -633,7 +635,8 @@ void collect_impl() {
                      sizeof(neri_object_header_v1) + allocation->payload_size,
                      true);
       }
-      std::free(allocation);
+      heap.storage.release(allocation, managed_prefix_size +
+          sizeof(neri_object_header_v1) + allocation->payload_size);
     } else {
       // Outside collection every live object is unmarked. Reset survivors
       // while sweeping instead of traversing the entire heap before marking.
@@ -641,6 +644,7 @@ void collect_impl() {
       link = &allocation->next;
     }
   }
+  heap.storage.collect_empty();
   heap.collection_count += 1;
   heap.next_collection_bytes = std::max(collection_floor_bytes,
       heap.managed_byte_count > UINT64_MAX / 2 ? UINT64_MAX : heap.managed_byte_count * 2);
@@ -1160,7 +1164,8 @@ void release_heap() {
                    sizeof(neri_object_header_v1) + allocation->payload_size,
                    false);
     }
-    std::free(allocation);
+    heap.storage.release(allocation, managed_prefix_size +
+        sizeof(neri_object_header_v1) + allocation->payload_size);
   }
   release_native_allocations(heap);
   heap = {};
@@ -1189,6 +1194,7 @@ void adopt_results(neri_task_scope &scope) {
     }
     parent.managed_object_count += child.managed_object_count;
     parent.managed_byte_count += child.managed_byte_count;
+    parent.storage.adopt(child.storage);
     delete result;
   }
 }
@@ -1685,16 +1691,16 @@ neri_rt_v1_gc_alloc(const neri_type_descriptor_v1 *type,
 
   const size_t physical_size = managed_prefix_size + total_size;
   auto *metadata =
-      static_cast<managed_allocation *>(std::calloc(1, physical_size));
+      static_cast<managed_allocation *>(heap.storage.allocate(physical_size));
   if (metadata == nullptr) {
     collect_impl();
     metadata = static_cast<managed_allocation *>(
-        std::calloc(1, physical_size));
+        heap.storage.allocate(physical_size));
   }
   if (metadata == nullptr ||
       heap.managed_byte_count > UINT64_MAX - total_size ||
       heap.managed_object_count == UINT64_MAX) {
-    std::free(metadata);
+    heap.storage.release(metadata, physical_size);
     out_of_memory("managed allocation failed");
   }
 
