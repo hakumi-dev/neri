@@ -99,12 +99,9 @@ public:
       return {8U, 8U, {}};
     }
     if (value.symbol || !value.arguments.empty()) reject("Invalid native scalar shape.");
-    if (value.tag == NERI_IR_TYPE_BOOL_V1 || value.tag == NERI_IR_TYPE_BYTE_V1)
-      return {1U, 1U, {}};
-    if (value.tag == NERI_IR_TYPE_INT32_V1 || value.tag == NERI_IR_TYPE_UINT32_V1 ||
-        value.tag == NERI_IR_TYPE_FLOAT32_V1) return {4U, 4U, {}};
-    if (value.tag == NERI_IR_TYPE_INT_V1 || value.tag == NERI_IR_TYPE_UINT64_V1 ||
-        value.tag == NERI_IR_TYPE_FLOAT_V1) return {8U, 8U, {}};
+    const auto bits = scalar_properties(value.tag).c_bits;
+    // Supported native targets align these fixed-width C scalars to their size.
+    if (bits != 0U) return {bits / 8U, bits / 8U, {}};
     reject("Type has no C-compatible inline layout.");
   }
 

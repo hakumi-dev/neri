@@ -2373,6 +2373,12 @@ private:
   }
 
   [[nodiscard]] llvm::Type *semantic_type(const type &value) const {
+    const auto scalar = scalar_properties(value.tag);
+    if (scalar.semantic_bits != 0U) {
+      if (!scalar.floating) return llvm::IntegerType::get(context_, scalar.semantic_bits);
+      return scalar.semantic_bits == 32U ? llvm::Type::getFloatTy(context_)
+                                         : llvm::Type::getDoubleTy(context_);
+    }
     switch (value.tag) {
     case NERI_IR_TYPE_NATIVE_RECORD_V1: {
       const auto layout = native_layouts(input_).layout(value);
@@ -2381,21 +2387,6 @@ private:
     }
     case NERI_IR_TYPE_FIXED_ARRAY_V1:
       return llvm::ArrayType::get(physical_scalar_type(value.arguments.front()), value.element_count);
-    case NERI_IR_TYPE_BOOL_V1:
-      return llvm::Type::getInt1Ty(context_);
-    case NERI_IR_TYPE_BYTE_V1:
-      return llvm::Type::getInt8Ty(context_);
-    case NERI_IR_TYPE_INT_V1:
-      return llvm::Type::getInt64Ty(context_);
-    case NERI_IR_TYPE_FLOAT_V1:
-      return llvm::Type::getDoubleTy(context_);
-    case NERI_IR_TYPE_INT32_V1:
-    case NERI_IR_TYPE_UINT32_V1:
-      return llvm::Type::getInt32Ty(context_);
-    case NERI_IR_TYPE_UINT64_V1:
-      return llvm::Type::getInt64Ty(context_);
-    case NERI_IR_TYPE_FLOAT32_V1:
-      return llvm::Type::getFloatTy(context_);
     case NERI_IR_TYPE_STRING_V1:
     case NERI_IR_TYPE_ARRAY_V1:
     case NERI_IR_TYPE_CLASS_V1:
@@ -2628,23 +2619,10 @@ private:
     }
     const auto scalar_kind = [&] {
       if (is_indirect_optional(value)) return NERI_SCALAR_KIND_NONE_V1;
-      switch (value.tag) {
-      case NERI_IR_TYPE_BOOL_V1:
-        return NERI_SCALAR_KIND_BOOL_V1;
-      case NERI_IR_TYPE_BYTE_V1:
-        return NERI_SCALAR_KIND_BYTE_V1;
-      case NERI_IR_TYPE_INT_V1:
-        return NERI_SCALAR_KIND_INT_V1;
-      case NERI_IR_TYPE_FLOAT_V1:
-        return NERI_SCALAR_KIND_FLOAT_V1;
-      case NERI_IR_TYPE_INT32_V1: return NERI_SCALAR_KIND_INT32_V1;
-      case NERI_IR_TYPE_UINT32_V1: return NERI_SCALAR_KIND_UINT32_V1;
-      case NERI_IR_TYPE_UINT64_V1: return NERI_SCALAR_KIND_UINT64_V1;
-      case NERI_IR_TYPE_FLOAT32_V1: return NERI_SCALAR_KIND_FLOAT32_V1;
-      default:
-        throw codegen_error(codegen_error_kind::lowering,
-                            "Array element has no scalar ABI descriptor.");
-      }
+      const auto kind = scalar_properties(value.tag).runtime_kind;
+      if (kind != NERI_SCALAR_KIND_NONE_V1) return kind;
+      throw codegen_error(codegen_error_kind::lowering,
+                          "Array element has no scalar ABI descriptor.");
     }();
     auto *pointer = llvm::PointerType::getUnqual(context_);
     auto *null_pointer = llvm::ConstantPointerNull::get(pointer);
