@@ -48,7 +48,7 @@ static void automatic_project_contract(const char *compiler, const char *root) {
   free(reply);
 
   open_document(library_uri,
-    "namespace dependencies\n"
+    "namespace dependencies\n\n"
     "def library(): String\n"
     "  return \"changed\"\n"
     "end\n", 0);
