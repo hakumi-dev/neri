@@ -1,9 +1,17 @@
 # Runtime and IR boundary
 
 The canonical exported declarations and layouts are in
-[`runtime_abi.h`](../native/include/neri/runtime_abi.h). Runtime ABI 1.35 uses a
+[`runtime_abi.h`](../native/include/neri/runtime_abi.h). Runtime ABI 1.36 uses a
 C calling convention on macOS ARM64, Linux x86-64 and Windows x86-64. Generated programs negotiate
 major version, minimum minor version and required feature bits before execution.
+
+ABI 1.36 adds `neri_rt_v1_region_enter` and `neri_rt_v1_region_leave` for
+compiler-proven allocation scopes. Entry suspends the current heap and activates
+a fresh child heap. Normal collection remains enabled in that heap. Leave
+reclaims its storage and resumes the parent after child roots and borrows have
+ended. Tokens are thread-confined and leave in LIFO order; child references must
+not survive leave. These native operations are trusted compiler boundaries,
+not a safe manual-region API.
 
 ABI 1.35 adds `neri_rt_v1_array_alloc_uninitialized` for compiler-generated
 sequential arrays with reference-free elements. The descriptor must describe an

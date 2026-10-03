@@ -991,6 +991,14 @@ The runtime [ABI and collection contract](ABI.md) defines roots and allocation
 boundaries. Bounds and arithmetic failures panic with exit status 70. Compile
 errors produce diagnostics and prevent artifact emission.
 
+Release compilation can reclaim temporary object graphs at a proven function
+boundary through automatic allocation regions. Source code continues to use
+ordinary constructors. The compiler retains ordinary GC allocation when it
+cannot prove the graph stays within the selected scope. Regions do not change
+reference semantics, and collection remains available within long-lived scopes.
+See [execution and optimization boundaries](ARCHITECTURE.md#execution-and-optimization-boundaries)
+for the current eligibility rules.
+
 ## Resources
 
 A `resource class` owns a value that is acquired with `using` and released when

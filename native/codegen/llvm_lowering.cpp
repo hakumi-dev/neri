@@ -1,4 +1,5 @@
 #include "llvm_lowering.h"
+#include "allocation_regions.h"
 #include "llvm_numeric.h"
 #include "native_layout.h"
 
@@ -275,6 +276,10 @@ public:
     }
     initialize_debug_information();
     build_class_layouts();
+    if (!emit_debug_information_ && std::ranges::find(input_.required_features,
+            ir_feature::AutomaticRegions) != input_.required_features.end()) {
+      allocation_regions_ = allocation_regions(input_);
+    }
     emit_program_requirements();
     declare_globals();
     declare_imports();
@@ -865,11 +870,14 @@ private:
       }
     }
 
-    void leave_root_frame() {
+    void leave_function_scope() {
       if (root_frame_ != nullptr) {
         auto *call = builder_.CreateCall(module_.root_frame_leave_function(),
                                          {root_frame_});
         call->setCallingConv(llvm::CallingConv::C);
+      }
+      if (allocation_region_ != nullptr) {
+        builder_.CreateCall(module_.region_leave_function(), {allocation_region_});
       }
     }
 
@@ -916,6 +924,9 @@ private:
         }
         values_.emplace(entry.parameters[index].id, lowered);
         emit_debug_local(entry.parameters[index].id, lowered);
+      }
+      if (module_.allocation_regions_.contains(&input_)) {
+        allocation_region_ = builder_.CreateCall(module_.region_enter_function(), {}, "allocation.region");
       }
       enter_root_frame();
 
@@ -2050,16 +2061,16 @@ private:
       }
       case NERI_IR_TERMINATOR_RETURN_V1:
         if (is_void(input_.result_type)) {
-          leave_root_frame();
+          leave_function_scope();
           builder_.CreateRetVoid();
         } else if (is_indirect_optional(input_.result_type)) {
           builder_.CreateStore(value(*terminator.return_value), result_slot_);
-          leave_root_frame();
+          leave_function_scope();
           builder_.CreateRetVoid();
         } else {
           auto *returned = to_physical_scalar(value(*terminator.return_value),
                                               input_.result_type);
-          leave_root_frame();
+          leave_function_scope();
           builder_.CreateRet(returned);
         }
         return;
@@ -2082,6 +2093,7 @@ private:
     llvm::Argument *result_slot_{};
     llvm::AllocaInst *root_array_{};
     llvm::AllocaInst *root_frame_{};
+    llvm::Value *allocation_region_{};
     llvm::StructType *root_frame_type_{};
     llvm::DISubprogram *subprogram_{};
     std::map<std::uint32_t, llvm::BasicBlock *> blocks_;
@@ -3398,6 +3410,16 @@ private:
     return declaration;
   }
 
+  [[nodiscard]] llvm::Function *region_enter_function() {
+    return runtime_function("neri_rt_v1_region_enter",
+        llvm::PointerType::getUnqual(context_), {});
+  }
+
+  [[nodiscard]] llvm::Function *region_leave_function() {
+    return runtime_function("neri_rt_v1_region_leave", llvm::Type::getVoidTy(context_),
+        {llvm::PointerType::getUnqual(context_)});
+  }
+
   [[nodiscard]] llvm::Function *root_frame_enter_function() {
     return runtime_function(
         "neri_rt_v1_gc_root_frame_enter",
@@ -3671,6 +3693,7 @@ private:
   std::map<decltype(symbol_key(symbol_id{})), llvm::Function *> functions_;
   std::map<decltype(symbol_key(symbol_id{})), llvm::Function *> c_exports_;
   llvm::GlobalVariable *program_requirements_{};
+  std::set<const function *> allocation_regions_;
   std::map<decltype(symbol_key(symbol_id{})), lowered_class> class_layouts_;
   std::map<decltype(symbol_key(symbol_id{})), lowered_field> field_layouts_;
   std::map<decltype(symbol_key(symbol_id{})), std::size_t>

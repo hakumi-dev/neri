@@ -409,6 +409,26 @@ remain enabled. Native records describe C-compatible memory layouts; they do not
 provide a general ownership or cross-thread transfer contract. Native memory access
 through `unsafe` does not establish synchronization.
 
+The `automatic-regions-v1` IR feature permits Release allocation scopes for
+functions whose managed allocation graphs cannot escape. The native analysis
+requires scalar parameters and results, including optional scalars, and a fully
+known direct-call graph. It admits operations on local objects and immutable
+literals; imports, virtual calls, unsafe operations and recursive call cycles
+prevent selection. Loops in an allocating function or its callees identify
+potential bulk allocation, avoiding a separate heap for single-allocation leaves.
+Unknown operations remain in the ordinary heap.
+
+Selected functions enter a child heap before registering their roots and release
+it after removing roots on every normal return. Intermediate graphs returned by
+callees remain in the enclosing scope. The parent stays suspended, preserving
+caller objects, and collection remains enabled inside the child to reclaim
+temporary objects during long-running scopes. This combines scoped reclamation
+with tracing, as studied in
+[Combining Region Inference and Garbage Collection (2002)](https://www.cs.cmu.edu/afs/cs/academic/class/15745-s06/web/handouts/hallenberg-pldi02.pdf).
+Neri uses conservative scalar boundaries rather than a general region type
+inference system. The optimization introduces no source syntax or object-layout
+changes. Manual region creation is not part of the safe language API.
+
 The compiler owns distinct syntax, semantic and IR representations. Binding and
 lowering currently operate on a combined program, and those mutable graphs are
 not independently scheduled tasks. Generic specialization is cached within a

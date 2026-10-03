@@ -81,6 +81,7 @@ struct runtime_state final {
   const char *const *process_arguments;
   heap_phase phase = heap_phase::uninitialized;
   const runtime_state *read_parent;
+  runtime_state *region_parent;
   std::string host_error;
   std::vector<neri_ref_v1 *> persistent_roots;
 };
@@ -1683,6 +1684,38 @@ neri_rt_v1_gc_root_frame_leave(neri_gc_root_frame_v1 *frame) {
   current_state().root_frame = frame->previous;
   frame->previous = nullptr;
   frame->runtime_cookie = 0;
+}
+
+NERI_RT_API neri_region_v1 *neri_rt_v1_region_enter(void) {
+  require_initialized();
+  auto &parent = current_state();
+  if (parent.phase != heap_phase::active || active_mark_stack != nullptr) {
+    contract_panic("allocation regions require an active heap outside tracing");
+  }
+  auto *child = new (std::nothrow) runtime_state{};
+  if (child == nullptr) out_of_memory("allocation region creation failed");
+  child->phase = heap_phase::active;
+  child->read_parent = &parent;
+  child->region_parent = &parent;
+  child->process_argument_count = parent.process_argument_count;
+  child->process_arguments = parent.process_arguments;
+  parent.phase = heap_phase::suspended;
+  active_state = child;
+  return reinterpret_cast<neri_region_v1 *>(child);
+}
+
+NERI_RT_API void neri_rt_v1_region_leave(neri_region_v1 *region) {
+  require_initialized();
+  auto *child = &current_state();
+  auto *parent = child->region_parent;
+  if (region != reinterpret_cast<neri_region_v1 *>(child) || parent == nullptr ||
+      parent->phase != heap_phase::suspended) {
+    contract_panic("allocation regions must leave in LIFO order");
+  }
+  release_heap();
+  active_state = parent;
+  parent->phase = heap_phase::active;
+  delete child;
 }
 
 NERI_RT_API void neri_rt_v1_gc_store_ref(neri_ref_v1 owner,

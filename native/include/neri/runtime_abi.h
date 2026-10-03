@@ -296,6 +296,15 @@ NERI_RT_API void
 neri_rt_v1_gc_root_frame_enter(neri_gc_root_frame_v1 *frame);
 NERI_RT_API void
 neri_rt_v1_gc_root_frame_leave(neri_gc_root_frame_v1 *frame);
+
+/* ABI 1.36: compiler-proven, nonescaping allocation scopes. Entry suspends the
+ * current heap and activates a fresh child heap. Normal collection remains
+ * enabled inside the child. Leave reclaims it in bulk and resumes the parent.
+ * Tokens are thread-confined and leave in LIFO order, after all child roots and
+ * borrows have ended. No child reference may survive leave. */
+typedef struct neri_region_v1 neri_region_v1;
+NERI_RT_API neri_region_v1 *neri_rt_v1_region_enter(void);
+NERI_RT_API void neri_rt_v1_region_leave(neri_region_v1 *region);
 NERI_RT_API void neri_rt_v1_gc_store_ref(neri_ref_v1 owner,
                                              neri_ref_v1 *slot,
                                              neri_ref_v1 value);
