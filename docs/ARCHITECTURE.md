@@ -238,6 +238,14 @@ intrinsic IDs in source.
 `tooling/abi` defines the declarative catalog for effect bits, runtime capability
 bits, native intrinsics, and symbol-specific runtime requirements. Its Neri
 generator produces the typed compiler definitions and the shared native header.
+`AbiEffects` and `AbiFeatures` declare typed descriptors with explicit bit values.
+Compile-time field reflection supplies their canonical names; shared naming
+rules derive C identifiers and effect spellings, with explicit spelling overrides
+where required. Intrinsics and runtime requirements reference those descriptors
+directly. Registration sorts by bit value, and validation rejects repeated
+registrations, conflicting codes or names, and references outside the catalog.
+Reordering fields preserves emitted order; renaming a field changes its derived
+ABI names and requires reviewing and regenerating the public artifacts.
 The compiler linker and native code generator combine all matching symbol rules;
 exact rules can raise the minimum version required by a broader prefix rule.
 The runtime and its package manifest obtain advertised capabilities from the
