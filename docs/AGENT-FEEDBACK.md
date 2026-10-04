@@ -123,10 +123,41 @@ is error; warnings and hints also preserve a valid analysis status. Diagnostic
 counts and truncation include all these findings.
 
 Snapshots include applicable ancestor `.editorconfig` files and their absence,
-so configuration changes invalidate cached diagnostics. Analysis reuse follows
-input dependencies; rendering the response does not require another semantic
-analysis. This separation of dependency tracking, rebuilding and reuse is
+source contents, manifest membership, discovery directories and effective
+compiler, host, runtime, code-generation and standard-library inputs. Feedback
+rechecks contents and membership before publishing a result; concurrent changes
+produce `conflict`. File timestamps and elapsed time do not establish validity.
+Analysis reuse follows input dependencies. This separation of dependency
+tracking, rebuilding and reuse is
 consistent with the model in [Build systems à la carte](https://simon.peytonjones.org/assets/pdfs/build-systems-original.pdf).
+
+On macOS and Linux, feedback shares one local persistent worker per canonical
+project and effective toolchain configuration within the current user account.
+The worker retains one graph, reusable unit reports and at most one semantic
+document. Pages for an evicted document can reanalyze its unit under the same
+input checks. Disk analysis remains independent of editor overlays. Workers
+serialize requests, recycle after 256 requests and stop after 120 seconds without
+a request. Transport failure uses a fresh analysis and reports
+`execution.mode: "fresh-fallback"` with its cause; a persistent response reports
+`execution.mode: "persistent"` and a correlated `requestId`. Platforms without
+the persistent transport use the same explicit fresh fallback.
+
+`expectedSnapshot` rejects a request for changed inputs. `pageSize` is between
+1 and 128. Each response presents at most one unit with diagnostics or an actionable
+state, preserving its message even when its diagnostic count is zero. Global
+counts and `complete` describe analysis coverage; `nextCursor` describes remaining
+presentation. An empty cursor marks the end. Cursors bind the snapshot, unit,
+offset and page size. A stale cursor produces `conflict`.
+
+Responses fit a 2 MiB byte budget. An individual diagnostic that cannot fit
+produces `pageFailure` and a cursor for the same offset; it is not skipped.
+The hook uses a smaller budget and includes an exact `nextCommand` to retrieve
+the continuation through the CLI with the larger budget. For direct CLI paging:
+
+```sh
+neri feedback --project . --page-size 32
+neri feedback --project . --page-size 32 --expected-snapshot SNAPSHOT --cursor CURSOR
+```
 
 ### neri.describe
 
@@ -419,40 +450,41 @@ incorporates it before the agent's next decision. The adapter responds at tool
 completion boundaries, including completed editing commands.
 Delivery follows the host's supported tool paths. Changes made by an external
 editor are observed at the next invocation.
-Codex's default hook context limit is approximately 2,500 tokens. Larger reports
-arrive as a preview and a path to the complete saved output; the agent reads that
-file for omitted unit diagnostics. The aggregate status, coverage and diagnostic
-count precede the unit list. Host preview limits and Neri's explicit diagnostic
-truncation are separate limits.
+The hook requests a page of at most 16 diagnostics within a 16 KiB feedback
+budget. Aggregate status, coverage, diagnostic count and snapshot accompany the
+page. `nextCursor` and `nextCommand` preserve access to later diagnostics. Host
+preview limits remain independent of this byte budget and the JSON envelope.
 
 Optional `--state FILE` enables deduplication for hook invocations. The parent
-directory must exist. State is a disposable cache: it records input identity and
-the host session, turn and transcript identity. An unchanged invocation in that
-scope emits `{}`. A new scope receives feedback correlated with its current
-operation, reusing valid project analyses when their inputs match. Missing turn
-identity disables message deduplication while permitting project-analysis reuse.
+directory must exist. A bounded delivery ledger records up to 64 recipient
+scopes with their snapshot and page identity. Alternating recipients retain their
+delivery records: an unchanged page previously delivered to the same recipient
+emits `{}`, while a new recipient receives its first page. Eviction or missing
+recipient identity permits repeat delivery. Recipient scopes include the host
+session, turn and transcript. Project-analysis reuse belongs to the persistent
+service and remains independent of delivery records.
 On macOS and Linux, invocations sharing a canonical state path serialize analysis
-with a process-owned OS lock. Each waiter reads the latest published cache after
-acquiring the lock and revalidates the graph before reusing unit results. The
+with a process-owned OS lock. Each waiter reads the latest delivery ledger after
+acquiring the lock and requests feedback for the current disk snapshot. The
 stable `FILE.lock` remains on disk; the OS releases ownership when the analyzing
-process exits or crashes. State publication is atomic and precedes delivery.
-Windows retains feedback and cache reuse without this serialization optimization.
+process exits or crashes. Delivery records are written under this lock before
+delivery. Missing or unreadable records permit repeat delivery.
+Windows project feedback uses fresh analysis without this serialization optimization.
 The input identity includes
 project and unit selection, compiler version and executable digest, the canonical standard-library
 location, its manifest and required sources, and observed project inputs.
-Project scope also records per-unit results.
+The persistent project worker retains reusable per-unit results.
 When one input closure changes, unaffected units reuse their recorded results.
 Each graph pass shares bounded file-content, digest and import observations
-across units. Verification creates a fresh pass and reads disk again. Project
-feedback brackets unit analysis with these graph checks; standalone unit feedback
+across units. Verification reads disk again. Project
+feedback brackets analysis and page construction with input checks; standalone unit feedback
 performs its own input checks. Diagnostics use the complete parser and binder
 without recording editor navigation symbols. Inspection and documentation retain
 their semantic symbol indexes.
-The response identifies reused units and keeps their truncation flags. Version 2
-state records carry an integrity digest over scope, inputs and the report.
-Project reports must satisfy their schema and correlated totals before reuse.
-The digest detects accidental corruption; it does not authenticate a writer
-with access to the state file.
+The response identifies reused units and keeps explicit continuation state.
+Standalone unit feedback retains version 2 state records with an integrity digest
+over scope, inputs and report. This digest detects accidental corruption and does
+not authenticate a writer with access to the state file.
 
 State writes concern only this cache. `effects.persisted` describes source-file
 persistence and remains false. A missing, partial or unwritable cache causes
