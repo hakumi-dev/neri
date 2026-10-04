@@ -1,0 +1,149 @@
+use host
+use json
+use result
+
+# One disk graph and at most one semantic document survive between requests.
+class AgentDiskFeedbackService
+  private root: String
+  private graph: AgentProjectGraph?
+  private barrier: AgentDiskBarrier
+  private observed: String = ""
+  private previousInputs: String = ""
+  private previousReport: String = ""
+  private compilerIdentity: String?
+  private execution: AgentFeedbackExecution?
+  private responseBytes: Int = 2097152
+
+  def init(root: String): Void
+    this.root = root
+    this.barrier = new AgentDiskBarrier(root)
+    this.compilerIdentity = agentFeedbackIdentity()
+  end
+
+  def response(operation: String, status: String, message: String): String
+    let output = json::Json.object()
+
+    output.put("operationId", json::Json.string(operation))
+    output.put("status", json::Json.string(status))
+    output.put("complete", json::Json.boolean(false))
+    output.put("message", json::Json.string(message))
+    let execution = this.execution
+
+    execution.write(output) if execution != null
+    let options = new json::Options()
+
+    options.maxOutputBytes = this.responseBytes
+    match output.stringify(options)
+      case result::Result.Ok(encoded)
+        return encoded
+      case result::Result.Error(problem)
+        let bounded = json::Json.object()
+
+        bounded.put("operationId", json::Json.string(operation))
+        bounded.put("status", json::Json.string(status))
+        bounded.put("complete", json::Json.boolean(false))
+        bounded.put(
+          "message",
+          json::Json.string("Feedback error details exceed the response limit; retry with a larger response budget.")
+        )
+        execution.write(bounded) if execution != null
+        match bounded.stringify(options)
+          case result::Result.Ok(encoded)
+            return encoded
+          case result::Result.Error(failure)
+            return "{\"status\":\"unavailable\",\"complete\":false,\"message\":\"Feedback error serialization failed.\"}"
+        end
+    end
+  end
+
+  def collect(
+    operation: String,
+    expectedSnapshot: String = "",
+    cursor: String = "",
+    pageSize: Int = 128,
+    responseBytes: Int = 2097152,
+    execution: AgentFeedbackExecution? = null
+  ): String
+    this.execution = execution
+    if responseBytes < 1024 || responseBytes > (new AgentLimits()).messageBytes()
+      return this.response(operation, "unavailable", "Feedback response byte budget is outside the supported range.")
+    end
+    this.responseBytes = responseBytes
+    if this.compilerIdentity == null
+      return this.response(operation, "unavailable", "Cannot fingerprint the effective feedback toolchain.")
+    end
+    if this.compilerIdentity != agentFeedbackIdentity()
+      this.graph = null
+      return this.response(
+        operation,
+        "conflict",
+        "Running compiler inputs changed; reconnect to the current toolchain."
+      )
+    end
+    let before = this.barrier.observe()
+
+    if before == null
+      this.graph = null
+      return this.response(operation, "unavailable", this.barrier.failure)
+    end
+    var graph = this.graph
+    var retained = graph != null && this.observed == before
+
+    if graph == null || this.observed != before
+      let rebuilt = new AgentProjectGraph(this.root)
+
+      graph = rebuilt
+      this.graph = rebuilt
+      this.barrier = new AgentDiskBarrier(this.root)
+      this.barrier.include(rebuilt)
+    end
+    if graph == null
+      return this.response(operation, "unavailable", "Disk graph is unavailable.")
+    end
+    let stableBefore = this.barrier.observe()
+
+    if stableBefore == null
+      this.graph = null
+      return this.response(operation, "unavailable", this.barrier.failure)
+    end
+    if retained && stableBefore != before
+      this.graph = null
+      this.observed = ""
+      return this.response(operation, "conflict", "Disk changed while verifying the retained graph.")
+    end
+    if expectedSnapshot != "" && expectedSnapshot != graph.snapshot
+      return this.response(operation, "conflict", "Expected project snapshot no longer matches disk.")
+    end
+    let page = new AgentFeedbackPage(graph.snapshot, cursor, pageSize, responseBytes)
+
+    if page.failure != ""
+      return this.response(operation, "conflict", page.failure)
+    end
+    let feedback = new AgentProjectFeedback(this.root)
+    let report = feedback.collect(operation, this.previousInputs, this.previousReport, false, graph, true, !retained)
+    let rendered = page.render(report, graph, operation, execution)
+
+    if rendered == null
+      return this.response(operation, "unavailable", page.failure)
+    end
+    let after = this.barrier.observe()
+
+    if after == null || after != stableBefore
+      this.graph = null
+      this.observed = ""
+      return this.response(
+        operation,
+        "conflict",
+        "Project inputs changed during analysis; retry against the current graph."
+      )
+    end
+    if feedback.inputs != ""
+      this.observed = after
+      this.previousInputs = feedback.inputs
+      this.previousReport = feedback.report
+    else
+      this.graph = null
+    end
+    return rendered
+  end
+end
