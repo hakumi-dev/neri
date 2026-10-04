@@ -71,6 +71,24 @@ snapshot, unit diagnostics, `complete`, `unitsTotal`, `unitsAnalyzed` and
 `unitsReused`. `invalidatedUnits` identifies units whose input closure required
 analysis; `removedUnits` identifies previously reported units absent now.
 
+Feedback includes parser and binder errors, code style findings and unused
+import hints from the same semantic tracking used by the editor. Each diagnostic
+contains its source URI, code, message, UTF-16 range and explicit severity:
+error `1`, warning `2`, information `3` or hint `4`, following the
+[LSP diagnostic contract](https://raw.githubusercontent.com/microsoft/language-server-protocol/gh-pages/_specifications/lsp/3.17/types/diagnostic.md).
+Ranges use zero-based positions and an exclusive end. Project feedback reports
+advisories for sources owned by each unit; referenced sources retain their
+existing compiler error reporting. Parser and binder errors determine analysis
+validity. Style findings remain advisories even when their configured severity
+is error; warnings and hints also preserve a valid analysis status. Diagnostic
+counts and truncation include all these findings.
+
+Snapshots include applicable ancestor `.editorconfig` files and their absence,
+so configuration changes invalidate cached diagnostics. Analysis reuse follows
+input dependencies; rendering the response does not require another semantic
+analysis. This separation of dependency tracking, rebuilding and reuse is
+consistent with the model in [Build systems à la carte](https://simon.peytonjones.org/assets/pdfs/build-systems-original.pdf).
+
 ### neri.describe
 
 `neri.describe` takes `operationId` and a nonempty `query`. It searches bound
@@ -314,6 +332,16 @@ and places the compiler result in `hookSpecificOutput.additionalContext`. The
 adapter accepts a final JSON value terminated by either a newline or EOF. A
 malformed event produces explicit unavailable feedback. Diagnostic messages and
 source excerpts are identified as program data in the enclosing context.
+
+Project hook reports use `schemaVersion: 2` and `view: "diagnostics"`. Their
+`units` array contains units with diagnostics, truncated diagnostics or a status
+other than valid. A valid unit with zero diagnostics is represented by the
+aggregate coverage counts. The report retains the snapshot, complete counts,
+truncation flags, `invalidatedUnits` and `removedUnits`, so clients can identify
+resolved diagnostics and removed units. Unit fingerprints remain in the full
+project API and analysis cache. This compact presentation preserves every
+diagnostic admitted by the normal response limits and is delivered to each new
+recipient scope, including when analysis is reused.
 
 Configure the project's `.codex/hooks.json`:
 
