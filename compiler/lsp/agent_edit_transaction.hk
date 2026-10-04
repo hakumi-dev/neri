@@ -1,0 +1,308 @@
+use host
+use json
+use result
+
+class AgentEditTransaction
+  def response(operation: String, status: String, message: String, revision: Int, snapshot: String): String
+    let output = json::Json.object()
+
+    output.put("schemaVersion", json::Json.integer(2))
+    output.put("operationId", json::Json.string(operation))
+    output.put("status", json::Json.string(status))
+    output.put("message", json::Json.string(message))
+    output.put("revision", json::Json.integer(revision))
+    output.put("snapshot", json::Json.string(snapshot))
+    output.put("applied", json::Json.boolean(false))
+    output.put("persisted", json::Json.boolean(false))
+    match output.stringify()
+      case result::Result.Ok(text)
+        return text
+      case result::Result.Error(problem)
+        return "{\"schemaVersion\":2,\"status\":\"unavailable\",\"message\":\"Cannot serialize the transaction result.\",\"applied\":false}"
+    end
+  end
+
+  def run(
+    workspace: NeriAgentWorkspace,
+    operation: String,
+    edits: AgentTextEdit?,
+    expectedRevision: Int,
+    expectedSnapshot: String,
+    preview: Bool = false,
+    control: AnalysisControl? = null
+  ): String
+    let graph = new AgentProjectGraph(workspace.root)
+    let observed = new AgentOverlaySnapshot(workspace, graph)
+    var cancellation = new AnalysisControl()
+
+    if control != null
+      cancellation = control
+    end
+    if graph.error() != ""
+      return this.response(operation, "unavailable", graph.error(), workspace.revision, observed.snapshot)
+    end
+    if expectedRevision != workspace.revision || expectedSnapshot != observed.snapshot
+      return this.response(
+        operation,
+        "conflict",
+        "Workspace inputs changed; use the current snapshot and revision.",
+        workspace.revision,
+        observed.snapshot
+      )
+    end
+    let plan = new AgentEditPlan()
+
+    if !plan.prepare(workspace, observed, edits)
+      return this.response(operation, "invalidRequest", plan.failure, workspace.revision, observed.snapshot)
+    end
+    let accepted = new NeriAgentWorkspace(workspace.root, workspace.unit)
+    let preparation = new AgentTransactionAnalysis()
+
+    if !preparation.prepare(workspace, accepted, plan, cancellation)
+      return this.response(operation, "limit", preparation.failure, workspace.revision, observed.snapshot)
+    end
+    let affected = new StringTable<Bool>()
+    var unit = graph.first
+
+    while unit != null
+      var document = plan.first
+
+      while document != null
+        if neriProjectListed(unit.project.ownSources, document.staged.sourcePath)
+          let consumers = graph.consumers(unit.key).cursor()
+
+          while consumers.hasValue()
+            affected.add(consumers.current(), true)
+            consumers.advance()
+          end
+        end
+        document = document.next
+      end
+      unit = unit.next
+    end
+    let results = json::Json.array()
+    let consumers = new StringBuffer()
+    let proposed = observed.capture(workspace, plan)
+    let view = new AgentTransactionView(
+      preview ? observed.snapshot : proposed,
+      proposed,
+      plan.digest(),
+      workspace.revision + (preview ? 0 : 1),
+      plan,
+      consumers
+    )
+    var analyzed = 0
+    var remainingDiagnostics = 128
+    var remainingBytes = (new AgentLimits()).diagnosticBytes()
+
+    unit = graph.first
+    while unit != null
+      if affected.find(unit.key) != null
+        consumers.add(unit.key)
+        if !cancellation.poll()
+          return this.response(
+            operation,
+            "cancelled",
+            "Transaction analysis was cancelled.",
+            workspace.revision,
+            observed.snapshot
+          )
+        end
+        let analysis = new AgentTransactionAnalysis()
+
+        if !analysis.run(unit, workspace, plan, cancellation)
+          return this.response(
+            operation,
+            cancellation.isCancelled() ? "cancelled" : "unavailable",
+            analysis.failure,
+            workspace.revision,
+            observed.snapshot
+          )
+        end
+        let document = analysis.document
+
+        if document != null
+          var page = new AgentDiagnosticPage()
+          let entry = json::Json.object()
+          let diagnostics = document.lastDiagnostics
+
+          page.total = document.advisories.count()
+          if diagnostics != null
+            page.total = page.total + diagnostics.count()
+          end
+          if remainingDiagnostics > 0 && remainingBytes > 0
+            page = agentDocumentDiagnosticPage(document, 0, remainingDiagnostics, remainingBytes)
+          else
+            page.items = "[]"
+            page.nextOffset = page.total > 0 ? 0 : -1
+          end
+
+          if page.failure != ""
+            page.items = "[]"
+            page.emittedCount = 0
+            page.nextOffset = 0
+          end
+          remainingDiagnostics = remainingDiagnostics - page.emittedCount
+          remainingBytes = remainingBytes - host::stringByteLength(page.items)
+          entry.put("projectKey", json::Json.string(unit.key))
+          entry.put("analysisStatus", json::Json.string(document.analysisStatus.wireName()))
+          entry.put("diagnosticCount", json::Json.integer(page.total))
+          entry.put("diagnosticsTruncated", json::Json.boolean(page.nextOffset >= 0))
+          entry.put("pageMessage", json::Json.string(page.failure))
+          entry.put("nextCursor", json::Json.string(page.nextOffset < 0 ? "" : view.cursor(unit.key, page.nextOffset)))
+          match json::Json.parse(page.items)
+            case result::Result.Ok(value)
+              entry.put("diagnostics", new json::Json(value))
+            case result::Result.Error(problem)
+              return this.response(
+                operation,
+                "unavailable",
+                "Cannot decode the diagnostic page.",
+                workspace.revision,
+                observed.snapshot
+              )
+          end
+          results.add(entry)
+          analyzed = analyzed + 1
+        end
+        unit.workspace.server.documents = null
+        unit.workspace.server.priorityDocument = null
+        analysis.document = null
+      end
+      unit = unit.next
+    end
+    if analyzed == 0
+      return this.response(
+        operation,
+        "unavailable",
+        "No owning project consumer was found for the batch.",
+        workspace.revision,
+        observed.snapshot
+      )
+    end
+    if !observed.unchanged(workspace) || !plan.unchanged()
+      return this.response(
+        operation,
+        "conflict",
+        "Workspace inputs changed during transaction analysis.",
+        workspace.revision,
+        observed.capture(workspace)
+      )
+    end
+    if !view.bounded()
+      return this.response(
+        operation,
+        "limit",
+        "Retained transaction sources or consumers exceed the workspace limit.",
+        workspace.revision,
+        observed.snapshot
+      )
+    end
+    let output = json::Json.object()
+    let changes = json::Json.array()
+    var document = plan.first
+
+    while document != null
+      let change = json::Json.object()
+
+      change.put("uri", json::Json.string(document.staged.uri))
+      change.put("beforeVersion", json::Json.integer(document.originalVersion))
+      change.put("afterVersion", json::Json.integer(document.staged.version))
+      let differences = json::Json.array()
+      var edit = document.edits
+
+      while edit != null
+        let difference = json::Json.object()
+
+        difference.put("range", agentRangeJson(edit.range))
+        difference.put(
+          "oldText",
+          json::Json.string(host::stringSlice(document.originalText, edit.first, edit.last - edit.first))
+        )
+        difference.put("newText", json::Json.string(edit.text))
+        differences.add(difference)
+        edit = edit.next
+      end
+      change.put("edits", differences)
+      changes.add(change)
+      document = document.next
+    end
+    output.put("schemaVersion", json::Json.integer(2))
+    output.put("operationId", json::Json.string(operation))
+    output.put("status", json::Json.string(preview ? "preview" : "applied"))
+    output.put("revision", json::Json.integer(workspace.revision + (preview ? 0 : 1)))
+    output.put("snapshot", json::Json.string(preview ? observed.snapshot : proposed))
+    output.put("proposedSnapshot", json::Json.string(proposed))
+    output.put("proposalId", json::Json.string(view.proposalId))
+    output.put("requestDigest", json::Json.string(view.requestDigest))
+    output.put("applied", json::Json.boolean(!preview))
+    output.put("persisted", json::Json.boolean(false))
+    output.put("changes", changes)
+    output.put("consumers", results)
+    var serialized = ""
+
+    match output.stringify()
+      case result::Result.Ok(text)
+        serialized = text
+      case result::Result.Error(problem)
+        return this.response(
+          operation,
+          "limit",
+          "Transaction result exceeds serialization limits.",
+          workspace.revision,
+          observed.snapshot
+        )
+    end
+    if host::stringByteLength(serialized) > workspace.responseBytes
+      return this.response(
+        operation,
+        "limit",
+        "Transaction result exceeds the message limit.",
+        workspace.revision,
+        observed.snapshot
+      )
+    end
+    if !cancellation.poll()
+      return this.response(
+        operation,
+        "cancelled",
+        "Transaction analysis was cancelled.",
+        workspace.revision,
+        observed.snapshot
+      )
+    end
+    if !observed.unchanged(workspace) || !plan.unchanged()
+      return this.response(
+        operation,
+        "conflict",
+        "Workspace inputs changed before transaction publication.",
+        workspace.revision,
+        observed.capture(workspace)
+      )
+    end
+    if !cancellation.poll()
+      return this.response(
+        operation,
+        "cancelled",
+        "Transaction analysis was cancelled.",
+        workspace.revision,
+        observed.snapshot
+      )
+    end
+    if !preview
+      document = plan.first
+      while document != null
+        document.original.text = document.staged.text
+        document.original.version = document.staged.version
+        document = document.next
+      end
+      workspace.revision = workspace.revision + 1
+      workspace.server.reanalyze()
+      workspace.fingerprint = accepted.fingerprint
+      workspace.project = accepted.project
+      workspace.inputLimit = false
+    end
+    workspace.retainTransaction(view)
+    return serialized
+  end
+end

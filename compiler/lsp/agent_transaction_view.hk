@@ -1,0 +1,210 @@
+use host
+use json
+use result
+
+class AgentTransactionView
+  public snapshot: String
+  public proposedSnapshot: String
+  public requestDigest: String
+  public proposalId: String
+  public revision: Int
+  public plan: AgentEditPlan
+  public consumers: StringBuffer
+
+  def init(
+    snapshot: String,
+    proposedSnapshot: String,
+    requestDigest: String,
+    revision: Int,
+    plan: AgentEditPlan,
+    consumers: StringBuffer
+  ): Void
+    this.snapshot = snapshot
+    this.proposedSnapshot = proposedSnapshot
+    this.requestDigest = requestDigest
+    this.proposalId = sha256FastText(runCacheFrame(proposedSnapshot) + runCacheFrame(requestDigest))
+    this.revision = revision
+    this.plan = plan
+    this.consumers = consumers
+  end
+
+  def cursor(unit: String, offset: Int, pageSize: Int = 128): String
+    return (new AgentPageCursor()).encode(this.snapshot, this.proposalId, unit, offset, pageSize)
+  end
+
+  def bounded(): Bool
+    var bytes = 0
+    var document = this.plan.first
+
+    while document != null
+      bytes = bytes + host::stringByteLength(document.originalText) + host::stringByteLength(document.staged.text) + host::stringByteLength(document.staged.uri)
+      document = document.next
+    end
+    var index = 0
+
+    while index < this.consumers.size
+      bytes = bytes + host::stringByteLength(this.consumers.get(index))
+      index = index + 1
+    end
+    return this.consumers.size <= (new AgentLimits()).projectUnits() && bytes <= (new AgentLimits()).analysisBytes()
+  end
+
+  def page(workspace: NeriAgentWorkspace, operation: String, expectedSnapshot: String, cursor: String): String
+    let graph = new AgentProjectGraph(workspace.root)
+    let observed = new AgentOverlaySnapshot(workspace, graph)
+    let transaction = new AgentEditTransaction()
+    let position = new AgentPageCursor()
+
+    if graph.error() != ""
+      return transaction.response(operation, "unavailable", graph.error(), workspace.revision, observed.snapshot)
+    end
+    if expectedSnapshot != this.snapshot || observed.snapshot != this.snapshot || workspace.revision != this.revision
+      return transaction.response(
+        operation,
+        "conflict",
+        "The transaction view belongs to an obsolete workspace snapshot.",
+        workspace.revision,
+        observed.snapshot
+      )
+    end
+    if !position.decode(cursor, this.snapshot, this.proposalId) || !neriProjectListed(this.consumers, position.unit)
+      return transaction.response(
+        operation,
+        "conflict",
+        "Cursor does not identify this transaction view.",
+        workspace.revision,
+        observed.snapshot
+      )
+    end
+    let unit = graph.find(position.unit)
+
+    if unit == null
+      return transaction.response(
+        operation,
+        "conflict",
+        "The transaction consumer no longer exists.",
+        workspace.revision,
+        observed.snapshot
+      )
+    end
+    let analysis = new AgentTransactionAnalysis()
+    let control = new AnalysisControl()
+
+    if !analysis.run(unit, workspace, this.plan, control)
+      return transaction.response(operation, "unavailable", analysis.failure, workspace.revision, observed.snapshot)
+    end
+    let document = analysis.document
+
+    if document == null
+      return transaction.response(
+        operation,
+        "unavailable",
+        "Transaction diagnostics are unavailable.",
+        workspace.revision,
+        observed.snapshot
+      )
+    end
+    let output = json::Json.object()
+    let diagnostics = document.lastDiagnostics
+    var diagnosticTotal = 0
+
+    if diagnostics != null
+      diagnosticTotal = diagnostics.count()
+    end
+    let total = diagnosticTotal + document.advisories.count()
+
+    if position.offset > total
+      return transaction.response(
+        operation,
+        "conflict",
+        "Cursor diagnostic offset is invalid.",
+        workspace.revision,
+        observed.snapshot
+      )
+    end
+    output.put("schemaVersion", json::Json.integer(2))
+    output.put("operationId", json::Json.string(operation))
+    output.put("status", json::Json.string("page"))
+    output.put("snapshot", json::Json.string(this.snapshot))
+    output.put("proposedSnapshot", json::Json.string(this.proposedSnapshot))
+    output.put("proposalId", json::Json.string(this.proposalId))
+    output.put("requestDigest", json::Json.string(this.requestDigest))
+    output.put("revision", json::Json.integer(this.revision))
+    output.put("projectKey", json::Json.string(unit.key))
+    output.put("analysisStatus", json::Json.string(document.analysisStatus.wireName()))
+    output.put("diagnosticCount", json::Json.integer(total))
+    output.put("applied", json::Json.boolean(false))
+    output.put("persisted", json::Json.boolean(false))
+    let reservation = json::Json.object()
+
+    reservation.put("metadata", output)
+    reservation.put("diagnostics", json::Json.array())
+    reservation.put("nextCursor", json::Json.string(this.cursor(unit.key, total, position.pageSize)))
+    reservation.put("emittedCount", json::Json.integer(128))
+    var overhead = 0
+
+    match reservation.stringify()
+      case result::Result.Ok(text)
+        overhead = host::stringByteLength(text)
+      case result::Result.Error(problem)
+        return transaction.response(
+          operation,
+          "limit",
+          "Transaction page metadata exceeds serialization limits.",
+          workspace.revision,
+          observed.snapshot
+        )
+    end
+    let page = agentDocumentDiagnosticPage(
+      document,
+      position.offset,
+      position.pageSize,
+      workspace.responseBytes - overhead
+    )
+
+    if page.failure != ""
+      return transaction.response(operation, "limit", page.failure, workspace.revision, observed.snapshot)
+    end
+    output.put("emittedCount", json::Json.integer(page.emittedCount))
+    output.put(
+      "nextCursor",
+      json::Json.string(page.nextOffset < 0 ? "" : this.cursor(unit.key, page.nextOffset, position.pageSize))
+    )
+    match json::Json.parse(page.items)
+      case result::Result.Ok(items)
+        output.put("diagnostics", new json::Json(items))
+      case result::Result.Error(problem)
+        return transaction.response(
+          operation,
+          "unavailable",
+          "Cannot decode transaction diagnostics.",
+          workspace.revision,
+          observed.snapshot
+        )
+    end
+    var serialized = ""
+
+    match output.stringify()
+      case result::Result.Ok(text)
+        serialized = text
+      case result::Result.Error(problem)
+        return transaction.response(
+          operation,
+          "limit",
+          "Transaction page exceeds serialization limits.",
+          workspace.revision,
+          observed.snapshot
+        )
+    end
+    if !observed.unchanged(workspace)
+      return transaction.response(
+        operation,
+        "conflict",
+        "Workspace inputs changed during transaction pagination.",
+        workspace.revision,
+        observed.capture(workspace)
+      )
+    end
+    return serialized
+  end
+end

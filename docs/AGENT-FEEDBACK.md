@@ -36,13 +36,13 @@ contains protocol messages only.
 | Find declarations by name, signature or type | `neri.describe` | Saved project graph |
 | Check all declared units | `neri.feedback` | Saved project graph |
 | Open source and inspect types at a position | `neri.open`, `neri.inspect` | In-memory buffers |
-| Try one source replacement | `neri.edit` | In-memory buffer, guarded by `expectedRevision` |
+| Preview or apply coordinated source edits | `neri.edit` | In-memory buffers, guarded by revision and snapshot |
 | Build and run registered tests | `neri.test` | Saved project graph |
 | Measure release compilation | `neri.profile` | Saved project graph; applications are not run |
 
 ### neri.open, neri.inspect and neri.edit
 
-`neri.open` opens an existing source from the selected unit or its references.
+`neri.open` opens an existing source owned by the complete project graph.
 The optional `text` value supplies an unsaved overlay; otherwise Neri reads the
 current file. A source can have only one open buffer.
 
@@ -54,11 +54,50 @@ ranges. `insertText` and `textEdit.newText` contain the same actual insertion;
 `cursorByteOffset` is the UTF-8 byte offset of the suggested cursor within that
 text.
 
-`neri.edit` applies one UTF-16 range replacement to an open in-memory buffer.
-The edit is atomic after its arguments, bounds, workspace revision, and buffer
-limits validate. It advances the buffer version and workspace revision, then
-reanalyzes the source's owning compilation unit and its references. The result reports
-`persisted: false` and `executed: false`.
+`neri.edit` accepts `operationId`, `expectedRevision`, `expectedSnapshot` and
+an `edits` array of `{uri, range, text}` replacements. The single replacement
+form supplies `uri`, `range` and `text` directly and uses the same batch engine.
+All affected buffers must already be open. Every range refers to the original
+version of its buffer; ranges must fit complete UTF-16 scalars and must not
+overlap. A batch contains at most 256 replacements.
+
+With `preview: true`, the result contains proposed changes and diagnostics while
+buffer text, versions and workspace revision remain unchanged. The compiler
+analyzes each owning unit and its transitive consumers with every staged overlay
+visible together. Unrelated units retain their separate source visibility.
+Syntax and type errors remain reportable proposal results; they do not prevent
+applying an intentional intermediate state.
+
+The compiler checks the complete input snapshot again after analysis and polls
+cancellation immediately before publishing the batch. A successful apply
+advances each changed buffer once and advances the workspace revision once.
+A conflict, invalid range, resource limit or cancellation publishes no buffer
+changes. Results include UTF-16 edit ranges, `oldText`, `newText`,
+`beforeVersion`, `afterVersion`, `snapshot`, `proposedSnapshot`, `proposalId`,
+`requestDigest`, `applied` and `persisted: false`. The host owns saving files.
+This is Neri's in-memory transaction contract; the LSP specification describes
+related [transactional workspace edit semantics](https://raw.githubusercontent.com/microsoft/language-server-protocol/gh-pages/_specifications/lsp/3.17/types/workspaceEdit.md).
+
+Each consumer reports diagnostic counts and a `nextCursor` when its first page
+is incomplete. To retrieve another page, call `neri.edit` with `operationId`,
+`expectedRevision`, `expectedSnapshot` and that `cursor`. Pages contain up to
+128 diagnostics and fit the 2 MiB protocol message limit. A diagnostic that
+cannot fit produces an explicit limit result without advancing its offset.
+Pagination reanalyzes only the requested consumer with the proposal's overlays;
+it neither applies edits nor advances the revision.
+
+The workspace retains the latest transaction view, limited to 16 MiB of plan
+text and consumer keys and 256 consumers. It releases each consumer's semantic
+model before analyzing the next. Another transaction replaces the retained view.
+Cursors bind the proposal, input snapshot, consumer and diagnostic offset;
+changed inputs or a replaced proposal produce `conflict`. Preview cursors use
+the base snapshot. Applying a proposal requires that base snapshot; the proposed
+snapshot describes the resulting state.
+
+MCP `notifications/cancelled` messages match the active request ID. The transport
+also recognizes a cancellation already queued behind a future request. A bounded
+64-slot queue preserves ordinary request order while analysis polls input;
+queued and partially received message text share an 8 MiB polling budget.
 
 ### neri.feedback
 
@@ -152,7 +191,7 @@ requested position. Clients can inspect another position to obtain more text.
 
 ### Overlay edit cycle
 
-For a source owned by the selected unit, call `neri.open` with these tool
+For a source owned by the project graph, call `neri.open` with these tool
 arguments, replacing the URI with that source's absolute URI:
 
 ```json
@@ -163,8 +202,8 @@ arguments, replacing the URI with that source's absolute URI:
 ```
 
 Use the returned workspace revision as `expectedRevision` on the next
-`neri.inspect` or `neri.edit` call. Positions and edit ranges count UTF-16 code
-units. After a conflict, use the returned state to inspect again before editing.
+`neri.inspect` or `neri.edit` call. Edits also use the returned `snapshot` as
+`expectedSnapshot`. Positions and edit ranges count UTF-16 code units. After a conflict, use the returned state to inspect again before editing.
 
 ```mermaid
 sequenceDiagram
@@ -175,9 +214,9 @@ sequenceDiagram
     N-->>A: Workspace revision and diagnostics
     A->>N: neri.inspect(uri, expectedRevision, position)
     N-->>A: Types, candidates and diagnostics
-    A->>N: neri.edit(uri, expectedRevision, range, text)
+    A->>N: neri.edit(edits, expectedRevision, expectedSnapshot)
     alt Revision and inputs remain valid
-        N-->>A: New revision, persisted=false, executed=false
+        N-->>A: New revision and snapshot, persisted=false
         A->>D: Save chosen source through host file tools
         A->>N: neri.feedback / neri.test
         N->>D: Read saved project inputs
@@ -195,6 +234,14 @@ what the test runner builds.
 
 Each tool publishes its own output schema through the
 [MCP tools contract](https://modelcontextprotocol.io/specification/2025-11-25/server/tools).
+Tool results expose the complete typed result in `structuredContent`. Clients
+consume that object; `content.text` is a brief status summary. The summary keeps
+compiler data in one representation. Preview, apply and page results are
+successful tool responses; compiler-invalid analyses also remain normal results.
+The transport budgets the serialized request ID and result envelope before edits
+and verifies every final MCP message against its 2 MiB limit. Request IDs that
+leave less than 256 KiB for a tool response are rejected before tool execution.
+
 Malformed arguments produce an error content item without a fabricated domain
 result. Compiler syntax and type diagnostics remain normal analyzed results.
 
@@ -216,12 +263,15 @@ The **analysis revision** identifies the internal LSP analysis generation.
 Invalidation and reanalysis can advance it independently of workspace revision,
 so clients use it to correlate feedback, not to authorize an edit.
 
-The **overlay snapshot digest** is a SHA-256 digest of the analyzed project key and the
-ordered source URIs and texts used by that analysis. Equal digests identify
-equal values for those recorded fields; they do not compare every process or
-toolchain setting. The digest does not state that external files remained
-unchanged after the response. The server checks its workspace inputs again
-before returning and reports a conflict if it observes a concurrent change.
+The **overlay snapshot** returned as `snapshot` binds the complete project graph,
+compiler binary, configuration and every open buffer's URI, text and version.
+Clients reuse it as `expectedSnapshot` for edits and transaction pages. Changes
+to another buffer, a sibling unit's dependencies or project membership invalidate
+that token. The server validates the same domain before returning or applying.
+
+The **analysis snapshot** returned as `analysisSnapshot` hashes the analyzed
+project key and that document analysis's ordered source URIs and texts. It
+correlates analysis content; `expectedSnapshot` accepts the full overlay snapshot.
 
 The **project snapshot** hashes the complete unit inventory, canonical member
 identities, each unit's observed inputs and the running compiler's binary digest.
@@ -236,7 +286,7 @@ through `projects`; directories of negative fixtures retain their own validation
 workflows. The MCP feedback reports compiler
 diagnostics; it does not subscribe to Rider's inspection panel.
 
-The selected unit's reference closure defines which files can be opened. Each
+Complete project membership defines which files can be opened. Each
 source is analyzed in its owning unit's closure, preserving the same dependency
 visibility as the editor. Inspecting a library source therefore does not report
 errors in its consumers; inspect the consumer source to analyze that unit with

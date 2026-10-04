@@ -26,6 +26,10 @@ end
 
 def agentSend(body: String): Void
   # MCP stdio is newline-delimited; stdout must contain protocol messages only.
+  if host::stringByteLength(body) > (new AgentLimits()).messageBytes()
+    console::println(agentJsonError("null", new LspErrorCode(-32603), "Response exceeds 2 MiB."))
+    return
+  end
   console::println(body)
 end
 
@@ -141,10 +145,22 @@ def agentToolsList(): String
 end
 
 def agentToolResult(output: String): String
-  let status = (new LspJsonParser(output)).parse().get("status")
-  let isError = !status.isString() || (status.scalarText() != "valid" && status.scalarText() != "invalid")
+  let status = (new LspJsonParser(output)).parse().get("status").scalarText()
+  let success = status == "valid" || status == "invalid" || status == "preview" || status == "applied" || status == "page"
+  var summary = "unknown"
 
-  return "{\"content\":[{\"type\":\"text\",\"text\":" + lspQuote(output) + "}],\"structuredContent\":" + output + ",\"isError\":" + (isError ? "true" : "false") + "}"
+  if success || status == "invalid_request" || status == "invalidRequest" || status == "conflict" || status == "unavailable" || status == "limit" || status == "cancelled"
+    summary = status
+  end
+  return "{\"content\":[{\"type\":\"text\",\"text\":" + lspQuote("Neri result: " + summary) + "}],\"structuredContent\":" + output + ",\"isError\":" + (success ? "false" : "true") + "}"
+end
+
+def agentToolResponseBudget(id: String): Int
+  let sample = "{\"status\":\"invalid_request\"}"
+  let envelope = host::stringByteLength(agentToolResult(sample)) - host::stringByteLength(sample) + 1
+  let prefix = "{\"jsonrpc\":\"2.0\",\"id\":" + id + ",\"result\":"
+
+  return (new AgentLimits()).messageBytes() - host::stringByteLength(prefix) - envelope - 1
 end
 
 def agentInvalidToolResult(workspace: NeriAgentWorkspace, arguments: LspJson): String
@@ -247,6 +263,17 @@ def agentHandle(workspace: NeriAgentWorkspace, message: LspJson, initialized: Bo
     else if tool == null
       agentSend(agentJsonError(id, LspErrorCode.invalidParams(), "Unknown tool"))
     else
+      let budget = agentToolResponseBudget(id)
+
+      if budget < 262144
+        agentSend(agentJsonError(
+            "null",
+            LspErrorCode.invalidRequest(),
+            "Request ID leaves insufficient response budget."
+          ))
+        return true
+      end
+      workspace.responseBytes = budget
       agentSend("{\"jsonrpc\":\"2.0\",\"id\":" + id + ",\"result\":" + agentToolCall(workspace, tool, params) + "}")
     end
     return true
@@ -298,12 +325,12 @@ def agentMain(): Void
     return
   end
   let workspace = new NeriAgentWorkspace(absolute, unit)
-  let input = new LspInput()
+  let input = new AgentProtocolInput(new LspInput())
   var negotiated = false
   var initialized = false
 
   while true
-    let line = agentReadLine(input)
+    let line = input.readLine()
 
     if line.isEof()
       return
@@ -335,7 +362,12 @@ def agentMain(): Void
           if method.isString() && method.scalarText() == "notifications/initialized" && negotiated && !agentHasId(message)
             initialized = true
           end
-          if !agentHandle(workspace, message, initialized)
+          workspace.operationControl = input.begin(agentId(message))
+          let running = agentHandle(workspace, message, initialized)
+
+          input.finish()
+          workspace.operationControl = null
+          if !running
             return
           end
         end

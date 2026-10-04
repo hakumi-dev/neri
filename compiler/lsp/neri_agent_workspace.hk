@@ -1,4 +1,6 @@
 use host
+use json
+use result
 
 class NeriAgentWorkspace
   public root: String = ""
@@ -8,7 +10,31 @@ class NeriAgentWorkspace
   public fingerprint: String = ""
   public project: NeriProject = new NeriProject()
   public inputLimit: Bool = false
+  public operationControl: AnalysisControl?
+  public responseBytes: Int = 2097152
   private diskFeedback: AgentFeedbackSession?
+  private transactionView: AgentTransactionView?
+  private analysisSnapshot: String = ""
+  private operationSnapshot: AgentOverlaySnapshot?
+
+  def retainTransaction(view: AgentTransactionView): Void
+    this.transactionView = view
+  end
+
+  def transactionPage(operation: String, expectedSnapshot: String, cursor: String): String
+    let view = this.transactionView
+
+    if view == null
+      return (new AgentEditTransaction()).response(
+        operation,
+        "conflict",
+        "No transaction view is retained in this workspace.",
+        this.revision,
+        ""
+      )
+    end
+    return view.page(this, operation, expectedSnapshot, cursor)
+  end
 
   def feedback(): AgentFeedbackSession
     let existing = this.diskFeedback
@@ -207,7 +233,6 @@ class NeriAgentWorkspace
     var emittedDiagnostics = 0
     var snapshot = ""
     var projectKey = ""
-    var excerpt = ""
 
     if document != null
       version = document.version
@@ -243,12 +268,76 @@ class NeriAgentWorkspace
           index = index + 1
         end
         snapshot = sha256FastText(parts.join())
-        excerpt = ",\"sourceExcerpt\":" + agentSourceExcerpt(document.text, position)
       end
     end
-    let extra = ",\"projectKey\":" + lspQuote(projectKey) + excerpt + (context == "" ? "" : ",\"context\":" + context)
+    let output = json::Json.object()
+    let effects = json::Json.object()
+    let domain = this.operationSnapshot
+    let domainSnapshot = domain == null ? "" : domain.capture(this)
 
-    return "{\"schemaVersion\":1,\"operationId\":" + lspQuote(operation) + ",\"uri\":" + lspQuote(uri) + ",\"revision\":" + (this.revision as String) + ",\"documentVersion\":" + (version as String) + ",\"status\":" + lspQuote(status.wireName()) + ",\"message\":" + lspQuote(message) + ",\"analysisStatus\":" + lspQuote(analysisStatus.wireName()) + ",\"analysisRevision\":" + (analysisRevision as String) + ",\"snapshot\":" + lspQuote(snapshot) + ",\"diagnostics\":" + diagnostics + ",\"diagnosticCount\":" + (diagnosticCount as String) + ",\"diagnosticsTruncated\":" + (diagnosticCount > emittedDiagnostics ? "true" : "false") + ",\"effects\":{\"applied\":" + (applied ? "true" : "false") + ",\"analyzed\":" + (analyzed ? "true" : "false") + ",\"persisted\":false,\"executed\":false}" + extra + "}"
+    output.put("schemaVersion", json::Json.integer(2))
+    output.put("operationId", json::Json.string(operation))
+    output.put("uri", json::Json.string(uri))
+    output.put("projectKey", json::Json.string(projectKey))
+    output.put("revision", json::Json.integer(this.revision))
+    output.put("documentVersion", json::Json.integer(version))
+    output.put("status", json::Json.string(status.wireName()))
+    output.put("message", json::Json.string(message))
+    output.put("analysisStatus", json::Json.string(analysisStatus.wireName()))
+    output.put("analysisRevision", json::Json.integer(analysisRevision))
+    output.put("snapshot", json::Json.string(domainSnapshot))
+    output.put("analysisSnapshot", json::Json.string(snapshot))
+    output.put("diagnosticCount", json::Json.integer(diagnosticCount))
+    output.put("diagnosticsTruncated", json::Json.boolean(diagnosticCount > emittedDiagnostics))
+    effects.put("applied", json::Json.boolean(applied))
+    effects.put("analyzed", json::Json.boolean(analyzed))
+    effects.put("persisted", json::Json.boolean(false))
+    effects.put("executed", json::Json.boolean(false))
+    output.put("effects", effects)
+    if !agentJsonProperty(output, "diagnostics", diagnostics)
+      return (new AgentEditTransaction()).response(
+        operation,
+        "unavailable",
+        "Cannot serialize document diagnostics.",
+        this.revision,
+        domainSnapshot
+      )
+    end
+    if document != null && analyzed && !agentJsonProperty(
+      output,
+      "sourceExcerpt",
+      agentSourceExcerpt(document.text, position)
+    )
+      return (new AgentEditTransaction()).response(
+        operation,
+        "unavailable",
+        "Cannot serialize the source excerpt.",
+        this.revision,
+        domainSnapshot
+      )
+    end
+    if context != "" && !agentJsonProperty(output, "context", context)
+      return (new AgentEditTransaction()).response(
+        operation,
+        "unavailable",
+        "Cannot serialize semantic context.",
+        this.revision,
+        domainSnapshot
+      )
+    end
+    match output.stringify()
+      case result::Result.Ok(text)
+        return text
+      case result::Result.Error(problem)
+        return (new AgentEditTransaction()).response(
+          operation,
+          "limit",
+          "Document response exceeds serialization limits.",
+          this.revision,
+          domainSnapshot
+        )
+    end
+
   end
 
   def handleTool(request: AgentDocumentRequest): String
@@ -256,6 +345,14 @@ class NeriAgentWorkspace
     let uri = request.uri()
 
     this.refresh()
+    let graph = new AgentProjectGraph(this.root)
+    let observed = new AgentOverlaySnapshot(this, graph)
+    let graphSnapshot = graph.snapshot
+
+    this.operationSnapshot = observed
+    if graph.error() != ""
+      return this.response(operation, uri, AgentWorkspaceStatus.unavailable(), graph.error(), null)
+    end
     if this.inputLimit
       return this.response(
         operation,
@@ -274,12 +371,12 @@ class NeriAgentWorkspace
     if rawPath != null
       path = neriCanonicalPath(rawPath)
     end
-    if path == null || this.project.sourceOwner(path) == null
+    if path == null || !observed.owns(path)
       return this.response(
         operation,
         uri,
         AgentWorkspaceStatus.invalidRequest(),
-        "URI must identify an existing source in the selected project unit or its references.",
+        "URI must identify an existing source in the complete project graph.",
         null
       )
     end
@@ -324,7 +421,7 @@ class NeriAgentWorkspace
       this.server.reanalyze()
       this.fingerprint = appliedFingerprint
     end
-    this.server.ensureAnalyzed(current)
+    this.analyzeRootDocument(current, path, graph)
     let context = request.context(this, current)
     let failedContext = context.failure()
 
@@ -334,7 +431,8 @@ class NeriAgentWorkspace
     let before = this.revision
 
     this.refresh()
-    if this.revision != before
+    graph.refresh()
+    if this.revision != before || graph.snapshot != graphSnapshot || graph.error() != ""
       return this.response(
         operation,
         canonicalUri,
@@ -355,6 +453,32 @@ class NeriAgentWorkspace
       context.json(),
       context.position()
     )
+  end
+
+  def analyzeRootDocument(document: LspDocument, path: String, graph: AgentProjectGraph): Void
+    let currentSnapshot = (new AgentOverlaySnapshot(this, graph)).snapshot
+
+    if this.analysisSnapshot != currentSnapshot
+      this.server.reanalyze()
+      this.analysisSnapshot = currentSnapshot
+    end
+    let originalRoot = this.server.rootPath
+    let originalUnit = this.server.unit
+    var owner = graph.first
+
+    if this.project.sourceOwner(path) == null
+      while owner != null
+        if neriProjectListed(owner.project.ownSources, path)
+          this.server.rootPath = bootstrapDirectory(owner.manifest)
+          this.server.unit = owner.name
+          break
+        end
+        owner = owner.next
+      end
+    end
+    this.server.ensureAnalyzed(document)
+    this.server.rootPath = originalRoot
+    this.server.unit = originalUnit
   end
 
   def applyOpen(request: AgentOpenRequest, target: AgentWorkspaceTarget): AgentToolExecution
@@ -429,74 +553,6 @@ class NeriAgentWorkspace
     return AgentToolExecution.applied(acceptedFingerprint)
   end
 
-  def applyEdit(request: AgentEditRequest, target: AgentWorkspaceTarget): AgentToolExecution
-
-    let document = target.document()
-
-    if document == null
-      return AgentToolExecution.failed(this.response(
-          request.operationId(),
-          target.uri(),
-          AgentWorkspaceStatus.unavailable(),
-          "Buffer is unavailable.",
-          null
-        ))
-    end
-    let range = request.range()
-    let first = agentBytePosition(document.text, range.start())
-    let last = agentBytePosition(document.text, range.finish())
-
-    if first < 0 || last < first
-      return AgentToolExecution.failed(this.response(
-          request.operationId(),
-          target.uri(),
-          AgentWorkspaceStatus.invalidRequest(),
-          "Edit range must lie on UTF-16 scalar boundaries inside the buffer.",
-          document
-        ))
-    end
-    let source = host::stringSlice(
-      document.text,
-      0,
-      first
-    ) + request.text() + host::stringSlice(document.text, last, host::stringByteLength(document.text) - last)
-    let limits = new AgentLimits()
-    var bytes = host::stringByteLength(source)
-    var other = this.server.documents
-
-    while other != null
-      if other.uri != target.uri()
-        bytes = bytes + host::stringByteLength(other.text)
-      end
-      other = other.next
-    end
-    if host::stringByteLength(source) > limits.documentBytes() || bytes > limits.bufferBytes()
-      return AgentToolExecution.failed(this.response(
-          request.operationId(),
-          target.uri(),
-          AgentWorkspaceStatus.limit(),
-          "Edit exceeds the document or workspace buffer limit.",
-          document
-        ))
-    end
-    let previous = document.text
-
-    document.text = source
-    let acceptedFingerprint = this.inputFingerprint()
-
-    if this.inputLimit
-      document.text = previous
-      return AgentToolExecution.failed(this.response(
-          request.operationId(),
-          target.uri(),
-          AgentWorkspaceStatus.limit(),
-          "Edit exceeds the workspace analysis input limit.",
-          document
-        ))
-    end
-    document.version = document.version + 1
-    return AgentToolExecution.applied(acceptedFingerprint)
-  end
 
   def inspectContext(request: AgentInspectRequest, document: LspDocument): AgentToolContext
 
