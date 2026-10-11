@@ -237,17 +237,26 @@ inserted. Hidden join collections belong to the context and are cleared on reset
 Self-referencing joins use distinct forward and inverse collection members.
 Their synthesized left and right FK prefixes preserve direction.
 
-## Typed navigation descriptors
+## Typed navigation selectors
 
-Ordinary relationship descriptors use the declared collection and reference
-names under `context.navigation.<set>`. For example:
+Include selectors use the entity's declared collection and reference members:
 
 ```neri
-db.authors.include(db.navigation.authors.books).thenInclude(db.navigation.books.publisher).all()
+db.books.include(book => book.publisher).all()
+db.authors.include(author => author.books).thenInclude(book => book.publisher).all()
 ```
 
-Each descriptor has a typed `NavigationStep<Source, Target>`. The existing
-`collectionStep_*` and `referenceStep_*` methods also accept explicit options.
+The compiler infers each lambda parameter and result type. Collection and
+optional-reference selectors continue from the related entity type. Additional
+`include` calls start another branch from the original query roots. Selectors
+describe one direct registered navigation member; loading does not execute them
+against entity instances. Scalar members and computed expressions fail validation
+before query execution.
+
+Explicit relationship descriptors remain under `context.navigation.<set>`.
+Each descriptor has a typed `NavigationStep<Source, Target>` and is passed to
+`includeStep` or `thenIncludeStep`. The `collectionStep_*` and `referenceStep_*`
+factories accept explicit loading options.
 Save-time detectors reconcile mapped collection and reference edits through the
 registered relationship policy.
 

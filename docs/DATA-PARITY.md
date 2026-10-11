@@ -25,7 +25,7 @@ contract is established. Distribution is separate from source capability.
 | Loading | Explicit collection/reference loading | Supported | Tracked and detached complete, filtered and chained loading with isolated identity scopes |
 | Loading | Relationship fixup | Supported | Reference, collection and skip-navigation descriptors reconcile materialization and mapped relationship edits |
 | Loading | Lazy loading | Supported | Explicit cached typed accessors with sync/async loading; ordinary access follows Neri field semantics |
-| Loading | Include query strategies | Supported | Typed navigation descriptors, Include/ThenInclude chains and selectable single/split execution with documented bounds |
+| Loading | Include query strategies | Supported | Typed entity-member lambda selectors, Include/ThenInclude chains and selectable single/split execution with documented bounds |
 | Loading | Async navigation loading | Supported | Owned chained include, collection/reference, many-to-many and lazy operations share cancellation/deadline and publication recovery |
 | Persistence | Tracked CRUD and graph ordering | Supported | Dependency-ordered saves, provisional composite identities and generated-key propagation with rollback |
 | Persistence | Async tracked saves | Supported | Owned polling operations and cleanup |

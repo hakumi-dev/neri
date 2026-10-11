@@ -19,6 +19,22 @@ def activeAfter(minimum: Int): quote fn(Customer): Bool
 end
 ```
 
+An expression lambda uses `parameter => expression` when its context supplies
+the parameter type. A quotation parameter converts that lambda into a typed
+tree, and generic inference can infer the result from its expression:
+
+```neri
+def inspectMember<R>(expression: quote fn(Customer): R): readonly Tree
+  return expression.tree()
+end
+
+let tree = inspectMember(customer => customer.active)
+```
+
+Expression lambdas also work with ordinary callback parameters. Their body is
+one expression, equivalent to a single `return` in a `do` block. A parameter
+without a contextual type requires an explicitly typed `do` block.
+
 The return signature supplies the parameter and result types. An explicit
 quotation without an expected signature supplies both annotations:
 

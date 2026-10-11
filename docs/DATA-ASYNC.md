@@ -58,8 +58,8 @@ subsequent ordinary queries can apply their registered fixup again.
 The `all` and `allAsync` terminals also checkpoint known navigation state before
 the root query, so root materialization fixup participates in failure recovery.
 
-Typed paths use `query.include(db.navigation.authors.books).thenInclude(
-db.navigation.books.publisher)` and support `allAsync` and `loadAsync`. Every
+Typed paths use `query.include(author => author.books).thenInclude(book => book.publisher)`
+and support `allAsync` and `loadAsync`. Every
 stage shares the operation's deadline, cancellation token and publication
 journal. Additional `include` branches start from the original roots. A single
 collection loader offers `asSingleQuery` to issue one LEFT JOIN command, or
