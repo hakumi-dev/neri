@@ -166,6 +166,9 @@ leases, savepoints and migrations against a real database. Its text values use
 UTF-8 and reject embedded NUL. Its checked arithmetic expressions fail explicitly;
 SQLite implements those operations through its checked scalar functions.
 Provider differences remain explicit capabilities and structured failures.
+Both adapters reject embedded NUL in text parameters. Use binary values for
+parameterized byte payloads; SQLite byte string expressions can inspect existing
+text values containing NUL without relying on text length semantics.
 
 `Query<T>.allAsync()` and projection terminals return owned polling operations.
 PostgreSQL uses nonblocking libpq; `SQLiteAsyncSession` performs database I/O on
