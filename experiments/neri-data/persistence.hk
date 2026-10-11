@@ -455,6 +455,7 @@ class TrackedHandle<T>
   private mappedColumns: readonly ResultColumns
   private mappedKeyName: String
   private mappedKeyColumns: String[]
+  private alternateKeyColumns: String[][]
   private generatedColumns: GeneratedValueColumn[]
   private captureEntity: fn(T): RawRow
   private removeEntity: fn(T): QueryFailure?
@@ -467,7 +468,8 @@ class TrackedHandle<T>
     capture: fn(T): RawRow,
     remove: fn(T): QueryFailure?,
     generatedColumns: GeneratedValueColumn[],
-    keyColumns: String[]? = null
+    keyColumns: String[]? = null,
+    alternateKeyColumns: String[][]? = null
   ): Void
     this.tracked = entry
     this.mintedEntity = entry.entity
@@ -478,8 +480,11 @@ class TrackedHandle<T>
     this.mappedKeyName = keyName
     this.mappedKeyColumns = [keyName]
     if keyColumns != null
-      this.mappedKeyColumns = keyColumns
+      this.mappedKeyColumns = tasks::generate(keyColumns.Length, 1) do |index|
+        return keyColumns[index]
+      end
     end
+    this.alternateKeyColumns = copyKeyTuples(alternateKeyColumns)
     this.generatedColumns = generatedColumns
     this.captureEntity = capture
     this.removeEntity = remove
@@ -519,6 +524,11 @@ class TrackedHandle<T>
     end
     if !sameCell(key, original)
       return QueryFailure.Provider(ProviderFailure.State("cascade entity key changed"))
+    end
+    let alternateError = immutableKeysFailure(current, this.tracked.original, this.alternateKeyColumns)
+
+    if alternateError != null
+      return QueryFailure.Provider(ProviderFailure.State(alternateError))
     end
     match this.tracked.state
       case EntityState.Detached()
@@ -565,6 +575,13 @@ class TrackedHandle<T>
     for key in this.mappedKeyColumns
       if slot == key && !allowKey
         return false
+      end
+    end
+    for tuple in this.alternateKeyColumns
+      for key in tuple
+        if slot == key && !allowKey
+          return false
+        end
       end
     end
     for generated in this.generatedColumns
@@ -1768,6 +1785,8 @@ class EntityTracker<T>
   private tableName: String
   private keyName: String
   private keyColumns: String[]
+  private alternateKeyColumns: String[][]
+  private foreignKeyColumns: String[][]
   private columns: ResultColumns
   private captureRow: fn(T): RawRow
   private applyRow: (fn(T, T): Void)?
@@ -1796,7 +1815,9 @@ class EntityTracker<T>
     generatedColumns: GeneratedValueColumn[] = [],
     applyGenerated: (fn(T, readonly RawRow): Void)? = null,
     concurrencyColumns: String[]? = null,
-    keyColumns: String[]? = null
+    keyColumns: String[]? = null,
+    alternateKeyColumns: String[][]? = null,
+    foreignKeyColumns: String[][]? = null
   ): Void
     this.tableName = table
     this.keyName = keyColumn
@@ -1806,6 +1827,8 @@ class EntityTracker<T>
         return keyColumns[index]
       end
     end
+    this.alternateKeyColumns = copyKeyTuples(alternateKeyColumns)
+    this.foreignKeyColumns = copyKeyTuples(foreignKeyColumns)
     this.columns = columns
     this.captureRow = capture
     this.applyRow = apply
@@ -1931,7 +1954,7 @@ class EntityTracker<T>
   end
 
   private def insert(entity: T, row: RawRow, state: EntityState): Void
-    let entry = new TrackedEntry<T>(entity, row, state)
+    let entry = new TrackedEntry<T>(entity, copyRow(row, this.columns), state)
 
     entry.transactionCreated = this.transactionActive
     if this.transactionActive
@@ -1958,6 +1981,16 @@ class EntityTracker<T>
   end
 
   private def validateKey(row: RawRow): QueryFailure?
+    let metadataError = this.validateMetadata()
+
+    if metadataError != null
+      return QueryFailure.Provider(ProviderFailure.State(metadataError))
+    end
+    let rowError = this.validateRow(row)
+
+    if rowError != null
+      return QueryFailure.Provider(ProviderFailure.State(rowError))
+    end
     let key = this.key(row)
 
     if key == null
@@ -2068,7 +2101,7 @@ class EntityTracker<T>
           existing.generation = existing.generation + 1
           existing.graphIdentity = new GraphIdentity()
           existing.entity = entity
-          existing.original = row
+          existing.original = copyRow(row, this.columns)
           existing.state = EntityState.Added()
           if this.transactionActive
             existing.transactionAdded = true
@@ -2120,7 +2153,8 @@ class EntityTracker<T>
         this.captureRow,
         remove,
         this.generatedColumns,
-        this.keyColumns
+        this.keyColumns,
+        this.alternateKeyColumns
       ))
   end
 
@@ -2274,7 +2308,8 @@ class EntityTracker<T>
         this.captureRow,
         remove,
         this.generatedColumns,
-        this.keyColumns
+        this.keyColumns,
+        this.alternateKeyColumns
       ))
   end
 
@@ -2316,7 +2351,7 @@ class EntityTracker<T>
           existing.generation = existing.generation + 1
           existing.graphIdentity = new GraphIdentity()
           existing.entity = entity
-          existing.original = row
+          existing.original = copyRow(row, this.columns)
           existing.state = EntityState.Unchanged()
           if this.transactionActive
             existing.transactionDeleted = false
@@ -2364,7 +2399,8 @@ class EntityTracker<T>
         this.captureRow,
         remove,
         this.generatedColumns,
-        this.keyColumns
+        this.keyColumns,
+        this.alternateKeyColumns
       ))
   end
 
@@ -2612,6 +2648,16 @@ class EntityTracker<T>
     if rowError != null
       return QueryFailure.Provider(ProviderFailure.State(rowError))
     end
+    let alternateError = immutableKeysFailure(tracked, entry.original, this.alternateKeyColumns)
+
+    if alternateError != null
+      return QueryFailure.Provider(ProviderFailure.State(alternateError))
+    end
+    let freshAlternateError = immutableKeysFailure(fresh, entry.original, this.alternateKeyColumns)
+
+    if freshAlternateError != null
+      return QueryFailure.Provider(ProviderFailure.State(freshAlternateError))
+    end
     if !sameOptionalCell(key, this.key(entry.original)) || !sameOptionalCell(key, this.key(fresh))
       return QueryFailure.Provider(ProviderFailure.State("rebase key mismatch"))
     end
@@ -2694,6 +2740,16 @@ class EntityTracker<T>
 
     if freshError != null
       return QueryFailure.Provider(ProviderFailure.State(freshError))
+    end
+    let alternateError = immutableKeysFailure(tracked, entry.original, this.alternateKeyColumns)
+
+    if alternateError != null
+      return QueryFailure.Provider(ProviderFailure.State(alternateError))
+    end
+    let freshAlternateError = immutableKeysFailure(fresh, entry.original, this.alternateKeyColumns)
+
+    if freshAlternateError != null
+      return QueryFailure.Provider(ProviderFailure.State(freshAlternateError))
     end
     if !sameOptionalCell(key, this.key(entry.original)) || !sameOptionalCell(key, this.key(fresh))
       return QueryFailure.Provider(ProviderFailure.State("refresh key mismatch"))
@@ -3009,6 +3065,11 @@ class EntityTracker<T>
     while current != null
       let entity = current.value
       let row = this.captureRow(entity)
+      let invalid = this.validateKey(row)
+
+      if invalid != null
+        return QueryResult<T>.Failure(invalid)
+      end
       let key = this.key(row)
 
       if key == null
@@ -3025,7 +3086,7 @@ class EntityTracker<T>
             existing.generation = existing.generation + 1
             existing.graphIdentity = new GraphIdentity()
             existing.entity = entity
-            existing.original = row
+            existing.original = copyRow(row, this.columns)
             existing.state = EntityState.Unchanged()
             resolved.add(entity)
           case EntityState.Added()
@@ -3078,8 +3139,9 @@ class EntityTracker<T>
     current.pendingGeneratedValues = null
     match current.state
       case EntityState.Added()
-        let snapshot = this.captureRow(current.entity)
-        let rowError = this.validateRow(snapshot)
+        let captured = this.captureRow(current.entity)
+        let snapshot = copyRow(captured, this.columns)
+        let rowError = this.validateRow(captured)
 
         if rowError != null
           return rowError
@@ -3088,6 +3150,11 @@ class EntityTracker<T>
 
         if !sameOptionalCell(key, this.key(current.original))
           return "tracked entity key changed"
+        end
+        let alternateError = immutableKeysFailure(snapshot, current.original, this.alternateKeyColumns)
+
+        if alternateError != null
+          return alternateError
         end
         current.pending = snapshot
         let error = this.prepareInsert(batch, snapshot, dialect)
@@ -3098,8 +3165,9 @@ class EntityTracker<T>
         current.pendingWrite = true
         current.pendingCommandIndex = batch.count() - 1
       case EntityState.Unchanged()
-        let snapshot = this.captureRow(current.entity)
-        let rowError = this.validateRow(snapshot)
+        let captured = this.captureRow(current.entity)
+        let snapshot = copyRow(captured, this.columns)
+        let rowError = this.validateRow(captured)
 
         if rowError != null
           return rowError
@@ -3108,6 +3176,11 @@ class EntityTracker<T>
 
         if !sameOptionalCell(key, this.key(current.original))
           return "tracked entity key changed"
+        end
+        let alternateError = immutableKeysFailure(snapshot, current.original, this.alternateKeyColumns)
+
+        if alternateError != null
+          return alternateError
         end
         current.pending = snapshot
         let beforeCommands = batch.count()
@@ -3121,14 +3194,20 @@ class EntityTracker<T>
           current.pendingCommandIndex = batch.count() - 1
         end
       case EntityState.Deleted()
-        let snapshot = this.captureRow(current.entity)
-        let rowError = this.validateRow(snapshot)
+        let captured = this.captureRow(current.entity)
+        let snapshot = copyRow(captured, this.columns)
+        let rowError = this.validateRow(captured)
 
         if rowError != null
           return rowError
         end
         if !sameOptionalCell(this.key(snapshot), this.key(current.original))
           return "tracked entity key changed"
+        end
+        let alternateError = immutableKeysFailure(snapshot, current.original, this.alternateKeyColumns)
+
+        if alternateError != null
+          return alternateError
         end
         let error = this.prepareDelete(batch, current.original, dialect)
 
@@ -3186,6 +3265,11 @@ class EntityTracker<T>
     end
     if !sameOptionalCell(this.key(snapshot), this.key(entry.original))
       return "tracked entity key changed"
+    end
+    let alternateError = immutableKeysFailure(snapshot, entry.original, this.alternateKeyColumns)
+
+    if alternateError != null
+      return alternateError
     end
     let tracker = this
     let prepare: fn(WriteBatch, SqlDialect): String? = fn(batch: WriteBatch, dialect: SqlDialect): String? do
@@ -3260,6 +3344,20 @@ class EntityTracker<T>
     end
     if keyFound != this.keyColumns.Length
       return "tracked key columns are missing or duplicated"
+    end
+    for tuple in this.alternateKeyColumns
+      let invalid = keyTupleMetadataFailure(tuple, this.columns, false)
+
+      if invalid != null
+        return invalid
+      end
+    end
+    for tuple in this.foreignKeyColumns
+      let invalid = keyTupleMetadataFailure(tuple, this.columns, true)
+
+      if invalid != null
+        return invalid
+      end
     end
     var generated = 0
 
@@ -3497,6 +3595,19 @@ class EntityTracker<T>
         return "captured column type or nullability mismatch: " + column.name()
       end
       index = index + 1
+    end
+    for tuple in this.foreignKeyColumns
+      match compositeKeyCell(row, tuple)
+        case Cell.Bool(value)
+          return "captured foreign key tuple is partial-null or invalid"
+        case Cell.Null()
+        case Cell.Int(value)
+        case Cell.Text(value)
+        case Cell.Float(value)
+          return "captured foreign key tuple is invalid"
+        case Cell.Binary(value)
+          return "captured foreign key tuple is invalid"
+      end
     end
     return null
   end
@@ -5834,4 +5945,84 @@ def compositeKeyCell(row: RawRow, columns: String[]): Cell
     end
   end
   return Cell.Null()
+end
+
+
+## Copies ordered tuple metadata so caller mutations cannot change identity rules.
+def copyKeyTuples(source: String[][]?): String[][]
+  if source == null
+    return []
+  end
+  return tasks::generate(source.Length, 1) do |index|
+    let tuple = source[index]
+
+    return tasks::generate(tuple.Length, 1) do |component|
+      return tuple[component]
+    end
+  end
+end
+
+def immutableKeysFailure(current: RawRow, original: RawRow, tuples: String[][]): String?
+  for columns in tuples
+    let before = compositeKey(original, columns)
+    let after = compositeKey(current, columns)
+
+    if before == null || after == null
+      return "tracked alternate key is missing or invalid"
+    end
+    if !sameCell(before, after)
+      return "tracked alternate key changed"
+    end
+  end
+  return null
+end
+
+def keyTupleMetadataFailure(tuple: String[], columns: readonly ResultColumns, optionalAllowed: Bool): String?
+  if tuple.Length == 0
+    return "tracked key tuple cannot be empty"
+  end
+  var position = 0
+  var nullable = false
+
+  while position < tuple.Length
+    let name = tuple[position]
+    var found = false
+    var index = 0
+
+    while index < columns.count()
+      let column = columns.at(index)
+
+      if column.name() == name
+        found = true
+        nullable = column.nullable() if position == 0
+        if column.nullable() != nullable || (!optionalAllowed && column.nullable())
+          return "tracked key tuple nullability is inconsistent"
+        end
+        match column.kind()
+          case ResultColumnKind.Int()
+          case ResultColumnKind.Text()
+          case ResultColumnKind.Bool()
+            return "tracked key tuple must use integer or string columns"
+          case ResultColumnKind.Float()
+            return "tracked key tuple must use integer or string columns"
+          case ResultColumnKind.Binary()
+            return "tracked key tuple must use integer or string columns"
+        end
+      end
+      index = index + 1
+    end
+    if !found
+      return "tracked key tuple column is missing"
+    end
+    var previous = 0
+
+    while previous < position
+      if tuple[previous] == name
+        return "tracked key tuple column is duplicated"
+      end
+      previous = previous + 1
+    end
+    position = position + 1
+  end
+  return null
 end

@@ -34,11 +34,14 @@ keys use a single required `Int` member.
 {"name": "account_external", "members": ["tenant", "externalId"]}
 ```
 
-Each member must be required and have a key-compatible scalar type. Relations
+Each member must be required and have a key-compatible scalar type. Alternate
+key tuples and unique tuples targeted by relationships are immutable while
+tracked; ordinary unique indexes remain writable. Relations
 accept ordered `key` and `foreignKey` arrays of equal length. The principal tuple
 must match its primary key or a declared unique key. Foreign key components have
 the corresponding scalar types and share nullability. An optional tuple is NULL
-only when every component is NULL; partial NULL tuples fail loading validation.
+only when every component is NULL; partial NULL tuples fail tracking, loading,
+and saving validation. Set writes select and match every primary key component.
 
 Generated schema columns retain composite primary key positions and foreign key
 column tuples. Includes, references, relationship setters, batched predicates,
