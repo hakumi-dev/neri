@@ -1,0 +1,582 @@
+use neri_data
+use result
+use resources
+use test
+
+class AsyncSaveItem
+  public id: Int = 0
+  public name: String = "sent"
+  public parentId: Int?
+end
+
+class SaveContractControl: AsyncControlDriver
+  private finish: fn(): AsyncControlResult
+  private pending: Bool = true
+  private result: AsyncControlResult?
+
+  def init(finish: fn(): AsyncControlResult): Void
+    this.finish = finish
+  end
+
+  public override def poll(): AsyncControlPoll
+    let result = this.result
+
+    if result != null
+      return AsyncControlPoll.Completed(result)
+    end
+    if this.pending
+      this.pending = false
+      return AsyncControlPoll.Pending(-1, AsyncInterest.Read())
+    end
+    let completed = this.finish()
+
+    this.result = completed
+    return AsyncControlPoll.Completed(completed)
+  end
+
+  public override def cancel(): Void
+  end
+
+  public override def close(): WriteFailure?
+    return null
+  end
+end
+
+class SaveContractWrite: AsyncWriteDriver
+  private finish: fn(): WriteResult
+  private pending: Bool = true
+  private result: WriteResult?
+
+  def init(finish: fn(): WriteResult): Void
+    this.finish = finish
+  end
+
+  public override def poll(): AsyncWritePoll
+    let result = this.result
+
+    if result != null
+      return AsyncWritePoll.Completed(result)
+    end
+    if this.pending
+      this.pending = false
+      return AsyncWritePoll.Pending(-1, AsyncInterest.Read())
+    end
+    let completed = this.finish()
+
+    this.result = completed
+    return AsyncWritePoll.Completed(completed)
+  end
+
+  public override def cancel(): Void
+  end
+
+  public override def close(): WriteFailure?
+    return null
+  end
+end
+
+class AsyncSaveProvider: Provider
+  public writes: Int = 0
+  public commits: Int = 0
+  public rollbacks: Int = 0
+  public savepointRollbacks: Int = 0
+  public failAt: Int = 0
+  public malformed: Bool = false
+  public sawParent: Bool = false
+  public editOnSend: AsyncSaveItem?
+  private state: TransactionState = TransactionState.RolledBack()
+
+  public override readonly def dialect(): SqlDialect
+    return SqlDialect.QuestionMark()
+  end
+
+  public override readonly def supports(capability: ProviderCapability): Bool
+    return true
+  end
+
+  public override def execute(plan: readonly SqlPlan): ProviderResult
+    return ProviderResult.Rows([])
+  end
+
+  public override def beginTransaction(): TransactionOpenResult
+    test::assertTrue(false)
+    return TransactionOpenResult.Failure(WriteFailure.Unsupported("synchronous begin invoked"))
+  end
+
+  public override def commitTransaction(lease: Int): WriteResult
+    test::assertTrue(false)
+    return WriteResult.Failure(WriteFailure.Unsupported("synchronous commit invoked"))
+  end
+
+  public override def rollbackTransaction(lease: Int): WriteResult
+    test::assertTrue(false)
+    return WriteResult.Failure(WriteFailure.Unsupported("synchronous rollback invoked"))
+  end
+
+  public override def writeBatchInTransaction(batch: readonly WriteBatch, lease: Int): WriteResult
+    test::assertTrue(false)
+    return WriteResult.Failure(WriteFailure.Unsupported("synchronous write invoked"))
+  end
+
+  public override def transactionState(lease: Int): TransactionState
+    return this.state
+  end
+
+  public override def beginControlAsync(
+    action: AsyncTransactionAction,
+    options: StreamOptions? = null
+  ): AsyncControlStart
+    let finish: fn(): AsyncControlResult = fn(): AsyncControlResult do
+      match action
+        case AsyncTransactionAction.Begin()
+          this.state = TransactionState.Active()
+          return AsyncControlResult.Begun(1)
+        case AsyncTransactionAction.Commit(lease)
+          this.commits = this.commits + 1
+          this.state = TransactionState.Committed()
+          return AsyncControlResult.Saved()
+        case AsyncTransactionAction.Rollback(lease)
+          this.rollbacks = this.rollbacks + 1
+          this.state = TransactionState.RolledBack()
+          return AsyncControlResult.Saved()
+        case AsyncTransactionAction.Savepoint(lease)
+          return AsyncControlResult.Created(1)
+        case AsyncTransactionAction.RollbackTo(lease, id)
+          this.savepointRollbacks = this.savepointRollbacks + 1
+          return AsyncControlResult.Saved()
+        case AsyncTransactionAction.Release(lease, id)
+          return AsyncControlResult.Saved()
+      end
+    end
+
+    return AsyncControlStart.Started(new SaveContractControl(finish))
+  end
+
+  public override def beginWriteAsync(
+    batch: readonly WriteBatch,
+    options: StreamOptions? = null,
+    lease: Int? = null,
+    validate: (fn(readonly WriteReturnedRows): WriteFailure?)? = null
+  ): AsyncWriteStart
+    this.writes = this.writes + 1
+    let position = this.writes
+    let edit = this.editOnSend
+
+    if edit != null
+      edit.name = "edited while pending"
+      this.editOnSend = null
+    end
+    let first = batch.first()
+
+    if first != null
+      var parameter = first.command().parameters().first()
+
+      while parameter != null
+        match parameter.value()
+          case Cell.Int(value)
+            this.sawParent = true if position == 2 && value == 50
+          case Cell.Null()
+          case Cell.Bool(value)
+          case Cell.Float(value)
+          case Cell.Text(value)
+          case Cell.Binary(value)
+        end
+        parameter = parameter.next()
+      end
+    end
+    let finish: fn(): WriteResult = fn(): WriteResult do
+      if position == this.failAt
+        return WriteResult.Failure(WriteFailure.Constraint("dependent insert failed"))
+      end
+      let outputs = new WriteReturnedRows()
+
+      outputs.add(new RawRow([new RawColumn("id", this.malformed ? Cell.Text("invalid") : Cell.Int(49 + position))]))
+      if validate != null
+        let error = validate(outputs)
+
+        if error != null
+          return WriteResult.Failure(error)
+        end
+      end
+      return WriteResult.SavedWithValues(batch.count(), outputs)
+    end
+
+    return AsyncWriteStart.Started(new SaveContractWrite(finish))
+  end
+end
+
+def captureAsyncItem(item: AsyncSaveItem): RawRow
+  let parent = item.parentId
+
+  return new RawRow([
+      new RawColumn("id", Cell.Int(item.id)),
+      new RawColumn("name", Cell.Text(item.name)),
+      new RawColumn("parent_id", parent == null ? Cell.Null() : Cell.Int(parent))
+    ])
+end
+
+def setAsyncKey(item: AsyncSaveItem, key: Int): Void
+  item.id = key
+end
+
+def asyncTracker(): EntityTracker<AsyncSaveItem>
+  return new EntityTracker<AsyncSaveItem>(
+    "items",
+    "id",
+    new ResultColumns([
+        new ResultColumn("id", ResultColumnKind.Int()),
+        new ResultColumn("name", ResultColumnKind.Text()),
+        new ResultColumn("parent_id", ResultColumnKind.Int(), true)
+      ]),
+    captureAsyncItem,
+    generatedKey: true,
+    setGeneratedKey: setAsyncKey
+  )
+end
+
+def expectAsyncSaved(result: WriteResult, expected: Int): Void
+  match result
+    case WriteResult.Saved(count)
+      test::assertEqual(count, expected)
+    case WriteResult.SavedWithValues(count, rows)
+      test::assertTrue(false)
+    case WriteResult.Failure(error)
+      test::assertTrue(false)
+  end
+end
+
+def frozenSnapshot(): resources::Outcome<Int, WriteFailure>
+  let provider = new AsyncSaveProvider()
+  let tracker = asyncTracker()
+  let context = new ChangeContext(provider)
+  let item = new AsyncSaveItem()
+
+  context.register(tracker.changeSet())
+  provider.editOnSend = item
+
+  test::assertTrue(tracker.add(item) == null)
+  using operation <- context.saveChangesAsync()
+    test::assertTrue(tracker.remove(item) != null)
+    context.clear()
+    var completed: WriteResult? = null
+    var polls = 0
+
+    while completed == null && polls < 100
+      match operation.poll()
+        case AsyncWritePoll.Pending(socket, interest)
+        case AsyncWritePoll.Completed(result)
+          completed = result
+      end
+      polls = polls + 1
+    end
+    let savedResult = completed == null ? WriteResult.Failure(WriteFailure.Transaction("save did not terminate")) : completed
+
+    expectAsyncSaved(savedResult, 1)
+
+    test::assertTrue(operation.close() == null)
+  end
+  let original = tracker.original(item)
+
+  test::assertEqual(item.id, 50)
+  test::assertEqual(item.name, "edited while pending")
+  test::assertEqual(provider.commits, 1)
+  test::assertTrue(original != null)
+  if original != null
+    match original.value("name")
+      case CellLookup.Found(value)
+        match value
+          case Cell.Text(name)
+            test::assertEqual(name, "sent")
+          case Cell.Null()
+          case Cell.Int(value)
+          case Cell.Bool(value)
+          case Cell.Float(value)
+          case Cell.Binary(value)
+            test::assertTrue(false)
+        end
+      case CellLookup.Missing()
+        test::assertTrue(false)
+    end
+  end
+  return 0
+end
+
+def graphSave(fail: Bool): resources::Outcome<Int, WriteFailure>
+  let provider = new AsyncSaveProvider()
+  let tracker = asyncTracker()
+  let context = new ChangeContext(provider)
+  let parent = new AsyncSaveItem()
+  let child = new AsyncSaveItem()
+  var parentHandle: TrackedHandle<AsyncSaveItem>? = null
+  var childHandle: TrackedHandle<AsyncSaveItem>? = null
+
+  context.register(tracker.changeSet())
+  ## Enroll the dependent first to prove that planning orders generated keys.
+  match tracker.addWithHandle(child)
+    case TrackHandleResult.Tracked(handle)
+      childHandle = handle
+    case TrackHandleResult.Failure(error)
+      test::assertTrue(false)
+  end
+  match tracker.addWithHandle(parent)
+    case TrackHandleResult.Tracked(handle)
+      parentHandle = handle
+    case TrackHandleResult.Failure(error)
+      test::assertTrue(false)
+  end
+  if parentHandle == null || childHandle == null
+    return 1
+  end
+  let readKey: fn(AsyncSaveItem): Cell = fn(item: AsyncSaveItem): Cell do
+    return Cell.Int(item.id)
+  end
+  let readParent: fn(AsyncSaveItem): Cell = fn(item: AsyncSaveItem): Cell do
+    let parent = item.parentId
+
+    return parent == null ? Cell.Null() : Cell.Int(parent)
+  end
+  let writeParent: fn(AsyncSaveItem, Cell): Void = fn(item: AsyncSaveItem, value: Cell): Void do
+    match value
+      case Cell.Int(value)
+        item.parentId = value
+      case Cell.Null()
+        item.parentId = null
+      case Cell.Bool(value)
+      case Cell.Float(value)
+      case Cell.Text(value)
+      case Cell.Binary(value)
+    end
+  end
+  let link = new ScalarRelationshipLink<AsyncSaveItem, AsyncSaveItem>(
+    parentHandle, childHandle, readKey, readParent, writeParent, ResultColumnKind.Int(), true, "parent_id"
+  )
+  let temporaryParent = parent.id
+  let temporaryChild = child.id
+
+  provider.failAt = fail ? 2 : 0
+
+  test::assertTrue(context.registerRelation(link.edge()) == null)
+  using operation <- context.saveChangesAsync()
+    var completed: WriteResult? = null
+    var polls = 0
+
+    while completed == null && polls < 100
+      match operation.poll()
+        case AsyncWritePoll.Pending(socket, interest)
+        case AsyncWritePoll.Completed(result)
+          completed = result
+      end
+      polls = polls + 1
+    end
+    let savedResult = completed == null ? WriteResult.Failure(WriteFailure.Transaction("save did not terminate")) : completed
+
+    let result = savedResult
+
+    if fail
+      match result
+        case WriteResult.Failure(error)
+        case WriteResult.Saved(count)
+          test::assertTrue(false)
+        case WriteResult.SavedWithValues(count, rows)
+          test::assertTrue(false)
+      end
+
+      test::assertEqual(parent.id, temporaryParent)
+      test::assertEqual(child.id, temporaryChild)
+      test::assertTrue(child.parentId == temporaryParent)
+      test::assertEqual(provider.rollbacks, 1)
+      test::assertEqual(provider.commits, 0)
+    else
+      expectAsyncSaved(result, 2)
+
+      test::assertTrue(provider.sawParent)
+      test::assertEqual(parent.id, 50)
+      test::assertEqual(child.id, 51)
+      test::assertTrue(child.parentId == 50)
+    end
+
+    test::assertTrue(operation.close() == null)
+  end
+  return 0
+end
+
+def pendingDisposal(): resources::Outcome<Int, WriteFailure>
+  let provider = new AsyncSaveProvider()
+  let tracker = asyncTracker()
+  let context = new ChangeContext(provider)
+  let item = new AsyncSaveItem()
+
+  context.register(tracker.changeSet())
+
+  test::assertTrue(tracker.add(item) == null)
+  using operation <- context.saveChangesAsync()
+    operation.poll()
+
+    test::assertTrue(operation.close() != null)
+    test::assertTrue(tracker.remove(item) != null)
+    var polls = 0
+    var complete = false
+
+    while polls < 100 && !complete
+      match context.pollSaveCleanup()
+        case AsyncWritePoll.Pending(socket, interest)
+        case AsyncWritePoll.Completed(result)
+          complete = true
+      end
+      polls = polls + 1
+    end
+
+    test::assertTrue(complete)
+    test::assertEqual(provider.writes, 0)
+    test::assertEqual(provider.rollbacks, 1)
+    test::assertTrue(tracker.remove(item) == null)
+  end
+  return 0
+end
+
+def trackedAsyncTransaction(): resources::Outcome<Int, WriteFailure>
+  let provider = new AsyncSaveProvider()
+  let tracker = asyncTracker()
+  let context = new ChangeContext(provider)
+  let item = new AsyncSaveItem()
+
+  context.register(tracker.changeSet())
+
+  test::assertTrue(tracker.add(item) == null)
+  let temporary = item.id
+
+  using operation <- context.beginTransactionAsync()
+    var completed: AsyncControlResult? = null
+    var polls = 0
+
+    while completed == null && polls < 100
+      match operation.poll()
+        case AsyncControlPoll.Pending(socket, interest)
+        case AsyncControlPoll.Completed(result)
+          completed = result
+      end
+      polls = polls + 1
+    end
+    let controlResult = completed == null ? AsyncControlResult.Failure(WriteFailure.Transaction("transaction did not terminate")) : completed
+
+    match controlResult
+      case AsyncControlResult.Begun(lease)
+        test::assertEqual(lease, 1)
+      case AsyncControlResult.Created(id)
+        test::assertTrue(false)
+      case AsyncControlResult.Saved()
+        test::assertTrue(false)
+      case AsyncControlResult.Failure(error)
+        test::assertTrue(false)
+    end
+
+    test::assertTrue(operation.close() == null)
+  end
+  using operation <- context.saveChangesAsync()
+    var completed: WriteResult? = null
+    var polls = 0
+
+    while completed == null && polls < 100
+      match operation.poll()
+        case AsyncWritePoll.Pending(socket, interest)
+        case AsyncWritePoll.Completed(result)
+          completed = result
+      end
+      polls = polls + 1
+    end
+    let savedResult = completed == null ? WriteResult.Failure(WriteFailure.Transaction("save did not terminate")) : completed
+
+    expectAsyncSaved(savedResult, 1)
+
+    test::assertTrue(operation.close() == null)
+  end
+  using operation <- context.rollbackTransactionAsync()
+    var completed: AsyncControlResult? = null
+    var polls = 0
+
+    while completed == null && polls < 100
+      match operation.poll()
+        case AsyncControlPoll.Pending(socket, interest)
+        case AsyncControlPoll.Completed(result)
+          completed = result
+      end
+      polls = polls + 1
+    end
+    let controlResult = completed == null ? AsyncControlResult.Failure(WriteFailure.Transaction("transaction did not terminate")) : completed
+
+    match controlResult
+      case AsyncControlResult.Saved()
+      case AsyncControlResult.Begun(lease)
+        test::assertTrue(false)
+      case AsyncControlResult.Created(id)
+        test::assertTrue(false)
+      case AsyncControlResult.Failure(error)
+        test::assertTrue(false)
+    end
+
+    test::assertTrue(operation.close() == null)
+  end
+
+  test::assertEqual(item.id, temporary)
+  test::assertEqual(provider.rollbacks, 1)
+  test::assertEqual(provider.commits, 0)
+  return 0
+end
+
+def malformedReturning(): resources::Outcome<Int, WriteFailure>
+  let provider = new AsyncSaveProvider()
+  let tracker = asyncTracker()
+  let context = new ChangeContext(provider)
+  let item = new AsyncSaveItem()
+
+  context.register(tracker.changeSet())
+  provider.malformed = true
+
+  test::assertTrue(tracker.add(item) == null)
+  using operation <- context.saveChangesAsync()
+    var completed: WriteResult? = null
+    var polls = 0
+
+    while completed == null && polls < 100
+      match operation.poll()
+        case AsyncWritePoll.Pending(socket, interest)
+        case AsyncWritePoll.Completed(result)
+          completed = result
+      end
+      polls = polls + 1
+    end
+    let savedResult = completed == null ? WriteResult.Failure(WriteFailure.Transaction("save did not terminate")) : completed
+
+    match savedResult
+      case WriteResult.Failure(error)
+      case WriteResult.Saved(count)
+        test::assertTrue(false)
+      case WriteResult.SavedWithValues(count, rows)
+        test::assertTrue(false)
+    end
+
+    test::assertEqual(provider.commits, 0)
+    test::assertEqual(provider.rollbacks, 1)
+    test::assertTrue(operation.close() == null)
+  end
+  return 0
+end
+
+def assertAsyncOutcome(outcome: resources::Outcome<Int, WriteFailure>): Void
+  test::assertEqual(outcome.closeFailures.count(), 0)
+  match outcome.completion
+    case resources::Completion.Value(value)
+      test::assertEqual(value, 0)
+    case resources::Completion.Failure(error)
+      test::assertTrue(false)
+  end
+end
+
+def main(): Void
+  assertAsyncOutcome(frozenSnapshot())
+  assertAsyncOutcome(graphSave(false))
+  assertAsyncOutcome(graphSave(true))
+  assertAsyncOutcome(pendingDisposal())
+  assertAsyncOutcome(trackedAsyncTransaction())
+  assertAsyncOutcome(malformedReturning())
+end

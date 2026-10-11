@@ -1,0 +1,464 @@
+use result
+use clock
+namespace neri_data
+
+## Polling performs at most one provider operation or one local save transition.
+class AsyncSaveDriver
+  private context: ChangeContext
+  private provider: Provider
+  private actions: WriteActionList
+  private options: StreamOptions?
+  private deadline: Int?
+  private lease: Int?
+  private scope: Int?
+  private implicit: Bool
+  private opened: Bool = false
+  ## 0 initial, 1 opening, 2 preparing, 3 writing, 4 finishing,
+  ## 5 rolling back, 6 releasing rolled-back savepoint, 7 completed.
+  private phase: Int = 0
+  private control: AsyncControlDriver?
+  private write: AsyncWriteDriver?
+  private selected: WriteAction?
+  private batch: WriteBatch?
+  private completed: Int = 0
+  private saved: Int = 0
+  private stopped: Bool = false
+  private error: WriteFailure?
+  private terminal: WriteResult?
+
+  def init(
+    context: ChangeContext,
+    provider: Provider,
+    actions: WriteActionList,
+    lease: Int?,
+    options: StreamOptions?
+  ): Void
+    this.context = context
+    this.provider = provider
+    this.actions = actions
+    this.lease = lease
+    this.implicit = lease == null
+    this.options = options
+    if options != null
+      let timeout = options.timeoutMilliseconds()
+
+      if timeout != null
+        let now = clock::milliseconds()
+
+        if timeout < 1 || timeout > 86400000 || now == null || now > 9223372036854775807 - timeout
+          this.error = WriteFailure.Validation("asynchronous save deadline is invalid or unavailable")
+        else
+          this.deadline = now + timeout
+        end
+      end
+    end
+  end
+
+  private def finish(result: WriteResult, success: Bool, restored: Bool): AsyncWritePoll
+    this.terminal = result
+    this.phase = 7
+    this.context.asyncSaveFinished(this.implicit, success, restored, this.opened)
+    return AsyncWritePoll.Completed(result)
+  end
+
+  private def fail(error: WriteFailure): AsyncWritePoll
+    this.error = error
+    let lease = this.lease
+
+    if !this.opened || lease == null
+      return this.finish(WriteResult.Failure(error), false, true)
+    end
+    this.phase = 5
+    return AsyncWritePoll.Pending(-1, AsyncInterest.Read())
+  end
+
+  private def cleanupFailed(cleanup: WriteFailure): AsyncWritePoll
+    let primary = this.error
+    let error = primary == null ? cleanup : WriteFailure.Cleanup(new WriteCleanupFailure(primary, cleanup))
+
+    return this.finish(WriteResult.Failure(error), false, false)
+  end
+
+  private def controlFailed(error: WriteFailure): AsyncWritePoll
+    let lease = this.lease
+
+    if lease != null
+      match this.provider.transactionState(lease)
+        case TransactionState.RolledBack()
+          this.terminal = WriteResult.Failure(error)
+          this.phase = 7
+          this.context.asyncSaveTransactionEnded(false)
+          return AsyncWritePoll.Completed(WriteResult.Failure(error))
+        case TransactionState.Committed()
+          this.terminal = WriteResult.Failure(error)
+          this.phase = 7
+          this.context.asyncSaveTransactionEnded(true)
+          return AsyncWritePoll.Completed(WriteResult.Failure(error))
+        case TransactionState.Invalid()
+          return this.cleanupFailed(error)
+        case TransactionState.Failed()
+          return this.cleanupFailed(error)
+        case TransactionState.Active()
+      end
+    end
+    if this.phase >= 5
+      return this.cleanupFailed(error)
+    end
+    return this.fail(error)
+  end
+
+  private def startControl(action: AsyncTransactionAction, cleanup: Bool): AsyncWritePoll
+    match this.provider.beginControlAsync(action, cleanup ? null : this.options)
+      case AsyncControlStart.Started(driver)
+        this.control = driver
+        return AsyncWritePoll.Pending(-1, AsyncInterest.Read())
+      case AsyncControlStart.Failure(error)
+        return this.controlFailed(error)
+    end
+  end
+
+  public def cancel(): Void
+    this.stopped = true
+    let write = this.write
+    let control = this.control
+
+    if write != null
+      write.cancel()
+    end
+    if control != null && this.phase < 5
+      control.cancel()
+    end
+  end
+
+  private def cancelled(): Bool
+    if this.stopped
+      return true
+    end
+    let options = this.options
+
+    if options != null
+      let token = options.token()
+
+      if token != null && token.cancelled()
+        return true
+      end
+    end
+    return streamTimedOut(this.deadline)
+  end
+
+  public def poll(): AsyncWritePoll
+    let terminal = this.terminal
+
+    if terminal != null
+      return AsyncWritePoll.Completed(terminal)
+    end
+    if this.phase < 4 && this.cancelled()
+      this.cancel()
+    end
+    let control = this.control
+
+    if control != null
+      match control.poll()
+        case AsyncControlPoll.Pending(socket, interest)
+          return AsyncWritePoll.Pending(socket, interest)
+        case AsyncControlPoll.Completed(result)
+          this.control = null
+          let closeError = control.close()
+
+          match result
+            case AsyncControlResult.Failure(error)
+              return this.controlFailed(closeError == null ? error : WriteFailure.Cleanup(new WriteCleanupFailure(
+                    error,
+                    closeError
+                  )))
+            case AsyncControlResult.Begun(lease)
+              if this.phase != 1 || !this.implicit || lease <= 0
+                return this.cleanupFailed(WriteFailure.Transaction("asynchronous begin returned an invalid lease"))
+              end
+              this.lease = lease
+              this.context.asyncSaveOpened(lease)
+              this.opened = true
+              this.phase = 2
+            case AsyncControlResult.Created(id)
+              if this.phase != 1 || this.implicit || id <= 0
+                return this.cleanupFailed(WriteFailure.Transaction("asynchronous savepoint returned an invalid identifier"))
+              end
+              this.scope = id
+              this.opened = true
+              this.phase = 2
+            case AsyncControlResult.Saved()
+              if this.phase == 4
+                return this.finish(
+                  closeError == null ? WriteResult.Saved(this.saved) : WriteResult.Failure(closeError),
+                  true,
+                  false
+                )
+              else if this.phase == 5
+                if this.implicit
+                  let error = this.error
+
+                  let primary = error == null ? WriteFailure.Transaction("asynchronous save cancelled") : error
+
+                  return this.finish(
+                    WriteResult.Failure(closeError == null ? primary : WriteFailure.Cleanup(new WriteCleanupFailure(
+                          primary,
+                          closeError
+                        ))),
+                    false,
+                    true
+                  )
+                end
+                this.phase = 6
+              else if this.phase == 6
+                let error = this.error
+
+                if closeError != null
+                  return this.cleanupFailed(closeError)
+                end
+                return this.finish(
+                  WriteResult.Failure(error == null ? WriteFailure.Transaction("asynchronous save cancelled") : error),
+                  false,
+                  true
+                )
+              else
+                return this.cleanupFailed(WriteFailure.Transaction("asynchronous transaction control returned an unexpected result"))
+              end
+          end
+          if closeError != null
+            if this.phase >= 5
+              return this.cleanupFailed(closeError)
+            end
+            return this.fail(closeError)
+          end
+          return AsyncWritePoll.Pending(-1, AsyncInterest.Read())
+      end
+    end
+    let write = this.write
+
+    if write != null
+      match write.poll()
+        case AsyncWritePoll.Pending(socket, interest)
+          return AsyncWritePoll.Pending(socket, interest)
+        case AsyncWritePoll.Completed(result)
+          this.write = null
+          let closeError = write.close()
+
+          match result
+            case WriteResult.Failure(error)
+              return this.fail(closeError == null ? error : WriteFailure.Cleanup(new WriteCleanupFailure(
+                    error,
+                    closeError
+                  )))
+            case WriteResult.Saved(count)
+              let batch = this.batch
+
+              if batch == null || count != batch.count() || writeBatchReturnsValues(batch)
+                return this.fail(WriteFailure.Provider(ProviderFailure.State("asynchronous save omitted generated values or returned an invalid count")))
+              end
+              this.saved = this.saved + count
+            case WriteResult.SavedWithValues(count, outputs)
+              let batch = this.batch
+              let selected = this.selected
+
+              if batch == null || selected == null || count != batch.count() || !writeReturnedPresenceMatches(
+                batch,
+                outputs
+              )
+                return this.fail(WriteFailure.Provider(ProviderFailure.State("asynchronous save returned invalid generated values")))
+              end
+              let invalid = selected.validateReturned(outputs)
+
+              if invalid != null
+                return this.fail(WriteFailure.Provider(ProviderFailure.State(invalid)))
+              end
+              selected.applyReturned()
+              this.saved = this.saved + count
+          end
+          if closeError != null
+            return this.fail(closeError)
+          end
+          let selected = this.selected
+
+          if selected == null
+            return this.fail(WriteFailure.Transaction("asynchronous save lost its operation"))
+          end
+          selected.accept()
+          selected.done = true
+          this.completed = this.completed + 1
+          this.selected = null
+          this.batch = null
+          this.phase = 2
+          return AsyncWritePoll.Pending(-1, AsyncInterest.Read())
+      end
+    end
+    if this.phase < 4
+      let error = this.error
+
+      if error != null
+        return this.fail(error)
+      end
+      if this.stopped
+        return this.fail(WriteFailure.Transaction("asynchronous save cancelled"))
+      end
+    end
+    if this.phase == 0
+      this.phase = 1
+      let lease = this.lease
+
+      return this.startControl(
+        lease == null ? AsyncTransactionAction.Begin() : AsyncTransactionAction.Savepoint(lease),
+        false
+      )
+    else if this.phase == 2
+      if this.completed == this.actions.count
+        this.phase = 4
+        let lease = this.lease
+        let scope = this.scope
+
+        if lease == null || (!this.implicit && scope == null)
+          return this.cleanupFailed(WriteFailure.Transaction("asynchronous save lost its transaction scope"))
+        end
+        return this.startControl(
+          this.implicit ? AsyncTransactionAction.Commit(lease) : AsyncTransactionAction.Release(
+            lease,
+            scope == null ? 0 : scope
+          ),
+          false
+        )
+      end
+      var selected = this.actions.first
+
+      while selected != null && (selected.done || !this.context.graphReady(selected, this.actions, false))
+        selected = selected.next
+      end
+      if selected == null
+        return this.fail(WriteFailure.Validation("relationship dependency cycle"))
+      end
+      let propagation = this.context.propagateFor(selected)
+
+      if propagation != null
+        return this.fail(propagation)
+      end
+      let batch = new WriteBatch()
+      let invalid = selected.prepare(batch, this.provider.dialect())
+
+      if invalid != null
+        return this.fail(WriteFailure.Validation(invalid))
+      end
+      if batch.count() == 0
+        selected.accept()
+        selected.done = true
+        this.completed = this.completed + 1
+        return AsyncWritePoll.Pending(-1, AsyncInterest.Read())
+      end
+      let validate: fn(readonly WriteReturnedRows): WriteFailure? = fn(outputs: readonly WriteReturnedRows): WriteFailure? do
+        if !writeReturnedPresenceMatches(batch, outputs)
+          return WriteFailure.Provider(ProviderFailure.State("asynchronous save returned invalid generated values"))
+        end
+        let invalid = selected.validateReturned(outputs)
+
+        return invalid == null ? null : WriteFailure.Provider(ProviderFailure.State(invalid))
+      end
+
+      this.selected = selected
+      this.batch = batch
+      this.phase = 3
+      match this.provider.beginWriteAsync(batch, this.options, this.lease, validate)
+        case AsyncWriteStart.Started(driver)
+          this.write = driver
+          return AsyncWritePoll.Pending(-1, AsyncInterest.Read())
+        case AsyncWriteStart.Failure(error)
+          return this.fail(error)
+      end
+    else if this.phase == 5
+      let lease = this.lease
+      let scope = this.scope
+
+      if lease == null || (!this.implicit && scope == null)
+        return this.cleanupFailed(WriteFailure.Transaction("asynchronous rollback lost its transaction scope"))
+      end
+      return this.startControl(
+        this.implicit ? AsyncTransactionAction.Rollback(lease) : AsyncTransactionAction.RollbackTo(
+          lease,
+          scope == null ? 0 : scope
+        ),
+        true
+      )
+    else if this.phase == 6
+      let lease = this.lease
+      let scope = this.scope
+
+      if lease == null || scope == null
+        return this.cleanupFailed(WriteFailure.Transaction("asynchronous cleanup lost its savepoint"))
+      end
+      return this.startControl(AsyncTransactionAction.Release(lease, scope), true)
+    end
+    return this.cleanupFailed(WriteFailure.Transaction("asynchronous save has an invalid state"))
+  end
+
+  public def close(): result::Failure?
+    if this.terminal != null
+      return null
+    end
+    this.cancel()
+    match this.poll()
+      case AsyncWritePoll.Pending(socket, interest)
+        return new result::Failure(
+          "cleanup_pending",
+          "data.async.save.close",
+          "pollSaveCleanup must finish the pending rollback"
+        )
+      case AsyncWritePoll.Completed(result)
+        match result
+          case WriteResult.Failure(error)
+            return writeResourceFailure(error, "data.async.save.close")
+          case WriteResult.Saved(count)
+            return null
+          case WriteResult.SavedWithValues(count, rows)
+            return null
+        end
+    end
+  end
+end
+
+resource class AsyncSave
+  private closed: Bool = false
+  private driver: AsyncSaveDriver
+
+  def init(driver: AsyncSaveDriver): Void
+    this.driver = driver
+  end
+
+  public def poll(): AsyncWritePoll
+    if this.closed
+      return AsyncWritePoll.Completed(WriteResult.Failure(WriteFailure.Transaction("asynchronous save resource is closed")))
+    end
+    return this.driver.poll()
+  end
+
+  public def cancel(): Void
+    if !this.closed
+      this.driver.cancel()
+    end
+  end
+
+  public def close(): result::Failure?
+    if this.closed
+      return null
+    end
+    this.closed = true
+    return this.driver.close()
+  end
+end
+
+def writeBatchReturnsValues(batch: readonly WriteBatch): Bool
+  var command = batch.first()
+
+  while command != null
+    if command.command().returningColumns() != null
+      return true
+    end
+    command = command.next()
+  end
+  return false
+end

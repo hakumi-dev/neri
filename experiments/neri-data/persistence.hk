@@ -1,5 +1,6 @@
 use host
 use buffers
+use result
 namespace neri_data
 
 ## A structured write failure that callers can inspect before choosing recovery.
@@ -719,6 +720,15 @@ class ChangeSet
   private restoreSaveFn: fn(): Void
   private discardSaveFn: fn(): Void
   private registered: Bool = false
+  private asyncBusy: Bool = false
+
+  internal def saving(): Bool
+    return this.asyncBusy
+  end
+
+  internal def setSaving(value: Bool): Void
+    this.asyncBusy = value
+  end
 
   def init(
     prepare: fn(WriteBatch, SqlDialect): String?,
@@ -2025,7 +2035,16 @@ class EntityTracker<T>
     end
   end
 
+  private def asyncSaving(): Bool
+    let set = this.set
+
+    return set != null && set.saving()
+  end
+
   public def add(entity: T): QueryFailure?
+    if this.asyncSaving()
+      return QueryFailure.Provider(ProviderFailure.State("asynchronous save is active"))
+    end
     if this.graphEnrollmentActive
       return QueryFailure.Provider(ProviderFailure.State("cannot add directly during graph enrollment"))
     end
@@ -2342,6 +2361,9 @@ class EntityTracker<T>
   end
 
   public def attach(entity: T): QueryFailure?
+    if this.asyncSaving()
+      return QueryFailure.Provider(ProviderFailure.State("asynchronous save is active"))
+    end
     if this.graphEnrollmentActive
       return QueryFailure.Provider(ProviderFailure.State("cannot attach directly during graph enrollment"))
     end
@@ -2418,6 +2440,9 @@ class EntityTracker<T>
   end
 
   public def remove(entity: T): QueryFailure?
+    if this.asyncSaving()
+      return QueryFailure.Provider(ProviderFailure.State("asynchronous save is active"))
+    end
     if this.graphEnrollmentActive
       return QueryFailure.Provider(ProviderFailure.State("cannot remove directly during graph enrollment"))
     end
@@ -2500,6 +2525,9 @@ class EntityTracker<T>
   end
 
   internal def ownsPersistedForNavigation(entity: T): Bool
+    if this.asyncSaving()
+      return false
+    end
     let current = this.captureRow(entity)
     let key = this.key(current)
 
@@ -2509,6 +2537,13 @@ class EntityTracker<T>
     let entry = this.find(key)
 
     if entry == null || !reference::same(entry.entity, entity) || !sameOptionalCell(key, this.key(entry.original))
+      return false
+    end
+    if immutableKeysFailure(
+      current,
+      entry.original,
+      this.alternateKeyColumns
+    ) != null || this.validateRow(current) != null
       return false
     end
     match entry.state
@@ -2597,6 +2632,9 @@ class EntityTracker<T>
 
   ## Stops tracking the key without writing to the provider.
   public def detach(entity: T): QueryFailure?
+    if this.asyncSaving()
+      return QueryFailure.Provider(ProviderFailure.State("asynchronous save is active"))
+    end
     let key = this.key(this.captureRow(entity))
 
     if key == null
@@ -2619,6 +2657,9 @@ class EntityTracker<T>
   ## Rebases one pending update or delete onto explicitly supplied database values.
   ## Local writable fields are preserved; store-owned fields take fresh values.
   public def rebase(entity: T, databaseEntity: T): QueryFailure?
+    if this.asyncSaving()
+      return QueryFailure.Provider(ProviderFailure.State("asynchronous save is active"))
+    end
     let local = this.captureRow(entity)
     let key = this.key(local)
 
@@ -2702,6 +2743,9 @@ class EntityTracker<T>
   ## Explicit store-wins refresh from a separately fetched entity of the same key.
   ## Validation completes before any mapped field on the tracked instance changes.
   public def refreshFrom(entity: T, databaseEntity: T): QueryFailure?
+    if this.asyncSaving()
+      return QueryFailure.Provider(ProviderFailure.State("asynchronous save is active"))
+    end
     let apply = this.applyRow
 
     if apply == null
@@ -2780,6 +2824,9 @@ class EntityTracker<T>
 
   ## Discards every tracked state in this entity set without changing the database.
   public def clear(): Void
+    if this.asyncSaving()
+      return
+    end
     if this.transactionActive
       var current = this.entries
 
@@ -3072,6 +3119,9 @@ class EntityTracker<T>
   end
 
   public def resolveRows(rows: TypedRows<T>): QueryResult<T>
+    if this.asyncSaving()
+      return QueryResult<T>.Failure(QueryFailure.Provider(ProviderFailure.State("asynchronous save is active")))
+    end
     let resolved = new TypedRows<T>()
     var current = rows.first()
 
@@ -3126,6 +3176,11 @@ class EntityTracker<T>
   end
 
   internal def prepare(batch: WriteBatch, dialect: SqlDialect): String?
+    let identifierError = this.validateDialectIdentifiers(dialect)
+
+    if identifierError != null
+      return identifierError
+    end
     let metadataError = this.validateMetadata()
 
     if metadataError != null
@@ -3144,7 +3199,34 @@ class EntityTracker<T>
     return null
   end
 
+  private def validateDialectIdentifiers(dialect: SqlDialect): String?
+    match dialect
+      case SqlDialect.QuestionMark()
+        return null
+      case SqlDialect.PostgreSql()
+        if host::stringByteLength(this.tableName) > 63
+          return "PostgreSQL table identifier exceeds 63 bytes: " + this.tableName
+        end
+        var index = 0
+
+        while index < this.columns.count()
+          let name = this.columns.at(index).name()
+
+          if host::stringByteLength(name) > 63
+            return "PostgreSQL column identifier exceeds 63 bytes: " + name
+          end
+          index = index + 1
+        end
+        return null
+    end
+  end
+
   private def prepareEntry(current: TrackedEntry<T>, batch: WriteBatch, dialect: SqlDialect): String?
+    let identifierError = this.validateDialectIdentifiers(dialect)
+
+    if identifierError != null
+      return identifierError
+    end
     current.pending = null
     current.pendingWrite = false
     current.pendingCommandIndex = -1
@@ -3934,7 +4016,11 @@ class EntityTracker<T>
       end
       if generated != null || returned != null
         current.transactionGeneratedApplied = true if this.transactionActive
-        current.pending = this.captureRow(current.entity)
+        let pending = current.pending
+
+        if pending != null && returned != null
+          current.pending = overlayReturnedRow(pending, returned)
+        end
         current.pendingGeneratedKey = null
         current.pendingGeneratedValues = null
       end
@@ -4101,9 +4187,247 @@ class ChangeContext
   private lease: Int?
   private transactionFailed: Bool = false
   private graphRegistrationActive: Bool = false
+  private activeSave: AsyncSaveDriver?
+  private activeControl: AsyncContextTransactionDriver?
 
   def init(provider: Provider? = null): Void
     this.boundProvider = provider
+  end
+
+
+
+  public def beginTransactionAsync(options: StreamOptions? = null): result::Result<AsyncContextTransaction, WriteFailure>
+    return this.startTransactionAsync(0, options)
+  end
+
+  public def commitTransactionAsync(options: StreamOptions? = null): result::Result<AsyncContextTransaction, WriteFailure>
+    return this.startTransactionAsync(1, options)
+  end
+
+  public def rollbackTransactionAsync(options: StreamOptions? = null): result::Result<AsyncContextTransaction, WriteFailure>
+    return this.startTransactionAsync(2, options)
+  end
+
+  private def startTransactionAsync(
+    mode: Int,
+    options: StreamOptions?
+  ): result::Result<AsyncContextTransaction, WriteFailure>
+    if this.activeSave != null || this.activeControl != null || this.graphRegistrationActive
+      return result::Result<AsyncContextTransaction, WriteFailure>.Error(WriteFailure.Transaction("context operation is already active"))
+    end
+    if this.transactionFailed && mode != 2
+      return result::Result<AsyncContextTransaction, WriteFailure>.Error(WriteFailure.Transaction("transaction state is uncertain"))
+    end
+    let provider = this.boundProvider
+    let lease = this.lease
+
+    if provider == null
+      return result::Result<AsyncContextTransaction, WriteFailure>.Error(WriteFailure.Unsupported("asynchronous transaction requires a provider"))
+    end
+    if (mode == 0 && lease != null) || (mode != 0 && lease == null)
+      return result::Result<AsyncContextTransaction, WriteFailure>.Error(WriteFailure.Transaction("transaction scope does not match the requested operation"))
+    end
+    let action = mode == 0 ? AsyncTransactionAction.Begin() : (mode == 1 ? AsyncTransactionAction.Commit(lease == null ? 0 : lease) : AsyncTransactionAction.Rollback(lease == null ? 0 : lease))
+
+    if mode == 0
+      this.checkpointSets()
+    end
+    match provider.beginControlAsync(action, options)
+      case AsyncControlStart.Failure(error)
+        this.discardCheckpoints() if mode == 0
+        return result::Result<AsyncContextTransaction, WriteFailure>.Error(error)
+      case AsyncControlStart.Started(operationDriver)
+        let driver = new AsyncContextTransactionDriver(this, provider, operationDriver, mode, lease)
+
+        this.activeControl = driver
+        this.setAsyncBusy(true)
+        let owned = new AsyncContextTransaction(driver)
+
+        return result::Result<AsyncContextTransaction, WriteFailure>.Ok(transfer owned)
+    end
+  end
+
+  public def pollTransactionCleanup(): AsyncControlPoll
+    let driver = this.activeControl
+
+    if driver == null
+      return AsyncControlPoll.Completed(AsyncControlResult.Saved())
+    end
+    return driver.poll()
+  end
+
+  internal def asyncTransactionOpened(lease: Int): Void
+    this.lease = lease
+  end
+
+  internal def asyncTransactionFinished(mode: Int, result: AsyncControlResult): Void
+    match result
+      case AsyncControlResult.Begun(lease)
+        this.lease = lease
+        this.transactionFailed = false
+      case AsyncControlResult.Created(id)
+        this.transactionFailed = true
+      case AsyncControlResult.Saved()
+        if mode == 2
+          this.restoreCheckpoints()
+        else
+          this.discardCheckpoints()
+        end
+        this.lease = null
+        this.transactionFailed = false
+        this.pruneEdges()
+      case AsyncControlResult.Failure(error)
+        let provider = this.boundProvider
+        let lease = this.lease
+
+        if lease == null
+          this.discardCheckpoints() if mode == 0
+        else if provider == null
+          this.transactionFailed = true
+        else
+          match provider.transactionState(lease)
+            case TransactionState.Active()
+            case TransactionState.RolledBack()
+              this.restoreCheckpoints()
+              this.lease = null
+              this.transactionFailed = false
+            case TransactionState.Committed()
+              this.discardCheckpoints()
+              this.lease = null
+              this.transactionFailed = false
+              this.pruneEdges()
+            case TransactionState.Invalid()
+              this.transactionFailed = true
+            case TransactionState.Failed()
+              this.transactionFailed = true
+          end
+        end
+    end
+    this.activeControl = null
+    this.setAsyncBusy(false)
+  end
+
+  internal def asyncSaveTransactionEnded(committed: Bool): Void
+    if committed
+      this.discardCheckpoints()
+      this.pruneEdges()
+    else
+      this.restoreGraphSave()
+      this.restoreCheckpoints()
+    end
+    this.lease = null
+    this.transactionFailed = false
+    this.activeSave = null
+    this.setAsyncBusy(false)
+  end
+
+  ## Saves each dependency-ordered operation through nonblocking provider drivers.
+  public def saveChangesAsync(options: StreamOptions? = null): result::Result<AsyncSave, WriteFailure>
+    if this.activeSave != null || this.activeControl != null
+      return result::Result<AsyncSave, WriteFailure>.Error(WriteFailure.Transaction("asynchronous context operation is active"))
+    end
+    if this.graphRegistrationActive || this.transactionFailed
+      return result::Result<AsyncSave, WriteFailure>.Error(WriteFailure.Transaction("context is unavailable for asynchronous saving"))
+    end
+    let provider = this.boundProvider
+
+    if provider == null
+      return result::Result<AsyncSave, WriteFailure>.Error(WriteFailure.Unsupported("saveChangesAsync requires a provider"))
+    end
+    let activeLease = this.lease
+
+    if activeLease != null && !provider.supports(ProviderCapability.Savepoints())
+      return result::Result<AsyncSave, WriteFailure>.Error(WriteFailure.Unsupported("asynchronous saving in a transaction requires savepoints"))
+    end
+    let actions = new WriteActionList()
+
+    this.checkpointGraphSave()
+    var set = this.firstSet
+
+    while set != null
+      let error = set.value.collectActions(actions)
+
+      if error != null
+        this.restoreGraphSave()
+        return result::Result<AsyncSave, WriteFailure>.Error(WriteFailure.Validation(error))
+      end
+      set = set.next
+    end
+    let invalid = this.graphPlan(actions)
+
+    if invalid != null
+      this.restoreGraphSave()
+      return result::Result<AsyncSave, WriteFailure>.Error(WriteFailure.Validation(invalid))
+    end
+    if activeLease == null
+      this.checkpointSets()
+    end
+    let driver = new AsyncSaveDriver(this, provider, actions, activeLease, options)
+
+    this.activeSave = driver
+    this.setAsyncBusy(true)
+    let owned = new AsyncSave(driver)
+
+    return result::Result<AsyncSave, WriteFailure>.Ok(transfer owned)
+  end
+
+  ## Continues a cancelled save after its resource was disposed while cleanup was pending.
+  public def pollSaveCleanup(): AsyncWritePoll
+    let driver = this.activeSave
+
+    if driver == null
+      return AsyncWritePoll.Completed(WriteResult.Saved(0))
+    end
+    return driver.poll()
+  end
+
+  private def setAsyncBusy(value: Bool): Void
+    var set = this.firstSet
+
+    while set != null
+      set.value.setSaving(value)
+      set = set.next
+    end
+  end
+
+  internal def asyncSaveOpened(lease: Int): Void
+    this.lease = lease
+  end
+
+  internal def asyncSaveFinished(implicit: Bool, success: Bool, restored: Bool, opened: Bool): Void
+    if success
+      if implicit
+        this.discardCheckpoints()
+        this.lease = null
+      else
+        this.discardGraphSave()
+      end
+      this.pruneEdges()
+    else if restored
+      this.restoreGraphSave()
+      if implicit
+        if opened
+          this.restoreCheckpoints()
+        else
+          this.discardCheckpoints()
+        end
+        this.lease = null
+      end
+    else
+      this.transactionFailed = true
+    end
+    this.activeSave = null
+    this.setAsyncBusy(false)
+  end
+
+  internal def operationFailure(): QueryFailure?
+    if this.activeSave != null || this.activeControl != null
+      return QueryFailure.Provider(ProviderFailure.State("asynchronous context operation is active"))
+    end
+    if this.transactionFailed
+      return QueryFailure.Provider(ProviderFailure.State("transaction state is uncertain"))
+    end
+    return null
   end
 
   internal def matchesProvider(expected: Provider): Bool
@@ -4113,6 +4437,9 @@ class ChangeContext
   end
 
   public def register(set: ChangeSet): Void
+    if this.activeSave != null || this.activeControl != null
+      return
+    end
     if this.graphRegistrationActive
       return
     end
@@ -4147,6 +4474,9 @@ class ChangeContext
   end
 
   internal def beginGraphRegistration(journal: GraphJournal): QueryFailure?
+    if this.activeSave != null || this.activeControl != null
+      return QueryFailure.Provider(ProviderFailure.State("asynchronous save is active"))
+    end
     if this.graphRegistrationActive
       return QueryFailure.Provider(ProviderFailure.State("graph enrollment is already active"))
     end
@@ -4224,6 +4554,9 @@ class ChangeContext
   end
 
   public def registerRelation(edge: RelationshipEdge): QueryFailure?
+    if this.activeSave != null || this.activeControl != null
+      return QueryFailure.Provider(ProviderFailure.State("asynchronous save is active"))
+    end
     if this.graphRegistrationActive
       return QueryFailure.Provider(ProviderFailure.State("cannot register a relationship during graph enrollment"))
     end
@@ -4300,6 +4633,9 @@ class ChangeContext
 
   ## Replaces an explicitly registered link for the same dependent and FK slot.
   public def reassignRelation(newEdge: RelationshipEdge): QueryFailure?
+    if this.activeSave != null || this.activeControl != null
+      return QueryFailure.Provider(ProviderFailure.State("asynchronous save is active"))
+    end
     if this.graphRegistrationActive
       return QueryFailure.Provider(ProviderFailure.State("cannot reassign a relationship during graph enrollment"))
     end
@@ -4378,6 +4714,9 @@ class ChangeContext
 
   ## Clears an optional FK, or retires a required cascade link after deleting its dependent closure.
   internal def unlinkByIdentity(identity: GraphIdentity, owner: ChangeSet, valid: Bool, slot: String): QueryFailure?
+    if this.activeSave != null || this.activeControl != null
+      return QueryFailure.Provider(ProviderFailure.State("asynchronous save is active"))
+    end
     if !this.ownsSet(owner)
       return QueryFailure.Provider(ProviderFailure.State("relationship handle belongs to another context"))
     end
@@ -4437,6 +4776,9 @@ class ChangeContext
   end
 
   internal def removeCascadeNode(root: CascadeNode, protectedIdentity: GraphIdentity? = null): QueryFailure?
+    if this.activeSave != null || this.activeControl != null
+      return QueryFailure.Provider(ProviderFailure.State("asynchronous save is active"))
+    end
     if !this.ownsSet(root.owner)
       return QueryFailure.Provider(ProviderFailure.State("cascade handle belongs to another context"))
     end
@@ -4619,6 +4961,9 @@ class ChangeContext
 
   ## Discards all tracked entries while retaining the borrowed provider and mappings.
   public def clear(): Void
+    if this.activeSave != null || this.activeControl != null
+      return
+    end
     if this.graphRegistrationActive
       return
     end
@@ -4636,6 +4981,9 @@ class ChangeContext
 
   ## Opens one explicit transaction and captures every tracked baseline.
   public def beginTransaction(): WriteResult
+    if this.activeSave != null || this.activeControl != null
+      return WriteResult.Failure(WriteFailure.Transaction("asynchronous save is active"))
+    end
     if this.graphRegistrationActive
       return WriteResult.Failure(WriteFailure.Validation("cannot begin a transaction during graph enrollment"))
     end
@@ -4663,6 +5011,9 @@ class ChangeContext
 
   ## Commits the provider before making provisional tracker baselines final.
   public def commitTransaction(): WriteResult
+    if this.activeSave != null || this.activeControl != null
+      return WriteResult.Failure(WriteFailure.Transaction("asynchronous save is active"))
+    end
     if this.graphRegistrationActive
       return WriteResult.Failure(WriteFailure.Validation("cannot commit a transaction during graph enrollment"))
     end
@@ -4707,6 +5058,9 @@ class ChangeContext
 
   ## Rolls back provider writes, then restores the tracked pre-transaction baselines.
   public def rollbackTransaction(): WriteResult
+    if this.activeSave != null || this.activeControl != null
+      return WriteResult.Failure(WriteFailure.Transaction("asynchronous save is active"))
+    end
     if this.graphRegistrationActive
       return WriteResult.Failure(WriteFailure.Validation("cannot roll back a transaction during graph enrollment"))
     end
@@ -4890,6 +5244,9 @@ class ChangeContext
 
   ## Executes a typed set write without changing any tracked snapshots.
   public def executeSet(plan: readonly SetWritePlan, expectedProvider: Provider? = null): WriteResult
+    if this.activeSave != null || this.activeControl != null
+      return WriteResult.Failure(WriteFailure.Transaction("asynchronous save is active"))
+    end
     if this.transactionFailed
       return WriteResult.Failure(WriteFailure.Transaction("transaction state is uncertain"))
     end
@@ -4982,6 +5339,9 @@ class ChangeContext
   end
 
   public def saveChanges(): WriteResult
+    if this.activeSave != null || this.activeControl != null
+      return WriteResult.Failure(WriteFailure.Transaction("asynchronous save is active"))
+    end
     if this.graphRegistrationActive
       return WriteResult.Failure(WriteFailure.Validation("cannot save during graph enrollment"))
     end
@@ -5115,7 +5475,7 @@ class ChangeContext
     end
   end
 
-  private def graphReady(action: WriteAction, actions: WriteActionList, planning: Bool): Bool
+  internal def graphReady(action: WriteAction, actions: WriteActionList, planning: Bool): Bool
     var edge = this.firstEdge
 
     while edge != null
@@ -5185,7 +5545,7 @@ class ChangeContext
     return true
   end
 
-  private def graphPlan(actions: WriteActionList): String?
+  internal def graphPlan(actions: WriteActionList): String?
     var edge = this.firstEdge
 
     while edge != null
@@ -5253,7 +5613,7 @@ class ChangeContext
     return null
   end
 
-  private def propagateFor(action: WriteAction): WriteFailure?
+  internal def propagateFor(action: WriteAction): WriteFailure?
     var edge = this.firstEdge
 
     while edge != null
@@ -6052,4 +6412,20 @@ def relationshipTupleSlot(columns: readonly ResultColumns): String
     index = index + 1
   end
   return result
+end
+
+## Copies returned generated cells into the frozen write snapshot.
+def overlayReturnedRow(snapshot: readonly RawRow, returned: readonly RawRow): RawRow
+  let columns: RawColumn[] = tasks::generate(snapshot.count(), 1) do |index|
+    let column = snapshot.at(index)
+
+    if column == null
+      return new RawColumn("", Cell.Null())
+    end
+    let generated = cellFromRow(returned, column.name)
+
+    return new RawColumn(column.name, cloneCell(generated == null ? column.value : generated))
+  end
+
+  return new RawRow(columns)
 end
