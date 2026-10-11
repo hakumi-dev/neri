@@ -1,3 +1,5 @@
+use host
+use buffers
 namespace neri_data
 
 ## A structured write failure that callers can inspect before choosing recovery.
@@ -227,6 +229,8 @@ def copyResultColumnKind(kind: readonly ResultColumnKind): ResultColumnKind
       return ResultColumnKind.Float()
     case ResultColumnKind.Text()
       return ResultColumnKind.Text()
+    case ResultColumnKind.Binary()
+      return ResultColumnKind.Binary()
   end
 end
 
@@ -249,6 +253,8 @@ def generatedKindCode(kind: readonly ResultColumnKind): Int
       return 3
     case ResultColumnKind.Text()
       return 4
+    case ResultColumnKind.Binary()
+      return 5
   end
 end
 
@@ -448,6 +454,7 @@ class TrackedHandle<T>
   private identity: GraphIdentity
   private mappedColumns: readonly ResultColumns
   private mappedKeyName: String
+  private mappedKeyColumns: String[]
   private generatedColumns: GeneratedValueColumn[]
   private captureEntity: fn(T): RawRow
   private removeEntity: fn(T): QueryFailure?
@@ -459,7 +466,8 @@ class TrackedHandle<T>
     keyName: String,
     capture: fn(T): RawRow,
     remove: fn(T): QueryFailure?,
-    generatedColumns: GeneratedValueColumn[]
+    generatedColumns: GeneratedValueColumn[],
+    keyColumns: String[]? = null
   ): Void
     this.tracked = entry
     this.mintedEntity = entry.entity
@@ -468,6 +476,10 @@ class TrackedHandle<T>
     this.identity = entry.graphIdentity
     this.mappedColumns = columns
     this.mappedKeyName = keyName
+    this.mappedKeyColumns = [keyName]
+    if keyColumns != null
+      this.mappedKeyColumns = keyColumns
+    end
     this.generatedColumns = generatedColumns
     this.captureEntity = capture
     this.removeEntity = remove
@@ -499,18 +511,14 @@ class TrackedHandle<T>
     end
     let current = this.captureEntity(this.tracked.entity)
 
-    match current.value(this.mappedKeyName)
-      case CellLookup.Missing()
-        return QueryFailure.Provider(ProviderFailure.State("cascade entity key is missing"))
-      case CellLookup.Found(key)
-        match this.tracked.original.value(this.mappedKeyName)
-          case CellLookup.Missing()
-            return QueryFailure.Provider(ProviderFailure.State("cascade tracked key is missing"))
-          case CellLookup.Found(original)
-            if !sameCell(key, original)
-              return QueryFailure.Provider(ProviderFailure.State("cascade entity key changed"))
-            end
-        end
+    let key = compositeKey(current, this.mappedKeyColumns)
+    let original = compositeKey(this.tracked.original, this.mappedKeyColumns)
+
+    if key == null || original == null
+      return QueryFailure.Provider(ProviderFailure.State("cascade entity key is missing or invalid"))
+    end
+    if !sameCell(key, original)
+      return QueryFailure.Provider(ProviderFailure.State("cascade entity key changed"))
     end
     match this.tracked.state
       case EntityState.Detached()
@@ -554,8 +562,10 @@ class TrackedHandle<T>
   end
 
   internal def hasScalarSlot(slot: String, kind: ResultColumnKind, optional: Bool, allowKey: Bool = false): Bool
-    if slot == this.mappedKeyName && !allowKey
-      return false
+    for key in this.mappedKeyColumns
+      if slot == key && !allowKey
+        return false
+      end
     end
     for generated in this.generatedColumns
       if generated.column().name() == slot
@@ -582,6 +592,8 @@ class TrackedHandle<T>
                 return false
               case ResultColumnKind.Float()
                 return false
+              case ResultColumnKind.Binary()
+                return false
             end
           case ResultColumnKind.Text()
             match column.kind()
@@ -593,10 +605,14 @@ class TrackedHandle<T>
                 return false
               case ResultColumnKind.Float()
                 return false
+              case ResultColumnKind.Binary()
+                return false
             end
           case ResultColumnKind.Bool()
             return false
           case ResultColumnKind.Float()
+            return false
+          case ResultColumnKind.Binary()
             return false
         end
       end
@@ -973,6 +989,8 @@ class RelationshipEdge
             return false
           case ResultColumnKind.Float()
             return false
+          case ResultColumnKind.Binary()
+            return false
         end
       case ResultColumnKind.Text()
         match other.scalarKind
@@ -984,10 +1002,14 @@ class RelationshipEdge
             return false
           case ResultColumnKind.Float()
             return false
+          case ResultColumnKind.Binary()
+            return false
         end
       case ResultColumnKind.Bool()
         return false
       case ResultColumnKind.Float()
+        return false
+      case ResultColumnKind.Binary()
         return false
     end
   end
@@ -1085,6 +1107,7 @@ class ScalarRelationshipLink<P, D>
   private nullableForeignKey: Bool
   private deletePolicy: RelationshipDeletePolicy
   private slotName: String
+  private tupleColumns: ResultColumns?
   private cachedEdge: RelationshipEdge?
   private orphanForeignKey: Cell?
   private lastAssignedForeignKey: Cell?
@@ -1098,7 +1121,8 @@ class ScalarRelationshipLink<P, D>
     kind: ResultColumnKind,
     optional: Bool,
     slot: String = "",
-    deletePolicy: RelationshipDeletePolicy = RelationshipDeletePolicy.Restrict()
+    deletePolicy: RelationshipDeletePolicy = RelationshipDeletePolicy.Restrict(),
+    tupleColumns: ResultColumns? = null
   ): Void
     this.principal = principal
     this.dependent = dependent
@@ -1109,6 +1133,7 @@ class ScalarRelationshipLink<P, D>
     this.nullableForeignKey = optional
     this.deletePolicy = deletePolicy
     this.slotName = slot
+    this.tupleColumns = tupleColumns
   end
 
   public def edge(): RelationshipEdge
@@ -1161,10 +1186,10 @@ class ScalarRelationshipLink<P, D>
       return link.persistedForeignKey()
     end
     let mappedSlot: fn(): Bool = fn(): Bool do
-      return link.dependent.hasScalarSlot(link.slotName, link.keyKind, link.nullableForeignKey)
+      return link.hasMappedTuple(false)
     end
     let mappedOrphanSlot: fn(): Bool = fn(): Bool do
-      return link.dependent.hasScalarSlot(link.slotName, link.keyKind, link.nullableForeignKey, true)
+      return link.hasMappedTuple(true)
     end
     let dependentCascade: fn(): CascadeNode = fn(): CascadeNode do
       return link.dependent.cascadeNode()
@@ -1344,12 +1369,52 @@ class ScalarRelationshipLink<P, D>
     if !this.matchesKind(this.readPrincipal(this.principal.entry().entity))
       return false
     end
+    let columns = this.tupleColumns
+
+    if columns != null
+      let names: String[] = tasks::generate(columns.count(), 1) do |index|
+        return columns.at(index).name()
+      end
+
+      return this.sameCell(
+        compositeKeyCell(dependentEntry.original, names),
+        this.readPrincipal(this.principal.entry().entity)
+      )
+    end
     match dependentEntry.original.value(this.slotName)
       case CellLookup.Found(value)
         return this.sameCell(value, this.readPrincipal(this.principal.entry().entity))
       case CellLookup.Missing()
         return false
     end
+  end
+
+  private def hasMappedTuple(allowKey: Bool): Bool
+    let columns = this.tupleColumns
+
+    if columns == null
+      return this.dependent.hasScalarSlot(this.slotName, this.keyKind, this.nullableForeignKey, allowKey)
+    end
+    let preservesIdentifyingKey = this.sameCell(
+      this.readForeignKey(this.dependent.entry().entity),
+      this.readPrincipal(this.principal.entry().entity)
+    )
+    var index = 0
+
+    while index < columns.count()
+      let column = columns.at(index)
+
+      if !this.dependent.hasScalarSlot(
+        column.name(),
+        copyResultColumnKind(column.kind()),
+        column.nullable(),
+        allowKey || preservesIdentifyingKey
+      )
+        return false
+      end
+      index = index + 1
+    end
+    return columns.count() > 1
   end
 
   private def validateKind(): QueryFailure?
@@ -1361,6 +1426,8 @@ class ScalarRelationshipLink<P, D>
       case ResultColumnKind.Bool()
         return QueryFailure.UnsupportedCapability("relationship keys must be Int or String")
       case ResultColumnKind.Float()
+        return QueryFailure.UnsupportedCapability("relationship keys must be Int or String")
+      case ResultColumnKind.Binary()
         return QueryFailure.UnsupportedCapability("relationship keys must be Int or String")
     end
   end
@@ -1376,6 +1443,8 @@ class ScalarRelationshipLink<P, D>
       case Cell.Bool(boolean)
         return false
       case Cell.Float(number)
+        return false
+      case Cell.Binary(text)
         return false
     end
   end
@@ -1394,6 +1463,8 @@ class ScalarRelationshipLink<P, D>
             return false
           case Cell.Float(number)
             return false
+          case Cell.Binary(text)
+            return false
         end
       case ResultColumnKind.Text()
         match value
@@ -1407,10 +1478,14 @@ class ScalarRelationshipLink<P, D>
             return false
           case Cell.Float(number)
             return false
+          case Cell.Binary(boolean)
+            return false
         end
       case ResultColumnKind.Bool()
         return false
       case ResultColumnKind.Float()
+        return false
+      case ResultColumnKind.Binary()
         return false
     end
   end
@@ -1429,6 +1504,8 @@ class ScalarRelationshipLink<P, D>
             return false
           case Cell.Float(other)
             return false
+          case Cell.Binary(other)
+            return false
         end
       case Cell.Text(value)
         match right
@@ -1442,12 +1519,16 @@ class ScalarRelationshipLink<P, D>
             return false
           case Cell.Float(other)
             return false
+          case Cell.Binary(other)
+            return false
         end
       case Cell.Null()
         return this.isNull(right)
       case Cell.Bool(value)
         return false
       case Cell.Float(value)
+        return false
+      case Cell.Binary(value)
         return false
     end
   end
@@ -1569,6 +1650,8 @@ class RelationshipLink<P, D>
           return
         case Cell.Float(number)
           return
+        case Cell.Binary(text)
+          return
       end
     end
 
@@ -1683,6 +1766,7 @@ end
 class EntityTracker<T>
   private tableName: String
   private keyName: String
+  private keyColumns: String[]
   private columns: ResultColumns
   private captureRow: fn(T): RawRow
   private applyRow: (fn(T, T): Void)?
@@ -1710,10 +1794,17 @@ class EntityTracker<T>
     setGeneratedKey: (fn(T, Int): Void)? = null,
     generatedColumns: GeneratedValueColumn[] = [],
     applyGenerated: (fn(T, readonly RawRow): Void)? = null,
-    concurrencyColumns: String[]? = null
+    concurrencyColumns: String[]? = null,
+    keyColumns: String[]? = null
   ): Void
     this.tableName = table
     this.keyName = keyColumn
+    this.keyColumns = [keyColumn]
+    if keyColumns != null
+      this.keyColumns = tasks::generate(keyColumns.Length, 1) do |index|
+        return keyColumns[index]
+      end
+    end
     this.columns = columns
     this.captureRow = capture
     this.applyRow = apply
@@ -1805,12 +1896,14 @@ class EntityTracker<T>
   end
 
   private def key(row: RawRow): Cell?
-    match row.value(this.keyName)
-      case CellLookup.Found(value)
-        return value
-      case CellLookup.Missing()
-        return null
+    return compositeKey(row, this.keyColumns)
+  end
+
+  private def isKeyColumn(name: String): Bool
+    for column in this.keyColumns
+      return true if column == name
     end
+    return false
   end
 
   private def find(key: Cell): TrackedEntry<T>?
@@ -1880,6 +1973,8 @@ class EntityTracker<T>
         return null
       case Cell.Text(value)
         return null
+      case Cell.Binary(value)
+        return QueryFailure.Provider(ProviderFailure.State("entity key must be an integer or string"))
     end
   end
 
@@ -1925,6 +2020,8 @@ class EntityTracker<T>
         case Cell.Text(value)
           return QueryFailure.Provider(ProviderFailure.State("generated key must be an integer"))
         case Cell.Float(value)
+          return QueryFailure.Provider(ProviderFailure.State("generated key must be an integer"))
+        case Cell.Binary(value)
           return QueryFailure.Provider(ProviderFailure.State("generated key must be an integer"))
       end
       if this.nextTemporaryKey == -9223372036854775808
@@ -2021,7 +2118,8 @@ class EntityTracker<T>
         this.keyName,
         this.captureRow,
         remove,
-        this.generatedColumns
+        this.generatedColumns,
+        this.keyColumns
       ))
   end
 
@@ -2174,7 +2272,8 @@ class EntityTracker<T>
         this.keyName,
         this.captureRow,
         remove,
-        this.generatedColumns
+        this.generatedColumns,
+        this.keyColumns
       ))
   end
 
@@ -2263,7 +2362,8 @@ class EntityTracker<T>
         this.keyName,
         this.captureRow,
         remove,
-        this.generatedColumns
+        this.generatedColumns,
+        this.keyColumns
       ))
   end
 
@@ -2687,6 +2787,7 @@ class EntityTracker<T>
             case Cell.Bool(value)
             case Cell.Text(value)
             case Cell.Float(value)
+            case Cell.Binary(value)
           end
         end
       end
@@ -2855,6 +2956,7 @@ class EntityTracker<T>
             case Cell.Bool(value)
             case Cell.Text(value)
             case Cell.Float(value)
+            case Cell.Binary(value)
           end
         end
       end
@@ -3098,7 +3200,10 @@ class EntityTracker<T>
     if this.generatedColumns.Length > 0 && this.applyGenerated == null
       return "generated columns require an apply callback"
     end
-    var keyFound = false
+    if this.keyColumns.Length == 0 || (this.generatedKey && this.keyColumns.Length != 1)
+      return "tracked key requires one or more assigned columns; generated key requires one column"
+    end
+    var keyFound = 0
     var index = 0
 
     while index < this.columns.count()
@@ -3116,8 +3221,8 @@ class EntityTracker<T>
         end
         previous = previous + 1
       end
-      if name == this.keyName
-        keyFound = true
+      if this.isKeyColumn(name)
+        keyFound = keyFound + 1
 
         if column.nullable()
           return "tracked key must be required"
@@ -3132,19 +3237,21 @@ class EntityTracker<T>
             if this.generatedKey
               return "generated key must be an integer"
             end
+          case ResultColumnKind.Binary()
+            return "tracked key must be integer or string"
         end
       end
       index = index + 1
     end
-    if !keyFound
-      return "tracked key column is missing"
+    if keyFound != this.keyColumns.Length
+      return "tracked key columns are missing or duplicated"
     end
     var generated = 0
 
     while generated < this.generatedColumns.Length
       let definition = this.generatedColumns[generated].column()
 
-      if definition.name() == this.keyName
+      if this.isKeyColumn(definition.name())
         return "generated scalar column must not be the key"
       end
       var matching = false
@@ -3182,7 +3289,7 @@ class EntityTracker<T>
       while token < concurrency.Length
         let name = concurrency[token]
 
-        if !identifierValid(name) || name == this.keyName
+        if !identifierValid(name) || this.isKeyColumn(name)
           return "concurrency column must be a mapped non-key column: " + name
         end
         var found = false
@@ -3444,7 +3551,7 @@ class EntityTracker<T>
       if !identifierValid(column)
         return "invalid tracked column identifier"
       end
-      if column != this.keyName
+      if !this.isKeyColumn(column)
         let before = cellFromRow(original, column)
         let after = cellFromRow(snapshot, column)
 
@@ -3520,6 +3627,9 @@ class EntityTracker<T>
             values.add(cell)
             sql = sql + " = " + dialectPlaceholder(dialect, values.count())
           case Cell.Text(value)
+            values.add(cell)
+            sql = sql + " = " + dialectPlaceholder(dialect, values.count())
+          case Cell.Binary(value)
             values.add(cell)
             sql = sql + " = " + dialectPlaceholder(dialect, values.count())
         end
@@ -3635,6 +3745,8 @@ class EntityTracker<T>
             case Cell.Text(value)
               return "generated insert returned a non-integer key"
             case Cell.Float(value)
+              return "generated insert returned a non-integer key"
+            case Cell.Binary(value)
               return "generated insert returned a non-integer key"
           end
         end
@@ -3754,39 +3866,60 @@ def writeCellMatches(cell: Cell, column: readonly ResultColumn): Bool
           return false
         case ResultColumnKind.Text()
           return false
+        case ResultColumnKind.Binary()
+          return false
       end
     case Cell.Int(value)
       match column.kind()
-        case ResultColumnKind.Int()
-          return true
         case ResultColumnKind.Bool()
           return false
+        case ResultColumnKind.Int()
+          return true
         case ResultColumnKind.Float()
           return false
         case ResultColumnKind.Text()
+          return false
+        case ResultColumnKind.Binary()
           return false
       end
     case Cell.Float(value)
       match column.kind()
-        case ResultColumnKind.Float()
-          return dataFloatFinite(value)
         case ResultColumnKind.Bool()
           return false
         case ResultColumnKind.Int()
           return false
+        case ResultColumnKind.Float()
+          return dataFloatFinite(value)
         case ResultColumnKind.Text()
+          return false
+        case ResultColumnKind.Binary()
           return false
       end
     case Cell.Text(value)
       match column.kind()
-        case ResultColumnKind.Text()
-          return true
         case ResultColumnKind.Bool()
           return false
         case ResultColumnKind.Int()
           return false
         case ResultColumnKind.Float()
           return false
+        case ResultColumnKind.Text()
+          return true
+        case ResultColumnKind.Binary()
+          return false
+      end
+    case Cell.Binary(value)
+      match column.kind()
+        case ResultColumnKind.Bool()
+          return false
+        case ResultColumnKind.Int()
+          return false
+        case ResultColumnKind.Float()
+          return false
+        case ResultColumnKind.Text()
+          return false
+        case ResultColumnKind.Binary()
+          return value.length() <= 134217728
       end
   end
 end
@@ -5400,66 +5533,91 @@ def sameCell(left: Cell, right: Cell): Bool
       match right
         case Cell.Null()
           return true
-        case Cell.Bool(value)
+        case Cell.Bool(other)
           return false
-        case Cell.Int(value)
+        case Cell.Int(other)
           return false
-        case Cell.Float(value)
+        case Cell.Float(other)
           return false
-        case Cell.Text(value)
+        case Cell.Text(other)
+          return false
+        case Cell.Binary(other)
           return false
       end
     case Cell.Bool(value)
       match right
-        case Cell.Bool(other)
-          return value == other
         case Cell.Null()
           return false
+        case Cell.Bool(other)
+          return value == other
         case Cell.Int(other)
           return false
         case Cell.Float(other)
           return false
         case Cell.Text(other)
+          return false
+        case Cell.Binary(other)
           return false
       end
     case Cell.Int(value)
       match right
-        case Cell.Int(other)
-          return value == other
-        case Cell.Null()
-          return false
-        case Cell.Bool(other)
-          return false
-        case Cell.Float(other)
-          return false
-        case Cell.Text(other)
-          return false
-      end
-    case Cell.Text(value)
-      match right
-        case Cell.Text(other)
-          return value == other
         case Cell.Null()
           return false
         case Cell.Bool(other)
           return false
         case Cell.Int(other)
-          return false
+          return value == other
         case Cell.Float(other)
+          return false
+        case Cell.Text(other)
+          return false
+        case Cell.Binary(other)
           return false
       end
     case Cell.Float(value)
       match right
-        case Cell.Float(other)
-          return dataFloatFinite(value) && dataFloatFinite(other) && value == other
         case Cell.Null()
           return false
         case Cell.Bool(other)
           return false
         case Cell.Int(other)
           return false
+        case Cell.Float(other)
+          return dataFloatFinite(value) && dataFloatFinite(other) && value == other
         case Cell.Text(other)
           return false
+        case Cell.Binary(other)
+          return false
+      end
+    case Cell.Text(value)
+      match right
+        case Cell.Null()
+          return false
+        case Cell.Bool(other)
+          return false
+        case Cell.Int(other)
+          return false
+        case Cell.Float(other)
+          return false
+        case Cell.Text(other)
+          return value == other
+        case Cell.Binary(other)
+          return false
+      end
+    case Cell.Binary(value)
+      match right
+        case Cell.Null()
+          return false
+        case Cell.Bool(other)
+          return false
+        case Cell.Int(other)
+          return false
+        case Cell.Float(other)
+          return false
+        case Cell.Text(other)
+          return false
+        case Cell.Binary(other)
+          return sameBinary(value, other)
       end
   end
 end
@@ -5490,4 +5648,175 @@ def cellOptionalString(value: String?): Cell
     return Cell.Null()
   end
   return Cell.Text(value)
+end
+
+def cellByteBuffer(value: readonly ByteBuffer): Cell
+  return Cell.Binary(copyBinary(value))
+end
+
+def cellOptionalByteBuffer(value: ByteBuffer?): Cell
+  if value == null
+    return Cell.Null()
+  end
+  return cellByteBuffer(value)
+end
+
+def cellDecimal(value: readonly Decimal): Cell
+  return Cell.Text(value.text())
+end
+
+def cellOptionalDecimal(value: Decimal?): Cell
+  if value == null
+    return Cell.Null()
+  end
+  return cellDecimal(value)
+end
+
+## Returns a stable identity for one key or an ordered tuple of Int/String keys.
+## Tuple components carry scalar tags and byte lengths, so delimiters cannot collide.
+def compositeKey(row: RawRow, columns: String[]): Cell?
+  if columns.Length == 0
+    return null
+  end
+  var encoded = ""
+
+  for column in columns
+    let cell = cellFromRow(row, column)
+
+    if cell == null
+      return null
+    end
+    var text = ""
+    var tag = ""
+
+    match cell
+      case Cell.Int(value)
+        text = value as String
+        tag = "I"
+      case Cell.Text(value)
+        text = value
+        tag = "S"
+      case Cell.Null()
+        return null
+      case Cell.Bool(value)
+        return null
+      case Cell.Float(value)
+        return null
+      case Cell.Binary(value)
+        return null
+    end
+    if columns.Length == 1
+      return cell
+    end
+    encoded = encoded + tag + (host::stringByteLength(text) as String) + ":" + text
+  end
+  return Cell.Text(encoded)
+end
+
+## Expands an encoded identity into its original ordered scalar components.
+def compositeKeyRow(key: Cell, columns: String[]): RawRow?
+  if columns.Length == 1
+    return new RawRow([new RawColumn(columns[0], key)])
+  end
+  var encoded: String? = null
+
+  match key
+    case Cell.Text(value)
+      encoded = value
+    case Cell.Null()
+    case Cell.Bool(value)
+    case Cell.Int(value)
+    case Cell.Float(value)
+    case Cell.Binary(value)
+  end
+  if encoded == null || columns.Length == 0
+    return null
+  end
+  let values: RawColumn[] = tasks::generate(columns.Length, 1) do |index|
+    return new RawColumn(columns[index], Cell.Null())
+  end
+  var offset = 0
+  var component = 0
+  let length = host::stringByteLength(encoded)
+
+  while component < columns.Length
+    if offset >= length
+      return null
+    end
+    let tag = host::stringByteAt(encoded, offset) as Int
+
+    offset = offset + 1
+    let start = offset
+
+    while offset < length && host::stringByteAt(
+      encoded,
+      offset
+    ) as Int >= 48 && host::stringByteAt(
+      encoded,
+      offset
+    ) as Int <= 57
+      offset = offset + 1
+    end
+    if offset == start || offset >= length || host::stringByteAt(encoded, offset) as Int != 58
+      return null
+    end
+    let count = host::parseInt(host::stringSlice(encoded, start, offset - start))
+
+    offset = offset + 1
+    if count == null || count < 0 || count > length - offset
+      return null
+    end
+    let value = host::stringSlice(encoded, offset, count)
+    var cell = Cell.Null()
+
+    if tag == 73
+      let number = host::parseInt(value)
+
+      if number == null || (number as String) != value
+        return null
+      end
+      cell = Cell.Int(number)
+    else if tag == 83
+      cell = Cell.Text(value)
+    else
+      return null
+    end
+    values[component] = new RawColumn(columns[component], cell)
+    offset = offset + count
+    component = component + 1
+  end
+  if offset != length
+    return null
+  end
+  return new RawRow(values)
+end
+
+## Returns NULL for an absent optional foreign-key tuple.
+def compositeKeyCell(row: RawRow, columns: String[]): Cell
+  let key = compositeKey(row, columns)
+
+  if key != null
+    return key
+  end
+  for column in columns
+    let cell = cellFromRow(row, column)
+
+    if cell == null
+      return Cell.Bool(false)
+    end
+    match cell
+      case Cell.Null()
+      case Cell.Int(value)
+        return Cell.Bool(false)
+      case Cell.Text(value)
+        return Cell.Bool(false)
+      case Cell.Bool(value)
+        return Cell.Bool(false)
+      case Cell.Float(value)
+        return Cell.Bool(false)
+      case Cell.Binary(value)
+        return Cell.Bool(false)
+    end
+  end
+  return Cell.Null()
 end

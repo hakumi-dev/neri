@@ -1,9 +1,11 @@
 use host
 use quotation
+use buffers
 namespace neri_data
 
 ## A typed value bound separately from compiled SQL text.
 enum Parameter
+  case Binary(value: ByteBuffer)
   case Bool(value: Bool)
   case Int(value: Int)
   case Float(value: Float)
@@ -12,6 +14,7 @@ end
 
 ## A provider value. Null remains distinct from every scalar value.
 enum Cell
+  case Binary(value: ByteBuffer)
   case Null()
   case Bool(value: Bool)
   case Int(value: Int)
@@ -130,6 +133,8 @@ class RawRow
             return CellLookup.Found(Cell.Float(value))
           case Cell.Text(value)
             return CellLookup.Found(Cell.Text(value))
+          case Cell.Binary(value)
+            return CellLookup.Found(Cell.Binary(copyBinary(value)))
         end
       end
     end
@@ -261,6 +266,7 @@ class ParameterValues
 end
 
 enum ResultColumnKind
+  case Binary()
   case Bool()
   case Int()
   case Float()
@@ -788,6 +794,7 @@ def compileLeaf(
       case Parameter.Bool(value)
       case Parameter.Int(value)
       case Parameter.Text(value)
+      case Parameter.Binary(value)
     end
     state.bind(parameter)
     suffix = suffix + dialectPlaceholder(dialect, state.count)
@@ -1076,6 +1083,8 @@ class Query<T>
           return this.failed(QueryFailure.UnsupportedCapability("navigation keys must be Int or String"))
         case Cell.Null()
           return this.failed(QueryFailure.UnsupportedCapability("navigation keys cannot be null"))
+        case Cell.Binary(boolean)
+          return this.failed(QueryFailure.UnsupportedCapability("navigation keys must be Int or String"))
       end
       let term = new Expression(ExpressionKind.Equal(), table: this.source, column: column, parameter: parameter)
 
@@ -1090,6 +1099,107 @@ class Query<T>
       return this.failed(QueryFailure.Provider(ProviderFailure.State("navigation key predicate is empty")))
     end
     return this.filtered(new Predicate<T>(combined))
+  end
+
+  ## Matches complete ordered key tuples using an OR of parameterized conjunctions.
+  internal def matchingTupleCells(columns: String[], keys: TypedRows<Cell>): Query<T>
+    if columns.Length == 1
+      return this.matchingCells(columns[0], keys)
+    end
+    let mapping = this.mapping
+
+    if mapping == null || columns.Length == 0 || keys.count() == 0
+      return this.failed(QueryFailure.UnsupportedCapability("tuple matching requires mapped columns and keys"))
+    end
+    var combined: Expression? = null
+    var item = keys.first()
+
+    while item != null
+      let row = compositeKeyRow(item.value, columns)
+
+      if row == null
+        return this.failed(QueryFailure.Provider(ProviderFailure.State("invalid composite key tuple")))
+      end
+      var tuple: Expression? = null
+
+      for column in columns
+        let typeName = navigationColumnType(mapping, column)
+        let cell = cellFromRow(row, column)
+        var parameter: Parameter? = null
+
+        if cell == null
+          return this.failed(QueryFailure.MissingColumn(column))
+        end
+        match cell
+          case Cell.Int(value)
+            if typeName != "Int" && typeName != "Int?"
+              return this.failed(QueryFailure.TypeMismatch(column, typeName, "Int"))
+            end
+            parameter = Parameter.Int(value)
+          case Cell.Text(value)
+            if typeName != "String" && typeName != "String?"
+              return this.failed(QueryFailure.TypeMismatch(column, typeName, "String"))
+            end
+            parameter = Parameter.Text(value)
+          case Cell.Null()
+          case Cell.Bool(value)
+          case Cell.Float(value)
+          case Cell.Binary(value)
+        end
+        if parameter == null
+          return this.failed(QueryFailure.UnsupportedCapability("tuple components must be Int or String"))
+        end
+        let term = new Expression(ExpressionKind.Equal(), table: this.source, column: column, parameter: parameter)
+
+        tuple = tuple == null ? term : new Expression(ExpressionKind.And(), left: tuple, right: term)
+      end
+      combined = combined == null ? tuple : new Expression(ExpressionKind.Or(), left: combined, right: tuple)
+      item = item.next
+    end
+    if combined == null
+      return this.failed(QueryFailure.Provider(ProviderFailure.State("tuple predicate is empty")))
+    end
+    return this.filtered(new Predicate<T>(combined))
+  end
+
+  ## Compares a mapped binary column with an independently copied byte value.
+  public def whereBinary(column: String, value: ByteBuffer): Query<T>
+    let mapping = this.mapping
+
+    if mapping == null
+      return this.failed(QueryFailure.UnsupportedCapability("binary predicates require entity mapping"))
+    end
+    let typeName = navigationColumnType(mapping, column)
+
+    if typeName != "buffers.ByteBuffer" && typeName != "buffers.ByteBuffer?" && typeName != "ByteBuffer" && typeName != "ByteBuffer?"
+      return this.failed(QueryFailure.TypeMismatch(column, "buffers.ByteBuffer", typeName))
+    end
+    return this.filtered(new Predicate<T>(new Expression(
+          ExpressionKind.Equal(),
+          table: this.source,
+          column: column,
+          parameter: Parameter.Binary(copyBinary(value))
+        )))
+  end
+
+  ## Compares canonical exact decimal representations without floating conversion.
+  public def whereDecimal(column: String, value: Decimal): Query<T>
+    let mapping = this.mapping
+
+    if mapping == null
+      return this.failed(QueryFailure.UnsupportedCapability("decimal predicates require entity mapping"))
+    end
+    let typeName = navigationColumnType(mapping, column)
+
+    if typeName != "neri_data.Decimal" && typeName != "neri_data.Decimal?" && typeName != "Decimal" && typeName != "Decimal?"
+      return this.failed(QueryFailure.TypeMismatch(column, "neri_data.Decimal", typeName))
+    end
+    return this.filtered(new Predicate<T>(new Expression(
+          ExpressionKind.Equal(),
+          table: this.source,
+          column: column,
+          parameter: Parameter.Text(value.text())
+        )))
   end
 
   private def freeze(): Query<T>
@@ -2608,6 +2718,8 @@ def compileQuery<T>(
         state.bind(Parameter.Float(value))
       case Parameter.Text(value)
         state.bind(Parameter.Text(value))
+      case Parameter.Binary(value)
+        state.bind(Parameter.Binary(value))
     end
     selectionParameter = selectionParameter.next()
   end
@@ -2630,6 +2742,8 @@ def compileQuery<T>(
         state.bind(Parameter.Float(value))
       case Parameter.Text(value)
         state.bind(Parameter.Text(value))
+      case Parameter.Binary(value)
+        state.bind(Parameter.Binary(value))
     end
     priorParameter = priorParameter.next()
   end
@@ -2811,6 +2925,8 @@ def cellKind(value: Cell): String
       return "Float"
     case Cell.Text(found)
       return "String"
+    case Cell.Binary(found)
+      return "ByteBuffer"
   end
 end
 
@@ -2830,6 +2946,8 @@ def decodeBool(row: RawRow, column: String): DecodeResult<Bool>
           return DecodeResult<Bool>.Failure(QueryFailure.TypeMismatch(column, "Bool", "Float"))
         case Cell.Text(value)
           return DecodeResult<Bool>.Failure(QueryFailure.TypeMismatch(column, "Bool", "String"))
+        case Cell.Binary(value)
+          return DecodeResult<Bool>.Failure(QueryFailure.TypeMismatch(column, "Bool", "ByteBuffer"))
       end
   end
 end
@@ -2850,6 +2968,8 @@ def decodeInt(row: RawRow, column: String): DecodeResult<Int>
           return DecodeResult<Int>.Failure(QueryFailure.TypeMismatch(column, "Int", "Float"))
         case Cell.Text(value)
           return DecodeResult<Int>.Failure(QueryFailure.TypeMismatch(column, "Int", "String"))
+        case Cell.Binary(value)
+          return DecodeResult<Int>.Failure(QueryFailure.TypeMismatch(column, "Int", "ByteBuffer"))
       end
   end
 end
@@ -2870,6 +2990,8 @@ def decodeString(row: RawRow, column: String): DecodeResult<String>
           return DecodeResult<String>.Failure(QueryFailure.TypeMismatch(column, "String", "Float"))
         case Cell.Int(value)
           return DecodeResult<String>.Failure(QueryFailure.TypeMismatch(column, "String", "Int"))
+        case Cell.Binary(value)
+          return DecodeResult<String>.Failure(QueryFailure.TypeMismatch(column, "String", "ByteBuffer"))
       end
   end
 end
@@ -2890,6 +3012,8 @@ def decodeNullableBool(row: RawRow, column: String): DecodeResult<Bool?>
           return DecodeResult<Bool?>.Failure(QueryFailure.TypeMismatch(column, "Bool?", "Float"))
         case Cell.Text(value)
           return DecodeResult<Bool?>.Failure(QueryFailure.TypeMismatch(column, "Bool?", "String"))
+        case Cell.Binary(value)
+          return DecodeResult<Bool?>.Failure(QueryFailure.TypeMismatch(column, "Bool?", "ByteBuffer"))
       end
   end
 end
@@ -2910,6 +3034,8 @@ def decodeNullableInt(row: RawRow, column: String): DecodeResult<Int?>
           return DecodeResult<Int?>.Failure(QueryFailure.TypeMismatch(column, "Int?", "Float"))
         case Cell.Text(value)
           return DecodeResult<Int?>.Failure(QueryFailure.TypeMismatch(column, "Int?", "String"))
+        case Cell.Binary(value)
+          return DecodeResult<Int?>.Failure(QueryFailure.TypeMismatch(column, "Int?", "ByteBuffer"))
       end
   end
 end
@@ -2930,6 +3056,8 @@ def decodeNullableString(row: RawRow, column: String): DecodeResult<String?>
           return DecodeResult<String?>.Failure(QueryFailure.TypeMismatch(column, "String?", "Float"))
         case Cell.Int(value)
           return DecodeResult<String?>.Failure(QueryFailure.TypeMismatch(column, "String?", "Int"))
+        case Cell.Binary(value)
+          return DecodeResult<String?>.Failure(QueryFailure.TypeMismatch(column, "String?", "ByteBuffer"))
       end
   end
 end
@@ -2953,6 +3081,8 @@ def decodeFloat(row: RawRow, column: String): DecodeResult<Float>
           return DecodeResult<Float>.Failure(QueryFailure.TypeMismatch(column, "Float", "Int"))
         case Cell.Text(value)
           return DecodeResult<Float>.Failure(QueryFailure.TypeMismatch(column, "Float", "String"))
+        case Cell.Binary(value)
+          return DecodeResult<Float>.Failure(QueryFailure.TypeMismatch(column, "Float", "ByteBuffer"))
       end
   end
 end
@@ -2976,6 +3106,8 @@ def decodeNullableFloat(row: RawRow, column: String): DecodeResult<Float?>
           return DecodeResult<Float?>.Failure(QueryFailure.TypeMismatch(column, "Float?", "Int"))
         case Cell.Text(value)
           return DecodeResult<Float?>.Failure(QueryFailure.TypeMismatch(column, "Float?", "String"))
+        case Cell.Binary(value)
+          return DecodeResult<Float?>.Failure(QueryFailure.TypeMismatch(column, "Float?", "ByteBuffer"))
       end
   end
 end

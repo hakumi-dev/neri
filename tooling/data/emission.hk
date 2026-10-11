@@ -429,7 +429,9 @@ def dataRelationUsesLegacyIntLink(relation: DataRelation): Bool
   let key = relation.key
   let foreignKey = relation.foreignKey
 
-  return key != null && foreignKey != null && key.typeName == "Int" && foreignKey.typeName == "Int"
+  let principal = relation.principal
+
+  return principal != null && relation.keyMembers.size == 1 && principal.keyMembers.size == 1 && relation.keyMember == principal.keyMember && key != null && foreignKey != null && key.typeName == "Int" && foreignKey.typeName == "Int"
 end
 
 def dataRelationPolicyArgument(relation: DataRelation): String
@@ -576,7 +578,7 @@ def dataEmitMapping(output: DataArtifact, entity: DataEntity): Void
   let key = entity.field(entity.keyMember)
 
   if key != null
-    output.write("], " + lspQuote(key.columnName) + ")\nend\n\n")
+    output.write("], " + lspQuote(key.columnName) + (entity.keyMembers.size > 1 ? ", primaryKeyColumns: " + dataEntityKeyColumns(entity) : "") + ")\nend\n\n")
   else
     output.write("])\nend\n\n")
   end
@@ -605,10 +607,14 @@ def dataEmitSchema(mapping: DataMapping): DataArtifact
       output.write(lspQuote(dataFieldIdentity(field)), field.origin)
       output.write(", new neri_data::SchemaColumn(")
       output.write(lspQuote(field.columnName), field.origin)
-      output.write(", neri_data::SchemaType." + dataScalarColumn(field.domain) + "(), nullable: " + (field.optional ? "true" : "false") + ", primaryKey: " + (field.memberName == entity.keyMember ? "true" : "false"))
+      output.write(", neri_data::SchemaType." + dataScalarColumn(field.domain) + "(), nullable: " + (field.optional ? "true" : "false") + ", primaryKey: " + (entity.isKeyMember(field.memberName) ? "true" : "false"))
       if field.defaultCode != ""
         output.write(", defaultValue: " + field.defaultCode)
       end
+      if entity.keyMembers.size > 1 && entity.isKeyMember(field.memberName)
+        output.write(", keyPosition: " + (dataKeyPosition(entity, field.memberName) as String))
+      end
+      output.write(dataSchemaReferenceCode(mapping, entity, field))
       output.write("))")
       fieldSeparator = ","
       field = field.nextField
@@ -648,19 +654,23 @@ end
 def dataEmitSnapshot(output: DataArtifact, entity: DataEntity): Void
   output.write("## Captures the mapped scalar values.\ndef ")
   output.write("snapshot_" + entity.generatedName, entity.origin)
-  output.write("(entity: " + semanticNamespaceDisplay(entity.typeName) + "): fields of " + semanticNamespaceDisplay(entity.typeName) + "\n  return neri_data::snapshot<" + semanticNamespaceDisplay(entity.typeName) + ">(")
-  var field = entity.firstField
-  var separator = ""
+  if dataEntityHasExtendedScalars(entity)
+    output.write("(entity: " + semanticNamespaceDisplay(entity.typeName) + "): neri_data::RawRow\n  return capture_" + entity.generatedName + "(entity)\nend\n\n")
+  else
+    output.write("(entity: " + semanticNamespaceDisplay(entity.typeName) + "): fields of " + semanticNamespaceDisplay(entity.typeName) + "\n  return neri_data::snapshot<" + semanticNamespaceDisplay(entity.typeName) + ">(")
+    var field = entity.firstField
+    var separator = ""
 
-  while field != null
-    output.write(separator)
-    output.write(field.memberName, field.origin)
-    output.write(": entity.")
-    output.write(field.memberName, field.origin)
-    separator = ", "
-    field = field.nextField
+    while field != null
+      output.write(separator)
+      output.write(field.memberName, field.origin)
+      output.write(": entity.")
+      output.write(field.memberName, field.origin)
+      separator = ", "
+      field = field.nextField
+    end
+    output.write(")\nend\n\n")
   end
-  output.write(")\nend\n\n")
   let key = entity.field(entity.keyMember)
 
   if key != null
@@ -676,6 +686,16 @@ def dataCaptureCell(field: DataField): String
 
   if field.optional
     return "neri_data::cellOptional" + dataScalarName(field.domain) + "(" + member + ")"
+  end
+  match field.domain
+    case DataScalarKind.Binary()
+      return "neri_data::cellByteBuffer(" + member + ")"
+    case DataScalarKind.Decimal()
+      return "neri_data::cellDecimal(" + member + ")"
+    case DataScalarKind.Int()
+    case DataScalarKind.Bool()
+    case DataScalarKind.Float()
+    case DataScalarKind.String()
   end
   return "neri_data::Cell." + dataScalarColumn(field.domain) + "(" + member + ")"
 end
@@ -742,10 +762,19 @@ def dataEmitGeneratedFieldsSetter(output: DataArtifact, entity: DataEntity): Voi
       if field.optional
         output.write("          entity." + field.memberName + " = null\n", field.origin)
       end
-      for kind in ["Bool", "Int", "Float", "Text"]
+      for kind in ["Bool", "Int", "Float", "Text", "Binary"]
         output.write("        case neri_data::Cell." + kind + "(value)\n")
         if kind == dataScalarColumn(field.domain)
-          output.write("          entity." + field.memberName + " = value\n", field.origin)
+          if dataScalarName(field.domain) == "Decimal"
+            output.write(
+              "          let decimal = neri_data::Decimal.parse(value)\n\n          if decimal != null\n            entity." + field.memberName + " = decimal\n          end\n",
+              field.origin
+            )
+          else if dataScalarName(field.domain) == "ByteBuffer"
+            output.write("          entity." + field.memberName + " = neri_data::copyBinary(value)\n", field.origin)
+          else
+            output.write("          entity." + field.memberName + " = value\n", field.origin)
+          end
         end
       end
       output.write("      end\n  end\n")
@@ -790,6 +819,10 @@ def dataEmitScalarForeignKeySetter(
   dependent: DataEntity,
   foreignKey: DataField
 ): Void
+  if relation.keyMembers.size > 1
+    dataEmitCompositeForeignKeySetter(output, relation, principal, dependent, foreignKey)
+    return
+  end
   output.write(dataOriginDoc(foreignKey.origin))
   output.write("def " + dataRelationForeignKeySetterName(
       relation,
@@ -808,7 +841,7 @@ def dataEmitScalarForeignKeySetter(
     output.write(foreignKey.memberName, foreignKey.origin)
     output.write(" = text\n    case neri_data::Cell.Int(number)\n    case neri_data::Cell.Bool(boolean)\n")
   end
-  output.write("    case neri_data::Cell.Float(real)\n")
+  output.write("    case neri_data::Cell.Float(real)\n    case neri_data::Cell.Binary(bytes)\n")
   output.write("    case neri_data::Cell.Null()\n")
   if foreignKey.optional
     output.write("      entity.")
@@ -851,7 +884,7 @@ def dataEmitRelationEdgeFactory(
     let key = relation.key
 
     if key != null
-      let kind = key.typeName == "Int" ? "Int" : "Text"
+      let kind = relation.keyMembers.size > 1 ? "Text" : (key.typeName == "Int" ? "Int" : "Text")
 
       output.write("  let link = new neri_data::ScalarRelationshipLink<" + p + ", " + d + ">(principal, dependent, " + dataRelationPrincipalCellGetterName(
           relation,
@@ -868,7 +901,10 @@ def dataEmitRelationEdgeFactory(
           principal,
           dependent,
           foreignKey
-        ) + ", neri_data::ResultColumnKind." + kind + "(), " + (foreignKey.optional ? "true" : "false") + ", " + lspQuote(foreignKey.columnName) + dataRelationPolicyArgument(relation) + ")\n")
+        ) + ", neri_data::ResultColumnKind." + kind + "(), " + (foreignKey.optional ? "true" : "false") + ", " + lspQuote(foreignKey.columnName) + dataRelationPolicyArgument(relation) + dataRelationTupleMetadata(
+          relation,
+          dependent
+        ) + ")\n")
     end
   end
   output.write("\n  return link.edge()\nend\n\n")
@@ -1069,7 +1105,11 @@ def dataEmitContext(mapping: DataMapping): DataArtifact
               principal,
               dependent,
               foreignKey
-            ) + "(entity: " + semanticNamespaceDisplay(principal.typeName) + "): neri_data::Cell\n  return " + dataCaptureCell(key) + "\nend\n\n")
+            ) + "(entity: " + semanticNamespaceDisplay(principal.typeName) + "): neri_data::Cell\n  return " + dataRelationKeyCell(
+              principal,
+              relation.keyMembers,
+              key
+            ) + "\nend\n\n")
         end
         output.write(dataOriginDoc(foreignKey.origin))
         output.write("def " + dataRelationForeignKeyGetterName(
@@ -1077,7 +1117,11 @@ def dataEmitContext(mapping: DataMapping): DataArtifact
             principal,
             dependent,
             foreignKey
-          ) + "(entity: " + semanticNamespaceDisplay(dependent.typeName) + "): neri_data::Cell\n  return " + dataCaptureCell(foreignKey) + "\nend\n\n")
+          ) + "(entity: " + semanticNamespaceDisplay(dependent.typeName) + "): neri_data::Cell\n  return " + dataRelationKeyCell(
+            dependent,
+            relation.foreignKeyMembers,
+            foreignKey
+          ) + "\nend\n\n")
         dataEmitScalarForeignKeySetter(output, relation, principal, dependent, foreignKey)
       end
       dataEmitRelationEdgeFactory(output, relation, principal, dependent, foreignKey)
@@ -1096,21 +1140,33 @@ def dataEmitContext(mapping: DataMapping): DataArtifact
             dependent,
             foreignKey,
             "principal_key"
-          ) + "(entity: " + p + "): neri_data::Cell\n  return " + dataCaptureCell(principalKey) + "\nend\n\n")
+          ) + "(entity: " + p + "): neri_data::Cell\n  return " + dataRelationKeyCell(
+            principal,
+            relation.keyMembers,
+            principalKey
+          ) + "\nend\n\n")
         output.write("def " + dataRelationNavigationName(
             relation,
             principal,
             dependent,
             foreignKey,
             "dependent_key"
-          ) + "(entity: " + d + "): neri_data::Cell\n  return " + dataCaptureCell(dependentKey) + "\nend\n\n")
+          ) + "(entity: " + d + "): neri_data::Cell\n  return " + dataRelationKeyCell(
+            dependent,
+            dependent.keyMembers,
+            dependentKey
+          ) + "\nend\n\n")
         output.write("def " + dataRelationNavigationName(
             relation,
             principal,
             dependent,
             foreignKey,
             "foreign_key"
-          ) + "(entity: " + d + "): neri_data::Cell\n  return " + dataCaptureCell(foreignKey) + "\nend\n\n")
+          ) + "(entity: " + d + "): neri_data::Cell\n  return " + dataRelationKeyCell(
+            dependent,
+            relation.foreignKeyMembers,
+            foreignKey
+          ) + "\nend\n\n")
         output.write("def " + dataRelationNavigationName(
             relation,
             principal,
@@ -1192,6 +1248,9 @@ def dataEmitContext(mapping: DataMapping): DataArtifact
       if concurrency != null
         output.write(", concurrencyColumns: concurrency_" + entity.generatedName)
       end
+      if entity.keyMembers.size > 1
+        output.write(", keyColumns: " + dataEntityKeyColumns(entity))
+      end
       output.write(")\n")
       output.write("    this.changes.register(this.tracker_" + entity.generatedName + ".changeSet())\n")
     end
@@ -1231,7 +1290,14 @@ def dataEmitContext(mapping: DataMapping): DataArtifact
       output.write("  public def ")
       output.write(dataRelationName(relation, principal, dependent, foreignKey), foreignKey.origin)
       output.write("(entity: " + semanticNamespaceDisplay(principal.typeName) + "): neri_data::Query<" + semanticNamespaceDisplay(dependent.typeName) + ">\n")
-      output.write("    return this." + dependent.setName + ".where(" + foreignKey.memberName + ": entity." + key.memberName + ")\n  end\n")
+      output.write("    return this." + dependent.setName)
+      var component = 0
+
+      while component < relation.keyMembers.size
+        output.write(".where(" + relation.foreignKeyMembers.get(component) + ": entity." + relation.keyMembers.get(component) + ")")
+        component = component + 1
+      end
+      output.write("\n  end\n")
       if dataRelationSupportsLink(relation)
         output.write("\n  ## Links tracked entities through the mapped foreign key.\n  public def ")
         output.write(dataRelationLinkName(relation, principal, dependent, foreignKey), foreignKey.origin)
@@ -1281,7 +1347,19 @@ def dataEmitContext(mapping: DataMapping): DataArtifact
         output.write(dataRelationNavigationName(relation, principal, dependent, foreignKey, "get_collection") + ", ")
         output.write(dataRelationNavigationName(relation, principal, dependent, foreignKey, "set_collection") + ", ")
         output.write(dataRelationNavigationName(relation, principal, dependent, foreignKey, "get_reference") + ", ")
-        output.write(dataRelationNavigationName(relation, principal, dependent, foreignKey, "set_reference") + ")\n")
+        output.write(dataRelationNavigationName(
+            relation,
+            principal,
+            dependent,
+            foreignKey,
+            "set_reference"
+          ) + ", foreignKeyColumns: " + dataMemberColumns(
+            dependent,
+            relation.foreignKeyMembers
+          ) + ", principalKeyColumns: " + dataMemberColumns(
+            principal,
+            relation.keyMembers
+          ) + ")\n")
         output.write("\n    return neri_data::include(principals, this." + dependent.setName + ", navigation)\n  end\n")
         output.write("\n  ## Loads the principal reference for dependent rows.\n  public def includeReference_" + dataRelationName(
             relation,
@@ -1302,7 +1380,19 @@ def dataEmitContext(mapping: DataMapping): DataArtifact
         output.write(dataRelationNavigationName(relation, principal, dependent, foreignKey, "get_collection") + ", ")
         output.write(dataRelationNavigationName(relation, principal, dependent, foreignKey, "set_collection") + ", ")
         output.write(dataRelationNavigationName(relation, principal, dependent, foreignKey, "get_reference") + ", ")
-        output.write(dataRelationNavigationName(relation, principal, dependent, foreignKey, "set_reference") + ")\n")
+        output.write(dataRelationNavigationName(
+            relation,
+            principal,
+            dependent,
+            foreignKey,
+            "set_reference"
+          ) + ", foreignKeyColumns: " + dataMemberColumns(
+            dependent,
+            relation.foreignKeyMembers
+          ) + ", principalKeyColumns: " + dataMemberColumns(
+            principal,
+            relation.keyMembers
+          ) + ")\n")
         output.write("\n    return neri_data::includeReference(dependents, this." + principal.setName + ", navigation)\n  end\n")
         output.write("\n  ## Builds a deferred collection step for a typed navigation path.\n  public def collectionStep_" + dataRelationName(
             relation,
@@ -1323,7 +1413,19 @@ def dataEmitContext(mapping: DataMapping): DataArtifact
         output.write(dataRelationNavigationName(relation, principal, dependent, foreignKey, "get_collection") + ", ")
         output.write(dataRelationNavigationName(relation, principal, dependent, foreignKey, "set_collection") + ", ")
         output.write(dataRelationNavigationName(relation, principal, dependent, foreignKey, "get_reference") + ", ")
-        output.write(dataRelationNavigationName(relation, principal, dependent, foreignKey, "set_reference") + ")\n")
+        output.write(dataRelationNavigationName(
+            relation,
+            principal,
+            dependent,
+            foreignKey,
+            "set_reference"
+          ) + ", foreignKeyColumns: " + dataMemberColumns(
+            dependent,
+            relation.foreignKeyMembers
+          ) + ", principalKeyColumns: " + dataMemberColumns(
+            principal,
+            relation.keyMembers
+          ) + ")\n")
         output.write("\n    return neri_data::collectionStep(this." + principal.setName + ", this." + dependent.setName + ", navigation, maximum, children)\n  end\n")
         output.write("\n  ## Builds a deferred reference step for a typed navigation path.\n  public def referenceStep_" + dataRelationName(
             relation,
@@ -1344,7 +1446,19 @@ def dataEmitContext(mapping: DataMapping): DataArtifact
         output.write(dataRelationNavigationName(relation, principal, dependent, foreignKey, "get_collection") + ", ")
         output.write(dataRelationNavigationName(relation, principal, dependent, foreignKey, "set_collection") + ", ")
         output.write(dataRelationNavigationName(relation, principal, dependent, foreignKey, "get_reference") + ", ")
-        output.write(dataRelationNavigationName(relation, principal, dependent, foreignKey, "set_reference") + ")\n")
+        output.write(dataRelationNavigationName(
+            relation,
+            principal,
+            dependent,
+            foreignKey,
+            "set_reference"
+          ) + ", foreignKeyColumns: " + dataMemberColumns(
+            dependent,
+            relation.foreignKeyMembers
+          ) + ", principalKeyColumns: " + dataMemberColumns(
+            principal,
+            relation.keyMembers
+          ) + ")\n")
         output.write("\n    return neri_data::referenceStep(this." + dependent.setName + ", this." + principal.setName + ", navigation)\n  end\n")
       end
     end
@@ -1411,4 +1525,138 @@ def dataEmit(mapping: DataMapping): DataEmission
   emission.add(dataEmitGraph(mapping))
   emission.add(dataEmitSchema(mapping))
   return emission
+end
+
+def dataEntityKeyColumns(entity: DataEntity): String
+  var result = "["
+  var index = 0
+
+  while index < entity.keyMembers.size
+    let field = entity.field(entity.keyMembers.get(index))
+
+    if field != null
+      result = result + (index == 0 ? "" : ", ") + lspQuote(field.columnName)
+    end
+    index = index + 1
+  end
+  return result + "]"
+end
+
+def dataMemberColumns(entity: DataEntity, members: StringBuffer): String
+  var result = "["
+  var index = 0
+
+  while index < members.size
+    let field = entity.field(members.get(index))
+
+    if field != null
+      result = result + (index == 0 ? "" : ", ") + lspQuote(field.columnName)
+    end
+    index = index + 1
+  end
+  return result + "]"
+end
+
+def dataSchemaReferenceCode(mapping: DataMapping, entity: DataEntity, field: DataField): String
+  var relation = mapping.firstRelation
+
+  while relation != null
+    let principal = relation.principal
+
+    if relation.dependentType == entity.typeName && relation.foreignKeyMember == field.memberName && principal != null
+      return ", reference: new neri_data::SchemaReference(" + lspQuote(principal.tableName) + ", " + dataMemberColumns(
+        principal,
+        relation.keyMembers
+      ) + ", " + dataMemberColumns(
+        entity,
+        relation.foreignKeyMembers
+      ) + ")"
+    end
+    relation = relation.nextRelation
+  end
+  return ""
+end
+
+def dataRelationKeyCell(entity: DataEntity, members: StringBuffer, first: DataField): String
+  if members.size == 1
+    return dataCaptureCell(first)
+  end
+  return "neri_data::compositeKeyCell(capture_" + entity.generatedName + "(entity), " + dataMemberColumns(
+    entity,
+    members
+  ) + ")"
+end
+
+def dataRelationTupleMetadata(relation: DataRelation, dependent: DataEntity): String
+  if relation.keyMembers.size == 1
+    return ""
+  end
+  var result = ", tupleColumns: new neri_data::ResultColumns(["
+  var index = 0
+
+  while index < relation.foreignKeyMembers.size
+    let field = dependent.field(relation.foreignKeyMembers.get(index))
+
+    if field != null
+      result = result + (index == 0 ? "" : ", ") + dataResultColumn(field)
+    end
+    index = index + 1
+  end
+  return result + "])"
+end
+
+def dataEmitCompositeForeignKeySetter(
+  output: DataArtifact,
+  relation: DataRelation,
+  principal: DataEntity,
+  dependent: DataEntity,
+  foreignKey: DataField
+): Void
+  output.write("def " + dataRelationForeignKeySetterName(
+      relation,
+      principal,
+      dependent,
+      foreignKey
+    ) + "(entity: " + semanticNamespaceDisplay(dependent.typeName) + ", value: neri_data::Cell): Void\n  match value\n    case neri_data::Cell.Null()\n")
+  var index = 0
+
+  if foreignKey.optional
+    while index < relation.foreignKeyMembers.size
+      output.write("      entity." + relation.foreignKeyMembers.get(index) + " = null\n")
+      index = index + 1
+    end
+  end
+  output.write("      return\n    case neri_data::Cell.Int(unused)\n      return\n    case neri_data::Cell.Bool(unused)\n      return\n    case neri_data::Cell.Float(unused)\n      return\n    case neri_data::Cell.Binary(unused)\n      return\n    case neri_data::Cell.Text(unused)\n  end\n  let row = neri_data::compositeKeyRow(value, " + dataMemberColumns(
+      dependent,
+      relation.foreignKeyMembers
+    ) + ")\n\n  if row == null\n    return\n  end\n")
+  index = 0
+  while index < relation.foreignKeyMembers.size
+    let field = dependent.field(relation.foreignKeyMembers.get(index))
+
+    if field != null
+      output.write("  var value_" + field.memberName + ": " + field.typeName + " = " + dataInitialValue(field) + "\n  match neri_data::decode" + (field.optional ? "Nullable" : "") + dataScalarName(field.domain) + "(row, " + lspQuote(field.columnName) + ")\n    case neri_data::DecodeResult.Failure(error)\n      return\n    case neri_data::DecodeResult.Value(decoded)\n      value_" + field.memberName + " = decoded\n  end\n")
+    end
+    index = index + 1
+  end
+  index = 0
+  while index < relation.foreignKeyMembers.size
+    let member = relation.foreignKeyMembers.get(index)
+
+    output.write("  entity." + member + " = value_" + member + "\n")
+    index = index + 1
+  end
+  output.write("end\n\n")
+end
+
+def dataEntityHasExtendedScalars(entity: DataEntity): Bool
+  var field = entity.firstField
+
+  while field != null
+    if dataScalarName(field.domain) == "ByteBuffer" || dataScalarName(field.domain) == "Decimal"
+      return true
+    end
+    field = field.nextField
+  end
+  return false
 end

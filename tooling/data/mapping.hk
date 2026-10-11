@@ -304,6 +304,10 @@ def dataTypeDomain(typeName: String): DataScalarKind?
     return DataScalarKind.Float()
   else if concrete == "String"
     return DataScalarKind.String()
+  else if concrete == "buffers.ByteBuffer" || concrete == "ByteBuffer"
+    return DataScalarKind.Binary()
+  else if concrete == "neri_data.Decimal" || concrete == "Decimal"
+    return DataScalarKind.Decimal()
   end
   return null
 end
@@ -452,6 +456,18 @@ def dataParseDefault(mapping: DataMapping, field: DataField, value: LspJson, con
         return mapping.fail(context + ".default must be a finite Float number.")
       end
       field.defaultCode = "neri_data::SchemaDefault.Float(" + literal + ")"
+    case DataScalarKind.Binary()
+      return mapping.fail(context + ".default does not support binary values; assign a ByteBuffer in application code.")
+    case DataScalarKind.Decimal()
+      if !value.isString()
+        return mapping.fail(context + ".default for Decimal must be a JSON decimal string.")
+      end
+      let parsed = dataDecimalLiteral(value.scalarText())
+
+      if parsed == null
+        return mapping.fail(context + ".default must be an exact decimal string with at most 4096 digits.")
+      end
+      field.defaultCode = "neri_data::SchemaDefault.Text(" + dataStringLiteral(parsed) + ")"
     case DataScalarKind.String()
       if !value.isString()
         return mapping.fail(context + ".default must be a JSON string.")
@@ -515,7 +531,7 @@ def dataParseField(mapping: DataMapping, entity: DataEntity, node: LspJson, inde
   let domain = dataTypeDomain(symbol.typeName)
 
   if domain == null
-    return mapping.fail("Mapped member '" + entity.typeName + "." + memberName + "' has unsupported type '" + symbol.typeName + "'; expected Int, Bool, Float, String, or an optional of one of those types.")
+    return mapping.fail("Mapped member '" + entity.typeName + "." + memberName + "' has unsupported type '" + symbol.typeName + "'; expected Int, Bool, Float, String, buffers.ByteBuffer, neri_data.Decimal, or an optional of one of those types.")
   end
   let field = new DataField(domain)
 
@@ -526,7 +542,7 @@ def dataParseField(mapping: DataMapping, entity: DataEntity, node: LspJson, inde
   if !dataParseDefault(mapping, field, node.get("default"), context)
     return false
   end
-  if memberName == entity.keyMember && field.defaultCode != ""
+  if entity.isKeyMember(memberName) && field.defaultCode != ""
     return mapping.fail(context + ".default is not allowed on a primary key.")
   end
   let generation = node.get("valueGeneration")
@@ -535,7 +551,7 @@ def dataParseField(mapping: DataMapping, entity: DataEntity, node: LspJson, inde
     if !generation.isString() || (generation.scalarText() != "onAdd" && generation.scalarText() != "onAddOrUpdate")
       return mapping.fail(context + ".valueGeneration must be 'onAdd' or 'onAddOrUpdate'.")
     end
-    if memberName == entity.keyMember
+    if entity.isKeyMember(memberName)
       return mapping.fail(context + ".valueGeneration is for non-key fields; use entity keyGeneration for generated keys.")
     end
     field.generatedOnAdd = true
@@ -645,7 +661,7 @@ def dataParseEntity(mapping: DataMapping, node: LspJson, index: Int): Bool
     mapping,
     node,
     context,
-    ["type", "set", "table", "key", "keyGeneration", "columns", "indexes", "concurrencyTokens"]
+    ["type", "set", "table", "key", "keyGeneration", "columns", "indexes", "alternateKeys", "concurrencyTokens"]
   )
     return false
   end
@@ -654,7 +670,10 @@ def dataParseEntity(mapping: DataMapping, node: LspJson, index: Int): Bool
   entity.typeName = dataString(mapping, node, "type", context)
   entity.setName = dataString(mapping, node, "set", context)
   entity.tableName = dataString(mapping, node, "table", context)
-  entity.keyMember = dataString(mapping, node, "key", context)
+  if !dataParseMembers(mapping, node.get("key"), entity.keyMembers, context + ".key")
+    return false
+  end
+  entity.keyMember = entity.keyMembers.get(0)
   let keyGeneration = node.get("keyGeneration")
 
   if !keyGeneration.isMissing()
@@ -735,16 +754,21 @@ def dataParseEntity(mapping: DataMapping, node: LspJson, index: Int): Bool
   if entity.firstField == null
     return mapping.fail(context + ".columns must contain at least one mapping.")
   end
-  let key = entity.field(entity.keyMember)
+  var keyIndex = 0
 
-  if key == null
-    return mapping.fail("Entity '" + entity.typeName + "' key '" + entity.keyMember + "' must be present in columns.")
-  end
-  if key.optional || !dataScalarSupportsKey(key.domain)
-    return mapping.fail("Entity '" + entity.typeName + "' key must be a non-optional Int or String.")
-  end
-  if entity.generatedKey && key.typeName != "Int"
-    return mapping.fail("Entity '" + entity.typeName + "' generated key must be Int.")
+  while keyIndex < entity.keyMembers.size
+    let key = entity.field(entity.keyMembers.get(keyIndex))
+
+    if key == null
+      return mapping.fail(context + ".key contains a member missing from columns.")
+    end
+    if key.optional || !dataScalarSupportsKey(key.domain)
+      return mapping.fail(context + ".key requires non-optional Int or String members.")
+    end
+    if entity.generatedKey && (entity.keyMembers.size != 1 || key.typeName != "Int")
+      return mapping.fail(context + ".keyGeneration requires exactly one Int key member.")
+    end
+    keyIndex = keyIndex + 1
   end
   let tokens = node.get("concurrencyTokens")
 
@@ -761,7 +785,7 @@ def dataParseEntity(mapping: DataMapping, node: LspJson, index: Int): Bool
       end
       let field = entity.field(token.scalarText())
 
-      if field == null || field.memberName == entity.keyMember
+      if field == null || field.entity.isKeyMember(memberName)
         return mapping.fail(context + ".concurrencyTokens references an unknown or key member '" + token.scalarText() + "'.")
       end
       var prior = 0
@@ -776,6 +800,41 @@ def dataParseEntity(mapping: DataMapping, node: LspJson, index: Int): Bool
       token = token.next
     end
     entity.concurrencyColumns = selected
+  end
+  let alternateKeys = node.get("alternateKeys")
+
+  if !alternateKeys.isMissing()
+    if !alternateKeys.isArray()
+      return mapping.fail(context + ".alternateKeys must be an array of named key definitions.")
+    end
+    var alternate = alternateKeys.first
+    var alternateIndex = 0
+
+    while alternate != null
+      if !dataParseIndex(mapping, entity, alternate, alternateIndex)
+        return false
+      end
+      let definition = entity.lastIndex
+
+      if definition != null
+        definition.unique = true
+        var memberIndex = 0
+
+        while memberIndex < definition.fields.size
+          var field = entity.firstField
+
+          while field != null
+            if dataFieldIdentity(field) == definition.fields.get(memberIndex) && (field.optional || !dataScalarSupportsKey(field.domain))
+              return mapping.fail(context + ".alternateKeys requires non-optional Int or String members.")
+            end
+            field = field.nextField
+          end
+          memberIndex = memberIndex + 1
+        end
+      end
+      alternate = alternate.next
+      alternateIndex = alternateIndex + 1
+    end
   end
   if !dataInitializer(entity)
     return mapping.fail("Entity '" + entity.typeName + "' needs an accessible initializer whose parameters match mapped columns in order, or zero-argument construction with public mapped fields.")
@@ -809,8 +868,24 @@ def dataParseRelation(mapping: DataMapping, node: LspJson, index: Int): Bool
 
   relation.principalType = dataString(mapping, node, "principal", context)
   relation.dependentType = dataString(mapping, node, "dependent", context)
-  relation.keyMember = dataString(mapping, node, "key", context)
-  relation.foreignKeyMember = dataString(mapping, node, "foreignKey", context)
+  if !dataParseMembers(
+    mapping,
+    node.get("key"),
+    relation.keyMembers,
+    context + ".key"
+  ) || !dataParseMembers(
+    mapping,
+    node.get("foreignKey"),
+    relation.foreignKeyMembers,
+    context + ".foreignKey"
+  )
+    return false
+  end
+  if relation.keyMembers.size != relation.foreignKeyMembers.size
+    return mapping.fail(context + " key and foreignKey must have the same number of members.")
+  end
+  relation.keyMember = relation.keyMembers.get(0)
+  relation.foreignKeyMember = relation.foreignKeyMembers.get(0)
   let deleteBehavior = node.get("deleteBehavior")
 
   if !deleteBehavior.isMissing()
@@ -858,16 +933,30 @@ def dataParseRelation(mapping: DataMapping, node: LspJson, index: Int): Bool
   if foreignKey.generatedOnAdd
     return mapping.fail(context + ".foreignKey cannot be a store-generated non-key field; tracked relationship writes own its value.")
   end
-  if relation.keyMember != principal.keyMember
-    return mapping.fail(context + ".key must name the principal entity key '" + principal.keyMember + "'.")
+  if !dataEntityHasKey(principal, relation.keyMembers)
+    return mapping.fail(context + ".key must name the complete principal primary key or a declared unique key.")
   end
-  let foreignKeyValueType = foreignKey.optional ? semanticInnerType(foreignKey.typeName) : foreignKey.typeName
+  var component = 0
 
-  if key.typeName != foreignKeyValueType
-    return mapping.fail(context + " foreign key must have the principal key type or its optional form, got '" + key.typeName + "' and '" + foreignKey.typeName + "'.")
-  end
-  if relation.deleteBehavior == "clientSetNull" && (!foreignKey.optional || relation.foreignKeyMember == dependent.keyMember)
-    return mapping.fail(context + ".deleteBehavior 'clientSetNull' requires a nullable, non-identifying foreign key.")
+  while component < relation.keyMembers.size
+    let principalField = principal.field(relation.keyMembers.get(component))
+    let dependentField = dependent.field(relation.foreignKeyMembers.get(component))
+
+    if principalField == null || dependentField == null || principalField.optional || !dataScalarSupportsKey(principalField.domain)
+      return mapping.fail(context + " keys must name mapped non-optional Int or String principal members.")
+    end
+    let foreignType = dependentField.optional ? semanticInnerType(dependentField.typeName) : dependentField.typeName
+
+    if principalField.typeName != foreignType || dependentField.generatedOnAdd
+      return mapping.fail(context + " foreign key components must match the principal key types and be application-owned.")
+    end
+    if dependentField.optional != foreignKey.optional
+      return mapping.fail(context + " foreign key components must share nullability.")
+    end
+    if relation.deleteBehavior == "clientSetNull" && (!dependentField.optional || dependent.isKeyMember(dependentField.memberName))
+      return mapping.fail(context + ".deleteBehavior 'clientSetNull' requires nullable, non-identifying foreign key components.")
+    end
+    component = component + 1
   end
   if relation.collectionMember != ""
     if !dataIdentifier(relation.collectionMember) || !dataIdentifier(relation.referenceMember)
@@ -1171,4 +1260,130 @@ def dataLoadMapping(path: String): DataMapping
     relationIndex = relationIndex + 1
   end
   return mapping
+end
+
+def dataParseMembers(mapping: DataMapping, node: LspJson, members: StringBuffer, context: String): Bool
+  if node.isString()
+    if !dataIdentifier(node.scalarText())
+      return mapping.fail(context + " must name a Neri member.")
+    end
+    members.add(node.scalarText())
+    return true
+  end
+  if !node.isArray()
+    return mapping.fail(context + " must be a member name or an array of member names.")
+  end
+  var member = node.first
+
+  while member != null
+    if !member.isString() || !dataIdentifier(member.scalarText())
+      return mapping.fail(context + " must contain Neri member names.")
+    end
+    var prior = 0
+
+    while prior < members.size
+      if members.get(prior) == member.scalarText()
+        return mapping.fail(context + " contains a duplicate member.")
+      end
+      prior = prior + 1
+    end
+    members.add(member.scalarText())
+    member = member.next
+  end
+  if members.size == 0
+    return mapping.fail(context + " must contain at least one member.")
+  end
+  return true
+end
+
+def dataDecimalLiteral(value: String): String?
+  let length = host::stringByteLength(value)
+
+  if length == 0 || length > 4098
+    return null
+  end
+  var start = 0
+  var negative = false
+  let sign = host::stringByteAt(value, 0) as Int
+
+  if sign == 45 || sign == 43
+    negative = sign == 45
+    start = 1
+  end
+  var point = length
+  var index = start
+  var digits = 0
+
+  while index < length
+    let byte = host::stringByteAt(value, index) as Int
+
+    if byte == 46 && point == length && index > start && index + 1 < length
+      point = index
+    else if byte >= 48 && byte <= 57
+      digits = digits + 1
+    else
+      return null
+    end
+    index = index + 1
+  end
+  if digits == 0 || digits > 4096
+    return null
+  end
+  while start + 1 < point && host::stringByteAt(value, start) as Int == 48
+    start = start + 1
+  end
+  var finish = length
+
+  if point < length
+    while finish > point + 1 && host::stringByteAt(value, finish - 1) as Int == 48
+      finish = finish - 1
+    end
+    finish = point if finish == point + 1
+  end
+  let result = host::stringSlice(value, start, finish - start)
+
+  return result == "0" ? "0" : (negative ? "-" : "") + result
+end
+
+def dataEntityHasKey(entity: DataEntity, members: StringBuffer): Bool
+  var primary = entity.keyMembers.size == members.size
+  var position = 0
+
+  while position < members.size
+    primary = false if position >= entity.keyMembers.size || entity.keyMembers.get(position) != members.get(position)
+    position = position + 1
+  end
+  if primary
+    return true
+  end
+  var index = entity.firstIndex
+
+  while index != null
+    if index.unique && index.fields.size == members.size
+      var matches = true
+
+      position = 0
+      while position < members.size
+        let field = entity.field(members.get(position))
+
+        matches = false if field == null || dataFieldIdentity(field) != index.fields.get(position)
+        position = position + 1
+      end
+      return true if matches
+    end
+    index = index.nextIndex
+  end
+  return false
+end
+
+def dataKeyPosition(entity: DataEntity, member: String): Int
+  if entity.keyMembers.size > 1
+    var index = 0
+
+    while index < entity.keyMembers.size
+      return index + 1 if entity.keyMembers.get(index) == member
+      index = index + 1
+    end
+  end
+  return 0
 end
