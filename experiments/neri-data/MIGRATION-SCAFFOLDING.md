@@ -70,7 +70,10 @@ A catalog directory contains completed bundles and generated `catalog.hk` and
 digests, then follows before/after signatures from the empty model. Directory
 and identifier spelling do not determine order. Missing bundles, branching
 history, edited generated operations, unknown files and symlinks fail discovery.
-The runtime project reference is resolved from the mapped data unit.
+The runtime project reference is resolved across the mapped project units.
+All runtime references must resolve to one project; the entities unit may remain
+a plain domain-model library. Generated catalog manifests store a relative
+reference to that runtime.
 
 ```sh
 scripts/neri.sh run --project tooling/data --unit migration-scaffold -- discover mapping.json migrations
