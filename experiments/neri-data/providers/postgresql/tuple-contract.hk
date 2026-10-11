@@ -1,0 +1,195 @@
+use neri_data
+use neri_data_postgresql
+use neri_data_async_contract
+use test
+
+class PostgreSQLTuplePrincipal
+  public tenant: Int = 1
+  public code: String = "first"
+  public external: Int = 100
+  public label: String = "original"
+  public childTenant: Int?
+  public childSequence: Int?
+end
+
+class PostgreSQLTupleDependent
+  public tenant: Int = 1
+  public sequence: Int = 7
+  public ownerTenant: Int?
+  public ownerExternal: Int?
+end
+
+def pgCaptureTuplePrincipal(entity: PostgreSQLTuplePrincipal): RawRow
+  return new RawRow([
+      new RawColumn("tenant", Cell.Int(entity.tenant)),
+      new RawColumn("code", Cell.Text(entity.code)),
+      new RawColumn("external", Cell.Int(entity.external)),
+      new RawColumn("label", Cell.Text(entity.label)),
+      new RawColumn("child_tenant", cellOptionalInt(entity.childTenant)),
+      new RawColumn("child_sequence", cellOptionalInt(entity.childSequence))
+    ])
+end
+
+def pgCaptureTupleDependent(entity: PostgreSQLTupleDependent): RawRow
+  return new RawRow([
+      new RawColumn("tenant", Cell.Int(entity.tenant)),
+      new RawColumn("sequence", Cell.Int(entity.sequence)),
+      new RawColumn("owner_tenant", cellOptionalInt(entity.ownerTenant)),
+      new RawColumn("owner_external", cellOptionalInt(entity.ownerExternal))
+    ])
+end
+
+def pgTupleCatalog(): MigrationSet
+  let principalReference = new SchemaReference(
+    "neri_contract_tuple_children",
+    ["tenant", "sequence"],
+    ["child_tenant", "child_sequence"]
+  )
+  let dependentReference = new SchemaReference(
+    "neri_contract_tuple_principals",
+    ["tenant", "external"],
+    ["owner_tenant", "owner_external"]
+  )
+  let migration = new Migration("pg_contract_tuples", [
+      SchemaOp.CreateTable("neri_contract_tuple_children", [
+          new SchemaColumn("tenant", SchemaType.Int(), primaryKey: true, keyPosition: 0),
+          new SchemaColumn("sequence", SchemaType.Int(), primaryKey: true, keyPosition: 1),
+          new SchemaColumn("owner_tenant", SchemaType.Int(), nullable: true, reference: dependentReference),
+          new SchemaColumn("owner_external", SchemaType.Int(), nullable: true)
+        ]),
+      SchemaOp.CreateTable("neri_contract_tuple_principals", [
+          new SchemaColumn("tenant", SchemaType.Int(), primaryKey: true, keyPosition: 0),
+          new SchemaColumn("code", SchemaType.Text(), primaryKey: true, keyPosition: 1),
+          new SchemaColumn("external", SchemaType.Int()),
+          new SchemaColumn("label", SchemaType.Text()),
+          new SchemaColumn("child_tenant", SchemaType.Int(), nullable: true, reference: principalReference),
+          new SchemaColumn("child_sequence", SchemaType.Int(), nullable: true)
+        ]),
+      SchemaOp.CreateIndex(
+        "neri_contract_tuple_alternate",
+        "neri_contract_tuple_principals",
+        ["tenant", "external"],
+        true
+      )
+    ], [
+      SchemaOp.DropTable("neri_contract_tuple_principals"),
+      SchemaOp.DropTable("neri_contract_tuple_children")
+    ])
+
+  return new MigrationSet([migration])
+end
+
+def pgTupleCount(provider: PostgreSQLProvider, sql: String, expected: Int): Void
+  let columns = new ResultColumns([new ResultColumn("n", ResultColumnKind.Int())])
+
+  match provider.execute(new SqlPlan(sql, new ParameterValues(), 1, columns))
+    case ProviderResult.Failure(error)
+      console::println(providerFailureMessage(error))
+
+      test::assertTrue(false)
+    case ProviderResult.Rows(rows)
+      test::assertEqual(rows.Length, 1)
+      if rows.Length == 1
+        match decodeInt(rows[0], "n")
+          case DecodeResult.Value(value)
+            test::assertEqual(value, expected)
+          case DecodeResult.Failure(error)
+            test::assertTrue(false)
+        end
+      end
+  end
+end
+
+def verifyPostgreSQLTuples(provider: PostgreSQLProvider): Void
+  let catalog = pgTupleCatalog()
+
+  pgMigrationApplied(provider.migrate(catalog), 1)
+  let principalColumns = new ResultColumns([
+      new ResultColumn("tenant", ResultColumnKind.Int()),
+      new ResultColumn("code", ResultColumnKind.Text()),
+      new ResultColumn("external", ResultColumnKind.Int()),
+      new ResultColumn("label", ResultColumnKind.Text()),
+      new ResultColumn("child_tenant", ResultColumnKind.Int(), true),
+      new ResultColumn("child_sequence", ResultColumnKind.Int(), true)
+    ])
+  let dependentColumns = new ResultColumns([
+      new ResultColumn("tenant", ResultColumnKind.Int()),
+      new ResultColumn("sequence", ResultColumnKind.Int()),
+      new ResultColumn("owner_tenant", ResultColumnKind.Int(), true),
+      new ResultColumn("owner_external", ResultColumnKind.Int(), true)
+    ])
+  let principals = new EntityTracker<PostgreSQLTuplePrincipal>(
+    "neri_contract_tuple_principals", "tenant", principalColumns, pgCaptureTuplePrincipal,
+    keyColumns: ["tenant", "code"], alternateKeyColumns: [["tenant", "external"]],
+    foreignKeyColumns: [["child_tenant", "child_sequence"]]
+  )
+  let children = new EntityTracker<PostgreSQLTupleDependent>(
+    "neri_contract_tuple_children", "tenant", dependentColumns, pgCaptureTupleDependent,
+    keyColumns: ["tenant", "sequence"], foreignKeyColumns: [["owner_tenant", "owner_external"]]
+  )
+  let context = new ChangeContext(provider)
+  let first = new PostgreSQLTuplePrincipal()
+  let second = new PostgreSQLTuplePrincipal()
+  let child = new PostgreSQLTupleDependent()
+
+  context.register(principals.changeSet())
+  context.register(children.changeSet())
+  second.code = "second"
+  second.external = 101
+
+  test::assertTrue(principals.add(first) == null)
+  test::assertTrue(principals.add(second) == null)
+  asyncContextSaved(awaitAsyncContextSave(context, 2))
+  child.ownerTenant = 1
+
+  test::assertTrue(children.add(child) != null)
+  child.ownerExternal = 100
+
+  test::assertTrue(children.add(child) == null)
+  asyncContextSaved(awaitAsyncContextSave(context, 1))
+  first.childTenant = 1
+  first.childSequence = 7
+  first.label = "updated first tuple"
+  asyncContextSaved(awaitAsyncContextSave(context, 1))
+  pgTupleCount(
+    provider,
+    "SELECT COUNT(*) AS n FROM neri_contract_tuple_principals WHERE tenant=1 AND code='first' AND label='updated first tuple'",
+    1
+  )
+  pgTupleCount(
+    provider,
+    "SELECT COUNT(*) AS n FROM neri_contract_tuple_principals WHERE tenant=1 AND code='second' AND label='original'",
+    1
+  )
+  pgTupleCount(
+    provider,
+    "SELECT COUNT(*) AS n FROM neri_contract_tuple_principals p JOIN neri_contract_tuple_children c ON (p.tenant,p.external)=(c.owner_tenant,c.owner_external) WHERE (p.child_tenant,p.child_sequence)=(c.tenant,c.sequence)",
+    1
+  )
+
+  match provider.executeSet(new SetWritePlan(
+      "UPDATE neri_contract_tuple_children SET owner_external=999",
+      new WriteValues()
+    ))
+    case WriteResult.Saved(count)
+      test::assertTrue(false)
+    case WriteResult.SavedWithValues(count, rows)
+      test::assertTrue(false)
+    case WriteResult.Failure(error)
+      test::assertTrue(writeFailureMessage(error) != "")
+  end
+  pgTupleCount(provider, "SELECT COUNT(*) AS n FROM neri_contract_tuple_children WHERE owner_external=100", 1)
+  first.childTenant = null
+  first.childSequence = null
+  asyncContextSaved(awaitAsyncContextSave(context, 1))
+
+  test::assertTrue(children.remove(child) == null)
+  asyncContextSaved(awaitAsyncContextSave(context, 1))
+
+  test::assertTrue(principals.remove(first) == null)
+  test::assertTrue(principals.remove(second) == null)
+  asyncContextSaved(awaitAsyncContextSave(context, 2))
+  pgTupleCount(provider, "SELECT COUNT(*) AS n FROM neri_contract_tuple_principals", 0)
+  pgTupleCount(provider, "SELECT COUNT(*) AS n FROM neri_contract_tuple_children", 0)
+  pgMigrationApplied(provider.migrate(catalog, ""), 1)
+end
