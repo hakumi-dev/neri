@@ -357,6 +357,11 @@ def sqliteRebuildUnsupportedSql(sql: String): Bool
 end
 
 def sqliteRebuildDefault(column: readonly SchemaColumn): String?
+  let sql = column.defaultSql()
+
+  if sql != null
+    return sql
+  end
   let value = column.defaultValue()
 
   if value == null
@@ -453,6 +458,15 @@ unsafe def sqliteRebuildInspect(
   let oldName = schemaTextLiteral(before.name())
   let newName = schemaTextLiteral(after.name())
   let temporary = schemaTextLiteral("__neri_rebuild")
+  var authored = false
+  var authoredIndex = 0
+
+  while authoredIndex < before.count()
+    let field = before.at(authoredIndex)
+
+    authored = authored || (field != null && schemaColumnFacetsCode(field.column()) != "")
+    authoredIndex = authoredIndex + 1
+  end
 
   let mainStaging = sqliteRebuildCheck(
     database,
@@ -558,24 +572,34 @@ unsafe def sqliteRebuildInspect(
             end
             field = field + 1
           end
-          if expected == null || actual.hidden() != 0 || actual.declaredType() != sqliteRebuildType(expected) || actual.required() != (!expected.nullable() && (!expected.primaryKey() || sqliteRebuildType(expected) == "TEXT" || sqliteRebuildKeyCount(before) > 1)) || actual.keyPosition() != sqliteRebuildKeyPosition(
+          if expected == null || actual.hidden() != (expected.computedSql() == null ? 0 : (expected.computedStored() ? 3 : 2)) || actual.declaredType() != sqliteRebuildType(expected) || actual.required() != (!expected.nullable() && (!expected.primaryKey() || sqliteRebuildType(expected) == "TEXT" || sqliteRebuildKeyCount(before) > 1)) || actual.keyPosition() != sqliteRebuildKeyPosition(
             before,
             expected.name()
-          ) || actual.defaultSql() != sqliteRebuildDefault(expected)
+          ) || (!authored && actual.defaultSql() != sqliteRebuildDefault(expected))
             return MigrationFailure.Drift("SQLite rebuild source column differs from declared schema")
           end
         end
         position = position + 1
       end
-      if actualCount != before.count() || createSql == null || sqliteRebuildUnsupportedSql(createSql)
+      if actualCount != before.count() || createSql == null || (!authored && sqliteRebuildUnsupportedSql(createSql))
         return MigrationFailure.Drift("SQLite rebuild source has missing columns or unsupported table constraints")
+      end
+      if authored
+        match compileSchema(schemaTableCreate(before), SqlDialect.QuestionMark())
+          case SchemaCompileResult.Failure(message)
+            return MigrationFailure.Validation(message)
+          case SchemaCompileResult.Statement(sql)
+            if schemaNormalizedSql(createSql) != schemaNormalizedSql(sql)
+              return MigrationFailure.Drift("SQLite rebuild authored source DDL differs from declared schema")
+            end
+        end
       end
   end
   return sqliteRebuildInspectIndexes(database, before)
 end
 
 unsafe def sqliteRebuildInspectIndexes(database: Void*, before: readonly SchemaTable): MigrationFailure?
-  let sql = "SELECT l.name, l.\"unique\", l.origin, l.partial, x.seqno, x.cid, x.name, x.\"desc\", x.coll FROM pragma_index_list(" + schemaTextLiteral(before.name()) + ", 'main') AS l JOIN pragma_index_xinfo(l.name, 'main') AS x WHERE x.\"key\" = 1 ORDER BY l.seq, x.seqno"
+  let sql = "SELECT l.name, l.\"unique\", l.origin, l.partial, x.seqno, x.cid, x.name, x.\"desc\", x.coll, s.sql FROM pragma_index_list(" + schemaTextLiteral(before.name()) + ", 'main') AS l JOIN pragma_index_xinfo(l.name, 'main') AS x LEFT JOIN main.sqlite_schema AS s ON s.type='index' AND s.name=l.name WHERE x.\"key\" = 1 ORDER BY l.seq, x.seqno"
   let statement = stackalloc Void*[1]
   let status = sqlitePrepareMigration(database, sql, statement)
   let prepared: Void*? = statement[0]
@@ -604,7 +628,7 @@ unsafe def sqliteRebuildInspectIndexes(database: Void*, before: readonly SchemaT
     let column = sqliteSchemaText(prepared, 6)
     let collation = sqliteSchemaText(prepared, 8)
 
-    if name == null || origin == null || column == null || collation == null || sqliteColumnType(
+    if name == null || origin == null || collation == null || sqliteColumnType(
       prepared,
       1 as Int32
     ) != (1 as Int32) || sqliteColumnType(
@@ -630,7 +654,7 @@ unsafe def sqliteRebuildInspectIndexes(database: Void*, before: readonly SchemaT
       if origin == "pk"
         let primary = sqliteRebuildKeyAt(before, ordinal)
 
-        if primary == null || !schemaSameIdentifier(
+        if primary == null || column == null || !schemaSameIdentifier(
           column,
           primary.name()
         ) || sqliteColumnInt(
@@ -647,14 +671,31 @@ unsafe def sqliteRebuildInspectIndexes(database: Void*, before: readonly SchemaT
           7 as Int32
         ) != 0 || !schemaSameIdentifier(
           collation,
-          "BINARY"
+          sqliteRebuildCollation(primary)
         )
           failure = MigrationFailure.Drift("SQLite rebuild source primary-key index differs from declared schema")
         else
           primaryKeys = primaryKeys + 1
         end
+      else if index != null && index.hasFacets()
+        let actual = sqliteSchemaText(prepared, 9)
+        var expected: String? = null
+
+        match compileSchema(schemaIndexCreate(before, index), SqlDialect.QuestionMark())
+          case SchemaCompileResult.Failure(message)
+            failure = MigrationFailure.Validation(message)
+          case SchemaCompileResult.Statement(sql)
+            expected = sql
+        end
+        if failure == null && (actual == null || expected == null || origin != "c" || schemaNormalizedSql(actual) != schemaNormalizedSql(expected))
+          failure = MigrationFailure.Drift("SQLite rebuild source expression index differs from declared schema")
+        end
+        if failure == null
+          seen = seen + 1 if ordinal == 0
+          keys = keys + 1
+        end
       else
-        if index == null || field == null || origin != "c" || sqliteColumnInt(
+        if index == null || field == null || column == null || origin != "c" || sqliteColumnInt(
           prepared,
           3 as Int32
         ) != 0 || sqliteColumnInt(
@@ -665,7 +706,7 @@ unsafe def sqliteRebuildInspectIndexes(database: Void*, before: readonly SchemaT
           7 as Int32
         ) != 0 || !schemaSameIdentifier(
           collation,
-          "BINARY"
+          sqliteRebuildCollation(field.column())
         ) || !schemaSameIdentifier(
           column,
           field.column().name()
@@ -699,7 +740,7 @@ unsafe def sqliteRebuildInspectIndexes(database: Void*, before: readonly SchemaT
     let index = before.indexAt(ordinal)
 
     if index != null
-      expectedKeys = expectedKeys + index.count()
+      expectedKeys = expectedKeys + index.count() + index.expressions().Length
     end
     ordinal = ordinal + 1
   end
@@ -878,7 +919,7 @@ unsafe def sqliteRebuildTable(
     end
     let original = before.find(field.identity())
 
-    if original != null
+    if original != null && field.column().computedSql() == null
       let separator = targets == "" ? "" : ", "
 
       targets = targets + separator + schemaQuote(field.column().name())
@@ -975,8 +1016,9 @@ unsafe def sqliteMigrationOperations(database: Void*, migration: readonly Migrat
       case SchemaOp.DropColumn(table, column)
       case SchemaOp.RenameTable(from, to)
       case SchemaOp.RenameColumn(table, from, to)
-      case SchemaOp.CreateIndex(name, table, columns, unique)
+      case SchemaOp.CreateIndex(name, table, columns, unique, indexFacets)
       case SchemaOp.DropIndex(name)
+      case SchemaOp.Sql(statement)
     end
     if !rebuilt
       match compileSchema(operation, SqlDialect.QuestionMark())
@@ -1127,4 +1169,11 @@ unsafe def sqliteRebuildInspectReferences(
     failure = MigrationFailure.Drift("SQLite rebuild source foreign-key count differs from declared schema")
   end
   return sqliteMigrationFinalize(database, prepared, failure)
+end
+
+
+def sqliteRebuildCollation(column: readonly SchemaColumn): String
+  let collation = column.collation()
+
+  return collation == null ? "BINARY" : collation
 end

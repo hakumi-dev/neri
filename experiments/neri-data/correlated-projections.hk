@@ -1,0 +1,248 @@
+namespace neri_data
+
+## Projects one checked SQL scalar while retaining its typed result layout.
+def builtScalarShape<T, R>(
+  codec: ScalarCodec<R>,
+  builder: fn(EntityMapping, CompileState, SqlDialect): ScalarSqlResult
+): RowShape<T, R>
+  let build: fn(
+    EntityMapping,
+    Int,
+    CompileState,
+    SqlDialect,
+    String?
+  ): ShapeCompileResult<R> = fn(
+    mapping: EntityMapping,
+    offset: Int,
+    state: CompileState,
+    dialect: SqlDialect,
+    presence: String?
+  ): ShapeCompileResult<R> do
+    match builder(mapping, state, dialect)
+      case ScalarSqlResult.Failure(error)
+        return ShapeCompileResult<R>.Failure(error)
+      case ScalarSqlResult.Value(value)
+        let alias = "__neri_shape_" + (offset as String)
+        let columns = new ResultColumns([new ResultColumn(alias, codec.kind(), codec.nullable())])
+        let decoder = codec.decoder(alias)
+        let prepare: fn(RawRow): ShapePrepareResult<R> = fn(row: RawRow): ShapePrepareResult<R> do
+          match decoder.decode(row)
+            case DecodeResult.Failure(error)
+              return ShapePrepareResult<R>.Failure(error)
+            case DecodeResult.Value(result)
+              let make: fn(): R = fn(): R do
+                return result
+              end
+
+              return ShapePrepareResult<R>.Ready(new ShapePrepared<R>(make))
+          end
+        end
+
+        return ShapeCompileResult<R>.Plan(new ShapePlan<R>(
+            value.sql + " AS \"" + alias + "\"",
+            columns,
+            1,
+            prepare,
+            value.checkedScalars,
+            scalar: codec.preservesSqlValue() ? alias : null,
+            scalarType: codec.typeName()
+          ))
+    end
+  end
+
+  return new RowShape<T, R>(build)
+end
+
+## A correlated relation's filters and pagination apply before the key comparison.
+def correlatedCount<T, U, K>(
+  source: Relation<U>,
+  codec: ScalarCodec<K>,
+  outerKey: quote fn(T): K,
+  innerKey: quote fn(U): K
+): RowShape<T, Int>
+  let builder: fn(
+    EntityMapping,
+    CompileState,
+    SqlDialect
+  ): ScalarSqlResult = fn(
+    mapping: EntityMapping,
+    state: CompileState,
+    dialect: SqlDialect
+  ): ScalarSqlResult do
+    return correlatedKeySql(source, codec, outerKey, innerKey, mapping, state, dialect, "COUNT(*)")
+  end
+
+  return builtScalarShape<T, Int>(intScalar(), builder)
+end
+
+def correlatedAny<T, U, K>(
+  source: Relation<U>,
+  codec: ScalarCodec<K>,
+  outerKey: quote fn(T): K,
+  innerKey: quote fn(U): K
+): RowShape<T, Bool>
+  let builder: fn(
+    EntityMapping,
+    CompileState,
+    SqlDialect
+  ): ScalarSqlResult = fn(
+    mapping: EntityMapping,
+    state: CompileState,
+    dialect: SqlDialect
+  ): ScalarSqlResult do
+    match correlatedKeySql(source, codec, outerKey, innerKey, mapping, state, dialect, "1", exists: true)
+      case ScalarSqlResult.Failure(error)
+        return ScalarSqlResult.Failure(error)
+      case ScalarSqlResult.Value(value)
+        return ScalarSqlResult.Value(value)
+    end
+  end
+
+  return builtScalarShape<T, Bool>(boolScalar(), builder)
+end
+
+def correlatedKeySql<T, U, K>(
+  source: Relation<U>,
+  codec: ScalarCodec<K>,
+  outerKey: quote fn(T): K,
+  innerKey: quote fn(U): K,
+  mapping: EntityMapping,
+  state: CompileState,
+  dialect: SqlDialect,
+  selection: String,
+  exists: Bool = false
+): ScalarSqlResult
+  if !codec.preservesSqlValue()
+    return scalarSqlFailure("correlated keys require a certified scalar codec")
+  end
+  match source.build(dialect)
+    case RelationBuildResult.Failure(error)
+      return ScalarSqlResult.Failure(error)
+    case RelationBuildResult.Plan(plan)
+      let shifted = joinShiftSql(plan.sql, state.count, dialect)
+
+      if shifted == null
+        return scalarSqlFailure("correlated source parameters cannot be rebased")
+      end
+      joinParameterCopy(plan.parameters, state)
+      let innerMapping = joinStageMapping(plan.mapping, "__neri_correlated")
+
+      match compileScalarQuotation(innerMapping, innerKey.tree(), codec.typeName(), state, dialect)
+        case ScalarSqlResult.Failure(error)
+          return ScalarSqlResult.Failure(error)
+        case ScalarSqlResult.Value(inner)
+          match compileScalarQuotation(mapping, outerKey.tree(), codec.typeName(), state, dialect)
+            case ScalarSqlResult.Failure(error)
+              return ScalarSqlResult.Failure(error)
+            case ScalarSqlResult.Value(outer)
+              var equality = " IS "
+
+              match dialect
+                case SqlDialect.QuestionMark()
+                case SqlDialect.PostgreSql()
+                  equality = " IS NOT DISTINCT FROM "
+              end
+              let sql = "SELECT " + selection + " FROM (" + shifted + ") AS \"__neri_correlated\" WHERE " + inner.sql + equality + outer.sql
+
+              return ScalarSqlResult.Value(new ScalarSql(
+                  exists ? "EXISTS (" + sql + ")" : "(" + sql + ")",
+                  plan.checkedScalars || inner.checkedScalars || outer.checkedScalars
+                ))
+          end
+      end
+  end
+end
+
+def optionalProjectionCodec<R>(codec: ScalarCodec<R>): ScalarCodec<R?>
+  let decode: fn(Cell): DecodeResult<R?> = fn(cell: Cell): DecodeResult<R?> do
+    match cell
+      case Cell.Null()
+        return DecodeResult<R?>.Value(null)
+      case Cell.Bool(value)
+      case Cell.Int(value)
+      case Cell.Float(value)
+      case Cell.Text(value)
+      case Cell.Binary(value)
+    end
+    match codec.decode(cell)
+      case DecodeResult.Failure(error)
+        return DecodeResult<R?>.Failure(error)
+      case DecodeResult.Value(value)
+        return DecodeResult<R?>.Value(value)
+    end
+  end
+
+  let optional = new ScalarCodec<R?>(decode, codec.kind(), true, codec.typeName() + "?")
+
+  return codec.preservesSqlValue() ? optional.certifySqlValue() : optional
+end
+
+## Returns the ordered first correlated scalar, or NULL when no related row exists.
+def correlatedFirst<T, U, K, R>(
+  source: Relation<U>,
+  codec: ScalarCodec<R>,
+  selector: quote fn(U): R,
+  keyCodec: ScalarCodec<K>,
+  outerKey: quote fn(T): K,
+  innerKey: quote fn(U): K
+): RowShape<T, R?>
+  let builder: fn(
+    EntityMapping,
+    CompileState,
+    SqlDialect
+  ): ScalarSqlResult = fn(
+    mapping: EntityMapping,
+    state: CompileState,
+    dialect: SqlDialect
+  ): ScalarSqlResult do
+    if !codec.preservesSqlValue() || !keyCodec.preservesSqlValue() || codec.nullable()
+      return scalarSqlFailure("correlated first requires a certified required result codec and key codec")
+    end
+    match source.build(dialect)
+      case RelationBuildResult.Failure(error)
+        return ScalarSqlResult.Failure(error)
+      case RelationBuildResult.Plan(plan)
+        let innerMapping = joinStageMapping(plan.mapping, "__neri_correlated")
+
+        match compileScalarQuotation(innerMapping, selector.tree(), codec.typeName(), state, dialect)
+          case ScalarSqlResult.Failure(error)
+            return ScalarSqlResult.Failure(error)
+          case ScalarSqlResult.Value(selected)
+            let shifted = joinShiftSql(plan.sql, state.count, dialect)
+
+            if shifted == null
+              return scalarSqlFailure("correlated source parameters cannot be rebased")
+            end
+            joinParameterCopy(plan.parameters, state)
+            match compileScalarQuotation(innerMapping, innerKey.tree(), keyCodec.typeName(), state, dialect)
+              case ScalarSqlResult.Failure(error)
+                return ScalarSqlResult.Failure(error)
+              case ScalarSqlResult.Value(inner)
+                match compileScalarQuotation(mapping, outerKey.tree(), keyCodec.typeName(), state, dialect)
+                  case ScalarSqlResult.Failure(error)
+                    return ScalarSqlResult.Failure(error)
+                  case ScalarSqlResult.Value(outer)
+                    var equality = " IS "
+
+                    match dialect
+                      case SqlDialect.QuestionMark()
+                      case SqlDialect.PostgreSql()
+                        equality = " IS NOT DISTINCT FROM "
+                    end
+                    let sql = "(SELECT " + selected.sql + " FROM (" + shifted + ") AS \"__neri_correlated\" WHERE " + inner.sql + equality + outer.sql + joinOrderSql(
+                      plan.order,
+                      "__neri_correlated"
+                    ) + " LIMIT 1)"
+
+                    return ScalarSqlResult.Value(new ScalarSql(
+                        sql,
+                        plan.checkedScalars || selected.checkedScalars || inner.checkedScalars || outer.checkedScalars
+                      ))
+                end
+            end
+        end
+    end
+  end
+
+  return builtScalarShape<T, R?>(optionalProjectionCodec(codec), builder)
+end

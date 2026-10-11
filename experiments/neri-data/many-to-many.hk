@@ -51,6 +51,434 @@ class ManyToManyNavigation<L, J, R>
     this.graphEnrollment = enrollGraph
   end
 
+  ## Registers reversible collection-difference inference before tracked saves.
+  public def step(lefts: Query<L>, joins: Query<J>, rights: Query<R>, maximum: Int = 10000): NavigationStep<L, R>
+    let first = collectionStep(lefts, joins, this.leftJoin, maximum)
+    let second = referenceStep(joins, rights, this.rightJoin)
+    let check: fn(Bool): QueryFailure? = fn(asynchronous: Bool): QueryFailure? do
+      let invalid = first.validate(asynchronous)
+
+      return invalid == null ? second.validate(asynchronous) : invalid
+    end
+    let checkpoint: fn(NavigationJournal): Void = fn(journal: NavigationJournal): Void do
+      this.checkpoint(lefts, joins, rights, new TypedRows<L>(), new TypedRows<J>(), journal)
+    end
+    let run: fn(
+      TypedRows<L>,
+      NavigationJournal
+    ): QueryResult<R> = fn(
+      rows: TypedRows<L>,
+      journal: NavigationJournal
+    ): QueryResult<R> do
+      match first.run(rows, journal)
+        case QueryResult.Failure(error)
+          return QueryResult<R>.Failure(error)
+        case QueryResult.Rows(related)
+          match second.run(related, journal)
+            case QueryResult.Failure(error)
+              return QueryResult<R>.Failure(error)
+            case QueryResult.Rows(targets)
+              this.publish(rows, targets, journal)
+              return QueryResult<R>.Rows(targets)
+          end
+      end
+    end
+    let runAsync: fn(
+      TypedRows<L>,
+      NavigationJournal,
+      StreamOptions?
+    ): AsyncLoadDriver<R> = fn(
+      rows: TypedRows<L>,
+      journal: NavigationJournal,
+      options: StreamOptions?
+    ): AsyncLoadDriver<R> do
+      let next: fn(TypedRows<J>): AsyncLoadDriver<R> = fn(related: TypedRows<J>): AsyncLoadDriver<R> do
+        return second.runAsync(related, journal, options)
+      end
+      let publish: fn(QueryResult<R>): QueryResult<R> = fn(result: QueryResult<R>): QueryResult<R> do
+        match result
+          case QueryResult.Failure(error)
+            return QueryResult<R>.Failure(error)
+          case QueryResult.Rows(targets)
+            this.publish(rows, targets, journal)
+            return QueryResult<R>.Rows(targets)
+        end
+      end
+
+      return new AsyncMapLoad<R, R>(new AsyncThenLoad<J, R>(first.runAsync(rows, journal, options), next), publish)
+    end
+
+    let single: fn(
+      SingleNavigationScope,
+      SingleNavigationRows<L>
+    ): SingleNavigationRows<R> = fn(
+      scope: SingleNavigationScope,
+      input: SingleNavigationRows<L>
+    ): SingleNavigationRows<R> do
+      let joinRows = first.contributeSingle(scope, input)
+      let rightRows = second.contributeSingle(scope, joinRows)
+      let publish: fn(NavigationJournal): Void = fn(journal: NavigationJournal): Void do
+        this.checkpoint(lefts, joins, rights, input.rows, joinRows.rows, journal)
+        this.publish(input.rows, rightRows.rows, journal)
+      end
+
+      scope.afterPublication(publish)
+      return rightRows
+    end
+
+    return new NavigationStep<L, R>(
+      run,
+      check,
+      lefts.provider(),
+      lefts.changeOwner(),
+      lefts.rowTracker(),
+      rights.rowTracker(),
+      checkpoint,
+      runAsync,
+      singleContributor: single
+    )
+  end
+
+  public def inverseStep(lefts: Query<L>, joins: Query<J>, rights: Query<R>, maximum: Int = 10000): NavigationStep<R, L>
+    let create: fn(R, L): J = fn(right: R, left: L): J do
+      return this.joinFactory(left, right)
+    end
+    let inverse = new ManyToManyNavigation<R, J, L>(
+      this.rightJoin,
+      this.leftJoin,
+      this.rightGetter,
+      this.rightSetter,
+      this.leftGetter,
+      this.leftSetter,
+      create,
+      this.graphEnrollment
+    )
+
+    return inverse.step(rights, joins, lefts, maximum)
+  end
+
+  ## Registers reversible collection-difference inference before tracked saves.
+  public def trackCollectionChanges(lefts: Query<L>, joins: Query<J>, rights: Query<R>): WriteFailure?
+    let owner = joins.changeOwner()
+    let leftOwner = lefts.changeOwner()
+    let rightOwner = rights.changeOwner()
+
+    if owner == null || leftOwner == null || rightOwner == null || !reference::same(
+      owner,
+      leftOwner
+    ) || !reference::same(
+      owner,
+      rightOwner
+    )
+      return WriteFailure.Validation("skip navigation change detection requires the same context")
+    end
+    let leftTracker = lefts.rowTracker()
+    let joinTracker = joins.rowTracker()
+    let rightTracker = rights.rowTracker()
+
+    if leftTracker == null || joinTracker == null || rightTracker == null
+      return WriteFailure.Validation("skip navigation materialization fixup requires tracked query roots")
+    end
+    let observed = new SkipNavigationChanges<L, R>()
+    let fixup: fn(): QueryFailure? = fn(): QueryFailure? do
+      return this.fixupMaterialized(leftTracker, joinTracker, rightTracker, observed)
+    end
+    let detect: fn(GraphJournal): QueryFailure? = fn(journal: GraphJournal): QueryFailure? do
+      return this.detectCollectionChanges(lefts, joins, rights, journal)
+    end
+    let registered = owner.registerChangeDetector(detect)
+
+    if registered != null
+      return registered
+    end
+    leftTracker.observeMaterialization(fixup)
+    joinTracker.observeMaterialization(fixup)
+    rightTracker.observeMaterialization(fixup)
+    let release: fn(): Void = fn(): Void do
+      observed.clear()
+    end
+
+    leftTracker.observeClear(release)
+    joinTracker.observeClear(release)
+    rightTracker.observeClear(release)
+    return null
+  end
+
+  internal def fixupMaterialized(
+    leftTracker: EntityTracker<L>,
+    joinTracker: EntityTracker<J>,
+    rightTracker: EntityTracker<R>,
+    observed: SkipNavigationChanges<L, R>
+  ): QueryFailure?
+    let leftRows = new TypedRows<L>()
+    let rightRows = new TypedRows<R>()
+    let joinRows = new TypedRows<J>()
+    let collectLeft: fn(L): Bool = fn(value: L): Bool do
+      if !skipNavigationLive(leftTracker.stateOf(value))
+        return true
+      end
+      leftRows.add(value)
+      return leftRows.count() <= 10000
+    end
+    let collectRight: fn(R): Bool = fn(value: R): Bool do
+      if !skipNavigationLive(rightTracker.stateOf(value))
+        return true
+      end
+      rightRows.add(value)
+      return rightRows.count() <= 10000
+    end
+    let collectJoin: fn(J): Bool = fn(value: J): Bool do
+      if !skipNavigationLive(joinTracker.stateOf(value))
+        return true
+      end
+      joinRows.add(value)
+      return joinRows.count() <= 10000
+    end
+
+    if !leftTracker.visitTracked(collectLeft) || !rightTracker.visitTracked(collectRight) || !joinTracker.visitTracked(collectJoin)
+      return QueryFailure.UnsupportedCapability("skip navigation materialization fixup exceeds 10000 entities")
+    end
+    let discovered = new SkipNavigationChanges<L, R>()
+    var join = joinRows.first()
+
+    while join != null
+      let leftKey = this.leftJoin.foreignKey(join.value)
+      let rightKey = this.rightJoin.foreignKey(join.value)
+      var left = leftRows.first()
+
+      while left != null
+        if navigationCellEqual(this.leftJoin.principalKey(left.value), leftKey)
+          var right = rightRows.first()
+
+          while right != null
+            if navigationCellEqual(
+              this.rightJoin.principalKey(right.value),
+              rightKey
+            ) && discovered.pair(
+              left.value,
+              right.value
+            ) == null
+              return QueryFailure.UnsupportedCapability("skip navigation materialization fixup exceeds 10000 pairs")
+            end
+            right = right.next
+          end
+        end
+        left = left.next
+      end
+      join = join.next
+    end
+    observed.retain(discovered)
+    var pair = discovered.first
+
+    while pair != null
+      let previous = observed.pair(pair.left, pair.right)
+
+      if previous == null
+        return QueryFailure.UnsupportedCapability("skip navigation observed pair limit exceeded")
+      end
+      pair = pair.next
+    end
+    pair = discovered.first
+
+    while pair != null
+      let previous = observed.pair(pair.left, pair.right)
+
+      if previous != null && !previous.baseline
+        previous.baseline = true
+        let selectedRights = new TypedRows<R>()
+        let selectedLefts = new TypedRows<L>()
+
+        for right in this.leftGetter(pair.left)
+          navigationDistinct(selectedRights, right)
+        end
+        for left in this.rightGetter(pair.right)
+          navigationDistinct(selectedLefts, left)
+        end
+        navigationDistinct(selectedRights, pair.right)
+        navigationDistinct(selectedLefts, pair.left)
+        this.leftSetter(pair.left, navigationArray(selectedRights))
+        this.rightSetter(pair.right, navigationArray(selectedLefts))
+      end
+      pair = pair.next
+    end
+    return null
+  end
+
+  ## Reconciles edits on either skip collection against the mapped join baseline.
+  internal def detectCollectionChanges(
+    lefts: Query<L>,
+    joins: Query<J>,
+    rights: Query<R>,
+    journal: GraphJournal
+  ): QueryFailure?
+    let leftTracker = lefts.rowTracker()
+    let joinTracker = joins.rowTracker()
+    let rightTracker = rights.rowTracker()
+
+    if leftTracker == null || joinTracker == null || rightTracker == null
+      return QueryFailure.UnsupportedCapability("skip navigation change detection requires tracked query roots")
+    end
+    let pairs = new SkipNavigationChanges<L, R>()
+    let leftRows = new TypedRows<L>()
+    let rightRows = new TypedRows<R>()
+    let collectLeft: fn(L): Bool = fn(left: L): Bool do
+      leftRows.add(left)
+      let before = this.leftGetter(left)
+      let joinsBefore = this.leftJoin.collection(left)
+      let stateBefore = this.leftJoin.collectionState(left)
+      let undo: fn(): Void = fn(): Void do
+        this.leftSetter(left, before)
+        this.leftJoin.setCollection(left, joinsBefore)
+        this.leftJoin.markCollection(left, stateBefore)
+      end
+
+      journal.record(undo)
+      for right in before
+        if pairs.pair(left, right) == null
+          pairs.failure = QueryFailure.UnsupportedCapability("skip navigation changes exceed 10000 pairs")
+          return false
+        end
+      end
+      for join in joinsBefore
+        let right = this.rightJoin.reference(join)
+
+        if right != null
+          let pair = pairs.pair(left, right)
+
+          if pair == null
+            pairs.failure = QueryFailure.UnsupportedCapability("skip navigation changes exceed 10000 pairs")
+            return false
+          end
+          pair.baseline = true
+        end
+      end
+      return leftRows.count() <= 10000
+    end
+    let collectRight: fn(R): Bool = fn(right: R): Bool do
+      rightRows.add(right)
+      let before = this.rightGetter(right)
+      let joinsBefore = this.rightJoin.collection(right)
+      let stateBefore = this.rightJoin.collectionState(right)
+      let undo: fn(): Void = fn(): Void do
+        this.rightSetter(right, before)
+        this.rightJoin.setCollection(right, joinsBefore)
+        this.rightJoin.markCollection(right, stateBefore)
+      end
+
+      journal.record(undo)
+      for left in before
+        if pairs.pair(left, right) == null
+          pairs.failure = QueryFailure.UnsupportedCapability("skip navigation changes exceed 10000 pairs")
+          return false
+        end
+      end
+      return rightRows.count() <= 10000
+    end
+
+    if !leftTracker.visitTracked(collectLeft) || !rightTracker.visitTracked(collectRight)
+      return pairs.failure == null ? QueryFailure.UnsupportedCapability("skip navigation change detection exceeds 10000 entities") : pairs.failure
+    end
+    var change = pairs.first
+
+    while change != null
+      let pair = change
+      let leftState = lefts.stateOf(pair.left)
+      let rightState = rights.stateOf(pair.right)
+
+      if leftState == null || rightState == null
+        return QueryFailure.Provider(ProviderFailure.State("skip collection contains an endpoint outside its tracked context"))
+      end
+      var leftValid = false
+      var rightValid = false
+      var addedLeft = false
+
+      match leftState
+        case TrackingState.Added()
+          addedLeft = true
+          leftValid = true
+        case TrackingState.Unchanged()
+          leftValid = true
+        case TrackingState.Modified()
+          leftValid = true
+        case TrackingState.Deleted()
+        case TrackingState.Detached()
+      end
+      match rightState
+        case TrackingState.Added()
+          rightValid = true
+        case TrackingState.Unchanged()
+          rightValid = true
+        case TrackingState.Modified()
+          rightValid = true
+        case TrackingState.Deleted()
+        case TrackingState.Detached()
+      end
+      if !leftValid || !rightValid
+        return QueryFailure.Provider(ProviderFailure.State("skip collection contains a deleted or detached endpoint"))
+      end
+      var leftDesired = false
+      var rightDesired = false
+
+      for right in this.leftGetter(pair.left)
+        leftDesired = leftDesired || reference::same(right, pair.right)
+      end
+      for left in this.rightGetter(pair.right)
+        rightDesired = rightDesired || reference::same(left, pair.left)
+      end
+      let desired = leftDesired != pair.baseline ? leftDesired : (rightDesired != pair.baseline ? rightDesired : pair.baseline)
+
+      if desired != pair.baseline
+        var complete = addedLeft
+
+        match this.leftJoin.collectionState(pair.left)
+          case NavigationLoadState.Loaded()
+            complete = true
+          case NavigationLoadState.Unknown()
+          case NavigationLoadState.Loading()
+          case NavigationLoadState.Partial()
+        end
+        if !complete
+          return QueryFailure.UnsupportedCapability("skip collection edits require a complete loaded left join collection or an Added endpoint")
+        end
+      end
+      change = change.next
+    end
+    change = pairs.first
+
+    while change != null
+      let pair = change
+      var leftDesired = false
+      var rightDesired = false
+
+      for right in this.leftGetter(pair.left)
+        leftDesired = leftDesired || reference::same(right, pair.right)
+      end
+      for left in this.rightGetter(pair.right)
+        rightDesired = rightDesired || reference::same(left, pair.left)
+      end
+      let desired = leftDesired != pair.baseline ? leftDesired : (rightDesired != pair.baseline ? rightDesired : pair.baseline)
+
+      if desired != pair.baseline
+        if desired
+          let invalid = this.link(joins, pair.left, pair.right)
+
+          if invalid != null
+            return invalid
+          end
+        else
+          this.leftJoin.markCollection(pair.left, NavigationLoadState.Loaded())
+          let invalid = this.unlink(joins, pair.left, pair.right)
+
+          if invalid != null
+            return invalid
+          end
+        end
+      end
+      change = change.next
+    end
+    return null
+  end
+
   public def load(
     lefts: Query<L>,
     joins: Query<J>,

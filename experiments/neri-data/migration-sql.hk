@@ -34,7 +34,7 @@ def schemaSqliteRebuild(before: readonly SchemaTable, after: readonly SchemaTabl
     end
     let original = before.find(field.identity())
 
-    if original != null
+    if original != null && field.column().computedSql() == null
       targets = targets + (targets == "" ? "" : ", ") + schemaQuote(field.column().name())
       sources = sources + (sources == "" ? "" : ", ") + schemaQuote(original.column().name())
     end
@@ -65,11 +65,17 @@ def schemaSqliteRebuild(before: readonly SchemaTable, after: readonly SchemaTabl
   return SchemaCompileResult.Statement(output)
 end
 
+## Resolves deferred events for constraints that will disappear with this DROP group.
+def schemaPostgresDropGroup(tables: String, targets: String): String
+  return "DO $neri_drop$ DECLARE targets oid[] := ARRAY[" + targets + "]::oid[]; item record; BEGIN FOR item IN SELECT DISTINCT constraint_entry.connamespace, constraint_entry.conname, namespace_entry.nspname FROM pg_catalog.pg_constraint constraint_entry JOIN pg_catalog.pg_namespace namespace_entry ON namespace_entry.oid = constraint_entry.connamespace WHERE constraint_entry.condeferrable AND constraint_entry.conrelid = ANY(targets) LOOP IF EXISTS (SELECT 1 FROM pg_catalog.pg_constraint surviving WHERE surviving.connamespace = item.connamespace AND surviving.conname = item.conname AND NOT (surviving.conrelid = ANY(targets))) THEN RAISE EXCEPTION 'deferred DROP constraint name also belongs to a surviving table'; END IF; EXECUTE pg_catalog.format('SET CONSTRAINTS %I.%I IMMEDIATE', item.nspname, item.conname); END LOOP; END; $neri_drop$;\nDROP TABLE " + tables + ";\n"
+end
+
 ## Initial foreign keys are installed after tables and unique indexes, including cycles.
 def compilePostgresSchemaSegment(migration: readonly Migration, up: Bool, start: Int, finish: Int): SchemaCompileResult
   var output = ""
   var references = ""
   var drops = ""
+  var dropTargets = ""
   let count = finish
   var index = start
 
@@ -98,7 +104,8 @@ def compilePostgresSchemaSegment(migration: readonly Migration, up: Bool, start:
         case SchemaOp.DropColumn(table, column)
         case SchemaOp.RenameTable(from, to)
         case SchemaOp.RenameColumn(table, from, to)
-        case SchemaOp.CreateIndex(name, table, columns, unique)
+        case SchemaOp.CreateIndex(name, table, columns, unique, indexFacets)
+        case SchemaOp.Sql(statement)
         case SchemaOp.DropIndex(name)
 
         case SchemaOp.InsertData(table, columns, values)
@@ -122,14 +129,19 @@ def compilePostgresSchemaSegment(migration: readonly Migration, up: Bool, start:
 
     match operation
       case SchemaOp.DropTable(table)
+        if !schemaTableValid(table)
+          return SchemaCompileResult.Failure("invalid or reserved table name")
+        end
         drops = drops + (drops == "" ? "" : ", ") + schemaQuote(table)
+        dropTargets = dropTargets + (dropTargets == "" ? "" : ", ") + "'" + schemaQuote(table) + "'::regclass"
         drop = true
       case SchemaOp.CreateTable(table, columns)
       case SchemaOp.AddColumn(table, column)
       case SchemaOp.DropColumn(table, column)
       case SchemaOp.RenameTable(from, to)
       case SchemaOp.RenameColumn(table, from, to)
-      case SchemaOp.CreateIndex(name, table, columns, unique)
+      case SchemaOp.CreateIndex(name, table, columns, unique, indexFacets)
+      case SchemaOp.Sql(statement)
       case SchemaOp.DropIndex(name)
 
       case SchemaOp.InsertData(table, columns, values)
@@ -141,8 +153,9 @@ def compilePostgresSchemaSegment(migration: readonly Migration, up: Bool, start:
     end
     if !drop
       if drops != ""
-        output = output + "DROP TABLE " + drops + ";\n"
+        output = output + schemaPostgresDropGroup(drops, dropTargets)
         drops = ""
+        dropTargets = ""
       end
       var handled = false
 
@@ -158,7 +171,12 @@ def compilePostgresSchemaSegment(migration: readonly Migration, up: Bool, start:
               column.nullable(),
               column.primaryKey(),
               schemaCloneDefault(column.defaultValue()),
-              keyPosition: column.keyPosition()
+              keyPosition: column.keyPosition(),
+              defaultSql: column.defaultSql(),
+              computedSql: column.computedSql(),
+              computedStored: column.computedStored(),
+              checkSql: column.checkSql(),
+              collation: column.collation()
             )
           end
 
@@ -206,7 +224,8 @@ def compilePostgresSchemaSegment(migration: readonly Migration, up: Bool, start:
         case SchemaOp.DropColumn(table, column)
         case SchemaOp.RenameTable(from, to)
         case SchemaOp.RenameColumn(table, from, to)
-        case SchemaOp.CreateIndex(name, table, columns, unique)
+        case SchemaOp.CreateIndex(name, table, columns, unique, indexFacets)
+        case SchemaOp.Sql(statement)
         case SchemaOp.DropIndex(name)
 
         case SchemaOp.InsertData(table, columns, values)
@@ -227,7 +246,7 @@ def compilePostgresSchemaSegment(migration: readonly Migration, up: Bool, start:
     index = index + 1
   end
   if drops != ""
-    output = output + "DROP TABLE " + drops + ";\n"
+    output = output + schemaPostgresDropGroup(drops, dropTargets)
   end
   return SchemaCompileResult.Statement(output + references)
 end
@@ -241,6 +260,9 @@ def schemaMigrationSegmentEnd(migration: readonly Migration, up: Bool, start: In
 
     if operation == null || schemaSeedOperation(operation)
       return index
+    end
+    if schemaSqlOperation(operation)
+      return index == start ? index + 1 : index
     end
     index = index + 1
   end
@@ -314,7 +336,8 @@ def compileMigration(migration: readonly Migration, up: Bool, dialect: SqlDialec
       case SchemaOp.DropColumn(table, column)
       case SchemaOp.RenameTable(from, to)
       case SchemaOp.RenameColumn(table, from, to)
-      case SchemaOp.CreateIndex(name, table, columns, unique)
+      case SchemaOp.CreateIndex(name, table, columns, unique, indexFacets)
+      case SchemaOp.Sql(statement)
       case SchemaOp.DropIndex(name)
 
       case SchemaOp.InsertData(table, columns, values)

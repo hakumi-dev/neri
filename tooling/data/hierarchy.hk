@@ -2,12 +2,26 @@ def dataCopyField(source: DataField): DataField
   let field = new DataField(source.domain)
 
   field.memberName = source.memberName
+  field.getter = source.getter
+  field.setter = source.setter
   field.columnName = source.columnName
   field.typeName = source.typeName
   field.pathCode = source.pathCode
   field.schemaIdentity = source.schemaIdentity
   field.boolToInt = source.boolToInt
+  field.conversionEncode = source.conversionEncode
+  field.conversionDecode = source.conversionDecode
+  field.conversionInitial = source.conversionInitial
+  field.conversionStorageType = source.conversionStorageType
+  field.jsonSymbol = source.jsonSymbol
+  field.jsonPrefix = source.jsonPrefix
+  field.defaultSql = source.defaultSql
+  field.computedSql = source.computedSql
+  field.computedStored = source.computedStored
+  field.checkSql = source.checkSql
+  field.collation = source.collation
   field.optional = source.optional
+  field.optionalParents = source.optionalParents
   field.defaultCode = source.defaultCode
   field.defaultNode = source.defaultNode
   field.generatedOnAdd = source.generatedOnAdd
@@ -16,6 +30,28 @@ def dataCopyField(source: DataField): DataField
   field.declaration = source.declaration
   field.origin = source.origin
   return field
+end
+
+def dataHierarchyDiscriminators(mapping: DataMapping, root: DataEntity, selected: DataEntity): String
+  var result = "[" + lspQuote(selected.discriminatorValue)
+  var derived = root.firstDerived
+  let semantic = mapping.semantic
+
+  while derived != null
+    var symbol = derived.entity.symbol
+    var depth = 0
+
+    while symbol != null && semantic != null && depth < 256
+      if symbol.baseName == selected.typeName
+        result = result + ", " + lspQuote(derived.discriminator)
+        break
+      end
+      symbol = semantic.findClass(symbol.baseName)
+      depth = depth + 1
+    end
+    derived = derived.nextDerived
+  end
+  return result + "]"
 end
 
 def dataParseHierarchy(mapping: DataMapping, entity: DataEntity, node: LspJson, context: String): Bool
@@ -28,8 +64,18 @@ def dataParseHierarchy(mapping: DataMapping, entity: DataEntity, node: LspJson, 
   if !dataObject(mapping, node, context, ["strategy", "discriminatorColumn", "value", "derivedTypes"])
     return false
   end
-  if dataString(mapping, node, "strategy", context) != "tph"
-    return mapping.fail(context + ".strategy must be 'tph'.")
+  entity.hierarchyStrategy = dataString(mapping, node, "strategy", context)
+  if entity.hierarchyStrategy != "tph" && entity.hierarchyStrategy != "tpc" && entity.hierarchyStrategy != "tpt"
+    return mapping.fail(context + ".strategy must be 'tph', 'tpt', or 'tpc'.")
+  end
+  if entity.hierarchyStrategy == "tpc" && (entity.generatedKey || entity.view)
+    return mapping.fail(context + " TPC requires assigned globally unique keys and managed concrete tables.")
+  end
+  if entity.hierarchyStrategy == "tpt" && entity.view
+    return mapping.fail(context + " TPT requires managed physical tables.")
+  end
+  if entity.readView != "" && entity.hierarchyStrategy != "tph"
+    return mapping.fail(context + " readView is supported for ordinary entities and TPH roots.")
   end
   entity.discriminatorColumn = dataString(mapping, node, "discriminatorColumn", context)
   entity.discriminatorValue = dataString(mapping, node, "value", context)
@@ -52,7 +98,7 @@ def dataParseHierarchy(mapping: DataMapping, entity: DataEntity, node: LspJson, 
   var definition: LspJson? = derivedTypes.first
 
   while definition != null
-    if !dataObject(mapping, definition, context + ".derivedTypes", ["type", "value", "columns"])
+    if !dataObject(mapping, definition, context + ".derivedTypes", ["type", "value", "columns", "table"])
       return false
     end
     let child = new DataEntity()
@@ -61,6 +107,40 @@ def dataParseHierarchy(mapping: DataMapping, entity: DataEntity, node: LspJson, 
     child.discriminatorValue = dataString(mapping, definition, "value", context)
     child.discriminatorColumn = entity.discriminatorColumn
     child.tableName = entity.tableName
+    if entity.hierarchyStrategy == "tpc" || entity.hierarchyStrategy == "tpt"
+      let tableSemantic = mapping.semantic
+      let tableSymbol = tableSemantic == null ? null : dataFindClass(tableSemantic, child.typeName)
+
+      if entity.hierarchyStrategy == "tpc" && definition.get("table").isMissing() && tableSymbol != null && tableSymbol.isAbstract
+        child.tableName = entity.tableName + "_abstract_" + tableSymbol.name
+      else
+        child.tableName = dataString(mapping, definition, "table", context)
+      end
+      if !dataSqlIdentifier(child.tableName) || dataSqlReserved(child.tableName) || dataSqlSameIdentifier(
+        child.tableName,
+        entity.tableName
+      )
+        return mapping.fail(context + " TPC descendants require distinct valid physical table names.")
+      end
+      var mappedTable = mapping.firstEntity
+
+      while mappedTable != null
+        if dataSqlSameIdentifier(mappedTable.tableName, child.tableName)
+          return mapping.fail(context + " TPC table collides with an existing mapped table.")
+        end
+        mappedTable = mappedTable.nextEntity
+      end
+      var concrete = entity.firstDerived
+
+      while concrete != null
+        if dataSqlSameIdentifier(concrete.entity.tableName, child.tableName)
+          return mapping.fail(context + " TPC concrete table names must be distinct.")
+        end
+        concrete = concrete.nextDerived
+      end
+    else if !definition.get("table").isMissing()
+      return mapping.fail(context + " TPH descendants share the root table.")
+    end
     child.keyMember = entity.keyMember
     child.keyMembers = entity.keyMembers
     child.generatedKey = entity.generatedKey
@@ -71,9 +151,20 @@ def dataParseHierarchy(mapping: DataMapping, entity: DataEntity, node: LspJson, 
     end
     let symbol = dataFindClass(semantic, child.typeName)
 
-    if symbol == null || symbol.baseName != entity.typeName || symbol.isAbstract || (!symbol.access.isPublic() && !symbol.access.isInternal())
-      return mapping.fail(context + ".derivedTypes requires accessible concrete direct subclasses of the root.")
+    if symbol == null || (!symbol.access.isPublic() && !symbol.access.isInternal())
+      return mapping.fail(context + ".derivedTypes requires accessible subclasses of the root.")
     end
+    var parent: DataEntity? = symbol.baseName == entity.typeName ? entity : null
+    var ancestor = entity.firstDerived
+
+    while ancestor != null
+      parent = ancestor.entity if ancestor.entity.typeName == symbol.baseName
+      ancestor = ancestor.nextDerived
+    end
+    if parent == null
+      return mapping.fail(context + ".derivedTypes must register each mapped base before its nested subclasses.")
+    end
+    child.hierarchyParent = parent.typeName
     if child.discriminatorValue == "" || child.discriminatorValue == entity.discriminatorValue
       return mapping.fail(context + ".derivedTypes requires distinct nonempty discriminator values.")
     end
@@ -91,7 +182,7 @@ def dataParseHierarchy(mapping: DataMapping, entity: DataEntity, node: LspJson, 
     child.symbol = symbol
     child.generatedName = symbol.name
     child.origin = dataOrigin(mapping, dataDeclaration(semantic, "type:" + child.typeName))
-    var complex = entity.firstComplex
+    var complex = parent.firstComplex
 
     while complex != null
       let copied = new DataComplex()
@@ -99,10 +190,12 @@ def dataParseHierarchy(mapping: DataMapping, entity: DataEntity, node: LspJson, 
       copied.memberName = complex.memberName
       copied.typeName = complex.typeName
       copied.pathCode = complex.pathCode
+      copied.optional = complex.optional
+      copied.presenceMember = complex.presenceMember
       child.addComplex(copied)
       complex = complex.nextComplex
     end
-    field = entity.firstField
+    field = parent.firstField
     while field != null
       child.addField(dataCopyField(field)) if field.hierarchyType == ""
       field = field.nextField
@@ -122,6 +215,7 @@ def dataParseHierarchy(mapping: DataMapping, entity: DataEntity, node: LspJson, 
       let added = child.lastField
 
       if added != null
+        child.hierarchyLocalMembers.add(added.memberName)
         if added.generatedOnAdd || added.generatedOnUpdate
           return mapping.fail(context + " derived generated values require a subtype readback contract.")
         end
@@ -144,11 +238,33 @@ def dataParseHierarchy(mapping: DataMapping, entity: DataEntity, node: LspJson, 
       column = column.next
       columnIndex = columnIndex + 1
     end
-    if !dataInitializer(child)
+    if !dataValidateOptionalComplex(mapping, child) || !dataInitializer(child)
       return mapping.fail(context + " derived types require construction matching their mapped scalar columns.")
     end
-    entity.addDerived(new DataDerived(child, child.discriminatorValue))
+    let derived = new DataDerived(child, child.discriminatorValue)
+
+    if parent.typeName != entity.typeName
+      derived.nextDerived = entity.firstDerived
+      entity.firstDerived = derived
+    else
+      entity.addDerived(derived)
+    end
     definition = definition.next
+  end
+  let rootSymbol = entity.symbol
+  var concreteCount = rootSymbol != null && rootSymbol.isAbstract ? 0 : 1
+  var concrete = entity.firstDerived
+
+  while concrete != null
+    let concreteSymbol = concrete.entity.symbol
+
+    if concreteSymbol != null && !concreteSymbol.isAbstract
+      concreteCount = concreteCount + 1
+    end
+    concrete = concrete.nextDerived
+  end
+  if concreteCount == 0
+    return mapping.fail(context + " requires at least one concrete mapped type.")
   end
   return true
 end

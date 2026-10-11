@@ -1,0 +1,381 @@
+use json
+use result
+namespace neri_data
+
+## An internally generated predicate, composable with other mapped query stages.
+class ComputedPredicate<T>
+  private builder: fn(EntityMapping, CompileState, SqlDialect): ScalarSqlResult
+
+  def init(builder: fn(EntityMapping, CompileState, SqlDialect): ScalarSqlResult): Void
+    this.builder = builder
+  end
+
+  internal def expression(mapping: EntityMapping): Predicate<T>
+    return new Predicate<T>(new Expression(
+        ExpressionKind.Decimal(),
+        scalarMapping: mapping,
+        decimalBuilder: this.builder
+      ))
+  end
+end
+
+def computedFiltered<T>(source: Relation<T>, predicate: ComputedPredicate<T>): Relation<T>
+  let build: fn(SqlDialect): RelationBuildResult<T> = fn(dialect: SqlDialect): RelationBuildResult<T> do
+    match source.build(dialect)
+      case RelationBuildResult.Failure(error)
+        return RelationBuildResult<T>.Failure(error)
+      case RelationBuildResult.Plan(plan)
+        let mapping = joinStageMapping(plan.mapping, "__neri_computed_input")
+        let state = new CompileState()
+
+        joinParameterCopy(plan.parameters, state)
+        match compileExpression(predicate.expression(mapping).expression, state, mapping.table(), dialect)
+          case ExpressionCompileResult.Failure(error)
+            return RelationBuildResult<T>.Failure(error)
+          case ExpressionCompileResult.Sql(filter)
+            let sql = "SELECT * FROM (" + plan.sql + ") AS \"__neri_computed_input\" WHERE " + filter + joinOrderSql(
+              plan.order,
+              mapping.table()
+            )
+
+            return RelationBuildResult<T>.Plan(new RelationPlan<T>(
+                sql,
+                new ParameterValues(state.head, state.count),
+                plan.columns,
+                plan.decoder,
+                plan.mapping,
+                true,
+                plan.order
+              ))
+        end
+    end
+  end
+
+  return new Relation<T>(
+    build,
+    source.provider(),
+    resolver: source.resolutionFactory(),
+    owner: source.contextOwner(),
+    physicalSource: source.physicalEntitySource(),
+    trackingActive: source.tracksEntities()
+  )
+end
+
+## A typed primitive collection stored as a validated JSON array in TEXT.
+class PrimitiveCollectionExpression<T, V>
+  private tree: readonly quotation::Tree
+  private kind: String
+  private parameter: fn(V): Parameter
+  private optional: Bool
+
+  def init(tree: readonly quotation::Tree, kind: String, parameter: fn(V): Parameter, optional: Bool = false): Void
+    this.tree = tree
+    this.kind = kind
+    this.parameter = parameter
+    this.optional = optional
+  end
+
+  internal def arraySql(mapping: EntityMapping, dialect: SqlDialect): ScalarSqlResult
+    match translateSelection(mapping, this.tree)
+      case SelectionResult.Failure(error)
+        return ScalarSqlResult.Failure(error)
+      case SelectionResult.Column(column)
+        let expected = this.kind == "string" ? "String[]" : (this.kind == "integer" ? "Int[]" : "Bool[]")
+
+        if column.typeName() != expected + (this.optional ? "?" : "") || column.storageTypeName() != (this.optional ? "String?" : "String")
+          return scalarSqlFailure("primitive collection expression requires matching converted TEXT storage")
+        end
+        let value = quoted(mapping.table(), column.column())
+        var sql = ""
+
+        match dialect
+          case SqlDialect.QuestionMark()
+            let expected = this.kind == "string" ? "\"type\" = 'text'" : (this.kind == "integer" ? "\"type\" = 'integer'" : "\"type\" IN ('true', 'false')")
+            let invalid = "json_extract(" + value + " || ' invalid primitive collection', '$')"
+
+            sql = "CASE WHEN " + value + " IS NULL THEN " + (this.optional ? "NULL" : "json_extract('invalid required primitive collection', '$')") + " WHEN json_type(" + value + ") = 'array' THEN CASE WHEN EXISTS (SELECT 1 FROM json_each(" + value + ") WHERE NOT (" + expected + ")) THEN " + invalid + " ELSE " + value + " END ELSE " + invalid + " END"
+          case SqlDialect.PostgreSql()
+            let json = "CAST(" + value + " AS JSONB)"
+            let element = "\"__neri_primitive\".\"value\""
+            let expected = this.kind == "integer" ? "jsonb_typeof(" + element + ") = 'number' AND " + element + "::TEXT ~ '^-?(0|[1-9][0-9]*)$' AND CAST(" + element + "::TEXT AS BIGINT) IS NOT NULL" : "jsonb_typeof(" + element + ") = '" + (this.kind == "boolean" ? "boolean" : "string") + "'"
+            let invalid = "CAST((coalesce(" + value + ", 'NULL') || ' invalid primitive collection') AS JSONB)"
+
+            sql = "CASE WHEN " + value + " IS NULL THEN " + (this.optional ? "NULL::JSONB" : invalid) + " WHEN jsonb_typeof(" + json + ") = 'array' THEN CASE WHEN EXISTS (SELECT 1 FROM jsonb_array_elements(" + json + ") AS \"__neri_primitive\"(\"value\") WHERE NOT (" + expected + ")) THEN " + invalid + " ELSE " + json + " END ELSE " + invalid + " END"
+        end
+        return ScalarSqlResult.Value(new ScalarSql("(" + sql + ")", false))
+    end
+  end
+
+  public def lengthShape(): RowShape<T, Int?>
+    let expression = this
+    let build: fn(
+      EntityMapping,
+      CompileState,
+      SqlDialect
+    ): ScalarSqlResult = fn(
+      mapping: EntityMapping,
+      state: CompileState,
+      dialect: SqlDialect
+    ): ScalarSqlResult do
+      match expression.arraySql(mapping, dialect)
+        case ScalarSqlResult.Failure(error)
+          return ScalarSqlResult.Failure(error)
+        case ScalarSqlResult.Value(array)
+          match dialect
+            case SqlDialect.QuestionMark()
+              return ScalarSqlResult.Value(new ScalarSql("json_array_length(" + array.sql + ")", false))
+            case SqlDialect.PostgreSql()
+              return ScalarSqlResult.Value(new ScalarSql(
+                  "CAST(jsonb_array_length(" + array.sql + ") AS BIGINT)",
+                  false
+                ))
+          end
+      end
+    end
+
+    return builtScalarShape<T, Int?>(optionalIntScalar(), build)
+  end
+
+  public def contains(value: V): ComputedPredicate<T>
+    let expression = this
+    let captured = this.parameter(value)
+    let kind = this.kind
+    let build: fn(
+      EntityMapping,
+      CompileState,
+      SqlDialect
+    ): ScalarSqlResult = fn(
+      mapping: EntityMapping,
+      state: CompileState,
+      dialect: SqlDialect
+    ): ScalarSqlResult do
+      match expression.arraySql(mapping, dialect)
+        case ScalarSqlResult.Failure(error)
+          return ScalarSqlResult.Failure(error)
+        case ScalarSqlResult.Value(array)
+          state.bind(captured)
+          let parameter = dialectPlaceholder(dialect, state.count)
+
+          match dialect
+            case SqlDialect.QuestionMark()
+              return ScalarSqlResult.Value(new ScalarSql(
+                  "EXISTS (SELECT 1 FROM json_each(" + array.sql + ") WHERE \"value\" = " + parameter + ")",
+                  false
+                ))
+            case SqlDialect.PostgreSql()
+              let element = "\"__neri_primitive\".\"value\""
+              let scalar = kind == "integer" ? "CAST(" + element + "::TEXT AS BIGINT)" : (kind == "boolean" ? "CAST(" + element + "::TEXT AS BOOLEAN)" : element + " #>> '{}'")
+
+              return ScalarSqlResult.Value(new ScalarSql(
+                  "EXISTS (SELECT 1 FROM jsonb_array_elements(" + array.sql + ") AS \"__neri_primitive\"(\"value\") WHERE " + scalar + " = " + parameter + ")",
+                  false
+                ))
+          end
+      end
+    end
+
+    return new ComputedPredicate<T>(build)
+  end
+end
+
+def stringCollection<T>(field: quote fn(T): String[]): PrimitiveCollectionExpression<T, String>
+  let parameter: fn(String): Parameter = fn(value: String): Parameter do
+    return Parameter.Text(value)
+  end
+
+  return new PrimitiveCollectionExpression<T, String>(field.tree(), "string", parameter)
+end
+
+def intCollection<T>(field: quote fn(T): Int[]): PrimitiveCollectionExpression<T, Int>
+  let parameter: fn(Int): Parameter = fn(value: Int): Parameter do
+    return Parameter.Int(value)
+  end
+
+  return new PrimitiveCollectionExpression<T, Int>(field.tree(), "integer", parameter)
+end
+
+def boolCollection<T>(field: quote fn(T): Bool[]): PrimitiveCollectionExpression<T, Bool>
+  let parameter: fn(Bool): Parameter = fn(value: Bool): Parameter do
+    return Parameter.Bool(value)
+  end
+
+  return new PrimitiveCollectionExpression<T, Bool>(field.tree(), "boolean", parameter)
+end
+
+def optionalStringCollection<T>(field: quote fn(T): String[]?): PrimitiveCollectionExpression<T, String>
+  let parameter: fn(String): Parameter = fn(value: String): Parameter do
+    return Parameter.Text(value)
+  end
+
+  return new PrimitiveCollectionExpression<T, String>(field.tree(), "string", parameter, true)
+end
+
+def optionalIntCollection<T>(field: quote fn(T): Int[]?): PrimitiveCollectionExpression<T, Int>
+  let parameter: fn(Int): Parameter = fn(value: Int): Parameter do
+    return Parameter.Int(value)
+  end
+
+  return new PrimitiveCollectionExpression<T, Int>(field.tree(), "integer", parameter, true)
+end
+
+def optionalBoolCollection<T>(field: quote fn(T): Bool[]?): PrimitiveCollectionExpression<T, Bool>
+  let parameter: fn(Bool): Parameter = fn(value: Bool): Parameter do
+    return Parameter.Bool(value)
+  end
+
+  return new PrimitiveCollectionExpression<T, Bool>(field.tree(), "boolean", parameter, true)
+end
+
+## Paths are constructed from separately bound property names and array indexes.
+class JsonPathExpression<T>
+  private tree: readonly quotation::Tree
+  private path: String
+  private depth: Int
+  private failure: QueryFailure?
+
+  def init(tree: readonly quotation::Tree, path: String = "$", depth: Int = 0, failure: QueryFailure? = null): Void
+    this.tree = tree
+    this.path = path
+    this.depth = depth
+    this.failure = failure
+  end
+
+  public def property(name: String): JsonPathExpression<T>
+    if name.byteLength() > 256 || this.depth >= 32
+      return new JsonPathExpression<T>(
+        this.tree,
+        failure: QueryFailure.UnsupportedCapability("JSON path exceeds its property or depth bound")
+      )
+    end
+    match json::stringify(json::Value.string(name))
+      case result::Result.Error(error)
+        return new JsonPathExpression<T>(
+          this.tree,
+          failure: QueryFailure.UnsupportedCapability("JSON property cannot be encoded")
+        )
+      case result::Result.Ok(encoded)
+        return new JsonPathExpression<T>(this.tree, this.path + "." + encoded, this.depth + 1, this.failure)
+    end
+  end
+
+  public def index(index: Int): JsonPathExpression<T>
+    if index < 0 || index > 2147483647 || this.depth >= 32
+      return new JsonPathExpression<T>(
+        this.tree,
+        failure: QueryFailure.UnsupportedCapability("JSON array index or path depth is outside its bound")
+      )
+    end
+    return new JsonPathExpression<T>(this.tree, this.path + "[" + (index as String) + "]", this.depth + 1, this.failure)
+  end
+
+  internal def scalarSql(
+    mapping: EntityMapping,
+    state: CompileState,
+    dialect: SqlDialect,
+    kind: String
+  ): ScalarSqlResult
+    let failure = this.failure
+
+    if failure != null
+      return ScalarSqlResult.Failure(failure)
+    end
+    match translateSelection(mapping, this.tree)
+      case SelectionResult.Failure(error)
+        return ScalarSqlResult.Failure(error)
+      case SelectionResult.Column(column)
+        if column.storageTypeName() != "String" && column.storageTypeName() != "String?"
+          return scalarSqlFailure("JSON path requires TEXT storage")
+        end
+        let document = quoted(mapping.table(), column.column())
+
+        var encodedPath = this.path
+
+        match dialect
+          case SqlDialect.QuestionMark()
+          case SqlDialect.PostgreSql()
+            encodedPath = "strict " + encodedPath
+        end
+        state.bind(Parameter.Text(encodedPath))
+        let path = dialectPlaceholder(dialect, state.count)
+        var sql = ""
+
+        match dialect
+          case SqlDialect.QuestionMark()
+            let value = "\"__neri_json_path\".\"value\""
+            let type = "\"__neri_json_path\".\"type\""
+            let expected = kind == "integer" ? type + " = 'integer'" : (kind == "boolean" ? type + " IN ('true', 'false')" : type + " = 'text'")
+
+            # Bind each occurrence separately in question-mark SQL.
+            state.bind(Parameter.Text(this.path))
+            sql = "(SELECT CASE WHEN " + type + " IS NULL OR " + type + " = 'null' THEN NULL WHEN " + expected + " THEN " + value + " ELSE json_extract(" + type + " || ' invalid JSON scalar', '$') END FROM (SELECT json_extract(" + document + ", " + path + ") AS \"value\", json_type(" + document + ", " + dialectPlaceholder(
+              dialect,
+              state.count
+            ) + ") AS \"type\") AS \"__neri_json_path\")"
+          case SqlDialect.PostgreSql()
+            let value = "\"__neri_json_path\".\"value\""
+            let expected = "jsonb_typeof(" + value + ") = '" + (kind == "integer" ? "number" : (kind == "boolean" ? "boolean" : "string")) + "'"
+            let text = value + " #>> '{}'"
+            let scalar = kind == "integer" ? "CAST(" + text + " AS BIGINT)" : (kind == "boolean" ? "CAST(" + text + " AS BOOLEAN)" : text)
+            let invalid = "CAST((jsonb_typeof(" + value + ") || ' invalid JSON scalar') AS BIGINT)" + (kind == "string" ? "::TEXT" : (kind == "boolean" ? "::INT::BOOLEAN" : ""))
+
+            sql = "(SELECT CASE WHEN " + value + " IS NULL OR " + value + " = 'null'::JSONB THEN NULL WHEN " + expected + " THEN " + scalar + " ELSE " + invalid + " END FROM (SELECT jsonb_path_query_first(CAST(" + document + " AS JSONB), CAST(" + path + " AS JSONPATH), '{}'::JSONB, true) AS \"value\") AS \"__neri_json_path\")"
+        end
+        return ScalarSqlResult.Value(new ScalarSql(sql, false))
+    end
+  end
+
+  public def textShape(): RowShape<T, String?>
+    let expression = this
+    let build: fn(
+      EntityMapping,
+      CompileState,
+      SqlDialect
+    ): ScalarSqlResult = fn(
+      mapping: EntityMapping,
+      state: CompileState,
+      dialect: SqlDialect
+    ): ScalarSqlResult do
+      return expression.scalarSql(mapping, state, dialect, "string")
+    end
+
+    return builtScalarShape<T, String?>(optionalTextScalar(), build)
+  end
+
+  public def intShape(): RowShape<T, Int?>
+    let expression = this
+    let build: fn(
+      EntityMapping,
+      CompileState,
+      SqlDialect
+    ): ScalarSqlResult = fn(
+      mapping: EntityMapping,
+      state: CompileState,
+      dialect: SqlDialect
+    ): ScalarSqlResult do
+      return expression.scalarSql(mapping, state, dialect, "integer")
+    end
+
+    return builtScalarShape<T, Int?>(optionalIntScalar(), build)
+  end
+
+  public def boolShape(): RowShape<T, Bool?>
+    let expression = this
+    let build: fn(
+      EntityMapping,
+      CompileState,
+      SqlDialect
+    ): ScalarSqlResult = fn(
+      mapping: EntityMapping,
+      state: CompileState,
+      dialect: SqlDialect
+    ): ScalarSqlResult do
+      return expression.scalarSql(mapping, state, dialect, "boolean")
+    end
+
+    return builtScalarShape<T, Bool?>(optionalBoolScalar(), build)
+  end
+end
+
+def jsonField<T, J>(field: quote fn(T): J): JsonPathExpression<T>
+  return new JsonPathExpression<T>(field.tree())
+end

@@ -11,10 +11,16 @@ missing required values are rejected before any migration executes.
 `diffSchema` produces parameterized `InsertData`, `UpdateData` and `DeleteData`
 operations in both directions. It deletes removed rows before schema changes and
 applies inserted/updated rows after them. Seed tables follow foreign-key dependency
-order; deletions reverse that order. Cyclic seeded dependencies require an explicitly
-ordered migration catalog. Seed relationship rewrites alongside principal removal
-also require an explicit catalog so application-specific data changes can precede
-key deletion. Removing a managed field while its column remains requires
+order; deletions reverse that order. Cyclic dependencies are accepted when the
+outstanding foreign keys are declared deferred. `SchemaReference(..., deferred:
+true)` emits `DEFERRABLE INITIALLY DEFERRED` on both providers.
+
+When retained dependent seeds change their foreign keys alongside principal removal,
+the diff inserts replacement principals and updates dependent values against the
+source schema before deleting old keys. It then changes the schema and applies
+remaining target fields. Stable logical fields preserve this ordering across column
+renames and added fields. Values needed by the source schema must be available from
+the target seed, an existing managed seed, or a source default. Removing a managed field while its column remains requires
 an explicit replacement value. A model seed owns its specified values; applications
 should use ordinary tracked writes for mutable operational data.
 

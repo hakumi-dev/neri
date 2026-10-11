@@ -105,18 +105,24 @@ class MappingColumn
   private storedColumn: String
   private storedPath: readonly MappingPath
   private storedBoolToInt: Bool
+  private storedStorageType: String?
+  private storedConversionId: String?
 
   def init(
     identity: String,
     typeName: String,
     column: String,
     path: readonly MappingPath? = null,
-    boolToInt: Bool = false
+    boolToInt: Bool = false,
+    storageType: String? = null,
+    conversionId: String? = null
   ): Void
     this.storedIdentity = identity
     this.storedTypeName = typeName
     this.storedColumn = column
     this.storedBoolToInt = boolToInt
+    this.storedStorageType = storageType
+    this.storedConversionId = conversionId
 
     if path == null
       this.storedPath = new MappingPath(identity, typeName)
@@ -142,10 +148,19 @@ class MappingColumn
   end
 
   public readonly def storageTypeName(): String
+    let storage = this.storedStorageType
+
+    if storage != null
+      return storage
+    end
     if this.storedBoolToInt
       return translationOptional(this.storedTypeName) ? "Int?" : "Int"
     end
     return this.storedTypeName
+  end
+
+  public readonly def conversionId(): String?
+    return this.storedConversionId
   end
 
   internal readonly def path(): readonly MappingPath
@@ -292,6 +307,20 @@ class EntityMapping
 
   public readonly def count(): Int
     return this.columnCount
+  end
+
+  internal readonly def permitsConvertedCapture(modelType: String, storageType: String): Bool
+    var column = this.firstColumn
+
+    while column != null
+      let mapped = column.value
+
+      if mapped.conversionId() != null && translationModelType(mapped.typeName()) == translationModelType(modelType) && semanticTranslationInner(mapped.storageTypeName()) == storageType
+        return true
+      end
+      column = column.next
+    end
+    return false
   end
 
   internal readonly def scalarColumn(): readonly MappingColumn?
@@ -452,7 +481,7 @@ class EntityMapping
 
       while keyColumn != null
         if keyColumn.value.column() == key
-          let typeName = semanticTranslationInner(keyColumn.value.typeName())
+          let typeName = semanticTranslationInner(keyColumn.value.storageTypeName())
 
           if translationOptional(keyColumn.value.typeName()) || (typeName != "Int" && typeName != "String")
             return QueryFailure.Provider(ProviderFailure.State("bulk key must be a required Int or String"))
@@ -480,8 +509,11 @@ class EntityMapping
     while current != null
       let value = current.value
 
-      if value.identity() == "" || !translationMappedScalar(value.typeName())
+      if value.identity() == "" || (!translationMappedScalar(value.typeName()) && value.conversionId() == null)
         return QueryFailure.Provider(ProviderFailure.State("entity mapping contains an invalid field identity or type"))
+      end
+      if value.conversionId() != null && (!translationMappedScalar(value.storageTypeName()) || translationOptional(value.typeName()) != translationOptional(value.storageTypeName()) || value.boolToInt())
+        return QueryFailure.Provider(ProviderFailure.State("converted field requires matching nullable scalar storage and one conversion policy"))
       end
       if value.boolToInt() && semanticTranslationInner(value.typeName()) != "Bool"
         return QueryFailure.Provider(ProviderFailure.State("Bool-to-Int conversion requires a Bool mapped field"))
@@ -582,6 +614,16 @@ def translationOptional(typeName: String): Bool
   return semanticTranslationInner(typeName) != typeName
 end
 
+def translationModelType(typeName: String): String
+  let value = semanticTranslationInner(typeName)
+  let length = host::stringByteLength(value)
+
+  if length > 10 && host::stringSlice(value, 0, 9) == "readonly(" && host::stringSlice(value, length - 1, 1) == ")"
+    return semanticTranslationInner(host::stringSlice(value, 9, length - 10))
+  end
+  return value
+end
+
 def translationParameter(value: readonly quotation::CaptureValue): Parameter?
   match value
     case quotation::CaptureValue.Bool(item)
@@ -612,6 +654,32 @@ def translationValueType(value: readonly quotation::CaptureValue): String
   end
 end
 
+def comparisonStorageSql(sql: String, prefixLength: Int): String
+  return prefixLength == 0 ? sql : "substr(" + sql + ", 1, " + (prefixLength as String) + ")"
+end
+
+def mappingComparisonPrefix(column: readonly MappingColumn): Int
+  let conversion = column.conversionId()
+
+  return conversion == "neri_data.cellDateTimeOffset" || conversion == "neri_data.cellOptionalDateTimeOffset" || conversion == "neri_data.cellDateTimeOffsetKey" || conversion == "neri_data.cellOptionalDateTimeOffsetKey" ? 28 : 0
+end
+
+def mappedOrderSql(mapping: EntityMapping?, table: String, physical: String): String
+  if mapping != null
+    var index = 0
+
+    while index < mapping.count()
+      let column = mapping.columnAt(index)
+
+      if column != null && column.column() == physical
+        return comparisonStorageSql(quoted(table, physical), mappingComparisonPrefix(column))
+      end
+      index = index + 1
+    end
+  end
+  return quoted(table, physical)
+end
+
 def translationEqual(mapping: EntityMapping, column: readonly MappingColumn, parameter: Parameter): Expression
   var stored = parameter
 
@@ -625,7 +693,13 @@ def translationEqual(mapping: EntityMapping, column: readonly MappingColumn, par
       case Parameter.Binary(value)
     end
   end
-  let equal = new Expression(ExpressionKind.Equal(), mapping.table(), column.column(), stored)
+  let equal = new Expression(
+    ExpressionKind.Equal(),
+    mapping.table(),
+    column.column(),
+    stored,
+    comparisonPrefixLength: mappingComparisonPrefix(column)
+  )
 
   if translationOptional(column.typeName())
     let present = new Expression(ExpressionKind.IsNotNull(), mapping.table(), column.column())
@@ -646,7 +720,8 @@ def translationColumnEqual(
     table,
     first.column(),
     rightTable: table,
-    rightColumn: second.column()
+    rightColumn: second.column(),
+    comparisonPrefixLength: mappingComparisonPrefix(first)
   )
 
   let firstOptional = translationOptional(first.typeName())
@@ -700,6 +775,9 @@ def translateFields(mapping: EntityMapping, pack: readonly fields::Pack): Transl
     if column == null || column.typeName() != entry.typeName()
       return translationFailure("field pack identity or type does not match mapping")
     end
+    if column.conversionId() != null && translationScalar(column.typeName())
+      return translationFailure("converted primitive filters require convertedField with the mapped encoder")
+    end
     let value = entry.value()
     let actual = translationValueType(value)
     var expression: Expression? = null
@@ -721,7 +799,7 @@ def translateFields(mapping: EntityMapping, pack: readonly fields::Pack): Transl
       end
       expression = new Expression(ExpressionKind.IsNull(), mapping.table(), column.column())
     else
-      if semanticTranslationInner(column.typeName()) != actual
+      if semanticTranslationInner(column.conversionId() == null ? column.typeName() : column.storageTypeName()) != actual
         return translationFailure("field filter scalar type does not match mapping")
       end
       let parameter = translationParameter(value)
@@ -744,17 +822,20 @@ class TranslationOperand
   public parameter: Parameter?
   public isNull: Bool
   public typeName: String
+  public capturedModelType: String
 
   def init(
     column: readonly MappingColumn? = null,
     parameter: Parameter? = null,
     isNull: Bool = false,
-    typeName: String = ""
+    typeName: String = "",
+    capturedModelType: String = ""
   ): Void
     this.column = column
     this.parameter = parameter
     this.isNull = isNull
     this.typeName = typeName
+    this.capturedModelType = capturedModelType
   end
 end
 
@@ -1368,6 +1449,9 @@ class QuotationTranslator
         if column == null || (column.typeName() != node.typeName() && !(this.guardedMembers && translationOptional(column.typeName()) && node.typeName() == semanticTranslationInner(column.typeName())))
           return OperandResult.Failure("quotation member identity or type does not match mapping")
         end
+        if column.conversionId() != null && translationScalar(column.typeName())
+          return OperandResult.Failure("converted primitive operations require convertedField with the mapped encoder")
+        end
         return OperandResult.Value(new TranslationOperand(column: column, typeName: node.typeName()))
       case quotation::NodeKind.IntLiteral()
         return OperandResult.Value(new TranslationOperand(parameter: Parameter.Int(node.intValue()), typeName: "Int"))
@@ -1413,9 +1497,24 @@ class QuotationTranslator
           return OperandResult.Value(new TranslationOperand(isNull: true, typeName: "Null"))
         end
         if semanticTranslationInner(node.typeName()) != typeName
-          return OperandResult.Failure("quotation capture type is invalid")
+          let right = this.rightMapping
+          let validConversion = this.mapping.permitsConvertedCapture(
+            node.typeName(),
+            typeName
+          ) || (right != null && right.permitsConvertedCapture(
+              node.typeName(),
+              typeName
+            ))
+
+          if !validConversion
+            return OperandResult.Failure("quotation capture type is invalid")
+          end
         end
-        return OperandResult.Value(new TranslationOperand(parameter: translationParameter(capture), typeName: typeName))
+        return OperandResult.Value(new TranslationOperand(
+            parameter: translationParameter(capture),
+            typeName: typeName,
+            capturedModelType: node.typeName()
+          ))
       case quotation::NodeKind.Parameter()
         let scalar = this.scalarColumn
 
@@ -1510,10 +1609,10 @@ class QuotationTranslator
     let secondColumn = right.column
 
     if firstColumn != null && secondColumn != null
-      if firstColumn.boolToInt() != secondColumn.boolToInt()
+      if firstColumn.boolToInt() != secondColumn.boolToInt() || firstColumn.conversionId() != secondColumn.conversionId() || firstColumn.storageTypeName() != secondColumn.storageTypeName()
         return translationFailure("mixed storage conversions require scalar comparison translation")
       end
-      if semanticTranslationInner(firstColumn.typeName()) != semanticTranslationInner(secondColumn.typeName()) || !translationScalar(firstColumn.typeName())
+      if semanticTranslationInner(firstColumn.typeName()) != semanticTranslationInner(secondColumn.typeName()) || !translationScalar(firstColumn.conversionId() == null ? firstColumn.typeName() : firstColumn.storageTypeName())
         return translationFailure("quotation comparison mapped member types do not match")
       end
       if equal
@@ -1524,7 +1623,9 @@ class QuotationTranslator
         end
         return TranslationResult.Expression(expression)
       end
-      if (firstColumn.typeName() != "Int" && firstColumn.typeName() != "Float") || firstColumn.typeName() != secondColumn.typeName()
+      let orderedType = firstColumn.conversionId() == null ? firstColumn.typeName() : firstColumn.storageTypeName()
+
+      if (orderedType != "Int" && orderedType != "Float" && !(firstColumn.conversionId() != null && orderedType == "String")) || firstColumn.typeName() != secondColumn.typeName()
         return translationFailure("ordered comparison requires required Int or Float mapped members")
       end
       var comparisonKind = ExpressionKind.Less()
@@ -1543,7 +1644,8 @@ class QuotationTranslator
           this.mapping.table(),
           firstColumn.column(),
           rightTable: this.mapping.table(),
-          rightColumn: secondColumn.column()
+          rightColumn: secondColumn.column(),
+          comparisonPrefixLength: mappingComparisonPrefix(firstColumn)
         ))
     end
     var column = left.column
@@ -1558,6 +1660,9 @@ class QuotationTranslator
     if column == null || value.column != null
       return translationFailure("quotation comparison requires one mapped member")
     end
+    if column.conversionId() != null && translationScalar(column.typeName())
+      return translationFailure("converted primitive comparisons require convertedField with the mapped encoder")
+    end
     if value.isNull
       if !equal || !translationOptional(column.typeName())
         return translationFailure("null comparison requires equality on an optional member")
@@ -1566,8 +1671,11 @@ class QuotationTranslator
 
       return TranslationResult.Expression(new Expression(nullKind, this.mapping.table(), column.column()))
     end
-    if semanticTranslationInner(column.typeName()) != value.typeName || value.parameter == null
+    if semanticTranslationInner(column.conversionId() == null ? column.typeName() : column.storageTypeName()) != value.typeName || value.parameter == null
       return translationFailure("quotation comparison types do not match")
+    end
+    if column.conversionId() != null && translationModelType(column.typeName()) != translationModelType(value.capturedModelType)
+      return translationFailure("converted comparison requires the matching captured model type")
     end
     if equal
       let parameter = value.parameter
@@ -1603,7 +1711,8 @@ class QuotationTranslator
         expressionKind,
         this.mapping.table(),
         column.column(),
-        value.parameter
+        value.parameter,
+        comparisonPrefixLength: mappingComparisonPrefix(column)
       ))
   end
 
@@ -2262,6 +2371,33 @@ def compileScalarNode(
     let firstType = firstNode.typeName()
     let secondType = secondNode.typeName()
 
+    if firstType != "Null" && secondType != "Null" && (!translationScalar(firstType) || !translationScalar(secondType))
+      match (new QuotationTranslator(
+          mapping,
+          tree,
+          rightMapping: rightMapping,
+          optionalRight: optionalRight,
+          guardedMembers: true
+        )).comparison(
+        node.kind(),
+        node.first(),
+        node.second()
+      )
+        case TranslationResult.Failure(error)
+          return ScalarSqlResult.Failure(error)
+        case TranslationResult.Expression(expression)
+          if expression == null
+            return scalarSqlFailure("converted comparison requires an expression")
+          end
+          match compileExpression(expression, state, mapping.table(), dialect)
+            case ExpressionCompileResult.Failure(error)
+              return ScalarSqlResult.Failure(error)
+            case ExpressionCompileResult.Sql(sql)
+              return scalarSqlValue(sql)
+          end
+      end
+    end
+
     if code == 7 || code == 8
       let presence = guardedPresenceColumn(mapping, rightMapping, tree, node.first(), node.second(), optionalRight)
 
@@ -2523,6 +2659,22 @@ def compileScalarQuotation(
     return scalarSqlFailure("optional member access requires a presence guard")
   end
   return compileScalarNode(mapping, tree, tree.root(), state, dialect, new ScalarSqlBudget())
+end
+
+# Direct converted members order by their scalar storage. DateTimeOffset uses
+# only the canonical UTC prefix, while projections retain the original offset.
+def compileOrderQuotation(
+  mapping: EntityMapping,
+  tree: readonly quotation::Tree,
+  state: CompileState,
+  dialect: SqlDialect
+): ScalarSqlResult
+  match translateSelection(mapping, tree)
+    case SelectionResult.Column(column)
+      return scalarSqlValue(comparisonStorageSql(mappingColumnSql(mapping, column), mappingComparisonPrefix(column)))
+    case SelectionResult.Failure(error)
+      return compileScalarQuotation(mapping, tree, tree.resultType(), state, dialect)
+  end
 end
 
 def compileJoinScalarQuotation(

@@ -60,6 +60,13 @@ The executable `contract` unit requires `NERI_POSTGRES_CONNINFO` and a disposabl
 database accessible to that connection. Its temporary tables remain connection
 local. Set the platform library search path to the libpq installation when needed.
 
+Generated-model PostgreSQL catalog cases require the optional
+`postgresql.client` capability. Run the test runner with
+`--capability postgresql.client`, set `NERI_LIBRARY_PATH` to the native libpq
+directory, and set `NERI_POSTGRES_CONNINFO` to a disposable database connection.
+Without the connection variable, those consumers compile and check model codecs;
+with it, they execute their relational contracts against connection-local tables.
+
 The driver follows PostgreSQL's [asynchronous command processing](https://www.postgresql.org/docs/current/libpq-async.html),
 [connection control](https://www.postgresql.org/docs/current/libpq-connect.html),
 and [single-row results](https://www.postgresql.org/docs/current/libpq-single-row-mode.html).

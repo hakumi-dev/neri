@@ -21,6 +21,10 @@ class SchemaScaffoldColumn
   public generatedOnUpdate: Bool
   public view: Bool
   public defaultSql: String?
+  public computedSql: String?
+  public computedStored: Bool
+  public checkSql: String?
+  public collation: String?
 
   def init(
     table: String,
@@ -31,7 +35,11 @@ class SchemaScaffoldColumn
     generatedOnAdd: Bool = false,
     generatedOnUpdate: Bool = false,
     view: Bool = false,
-    defaultSql: String? = null
+    defaultSql: String? = null,
+    computedSql: String? = null,
+    computedStored: Bool = true,
+    checkSql: String? = null,
+    collation: String? = null
   ): Void
     this.table = table
     this.name = name
@@ -42,6 +50,10 @@ class SchemaScaffoldColumn
     this.generatedOnUpdate = generatedOnUpdate
     this.view = view
     this.defaultSql = defaultSql
+    this.computedSql = computedSql
+    this.computedStored = computedStored
+    this.checkSql = checkSql
+    this.collation = collation
   end
 end
 
@@ -166,17 +178,19 @@ end
 
 def scaffoldSchema(
   columns: readonly SchemaScaffoldColumn[],
-  options: SchemaScaffoldOptions? = null
+  options: SchemaScaffoldOptions? = null,
+  references: readonly SchemaScaffoldReference[] = [],
+  indexes: readonly SchemaScaffoldIndex[] = []
 ): SchemaScaffoldResult
   let settings = options == null ? new SchemaScaffoldOptions() : options
 
   if !scaffoldCodeIdentifierValid(settings.modelNamespace) || !scaffoldCodeIdentifierValid(settings.dataNamespace) || !scaffoldCodeIdentifierValid(settings.context) || !scaffoldCodeIdentifierValid(settings.unit) || settings.project == "" || settings.output == ""
     return SchemaScaffoldResult.Failure(ProviderFailure.State("schema scaffolding requires valid namespace, context, unit and output options"))
   end
-  if columns.Length > 1000
+  if columns.Length > 1000 || references.Length > 1000 || indexes.Length > 1000
     return SchemaScaffoldResult.Failure(ProviderFailure.State("schema scaffolding exceeds 1000 columns"))
   end
-  var source = "use buffers\nnamespace " + settings.modelNamespace + "\n\n# Database scaffolding preserves query/write metadata. Foreign keys, indexes and\n# database expression definitions remain owned by the inspected database.\n"
+  var source = "use buffers\nnamespace " + settings.modelNamespace + "\n\n# Database scaffolding preserves query/write and database schema metadata.\n"
   var entities = ""
   var index = 0
 
@@ -209,6 +223,9 @@ def scaffoldSchema(
 
       if !identifierValid(column.name) || !scaffoldTypeSupported(column.type) || column.keyPosition < 0 || column.view != columns[start].view || (column.generatedOnUpdate && !column.generatedOnAdd)
         return SchemaScaffoldResult.Failure(ProviderFailure.State("schema scaffolding has unsupported column metadata: " + table + "." + column.name))
+      end
+      if column.generatedOnUpdate && column.computedSql == null
+        return SchemaScaffoldResult.Failure(ProviderFailure.State("schema scaffolding could not preserve the computed expression: " + table + "." + column.name))
       end
       if column.keyPosition > 0
         keys = keys + 1
@@ -271,14 +288,35 @@ def scaffoldSchema(
       let column = columns[position]
       let member = scaffoldIdentifier(column.name, "field_")
       let defaultSql = column.defaultSql
+      let computedSql = column.computedSql
+      let expression = computedSql == null ? defaultSql : computedSql
 
-      if defaultSql != null
-        source = source + "  # Database expression: " + scaffoldJson(defaultSql) + "\n"
+      if expression != null
+        source = source + "  # Database expression: " + scaffoldJson(expression) + "\n"
       end
       source = source + "  public " + member + ": " + column.type + (column.nullable ? "?" : "") + " = " + scaffoldInitialValue(column) + "\n"
       fields = fields + (position == start ? "" : ",") + "{\"member\":" + scaffoldJson(member) + ",\"column\":" + scaffoldJson(column.name)
       if !keyless && column.keyPosition == 0 && column.generatedOnAdd
         fields = fields + ",\"valueGeneration\":" + scaffoldJson(column.generatedOnUpdate ? "onAddOrUpdate" : "onAdd")
+      end
+      for facet in ["defaultSql", "computedSql", "checkSql", "collation"]
+        var value: String? = null
+
+        if facet == "defaultSql" && column.keyPosition == 0 && column.computedSql == null
+          value = column.defaultSql
+        else if facet == "computedSql"
+          value = column.computedSql
+        else if facet == "checkSql"
+          value = column.checkSql
+        else if facet == "collation"
+          value = column.collation
+        end
+        if value != null
+          fields = fields + "," + scaffoldJson(facet) + ":" + scaffoldJson(value)
+        end
+      end
+      if column.computedSql != null && !column.computedStored
+        fields = fields + ",\"computedStored\":false"
       end
       fields = fields + "}"
       position = position + 1
@@ -287,9 +325,94 @@ def scaffoldSchema(
     entities = entities + (entities == "" ? "" : ",") + "{\"type\":" + scaffoldJson(settings.modelNamespace + "." + entity) + ",\"set\":" + scaffoldJson(set)
     entities = entities + (columns[start].view ? ",\"view\":" : ",\"table\":") + scaffoldJson(table)
     entities = entities + (keyless ? ",\"keyless\":true" : ",\"key\":[" + keyJson + "]")
-    entities = entities + (generatedKey ? ",\"keyGeneration\":\"onAdd\"" : "") + ",\"columns\":[" + fields + "]}"
+    entities = entities + (generatedKey ? ",\"keyGeneration\":\"onAdd\"" : "") + ",\"columns\":[" + fields + "]"
+    var indexJson = ""
+
+    for definition in indexes
+      if definition.table == table
+        if !identifierValid(definition.name)
+          return SchemaScaffoldResult.Failure(ProviderFailure.State("schema scaffolding cannot represent an index name"))
+        end
+        indexJson = indexJson + (indexJson == "" ? "" : ",") + "{\"name\":" + scaffoldJson(definition.name) + ",\"members\":" + scaffoldMembers(definition.fields) + ",\"unique\":" + (definition.unique ? "true" : "false")
+        if definition.descending.Length > 0
+          var direction = ""
+
+          for descending in definition.descending
+            direction = direction + (direction == "" ? "" : ",") + (descending ? "true" : "false")
+          end
+          indexJson = indexJson + ",\"descending\":[" + direction + "]"
+        end
+        if definition.expressions.Length > 0
+          indexJson = indexJson + ",\"expressions\":" + scaffoldStrings(definition.expressions)
+        end
+        if definition.included.Length > 0
+          indexJson = indexJson + ",\"include\":" + scaffoldMembers(definition.included)
+        end
+        let predicate = definition.predicate
+
+        if predicate != null
+          indexJson = indexJson + ",\"predicate\":" + scaffoldJson(predicate)
+        end
+        indexJson = indexJson + "}"
+      end
+    end
+    entities = entities + (indexJson == "" ? "" : ",\"indexes\":[" + indexJson + "]") + "}"
+
   end
-  let mapping = "{\"version\":1,\"project\":" + scaffoldJson(settings.project) + ",\"unit\":" + scaffoldJson(settings.unit) + ",\"namespace\":" + scaffoldJson(settings.dataNamespace) + ",\"context\":" + scaffoldJson(settings.context) + ",\"output\":" + scaffoldJson(settings.output) + ",\"entities\":[" + entities + "]}"
+  var relations = ""
+
+  for reference in references
+    if reference.fields.Length == 0 || reference.fields.Length != reference.keys.Length || !schemaTableValid(reference.table) || !schemaTableValid(reference.parent) || (reference.deleteBehavior != "NO ACTION" && reference.deleteBehavior != "RESTRICT" && reference.deleteBehavior != "CASCADE" && reference.deleteBehavior != "SET NULL")
+      return SchemaScaffoldResult.Failure(ProviderFailure.State("schema scaffolding has invalid foreign-key metadata"))
+    end
+    var component = 0
+
+    while component < reference.fields.Length
+      var fieldFound = false
+      var keyFound = false
+
+      for column in columns
+        if column.table == reference.table && column.name == reference.fields[component] && !column.view
+          fieldFound = true
+        end
+        if column.table == reference.parent && column.name == reference.keys[component] && !column.view && !column.nullable
+          keyFound = true
+        end
+      end
+      if !fieldFound || !keyFound
+        return SchemaScaffoldResult.Failure(ProviderFailure.State("schema scaffolding foreign key references an unmapped or nullable principal field"))
+      end
+      component = component + 1
+    end
+    relations = relations + (relations == "" ? "" : ",") + "{\"principal\":" + scaffoldJson(settings.modelNamespace + "." + scaffoldIdentifier(
+        reference.parent,
+        "Entity_"
+      )) + ",\"dependent\":" + scaffoldJson(settings.modelNamespace + "." + scaffoldIdentifier(
+        reference.table,
+        "Entity_"
+      )) + ",\"key\":" + scaffoldMembers(reference.keys) + ",\"foreignKey\":" + scaffoldMembers(reference.fields) + ",\"databaseOnDelete\":" + scaffoldJson(reference.deleteBehavior) + (reference.deferred ? ",\"deferred\":true" : "") + "}"
+  end
+  let mapping = "{\"version\":1,\"project\":" + scaffoldJson(settings.project) + ",\"unit\":" + scaffoldJson(settings.unit) + ",\"namespace\":" + scaffoldJson(settings.dataNamespace) + ",\"context\":" + scaffoldJson(settings.context) + ",\"output\":" + scaffoldJson(settings.output) + ",\"entities\":[" + entities + "],\"relations\":[" + relations + "]}"
 
   return SchemaScaffoldResult.Source(source, mapping)
+end
+
+
+def scaffoldStrings(values: readonly String[]): String
+  var json = "["
+  var index = 0
+
+  for value in values
+    json = json + (index == 0 ? "" : ",") + scaffoldJson(value)
+    index = index + 1
+  end
+  return json + "]"
+end
+
+def scaffoldMembers(values: readonly String[]): String
+  let members = arrays::generate<String>(values.Length) do |index|
+    return scaffoldIdentifier(values[index], "field_")
+  end
+
+  return scaffoldStrings(members)
 end

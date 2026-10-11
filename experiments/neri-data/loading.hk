@@ -105,6 +105,20 @@ def navigationColumnType(mapping: readonly EntityMapping, column: String): Strin
   return ""
 end
 
+def navigationColumnStorageType(mapping: readonly EntityMapping, column: String): String
+  var index = 0
+
+  while index < mapping.count()
+    let field = mapping.columnAt(index)
+
+    if field != null && field.column() == column
+      return field.storageTypeName()
+    end
+    index = index + 1
+  end
+  return ""
+end
+
 def navigationUnderlyingType(value: String): String
   if value == "Int?"
     return "Int"
@@ -432,7 +446,7 @@ def navigationOrderTerm(
   dialect: SqlDialect
 ): NavigationOrderResult
   if tree != null
-    match compileScalarQuotation(mapping, tree, tree.resultType(), state, dialect)
+    match compileOrderQuotation(mapping, tree, state, dialect)
       case ScalarSqlResult.Failure(error)
         return NavigationOrderResult.Failure(error)
       case ScalarSqlResult.Value(value)
@@ -440,10 +454,10 @@ def navigationOrderTerm(
         return NavigationOrderResult.Sql(value.sql + (descending ? " DESC" : " ASC"))
     end
   end
-  if !identifierValid(column) || navigationColumnType(mapping, column) == ""
+  if !identifierValid(column) || navigationColumnStorageType(mapping, column) == ""
     return NavigationOrderResult.Failure(QueryFailure.MissingColumn(column))
   end
-  return NavigationOrderResult.Sql(quoted(mapping.table(), column) + (descending ? " DESC" : " ASC"))
+  return NavigationOrderResult.Sql(mappedOrderSql(mapping, mapping.table(), column) + (descending ? " DESC" : " ASC"))
 end
 
 def navigationWindowOrder<T>(
@@ -492,6 +506,7 @@ class IncludedQuery<P, D>: AsyncNavigationPlan<P, D>
   private selectedChildren: Query<D>?
   private relation: CollectionNavigation<P, D>
   private childMaximum: Int = 10000
+  private detached: Bool = false
 
   def init(
     principals: Query<P>,
@@ -505,10 +520,51 @@ class IncludedQuery<P, D>: AsyncNavigationPlan<P, D>
     this.selectedChildren = selectedChildren
   end
 
+  ## Executes this graph with one left-join statement.
+  public def asSingleQuery(): SingleIncludedQuery<P, D>
+    return new SingleIncludedQuery<P, D>(this)
+  end
+
+  internal def effectiveSinglePlan(): IncludedQuery<P, D>
+    return this.detached ? this.detachedPlan() : this
+  end
+
+  public def asSplitQuery(): IncludedQuery<P, D>
+    return this
+  end
+
+  internal def rootQuery(): Query<P>
+    return this.principals
+  end
+
+  internal def relatedQuery(): Query<D>
+    return this.dependents
+  end
+
+  internal def childSelection(): Query<D>
+    let selected = this.selectedChildren
+
+    return selected == null ? this.dependents : selected
+  end
+
+  internal def navigation(): CollectionNavigation<P, D>
+    return this.relation
+  end
+
+  internal def singleChildren(dialect: SqlDialect): CompileResult<D>
+    let selected = this.selectedChildren
+
+    if selected == null
+      return compilePipeline<D, D>(this.dependents, this.dependents.rowDecoder(), null, null, dialect, unbounded: true)
+    end
+    return this.compileSelectedChildren(selected, null, 9223372036854775807, dialect)
+  end
+
   public def beforePublication(observer: fn(TypedRows<P>, TypedRows<D>): Void): IncludedQuery<P, D>
     let clone = new IncludedQuery<P, D>(this.principals, this.dependents, this.relation, this.selectedChildren)
 
     clone.childMaximum = this.childMaximum
+    clone.detached = this.detached
     clone.publicationObserver = observer
     return clone
   end
@@ -517,6 +573,7 @@ class IncludedQuery<P, D>: AsyncNavigationPlan<P, D>
     let copy = new IncludedQuery<P, D>(this.principals, this.dependents, this.relation, this.selectedChildren)
 
     copy.childMaximum = maximum
+    copy.detached = this.detached
     copy.publicationObserver = this.publicationObserver
     return copy
   end
@@ -526,17 +583,44 @@ class IncludedQuery<P, D>: AsyncNavigationPlan<P, D>
     let copy = new IncludedQuery<P, D>(this.principals, this.dependents, this.relation, query)
 
     copy.childMaximum = this.childMaximum
+    copy.detached = this.detached
+    copy.publicationObserver = this.publicationObserver
+    return copy
+  end
+
+  ## Each materialization uses fresh graph identities outside the context tracker.
+  public def asNoTracking(): IncludedQuery<P, D>
+    let copy = this.maxChildren(this.childMaximum)
+
+    copy.detached = true
+    return copy
+  end
+
+  private def detachedPlan(): IncludedQuery<P, D>
+    let principals = this.principals.detachedGraph()
+    let dependents = this.dependents.detachedGraph()
+    var children: Query<D>? = null
+    let selected = this.selectedChildren
+    let tracker = dependents.rowTracker()
+
+    if selected != null && tracker != null
+      children = selected.withNavigationTracker(tracker)
+    end
+    let copy = new IncludedQuery<P, D>(principals, dependents, this.relation, children)
+
+    copy.childMaximum = this.childMaximum
     copy.publicationObserver = this.publicationObserver
     return copy
   end
 
   public def allAsync(options: StreamOptions? = null): result::Result<AsyncNavigation<P, D>, QueryFailure>
-    let invalid = this.validateQueries(true)
+    let plan = this.detached ? this.detachedPlan() : this
+    let invalid = plan.validateQueries(true)
 
     if invalid != null
       return result::Result<AsyncNavigation<P, D>, QueryFailure>.Error(invalid)
     end
-    match prepareAsyncNavigation<P, D>(this, options)
+    match prepareAsyncNavigation<P, D>(plan, options)
       case AsyncNavigationStart.Failure(error)
         return result::Result<AsyncNavigation<P, D>, QueryFailure>.Error(error)
       case AsyncNavigationStart.Started(driver)
@@ -550,12 +634,28 @@ class IncludedQuery<P, D>: AsyncNavigationPlan<P, D>
     rows: TypedRows<P>,
     options: StreamOptions? = null
   ): result::Result<AsyncNavigation<P, D>, QueryFailure>
-    let invalid = this.validateQueries(true)
+    let plan = this.detached ? this.detachedPlan() : this
+    var selected = rows
+
+    if this.detached
+      let tracker = plan.principals.rowTracker()
+
+      if tracker == null
+        return result::Result<AsyncNavigation<P, D>, QueryFailure>.Error(QueryFailure.UnsupportedCapability("detached graph requires identity metadata"))
+      end
+      match tracker.resolveRows(rows)
+        case QueryResult.Failure(error)
+          return result::Result<AsyncNavigation<P, D>, QueryFailure>.Error(error)
+        case QueryResult.Rows(resolved)
+          selected = resolved
+      end
+    end
+    let invalid = plan.validateQueries(true)
 
     if invalid != null
       return result::Result<AsyncNavigation<P, D>, QueryFailure>.Error(invalid)
     end
-    let owned = new AsyncNavigation<P, D>(new AsyncNavigationDriver<P, D>(this, options, rows: rows))
+    let owned = new AsyncNavigation<P, D>(new AsyncNavigationDriver<P, D>(plan, options, rows: selected))
 
     return result::Result<AsyncNavigation<P, D>, QueryFailure>.Ok(transfer owned)
   end
@@ -632,6 +732,9 @@ class IncludedQuery<P, D>: AsyncNavigationPlan<P, D>
   end
 
   public def all(): QueryResult<P>
+    if this.detached
+      return this.detachedPlan().all()
+    end
     let invalid = this.validateQueries()
 
     if invalid != null
@@ -760,9 +863,12 @@ class IncludedQuery<P, D>: AsyncNavigationPlan<P, D>
       return QueryFailure.UnsupportedCapability("navigation loading requires mapped primary keys")
     end
     let principalColumns = this.relation.principalColumns(principalMapping.primaryKeys())
-    let principalType = principalColumns.Length == 0 ? "" : navigationColumnType(principalMapping, principalColumns[0])
-    let dependentType = navigationColumnType(dependentMapping, dependentKey)
-    let foreignType = navigationColumnType(dependentMapping, this.relation.column())
+    let principalType = principalColumns.Length == 0 ? "" : navigationColumnStorageType(
+      principalMapping,
+      principalColumns[0]
+    )
+    let dependentType = navigationColumnStorageType(dependentMapping, dependentKey)
+    let foreignType = navigationColumnStorageType(dependentMapping, this.relation.column())
 
     if (principalType != "Int" && principalType != "String") || (dependentType != "Int" && dependentType != "String") || (foreignType != "Int" && foreignType != "String" && foreignType != "Int?" && foreignType != "String?") || principalType != navigationUnderlyingType(foreignType)
       return QueryFailure.UnsupportedCapability("navigation keys and foreign key require matching Int or String mappings")
@@ -780,7 +886,7 @@ class IncludedQuery<P, D>: AsyncNavigationPlan<P, D>
       let sample = new TypedRows<Cell>()
       let sampleColumns: RawColumn[] = tasks::generate(principalColumns.Length, 1) do |index|
         let column = principalColumns[index]
-        let typeName = navigationColumnType(principalMapping, column)
+        let typeName = navigationColumnStorageType(principalMapping, column)
 
         return new RawColumn(column, typeName == "Int" ? Cell.Int(0) : Cell.Text(""))
       end
@@ -798,7 +904,7 @@ class IncludedQuery<P, D>: AsyncNavigationPlan<P, D>
     return null
   end
 
-  private def compileBaseChildren(query: Query<D>, keys: TypedRows<Cell>, dialect: SqlDialect): CompileResult<D>
+  private def compileBaseChildren(query: Query<D>, keys: TypedRows<Cell>?, dialect: SqlDialect): CompileResult<D>
     let mapping = this.dependents.entityMapping()
 
     if mapping == null
@@ -809,35 +915,15 @@ class IncludedQuery<P, D>: AsyncNavigationPlan<P, D>
     if dependentKey == null
       return CompileResult<D>.Failure(QueryFailure.UnsupportedCapability("navigation children require a mapped primary key"))
     end
-    let predicate = query.filterExpression()
-    var source = new Query<D>(
-      query.sourceName(),
-      query.rowDecoder(),
-      mapping: mapping,
-      provider: query.provider(),
-      tracker: query.rowTracker(),
-      changes: query.changeOwner()
-    )
-
-    if predicate != null
-      source = new Query<D>(
-        query.sourceName(),
-        query.rowDecoder(),
-        new Predicate<D>(predicate),
-        mapping: mapping,
-        provider: query.provider(),
-        tracker: query.rowTracker(),
-        changes: query.changeOwner()
-      )
-    end
-    let matched = source.matchingTupleCells(this.relation.columns(), keys)
+    let source = query.navigationBase()
+    let matched = keys == null ? source : source.matchingTupleCells(this.relation.columns(), keys)
 
     return compilePipeline<D, D>(matched, matched.rowDecoder(), null, null, dialect, ordered: false, unbounded: true)
   end
 
   private def compileSelectedChildren(
     query: Query<D>,
-    keys: TypedRows<Cell>,
+    keys: TypedRows<Cell>?,
     maximum: Int,
     dialect: SqlDialect
   ): CompileResult<D>
@@ -849,7 +935,7 @@ class IncludedQuery<P, D>: AsyncNavigationPlan<P, D>
 
   private def compileUnpagedChildren(
     query: Query<D>,
-    keys: TypedRows<Cell>,
+    keys: TypedRows<Cell>?,
     maximum: Int,
     dialect: SqlDialect
   ): CompileResult<D>
@@ -899,7 +985,7 @@ class IncludedQuery<P, D>: AsyncNavigationPlan<P, D>
 
   private def compileWindowedChildren(
     query: Query<D>,
-    keys: TypedRows<Cell>,
+    keys: TypedRows<Cell>?,
     maximum: Int,
     dialect: SqlDialect
   ): CompileResult<D>
@@ -972,6 +1058,20 @@ class IncludedQuery<P, D>: AsyncNavigationPlan<P, D>
   end
 
   public def load(rows: TypedRows<P>, prefetched: TypedRows<D>? = null): QueryResult<P>
+    if this.detached
+      let plan = this.detachedPlan()
+      let tracker = plan.principals.rowTracker()
+
+      if tracker == null
+        return QueryResult<P>.Failure(QueryFailure.UnsupportedCapability("detached graph requires identity metadata"))
+      end
+      match tracker.resolveRows(rows)
+        case QueryResult.Failure(error)
+          return QueryResult<P>.Failure(error)
+        case QueryResult.Rows(resolved)
+          return plan.load(resolved, prefetched)
+      end
+    end
     let journal = new NavigationJournal()
     let result = this.loadCore(rows, prefetched, journal)
 
@@ -1236,20 +1336,39 @@ class IncludedQuery<P, D>: AsyncNavigationPlan<P, D>
       for oldChild in this.relation.collection(bucket.principal)
         let oldReference = this.relation.reference(oldChild)
         let originalChild = childTracker.original(oldChild)
+        let currentChild = childTracker.current(oldChild)
+        var added = false
+        let state = childTracker.stateOf(oldChild)
+
+        if state != null
+          match state
+            case TrackingState.Added()
+              added = true
+            case TrackingState.Unchanged()
+            case TrackingState.Modified()
+            case TrackingState.Deleted()
+            case TrackingState.Detached()
+          end
+        end
 
         if oldReference == null || !reference::same(oldReference, bucket.principal)
           return QueryResult<P>.Failure(QueryFailure.Provider(ProviderFailure.State("tracked navigation collection and inverse reference disagree")))
         end
-        if !childTracker.ownsPersistedForNavigation(oldChild) || !navigationCellEqual(
+        if (!added && !childTracker.ownsPersistedForNavigation(oldChild)) || !navigationCellEqual(
           this.relation.foreignKey(oldChild),
           bucket.key
-        ) || originalChild == null || !navigationTupleRowMatches(
-          originalChild,
+        ) || currentChild == null || !navigationTupleRowMatches(
+          currentChild,
           this.relation.columns(),
           bucket.key
-        )
+        ) || (!added && (originalChild == null || !navigationTupleRowMatches(
+              originalChild,
+              this.relation.columns(),
+              bucket.key
+            )))
           return QueryResult<P>.Failure(QueryFailure.Provider(ProviderFailure.State("tracked navigation collection conflicts with pending local relationship changes")))
         end
+        navigationDistinct(bucket.children, oldChild)
       end
       bucket = bucket.next
     end
@@ -1309,8 +1428,8 @@ def navigationTupleColumnsValid(
   var index = 0
 
   while index < keys.Length
-    let keyType = navigationColumnType(principal, keys[index])
-    let foreignType = navigationColumnType(dependent, foreignKeys[index])
+    let keyType = navigationColumnStorageType(principal, keys[index])
+    let foreignType = navigationColumnStorageType(dependent, foreignKeys[index])
 
     if (keyType != "Int" && keyType != "String") || keyType != navigationUnderlyingType(foreignType)
       return false

@@ -92,6 +92,14 @@ end
 class SQLiteSchemaSnapshot
   private columns: SQLiteSchemaColumn?[]
   private size: Int = 0
+  private references: SchemaScaffoldReference?[] = arrays::generate<SchemaScaffoldReference?>(1000) do |index|
+    return null
+  end
+  private indexes: SchemaScaffoldIndex?[] = arrays::generate<SchemaScaffoldIndex?>(1000) do |index|
+    return null
+  end
+  private referenceSize: Int = 0
+  private indexSize: Int = 0
 
   def init(): Void
     this.columns = tasks::generate(1000, 1) do |index|
@@ -102,6 +110,32 @@ class SQLiteSchemaSnapshot
   internal def add(column: SQLiteSchemaColumn): Void
     this.columns[this.size] = column
     this.size = this.size + 1
+  end
+
+  internal def addReference(reference: SchemaScaffoldReference): Void
+    this.references[this.referenceSize] = reference
+    this.referenceSize = this.referenceSize + 1
+  end
+
+  internal def addIndex(index: SchemaScaffoldIndex): Void
+    this.indexes[this.indexSize] = index
+    this.indexSize = this.indexSize + 1
+  end
+
+  public readonly def referenceCount(): Int
+    return this.referenceSize
+  end
+
+  public readonly def indexCount(): Int
+    return this.indexSize
+  end
+
+  public readonly def referenceAt(index: Int): readonly SchemaScaffoldReference?
+    return index < 0 || index >= this.referenceSize ? null : this.references[index]
+  end
+
+  public readonly def indexAt(index: Int): readonly SchemaScaffoldIndex?
+    return index < 0 || index >= this.indexSize ? null : this.indexes[index]
   end
 
   public readonly def count(): Int
@@ -121,8 +155,33 @@ enum SQLiteSchemaResult
   case Failure(message: ProviderFailure)
 end
 
-## A single statement provides a coherent schema view. No caller SQL is accepted.
+## All metadata statements share a read transaction. No caller SQL is accepted.
 unsafe def sqliteInspectSchema(database: Void*): SQLiteSchemaResult
+  let owned = sqliteAutoCommit(database) != (0 as Int32)
+
+  if owned && sqliteExecuteLiteral(database, "BEGIN") != (0 as Int32)
+    return SQLiteSchemaResult.Failure(sqliteFailure(database, "schema.begin"))
+  end
+  let result = sqliteInspectSchemaCurrent(database)
+
+  if owned
+    let status = sqliteExecuteLiteral(database, "ROLLBACK")
+
+    if status != (0 as Int32)
+      let cleanup = sqliteFailure(database, "schema.rollback", status)
+
+      match result
+        case SQLiteSchemaResult.Failure(primary)
+          return SQLiteSchemaResult.Failure(ProviderFailure.Cleanup(new ProviderCleanupFailure(primary, cleanup)))
+        case SQLiteSchemaResult.Snapshot(snapshot)
+          return SQLiteSchemaResult.Failure(cleanup)
+      end
+    end
+  end
+  return result
+end
+
+unsafe def sqliteInspectSchemaCurrent(database: Void*): SQLiteSchemaResult
   let rowid = "(p.pk=1 AND upper(p.type)='INTEGER' AND NOT EXISTS(SELECT 1 FROM pragma_index_list(s.name,'main') AS pi WHERE pi.origin='pk'))"
   let sql = "SELECT s.name,p.name,p.type,p.dflt_value,p.\"notnull\",p.pk,p.hidden,s.sql,s.type," + rowid + ", (p.pk>0 AND (" + rowid + " OR EXISTS(SELECT 1 FROM pragma_table_list AS tl WHERE tl.schema='main' AND tl.name=s.name AND (tl.wr=1 OR tl.strict=1)))) FROM main.sqlite_schema AS s JOIN pragma_table_xinfo(s.name,'main') AS p WHERE s.type IN ('table','view') AND substr(lower(s.name),1,7)<>'sqlite_' AND substr(lower(s.name),1,7)<>'__neri_' ORDER BY s.name COLLATE BINARY,p.cid"
   let length = host::stringByteLength(sql)
@@ -159,6 +218,14 @@ unsafe def sqliteInspectSchema(database: Void*): SQLiteSchemaResult
       case SQLiteSchemaResult.Snapshot(value)
         return SQLiteSchemaResult.Failure(sqliteFailure(database, "schema.finalize", finalized))
     end
+  end
+  match result
+    case SQLiteSchemaResult.Failure(error)
+      return SQLiteSchemaResult.Failure(error)
+    case SQLiteSchemaResult.Snapshot(snapshot)
+      let failure = sqliteInspectSchemaMetadata(database, snapshot)
+
+      return failure == null ? SQLiteSchemaResult.Snapshot(snapshot) : SQLiteSchemaResult.Failure(failure)
   end
   return result
 end
@@ -262,13 +329,211 @@ def sqliteScaffoldSchema(snapshot: readonly SQLiteSchemaSnapshot, options: Schem
     if column.hidden() == 1
       type = ""
     end
+    let previous = snapshot.at(index - 1)
+    let facets = schemaDdlColumn(
+      column.createSql(),
+      column.name(),
+      previous == null || previous.table() != column.table()
+    )
+
     return new SchemaScaffoldColumn(
       column.table(), column.name(), type,
       !column.required() && !column.keyRequired(), column.keyPosition(),
       generated || rowidKey || column.defaultSql() != null,
-      generated, column.view(), generated ? column.createSql() : column.defaultSql()
+      generated, column.view(), generated ? null : column.defaultSql(), facets.computedSql, column.hidden() != 2, facets.checkSql, facets.collation
     )
   end
 
-  return neri_data::scaffoldSchema(columns, options)
+  let references = arrays::generate<SchemaScaffoldReference>(snapshot.referenceCount()) do |index|
+    let reference = snapshot.referenceAt(index)
+
+    return reference == null ? new SchemaScaffoldReference(
+      "",
+      "",
+      [],
+      []
+    ) : new SchemaScaffoldReference(
+      reference.table,
+      reference.parent,
+      schemaSeedColumnsCopy(reference.fields),
+      schemaSeedColumnsCopy(reference.keys),
+      reference.deleteBehavior,
+      reference.deferred
+    )
+  end
+  let indexes = arrays::generate<SchemaScaffoldIndex>(snapshot.indexCount()) do |index|
+    let definition = snapshot.indexAt(index)
+
+    return definition == null ? new SchemaScaffoldIndex(
+      "",
+      "",
+      [],
+      false
+    ) : new SchemaScaffoldIndex(
+      definition.table,
+      definition.name,
+      schemaSeedColumnsCopy(definition.fields),
+      definition.unique,
+      definition.descending,
+      definition.expressions,
+      definition.included,
+      definition.predicate
+    )
+  end
+
+  return neri_data::scaffoldSchema(columns, options, references, indexes)
+end
+
+
+unsafe def sqliteInspectSchemaMetadata(database: Void*, snapshot: SQLiteSchemaSnapshot): ProviderFailure?
+  let foreignSql = "SELECT s.name,f.id,f.seq,f.\"table\",f.\"from\",f.\"to\",f.on_delete,s.sql FROM main.sqlite_schema s JOIN pragma_foreign_key_list(s.name,'main') f WHERE s.type='table' AND substr(lower(s.name),1,7)<>'sqlite_' AND substr(lower(s.name),1,7)<>'__neri_' ORDER BY s.name COLLATE BINARY,f.id,f.seq"
+  let statement = stackalloc Void*[1]
+  var status = sqlitePrepareMigration(database, foreignSql, statement)
+  var prepared: Void*? = statement[0]
+
+  if status != (0 as Int32) || prepared == null
+    let failure = sqliteFailure(database, "schema.foreign-keys.prepare", status)
+
+    return prepared == null ? failure : sqliteFinalizeFailure(database, prepared, failure)
+  end
+  var failure: ProviderFailure? = null
+  var table = ""
+  var parent = ""
+  var action = ""
+  var createSql = ""
+  var group = -1
+  var fields = new TypedRows<String>()
+  var keys = new TypedRows<String>()
+  var rows = 0
+
+  status = sqliteStep(prepared)
+  while status == (100 as Int32) && failure == null
+    let nextTable = sqliteSchemaText(prepared, 0)
+    let nextParent = sqliteSchemaText(prepared, 3)
+    let field = sqliteSchemaText(prepared, 4)
+    var key = sqliteSchemaText(prepared, 5)
+    let nextAction = sqliteSchemaText(prepared, 6)
+    let ddl = sqliteSchemaText(prepared, 7)
+    let id = sqliteColumnInt(prepared, 1 as Int32)
+    let ordinal = sqliteColumnInt(prepared, 2 as Int32)
+
+    if nextTable == null || nextParent == null || field == null || nextAction == null || ddl == null || rows >= 1000
+      failure = ProviderFailure.State("SQLite foreign-key inspection metadata is invalid or exceeds 1000 components")
+    else
+      if group != id || table != nextTable
+        if group >= 0
+          let tuple = navigationArray(fields)
+
+          snapshot.addReference(new SchemaScaffoldReference(
+              table,
+              parent,
+              tuple,
+              navigationArray(keys),
+              action,
+              schemaDdlDeferred(createSql, parent, tuple)
+            ))
+        end
+        table = nextTable
+        parent = nextParent
+        action = nextAction
+        createSql = ddl
+        group = id
+        fields = new TypedRows<String>()
+        keys = new TypedRows<String>()
+      end
+      if key == null
+        var index = 0
+
+        while index < snapshot.count()
+          let candidate = snapshot.at(index)
+
+          if candidate != null && candidate.table() == parent && candidate.keyPosition() == ordinal + 1
+            key = candidate.name()
+          end
+          index = index + 1
+        end
+      end
+      if key == null || ordinal != fields.count()
+        failure = ProviderFailure.State("SQLite foreign key references an unresolved primary-key tuple")
+      else
+        fields.add(field)
+        keys.add(key)
+        rows = rows + 1
+      end
+    end
+    status = sqliteStep(prepared) if failure == null
+  end
+  if failure == null && status != (101 as Int32)
+    failure = sqliteFailure(database, "schema.foreign-keys")
+  end
+  let finalized = sqliteFinalize(prepared)
+
+  if finalized != (0 as Int32)
+    return failure == null ? sqliteFailure(
+      database,
+      "schema.foreign-keys.finalize",
+      finalized
+    ) : sqliteMergeFinalize(
+      database,
+      failure,
+      finalized
+    )
+  end
+  if failure != null
+    return failure
+  end
+  if group >= 0
+    let tuple = navigationArray(fields)
+
+    snapshot.addReference(new SchemaScaffoldReference(
+        table,
+        parent,
+        tuple,
+        navigationArray(keys),
+        action,
+        schemaDdlDeferred(createSql, parent, tuple)
+      ))
+  end
+  let indexSql = "SELECT s.tbl_name,CASE WHEN s.sql IS NULL THEN 'scaffold_unique_'||s.tbl_name||'_'||l.seq ELSE s.name END,COALESCE(s.sql,'CREATE UNIQUE INDEX '||quote('scaffold_unique_'||s.tbl_name||'_'||l.seq)||' ON '||quote(s.tbl_name)||' ('||(SELECT group_concat(char(34)||replace(x.name,char(34),char(34)||char(34))||char(34),',') FROM pragma_index_xinfo(s.name,'main') x WHERE x.\"key\"=1)||')'),l.\"unique\" FROM main.sqlite_schema s JOIN pragma_index_list(s.tbl_name,'main') l ON l.name=s.name WHERE s.type='index' AND (s.sql IS NOT NULL OR l.origin='u') AND substr(lower(s.tbl_name),1,7)<>'__neri_' ORDER BY s.tbl_name COLLATE BINARY,s.name COLLATE BINARY"
+
+  status = sqlitePrepareMigration(database, indexSql, statement)
+  prepared = statement[0]
+  if status != (0 as Int32) || prepared == null
+    let failure = sqliteFailure(database, "schema.indexes.prepare", status)
+
+    return prepared == null ? failure : sqliteFinalizeFailure(database, prepared, failure)
+  end
+  status = sqliteStep(prepared)
+  while status == (100 as Int32) && failure == null
+    let indexTable = sqliteSchemaText(prepared, 0)
+    let name = sqliteSchemaText(prepared, 1)
+    let ddl = sqliteSchemaText(prepared, 2)
+
+    if indexTable == null || name == null || ddl == null || snapshot.indexCount() >= 1000
+      failure = ProviderFailure.State("SQLite index inspection metadata is invalid or exceeds 1000 indexes")
+    else
+      let definition = schemaDdlIndex(ddl, indexTable, name, sqliteColumnInt(prepared, 3 as Int32) != 0)
+
+      if definition == null
+        failure = ProviderFailure.State("SQLite index expression definition is unsupported")
+      else
+        snapshot.addIndex(definition)
+      end
+    end
+    status = sqliteStep(prepared) if failure == null
+  end
+  if failure == null && status != (101 as Int32)
+    failure = sqliteFailure(database, "schema.indexes")
+  end
+  let indexFinalized = sqliteFinalize(prepared)
+
+  return indexFinalized == (0 as Int32) ? failure : (failure == null ? sqliteFailure(
+      database,
+      "schema.indexes.finalize",
+      indexFinalized
+    ) : sqliteMergeFinalize(
+      database,
+      failure,
+      indexFinalized
+    ))
 end

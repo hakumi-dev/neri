@@ -1,0 +1,175 @@
+namespace neri_data
+
+## Enrolls one inheritance table for the same object held by the root identity tracker.
+class TableSegment<B, P, D>
+  private changes: ChangeContext
+  private roots: EntityTracker<B>
+  private parents: EntityTracker<P>
+  private children: EntityTracker<D>
+  private selectParent: fn(B): P?
+  private selectChild: fn(B): D?
+  private childRoot: fn(D): B
+  private edge: fn(TrackedHandle<P>, TrackedHandle<D>): RelationshipEdge
+  private running: Bool = false
+
+  def init(
+    changes: ChangeContext,
+    roots: EntityTracker<B>,
+    parents: EntityTracker<P>,
+    children: EntityTracker<D>,
+    selectParent: fn(B): P?,
+    selectChild: fn(B): D?,
+    childRoot: fn(D): B,
+    edge: fn(TrackedHandle<P>, TrackedHandle<D>): RelationshipEdge
+  ): Void
+    this.changes = changes
+    this.roots = roots
+    this.parents = parents
+    this.children = children
+    this.selectParent = selectParent
+    this.selectChild = selectChild
+    this.childRoot = childRoot
+    this.edge = edge
+  end
+
+  public def synchronize(): QueryFailure?
+    if this.running
+      return null
+    end
+    this.running = true
+    let status = new ModelCallbackState()
+    let visit: fn(B): Bool = fn(root: B): Bool do
+      let parent = this.selectParent(root)
+      let child = this.selectChild(root)
+      let state = this.roots.stateOf(root)
+
+      if parent == null || child == null || state == null
+        return true
+      end
+      var added = false
+      var deleted = false
+
+      match state
+        case TrackingState.Added()
+          added = true
+        case TrackingState.Deleted()
+          deleted = true
+        case TrackingState.Detached()
+          return true
+        case TrackingState.Unchanged()
+        case TrackingState.Modified()
+      end
+      var parentHandle: TrackedHandle<P>? = null
+      var childHandle: TrackedHandle<D>? = null
+
+      match this.parents.cascadeHandle(parent)
+        case TrackHandleResult.Tracked(handle)
+          parentHandle = handle
+        case TrackHandleResult.Failure(error)
+          let baseline = this.roots.original(root)
+          let enrolled = added ? this.parents.addWithHandle(parent) : (baseline == null ? this.parents.attachWithHandle(parent) : this.parents.attachWithSnapshot(
+              parent,
+              baseline
+            ))
+
+          match enrolled
+            case TrackHandleResult.Tracked(handle)
+              parentHandle = handle
+            case TrackHandleResult.Failure(error)
+              status.failure = error
+              return false
+          end
+      end
+      match this.children.cascadeHandle(child)
+        case TrackHandleResult.Tracked(handle)
+          childHandle = handle
+        case TrackHandleResult.Failure(error)
+          let baseline = this.roots.original(root)
+          let enrolled = added ? this.children.addWithHandle(child) : (baseline == null ? this.children.attachWithHandle(child) : this.children.attachWithSnapshot(
+              child,
+              baseline
+            ))
+
+          match enrolled
+            case TrackHandleResult.Tracked(handle)
+              childHandle = handle
+            case TrackHandleResult.Failure(error)
+              status.failure = error
+              return false
+          end
+      end
+      if parentHandle == null || childHandle == null
+        status.failure = QueryFailure.Provider(ProviderFailure.State("inheritance table enrollment did not yield live handles"))
+        return false
+      end
+      status.failure = this.changes.registerRelation(this.edge(parentHandle, childHandle))
+      if status.failure == null && deleted
+        let childState = this.children.stateOf(child)
+        var alreadyDeleted = false
+
+        if childState != null
+          match childState
+            case TrackingState.Deleted()
+              alreadyDeleted = true
+            case TrackingState.Added()
+            case TrackingState.Unchanged()
+            case TrackingState.Modified()
+            case TrackingState.Detached()
+          end
+        end
+        status.failure = this.children.remove(child) if !alreadyDeleted
+      end
+      return status.failure == null
+    end
+
+    this.roots.visitTracked(visit)
+    if status.failure == null
+      let detachOrphan: fn(D): Bool = fn(child: D): Bool do
+        let state = this.roots.stateOf(this.childRoot(child))
+        var detached = state == null
+
+        if state != null
+          match state
+            case TrackingState.Detached()
+              detached = true
+            case TrackingState.Added()
+            case TrackingState.Unchanged()
+            case TrackingState.Modified()
+            case TrackingState.Deleted()
+          end
+        end
+        status.failure = this.children.detach(child) if detached
+        return status.failure == null
+      end
+
+      this.children.visitTracked(detachOrphan)
+    end
+    this.running = false
+    return status.failure
+  end
+
+  public def register(): WriteFailure?
+    let observe: fn(): QueryFailure? = fn(): QueryFailure? do
+      let journal = new GraphJournal()
+      let capture = this.changes.journalChanges(journal)
+
+      if capture != null
+        return capture
+      end
+      let failure = this.synchronize()
+
+      if failure != null
+        journal.rollback()
+      else
+        journal.discard()
+      end
+      return failure
+    end
+    let detect: fn(GraphJournal): QueryFailure? = fn(journal: GraphJournal): QueryFailure? do
+      return this.synchronize()
+    end
+
+    this.roots.observeMaterialization(observe)
+    return this.changes.registerChangeDetector(detect)
+  end
+end

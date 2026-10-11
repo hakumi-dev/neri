@@ -414,7 +414,8 @@ use this boundary; their validated factories remain safe entry points.
 
 Public, safe instance methods on ordinary classes can expose operators using
 `@operator("+")`. The annotation belongs to the class that implements the
-operation. Binary operators take one parameter of exactly that class type;
+operation. Binary operators take one parameter of that class type or its readonly view;
+an operand can acquire the readonly view while binding the operator call.
 unary operators take none. Arithmetic operators return that class type;
 comparison operators and unary `!` return `Bool`.
 

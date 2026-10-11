@@ -31,18 +31,24 @@ class UpdateAssignment
   private targetTree: readonly quotation::Tree
   private valueTree: readonly quotation::Tree
   private resultType: String
-  private previousEntry: readonly UpdateAssignment?
+  private previousEntry: UpdateAssignment?
+  private builder: (fn(EntityMapping, CompileState, SqlDialect): ScalarSqlResult)?
+  private exactStorage: Bool
 
   def init(
     target: readonly quotation::Tree,
     value: readonly quotation::Tree,
     typeName: String,
-    previous: readonly UpdateAssignment?
+    previous: UpdateAssignment?,
+    builder: (fn(EntityMapping, CompileState, SqlDialect): ScalarSqlResult)? = null,
+    exactStorage: Bool = false
   ): Void
     this.targetTree = target
     this.valueTree = value
     this.resultType = typeName
     this.previousEntry = previous
+    this.builder = builder
+    this.exactStorage = exactStorage
   end
 
   internal readonly def target(): readonly quotation::Tree
@@ -57,17 +63,30 @@ class UpdateAssignment
     return this.resultType
   end
 
-  internal readonly def previous(): readonly UpdateAssignment?
+  internal def previous(): UpdateAssignment?
     return this.previousEntry
+  end
+
+  internal readonly def usesExactStorage(): Bool
+    return this.exactStorage
+  end
+
+  internal def compileValue(mapping: EntityMapping, state: CompileState, dialect: SqlDialect): ScalarSqlResult
+    let builder = this.builder
+
+    if builder != null
+      return builder(mapping, state, dialect)
+    end
+    return compileScalarQuotation(mapping, this.valueTree, this.resultType, state, dialect)
   end
 end
 
 ## Persistent, typed assignments for one set-based update.
 class UpdateSet<T>
-  private latest: readonly UpdateAssignment?
+  private latest: UpdateAssignment?
   private size: Int
 
-  def init(last: readonly UpdateAssignment? = null, count: Int = 0): Void
+  def init(last: UpdateAssignment? = null, count: Int = 0): Void
     this.latest = last
     this.size = count
   end
@@ -76,7 +95,7 @@ class UpdateSet<T>
     return this.size
   end
 
-  internal readonly def entryAt(index: Int): readonly UpdateAssignment?
+  internal def entryAt(index: Int): UpdateAssignment?
     if index < 0 || index >= this.size
       return null
     end
@@ -90,8 +109,108 @@ class UpdateSet<T>
     return current
   end
 
-  public readonly def set<V>(target: quote fn(T): V, value: quote fn(T): V): UpdateSet<T>
+  public def set<V>(target: quote fn(T): V, value: quote fn(T): V): UpdateSet<T>
     let entry = new UpdateAssignment(target.tree(), value.tree(), target.tree().resultType(), this.latest)
+
+    return new UpdateSet<T>(entry, this.size + 1)
+  end
+
+  public def setString(target: quote fn(T): String, value: StringExpression<T>): UpdateSet<T>
+    let build: fn(
+      EntityMapping,
+      CompileState,
+      SqlDialect
+    ): ScalarSqlResult = fn(
+      mapping: EntityMapping,
+      state: CompileState,
+      dialect: SqlDialect
+    ): ScalarSqlResult do
+      return value.buildSql(mapping, state, dialect)
+    end
+
+    return this.withBuilder(target.tree(), build)
+  end
+
+  public def setOptionalString(target: quote fn(T): String?, value: OptionalStringExpression<T>): UpdateSet<T>
+    let build: fn(
+      EntityMapping,
+      CompileState,
+      SqlDialect
+    ): ScalarSqlResult = fn(
+      mapping: EntityMapping,
+      state: CompileState,
+      dialect: SqlDialect
+    ): ScalarSqlResult do
+      return value.expression().buildSql(mapping, state, dialect)
+    end
+
+    return this.withBuilder(target.tree(), build)
+  end
+
+  public def setNumeric<V>(target: quote fn(T): V, value: NumericExpression<T, V>): UpdateSet<T>
+    let build: fn(
+      EntityMapping,
+      CompileState,
+      SqlDialect
+    ): ScalarSqlResult = fn(
+      mapping: EntityMapping,
+      state: CompileState,
+      dialect: SqlDialect
+    ): ScalarSqlResult do
+      return value.builder(mapping, state, dialect)
+    end
+
+    return this.withBuilder(target.tree(), build)
+  end
+
+  public def setOptionalNumeric<V>(target: quote fn(T): V?, value: OptionalNumericExpression<T, V>): UpdateSet<T>
+    let build: fn(
+      EntityMapping,
+      CompileState,
+      SqlDialect
+    ): ScalarSqlResult = fn(
+      mapping: EntityMapping,
+      state: CompileState,
+      dialect: SqlDialect
+    ): ScalarSqlResult do
+      return value.buildSql(mapping, state, dialect)
+    end
+
+    return this.withBuilder(target.tree(), build)
+  end
+
+  public def setConverted<V>(target: quote fn(T): V, value: V, encode: fn(V): Cell, conversionId: String): UpdateSet<T>
+    let captured = shadowCellCopy(encode(value))
+    let tree = target.tree()
+    let build: fn(
+      EntityMapping,
+      CompileState,
+      SqlDialect
+    ): ScalarSqlResult = fn(
+      mapping: EntityMapping,
+      state: CompileState,
+      dialect: SqlDialect
+    ): ScalarSqlResult do
+      match translateSelection(mapping, tree)
+        case SelectionResult.Failure(error)
+          return ScalarSqlResult.Failure(error)
+        case SelectionResult.Column(column)
+          if column.conversionId() != conversionId
+            return scalarSqlFailure("converted assignment must use the mapped encoder identity")
+          end
+          return bulkCapturedStorage(column, captured, state, dialect)
+      end
+    end
+
+    return this.withBuilder(tree, build, true)
+  end
+
+  private def withBuilder(
+    target: readonly quotation::Tree,
+    builder: fn(EntityMapping, CompileState, SqlDialect): ScalarSqlResult,
+    exactStorage: Bool = false
+  ): UpdateSet<T>
+    let entry = new UpdateAssignment(target, target, target.resultType(), this.latest, builder, exactStorage)
 
     return new UpdateSet<T>(entry, this.size + 1)
   end
@@ -99,6 +218,116 @@ end
 
 def updateSet<T>(): UpdateSet<T>
   return new UpdateSet<T>()
+end
+
+def bulkCapturedStorage(
+  column: readonly MappingColumn,
+  cell: Cell,
+  state: CompileState,
+  dialect: SqlDialect
+): ScalarSqlResult
+  let declared = semanticTranslationInner(column.storageTypeName())
+  let decimal = declared == "neri_data.Decimal" || declared == "Decimal"
+  let expected = decimal ? "String" : (declared == "buffers.ByteBuffer" ? "ByteBuffer" : declared)
+  var parameter: Parameter? = null
+  var actual = ""
+
+  match cell
+    case Cell.Null()
+      if !translationOptional(column.storageTypeName())
+        return scalarSqlFailure("converted NULL assignment requires nullable mapped storage")
+      end
+      return scalarSqlValue("NULL")
+    case Cell.Bool(value)
+      actual = "Bool"
+      parameter = Parameter.Bool(value)
+    case Cell.Int(value)
+      actual = "Int"
+      parameter = Parameter.Int(value)
+    case Cell.Float(value)
+      if !dataFloatFinite(value)
+        return scalarSqlFailure("converted assignment Float must be finite")
+      end
+      actual = "Float"
+      parameter = Parameter.Float(value)
+    case Cell.Text(value)
+      if decimal && decimalCanonical(value) != value
+        return scalarSqlFailure("converted Decimal assignment requires canonical TEXT")
+      end
+      actual = "String"
+      parameter = Parameter.Text(value)
+    case Cell.Binary(value)
+      actual = "ByteBuffer"
+      parameter = Parameter.Binary(copyBinary(value))
+  end
+  if actual != expected || parameter == null
+    return scalarSqlFailure("converted assignment encoder result must match storage type")
+  end
+  state.bind(parameter)
+  return scalarSqlValue(dialectPlaceholder(dialect, state.count))
+end
+
+def bulkPhysicalFailure<T>(query: Query<T>, columns: String[]): String?
+  let tracker = query.writeTracker()
+
+  return tracker == null ? null : tracker.setWriteFailure(columns)
+end
+
+def bulkScalarDependencies(mapping: EntityMapping, target: String, sql: String): String[]
+  let columns = new TypedRows<String>()
+
+  columns.add(target)
+  var index = 0
+
+  while index < mapping.count()
+    let column = mapping.columnAt(index)
+
+    if column != null && column.column() != target && sql.contains(quoted(mapping.table(), column.column()))
+      columns.add(column.column())
+    end
+    index = index + 1
+  end
+  return navigationArray(columns)
+end
+
+def compileSetMappedCell<T>(query: Query<T>, name: String, captured: Cell, dialect: SqlDialect): SetPlanResult
+  let mapping = query.entityMapping()
+
+  if mapping == null || mapping.readOnly()
+    return SetPlanResult.Failure(WriteFailure.Unsupported("mapped storage update requires a writable entity mapping"))
+  end
+  let key = mapping.keyColumn()
+  let column = mappedLogicalColumn(mapping, name)
+
+  if key == null || column == null || mapping.isPrimaryKey(column.column())
+    return SetPlanResult.Failure(WriteFailure.Validation("mapped storage update requires a declared non-key property"))
+  end
+  let physicalFailure = bulkPhysicalFailure(query, [column.column()])
+
+  if physicalFailure != null
+    return SetPlanResult.Failure(WriteFailure.Unsupported(physicalFailure))
+  end
+  match bulkKeySelection(query, mapping, key, dialect)
+    case CompileResult.Failure(error)
+      return SetPlanResult.Failure(bulkScalarFailure(error))
+    case CompileResult.Plan(selection)
+      let state = new CompileState()
+
+      state.count = selection.parameterValues().count()
+      match bulkCapturedStorage(column, shadowCellCopy(captured), state, dialect)
+        case ScalarSqlResult.Failure(error)
+          return SetPlanResult.Failure(bulkScalarFailure(error))
+        case ScalarSqlResult.Value(value)
+          let parameters = new WriteValues()
+
+          bulkParameters(selection.parameterValues(), parameters)
+          bulkParameters(new ParameterValues(state.head, state.count - selection.parameterValues().count()), parameters)
+          let alias = bulkTargetAlias(mapping.table())
+          let sql = "WITH \"" + alias + "\" AS MATERIALIZED (" + selection.sql().sql() + ") UPDATE \"" + mapping.table() + "\" SET \"" + column.column() + "\" = " + value.sql + " WHERE " + bulkKeyOperand(mapping) + " IN (SELECT " + bulkKeyNames(mapping) + " FROM \"" + alias + "\")"
+
+          return SetPlanResult.Plan(new SetWritePlan(sql, parameters, selection.sql().requiresCheckedScalars()))
+      end
+  end
 end
 
 enum SetPlanResult
@@ -201,6 +430,21 @@ def compileSetDelete<T>(query: Query<T>, dialect: SqlDialect): SetPlanResult
   if mapping.readOnly()
     return SetPlanResult.Failure(WriteFailure.Unsupported("read-only entities cannot be modified"))
   end
+  let tracker = query.writeTracker()
+
+  if tracker != null && tracker.hasTableSegments()
+    return SetPlanResult.Failure(WriteFailure.Unsupported("bulk delete requires one physical table; segmented inheritance uses tracked deletion"))
+  end
+  let names: String[] = tasks::generate(mapping.count(), 1) do |index|
+    let column = mapping.columnAt(index)
+
+    return column == null ? "" : column.column()
+  end
+  let physicalFailure = bulkPhysicalFailure(query, names)
+
+  if physicalFailure != null
+    return SetPlanResult.Failure(WriteFailure.Unsupported(physicalFailure))
+  end
   let key = mapping.keyColumn()
 
   if key == null
@@ -267,6 +511,14 @@ def compileSetUpdate<T>(query: Query<T>, changes: readonly fields::Pack, dialect
 
         if column == null || column.typeName() != entry.typeName()
           return SetPlanResult.Failure(WriteFailure.Validation("bulk update field does not match mapping"))
+        end
+        if column.conversionId() != null
+          return SetPlanResult.Failure(WriteFailure.Validation("converted update targets require setConverted with the mapped encoder"))
+        end
+        let physicalFailure = bulkPhysicalFailure(query, [column.column()])
+
+        if physicalFailure != null
+          return SetPlanResult.Failure(WriteFailure.Unsupported(physicalFailure))
         end
         if mapping.isPrimaryKey(column.column())
           return SetPlanResult.Failure(WriteFailure.Validation("bulk update cannot change the primary key"))
@@ -380,7 +632,7 @@ def bulkPostgresResultValidator(sql: String, typeName: String): String
   return "(SELECT CASE WHEN " + value + " IS NULL THEN " + nullValue + " ELSE " + checked + " END FROM (SELECT CAST(" + sql + " AS " + sqlType + ") AS \"value\") AS \"__neri_set_value\")"
 end
 
-def compileSetUpdateExpressions<T>(query: Query<T>, setters: readonly UpdateSet<T>, dialect: SqlDialect): SetPlanResult
+def compileSetUpdateExpressions<T>(query: Query<T>, setters: UpdateSet<T>, dialect: SqlDialect): SetPlanResult
   let mapping = query.entityMapping()
 
   if mapping == null
@@ -436,6 +688,9 @@ def compileSetUpdateExpressions<T>(query: Query<T>, setters: readonly UpdateSet<
             if column.typeName() != entry.typeName() || entry.value().resultType() != entry.typeName()
               return SetPlanResult.Failure(WriteFailure.Validation("computed bulk update target and value types must match mapping"))
             end
+            if column.conversionId() != null && !entry.usesExactStorage()
+              return SetPlanResult.Failure(WriteFailure.Validation("converted update targets require setConverted with the mapped encoder"))
+            end
             if mapping.isPrimaryKey(column.column())
               return SetPlanResult.Failure(WriteFailure.Validation("computed bulk update cannot change the primary key"))
             end
@@ -457,18 +712,30 @@ def compileSetUpdateExpressions<T>(query: Query<T>, setters: readonly UpdateSet<
               end
               prior = prior + 1
             end
-            match compileScalarQuotation(mapping, entry.value(), column.typeName(), state, dialect)
+            match entry.compileValue(mapping, state, dialect)
               case ScalarSqlResult.Failure(error)
                 return SetPlanResult.Failure(bulkScalarFailure(error))
               case ScalarSqlResult.Value(value)
+                let physicalFailure = bulkPhysicalFailure(
+                  query,
+                  bulkScalarDependencies(mapping, column.column(), value.sql)
+                )
+
+                if physicalFailure != null
+                  return SetPlanResult.Failure(WriteFailure.Unsupported(physicalFailure))
+                end
                 let allowNull = translationOptional(column.typeName()) ? "1" : "0"
                 var guarded = ""
 
-                match dialect
-                  case SqlDialect.QuestionMark()
-                    guarded = bulkResultValidator(column.typeName()) + "(" + value.sql + ", " + allowNull + ")"
-                  case SqlDialect.PostgreSql()
-                    guarded = bulkPostgresResultValidator(value.sql, column.typeName())
+                if entry.usesExactStorage()
+                  guarded = value.sql
+                else
+                  match dialect
+                    case SqlDialect.QuestionMark()
+                      guarded = bulkResultValidator(column.typeName()) + "(" + value.sql + ", " + allowNull + ")"
+                    case SqlDialect.PostgreSql()
+                      guarded = bulkPostgresResultValidator(value.sql, column.typeName())
+                  end
                 end
 
                 if column.boolToInt()

@@ -539,6 +539,7 @@ class Expression
   internal scalarMapping: EntityMapping?
   internal hasScalar: Bool
   internal decimalBuilder: (fn(EntityMapping, CompileState, SqlDialect): ScalarSqlResult)?
+  internal comparisonPrefixLength: Int
 
   def init(
     kind: ExpressionKind,
@@ -551,7 +552,8 @@ class Expression
     rightColumn: String? = null,
     scalarTree: readonly quotation::Tree? = null,
     scalarMapping: EntityMapping? = null,
-    decimalBuilder: (fn(EntityMapping, CompileState, SqlDialect): ScalarSqlResult)? = null
+    decimalBuilder: (fn(EntityMapping, CompileState, SqlDialect): ScalarSqlResult)? = null,
+    comparisonPrefixLength: Int = 0
   ): Void
     this.kind = kind
     this.table = table
@@ -564,6 +566,7 @@ class Expression
     this.scalarTree = scalarTree
     this.scalarMapping = scalarMapping
     this.decimalBuilder = decimalBuilder
+    this.comparisonPrefixLength = comparisonPrefixLength
     this.hasScalar = decimalBuilder != null || scalarTree != null || (left != null && left.hasScalar) || (right != null && right.hasScalar)
   end
 end
@@ -597,10 +600,12 @@ end
 class SqlSource
   private text: String
   private checkedScalars: Bool
+  private mappedRootWrites: Bool
 
-  def init(sql: String, requiresCheckedScalars: Bool = false): Void
+  def init(sql: String, requiresCheckedScalars: Bool = false, mappedRootWrites: Bool = false): Void
     this.text = sql
     this.checkedScalars = requiresCheckedScalars
+    this.mappedRootWrites = mappedRootWrites
   end
 
   internal readonly def sql(): String
@@ -609,6 +614,10 @@ class SqlSource
 
   internal readonly def requiresCheckedScalars(): Bool
     return this.checkedScalars
+  end
+
+  internal readonly def canWriteMappedRoot(): Bool
+    return this.mappedRootWrites
   end
 end
 
@@ -890,7 +899,7 @@ def compileLeaf(
     if rightTable != source
       return ExpressionCompileResult.Failure(QueryFailure.SourceMismatch(source, rightTable))
     end
-    suffix = suffix + quoted(rightTable, rightColumn)
+    suffix = suffix + comparisonStorageSql(quoted(rightTable, rightColumn), expression.comparisonPrefixLength)
   else if binds
     let parameter = expression.parameter
 
@@ -908,9 +917,12 @@ def compileLeaf(
       case Parameter.Binary(value)
     end
     state.bind(parameter)
-    suffix = suffix + dialectPlaceholder(dialect, state.count)
+    suffix = suffix + comparisonStorageSql(dialectPlaceholder(dialect, state.count), expression.comparisonPrefixLength)
   end
-  return ExpressionCompileResult.Sql(quoted(expression.table, expression.column) + suffix)
+  return ExpressionCompileResult.Sql(comparisonStorageSql(
+      quoted(expression.table, expression.column),
+      expression.comparisonPrefixLength
+    ) + suffix)
 end
 
 class OrderTerm
@@ -1080,9 +1092,100 @@ class Query<T>
     return this.configured(false, false, this.globalFilter, this.filtersDisabled, this.previous)
   end
 
+  ## Creates an isolated identity scope for a detached navigation graph.
+  ## Reuse this query for every occurrence of the same entity set in that graph.
+  public def detachedGraph(): Query<T>
+    let tracker = this.tracker
+
+    if tracker == null
+      return this.failed(QueryFailure.UnsupportedCapability("detached graph loading requires entity identity metadata"))
+    end
+    return this.withNavigationTracker(tracker.identityResolver())
+  end
+
+  internal def withNavigationTracker(tracker: EntityTracker<T>): Query<T>
+    let prior = this.previous
+
+    return new Query<T>(
+      this.source, this.decoder, this.predicate, this.orderTable, this.orderColumn,
+      this.descending, this.limit, this.mapping, this.failure, this.boundProvider,
+      tracker, prior == null ? null : prior.withNavigationTracker(tracker),
+      this.offset, this.unique, this.thenTerms, changes: this.changes,
+      primaryOrderTree: this.primaryOrderTree, globalFilter: this.globalFilter,
+      filtersDisabled: this.filtersDisabled, tagComments: this.tagComments,
+      rawSource: this.rawSource, rawParameters: this.rawParameters,
+      namedFilters: this.namedFilters, ignoredFilterNames: this.ignoredFilterNames
+    )
+  end
+
+  internal def navigationBase(): Query<T>
+    return new Query<T>(
+      this.source, this.decoder, this.predicate, mapping: this.mapping,
+      failure: this.failure, provider: this.boundProvider, tracker: this.tracker,
+      changes: this.changes, trackingDisabled: this.trackingDisabled,
+      identityOnly: this.identityOnly, globalFilter: this.globalFilter,
+      filtersDisabled: this.filtersDisabled, tagComments: this.tagComments,
+      rawSource: this.rawSource, rawParameters: this.rawParameters,
+      namedFilters: this.namedFilters, ignoredFilterNames: this.ignoredFilterNames
+    )
+  end
+
+  internal def stableNavigationOrder(): Query<T>
+    let mapping = this.mapping
+
+    if mapping == null || mapping.primaryKeys().Length == 0
+      return this
+    end
+    var table = this.orderTable
+    var column = this.orderColumn
+    var terms = this.thenTerms
+    let keys = mapping.primaryKeys()
+    var index = 0
+
+    if column == null && this.primaryOrderTree == null
+      table = this.source
+      column = keys[0]
+      index = 1
+    end
+    while index < keys.Length
+      terms = appendOrder(terms, keys[index], false)
+      index = index + 1
+    end
+    let prior = this.previous
+
+    return new Query<T>(
+      this.source, this.decoder, this.predicate, table, column,
+      this.descending, this.limit, this.mapping, this.failure, this.boundProvider,
+      this.tracker, prior == null ? null : prior.stableNavigationOrder(),
+      this.offset, this.unique, terms, changes: this.changes,
+      primaryOrderTree: this.primaryOrderTree, trackingDisabled: this.trackingDisabled,
+      identityOnly: this.identityOnly, globalFilter: this.globalFilter,
+      filtersDisabled: this.filtersDisabled, tagComments: this.tagComments,
+      rawSource: this.rawSource, rawParameters: this.rawParameters,
+      namedFilters: this.namedFilters, ignoredFilterNames: this.ignoredFilterNames
+    )
+  end
+
   ## Uses trusted composable SQL with separately bound provider-dialect parameters.
   ## The SQL must expose mapped physical columns and form a valid SQL subquery.
   public def fromSql(sql: String, parameters: readonly ParameterValues): Query<T>
+    return this.sqlRoot(sql, parameters, false)
+  end
+
+  ## Uses a generated mapped read source while preserving its physical write layout.
+  public def fromMappedSql(sql: String, parameters: readonly ParameterValues): Query<T>
+    let mapping = this.mapping
+
+    if mapping == null
+      return this.failed(QueryFailure.UnsupportedCapability("mapped SQL sources require entity metadata"))
+    end
+    if !mapping.readOnly() && (this.tracker == null || this.changes == null)
+      return this.failed(QueryFailure.UnsupportedCapability("writable mapped SQL sources require context tracking metadata"))
+    end
+    return this.sqlRoot(sql, parameters, true)
+  end
+
+  private def sqlRoot(sql: String, parameters: readonly ParameterValues, mappedRootWrites: Bool): Query<T>
     if !this.isUnfilteredRoot() || this.rawSource != null
       return this.failed(QueryFailure.UnsupportedCapability("SQL sources require an unfiltered query root"))
     end
@@ -1100,7 +1203,7 @@ class Query<T>
     let copied = new CompileState()
 
     joinParameterCopy(parameters, copied)
-    let source = new SqlSource("(" + sql + "\n) AS \"" + this.source + "\"")
+    let source = new SqlSource("(" + sql + "\n) AS \"" + this.source + "\"", mappedRootWrites: mappedRootWrites)
 
     return this.configured(
       this.trackingDisabled,
@@ -1320,6 +1423,10 @@ class Query<T>
     return this.selectShape(decimalShape(expression))
   end
 
+  public def selectOptionalDecimal(expression: OptionalDecimalExpression<T>): ShapeProjection<T, Decimal?>
+    return this.selectShape(optionalDecimalShape(expression))
+  end
+
   public def matchingDecimal(predicate: DecimalPredicate<T>): Query<T>
     let mapping = this.mapping
 
@@ -1329,8 +1436,25 @@ class Query<T>
     return this.filtered(predicate.expression(mapping))
   end
 
+  public def matchingComputed(predicate: ComputedPredicate<T>): Query<T>
+    let mapping = this.mapping
+
+    if mapping == null
+      return this.failed(QueryFailure.UnsupportedCapability("computed predicates require mapped fields"))
+    end
+    return this.filtered(predicate.expression(mapping))
+  end
+
+  public def whereMappedCell(name: String, value: Cell): Query<T>
+    return this.matchingComputed(mappedCellEqual<T>(name, value))
+  end
+
   public def orderByDecimal(expression: DecimalExpression<T>, descending: Bool = false): Relation<T>
     return decimalOrdered(this.asRelation(), expression, descending)
+  end
+
+  public def orderByOptionalDecimal(expression: OptionalDecimalExpression<T>, descending: Bool = false): Relation<T>
+    return decimalOrdered(this.asRelation(), expression.expression(), descending)
   end
 
   public def matching(predicate: quote fn(T): Bool): Query<T>
@@ -1483,7 +1607,7 @@ class Query<T>
 
       if field != null && field.column() == column
         found = true
-        columnType = field.typeName()
+        columnType = field.storageTypeName()
       end
       index = index + 1
     end
@@ -1558,7 +1682,7 @@ class Query<T>
       var tuple: Expression? = null
 
       for column in columns
-        let typeName = navigationColumnType(mapping, column)
+        let typeName = navigationColumnStorageType(mapping, column)
         let cell = cellFromRow(row, column)
         var parameter: Parameter? = null
 
@@ -1790,6 +1914,11 @@ class Query<T>
 
   public def orderBy(field: quote fn(T): Int, descending: Bool = false): Query<T>
     return this.orderTree(field.tree(), descending)
+  end
+
+  ## Starts a typed deferred include path from this query.
+  public def include<U>(step: NavigationStep<T, U>): NavigationQuery<T, U>
+    return includePath(this, step)
   end
 
   public def orderByValue<R>(codec: ScalarCodec<R>, field: quote fn(T): R, descending: Bool = false): Query<T>
@@ -2076,7 +2205,7 @@ class Query<T>
   end
 
   public def executeUpdateSetAsync(
-    setters: readonly UpdateSet<T>,
+    setters: UpdateSet<T>,
     options: StreamOptions? = null
   ): result::Result<AsyncWrite, WriteFailure>
     let provider = this.boundProvider
@@ -2147,7 +2276,7 @@ class Query<T>
   end
 
   ## Updates several mapped fields from expressions over each original row.
-  public def executeUpdateSet(setters: readonly UpdateSet<T>): WriteResult
+  public def executeUpdateSet(setters: UpdateSet<T>): WriteResult
     let provider = this.boundProvider
 
     if provider == null
@@ -2169,6 +2298,26 @@ class Query<T>
           return owner.executeSet(plan, provider)
         end
         return normalizeSetWrite(provider.executeSet(plan))
+    end
+  end
+
+  ## Writes one mapped logical property using an explicitly typed storage cell.
+  public def executeUpdateMappedCell(name: String, value: Cell): WriteResult
+    let provider = this.boundProvider
+
+    if provider == null || !provider.supports(ProviderCapability.SetWrites())
+      return WriteResult.Failure(WriteFailure.Unsupported("mapped update requires provider set writes"))
+    end
+    match compileSetMappedCell(this, name, value, provider.dialect())
+      case SetPlanResult.Failure(error)
+        return WriteResult.Failure(error)
+      case SetPlanResult.Plan(plan)
+        if plan.requiresCheckedScalars() && !provider.supports(ProviderCapability.CheckedScalarExpressions())
+          return WriteResult.Failure(WriteFailure.Unsupported("provider does not support checked scalar expressions"))
+        end
+        let owner = this.changes
+
+        return owner == null ? normalizeSetWrite(provider.executeSet(plan)) : owner.executeSet(plan, provider)
     end
   end
 
@@ -2412,6 +2561,20 @@ class Query<T>
     end
   end
 
+  ## Returns the active handle for this exact tracked entity instance.
+  public def handle(entity: T): TrackHandleResult<T>
+    let failure = this.mutationFailure()
+    let tracker = this.tracker
+
+    if failure != null
+      return TrackHandleResult<T>.Failure(failure)
+    end
+    if tracker == null
+      return TrackHandleResult<T>.Failure(QueryFailure.UnsupportedCapability("query requires an entity tracker"))
+    end
+    return tracker.handle(entity)
+  end
+
   ## Starts tracking a new entity through this query's root context.
   public def add(entity: T): QueryFailure?
     let mutationFailure = this.mutationFailure()
@@ -2566,7 +2729,9 @@ class Query<T>
     if mapping != null && mapping.readOnly()
       return QueryFailure.UnsupportedCapability("read-only entities cannot be tracked for writes")
     end
-    if !this.isUnfilteredRoot() || this.rawSource != null
+    let sqlSource = this.rawSource
+
+    if !this.isUnfilteredRoot() || (sqlSource != null && !sqlSource.canWriteMappedRoot())
       return QueryFailure.UnsupportedCapability("entity mutations require an unfiltered query root")
     end
     return null
@@ -2692,6 +2857,11 @@ class Query<T>
     return this.tracker
   end
 
+  ## Physical write metadata is independent of the materialization policy.
+  internal def writeTracker(): EntityTracker<T>?
+    return this.tracker
+  end
+
   internal def changeOwner(): ChangeContext?
     return this.changes
   end
@@ -2745,7 +2915,7 @@ def queryRelationColumnType(mapping: EntityMapping, physical: String): String?
     let column = mapping.columnAt(index)
 
     if column != null && column.column() == physical
-      return column.typeName()
+      return column.storageTypeName()
     end
     index = index + 1
   end
@@ -2825,11 +2995,17 @@ def compileQueryRelationPlan<T>(
         return RelationBuildResult<T>.Failure(QueryFailure.MissingColumn(current.column))
       end
       typeName = found
-      expression = quoted(source, current.column)
+      expression = mappedOrderSql(mapping, source, current.column)
     else
       typeName = tree.resultType()
 
-      match compileScalarQuotation(orderMapping, tree, tree.resultType(), state, dialect)
+      match translateSelection(orderMapping, tree)
+        case SelectionResult.Column(column)
+          typeName = column.storageTypeName()
+        case SelectionResult.Failure(error)
+      end
+
+      match compileOrderQuotation(orderMapping, tree, state, dialect)
         case ScalarSqlResult.Failure(error)
           return RelationBuildResult<T>.Failure(error)
         case ScalarSqlResult.Value(value)
@@ -3486,7 +3662,7 @@ def compileQuery<T>(
       if orderMapping == null || orderMapping.table() != source
         return CompileResult<T>.Failure(QueryFailure.UnsupportedCapability("computed ordering requires matching entity mapping"))
       end
-      match compileScalarQuotation(orderMapping, primaryOrderTree, primaryOrderTree.resultType(), state, dialect)
+      match compileOrderQuotation(orderMapping, primaryOrderTree, state, dialect)
         case ScalarSqlResult.Failure(error)
           return CompileResult<T>.Failure(error)
         case ScalarSqlResult.Value(value)
@@ -3506,7 +3682,7 @@ def compileQuery<T>(
       if orderTable != source
         return CompileResult<T>.Failure(QueryFailure.SourceMismatch(source, orderTable))
       end
-      sql = sql + " ORDER BY " + quoted(orderTable, orderColumn) + (descending ? " DESC" : " ASC")
+      sql = sql + " ORDER BY " + mappedOrderSql(orderMapping, orderTable, orderColumn) + (descending ? " DESC" : " ASC")
     end
     var nextOrder = secondary
 
@@ -3517,7 +3693,7 @@ def compileQuery<T>(
         if orderMapping == null || orderMapping.table() != source
           return CompileResult<T>.Failure(QueryFailure.UnsupportedCapability("computed ordering requires matching entity mapping"))
         end
-        match compileScalarQuotation(orderMapping, tree, tree.resultType(), state, dialect)
+        match compileOrderQuotation(orderMapping, tree, state, dialect)
           case ScalarSqlResult.Failure(error)
             return CompileResult<T>.Failure(error)
           case ScalarSqlResult.Value(value)
@@ -3528,7 +3704,11 @@ def compileQuery<T>(
         if !dialectIdentifierValid(nextOrder.column, dialect)
           return CompileResult<T>.Failure(QueryFailure.InvalidIdentifier(nextOrder.column))
         end
-        sql = sql + ", " + quoted(source, nextOrder.column) + (nextOrder.descending ? " DESC" : " ASC")
+        sql = sql + ", " + mappedOrderSql(
+          orderMapping,
+          source,
+          nextOrder.column
+        ) + (nextOrder.descending ? " DESC" : " ASC")
       end
       nextOrder = nextOrder.next
     end

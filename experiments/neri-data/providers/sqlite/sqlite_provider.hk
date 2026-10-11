@@ -192,8 +192,83 @@ class SQLiteProvider: neri_data::Provider
   private lastTransactionState: TransactionState = TransactionState.Invalid()
   private nextSavepoint: Int = 1
   private savepoints: SQLiteSavepointNode?
+  private ownsHandle: Bool = true
+  private reconnectPath: String?
+  private reconnectOptions: SQLiteOptions?
 
   def init(): Void
+  end
+
+  ## The caller retains the native handle and exclusively owns its lifetime.
+  public static unsafe def borrowNativeTransaction(database: Void*): SQLiteOpenResult
+    if sqliteAutoCommit(database) != (0 as Int32)
+      return SQLiteOpenResult.Failure(ProviderFailure.State("native SQLite transaction must already be active"))
+    end
+    let failure = sqliteForeignKeysFailure(database)
+
+    if failure != null
+      return SQLiteOpenResult.Failure(failure)
+    end
+    if !sqliteRegisterCheckedScalars(database)
+      return SQLiteOpenResult.Failure(sqliteFailure(database, "borrow.checked_scalars"))
+    end
+    let provider = new SQLiteProvider()
+
+    provider.database = database
+    provider.writable = true
+    provider.ownsHandle = false
+    provider.activeLease = 1
+    provider.lastLease = 1
+    provider.nextLease = 2
+    provider.lastTransactionState = TransactionState.Active()
+    provider.windowFunctions = sqliteVersionNumber() >= (3025000 as Int32)
+    return SQLiteOpenResult.Opened(provider)
+  end
+
+  ## Reuses a borrowed wrapper after the native owner starts its next transaction.
+  public def enlistNativeTransaction(): TransactionOpenResult
+    if this.ownsHandle || this.streaming || this.activeLease != 0 || this.nextLease <= 0 || this.nextLease == 9223372036854775807
+      return TransactionOpenResult.Failure(WriteFailure.Transaction("borrowed SQLite transaction enrollment requires an idle wrapper"))
+    end
+    unsafe
+      let handle = this.database
+
+      if handle == null || !(sqliteAutoCommit(handle) == (0 as Int32))
+        return TransactionOpenResult.Failure(WriteFailure.Transaction("native SQLite transaction must be idle and active"))
+      end
+    end
+    let lease = this.nextLease
+
+    this.nextLease = lease + 1
+    this.activeLease = lease
+    this.lastLease = lease
+    this.lastTransactionState = TransactionState.Active()
+    this.savepoints = null
+    return TransactionOpenResult.Begun(lease)
+  end
+
+  public readonly def nativeTransactionLease(): Int?
+    return this.activeLease == 0 ? null : this.activeLease
+  end
+
+  ## Acknowledges an externally completed outcome only after native transaction exit.
+  public def acknowledgeNativeTransaction(committed: Bool): WriteResult
+    if this.ownsHandle || this.streaming || this.activeLease == 0
+      return WriteResult.Failure(WriteFailure.Transaction("no idle borrowed SQLite transaction to acknowledge"))
+    end
+    unsafe
+      let database = this.database
+
+      if database == null || sqliteAutoCommit(database) == (0 as Int32)
+        return WriteResult.Failure(WriteFailure.Transaction("native SQLite transaction is still active"))
+      end
+    end
+    this.lastLease = this.activeLease
+    this.activeLease = 0
+    this.savepoints = null
+    this.lastTransactionState = committed ? TransactionState.Committed() : TransactionState.RolledBack()
+    this.poisoned = false
+    return WriteResult.Saved(0)
   end
 
   static def open(path: String, options: SQLiteOptions? = null): SQLiteOpenResult
@@ -276,6 +351,8 @@ class SQLiteProvider: neri_data::Provider
       let provider = new SQLiteProvider()
 
       provider.database = result[0]
+      provider.reconnectPath = path
+      provider.reconnectOptions = policy
       match sqliteConfigure(result[0], policy, writable)
         case SQLiteConfigurationResult.Failure(error)
           return SQLiteOpenResult.Failure(sqliteCloseFailure(result[0], error))
@@ -322,6 +399,40 @@ class SQLiteProvider: neri_data::Provider
     return this.effectiveConfiguration
   end
 
+  ## Reopens the same file and retains this provider object for mapped query roots.
+  public def reconnectAfterRollback(): WriteFailure?
+    let path = this.reconnectPath
+
+    if !this.ownsHandle || this.streaming || this.activeLease != 0 || this.poisoned || path == null || path == ":memory:"
+      return WriteFailure.Transaction("SQLite reconnect requires an idle owned file connection")
+    end
+    let opened = SQLiteProvider.openMode(path, this.writable, false, this.reconnectOptions)
+
+    match opened
+      case SQLiteOpenResult.Failure(error)
+        return WriteFailure.Provider(error)
+      case SQLiteOpenResult.Opened(replacement)
+        let failure = this.closeFailure()
+
+        if failure != null
+          let cleanup = replacement.closeFailure()
+
+          return cleanup == null ? WriteFailure.Provider(failure) : WriteFailure.Cleanup(new WriteCleanupFailure(
+              WriteFailure.Provider(failure),
+              WriteFailure.Provider(cleanup)
+            ))
+        end
+        this.database = replacement.database
+        replacement.database = null
+        replacement.closed = true
+        this.closed = false
+        this.effectiveConfiguration = replacement.effectiveConfiguration
+        this.windowFunctions = replacement.windowFunctions
+        return null
+    end
+    return WriteFailure.Transaction("SQLite reconnect did not finish")
+  end
+
   public def close(): Bool
     return this.closeFailure() == null
   end
@@ -329,6 +440,14 @@ class SQLiteProvider: neri_data::Provider
   public def closeFailure(): ProviderFailure?
     if this.streaming
       return ProviderFailure.State("SQLite close could not finish")
+    end
+    if !this.ownsHandle
+      if this.activeLease != 0
+        return ProviderFailure.State("borrowed SQLite transaction requires acknowledged completion before close")
+      end
+      this.database = null
+      this.closed = true
+      return null
     end
     unsafe
       let database = this.database
@@ -1116,6 +1235,9 @@ class SQLiteProvider: neri_data::Provider
   end
 
   public override def beginTransaction(): TransactionOpenResult
+    if !this.ownsHandle
+      return TransactionOpenResult.Failure(WriteFailure.Transaction("external SQLite owner controls transaction completion"))
+    end
     if this.streaming
       return TransactionOpenResult.Failure(WriteFailure.Transaction("SQLite provider is busy streaming"))
     end
@@ -1172,6 +1294,9 @@ class SQLiteProvider: neri_data::Provider
           return TransactionState.Failed()
         end
         if sqliteAutoCommit(database) != (0 as Int32)
+          if !this.ownsHandle
+            return TransactionState.Failed()
+          end
           this.activeLease = 0
           this.savepoints = null
           this.lastTransactionState = TransactionState.RolledBack()
@@ -1210,6 +1335,9 @@ class SQLiteProvider: neri_data::Provider
         return SavepointOpenResult.Failure(WriteFailure.Transaction("SQLite database handle unavailable"))
       end
       if sqliteAutoCommit(database) != (0 as Int32)
+        if !this.ownsHandle
+          return SavepointOpenResult.Failure(WriteFailure.Transaction("external transaction completion is not acknowledged"))
+        end
         this.activeLease = 0
         this.savepoints = null
         this.lastTransactionState = TransactionState.RolledBack()
@@ -1222,9 +1350,11 @@ class SQLiteProvider: neri_data::Provider
         let failure = sqliteWriteFailure(database, status, "savepoint")
 
         if sqliteAutoCommit(database) != (0 as Int32)
-          this.activeLease = 0
-          this.savepoints = null
-          this.lastTransactionState = TransactionState.RolledBack()
+          if this.ownsHandle
+            this.activeLease = 0
+            this.savepoints = null
+            this.lastTransactionState = TransactionState.RolledBack()
+          end
         end
         return SavepointOpenResult.Failure(failure)
       end
@@ -1403,6 +1533,9 @@ class SQLiteProvider: neri_data::Provider
   end
 
   public override def commitTransaction(lease: Int): WriteResult
+    if !this.ownsHandle
+      return WriteResult.Failure(WriteFailure.Transaction("external SQLite owner controls transaction completion"))
+    end
     if this.streaming
       return WriteResult.Failure(WriteFailure.Transaction("SQLite provider is busy streaming"))
     end
@@ -1434,6 +1567,9 @@ class SQLiteProvider: neri_data::Provider
   end
 
   public override def rollbackTransaction(lease: Int): WriteResult
+    if !this.ownsHandle
+      return WriteResult.Failure(WriteFailure.Transaction("external SQLite owner controls transaction completion"))
+    end
     if this.streaming
       return WriteResult.Failure(WriteFailure.Transaction("SQLite provider is busy streaming"))
     end
@@ -1484,6 +1620,10 @@ class SQLiteProvider: neri_data::Provider
             )))
       end
       if sqliteAutoCommit(database) != (0 as Int32)
+        if !this.ownsHandle
+          this.lastTransactionState = TransactionState.Failed()
+          return WriteResult.Failure(error)
+        end
         this.activeLease = 0
         this.savepoints = null
         this.lastTransactionState = TransactionState.RolledBack()
@@ -1507,6 +1647,14 @@ class SQLiteProvider: neri_data::Provider
 
   private def failOuterTransaction(error: WriteFailure): WriteResult
     this.removeWorkerProgressForCleanup()
+    if !this.ownsHandle
+      this.poisoned = true
+      this.lastTransactionState = TransactionState.Failed()
+      return WriteResult.Failure(WriteFailure.Cleanup(new WriteCleanupFailure(
+            error,
+            WriteFailure.Transaction("external transaction owner must recover uncertain native state")
+          )))
+    end
     unsafe
       let database = this.database
 

@@ -1,0 +1,315 @@
+namespace neri_data
+
+## A collection include whose roots, children and presence marker share one statement.
+class SingleIncludedQuery<P, D>
+  private source: IncludedQuery<P, D>
+
+  def init(source: IncludedQuery<P, D>): Void
+    this.source = source
+  end
+
+  public def asSplitQuery(): IncludedQuery<P, D>
+    return this.source
+  end
+
+  public def all(): QueryResult<P>
+    let source = this.source.effectiveSinglePlan()
+    let invalid = source.validateQueries()
+    let provider = source.rootQuery().provider()
+
+    if invalid != null
+      return QueryResult<P>.Failure(invalid)
+    end
+    if provider == null
+      return QueryResult<P>.Failure(QueryFailure.UnsupportedCapability("single include requires a provider"))
+    end
+    let journal = new NavigationJournal()
+
+    source.checkpointRoots(journal)
+    let build: fn(SqlDialect): CompileResult<LeftJoined<P, D>> = fn(dialect: SqlDialect): CompileResult<LeftJoined<P, D>> do
+      return singleNavigationPlan(source, dialect)
+    end
+
+    match materializeStream<LeftJoined<P, D>>(provider, build, maximumRows: 20000)
+      case QueryResult.Failure(error)
+        journal.rollback()
+        return QueryResult<P>.Failure(error)
+      case QueryResult.Rows(rows)
+        let result = publishSingleNavigation(source, rows)
+
+        match result
+          case QueryResult.Failure(error)
+            journal.rollback()
+          case QueryResult.Rows(roots)
+            journal.discard()
+        end
+        return result
+    end
+  end
+
+  public def allAsync(options: StreamOptions? = null): result::Result<AsyncLoad<P>, QueryFailure>
+    let source = this.source.effectiveSinglePlan()
+    let invalid = source.validateQueries(true)
+    let provider = source.rootQuery().provider()
+
+    if invalid != null
+      return result::Result<AsyncLoad<P>, QueryFailure>.Error(invalid)
+    end
+    if provider == null
+      return result::Result<AsyncLoad<P>, QueryFailure>.Error(QueryFailure.UnsupportedCapability("single include requires a provider"))
+    end
+    let journal = new NavigationJournal()
+
+    source.checkpointRoots(journal)
+    match singleNavigationPlan(source, provider.dialect())
+      case CompileResult.Failure(error)
+        journal.rollback()
+        return result::Result<AsyncLoad<P>, QueryFailure>.Error(error)
+      case CompileResult.Plan(plan)
+        match prepareAsyncQuery<LeftJoined<P, D>>(provider, plan, options, maximumRows: 20000)
+          case AsyncQueryPreparation.Failure(error)
+            journal.rollback()
+            return result::Result<AsyncLoad<P>, QueryFailure>.Error(error)
+          case AsyncQueryPreparation.Ready(driver, compiled, tracker)
+            let owned = new AsyncLoad<P>(new AsyncSingleNavigation<P, D>(
+                source,
+                new AsyncBufferedRead<LeftJoined<P, D>>(driver, compiled),
+                journal
+              ))
+
+            return result::Result<AsyncLoad<P>, QueryFailure>.Ok(transfer owned)
+        end
+    end
+  end
+end
+
+def singleNavigationPlan<P, D>(source: IncludedQuery<P, D>, dialect: SqlDialect): CompileResult<LeftJoined<P, D>>
+  let relation = source.navigation()
+  let root = source.rootQuery()
+  let mapping = root.entityMapping()
+
+  if mapping == null
+    return CompileResult<LeftJoined<P, D>>.Failure(QueryFailure.UnsupportedCapability("single include requires mapped roots"))
+  end
+  match root.asRelation().build(dialect)
+    case RelationBuildResult.Failure(error)
+      return CompileResult<LeftJoined<P, D>>.Failure(error)
+    case RelationBuildResult.Plan(left)
+      match source.singleChildren(dialect)
+        case CompileResult.Failure(error)
+          return CompileResult<LeftJoined<P, D>>.Failure(error)
+        case CompileResult.Plan(right)
+          let shifted = joinShiftSql(right.sql().sql(), left.parameters.count(), dialect)
+          let childMapping = source.relatedQuery().entityMapping()
+
+          if shifted == null || childMapping == null
+            return CompileResult<LeftJoined<P, D>>.Failure(QueryFailure.UnsupportedCapability("single include parameter or child mapping is invalid"))
+          end
+          let childKey = childMapping.keyColumn()
+
+          if childKey == null
+            return CompileResult<LeftJoined<P, D>>.Failure(QueryFailure.UnsupportedCapability("single include requires a child primary key"))
+          end
+          let principalColumns = relation.principalColumns(mapping.primaryKeys())
+          let foreignColumns = relation.columns()
+          var condition = ""
+          var index = 0
+
+          while index < principalColumns.Length
+            condition = condition + (index == 0 ? "" : " AND ") + quoted(
+              "__neri_include_root",
+              principalColumns[index]
+            ) + " = " + quoted(
+              "__neri_include_child",
+              foreignColumns[index]
+            )
+            index = index + 1
+          end
+          let state = new CompileState()
+
+          joinParameterCopy(left.parameters, state)
+          joinParameterCopy(right.sql().parameters(), state)
+          let childColumns = relationColumnsCopy(right.sql().columns())
+          let columns = joinOutputColumns(left.columns, childColumns, true)
+          var ordering = joinOrderSql(left.order, "__neri_include_root")
+
+          if ordering == ""
+            ordering = " ORDER BY " + navigationQuotedColumns("__neri_include_root", principalColumns)
+          end
+          match navigationWindowOrder<D>(
+            source.childSelection(),
+            joinStageMapping(childMapping, "__neri_include_child"),
+            childKey,
+            state,
+            dialect
+          )
+            case NavigationOrderResult.Failure(error)
+              return CompileResult<LeftJoined<P, D>>.Failure(error)
+            case NavigationOrderResult.Sql(sql)
+              ordering = ordering + ", " + sql
+          end
+          let sql = "SELECT " + joinSelectColumns(
+            left.columns,
+            "__neri_include_root",
+            "__neri_l"
+          ) + ", " + joinSelectColumns(
+            childColumns,
+            "__neri_include_child",
+            "__neri_r"
+          ) + ", CASE WHEN " + quoted(
+            "__neri_include_child",
+            childKey
+          ) + " IS NULL THEN 0 ELSE 1 END AS \"__neri_present\" FROM (" + left.sql + ") AS \"__neri_include_root\" LEFT JOIN (" + shifted + ") AS \"__neri_include_child\" ON " + condition + ordering
+          let decode: fn(RawRow): DecodeResult<LeftJoined<P, D>> = fn(row: RawRow): DecodeResult<LeftJoined<P, D>> do
+            match joinDecodeSide<P>(row, left.columns, root.rowDecoder(), "__neri_l")
+              case DecodeResult.Failure(error)
+                return DecodeResult<LeftJoined<P, D>>.Failure(error)
+              case DecodeResult.Value(parent)
+                match decodeInt(row, "__neri_present")
+                  case DecodeResult.Failure(error)
+                    return DecodeResult<LeftJoined<P, D>>.Failure(error)
+                  case DecodeResult.Value(present)
+                    if present == 0
+                      return DecodeResult<LeftJoined<P, D>>.Value(new LeftJoined<P, D>(parent, null))
+                    end
+                    if present != 1
+                      return DecodeResult<LeftJoined<P, D>>.Failure(QueryFailure.Provider(ProviderFailure.State("single include presence marker is invalid")))
+                    end
+                end
+                match joinDecodeSide<D>(row, childColumns, source.relatedQuery().rowDecoder(), "__neri_r")
+                  case DecodeResult.Failure(error)
+                    return DecodeResult<LeftJoined<P, D>>.Failure(error)
+                  case DecodeResult.Value(child)
+                    return DecodeResult<LeftJoined<P, D>>.Value(new LeftJoined<P, D>(parent, child))
+                end
+            end
+          end
+
+          return CompileResult<LeftJoined<P, D>>.Plan(new TypedPlan<LeftJoined<P, D>>(
+              new SqlPlan(
+                sql,
+                new ParameterValues(state.head, state.count),
+                20000,
+                columns,
+                left.checkedScalars || right.sql().requiresCheckedScalars()
+              ),
+              new Decoder<LeftJoined<P, D>>(decode, columns)
+            ))
+      end
+  end
+end
+
+def publishSingleNavigation<P, D>(source: IncludedQuery<P, D>, joined: TypedRows<LeftJoined<P, D>>): QueryResult<P>
+  let roots = new TypedRows<P>()
+  let children = new TypedRows<D>()
+  let relation = source.navigation()
+  let tracker = source.rootQuery().rowTracker()
+
+  if tracker == null
+    return QueryResult<P>.Failure(QueryFailure.UnsupportedCapability("single include requires identity metadata"))
+  end
+  var row = joined.first()
+
+  while row != null
+    let value = row.value
+    var root = roots.first()
+    var present = false
+
+    while root != null
+      present = present || navigationCellEqual(relation.principalKey(root.value), relation.principalKey(value.left))
+      root = root.next
+    end
+    if !present
+      roots.add(value.left)
+    end
+    let child = value.right
+
+    if child != null
+      var other = children.first()
+      var duplicate = false
+
+      while other != null
+        duplicate = duplicate || navigationCellEqual(relation.dependentKey(other.value), relation.dependentKey(child))
+        other = other.next
+      end
+      if !duplicate
+        children.add(child)
+      end
+    end
+    row = row.next
+  end
+  if roots.count() > 10000 || children.count() > source.navigationMaximum()
+    return QueryResult<P>.Failure(QueryFailure.Provider(ProviderFailure.State("single include graph row limit exceeded")))
+  end
+  match tracker.resolveRows(roots)
+    case QueryResult.Failure(error)
+      return QueryResult<P>.Failure(error)
+    case QueryResult.Rows(resolved)
+      return source.load(resolved, children)
+  end
+end
+
+class AsyncSingleNavigation<P, D>: AsyncLoadDriver<P>
+  private source: IncludedQuery<P, D>
+  private read: AsyncBufferedRead<LeftJoined<P, D>>?
+  private journal: NavigationJournal
+  private terminal: QueryResult<P>?
+
+  def init(source: IncludedQuery<P, D>, read: AsyncBufferedRead<LeftJoined<P, D>>, journal: NavigationJournal): Void
+    this.source = source
+    this.read = read
+    this.journal = journal
+  end
+
+  public override def poll(): AsyncQueryPoll<P>
+    let terminal = this.terminal
+
+    if terminal != null
+      return AsyncQueryPoll<P>.Completed(terminal)
+    end
+    let read = this.read
+
+    if read == null
+      this.close()
+      return this.poll()
+    end
+    match read.poll()
+      case AsyncQueryPoll.Pending(socket, interest)
+        return AsyncQueryPoll<P>.Pending(socket, interest)
+      case AsyncQueryPoll.Completed(result)
+        this.read = null
+        match result
+          case QueryResult.Failure(error)
+            this.terminal = QueryResult<P>.Failure(error)
+            this.journal.rollback()
+          case QueryResult.Rows(rows)
+            let published = publishSingleNavigation(this.source, rows)
+
+            this.terminal = published
+            match published
+              case QueryResult.Failure(error)
+                this.journal.rollback()
+              case QueryResult.Rows(roots)
+                this.journal.discard()
+            end
+        end
+        return this.poll()
+    end
+  end
+
+  public override def cancel(): Void
+    this.close()
+  end
+
+  public override def close(): ProviderFailure?
+    let read = this.read
+    let error = read == null ? null : read.close()
+
+    this.read = null
+    if this.terminal == null
+      this.journal.rollback()
+      this.terminal = QueryResult<P>.Failure(error == null ? QueryFailure.Provider(ProviderFailure.State("single include cancelled")) : QueryFailure.Provider(error))
+    end
+    return error
+  end
+end

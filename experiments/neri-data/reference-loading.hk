@@ -78,6 +78,7 @@ def referenceForeignKeyAllowed(value: Cell): Bool
 end
 
 class ReferencedQuery<P, D>: AsyncNavigationPlan<D, P>
+  private detached: Bool = false
   private publicationObserver: (fn(TypedRows<D>, TypedRows<P>): Void)?
   private dependents: Query<D>
   private principals: Query<P>
@@ -93,7 +94,27 @@ class ReferencedQuery<P, D>: AsyncNavigationPlan<D, P>
     let clone = new ReferencedQuery<P, D>(this.dependents, this.principals, this.relation)
 
     clone.publicationObserver = observer
+    clone.detached = this.detached
     return clone
+  end
+
+  public def asNoTracking(): ReferencedQuery<P, D>
+    let copy = new ReferencedQuery<P, D>(this.dependents, this.principals, this.relation)
+
+    copy.publicationObserver = this.publicationObserver
+    copy.detached = true
+    return copy
+  end
+
+  private def detachedPlan(): ReferencedQuery<P, D>
+    let copy = new ReferencedQuery<P, D>(
+      this.dependents.detachedGraph(),
+      this.principals.detachedGraph(),
+      this.relation
+    )
+
+    copy.publicationObserver = this.publicationObserver
+    return copy
   end
 
   internal def validateQueries(): QueryFailure?
@@ -139,10 +160,13 @@ class ReferencedQuery<P, D>: AsyncNavigationPlan<D, P>
     if dependentKey == null || principalKey == null
       return QueryFailure.UnsupportedCapability("reference loading requires mapped primary keys")
     end
-    let dependentType = navigationColumnType(dependentMapping, dependentKey)
+    let dependentType = navigationColumnStorageType(dependentMapping, dependentKey)
     let principalColumns = this.relation.principalColumns(principalMapping.primaryKeys())
-    let principalType = principalColumns.Length == 0 ? "" : navigationColumnType(principalMapping, principalColumns[0])
-    let foreignType = navigationColumnType(dependentMapping, this.relation.column())
+    let principalType = principalColumns.Length == 0 ? "" : navigationColumnStorageType(
+      principalMapping,
+      principalColumns[0]
+    )
+    let foreignType = navigationColumnStorageType(dependentMapping, this.relation.column())
 
     if (dependentType != "Int" && dependentType != "String") || (principalType != "Int" && principalType != "String") || (foreignType != "Int" && foreignType != "String" && foreignType != "Int?" && foreignType != "String?") || principalType != navigationUnderlyingType(foreignType)
       return QueryFailure.UnsupportedCapability("reference keys and foreign key require matching Int or String mappings")
@@ -154,12 +178,13 @@ class ReferencedQuery<P, D>: AsyncNavigationPlan<D, P>
   end
 
   public def allAsync(options: StreamOptions? = null): result::Result<AsyncNavigation<D, P>, QueryFailure>
-    let invalid = this.validateQueries()
+    let plan = this.detached ? this.detachedPlan() : this
+    let invalid = plan.validateQueries()
 
     if invalid != null
       return result::Result<AsyncNavigation<D, P>, QueryFailure>.Error(invalid)
     end
-    match prepareAsyncNavigation<D, P>(this, options)
+    match prepareAsyncNavigation<D, P>(plan, options)
       case AsyncNavigationStart.Failure(error)
         return result::Result<AsyncNavigation<D, P>, QueryFailure>.Error(error)
       case AsyncNavigationStart.Started(driver)
@@ -173,12 +198,28 @@ class ReferencedQuery<P, D>: AsyncNavigationPlan<D, P>
     rows: TypedRows<D>,
     options: StreamOptions? = null
   ): result::Result<AsyncNavigation<D, P>, QueryFailure>
-    let invalid = this.validateQueries()
+    let plan = this.detached ? this.detachedPlan() : this
+    var selected = rows
+
+    if this.detached
+      let tracker = plan.dependents.rowTracker()
+
+      if tracker == null
+        return result::Result<AsyncNavigation<D, P>, QueryFailure>.Error(QueryFailure.UnsupportedCapability("detached graph requires identity metadata"))
+      end
+      match tracker.resolveRows(rows)
+        case QueryResult.Failure(error)
+          return result::Result<AsyncNavigation<D, P>, QueryFailure>.Error(error)
+        case QueryResult.Rows(resolved)
+          selected = resolved
+      end
+    end
+    let invalid = plan.validateQueries()
 
     if invalid != null
       return result::Result<AsyncNavigation<D, P>, QueryFailure>.Error(invalid)
     end
-    let owned = new AsyncNavigation<D, P>(new AsyncNavigationDriver<D, P>(this, options, rows: rows))
+    let owned = new AsyncNavigation<D, P>(new AsyncNavigationDriver<D, P>(plan, options, rows: selected))
 
     return result::Result<AsyncNavigation<D, P>, QueryFailure>.Ok(transfer owned)
   end
@@ -249,6 +290,9 @@ class ReferencedQuery<P, D>: AsyncNavigationPlan<D, P>
   end
 
   public def all(): QueryResult<D>
+    if this.detached
+      return this.detachedPlan().all()
+    end
     let invalid = this.validateQueries()
 
     if invalid != null
@@ -275,6 +319,20 @@ class ReferencedQuery<P, D>: AsyncNavigationPlan<D, P>
   end
 
   public def load(rows: TypedRows<D>, prefetched: TypedRows<P>? = null): QueryResult<D>
+    if this.detached
+      let plan = this.detachedPlan()
+      let tracker = plan.dependents.rowTracker()
+
+      if tracker == null
+        return QueryResult<D>.Failure(QueryFailure.UnsupportedCapability("detached graph requires identity metadata"))
+      end
+      match tracker.resolveRows(rows)
+        case QueryResult.Failure(error)
+          return QueryResult<D>.Failure(error)
+        case QueryResult.Rows(resolved)
+          return plan.load(resolved, prefetched)
+      end
+    end
     let journal = new NavigationJournal()
     let result = this.loadCore(rows, prefetched, journal)
 

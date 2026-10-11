@@ -1,0 +1,108 @@
+namespace neri_data
+
+## Identifying owned rows cascade with their tracked owner even after independent queries.
+def registerOwnedCollectionDelete<P, D>(
+  principals: Query<P>,
+  dependents: Query<D>,
+  relation: CollectionNavigation<P, D>,
+  edgeFactory: fn(TrackedHandle<P>, TrackedHandle<D>): RelationshipEdge
+): WriteFailure?
+  let changes = principals.changeOwner()
+  let parents = principals.rowTracker()
+  let children = dependents.rowTracker()
+
+  if changes == null || parents == null || children == null
+    return WriteFailure.Validation("owned collection deletion requires tracked owner and dependent roots")
+  end
+  let detect: fn(GraphJournal): QueryFailure? = fn(journal: GraphJournal): QueryFailure? do
+    let status = new ModelCallbackState()
+    let visitParent: fn(P): Bool = fn(parent: P): Bool do
+      let state = parents.stateOf(parent)
+      var deleted = false
+
+      if state != null
+        match state
+          case TrackingState.Deleted()
+            deleted = true
+          case TrackingState.Added()
+          case TrackingState.Unchanged()
+          case TrackingState.Modified()
+          case TrackingState.Detached()
+        end
+      end
+      if !deleted
+        return true
+      end
+      var parentHandle: TrackedHandle<P>? = null
+
+      match parents.cascadeHandle(parent)
+        case TrackHandleResult.Failure(error)
+          status.failure = error
+          return false
+        case TrackHandleResult.Tracked(handle)
+          parentHandle = handle
+      end
+      if parentHandle == null
+        return false
+      end
+      let ownerHandle = parentHandle
+      let visitChild: fn(D): Bool = fn(child: D): Bool do
+        let original = children.original(child)
+
+        if original == null || !navigationTupleRowMatches(original, relation.columns(), relation.principalKey(parent))
+          return true
+        end
+        let state = children.stateOf(child)
+        var active = false
+        var deletedChild = false
+
+        if state != null
+          match state
+            case TrackingState.Added()
+              active = true
+            case TrackingState.Unchanged()
+              active = true
+            case TrackingState.Modified()
+              active = true
+            case TrackingState.Deleted()
+              deletedChild = true
+            case TrackingState.Detached()
+          end
+        end
+        status.failure = children.remove(child) if active
+        if status.failure == null && (deletedChild || (active && children.stateOf(child) != null))
+          let current = children.stateOf(child)
+          var retained = false
+
+          if current != null
+            match current
+              case TrackingState.Deleted()
+                retained = true
+              case TrackingState.Added()
+              case TrackingState.Unchanged()
+              case TrackingState.Modified()
+              case TrackingState.Detached()
+            end
+          end
+          if retained
+            match children.cascadeHandle(child)
+              case TrackHandleResult.Failure(error)
+                status.failure = error
+              case TrackHandleResult.Tracked(handle)
+                status.failure = changes.registerRelation(edgeFactory(ownerHandle, handle))
+            end
+          end
+        end
+        return status.failure == null
+      end
+
+      children.visitTracked(visitChild)
+      return status.failure == null
+    end
+
+    parents.visitTracked(visitParent)
+    return status.failure
+  end
+
+  return changes.registerChangeDetector(detect)
+end

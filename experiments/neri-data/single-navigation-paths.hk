@@ -1,0 +1,976 @@
+use host
+namespace neri_data
+
+class SingleNavigationOrder
+  public sql: String = ""
+end
+
+class SingleNavigationPublication
+  public action: fn(NavigationJournal): Void
+  public next: SingleNavigationPublication?
+
+  def init(action: fn(NavigationJournal): Void): Void
+    this.action = action
+  end
+end
+
+class SingleNavigationRows<T>
+  public rows: TypedRows<T>
+  public role: Int
+
+  def init(role: Int): Void
+    this.role = role
+    this.rows = new TypedRows<T>()
+  end
+end
+
+class SingleNavigationRole
+  public build: fn(SqlDialect): CompileResult<RawRow>
+  public decode: fn(TypedRows<RawRow>, Int, ResultColumns): QueryFailure?
+  public publish: fn(NavigationJournal): QueryFailure?
+  public parent: Int
+  public sourceColumns: String[]
+  public targetColumns: String[]
+  public ordering: SingleNavigationOrder?
+  public next: SingleNavigationRole?
+
+  def init(
+    build: fn(SqlDialect): CompileResult<RawRow>,
+    decode: fn(TypedRows<RawRow>, Int, ResultColumns): QueryFailure?,
+    publish: fn(NavigationJournal): QueryFailure?,
+    parent: Int,
+    sourceColumns: String[],
+    targetColumns: String[],
+    ordering: SingleNavigationOrder? = null
+  ): Void
+    this.build = build
+    this.decode = decode
+    this.publish = publish
+    this.parent = parent
+    this.sourceColumns = sourceColumns
+    this.targetColumns = targetColumns
+    this.ordering = ordering
+  end
+end
+
+class SingleNavigationScope
+  public first: SingleNavigationRole?
+  private last: SingleNavigationRole?
+  public count: Int = 0
+  public failure: QueryFailure?
+  public publications: SingleNavigationPublication?
+  private lastPublication: SingleNavigationPublication?
+
+  def init(): Void
+  end
+
+  public def append(role: SingleNavigationRole): Int
+    let index = this.count
+    let last = this.last
+
+    if last == null
+      this.first = role
+    else
+      last.next = role
+    end
+    this.last = role
+    this.count = this.count + 1
+    return index
+  end
+
+  public def afterPublication(action: fn(NavigationJournal): Void): Void
+    let added = new SingleNavigationPublication(action)
+    let last = this.lastPublication
+
+    if last == null
+      this.publications = added
+    else
+      last.next = added
+    end
+    this.lastPublication = added
+  end
+end
+
+class SingleNavigationGraph<R, T>
+  public scope: SingleNavigationScope
+  public roots: SingleNavigationRows<R>
+  public current: SingleNavigationRows<T>
+
+  def init(scope: SingleNavigationScope, roots: SingleNavigationRows<R>, current: SingleNavigationRows<T>): Void
+    this.scope = scope
+    this.roots = roots
+    this.current = current
+  end
+end
+
+class SingleNavigationCompiledRole
+  public role: SingleNavigationRole
+  public plan: TypedPlan<RawRow>
+  public index: Int
+  public next: SingleNavigationCompiledRole?
+
+  def init(role: SingleNavigationRole, plan: TypedPlan<RawRow>, index: Int): Void
+    this.role = role
+    this.plan = plan
+    this.index = index
+  end
+end
+
+class SingleNavigationBuild
+  public plan: TypedPlan<RawRow>
+  public roles: SingleNavigationCompiledRole?
+
+  def init(plan: TypedPlan<RawRow>, roles: SingleNavigationCompiledRole?): Void
+    this.plan = plan
+    this.roles = roles
+  end
+end
+
+enum SingleNavigationBuildResult
+  case Plan(value: SingleNavigationBuild)
+  case Failure(error: QueryFailure)
+end
+
+def singleNavigationName(index: Int): String
+  return "__neri_path_role" + (index as String)
+end
+
+def singleNavigationColumn(role: Int, column: Int): String
+  return "__neri_path_" + (role as String) + "_" + (column as String)
+end
+
+def singleNavigationNull(kind: readonly ResultColumnKind, dialect: SqlDialect): String
+  match dialect
+    case SqlDialect.QuestionMark()
+      return "NULL"
+    case SqlDialect.PostgreSql()
+      match kind
+        case ResultColumnKind.Bool()
+          return "CAST(NULL AS BOOLEAN)"
+        case ResultColumnKind.Int()
+          return "CAST(NULL AS BIGINT)"
+        case ResultColumnKind.Float()
+          return "CAST(NULL AS DOUBLE PRECISION)"
+        case ResultColumnKind.Text()
+          return "CAST(NULL AS TEXT)"
+        case ResultColumnKind.Binary()
+          return "CAST(NULL AS BYTEA)"
+      end
+  end
+end
+
+def singleNavigationHasColumn(columns: readonly ResultColumns, name: String): Bool
+  if !identifierValid(name)
+    return false
+  end
+  var index = 0
+
+  while index < columns.count()
+    if columns.at(index).name() == name
+      return true
+    end
+    index = index + 1
+  end
+  return false
+end
+
+def singleNavigationAppendColumn(columns: ResultColumns, added: ResultColumn): ResultColumns
+  let values: ResultColumn[] = tasks::generate(columns.count() + 1, 1) do |index|
+    if index == columns.count()
+      return new ResultColumn(added.name(), shapeKind(added.kind()), added.nullable())
+    end
+    let column = columns.at(index)
+
+    return new ResultColumn(column.name(), shapeKind(column.kind()), column.nullable())
+  end
+
+  return new ResultColumns(values)
+end
+
+def singleNavigationCopyColumns(columns: readonly ResultColumns): ResultColumns
+  let values: ResultColumn[] = tasks::generate(columns.count(), 1) do |index|
+    let column = columns.at(index)
+
+    return new ResultColumn(column.name(), shapeKind(column.kind()), column.nullable())
+  end
+
+  return new ResultColumns(values)
+end
+
+def singleRawPlan<T>(plan: TypedPlan<T>): TypedPlan<RawRow>
+  let read: fn(RawRow): DecodeResult<RawRow> = fn(row: RawRow): DecodeResult<RawRow> do
+    return DecodeResult<RawRow>.Value(row)
+  end
+
+  let original = plan.sql()
+  let columns = singleNavigationCopyColumns(original.columns())
+
+  return new TypedPlan<RawRow>(
+    new SqlPlan(original.sql(), plan.parameterValues(), original.limit(), columns, original.requiresCheckedScalars()),
+    new Decoder<RawRow>(read, columns)
+  )
+end
+
+def singleNavigationDecode<T>(
+  rows: TypedRows<RawRow>,
+  role: Int,
+  columns: ResultColumns,
+  decoder: Decoder<T>,
+  target: SingleNavigationRows<T>
+): QueryFailure?
+  var current = rows.first()
+
+  while current != null
+    match decodeInt(current.value, "__neri_path_role")
+      case DecodeResult.Failure(error)
+        return error
+      case DecodeResult.Value(index)
+        if index == role
+          let raw = current.value
+          let values: RawColumn[] = tasks::generate(columns.count(), 1) do |column|
+            let name = singleNavigationColumn(role, column)
+            var cell = Cell.Null()
+
+            match raw.value(name)
+              case CellLookup.Missing()
+              case CellLookup.Found(value)
+                cell = value
+            end
+            return new RawColumn(columns.at(column).name(), cell)
+          end
+
+          match decoder.decode(new RawRow(values))
+            case DecodeResult.Failure(error)
+              return error
+            case DecodeResult.Value(value)
+              if target.rows.count() >= 10000
+                return QueryFailure.UnsupportedCapability("single navigation role exceeds 10000 rows")
+              end
+              target.rows.add(value)
+          end
+        end
+    end
+    current = current.next
+  end
+  return null
+end
+
+def singleNavigationRoot<T>(query: Query<T>): SingleNavigationGraph<T, T>
+  let scope = new SingleNavigationScope()
+  let rows = new SingleNavigationRows<T>(0)
+  let ordering = new SingleNavigationOrder()
+  let build: fn(SqlDialect): CompileResult<RawRow> = fn(dialect: SqlDialect): CompileResult<RawRow> do
+    match query.stableNavigationOrder().asRelation().build(dialect)
+      case RelationBuildResult.Failure(error)
+        return CompileResult<RawRow>.Failure(error)
+      case RelationBuildResult.Plan(plan)
+        let order = joinOrderSql(plan.order, "__neri_path_target")
+
+        ordering.sql = order == "" ? "" : host::stringSlice(order, 1, host::stringByteLength(order) - 1)
+        for key in plan.mapping.primaryKeys()
+          ordering.sql = ordering.sql + (ordering.sql == "" ? "ORDER BY " : ", ") + quoted(
+            "__neri_path_target",
+            key
+          ) + " ASC"
+        end
+        let columns = singleNavigationCopyColumns(plan.columns)
+        let read: fn(RawRow): DecodeResult<RawRow> = fn(row: RawRow): DecodeResult<RawRow> do
+          return DecodeResult<RawRow>.Value(row)
+        end
+
+        return CompileResult<RawRow>.Plan(new TypedPlan<RawRow>(
+            new SqlPlan(plan.sql, plan.parameters, 10000, columns, plan.checkedScalars),
+            new Decoder<RawRow>(read, columns)
+          ))
+    end
+  end
+  let decode: fn(
+    TypedRows<RawRow>,
+    Int,
+    ResultColumns
+  ): QueryFailure? = fn(
+    raw: TypedRows<RawRow>,
+    role: Int,
+    columns: ResultColumns
+  ): QueryFailure? do
+    return singleNavigationDecode(raw, role, columns, query.rowDecoder(), rows)
+  end
+  let publish: fn(NavigationJournal): QueryFailure? = fn(journal: NavigationJournal): QueryFailure? do
+    let tracker = query.rowTracker()
+
+    if tracker != null
+      match tracker.resolveRows(rows.rows)
+        case QueryResult.Failure(error)
+          return error
+        case QueryResult.Rows(resolved)
+          rows.rows = resolved
+      end
+    end
+    return null
+  end
+
+  scope.append(new SingleNavigationRole(build, decode, publish, -1, [], [], ordering))
+  return new SingleNavigationGraph<T, T>(scope, rows, rows)
+end
+
+def buildSingleNavigation(scope: SingleNavigationScope, dialect: SqlDialect): SingleNavigationBuildResult
+  let failure = scope.failure
+
+  if failure != null
+    return SingleNavigationBuildResult.Failure(failure)
+  end
+  if scope.count < 1 || scope.count > 65
+    return SingleNavigationBuildResult.Failure(QueryFailure.UnsupportedCapability("single navigation graph exceeds role limit"))
+  end
+  var role = scope.first
+  var first: SingleNavigationCompiledRole? = null
+  var last: SingleNavigationCompiledRole? = null
+  var index = 0
+  var columns = new ResultColumns([
+      new ResultColumn("__neri_path_role", ResultColumnKind.Int()),
+      new ResultColumn("__neri_path_sequence", ResultColumnKind.Int())
+    ])
+  let state = new CompileState()
+  var ctes = ""
+  var checked = false
+
+  while role != null
+    match role.build(dialect)
+      case CompileResult.Failure(error)
+        return SingleNavigationBuildResult.Failure(error)
+      case CompileResult.Plan(plan)
+        if singleNavigationHasColumn(plan.sql().columns(), "__neri_path_sequence")
+          return SingleNavigationBuildResult.Failure(QueryFailure.UnsupportedCapability("single navigation source uses a reserved sequence column"))
+        end
+        let sql = joinShiftSql(plan.sql().sql(), state.count, dialect)
+
+        if sql == null
+          return SingleNavigationBuildResult.Failure(QueryFailure.UnsupportedCapability("single navigation parameters cannot be rebased"))
+        end
+        joinParameterCopy(plan.parameterValues(), state)
+        checked = checked || plan.sql().requiresCheckedScalars()
+        let name = singleNavigationName(index)
+        var condition = ""
+
+        if role.parent >= 0
+          if role.parent >= index || role.sourceColumns.Length == 0 || role.sourceColumns.Length != role.targetColumns.Length
+            return SingleNavigationBuildResult.Failure(QueryFailure.UnsupportedCapability("single navigation role has invalid key linkage"))
+          end
+          var key = 0
+          var parentPlan = first
+
+          while parentPlan != null && parentPlan.index != role.parent
+            parentPlan = parentPlan.next
+          end
+          if parentPlan == null
+            return SingleNavigationBuildResult.Failure(QueryFailure.UnsupportedCapability("single navigation parent role is missing"))
+          end
+
+          while key < role.sourceColumns.Length
+            if !singleNavigationHasColumn(
+              parentPlan.plan.sql().columns(),
+              role.sourceColumns[key]
+            ) || !singleNavigationHasColumn(
+              plan.sql().columns(),
+              role.targetColumns[key]
+            )
+              return SingleNavigationBuildResult.Failure(QueryFailure.UnsupportedCapability("single navigation linkage must reference mapped result columns"))
+            end
+            condition = condition + (key == 0 ? "" : " AND ") + quoted(
+              "__neri_path_parent",
+              role.sourceColumns[key]
+            ) + " = " + quoted(
+              "__neri_path_target",
+              role.targetColumns[key]
+            )
+            key = key + 1
+          end
+          condition = " WHERE EXISTS (SELECT 1 FROM \"" + singleNavigationName(role.parent) + "\" AS \"__neri_path_parent\" WHERE " + condition + ")"
+        end
+        let ordering = role.ordering
+        let windowOrder = ordering == null ? "" : ordering.sql
+
+        ctes = ctes + (index == 0 ? "WITH " : ", ") + "\"" + name + "\" AS (SELECT \"__neri_path_target\".*, ROW_NUMBER() OVER (" + windowOrder + ") AS \"__neri_path_sequence\" FROM (" + sql + ") AS \"__neri_path_target\"" + condition + ")"
+        let node = new SingleNavigationCompiledRole(role, plan, index)
+
+        if last == null
+          first = node
+        else
+          last.next = node
+        end
+        last = node
+        var column = 0
+
+        while column < plan.sql().columns().count()
+          let source = plan.sql().columns().at(column)
+
+          columns = singleNavigationAppendColumn(
+            columns,
+            new ResultColumn(singleNavigationColumn(index, column), shapeKind(source.kind()), true)
+          )
+          column = column + 1
+        end
+        index = index + 1
+    end
+    role = role.next
+  end
+  if columns.count() > 1000
+    return SingleNavigationBuildResult.Failure(QueryFailure.UnsupportedCapability("single navigation graph exceeds column limit"))
+  end
+  var selected = first
+  var combinedSql = ""
+
+  while selected != null
+    let name = singleNavigationName(selected.index)
+    var projection = (selected.index as String) + " AS \"__neri_path_role\", " + quoted(
+      name,
+      "__neri_path_sequence"
+    ) + " AS \"__neri_path_sequence\""
+    var source = first
+
+    while source != null
+      var column = 0
+
+      while column < source.plan.sql().columns().count()
+        projection = projection + ", " + (source.index == selected.index ? quoted(
+            name,
+            source.plan.sql().columns().at(column).name()
+          ) : singleNavigationNull(
+            source.plan.sql().columns().at(column).kind(),
+            dialect
+          )) + " AS \"" + singleNavigationColumn(
+          source.index,
+          column
+        ) + "\""
+        column = column + 1
+      end
+      source = source.next
+    end
+    combinedSql = combinedSql + (combinedSql == "" ? "" : " UNION ALL ") + "SELECT " + projection + " FROM \"" + name + "\""
+    selected = selected.next
+  end
+  let read: fn(RawRow): DecodeResult<RawRow> = fn(row: RawRow): DecodeResult<RawRow> do
+    return DecodeResult<RawRow>.Value(row)
+  end
+  let sql = ctes + " " + combinedSql + " ORDER BY \"__neri_path_role\", \"__neri_path_sequence\""
+  let maximum = scope.count > 10 ? 100000 : scope.count * 10000
+  let plan = new TypedPlan<RawRow>(
+    new SqlPlan(sql, new ParameterValues(state.head, state.count), maximum, columns, checked),
+    new Decoder<RawRow>(read, columns)
+  )
+
+  return SingleNavigationBuildResult.Plan(new SingleNavigationBuild(plan, first))
+end
+
+def publishSingleNavigationGraph<R, T>(
+  graph: SingleNavigationGraph<R, T>,
+  built: SingleNavigationBuild,
+  rows: TypedRows<RawRow>,
+  journal: NavigationJournal
+): QueryResult<R>
+  var role = built.roles
+
+  while role != null
+    let invalid = role.role.decode(rows, role.index, singleNavigationCopyColumns(role.plan.sql().columns()))
+
+    if invalid != null
+      return QueryResult<R>.Failure(invalid)
+    end
+    role = role.next
+  end
+  role = built.roles
+  while role != null
+    let invalid = role.role.publish(journal)
+
+    if invalid != null
+      return QueryResult<R>.Failure(invalid)
+    end
+    role = role.next
+  end
+  var publication = graph.scope.publications
+
+  while publication != null
+    publication.action(journal)
+    publication = publication.next
+  end
+  return QueryResult<R>.Rows(graph.roots.rows)
+end
+
+class SingleNavigationQuery<R, T>
+  private source: NavigationQuery<R, T>
+
+  def init(source: NavigationQuery<R, T>): Void
+    this.source = source
+  end
+
+  public def asSplitQuery(): NavigationQuery<R, T>
+    return this.source
+  end
+
+  public def thenInclude<N>(step: NavigationStep<T, N>): SingleNavigationQuery<R, N>
+    return this.source.thenInclude(step).asSingleQuery()
+  end
+
+  public def include<N>(step: NavigationStep<R, N>): SingleNavigationQuery<R, N>
+    return this.source.include(step).asSingleQuery()
+  end
+
+  public def all(): QueryResult<R>
+    let invalid = this.source.validate()
+    let provider = this.source.rootQuery().provider()
+
+    if invalid != null
+      return QueryResult<R>.Failure(invalid)
+    end
+    if provider == null
+      return QueryResult<R>.Failure(QueryFailure.UnsupportedCapability("single navigation path requires a provider"))
+    end
+    let graph = this.source.buildSingleGraph()
+    let journal = new NavigationJournal()
+
+    this.source.checkpointSingle(journal)
+    match buildSingleNavigation(graph.scope, provider.dialect())
+      case SingleNavigationBuildResult.Failure(error)
+        journal.rollback()
+        return QueryResult<R>.Failure(error)
+      case SingleNavigationBuildResult.Plan(built)
+        let build: fn(SqlDialect): CompileResult<RawRow> = fn(dialect: SqlDialect): CompileResult<RawRow> do
+          return CompileResult<RawRow>.Plan(built.plan)
+        end
+
+        match materializeStream(provider, build, maximumRows: built.plan.sql().limit())
+          case QueryResult.Failure(error)
+            journal.rollback()
+            return QueryResult<R>.Failure(error)
+          case QueryResult.Rows(rows)
+            let result = publishSingleNavigationGraph(graph, built, rows, journal)
+
+            match result
+              case QueryResult.Failure(error)
+                journal.rollback()
+              case QueryResult.Rows(roots)
+                journal.discard()
+            end
+            return result
+        end
+    end
+  end
+
+  public def allAsync(options: StreamOptions? = null): result::Result<AsyncLoad<R>, QueryFailure>
+    let invalid = this.source.validate(true)
+    let provider = this.source.rootQuery().provider()
+
+    if invalid != null
+      return result::Result<AsyncLoad<R>, QueryFailure>.Error(invalid)
+    end
+    if provider == null
+      return result::Result<AsyncLoad<R>, QueryFailure>.Error(QueryFailure.UnsupportedCapability("single navigation path requires a provider"))
+    end
+    let graph = this.source.buildSingleGraph()
+    let journal = new NavigationJournal()
+
+    this.source.checkpointSingle(journal)
+    match buildSingleNavigation(graph.scope, provider.dialect())
+      case SingleNavigationBuildResult.Failure(error)
+        journal.rollback()
+        return result::Result<AsyncLoad<R>, QueryFailure>.Error(error)
+      case SingleNavigationBuildResult.Plan(built)
+        match prepareAsyncQuery(provider, built.plan, options, maximumRows: built.plan.sql().limit())
+          case AsyncQueryPreparation.Failure(error)
+            journal.rollback()
+            return result::Result<AsyncLoad<R>, QueryFailure>.Error(error)
+          case AsyncQueryPreparation.Ready(driver, plan, tracker)
+            let owned = new AsyncLoad<R>(new AsyncSingleNavigationGraph<R, T>(
+                graph,
+                built,
+                new AsyncBufferedRead<RawRow>(driver, plan),
+                journal
+              ))
+
+            return result::Result<AsyncLoad<R>, QueryFailure>.Ok(transfer owned)
+        end
+    end
+  end
+end
+
+class AsyncSingleNavigationGraph<R, T>: AsyncLoadDriver<R>
+  private graph: SingleNavigationGraph<R, T>
+  private built: SingleNavigationBuild
+  private source: AsyncBufferedRead<RawRow>
+  private journal: NavigationJournal
+  private terminal: QueryResult<R>?
+  private closed: Bool = false
+
+  def init(
+    graph: SingleNavigationGraph<R, T>,
+    built: SingleNavigationBuild,
+    source: AsyncBufferedRead<RawRow>,
+    journal: NavigationJournal
+  ): Void
+    this.graph = graph
+    this.built = built
+    this.source = source
+    this.journal = journal
+  end
+
+  public override def poll(): AsyncQueryPoll<R>
+    let terminal = this.terminal
+
+    if terminal != null
+      return AsyncQueryPoll<R>.Completed(terminal)
+    end
+    match this.source.poll()
+      case AsyncQueryPoll.Pending(socket, interest)
+        return AsyncQueryPoll<R>.Pending(socket, interest)
+      case AsyncQueryPoll.Completed(result)
+        match result
+          case QueryResult.Failure(error)
+            this.journal.rollback()
+            this.terminal = QueryResult<R>.Failure(error)
+          case QueryResult.Rows(rows)
+            let published = publishSingleNavigationGraph(this.graph, this.built, rows, this.journal)
+
+            match published
+              case QueryResult.Failure(error)
+                this.journal.rollback()
+              case QueryResult.Rows(roots)
+                this.journal.discard()
+            end
+            this.terminal = published
+        end
+        return this.poll()
+    end
+  end
+
+  public override def cancel(): Void
+    if this.terminal != null
+      return
+    end
+    this.source.close()
+    this.journal.rollback()
+    this.terminal = QueryResult<R>.Failure(QueryFailure.Provider(ProviderFailure.State("single navigation operation was cancelled")))
+  end
+
+  public override def close(): ProviderFailure?
+    if this.closed
+      return null
+    end
+    this.closed = true
+    if this.terminal == null
+      this.journal.rollback()
+      this.terminal = QueryResult<R>.Failure(QueryFailure.Provider(ProviderFailure.State("single navigation operation was closed before completion")))
+    end
+    return this.source.close()
+  end
+end
+
+def singleCollectionRole<P, D>(
+  scope: SingleNavigationScope,
+  input: SingleNavigationRows<P>,
+  principals: Query<P>,
+  dependents: Query<D>,
+  relation: CollectionNavigation<P, D>,
+  maximum: Int,
+  selected: Query<D>?
+): SingleNavigationRows<D>
+  let target = new SingleNavigationRows<D>(scope.count)
+  let mapping = principals.entityMapping()
+
+  if mapping == null
+    scope.failure = QueryFailure.UnsupportedCapability("single collection requires principal key metadata")
+    return target
+  end
+  var loader = include(principals, dependents, relation).maxChildren(maximum)
+
+  if selected != null
+    loader = loader.children(selected)
+  end
+  let prepared = loader
+  let ordering = new SingleNavigationOrder()
+  let orderingQuery = selected == null ? dependents : selected
+  let build: fn(SqlDialect): CompileResult<RawRow> = fn(dialect: SqlDialect): CompileResult<RawRow> do
+    match prepared.singleChildren(dialect)
+      case CompileResult.Failure(error)
+        return CompileResult<RawRow>.Failure(error)
+      case CompileResult.Plan(plan)
+        return singleOrderedRawPlan(orderingQuery, plan, dialect, ordering)
+    end
+  end
+  let decode: fn(
+    TypedRows<RawRow>,
+    Int,
+    ResultColumns
+  ): QueryFailure? = fn(
+    raw: TypedRows<RawRow>,
+    role: Int,
+    columns: ResultColumns
+  ): QueryFailure? do
+    return singleNavigationDecode(raw, role, columns, dependents.rowDecoder(), target)
+  end
+  let publish: fn(NavigationJournal): QueryFailure? = fn(journal: NavigationJournal): QueryFailure? do
+    let parents = principals.rowTracker()
+    let children = dependents.rowTracker()
+
+    if parents == null || children == null
+      return QueryFailure.UnsupportedCapability("single collection requires identity metadata")
+    end
+    checkpointNavigation(relation, parents, children, input.rows, target.rows, journal)
+    var checked = include(principals, dependents, navigationJournalled(relation, journal)).maxChildren(maximum)
+
+    if selected != null
+      checked = checked.children(selected)
+    end
+    match checked.load(input.rows, target.rows)
+      case QueryResult.Failure(error)
+        return error
+      case QueryResult.Rows(rows)
+        let related = new TypedRows<D>()
+        var parent = rows.first()
+
+        while parent != null
+          for child in relation.collection(parent.value)
+            navigationDistinct(related, child)
+          end
+          parent = parent.next
+        end
+        target.rows = related
+    end
+    return null
+  end
+
+  scope.append(new SingleNavigationRole(
+      build,
+      decode,
+      publish,
+      input.role,
+      relation.principalColumns(mapping.primaryKeys()),
+      relation.columns(),
+      ordering
+    ))
+  return target
+end
+
+def singleReferenceRole<P, D>(
+  scope: SingleNavigationScope,
+  input: SingleNavigationRows<D>,
+  dependents: Query<D>,
+  principals: Query<P>,
+  relation: CollectionNavigation<P, D>
+): SingleNavigationRows<P>
+  let target = new SingleNavigationRows<P>(scope.count)
+  let mapping = principals.entityMapping()
+
+  if mapping == null
+    scope.failure = QueryFailure.UnsupportedCapability("single reference requires principal key metadata")
+    return target
+  end
+  let ordering = new SingleNavigationOrder()
+  let build: fn(SqlDialect): CompileResult<RawRow> = fn(dialect: SqlDialect): CompileResult<RawRow> do
+    match compilePipeline<P, P>(principals, principals.rowDecoder(), null, null, dialect, unbounded: true)
+      case CompileResult.Failure(error)
+        return CompileResult<RawRow>.Failure(error)
+      case CompileResult.Plan(plan)
+        return singleOrderedRawPlan(principals, plan, dialect, ordering)
+    end
+  end
+  let decode: fn(
+    TypedRows<RawRow>,
+    Int,
+    ResultColumns
+  ): QueryFailure? = fn(
+    raw: TypedRows<RawRow>,
+    role: Int,
+    columns: ResultColumns
+  ): QueryFailure? do
+    return singleNavigationDecode(raw, role, columns, principals.rowDecoder(), target)
+  end
+  let publish: fn(NavigationJournal): QueryFailure? = fn(journal: NavigationJournal): QueryFailure? do
+    let parents = principals.rowTracker()
+    let children = dependents.rowTracker()
+
+    if parents == null || children == null
+      return QueryFailure.UnsupportedCapability("single reference requires identity metadata")
+    end
+    checkpointNavigation(relation, parents, children, target.rows, input.rows, journal)
+    match includeReference(
+      dependents,
+      principals,
+      navigationJournalled(relation, journal)
+    ).load(
+      input.rows,
+      target.rows
+    )
+      case QueryResult.Failure(error)
+        return error
+      case QueryResult.Rows(rows)
+        let related = new TypedRows<P>()
+        var child = rows.first()
+
+        while child != null
+          let parent = relation.reference(child.value)
+
+          if parent != null
+            navigationDistinct(related, parent)
+          end
+          child = child.next
+        end
+        target.rows = related
+    end
+    return null
+  end
+
+  scope.append(new SingleNavigationRole(
+      build,
+      decode,
+      publish,
+      input.role,
+      relation.columns(),
+      relation.principalColumns(mapping.primaryKeys()),
+      ordering
+    ))
+  return target
+end
+
+def singleKeylessReferenceRole<D, P>(
+  scope: SingleNavigationScope,
+  input: SingleNavigationRows<D>,
+  roots: Query<D>,
+  principals: Query<P>,
+  foreignKey: fn(D): Cell,
+  principalKey: fn(P): Cell,
+  getReference: fn(D): P?,
+  setReference: fn(D, P?): Void,
+  foreignKeyColumns: String[]
+): SingleNavigationRows<P>
+  let target = new SingleNavigationRows<P>(scope.count)
+  let mapping = principals.entityMapping()
+
+  if mapping == null || foreignKeyColumns.Length != mapping.primaryKeys().Length
+    scope.failure = QueryFailure.UnsupportedCapability("single keyless reference requires physical FK and principal key metadata")
+    return target
+  end
+  let ordering = new SingleNavigationOrder()
+  let build: fn(SqlDialect): CompileResult<RawRow> = fn(dialect: SqlDialect): CompileResult<RawRow> do
+    match compilePipeline<P, P>(principals, principals.rowDecoder(), null, null, dialect, unbounded: true)
+      case CompileResult.Failure(error)
+        return CompileResult<RawRow>.Failure(error)
+      case CompileResult.Plan(plan)
+        return singleOrderedRawPlan(principals, plan, dialect, ordering)
+    end
+  end
+  let decode: fn(
+    TypedRows<RawRow>,
+    Int,
+    ResultColumns
+  ): QueryFailure? = fn(
+    raw: TypedRows<RawRow>,
+    role: Int,
+    columns: ResultColumns
+  ): QueryFailure? do
+    return singleNavigationDecode(raw, role, columns, principals.rowDecoder(), target)
+  end
+  let publish: fn(NavigationJournal): QueryFailure? = fn(journal: NavigationJournal): QueryFailure? do
+    let tracker = principals.rowTracker()
+
+    if tracker != null
+      match tracker.resolveRows(target.rows)
+        case QueryResult.Failure(error)
+          return error
+        case QueryResult.Rows(rows)
+          target.rows = rows
+      end
+    end
+    var root = input.rows.first()
+
+    while root != null
+      let entity = root.value
+      let previous = getReference(entity)
+      let undo: fn(): Void = fn(): Void do
+        setReference(entity, previous)
+      end
+
+      journal.record(undo)
+      root = root.next
+    end
+    match includeKeylessReference(
+      roots,
+      principals,
+      foreignKey,
+      principalKey,
+      setReference
+    ).publishNavigation(
+      input.rows,
+      target.rows
+    )
+      case QueryResult.Failure(error)
+        return error
+      case QueryResult.Rows(rows)
+        return null
+    end
+  end
+
+  scope.append(new SingleNavigationRole(
+      build,
+      decode,
+      publish,
+      input.role,
+      foreignKeyColumns,
+      mapping.primaryKeys(),
+      ordering
+    ))
+  return target
+end
+
+def singleOrderedRawPlan<T>(
+  query: Query<T>,
+  plan: TypedPlan<T>,
+  dialect: SqlDialect,
+  ordering: SingleNavigationOrder
+): CompileResult<RawRow>
+  if singleNavigationHasColumn(plan.sql().columns(), "__neri_path_sort")
+    return CompileResult<RawRow>.Failure(QueryFailure.UnsupportedCapability("single navigation source uses a reserved sort column"))
+  end
+  let mapping = query.entityMapping()
+
+  if mapping == null
+    return CompileResult<RawRow>.Failure(QueryFailure.UnsupportedCapability("single navigation ordering requires mapped source"))
+  end
+  let key = mapping.keyColumn()
+
+  if key == null
+    return CompileResult<RawRow>.Failure(QueryFailure.UnsupportedCapability("single navigation ordering requires a primary key"))
+  end
+  let state = new CompileState()
+
+  match navigationWindowOrder(query, joinStageMapping(mapping, "__neri_path_sorted"), key, state, dialect)
+    case NavigationOrderResult.Failure(error)
+      return CompileResult<RawRow>.Failure(error)
+    case NavigationOrderResult.Sql(order)
+      let shifted = joinShiftSql(plan.sql().sql(), state.count, dialect)
+
+      if shifted == null
+        return CompileResult<RawRow>.Failure(QueryFailure.UnsupportedCapability("single navigation ordering parameters cannot be rebased"))
+      end
+      joinParameterCopy(plan.parameterValues(), state)
+      let columns = singleNavigationAppendColumn(
+        singleNavigationCopyColumns(plan.sql().columns()),
+        new ResultColumn("__neri_path_sort", ResultColumnKind.Int())
+      )
+      let read: fn(RawRow): DecodeResult<RawRow> = fn(row: RawRow): DecodeResult<RawRow> do
+        return DecodeResult<RawRow>.Value(row)
+      end
+      let sql = "SELECT \"__neri_path_sorted\".*, ROW_NUMBER() OVER (ORDER BY " + order + ") AS \"__neri_path_sort\" FROM (" + shifted + ") AS \"__neri_path_sorted\""
+
+      ordering.sql = "ORDER BY " + quoted("__neri_path_target", "__neri_path_sort")
+      return CompileResult<RawRow>.Plan(new TypedPlan<RawRow>(
+          new SqlPlan(
+            sql,
+            new ParameterValues(state.head, state.count),
+            100000,
+            columns,
+            plan.sql().requiresCheckedScalars() || state.requiresCheckedScalars
+          ),
+          new Decoder<RawRow>(read, columns)
+        ))
+  end
+end

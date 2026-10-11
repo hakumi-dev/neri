@@ -1,0 +1,273 @@
+use clock
+namespace neri_data
+
+class AsyncMapLoad<A, B>: AsyncLoadDriver<B>
+  private source: AsyncLoadDriver<A>
+  private map: fn(QueryResult<A>): QueryResult<B>
+  private terminal: QueryResult<B>?
+
+  def init(source: AsyncLoadDriver<A>, map: fn(QueryResult<A>): QueryResult<B>): Void
+    this.source = source
+    this.map = map
+  end
+
+  public override def poll(): AsyncQueryPoll<B>
+    let terminal = this.terminal
+
+    if terminal != null
+      return AsyncQueryPoll<B>.Completed(terminal)
+    end
+    match this.source.poll()
+      case AsyncQueryPoll.Pending(socket, interest)
+        return AsyncQueryPoll<B>.Pending(socket, interest)
+      case AsyncQueryPoll.Completed(result)
+        this.terminal = this.map(result)
+        return this.poll()
+    end
+  end
+
+  public override def cancel(): Void
+    this.source.cancel()
+  end
+
+  public override def close(): ProviderFailure?
+    return this.source.close()
+  end
+end
+
+class AsyncCompletedLoad<T>: AsyncLoadDriver<T>
+  private result: QueryResult<T>
+
+  def init(result: QueryResult<T>): Void
+    this.result = result
+  end
+
+  public override def poll(): AsyncQueryPoll<T>
+    return AsyncQueryPoll<T>.Completed(this.result)
+  end
+
+  public override def cancel(): Void
+  end
+
+  public override def close(): ProviderFailure?
+    return null
+  end
+end
+
+## Advances a typed navigation stage only after its predecessor completes.
+class AsyncThenLoad<A, B>: AsyncLoadDriver<B>
+  private first: AsyncLoadDriver<A>?
+  private second: AsyncLoadDriver<B>?
+  private next: fn(TypedRows<A>): AsyncLoadDriver<B>
+  private terminal: QueryResult<B>?
+
+  def init(first: AsyncLoadDriver<A>, next: fn(TypedRows<A>): AsyncLoadDriver<B>): Void
+    this.first = first
+    this.next = next
+  end
+
+  public override def poll(): AsyncQueryPoll<B>
+    let terminal = this.terminal
+
+    if terminal != null
+      return AsyncQueryPoll<B>.Completed(terminal)
+    end
+    let first = this.first
+
+    if first != null
+      match first.poll()
+        case AsyncQueryPoll.Pending(socket, interest)
+          return AsyncQueryPoll<B>.Pending(socket, interest)
+        case AsyncQueryPoll.Completed(result)
+          first.close()
+          this.first = null
+          match result
+            case QueryResult.Failure(error)
+              this.terminal = QueryResult<B>.Failure(error)
+              return this.poll()
+            case QueryResult.Rows(rows)
+              this.second = this.next(rows)
+              return AsyncQueryPoll<B>.Pending(-1, AsyncInterest.Read())
+          end
+      end
+    end
+    let second = this.second
+
+    if second == null
+      this.terminal = QueryResult<B>.Failure(QueryFailure.Provider(ProviderFailure.State("asynchronous navigation path lost its stage")))
+      return this.poll()
+    end
+    match second.poll()
+      case AsyncQueryPoll.Pending(socket, interest)
+        return AsyncQueryPoll<B>.Pending(socket, interest)
+      case AsyncQueryPoll.Completed(result)
+        second.close()
+        this.second = null
+        this.terminal = result
+        return AsyncQueryPoll<B>.Completed(result)
+    end
+  end
+
+  public override def cancel(): Void
+    this.close()
+  end
+
+  public override def close(): ProviderFailure?
+    let first = this.first
+    let second = this.second
+    var error: ProviderFailure? = null
+
+    if first != null
+      error = first.close()
+      this.first = null
+    end
+    if second != null
+      let cleanup = second.close()
+
+      error = error == null ? cleanup : (cleanup == null ? error : ProviderFailure.Cleanup(new ProviderCleanupFailure(
+            error,
+            cleanup
+          )))
+      this.second = null
+    end
+    if this.terminal == null
+      this.terminal = QueryResult<B>.Failure(error == null ? QueryFailure.Provider(ProviderFailure.State("asynchronous navigation path cancelled")) : QueryFailure.Provider(error))
+    end
+    return error
+  end
+end
+
+## One root read, shared deadline and publication journal cover every chained stage.
+class AsyncPathLoad<R, T>: AsyncLoadDriver<R>
+  private path: fn(TypedRows<R>, NavigationJournal, StreamOptions?): AsyncLoadDriver<T>
+  private journal: NavigationJournal
+  private options: StreamOptions?
+  private root: AsyncBufferedRead<R>?
+  private roots: TypedRows<R>?
+  private current: AsyncLoadDriver<T>?
+  private terminal: QueryResult<R>?
+  private deadline: Int?
+
+  def init(
+    path: fn(TypedRows<R>, NavigationJournal, StreamOptions?): AsyncLoadDriver<T>,
+    journal: NavigationJournal,
+    options: StreamOptions?,
+    root: AsyncBufferedRead<R>? = null,
+    rows: TypedRows<R>? = null
+  ): Void
+    this.path = path
+    this.journal = journal
+    this.options = options
+    this.root = root
+    this.roots = rows
+    if options != null
+      let timeout = options.timeoutMilliseconds()
+
+      if timeout != null
+        let now = clock::milliseconds()
+
+        if timeout < 1 || timeout > 86400000 || now == null || now > 9223372036854775807 - timeout
+          this.close()
+        else
+          this.deadline = now + timeout
+        end
+      end
+    end
+  end
+
+  private def complete(result: QueryResult<R>): AsyncQueryPoll<R>
+    match result
+      case QueryResult.Failure(error)
+        this.journal.rollback()
+      case QueryResult.Rows(rows)
+        this.journal.discard()
+    end
+    this.terminal = result
+    return AsyncQueryPoll<R>.Completed(result)
+  end
+
+  public override def poll(): AsyncQueryPoll<R>
+    let terminal = this.terminal
+
+    if terminal != null
+      return AsyncQueryPoll<R>.Completed(terminal)
+    end
+    let options = this.options
+    let token = options == null ? null : options.token()
+
+    if (token != null && token.cancelled()) || streamTimedOut(this.deadline)
+      this.close()
+      return this.poll()
+    end
+    let root = this.root
+
+    if root != null
+      match root.poll()
+        case AsyncQueryPoll.Pending(socket, interest)
+          return AsyncQueryPoll<R>.Pending(socket, interest)
+        case AsyncQueryPoll.Completed(result)
+          this.root = null
+          match result
+            case QueryResult.Failure(error)
+              return this.complete(QueryResult<R>.Failure(error))
+            case QueryResult.Rows(rows)
+              this.roots = rows
+          end
+      end
+      return AsyncQueryPoll<R>.Pending(-1, AsyncInterest.Read())
+    end
+    let rows = this.roots
+
+    if rows == null || rows.count() > 10000
+      return this.complete(QueryResult<R>.Failure(QueryFailure.Provider(ProviderFailure.State("asynchronous navigation root exceeds 10000 rows or is absent"))))
+    end
+    let current = this.current
+
+    if current == null
+      this.current = this.path(rows, this.journal, options)
+      return AsyncQueryPoll<R>.Pending(-1, AsyncInterest.Read())
+    end
+    match current.poll()
+      case AsyncQueryPoll.Pending(socket, interest)
+        return AsyncQueryPoll<R>.Pending(socket, interest)
+      case AsyncQueryPoll.Completed(result)
+        current.close()
+        this.current = null
+        match result
+          case QueryResult.Failure(error)
+            return this.complete(QueryResult<R>.Failure(error))
+          case QueryResult.Rows(related)
+            return this.complete(QueryResult<R>.Rows(rows))
+        end
+    end
+  end
+
+  public override def cancel(): Void
+    this.close()
+  end
+
+  public override def close(): ProviderFailure?
+    let root = this.root
+    let current = this.current
+    var error: ProviderFailure? = null
+
+    if root != null
+      error = root.close()
+      this.root = null
+    end
+    if current != null
+      let cleanup = current.close()
+
+      error = error == null ? cleanup : (cleanup == null ? error : ProviderFailure.Cleanup(new ProviderCleanupFailure(
+            error,
+            cleanup
+          )))
+      this.current = null
+    end
+    if this.terminal == null
+      this.journal.rollback()
+      this.terminal = QueryResult<R>.Failure(error == null ? QueryFailure.Provider(ProviderFailure.State("asynchronous navigation path cancelled")) : QueryFailure.Provider(error))
+    end
+    return error
+  end
+end

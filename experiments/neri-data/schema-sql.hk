@@ -4,6 +4,11 @@ def schemaPostgresColumnNamesValid(column: readonly SchemaColumn): Bool
   if host::stringByteLength(column.name()) > 63
     return false
   end
+  let collation = column.collation()
+
+  if (column.checkSql() != null && host::stringByteLength("neri_ck_" + column.name()) > 63) || (collation != null && host::stringByteLength(collation) > 63)
+    return false
+  end
   let reference = column.reference()
 
   if reference == null
@@ -56,6 +61,8 @@ def schemaPostgresOpNamesValid(op: readonly SchemaOp): Bool
   var names: String[] = []
 
   match op
+    case SchemaOp.Sql(statement)
+      return schemaTrustedSqlFailure(statement) == null
     case SchemaOp.InsertData(table, columns, values)
       names = [table]
       for column in columns
@@ -90,10 +97,15 @@ def schemaPostgresOpNamesValid(op: readonly SchemaOp): Bool
       names = [from, to]
     case SchemaOp.RenameColumn(table, from, to)
       names = [table, from, to]
-    case SchemaOp.CreateIndex(name, table, columns, unique)
+    case SchemaOp.CreateIndex(name, table, columns, unique, indexFacets)
       names = [name, table]
       for column in columns
         return false if host::stringByteLength(column) > 63
+      end
+      if indexFacets != null
+        for column in indexFacets.include()
+          return false if host::stringByteLength(column) > 63
+        end
       end
     case SchemaOp.DropIndex(name)
       names = [name]
@@ -159,7 +171,7 @@ def schemaReferenceSql(column: readonly SchemaColumn, columns: readonly SchemaCo
     columnsSql = columnsSql + (index == 0 ? "" : ", ") + schemaQuote(target)
     index = index + 1
   end
-  return SchemaCompileResult.Statement("CONSTRAINT " + schemaQuote(schemaReferenceConstraint(column)) + " FOREIGN KEY (" + fieldsSql + ") REFERENCES " + schemaQuote(reference.table()) + " (" + columnsSql + ") ON DELETE " + reference.onDelete())
+  return SchemaCompileResult.Statement("CONSTRAINT " + schemaQuote(schemaReferenceConstraint(column)) + " FOREIGN KEY (" + fieldsSql + ") REFERENCES " + schemaQuote(reference.table()) + " (" + columnsSql + ") ON DELETE " + reference.onDelete() + (reference.deferred() ? " DEFERRABLE INITIALLY DEFERRED" : ""))
 end
 
 def schemaTableConstraints(columns: readonly SchemaColumn[]): SchemaCompileResult
@@ -282,15 +294,36 @@ def schemaPostgresRebuild(
         if oldColumn.nullable() != column.nullable()
           output = output + alter + (column.nullable() ? "DROP NOT NULL" : "SET NOT NULL") + ";\n"
         end
-        if schemaDefaultCode(oldColumn.defaultValue()) != schemaDefaultCode(column.defaultValue()) || schemaTypeCode(oldColumn.type()) != schemaTypeCode(column.type())
+        if oldColumn.computedSql() != column.computedSql() || oldColumn.computedStored() != column.computedStored()
           match schemaColumnSql(column, dialect: SqlDialect.PostgreSql())
             case SchemaCompileResult.Failure(message)
               return SchemaCompileResult.Failure(message)
             case SchemaCompileResult.Statement(sql)
-              let defaultValue = schemaDefaultSql(column.defaultValue(), SqlDialect.PostgreSql())
+              output = output + prefix + "DROP COLUMN " + schemaQuote(column.name()) + ";\n" + prefix + "ADD COLUMN " + sql + ";\n"
+          end
+        else if schemaDefaultCode(oldColumn.defaultValue()) != schemaDefaultCode(column.defaultValue()) || oldColumn.defaultSql() != column.defaultSql() || schemaTypeCode(oldColumn.type()) != schemaTypeCode(column.type())
+          match schemaColumnSql(column, dialect: SqlDialect.PostgreSql())
+            case SchemaCompileResult.Failure(message)
+              return SchemaCompileResult.Failure(message)
+            case SchemaCompileResult.Statement(sql)
+              let defaultValue = column.defaultSql() == null ? schemaDefaultSql(
+                column.defaultValue(),
+                SqlDialect.PostgreSql()
+              ) : column.defaultSql()
 
               output = output + alter + (defaultValue == null ? "DROP DEFAULT" : "SET DEFAULT " + defaultValue) + ";\n"
           end
+        end
+        if oldColumn.checkSql() != column.checkSql()
+          output = output + prefix + "DROP CONSTRAINT IF EXISTS " + schemaQuote("neri_ck_" + oldColumn.name()) + ";\n" if oldColumn.checkSql() != null
+          let checkSql = column.checkSql()
+
+          output = output + prefix + "ADD CONSTRAINT " + schemaQuote("neri_ck_" + column.name()) + " CHECK (" + checkSql + ");\n" if checkSql != null
+        end
+        if oldColumn.collation() != column.collation()
+          let collation = column.collation()
+
+          output = output + alter + "TYPE " + schemaPostgresType(column) + " COLLATE " + schemaQuote(collation == null ? "default" : collation) + " USING " + schemaQuote(column.name()) + "::" + schemaPostgresType(column) + ";\n"
         end
       end
     end

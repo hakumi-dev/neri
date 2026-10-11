@@ -1,0 +1,268 @@
+namespace neri_data
+
+## Calendar fields use canonical native storage and preserve stored offset semantics.
+class CalendarExpression<T>
+  private field: readonly quotation::Tree
+  private utc: Bool
+
+  def init(field: readonly quotation::Tree, utc: Bool): Void
+    this.field = field
+    this.utc = utc
+  end
+
+  public def year(): CalendarPartExpression<T>
+    return this.part(0)
+  end
+
+  public def month(): CalendarPartExpression<T>
+    return this.part(1)
+  end
+
+  public def day(): CalendarPartExpression<T>
+    return this.part(2)
+  end
+
+  public def hour(): CalendarPartExpression<T>
+    return this.part(3)
+  end
+
+  public def minute(): CalendarPartExpression<T>
+    return this.part(4)
+  end
+
+  public def second(): CalendarPartExpression<T>
+    return this.part(5)
+  end
+
+  public def millisecond(): CalendarPartExpression<T>
+    return this.part(6)
+  end
+
+  public def microsecond(): CalendarPartExpression<T>
+    return this.part(7)
+  end
+
+  public def ticksWithinSecond(): CalendarPartExpression<T>
+    return this.part(8)
+  end
+
+  public def microsecondsWithinSecond(): CalendarPartExpression<T>
+    return this.part(11)
+  end
+
+  public def nanosecond(): CalendarPartExpression<T>
+    return this.part(12)
+  end
+
+  public def dayOfWeek(): CalendarPartExpression<T>
+    return this.part(9)
+  end
+
+  public def dayOfYear(): CalendarPartExpression<T>
+    return this.part(10)
+  end
+
+  private def part(code: Int): CalendarPartExpression<T>
+    let field = this.field
+    let utc = this.utc
+    let build: fn(
+      EntityMapping,
+      CompileState,
+      SqlDialect
+    ): ScalarSqlResult = fn(
+      mapping: EntityMapping,
+      state: CompileState,
+      dialect: SqlDialect
+    ): ScalarSqlResult do
+      return calendarPartSql(mapping, field, utc, code, dialect)
+    end
+
+    return new CalendarPartExpression<T>(build)
+  end
+end
+
+class CalendarPartExpression<T>
+  private builder: fn(EntityMapping, CompileState, SqlDialect): ScalarSqlResult
+
+  def init(builder: fn(EntityMapping, CompileState, SqlDialect): ScalarSqlResult): Void
+    this.builder = builder
+  end
+
+  ## Nullable fields retain SQL NULL in their projected calendar parts.
+  public def shape(): RowShape<T, Int?>
+    return builtScalarShape<T, Int?>(optionalIntScalar(), this.builder)
+  end
+
+  public def requiredShape(): RowShape<T, Int>
+    return builtScalarShape<T, Int>(intScalar(), this.builder)
+  end
+
+  public def equalTo(value: Int): ComputedPredicate<T>
+    return this.compare(value, "=")
+  end
+
+  public def lessThan(value: Int): ComputedPredicate<T>
+    return this.compare(value, "<")
+  end
+
+  public def greaterThan(value: Int): ComputedPredicate<T>
+    return this.compare(value, ">")
+  end
+
+  private def compare(value: Int, operation: String): ComputedPredicate<T>
+    let source = this.builder
+    let build: fn(
+      EntityMapping,
+      CompileState,
+      SqlDialect
+    ): ScalarSqlResult = fn(
+      mapping: EntityMapping,
+      state: CompileState,
+      dialect: SqlDialect
+    ): ScalarSqlResult do
+      match source(mapping, state, dialect)
+        case ScalarSqlResult.Failure(error)
+          return ScalarSqlResult.Failure(error)
+        case ScalarSqlResult.Value(part)
+          state.bind(Parameter.Int(value))
+          return scalarSqlValue(
+            "(" + part.sql + " " + operation + " " + dialectPlaceholder(dialect, state.count) + ")",
+            part.checkedScalars
+          )
+      end
+    end
+
+    return new ComputedPredicate<T>(build)
+  end
+end
+
+def calendarField<T, V>(field: quote fn(T): V): CalendarExpression<T>
+  return new CalendarExpression<T>(field.tree(), false)
+end
+
+## DateTimeOffset parts intentionally describe the UTC instant, preserving stored offsets.
+def utcCalendarField<T, V>(field: quote fn(T): V): CalendarExpression<T>
+  return new CalendarExpression<T>(field.tree(), true)
+end
+
+def calendarPartSql(
+  mapping: EntityMapping,
+  field: readonly quotation::Tree,
+  utc: Bool,
+  code: Int,
+  dialect: SqlDialect
+): ScalarSqlResult
+  if code < 0 || code > 12
+    return scalarSqlFailure("calendar part code is invalid")
+  end
+  match translateSelection(mapping, field)
+    case SelectionResult.Failure(error)
+      return ScalarSqlResult.Failure(error)
+    case SelectionResult.Column(column)
+      let type = translationModelType(column.typeName())
+      let optional = translationOptional(column.typeName())
+      let suffix = optional ? "Optional" : ""
+      let date = type == "neri_data.DateOnly"
+      let time = type == "neri_data.TimeOnly"
+      let instant = type == "neri_data.DateTime"
+      let offset = type == "neri_data.DateTimeOffset"
+      let name = date ? "DateOnly" : (time ? "TimeOnly" : (instant ? "DateTime" : "DateTimeOffset"))
+      let expected = "neri_data.cell" + suffix + name
+      let conversion = column.conversionId()
+
+      if (!date && !time && !instant && !offset) || (utc && !offset) || translationModelType(field.resultType()) != type || translationOptional(field.resultType()) != optional || column.storageTypeName() != (optional ? "String?" : "String") || (conversion != expected && !(offset && conversion == expected + "Key"))
+        return scalarSqlFailure("calendar expression requires its native canonical mapping and explicit UTC offset semantics")
+      end
+      if (date && ((code >= 3 && code <= 8) || code >= 11)) || (time && (code <= 2 || code == 9 || code == 10))
+        return scalarSqlFailure("calendar part is unavailable for this native field type")
+      end
+      var value = quoted(mapping.table(), column.column())
+
+      if offset && !utc && conversion != expected + "Key"
+        value = calendarLocalOffsetSql(value, dialect)
+      end
+      var start = 1
+      var count = 2
+      var minimum = 0
+      var maximum = 59
+
+      if code == 0
+        count = 4
+        minimum = 1
+        maximum = 9999
+      else if code == 1
+        start = 6
+        minimum = 1
+        maximum = 12
+      else if code == 2
+        start = 9
+        minimum = 1
+        maximum = 31
+      else if code == 3
+        start = time ? 1 : 12
+        maximum = 23
+      else if code == 4
+        start = time ? 4 : 15
+      else if code == 5
+        start = time ? 7 : 18
+      else if code >= 6 && code <= 8
+        start = time ? 10 : 21
+        start = start + 3 if code == 7
+        count = code == 8 ? 7 : 3
+        maximum = code == 8 ? 9999999 : 999
+      else if code == 11
+        start = time ? 10 : 21
+        count = 6
+        maximum = 999999
+      else if code == 12
+        start = time ? 16 : 27
+        count = 1
+        maximum = 9
+      end
+      if code == 9 || code == 10
+        let calendar = "substr(" + value + ", 1, 10)"
+
+        match dialect
+          case SqlDialect.QuestionMark()
+            let part = "CAST(strftime('" + (code == 9 ? "%w" : "%j") + "', " + calendar + ") AS INTEGER)"
+
+            return scalarSqlValue(
+              "CASE WHEN " + value + " IS NULL THEN NULL WHEN " + part + " IS NULL THEN json_extract('invalid calendar date', '$') ELSE " + part + " END",
+              true
+            )
+          case SqlDialect.PostgreSql()
+            return scalarSqlValue("CAST(EXTRACT(" + (code == 9 ? "DOW" : "DOY") + " FROM CAST(" + calendar + " AS DATE)) AS BIGINT)")
+        end
+      end
+      let text = "substr(" + value + ", " + (start as String) + ", " + (count as String) + ")"
+      let digits = "CAST(" + text + " AS BIGINT)"
+      let part = code == 12 ? "(" + digits + " * 100)" : digits
+      let range = digits + " BETWEEN " + (minimum as String) + " AND " + (maximum as String)
+
+      match dialect
+        case SqlDialect.QuestionMark()
+          return scalarSqlValue(
+            "CASE WHEN " + value + " IS NULL THEN NULL WHEN length(" + text + ") = " + (count as String) + " AND " + text + " NOT GLOB '*[^0-9]*' AND " + range + " THEN " + part + " ELSE json_extract('invalid calendar part', '$') END",
+            true
+          )
+        case SqlDialect.PostgreSql()
+          return scalarSqlValue("CASE WHEN " + value + " IS NULL THEN NULL WHEN " + range + " THEN " + part + " ELSE CAST(" + text + " || ' invalid calendar part' AS BIGINT) END")
+      end
+  end
+end
+
+def calendarLocalOffsetSql(value: String, dialect: SqlDialect): String
+  let minutes = "COALESCE(CAST(NULLIF(substr(" + value + ", 30), '') AS BIGINT), 0)"
+  let valid = minutes + " BETWEEN -840 AND 840"
+
+  match dialect
+    case SqlDialect.QuestionMark()
+      let calendar = "replace(datetime(substr(" + value + ", 1, 19), printf('%+d minutes', " + minutes + ")), ' ', 'T')"
+
+      return "(CASE WHEN " + value + " IS NULL THEN NULL WHEN " + valid + " AND " + calendar + " IS NOT NULL THEN " + calendar + " || substr(" + value + ", 20, 9) ELSE json_extract('invalid calendar offset', '$') END)"
+    case SqlDialect.PostgreSql()
+      let calendar = "to_char(CAST(substr(" + value + ", 1, 19) AS TIMESTAMP) + " + minutes + " * INTERVAL '1 minute', 'YYYY-MM-DD\"T\"HH24:MI:SS')"
+
+      return "(CASE WHEN " + value + " IS NULL THEN NULL WHEN " + valid + " THEN " + calendar + " || substr(" + value + ", 20, 9) ELSE CAST(" + value + " || ' invalid calendar offset' AS TIMESTAMP)::TEXT END)"
+  end
+end

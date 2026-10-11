@@ -1,0 +1,393 @@
+use host
+namespace neri_data
+
+## Token offsets preserve expression text while quoted names remain distinguishable.
+class SchemaDdlToken
+  public value: String
+  public start: Int
+  public finish: Int
+  public quoted: Bool
+
+  def init(value: String, start: Int, finish: Int, quoted: Bool = false): Void
+    this.value = value
+    this.start = start
+    this.finish = finish
+    this.quoted = quoted
+  end
+end
+
+def schemaDdlTokens(sql: String): SchemaDdlToken[]
+  let values = new TypedRows<SchemaDdlToken>()
+  var index = 0
+  let length = host::stringByteLength(sql)
+
+  while index < length && values.count() < 10000
+    let byte = host::stringByteAt(sql, index) as Int
+
+    if byte <= 32
+      index = index + 1
+    else if byte == 45 && index + 1 < length && host::stringByteAt(sql, index + 1) as Int == 45
+      index = index + 2
+      while index < length && host::stringByteAt(sql, index) as Int != 10
+        index = index + 1
+      end
+    else if byte == 47 && index + 1 < length && host::stringByteAt(sql, index + 1) as Int == 42
+      index = index + 2
+      while index + 1 < length && !(host::stringByteAt(
+          sql,
+          index
+        ) as Int == 42 && host::stringByteAt(
+          sql,
+          index + 1
+        ) as Int == 47)
+        index = index + 1
+      end
+      index = index + 2
+    else if byte == 34 || byte == 39 || byte == 96 || byte == 91
+      let start = index
+      let close = byte == 91 ? 93 : byte
+      var value = ""
+
+      index = index + 1
+      while index < length
+        let current = host::stringByteAt(sql, index) as Int
+
+        if current == close
+          index = index + 1
+          if index < length && host::stringByteAt(sql, index) as Int == close
+            value = value + host::stringSlice(sql, index, 1)
+            index = index + 1
+          else
+            break
+          end
+        else
+          value = value + host::stringSlice(sql, index, 1)
+          index = index + 1
+        end
+      end
+      values.add(new SchemaDdlToken(value, start, index, true))
+    else if byte == 40 || byte == 41 || byte == 44 || byte == 46 || byte == 59
+      values.add(new SchemaDdlToken(host::stringSlice(sql, index, 1), index, index + 1))
+      index = index + 1
+    else
+      let start = index
+
+      while index < length
+        let current = host::stringByteAt(sql, index) as Int
+
+        if current <= 32 || current == 34 || current == 39 || current == 96 || current == 91 || current == 40 || current == 41 || current == 44 || current == 46 || current == 59
+          break
+        end
+        index = index + 1
+      end
+      values.add(new SchemaDdlToken(host::stringSlice(sql, start, index - start), start, index))
+    end
+  end
+  return navigationArray(values)
+end
+
+def schemaDdlKeyword(token: readonly SchemaDdlToken, keyword: String): Bool
+  return !token.quoted && schemaSameIdentifier(token.value, keyword)
+end
+
+def schemaDdlClose(tokens: readonly SchemaDdlToken[], open: Int): Int
+  var depth = 0
+  var index = open
+
+  while index < tokens.Length
+    if schemaDdlKeyword(tokens[index], "(")
+      depth = depth + 1
+    else if schemaDdlKeyword(tokens[index], ")")
+      depth = depth - 1
+      if depth == 0
+        return index
+      end
+    end
+    index = index + 1
+  end
+  return -1
+end
+
+def schemaDdlExpression(sql: String, tokens: readonly SchemaDdlToken[], open: Int): String?
+  if open < 0 || open >= tokens.Length || !schemaDdlKeyword(tokens[open], "(")
+    return null
+  end
+  let close = schemaDdlClose(tokens, open)
+
+  return close < 0 ? null : host::stringSlice(sql, tokens[open].finish, tokens[close].start - tokens[open].finish)
+end
+
+class SchemaDdlColumnFacets
+  public computedSql: String?
+  public checkSql: String?
+  public collation: String?
+end
+
+def schemaDdlColumn(sql: String, name: String, tableChecks: Bool = false): SchemaDdlColumnFacets
+  let result = new SchemaDdlColumnFacets()
+  let tokens = schemaDdlTokens(sql)
+  var index = 0
+
+  while index < tokens.Length && !schemaDdlKeyword(tokens[index], "(")
+    index = index + 1
+  end
+  index = index + 1
+  var selected = false
+  var tableConstraint = false
+  var depth = 0
+  var segment = true
+
+  while index < tokens.Length
+    let token = tokens[index]
+
+    if depth == 0 && segment
+      selected = schemaSameIdentifier(token.value, name)
+      tableConstraint = schemaDdlKeyword(token, "CONSTRAINT") || schemaDdlKeyword(token, "CHECK")
+      segment = false
+    end
+    if depth == 0 && selected && schemaDdlKeyword(token, "AS")
+      result.computedSql = schemaDdlExpression(sql, tokens, index + 1)
+    end
+    if depth == 0 && selected && schemaDdlKeyword(token, "COLLATE") && index + 1 < tokens.Length
+      result.collation = tokens[index + 1].value
+    end
+    if depth == 0 && (selected || (tableChecks && tableConstraint)) && schemaDdlKeyword(token, "CHECK")
+      let expression = schemaDdlExpression(sql, tokens, index + 1)
+      let previous = result.checkSql
+
+      if expression != null
+        result.checkSql = previous == null ? expression : "(" + previous + ") AND (" + expression + ")"
+      end
+    end
+    if schemaDdlKeyword(token, "(")
+      depth = depth + 1
+    else if schemaDdlKeyword(token, ")")
+      if depth == 0
+        break
+      end
+      depth = depth - 1
+    else if depth == 0 && schemaDdlKeyword(token, ",")
+      segment = true
+    end
+    index = index + 1
+  end
+  return result
+end
+
+class SchemaScaffoldReference
+  public table: String
+  public parent: String
+  public fields: String[]
+  public keys: String[]
+  public deleteBehavior: String
+  public deferred: Bool
+
+  def init(
+    table: String,
+    parent: String,
+    fields: readonly String[],
+    keys: readonly String[],
+    deleteBehavior: String = "NO ACTION",
+    deferred: Bool = false
+  ): Void
+    this.table = table
+    this.parent = parent
+    this.fields = arrays::generate(fields.Length) do |index|
+      return fields[index]
+    end
+    this.keys = arrays::generate(keys.Length) do |index|
+      return keys[index]
+    end
+    this.deleteBehavior = deleteBehavior
+    this.deferred = deferred
+  end
+end
+
+class SchemaScaffoldIndex
+  public table: String
+  public name: String
+  public fields: String[]
+  public unique: Bool
+  public descending: Bool[]
+  public expressions: String[]
+  public included: String[]
+  public predicate: String?
+
+  def init(
+    table: String,
+    name: String,
+    fields: readonly String[],
+    unique: Bool,
+    descending: readonly Bool[] = [],
+    expressions: readonly String[] = [],
+    included: readonly String[] = [],
+    predicate: String? = null
+  ): Void
+    this.table = table
+    this.name = name
+    this.fields = arrays::generate(fields.Length) do |index|
+      return fields[index]
+    end
+    this.unique = unique
+    this.descending = arrays::generate(descending.Length) do |index|
+      return descending[index]
+    end
+    this.expressions = arrays::generate(expressions.Length) do |index|
+      return expressions[index]
+    end
+    this.included = arrays::generate(included.Length) do |index|
+      return included[index]
+    end
+    this.predicate = predicate
+  end
+end
+
+## Expressions stay in physical SQL; mapped field terms use physical names here.
+def schemaDdlIndex(sql: String, table: String, name: String, unique: Bool): SchemaScaffoldIndex?
+  let tokens = schemaDdlTokens(sql)
+  var index = 0
+
+  while index < tokens.Length && !schemaDdlKeyword(tokens[index], "ON")
+    index = index + 1
+  end
+  while index < tokens.Length && !schemaDdlKeyword(tokens[index], "(")
+    if schemaDdlKeyword(
+      tokens[index],
+      "USING"
+    ) && (index + 1 >= tokens.Length || !schemaDdlKeyword(
+        tokens[index + 1],
+        "btree"
+      ))
+      return null
+    end
+    index = index + 1
+  end
+  let close = schemaDdlClose(tokens, index)
+
+  if close < 0
+    return null
+  end
+  let fields = new TypedRows<String>()
+  let expressions = new TypedRows<String>()
+  let descending = new TypedRows<Bool>()
+  let included = new TypedRows<String>()
+  var start = index + 1
+  var depth = 0
+
+  index = start
+  while index <= close
+    let token = tokens[index]
+
+    if depth == 0 && (index == close || schemaDdlKeyword(token, ","))
+      var finish = index
+      var desc = false
+
+      if finish > start && (schemaDdlKeyword(tokens[finish - 1], "DESC") || schemaDdlKeyword(tokens[finish - 1], "ASC"))
+        desc = schemaDdlKeyword(tokens[finish - 1], "DESC")
+        finish = finish - 1
+      end
+      if finish <= start
+        return null
+      end
+      if finish == start + 1 && expressions.count() == 0 && identifierValid(tokens[start].value) && host::stringByteAt(
+        sql,
+        tokens[start].start
+      ) as Int != 39
+        fields.add(tokens[start].value)
+      else
+        expressions.add(host::stringSlice(sql, tokens[start].start, tokens[finish - 1].finish - tokens[start].start))
+      end
+      descending.add(desc)
+      start = index + 1
+    else if schemaDdlKeyword(token, "(")
+      depth = depth + 1
+    else if schemaDdlKeyword(token, ")")
+      depth = depth - 1
+    end
+    index = index + 1
+  end
+  var predicate: String? = null
+
+  while index < tokens.Length
+    if schemaDdlKeyword(tokens[index], "WHERE") && index + 1 < tokens.Length
+      let finish = schemaDdlKeyword(tokens[tokens.Length - 1], ";") ? tokens.Length - 2 : tokens.Length - 1
+
+      predicate = host::stringSlice(sql, tokens[index + 1].start, tokens[finish].finish - tokens[index + 1].start)
+      break
+    end
+    if schemaDdlKeyword(tokens[index], "INCLUDE") && index + 1 < tokens.Length
+      let includeEnd = schemaDdlClose(tokens, index + 1)
+      var position = index + 2
+
+      if includeEnd < 0
+        return null
+      end
+
+      while includeEnd >= 0 && position < includeEnd
+        if !schemaDdlKeyword(tokens[position], ",")
+          included.add(tokens[position].value)
+        end
+        position = position + 1
+      end
+      index = includeEnd if includeEnd >= 0
+    else if !schemaDdlKeyword(tokens[index], ";")
+      return null
+    end
+    index = index + 1
+  end
+  return new SchemaScaffoldIndex(
+    table,
+    name,
+    navigationArray(fields),
+    unique,
+    navigationArray(descending),
+    navigationArray(expressions),
+    navigationArray(included),
+    predicate
+  )
+end
+
+
+def schemaDdlDeferred(sql: String, parent: String, fields: readonly String[]): Bool
+  let tokens = schemaDdlTokens(sql)
+  var index = 0
+  var parentMatched = false
+  var fieldMatched = false
+  var deferred = false
+  var depth = 0
+
+  while index < tokens.Length
+    let token = tokens[index]
+
+    if depth == 1 && schemaDdlKeyword(token, ",")
+      if parentMatched && fieldMatched && deferred
+        return true
+      end
+      parentMatched = false
+      fieldMatched = false
+      deferred = false
+    end
+    if depth == 1 && schemaDdlKeyword(token, "REFERENCES") && index + 1 < tokens.Length
+      parentMatched = schemaSameIdentifier(tokens[index + 1].value, parent)
+    end
+    if depth == 1 && schemaDdlKeyword(
+      token,
+      "INITIALLY"
+    ) && index + 1 < tokens.Length && schemaDdlKeyword(
+      tokens[index + 1],
+      "DEFERRED"
+    )
+      deferred = true
+    end
+    if fields.Length > 0 && schemaSameIdentifier(token.value, fields[0])
+      fieldMatched = true
+    end
+    if schemaDdlKeyword(token, "(")
+      depth = depth + 1
+    else if schemaDdlKeyword(token, ")")
+      depth = depth - 1
+    end
+    index = index + 1
+  end
+  return parentMatched && fieldMatched && deferred
+end

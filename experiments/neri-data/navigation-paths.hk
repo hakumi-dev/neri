@@ -83,21 +83,27 @@ end
 ## One checked relationship traversal, retaining its source query identity.
 class NavigationStep<A, B>
   private execute: fn(TypedRows<A>, NavigationJournal): QueryResult<B>
-  private check: fn(): QueryFailure?
+  private check: fn(Bool): QueryFailure?
   private sourceProvider: Provider?
   private sourceOwner: ChangeContext?
   private inputTracker: EntityTracker<A>?
   private outputTracker: EntityTracker<B>?
   private checkpointKnown: (fn(NavigationJournal): Void)?
+  private executeAsync: (fn(TypedRows<A>, NavigationJournal, StreamOptions?): AsyncLoadDriver<B>)?
+  internal requiresSourceTracker: Bool
+  private singleContributor: (fn(SingleNavigationScope, SingleNavigationRows<A>): SingleNavigationRows<B>)?
 
   def init(
     execute: fn(TypedRows<A>, NavigationJournal): QueryResult<B>,
-    check: fn(): QueryFailure?,
+    check: fn(Bool): QueryFailure?,
     provider: Provider?,
     owner: ChangeContext?,
     inputTracker: EntityTracker<A>?,
     outputTracker: EntityTracker<B>?,
-    checkpoint: (fn(NavigationJournal): Void)? = null
+    checkpoint: (fn(NavigationJournal): Void)? = null,
+    executeAsync: (fn(TypedRows<A>, NavigationJournal, StreamOptions?): AsyncLoadDriver<B>)? = null,
+    requiresSourceTracker: Bool = true,
+    singleContributor: (fn(SingleNavigationScope, SingleNavigationRows<A>): SingleNavigationRows<B>)? = null
   ): Void
     this.execute = execute
     this.check = check
@@ -106,6 +112,9 @@ class NavigationStep<A, B>
     this.inputTracker = inputTracker
     this.outputTracker = outputTracker
     this.checkpointKnown = checkpoint
+    this.executeAsync = executeAsync
+    this.requiresSourceTracker = requiresSourceTracker
+    this.singleContributor = singleContributor
   end
 
   internal def checkpoint(journal: NavigationJournal): Void
@@ -120,8 +129,20 @@ class NavigationStep<A, B>
     return this.execute(rows, journal)
   end
 
-  internal def validate(): QueryFailure?
-    return this.check()
+  internal def validate(asynchronous: Bool = false): QueryFailure?
+    if asynchronous && this.executeAsync == null
+      return QueryFailure.UnsupportedCapability("navigation step has no asynchronous implementation")
+    end
+    return this.check(asynchronous)
+  end
+
+  internal def runAsync(rows: TypedRows<A>, journal: NavigationJournal, options: StreamOptions?): AsyncLoadDriver<B>
+    let run = this.executeAsync
+
+    if run == null
+      return new AsyncCompletedLoad<B>(QueryResult<B>.Failure(QueryFailure.UnsupportedCapability("navigation step has no asynchronous implementation")))
+    end
+    return run(rows, journal, options)
   end
 
   internal def provider(): Provider?
@@ -138,6 +159,16 @@ class NavigationStep<A, B>
 
   internal def targetTracker(): EntityTracker<B>?
     return this.outputTracker
+  end
+
+  internal def contributeSingle(scope: SingleNavigationScope, source: SingleNavigationRows<A>): SingleNavigationRows<B>
+    let contributor = this.singleContributor
+
+    if contributor == null
+      scope.failure = QueryFailure.UnsupportedCapability("navigation step has no single SQL contribution")
+      return new SingleNavigationRows<B>(scope.count)
+    end
+    return contributor(scope, source)
   end
 end
 
@@ -214,7 +245,7 @@ def collectionStep<P, D>(
   maximum: Int = 10000,
   children: Query<D>? = null
 ): NavigationStep<P, D>
-  let check: fn(): QueryFailure? = fn(): QueryFailure? do
+  let check: fn(Bool): QueryFailure? = fn(asynchronous: Bool): QueryFailure? do
     if maximum < 1 || maximum > 10000
       return QueryFailure.Provider(ProviderFailure.State("navigation child limit must be between 1 and 10000"))
     end
@@ -223,7 +254,7 @@ def collectionStep<P, D>(
     if children != null
       selected = selected.children(children)
     end
-    return selected.maxChildren(maximum).validateQueries()
+    return selected.maxChildren(maximum).validateQueries(asynchronous)
   end
   let execute: fn(
     TypedRows<P>,
@@ -272,6 +303,64 @@ def collectionStep<P, D>(
     include(principals, dependents, relation).checkpointRoots(journal)
   end
 
+  let asyncRun: fn(
+    TypedRows<P>,
+    NavigationJournal,
+    StreamOptions?
+  ): AsyncLoadDriver<D> = fn(
+    rows: TypedRows<P>,
+    journal: NavigationJournal,
+    options: StreamOptions?
+  ): AsyncLoadDriver<D> do
+    let parentTracker = principals.rowTracker()
+    let childTracker = dependents.rowTracker()
+
+    if parentTracker == null || childTracker == null
+      return new AsyncCompletedLoad<D>(QueryResult<D>.Failure(QueryFailure.UnsupportedCapability("navigation path requires tracked roots")))
+    end
+    let before: fn(TypedRows<P>, TypedRows<D>): Void = fn(roots: TypedRows<P>, incoming: TypedRows<D>): Void do
+      checkpointNavigation(relation, parentTracker, childTracker, roots, incoming, journal)
+    end
+    var selected = include(
+      principals,
+      dependents,
+      navigationJournalled(relation, journal)
+    ).maxChildren(maximum).beforePublication(before)
+
+    if children != null
+      selected = selected.children(children)
+    end
+    let map: fn(QueryResult<P>): QueryResult<D> = fn(result: QueryResult<P>): QueryResult<D> do
+      match result
+        case QueryResult.Failure(error)
+          return QueryResult<D>.Failure(error)
+        case QueryResult.Rows(loaded)
+          let next = new TypedRows<D>()
+          var current = loaded.first()
+
+          while current != null
+            for child in relation.collection(current.value)
+              navigationDistinct(next, child)
+            end
+            current = current.next
+          end
+          return QueryResult<D>.Rows(next)
+      end
+    end
+
+    return new AsyncMappedNavigation<P, D, D>(new AsyncNavigationDriver<P, D>(selected, options, rows: rows), map)
+  end
+
+  let single: fn(
+    SingleNavigationScope,
+    SingleNavigationRows<P>
+  ): SingleNavigationRows<D> = fn(
+    scope: SingleNavigationScope,
+    input: SingleNavigationRows<P>
+  ): SingleNavigationRows<D> do
+    return singleCollectionRole(scope, input, principals, dependents, relation, maximum, children)
+  end
+
   return new NavigationStep<P, D>(
     execute,
     check,
@@ -279,7 +368,9 @@ def collectionStep<P, D>(
     principals.changeOwner(),
     principals.rowTracker(),
     dependents.rowTracker(),
-    checkpoint
+    checkpoint,
+    asyncRun,
+    singleContributor: single
   )
 end
 
@@ -288,7 +379,7 @@ def referenceStep<P, D>(
   principals: Query<P>,
   relation: CollectionNavigation<P, D>
 ): NavigationStep<D, P>
-  let check: fn(): QueryFailure? = fn(): QueryFailure? do
+  let check: fn(Bool): QueryFailure? = fn(asynchronous: Bool): QueryFailure? do
     return includeReference(dependents, principals, relation).validateQueries()
   end
   let execute: fn(
@@ -335,6 +426,62 @@ def referenceStep<P, D>(
     includeReference(dependents, principals, relation).checkpointRoots(journal)
   end
 
+  let asyncRun: fn(
+    TypedRows<D>,
+    NavigationJournal,
+    StreamOptions?
+  ): AsyncLoadDriver<P> = fn(
+    rows: TypedRows<D>,
+    journal: NavigationJournal,
+    options: StreamOptions?
+  ): AsyncLoadDriver<P> do
+    let parentTracker = principals.rowTracker()
+    let childTracker = dependents.rowTracker()
+
+    if parentTracker == null || childTracker == null
+      return new AsyncCompletedLoad<P>(QueryResult<P>.Failure(QueryFailure.UnsupportedCapability("navigation path requires tracked roots")))
+    end
+    let before: fn(TypedRows<D>, TypedRows<P>): Void = fn(roots: TypedRows<D>, incoming: TypedRows<P>): Void do
+      checkpointNavigation(relation, parentTracker, childTracker, incoming, roots, journal)
+    end
+    let selected = includeReference(
+      dependents,
+      principals,
+      navigationJournalled(relation, journal)
+    ).beforePublication(before)
+    let map: fn(QueryResult<D>): QueryResult<P> = fn(result: QueryResult<D>): QueryResult<P> do
+      match result
+        case QueryResult.Failure(error)
+          return QueryResult<P>.Failure(error)
+        case QueryResult.Rows(loaded)
+          let next = new TypedRows<P>()
+          var current = loaded.first()
+
+          while current != null
+            let principal = relation.reference(current.value)
+
+            if principal != null
+              navigationDistinct(next, principal)
+            end
+            current = current.next
+          end
+          return QueryResult<P>.Rows(next)
+      end
+    end
+
+    return new AsyncMappedNavigation<D, P, P>(new AsyncNavigationDriver<D, P>(selected, options, rows: rows), map)
+  end
+
+  let single: fn(
+    SingleNavigationScope,
+    SingleNavigationRows<D>
+  ): SingleNavigationRows<P> = fn(
+    scope: SingleNavigationScope,
+    input: SingleNavigationRows<D>
+  ): SingleNavigationRows<P> do
+    return singleReferenceRole(scope, input, dependents, principals, relation)
+  end
+
   return new NavigationStep<D, P>(
     execute,
     check,
@@ -342,6 +489,8 @@ def referenceStep<P, D>(
     dependents.changeOwner(),
     dependents.rowTracker(),
     principals.rowTracker(),
-    checkpoint
+    checkpoint,
+    asyncRun,
+    singleContributor: single
   )
 end

@@ -44,16 +44,16 @@ def decimalSortKey(value: readonly Decimal): String
   return (negative ? "0" : "2") + encoded + digits + (negative ? ":" : "/")
 end
 
-def decimalCheckedSql(sql: String, dialect: SqlDialect): String
+def decimalCheckedSql(sql: String, dialect: SqlDialect, optional: Bool = false): String
   match dialect
     case SqlDialect.QuestionMark()
-      return "__neri_decimal_value(" + sql + ", 0)"
+      return "__neri_decimal_value(" + sql + (optional ? ", 1)" : ", 0)")
     case SqlDialect.PostgreSql()
       let value = "\"__neri_decimal_value\".\"number\""
       let numeric = "CAST(" + value + " AS NUMERIC)"
       let valid = "(" + value + " ~ '^-?(0|[1-9][0-9]*)(\\.[0-9]*[1-9])?$' AND " + value + " <> '-0' AND length(replace(replace(" + value + ", '.', ''), '-', '')) <= 4096)"
 
-      return "(SELECT CAST(trim_scale(CASE WHEN " + valid + " THEN " + numeric + " ELSE CAST((coalesce(" + value + ", 'NULL') || ' invalid Decimal') AS NUMERIC) END) AS TEXT) FROM (SELECT " + sql + " AS \"number\") AS \"__neri_decimal_value\")"
+      return "(SELECT CAST(trim_scale(CASE WHEN " + (optional ? value + " IS NULL THEN NULL WHEN " : "") + valid + " THEN " + numeric + " ELSE CAST((coalesce(" + value + ", 'NULL') || ' invalid Decimal') AS NUMERIC) END) AS TEXT) FROM (SELECT " + sql + " AS \"number\") AS \"__neri_decimal_value\")"
   end
 end
 
@@ -72,7 +72,7 @@ def decimalSortSql(sql: String, dialect: SqlDialect): String
   end
 end
 
-## An exact SQL decimal expression with bounded addition and subtraction.
+## An exact SQL decimal expression with bounded arithmetic.
 class DecimalExpression<T>
   private builder: fn(EntityMapping, CompileState, SqlDialect): ScalarSqlResult
   private size: Int
@@ -94,11 +94,24 @@ class DecimalExpression<T>
   end
 
   public def add(other: DecimalExpression<T>): DecimalExpression<T>
-    return decimalBinary(this, other, false)
+    return decimalBinary(this, other, "+")
   end
 
   public def subtract(other: DecimalExpression<T>): DecimalExpression<T>
-    return decimalBinary(this, other, true)
+    return decimalBinary(this, other, "-")
+  end
+
+  public def multiply(other: DecimalExpression<T>): DecimalExpression<T>
+    return decimalBinary(this, other, "*")
+  end
+
+  ## Scale is explicit; SQL and local Decimal arithmetic truncate toward zero.
+  public def divideTruncated(other: DecimalExpression<T>, scale: Int): DecimalExpression<T>
+    return decimalBinary(this, other, "/", scale)
+  end
+
+  public def asOptional(): OptionalDecimalExpression<T>
+    return new OptionalDecimalExpression<T>(this)
   end
 
   public def equalTo(other: DecimalExpression<T>): DecimalPredicate<T>
@@ -186,7 +199,13 @@ def decimalValue<T>(value: readonly Decimal): DecimalExpression<T>
   return new DecimalExpression<T>(build)
 end
 
-def decimalBinary<T>(left: DecimalExpression<T>, right: DecimalExpression<T>, subtract: Bool): DecimalExpression<T>
+def decimalBinary<T>(
+  left: DecimalExpression<T>,
+  right: DecimalExpression<T>,
+  operation: String,
+  scale: Int = 0,
+  optional: Bool = false
+): DecimalExpression<T>
   let build: fn(
     EntityMapping,
     CompileState,
@@ -196,6 +215,9 @@ def decimalBinary<T>(left: DecimalExpression<T>, right: DecimalExpression<T>, su
     state: CompileState,
     dialect: SqlDialect
   ): ScalarSqlResult do
+    if operation == "/" && (scale < 0 || scale > 4096)
+      return scalarSqlFailure("decimal division scale must be between 0 and 4096")
+    end
     match left.buildSql(mapping, state, dialect)
       case ScalarSqlResult.Failure(error)
         return ScalarSqlResult.Failure(error)
@@ -208,11 +230,24 @@ def decimalBinary<T>(left: DecimalExpression<T>, right: DecimalExpression<T>, su
 
             match dialect
               case SqlDialect.QuestionMark()
-                sql = (subtract ? "__neri_decimal_subtract(" : "__neri_decimal_add(") + first.sql + ", " + second.sql + ")"
+                let name = operation == "+" ? "add" : (operation == "-" ? "subtract" : (operation == "*" ? "multiply" : "divide"))
+
+                sql = "__neri_decimal_" + name + "(" + first.sql + ", " + second.sql + (operation == "/" ? ", " + (scale as String) : "") + ")"
               case SqlDialect.PostgreSql()
-                sql = "CAST(trim_scale(CAST(" + first.sql + " AS NUMERIC) " + (subtract ? "-" : "+") + " CAST(" + second.sql + " AS NUMERIC)) AS TEXT)"
+                if operation == "/"
+                  let power = "power(10::NUMERIC, " + (scale as String) + ")"
+
+                  let quotient = "CAST(div(CAST(" + first.sql + " AS NUMERIC) * " + power + ", CAST(" + second.sql + " AS NUMERIC)) AS TEXT)"
+                  let value = "\"__neri_decimal_divide\".\"quotient\""
+                  let digits = "lpad(ltrim(" + value + ", '-'), greatest(length(ltrim(" + value + ", '-')), " + ((scale + 1) as String) + "), '0')"
+                  let magnitude = scale == 0 ? digits : "left(" + digits + ", length(" + digits + ") - " + (scale as String) + ") || '.' || right(" + digits + ", " + (scale as String) + ")"
+
+                  sql = "(SELECT CAST(trim_scale(CAST((CASE WHEN left(" + value + ", 1) = '-' THEN '-' ELSE '' END) || " + magnitude + " AS NUMERIC)) AS TEXT) FROM (SELECT " + quotient + " AS \"quotient\") AS \"__neri_decimal_divide\")"
+                else
+                  sql = "CAST(trim_scale(CAST(" + first.sql + " AS NUMERIC) " + operation + " CAST(" + second.sql + " AS NUMERIC)) AS TEXT)"
+                end
             end
-            return ScalarSqlResult.Value(new ScalarSql(decimalCheckedSql(sql, dialect), true))
+            return ScalarSqlResult.Value(new ScalarSql(decimalCheckedSql(sql, dialect, optional), true))
         end
     end
   end
@@ -314,7 +349,15 @@ def decimalRemappedMapping(original: EntityMapping, source: String): EntityMappi
     if column == null
       return new MappingColumn("invalid", "Invalid", "invalid")
     end
-    return new MappingColumn(column.identity(), column.typeName(), column.column(), column.path(), column.boolToInt())
+    return new MappingColumn(
+      column.identity(),
+      column.typeName(),
+      column.column(),
+      column.path(),
+      column.boolToInt(),
+      column.storageTypeName(),
+      column.conversionId()
+    )
   end
 
   return new EntityMapping(original.entityType(), source, fields, readOnly: original.readOnly())

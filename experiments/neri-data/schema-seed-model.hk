@@ -125,7 +125,7 @@ class SchemaSeed
     while index < table.count()
       let field = table.at(index)
 
-      if field != null && !field.column().primaryKey() && !field.column().nullable() && field.column().defaultValue() == null
+      if field != null && !field.column().primaryKey() && !field.column().nullable() && field.column().defaultValue() == null && field.column().defaultSql() == null && field.column().computedSql() == null
         var found = false
 
         for identity in this.storedFields
@@ -252,8 +252,25 @@ class SchemaSeedOrder
         index = index + 1
       end
       if !progress
-        this.failure = "model seed foreign-key cycles require an explicitly ordered migration catalog"
-        return
+        index = 0
+        while index < model.count()
+          let table = model.at(index)
+
+          if table != null && table.seedCount() > 0 && !this.contains(table.identity()) && this.ready(
+            model,
+            table,
+            true
+          )
+            this.tables.add(table.copy())
+            remaining = remaining - 1
+            progress = true
+          end
+          index = index + 1
+        end
+        if !progress
+          this.failure = "cyclic model seed foreign keys require deferred constraints"
+          return
+        end
       end
     end
   end
@@ -270,14 +287,14 @@ class SchemaSeedOrder
     return false
   end
 
-  private def ready(model: SchemaModel, table: readonly SchemaTable): Bool
+  private def ready(model: SchemaModel, table: readonly SchemaTable, deferred: Bool = false): Bool
     var fieldIndex = 0
 
     while fieldIndex < table.count()
       let field = table.at(fieldIndex)
       let reference = field == null ? null : field.column().reference()
 
-      if reference != null
+      if reference != null && !(deferred && reference.deferred())
         var targetIndex = 0
 
         while targetIndex < model.count()
@@ -325,7 +342,7 @@ def schemaDiffRemoveSeeds(from: SchemaModel, to: SchemaModel, ops: SchemaDiffOps
   return null
 end
 
-def schemaDiffApplySeeds(from: SchemaModel, to: SchemaModel, ops: SchemaDiffOps): String?
+def schemaDiffApplySeeds(from: SchemaModel, to: SchemaModel, ops: SchemaDiffOps, beforeStructure: Bool = false): String?
   let order = new SchemaSeedOrder(to)
 
   if order.failure != null
@@ -347,7 +364,14 @@ def schemaDiffApplySeeds(from: SchemaModel, to: SchemaModel, ops: SchemaDiffOps)
         if oldSeed == null
           ops.add(seed.operation(table, true))
         else if oldSeed.signature() != seed.signature()
-          if previous != null && schemaSeedParentRemoval(from, to, previous)
+          if previous != null && schemaSeedParentRemoval(
+            from,
+            to,
+            previous
+          ) && !beforeStructure && !schemaSeedsStableStructure(
+            from,
+            to
+          )
             return "seed relationship rewrites alongside principal removal require an explicitly ordered migration catalog"
           end
           var oldIndex = 0
@@ -410,4 +434,177 @@ def schemaSeedParentRemoval(from: SchemaModel, to: SchemaModel, table: readonly 
     fieldIndex = fieldIndex + 1
   end
   return false
+end
+
+def schemaSeedsStableStructure(from: SchemaModel, to: SchemaModel): Bool
+  if from.count() != to.count()
+    return false
+  end
+  var index = 0
+
+  while index < from.count()
+    let before = from.at(index)
+    let after = before == null ? null : to.find(before.identity())
+
+    if before == null || after == null || before.name() != after.name() || before.count() != after.count() || before.indexCount() != after.indexCount()
+      return false
+    end
+    var fieldIndex = 0
+
+    while fieldIndex < before.count()
+      let field = before.at(fieldIndex)
+      let other = field == null ? null : after.find(field.identity())
+
+      if field == null || other == null || schemaColumnCode(field.column()) != schemaColumnCode(other.column())
+        return false
+      end
+      fieldIndex = fieldIndex + 1
+    end
+    var indexPosition = 0
+
+    while indexPosition < before.indexCount()
+      let definition = before.indexAt(indexPosition)
+      let other = definition == null ? null : after.findIndex(definition.name())
+
+      if definition == null || other == null || definition.signature() != other.signature()
+        return false
+      end
+      indexPosition = indexPosition + 1
+    end
+    index = index + 1
+  end
+  return true
+end
+
+def schemaSeedsPrincipalRemoval(from: SchemaModel, to: SchemaModel): Bool
+  var index = 0
+
+  while index < from.count()
+    let table = from.at(index)
+
+    if table != null && schemaSeedParentRemoval(from, to, table)
+      return true
+    end
+    index = index + 1
+  end
+  return false
+end
+
+
+class SchemaSeedStage
+  public model: SchemaModel
+  public failure: String?
+
+  def init(from: SchemaModel, to: SchemaModel): Void
+    let tables = arrays::generate<SchemaTable>(from.count()) do |tableIndex|
+      let previous = from.at(tableIndex)
+
+      if previous == null
+        return new SchemaTable("", "", [])
+      end
+      let target = to.find(previous.identity())
+      let fields = arrays::generate<SchemaField>(previous.count()) do |index|
+        let field = previous.at(index)
+
+        return field == null ? new SchemaField("", new SchemaColumn("", SchemaType.Int())) : field.copy()
+      end
+      let indexes = arrays::generate<SchemaIndex>(previous.indexCount()) do |index|
+        let definition = previous.indexAt(index)
+
+        return definition == null ? new SchemaIndex("", []) : definition.copy()
+      end
+      let seeds = new TypedRows<SchemaSeed>()
+      var index = 0
+
+      while index < previous.seedCount()
+        let seed = previous.seedAt(index)
+
+        if seed != null && (target == null || target.findSeed(seed.keySignature()) == null)
+          seeds.add(seed.copy())
+        end
+        index = index + 1
+      end
+      index = 0
+      while target != null && index < target.seedCount()
+        let seed = target.seedAt(index)
+
+        if seed != null
+          let old = previous.findSeed(seed.keySignature())
+          let seedFields = new TypedRows<String>()
+          let seedValues = new TypedRows<Cell>()
+          var fieldIndex = 0
+
+          while fieldIndex < previous.count()
+            let field = previous.at(fieldIndex)
+
+            if field != null && !field.column().primaryKey()
+              var value: Cell? = null
+              var position = 0
+
+              while position < seed.count()
+                if seed.at(position) == field.identity()
+                  value = schemaSeedCellCopy(seed.valueAt(position))
+                end
+                position = position + 1
+              end
+              position = 0
+              while value == null && old != null && position < old.count()
+                if old.at(position) == field.identity()
+                  value = schemaSeedCellCopy(old.valueAt(position))
+                end
+                position = position + 1
+              end
+              if value != null
+                seedFields.add(field.identity())
+                seedValues.add(value)
+              end
+            end
+            fieldIndex = fieldIndex + 1
+          end
+          let keys = arrays::generate<String>(seed.keyCount()) do |position|
+            let identity = seed.keyAt(position)
+
+            return identity == null ? "" : identity
+          end
+          let values = arrays::generate<Cell>(seed.keyCount()) do |position|
+            let value = schemaSeedCellCopy(seed.keyValueAt(position))
+
+            return value == null ? Cell.Null() : value
+          end
+          let staged = new SchemaSeed(keys, values, navigationArray(seedFields), navigationArray(seedValues))
+          let invalid = staged.validate(previous)
+
+          if invalid != null
+            this.failure = "seed rewrite before schema change cannot satisfy the source schema: " + invalid
+          end
+          seeds.add(staged)
+        end
+        index = index + 1
+      end
+      return new SchemaTable(previous.identity(), previous.name(), fields, indexes, navigationArray(seeds))
+    end
+
+    this.model = new SchemaModel(tables)
+  end
+end
+
+def schemaSeedCellCopy(value: readonly Cell?): Cell?
+  if value == null
+    return null
+  end
+  match value
+    case Cell.Null()
+      return Cell.Null()
+    case Cell.Int(item)
+      return Cell.Int(item)
+    case Cell.Bool(item)
+      return Cell.Bool(item)
+    case Cell.Float(item)
+      return Cell.Float(item)
+    case Cell.Text(item)
+      return Cell.Text(item)
+    case Cell.Binary(item)
+      return Cell.Binary(copyBinary(item))
+  end
+  return null
 end

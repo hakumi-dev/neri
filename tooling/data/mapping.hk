@@ -300,6 +300,8 @@ def dataTypeDomain(typeName: String): DataScalarKind?
 
   if concrete == "Int"
     return DataScalarKind.Int()
+  else if concrete == "neri_data.TimeSpan" || concrete == "TimeSpan"
+    return DataScalarKind.Int()
   else if concrete == "Bool"
     return DataScalarKind.Bool()
   else if concrete == "Float"
@@ -310,6 +312,8 @@ def dataTypeDomain(typeName: String): DataScalarKind?
     return DataScalarKind.Binary()
   else if concrete == "neri_data.Decimal" || concrete == "Decimal"
     return DataScalarKind.Decimal()
+  else if dataTextScalarFamily(concrete) != ""
+    return DataScalarKind.String()
   end
   return null
 end
@@ -400,7 +404,7 @@ def dataInitializer(entity: DataEntity): Bool
   while mapped != null
     let fieldSymbol = mapped.symbol
 
-    if fieldSymbol == null || !fieldSymbol.access.isPublic()
+    if mapped.getter == "" && (fieldSymbol == null || !fieldSymbol.access.isPublic())
       return false
     end
     mapped = mapped.nextField
@@ -412,6 +416,9 @@ end
 def dataParseDefault(mapping: DataMapping, field: DataField, value: LspJson, context: String): Bool
   if value.isMissing()
     return true
+  end
+  if !dataValidateConvertedLiteral(mapping, field, value, context)
+    return false
   end
   field.defaultNode = value
   if value.isNull()
@@ -516,11 +523,11 @@ def dataResolveMember(mapping: DataMapping, entity: DataEntity, name: String, fi
       field.schemaIdentity = entity.typeName + "." + memberPath if parentPath != ""
       return symbol
     end
-    if semanticIsOptional(symbol.typeName)
-      mapping.fail("Complex member '" + entity.typeName + "." + memberPath + "' must be non-optional.")
-      return null
-    end
-    let complexType = dataFindClass(model, symbol.typeName)
+    let optionalParent = semanticIsOptional(symbol.typeName)
+    let concreteType = optionalParent ? semanticInnerType(symbol.typeName) : symbol.typeName
+    let complexType = dataFindClass(model, concreteType)
+
+    field.optionalParents.add(memberPath) if optionalParent
 
     if complexType == null || (!complexType.access.isPublic() && !complexType.access.isInternal())
       mapping.fail("Complex member '" + entity.typeName + "." + memberPath + "' requires an accessible class type.")
@@ -537,7 +544,8 @@ def dataResolveMember(mapping: DataMapping, entity: DataEntity, name: String, fi
       let complex = new DataComplex()
 
       complex.memberName = memberPath
-      complex.typeName = symbol.typeName
+      complex.typeName = concreteType
+      complex.optional = optionalParent
       complex.pathCode = path
       entity.addComplex(complex)
     end
@@ -551,7 +559,27 @@ end
 def dataParseField(mapping: DataMapping, entity: DataEntity, node: LspJson, index: Int): Bool
   let context = "entities[" + (index as String) + "].columns"
 
-  if !dataObject(mapping, node, context, ["member", "column", "default", "valueGeneration", "conversion"])
+  if !dataObject(
+    mapping,
+    node,
+    context,
+    [
+      "member",
+      "column",
+      "default",
+      "valueGeneration",
+      "conversion",
+      "defaultSql",
+      "computedSql",
+      "computedStored",
+      "checkSql",
+      "collation",
+      "type",
+      "getter",
+      "setter",
+      "json"
+    ]
+  )
     return false
   end
   let memberName = dataString(mapping, node, "member", context)
@@ -583,33 +611,80 @@ def dataParseField(mapping: DataMapping, entity: DataEntity, node: LspJson, inde
     return false
   end
   let field = new DataField(DataScalarKind.Int())
-  let symbol = dataResolveMember(mapping, entity, memberName, field)
+  let accessor = !node.get("getter").isMissing() || !node.get("setter").isMissing() || !node.get("type").isMissing()
+  let symbol = accessor ? null : dataResolveMember(mapping, entity, memberName, field)
 
-  if symbol == null
+  if symbol == null && !accessor
     return mapping.fail("Mapped member '" + entity.typeName + "." + memberName + "' does not exist; regenerate or update the mapping after a rename.")
   end
-  if !symbol.access.isPublic()
+  if symbol != null && !symbol.access.isPublic()
     return mapping.fail("Mapped member '" + entity.typeName + "." + memberName + "' must be public.")
   end
-  let domain = dataTypeDomain(symbol.typeName)
+  let conversion = node.get("conversion")
+  let customConversion = conversion.isObject()
+  let jsonValue = node.get("json")
+  let modelJson = !jsonValue.isMissing() && jsonValue.isBoolean() && jsonValue.isTrue()
+  let typeName = accessor ? dataString(mapping, node, "type", context) : (symbol == null ? "" : symbol.typeName)
+  let domain = modelJson ? dataTypeDomain("String") : (customConversion ? dataTypeDomain(dataString(
+        mapping,
+        conversion,
+        "storageType",
+        context + ".conversion"
+      )) : dataTypeDomain(typeName))
 
   if domain == null
-    return mapping.fail("Mapped member '" + entity.typeName + "." + memberName + "' has unsupported type '" + symbol.typeName + "'; expected Int, Bool, Float, String, buffers.ByteBuffer, neri_data.Decimal, or an optional of one of those types.")
+    return mapping.fail("Mapped member '" + entity.typeName + "." + memberName + "' has unsupported type '" + typeName + "'; declare a supported scalar or explicit storage converter.")
   end
   field.domain = domain
   field.memberName = memberName
   field.columnName = columnName
-  field.typeName = symbol.typeName
-  field.optional = semanticIsOptional(symbol.typeName)
-  let conversion = node.get("conversion")
-
-  if !conversion.isMissing()
-    if !conversion.isString() || conversion.scalarText() != "boolToInt" || dataScalarName(field.domain) != "Bool"
-      return mapping.fail(context + ".conversion supports 'boolToInt' on Bool or Bool? fields.")
+  field.typeName = typeName
+  field.optional = semanticIsOptional(typeName)
+  if !jsonValue.isMissing()
+    if !modelJson || !conversion.isMissing() || accessor || entity.isKeyMember(memberName) || field.optionalParents.size > 0
+      return mapping.fail(context + ".json requires a direct complex member without another conversion or key policy.")
     end
-    field.boolToInt = true
+    if !dataParseJsonModel(mapping, entity, field)
+      return false
+    end
+  end
+  if accessor
+    if !dataIdentifier(memberName) || entity.isKeyMember(memberName)
+      return mapping.fail(context + " accessor properties require a direct non-primary-key logical member name.")
+    end
+    field.getter = dataConversionFunction(mapping, node, "getter", typeName, [entity.typeName], context)
+    field.setter = dataConversionFunction(mapping, node, "setter", "Void", [entity.typeName, typeName], context)
+    field.schemaIdentity = entity.typeName + "." + memberName
+    if mapping.error != ""
+      return false
+    end
+  end
+  let family = dataTextScalarFamily(semanticIsOptional(typeName) ? semanticInnerType(typeName) : typeName)
+
+  if family != "" && conversion.isMissing()
+    field.conversionStorageType = dataScalarName(field.domain) + (field.optional ? "?" : "")
+    field.conversionEncode = "neri_data.cell" + (field.optional ? "Optional" : "") + family
+    field.conversionDecode = "neri_data.decode" + (field.optional ? "Nullable" : "") + family
+    field.conversionInitial = "neri_data.initial" + family if !field.optional
+  end
+  if !conversion.isMissing()
+    if customConversion
+      if !dataParseValueConversion(mapping, field, conversion, context + ".conversion")
+        return false
+      end
+    else if !conversion.isString() || conversion.scalarText() != "boolToInt" || dataScalarName(field.domain) != "Bool"
+      return mapping.fail(context + ".conversion supports 'boolToInt' on Bool or Bool? fields.")
+    else
+      field.boolToInt = true
+    end
+  end
+  if field.optionalParents.size > 0 && customConversion
+    return mapping.fail(context + ".conversion on optional complex leaves requires a nullable model field outside the optional complex path.")
   end
   if !dataParseDefault(mapping, field, node.get("default"), context)
+    return false
+  end
+  if !dataParseFieldSqlFacets(mapping, entity, field, node, context)
     return false
   end
   if entity.isKeyMember(memberName) && field.defaultCode != ""
@@ -618,6 +693,12 @@ def dataParseField(mapping: DataMapping, entity: DataEntity, node: LspJson, inde
   let generation = node.get("valueGeneration")
 
   if !generation.isMissing()
+    if accessor
+      return mapping.fail(context + ".valueGeneration requires a declared scalar field.")
+    end
+    if field.conversionEncode != ""
+      return mapping.fail(context + ".valueGeneration requires a built-in scalar readback codec.")
+    end
     if entity.keyless
       return mapping.fail(context + ".valueGeneration is not allowed on a keyless query source.")
     end
@@ -633,7 +714,7 @@ def dataParseField(mapping: DataMapping, entity: DataEntity, node: LspJson, inde
   field.symbol = symbol
   let semantic = mapping.semantic
 
-  field.declaration = dataDeclaration(semantic, "field:" + symbol.owner + "." + symbol.name) if semantic != null
+  field.declaration = dataDeclaration(semantic, "field:" + symbol.owner + "." + symbol.name) if semantic != null && symbol != null
   field.origin = dataOrigin(mapping, field.declaration)
   entity.addField(field)
   return true
@@ -642,7 +723,12 @@ end
 def dataParseIndex(mapping: DataMapping, entity: DataEntity, node: LspJson, index: Int): Bool
   let context = "entities[" + entity.typeName + "].indexes[" + (index as String) + "]"
 
-  if !dataObject(mapping, node, context, ["name", "members", "unique"])
+  if !dataObject(
+    mapping,
+    node,
+    context,
+    ["name", "members", "unique", "descending", "expressions", "include", "predicate"]
+  )
     return false
   end
   let name = dataString(mapping, node, "name", context)
@@ -686,8 +772,8 @@ def dataParseIndex(mapping: DataMapping, entity: DataEntity, node: LspJson, inde
     definition.fields.add(identity)
     member = member.next
   end
-  if definition.fields.size == 0
-    return mapping.fail(context + ".members must contain at least one mapped member.")
+  if !dataParseIndexFacets(mapping, entity, definition, node, context)
+    return false
   end
   entity.addIndex(definition)
   return true
@@ -739,6 +825,9 @@ def dataParseEntity(mapping: DataMapping, node: LspJson, index: Int): Bool
       "set",
       "table",
       "view",
+      "readView",
+      "snapshotEqual",
+      "owned",
       "keyless",
       "queryFilter",
       "queryFilters",
@@ -769,13 +858,19 @@ def dataParseEntity(mapping: DataMapping, node: LspJson, index: Int): Bool
   let view = node.get("view")
 
   if !view.isMissing()
-    if !entity.keyless || !node.get("table").isMissing()
-      return mapping.fail(context + ".view requires keyless: true and replaces table.")
+    if !node.get("table").isMissing()
+      return mapping.fail(context + ".view replaces table.")
     end
     entity.view = true
     entity.tableName = dataString(mapping, node, "view", context)
   else
     entity.tableName = dataString(mapping, node, "table", context)
+  end
+  if !node.get("readView").isMissing()
+    entity.readView = dataString(mapping, node, "readView", context)
+    if !dataSqlIdentifier(entity.readView) || entity.view || entity.keyless
+      return mapping.fail(context + ".readView requires a keyed table write target and an unquoted view identifier.")
+    end
   end
   if entity.keyless
     for option in ["key", "keyGeneration", "indexes", "alternateKeys", "concurrencyTokens"]
@@ -846,6 +941,22 @@ def dataParseEntity(mapping: DataMapping, node: LspJson, index: Int): Bool
     return mapping.fail("Mapped entity type '" + entity.typeName + "' must be public or internal.")
   end
   entity.symbol = symbol
+  if symbol.isAbstract && node.get("hierarchy").isMissing()
+    return mapping.fail(context + " abstract entity types require a mapped inheritance hierarchy.")
+  end
+  if !node.get("snapshotEqual").isMissing()
+    entity.snapshotEqual = dataConversionFunction(
+      mapping,
+      node,
+      "snapshotEqual",
+      "Bool",
+      ["neri_data.RawRow", "neri_data.RawRow"],
+      context
+    )
+    if mapping.error != ""
+      return false
+    end
+  end
   let queryFilter = node.get("queryFilter")
 
   if !queryFilter.isMissing()
@@ -914,6 +1025,12 @@ def dataParseEntity(mapping: DataMapping, node: LspJson, index: Int): Bool
   if entity.firstField == null
     return mapping.fail(context + ".columns must contain at least one mapping.")
   end
+  if !dataValidateOptionalComplex(mapping, entity)
+    return false
+  end
+  if !dataParseOwned(mapping, entity, node.get("owned"), context)
+    return false
+  end
   var keyIndex = 0
 
   while keyIndex < entity.keyMembers.size
@@ -977,6 +1094,9 @@ def dataParseEntity(mapping: DataMapping, node: LspJson, index: Int): Bool
       let definition = entity.lastIndex
 
       if definition != null
+        if definition.predicate != "" || definition.expressions.size > 0
+          return mapping.fail(context + ".alternateKeys requires an unconditional unique column tuple.")
+        end
         definition.unique = true
         definition.alternateKey = true
         var memberIndex = 0
@@ -1027,7 +1147,18 @@ def dataParseRelation(mapping: DataMapping, node: LspJson, index: Int): Bool
     mapping,
     node,
     context,
-    ["principal", "dependent", "key", "foreignKey", "collection", "reference", "deleteBehavior"]
+    [
+      "principal",
+      "dependent",
+      "key",
+      "foreignKey",
+      "collection",
+      "reference",
+      "deleteBehavior",
+      "databaseOnDelete",
+      "deferred",
+      "ownership"
+    ]
   )
     return false
   end
@@ -1053,7 +1184,36 @@ def dataParseRelation(mapping: DataMapping, node: LspJson, index: Int): Bool
   end
   relation.keyMember = relation.keyMembers.get(0)
   relation.foreignKeyMember = relation.foreignKeyMembers.get(0)
+  let ownership = node.get("ownership")
+
+  if !ownership.isMissing()
+    if !ownership.isBoolean()
+      return mapping.fail(context + ".ownership must be a JSON Boolean.")
+    end
+    relation.ownership = ownership.isTrue()
+    relation.deleteBehavior = "clientCascade" if relation.ownership
+    relation.databaseOnDelete = "CASCADE" if relation.ownership
+  end
+  let deferred = node.get("deferred")
+
+  if !deferred.isMissing()
+    if !deferred.isBoolean()
+      return mapping.fail(context + ".deferred must be a JSON Boolean.")
+    end
+    relation.deferred = deferred.isTrue()
+  end
   let deleteBehavior = node.get("deleteBehavior")
+  let databaseOnDelete = node.get("databaseOnDelete")
+
+  if !databaseOnDelete.isMissing()
+    if !databaseOnDelete.isString()
+      return mapping.fail(context + ".databaseOnDelete must be a JSON string.")
+    end
+    relation.databaseOnDelete = databaseOnDelete.scalarText()
+    if relation.databaseOnDelete != "NO ACTION" && relation.databaseOnDelete != "RESTRICT" && relation.databaseOnDelete != "CASCADE" && relation.databaseOnDelete != "SET NULL"
+      return mapping.fail(context + ".databaseOnDelete must be NO ACTION, RESTRICT, CASCADE, or SET NULL.")
+    end
+  end
 
   if !deleteBehavior.isMissing()
     if !deleteBehavior.matches(LspJsonType.String())
@@ -1069,11 +1229,17 @@ def dataParseRelation(mapping: DataMapping, node: LspJson, index: Int): Bool
   let collection = node.get("collection")
   let reference = node.get("reference")
 
-  if collection.isMissing() != reference.isMissing()
+  let declaredDependent = mapping.entity(relation.dependentType)
+  let keylessReference = declaredDependent != null && declaredDependent.keyless && collection.isMissing() && !reference.isMissing()
+
+  if collection.isMissing() != reference.isMissing() && !keylessReference
     return mapping.fail(context + " requires both collection and reference navigation members.")
   end
   if !collection.isMissing()
     relation.collectionMember = dataString(mapping, node, "collection", context)
+    relation.referenceMember = dataString(mapping, node, "reference", context)
+  end
+  if keylessReference
     relation.referenceMember = dataString(mapping, node, "reference", context)
   end
   if mapping.error != ""
@@ -1088,8 +1254,11 @@ def dataParseRelation(mapping: DataMapping, node: LspJson, index: Int): Bool
   if dependent == null
     return mapping.fail(context + ".dependent must name a mapped entity.")
   end
-  if principal.keyless || dependent.keyless
-    return mapping.fail(context + " relationships require keyed entity types.")
+  if principal.keyless || (dependent.keyless && !keylessReference)
+    return mapping.fail(context + " requires a keyed principal; keyless dependents support reference-only navigation.")
+  end
+  if dependent.keyless && (!deleteBehavior.isMissing() || !databaseOnDelete.isMissing() || relation.deferred)
+    return mapping.fail(context + " keyless references cannot configure tracked deletion or physical foreign keys.")
   end
   let key = principal.field(relation.keyMember)
   let foreignKey = dependent.field(relation.foreignKeyMember)
@@ -1126,10 +1295,19 @@ def dataParseRelation(mapping: DataMapping, node: LspJson, index: Int): Bool
     if dependentField.optional != foreignKey.optional
       return mapping.fail(context + " foreign key components must share nullability.")
     end
+    if relation.ownership && (dependentField.optional || !dependent.isKeyMember(dependentField.memberName))
+      return mapping.fail(context + ".ownership requires a non-null identifying foreign key contained in the dependent primary key.")
+    end
     if relation.deleteBehavior == "clientSetNull" && (!dependentField.optional || dependent.isKeyMember(dependentField.memberName))
       return mapping.fail(context + ".deleteBehavior 'clientSetNull' requires nullable, non-identifying foreign key components.")
     end
+    if relation.databaseOnDelete == "SET NULL" && (!dependentField.optional || dependent.isKeyMember(dependentField.memberName))
+      return mapping.fail(context + ".databaseOnDelete SET NULL requires nullable non-key foreign key components.")
+    end
     component = component + 1
+  end
+  if relation.ownership && (relation.collectionMember == "" || relation.deleteBehavior != "clientCascade" || dependent.keyless)
+    return mapping.fail(context + ".ownership requires declared collection/reference navigation and clientCascade deletion.")
   end
   if relation.collectionMember != ""
     if !dataIdentifier(relation.collectionMember) || !dataIdentifier(relation.referenceMember)
@@ -1166,6 +1344,21 @@ def dataParseRelation(mapping: DataMapping, node: LspJson, index: Int): Bool
       )
     end
   end
+  if keylessReference
+    let dependentSymbol = dependent.symbol
+
+    if dependentSymbol == null || !dataIdentifier(relation.referenceMember) || dependent.field(relation.referenceMember) != null
+      return mapping.fail(context + ".reference requires an unmapped public principal reference field.")
+    end
+    let referenceSymbol = dataFindField(mapping.semantic, dependentSymbol, relation.referenceMember)
+
+    if referenceSymbol == null || !referenceSymbol.access.isPublic() || referenceSymbol.typeName != relation.principalType + "?"
+      return mapping.fail(context + ".reference must name a public " + relation.principalType + "? field on the keyless dependent.")
+    end
+    if !dataMembersEqual(principal.keyMembers, relation.keyMembers)
+      return mapping.fail(context + " keyless reference loading requires the principal primary key.")
+    end
+  end
   var existing = mapping.firstRelation
 
   while existing != null
@@ -1175,7 +1368,7 @@ def dataParseRelation(mapping: DataMapping, node: LspJson, index: Int): Bool
     )
       return mapping.fail(context + " repeats an existing foreign-key tuple; each mapped tuple has one principal relation.")
     end
-    if relation.collectionMember != "" && ((existing.principalType == relation.principalType && existing.collectionMember == relation.collectionMember) || (existing.dependentType == relation.dependentType && existing.referenceMember == relation.referenceMember))
+    if (relation.collectionMember != "" && existing.principalType == relation.principalType && existing.collectionMember == relation.collectionMember) || (relation.referenceMember != "" && existing.dependentType == relation.dependentType && existing.referenceMember == relation.referenceMember)
       return mapping.fail(context + " reuses a navigation member from another relation.")
     end
     existing = existing.nextRelation
@@ -1453,6 +1646,10 @@ def dataLoadMapping(path: String): DataMapping
   if !dataParseMany(mapping, root.get("manyToMany"))
     return mapping
   end
+  if !dataValidateOwnership(mapping)
+    return mapping
+  end
+  dataNormalizeDateTimeOffsetKeys(mapping)
   return mapping
 end
 
@@ -1553,7 +1750,7 @@ def dataEntityHasKey(entity: DataEntity, members: StringBuffer): Bool
   var index = entity.firstIndex
 
   while index != null
-    if index.unique && index.fields.size == members.size
+    if index.unique && index.predicate == "" && index.expressions.size == 0 && index.fields.size == members.size
       var matches = true
 
       position = 0
@@ -1601,6 +1798,13 @@ end
 
 ## Allocates one distinct dependent-column anchor per physical foreign-key tuple.
 def dataAssignReferenceAnchors(mapping: DataMapping): Bool
+  var reset = mapping.firstRelation
+
+  while reset != null
+    reset.referenceAnchor = ""
+    reset.anchorVisit = 0
+    reset = reset.nextRelation
+  end
   var relation = mapping.firstRelation
   var visit = 0
 

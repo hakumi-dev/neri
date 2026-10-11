@@ -1,0 +1,205 @@
+use buffers
+namespace neri_data
+
+## Compares converted model values through the exact encoder registered in mapping.
+class ConvertedScalarExpression<T, V>
+  private selector: readonly quotation::Tree
+  private encode: fn(V): Cell
+  private conversionId: String?
+
+  def init(selector: readonly quotation::Tree, encode: fn(V): Cell, conversionId: String?): Void
+    this.selector = selector
+    this.encode = encode
+    this.conversionId = conversionId
+  end
+
+  public def equalTo(value: V): ComputedPredicate<T>
+    return this.compare(value, "=")
+  end
+
+  public def notEqualTo(value: V): ComputedPredicate<T>
+    return this.compare(value, "<>")
+  end
+
+  public def lessThan(value: V): ComputedPredicate<T>
+    return this.compare(value, "<")
+  end
+
+  public def lessThanOrEqual(value: V): ComputedPredicate<T>
+    return this.compare(value, "<=")
+  end
+
+  public def greaterThan(value: V): ComputedPredicate<T>
+    return this.compare(value, ">")
+  end
+
+  public def greaterThanOrEqual(value: V): ComputedPredicate<T>
+    return this.compare(value, ">=")
+  end
+
+  private def compare(value: V, operation: String): ComputedPredicate<T>
+    let captured = shadowCellCopy(this.encode(value))
+    let selector = this.selector
+    let conversionId = this.conversionId
+    let build: fn(
+      EntityMapping,
+      CompileState,
+      SqlDialect
+    ): ScalarSqlResult = fn(
+      mapping: EntityMapping,
+      state: CompileState,
+      dialect: SqlDialect
+    ): ScalarSqlResult do
+      match translateSelection(mapping, selector)
+        case SelectionResult.Failure(error)
+          return ScalarSqlResult.Failure(error)
+        case SelectionResult.Column(column)
+          if translationModelType(column.typeName()) != translationModelType(selector.resultType()) || translationOptional(column.typeName()) != translationOptional(selector.resultType()) || column.conversionId() != conversionId
+            return scalarSqlFailure("converted expression must use its mapped model type and encoder identity")
+          end
+          return convertedCellComparison(mapping, column, captured, operation, state, dialect)
+      end
+    end
+
+    return new ComputedPredicate<T>(build)
+  end
+end
+
+def convertedField<T, V>(
+  selector: quote fn(T): V,
+  encode: fn(V): Cell,
+  conversionId: String
+): ConvertedScalarExpression<T, V>
+  return new ConvertedScalarExpression<T, V>(selector.tree(), encode, conversionId)
+end
+
+def binaryField<T>(selector: quote fn(T): ByteBuffer): ConvertedScalarExpression<T, ByteBuffer>
+  let encode: fn(ByteBuffer): Cell = fn(value: ByteBuffer): Cell do
+    return Cell.Binary(copyBinary(value))
+  end
+
+  return new ConvertedScalarExpression<T, ByteBuffer>(selector.tree(), encode, null)
+end
+
+def optionalBinaryField<T>(selector: quote fn(T): ByteBuffer?): ConvertedScalarExpression<T, ByteBuffer?>
+  let encode: fn(ByteBuffer?): Cell = fn(value: ByteBuffer?): Cell do
+    return value == null ? Cell.Null() : Cell.Binary(copyBinary(value))
+  end
+
+  return new ConvertedScalarExpression<T, ByteBuffer?>(selector.tree(), encode, null)
+end
+
+## Compares a logical mapped property, including accessor-backed shadow properties.
+def mappedCellEqual<T>(name: String, value: Cell): ComputedPredicate<T>
+  let captured = shadowCellCopy(value)
+  let build: fn(EntityMapping, CompileState, SqlDialect): ScalarSqlResult = fn(
+    mapping: EntityMapping,
+    state: CompileState,
+    dialect: SqlDialect
+  ): ScalarSqlResult do
+    let column = mappedLogicalColumn(mapping, name)
+
+    if column == null
+      return scalarSqlFailure("mapped equality requires a declared logical property")
+    end
+    return convertedCellComparison(mapping, column, captured, "=", state, dialect)
+  end
+
+  return new ComputedPredicate<T>(build)
+end
+
+def convertedCellComparison(
+  mapping: EntityMapping,
+  column: readonly MappingColumn,
+  captured: Cell,
+  operation: String,
+  state: CompileState,
+  dialect: SqlDialect
+): ScalarSqlResult
+  if operation != "=" && operation != "<>" && operation != "<" && operation != "<=" && operation != ">" && operation != ">="
+    return scalarSqlFailure("converted comparison requires a supported comparison operator")
+  end
+  let nullable = translationOptional(column.typeName())
+  let declaredStorage = semanticTranslationInner(column.storageTypeName())
+  let decimalStorage = declaredStorage == "Decimal" || declaredStorage == "neri_data.Decimal"
+  let storage = declaredStorage == "buffers.ByteBuffer" ? "ByteBuffer" : (decimalStorage ? "String" : declaredStorage)
+  let ordered = operation != "=" && operation != "<>"
+
+  if ordered && (nullable || decimalStorage || (storage != "Int" && storage != "Float" && storage != "String"))
+    return scalarSqlFailure("ordered converted expressions require required Int, Float or TEXT storage")
+  end
+  let raw = quoted(mapping.table(), column.column())
+  var parameter: Parameter? = null
+  var actual = ""
+
+  match captured
+    case Cell.Null()
+      if !nullable || ordered
+        return scalarSqlFailure("converted NULL requires an optional equality expression")
+      end
+      return ScalarSqlResult.Value(new ScalarSql(raw + (operation == "=" ? " IS NULL" : " IS NOT NULL")))
+    case Cell.Bool(value)
+      actual = "Bool"
+      parameter = Parameter.Bool(value)
+    case Cell.Int(value)
+      actual = "Int"
+      parameter = Parameter.Int(value)
+    case Cell.Float(value)
+      if !dataFloatFinite(value)
+        return scalarSqlFailure("converted Float must be finite")
+      end
+      actual = "Float"
+      parameter = Parameter.Float(value)
+    case Cell.Text(value)
+      if decimalStorage && decimalCanonical(value) != value
+        return scalarSqlFailure("mapped Decimal storage requires canonical decimal TEXT")
+      end
+      actual = "String"
+      parameter = Parameter.Text(value)
+    case Cell.Binary(value)
+      actual = "ByteBuffer"
+      parameter = Parameter.Binary(copyBinary(value))
+  end
+  if actual != storage || parameter == null
+    return scalarSqlFailure("converted encoder result must match mapped scalar storage")
+  end
+  state.bind(parameter)
+  let prefix = mappingComparisonPrefix(column)
+  let left = comparisonStorageSql(raw, prefix)
+  let right = comparisonStorageSql(dialectPlaceholder(dialect, state.count), prefix)
+  let comparison = left + " " + operation + " " + right
+  let sql = !nullable ? comparison : (operation == "<>" ? "(" + raw + " IS NULL OR " + comparison + ")" : "(" + raw + " IS NOT NULL AND " + comparison + ")")
+
+  return ScalarSqlResult.Value(new ScalarSql(sql))
+end
+
+## Inherited direct properties retain their declaring type's mapping identity.
+def mappedLogicalColumn(mapping: EntityMapping, name: String): readonly MappingColumn?
+  let exact = mapping.find(mapping.entityType() + "." + name)
+
+  if exact != null
+    return exact
+  end
+  let suffix = "." + name
+  let suffixLength = host::stringByteLength(suffix)
+  var selected: readonly MappingColumn? = null
+  var index = 0
+
+  while index < mapping.count()
+    let column = mapping.columnAt(index)
+
+    if column != null && column.path().parent == null
+      let identity = column.identity()
+      let length = host::stringByteLength(identity)
+
+      if length > suffixLength && host::stringSlice(identity, length - suffixLength, suffixLength) == suffix
+        if selected != null
+          return null
+        end
+        selected = column
+      end
+    end
+    index = index + 1
+  end
+  return selected
+end

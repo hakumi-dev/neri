@@ -32,6 +32,86 @@ requires tracker metadata. Keyless mappings remain untracked. Buffered entity
 set operations preserve the left query's tracking policy. Streaming visitors
 materialize detached rows.
 
+## Converted fields and mapped properties
+
+`convertedField<T, V>(quote selector, encode: fn(V): Cell, conversionId)`
+compares a converted model value through its registered encoder. The selector's
+model type, storage type and encoder identity must agree with the mapping.
+`equalTo`, `notEqualTo` and ordered comparisons produce a `ComputedPredicate<T>`
+for `matchingComputed`. Equality compensates for SQL NULL. Ordered comparisons
+require nonnullable Int, Float or TEXT storage; Decimal uses its dedicated exact
+expression API. Primitive model fields with custom encoders require this explicit
+API for comparisons, so a String encoder cannot silently compare plain text
+against encoded text. Nullability remains part of the selector's model type.
+
+`binaryField(quote selector)` and `optionalBinaryField(quote selector)` expose
+the same equality operations for ByteBuffer fields. Creating a predicate copies
+the captured buffer, so later mutations cannot change the query parameter.
+
+`whereMappedCell(logicalName, value)` compares declared logical properties,
+including shadow and indexer properties. The value uses the property's storage
+type. Mapping validation resolves the logical name and checks the value; property
+names are never inserted into SQL directly.
+
+`executeUpdateMappedCell(logicalName, value)` writes one declared logical
+property from a validated storage cell. It rejects primary-key changes and uses
+the complete query pipeline to select the affected keys.
+
+`UpdateSet<T>` combines typed SQL assignments for `executeUpdateSet` and
+`executeUpdateSetAsync`. Use `setString`, `setOptionalString`, `setNumeric` and
+`setOptionalNumeric` with the corresponding expression builders. `setConverted`
+accepts a model value, its encoder and the exact mapped conversion identity;
+it captures the encoded value once and copies binary storage. Converted targets
+require this explicit encoder API. Assignments preserve SQL NULL and validate
+required values, numeric bounds and finite Float results.
+
+Set writes target one physical table. A TPT update may assign base-table fields
+while selecting keys through predicates on the joined read source. Assignments
+and computed values that depend on another physical table fail before SQL.
+Segmented inheritance deletion and TPC mappings that select a table per entity
+use tracked writes.
+
+## String and calendar expressions
+
+`stringField(quote selector)` and `optionalStringField(quote selector)` expose
+`contains`, `startsWith` and `endsWith` literal predicates through
+`matchingComputed`. Matching is case sensitive, and `%`, `_` and backslashes
+remain literal parameter text. String functions require unconverted String
+storage. `lower`, `upper`, `trim` and `substring(start, length)` compose before
+`stringShape` or `stringLengthShape`; nullable equivalents use
+`optionalStringShape` and `optionalStringLengthShape`. `coalesce(fallback)`
+turns an optional string expression into a required expression.
+
+Substring offsets count Unicode characters from zero. Start is bounded by
+2147483646 and length by 2147483647; negative arguments fail compilation.
+`trim` removes SQL spaces. Casing follows the provider: SQLite's built-in
+functions transform ASCII, while PostgreSQL uses its configured locale.
+
+`calendarField(quote selector)` reads native DateOnly, TimeOnly, UTC DateTime
+and the local calendar parts of DateTimeOffset using its stored offset.
+`utcCalendarField(quote selector)` reads DateTimeOffset's UTC instant;
+its stored offset remains available when materializing the entity.
+DateTimeOffset keys and foreign keys use normalized UTC storage and materialize
+with offset zero, so their local calendar parts equal their UTC parts.
+Available parts are year, month, day, hour, minute, second, millisecond, microsecond,
+nanosecond, microsecondsWithinSecond, ticksWithinSecond, dayOfWeek (Sunday is
+zero), and dayOfYear. Microsecond is the component within a millisecond (0..999);
+nanosecond is the remaining 100-nanosecond tick component (0..900).
+A date-only field
+rejects time parts, and a time-only field rejects date parts.
+`part.shape()` preserves SQL NULL, while `part.requiredShape()` requires a
+nonnull result. Part comparisons produce predicates for `matchingComputed`.
+These APIs require the native canonical storage mapping and encoder identity.
+
+`intField`, `floatField`, `optionalIntField` and `optionalFloatField` build
+typed numeric expressions. `toFloat()` uses the standard finite Int-to-double
+conversion, including its precision limit for large integers.
+`toIntTruncated()` truncates toward zero and rejects nonfinite or out-of-range
+values before conversion. Optional casts retain NULL; `coalesce(fallback)`
+returns a required numeric expression with a bound fallback. `shape()` selects
+the expression. Scalar quotations also translate typed conditional expressions
+to SQL CASE, preserving the order of query stages.
+
 ## Trusted composable SQL
 
 `query.fromSql(sql, parameters)` supplies an unfiltered root with a trusted SQL
@@ -39,6 +119,13 @@ subquery exposing its mapped physical columns. `sqlQuery<T>` creates a typed
 class query from an explicit decoder, optional mapping, and provider. `sqlScalar`
 creates a scalar relation with a certified scalar codec and a result column
 named `Value`:
+
+Entity mutation methods require an unfiltered mapped root. User `fromSql`
+sources reject those methods. Generated hierarchy and view mappings use
+`fromMappedSql` to retain their physical write metadata while reading a composed
+source. Writable mapped sources require the context tracker; read-only mappings
+continue to reject writes. Bulk operations validate the physical layout even
+when the query uses `asNoTracking()`.
 
 ```neri
 let values = sqlScalar(
@@ -82,10 +169,17 @@ provider, context, captured defaults, and tracking policy. It translates the
 target once to verify identical SQL and result/parameter shape. Subsequent reads
 reuse that translated plan. Bound context lifecycle checks remain active.
 
+`CompiledQuery.delegate` and `asyncDelegate` accept an explicit argument-to-parameter
+binder and return reusable functions. `CompiledQueryCache<C,T>` adds a bounded
+context-identity LRU around a query factory; each new context is checked once for
+the same SQL, result columns, parameter kinds and provider dialect. Values that
+change between calls belong in the binder. Eviction releases the cached context
+and its plan; `clear` releases all entries.
+
 ## Exact Decimal expressions
 
-`DecimalExpression<T>` provides exact required Decimal fields and constants,
-addition, subtraction, comparisons, and ordering:
+`DecimalExpression<T>` provides exact Decimal fields and constants, addition,
+subtraction, multiplication, explicit-scale division, comparisons, and ordering:
 
 ```neri
 let amount = decimalField(quote do |item: Item|: Decimal
@@ -108,6 +202,26 @@ explicit expressions execute in SQL.
 SQLite uses exact Decimal callbacks. PostgreSQL validates canonical TEXT,
 calculates through unconstrained NUMERIC, and returns canonical TEXT. Neither
 path converts through Float. Ordering uses a binary decimal sort key and
-preserves it through later query stages. Required Decimal expressions support
-addition and subtraction; optional Decimal arithmetic, multiplication, and
-division have no SQL expression contract.
+preserves it through later query stages. `multiply` is exact. `divideTruncated`
+requires a scale from 0 through 4096 and truncates toward zero; division by zero,
+invalid inputs and overlarge results fail. Local Decimal methods follow the
+same rules. `optionalDecimalField`, `optionalDecimalValue` and
+`selectOptionalDecimal` propagate NULL through arithmetic. Optional expressions
+also provide `isNull`, null-safe `equalTo`, and `coalesce` with a required value.
+
+`correlatedCount`, `correlatedAny` and `correlatedFirst` build typed scalar
+projection shapes from a composed relation and matching outer/inner key
+quotations. Source filters and ordering remain in SQL; a missing first row
+produces NULL. Captures remain bound parameters.
+
+Converted primitive collection fields support `stringCollection`,
+`intCollection`, `boolCollection` and their optional variants. `contains` produces
+a predicate for `matchingComputed`; `lengthShape` produces a nullable length.
+JSON TEXT fields support `jsonField(...).property(name).index(index)` with
+`textShape`, `intShape` and `boolShape`. Paths and values are parameters; missing
+paths and JSON null produce NULL, while malformed JSON or wrong scalar types
+fail. SQLite uses JSON functions and PostgreSQL uses strict JSONB paths.
+`query.select(codec, quote selector)` also projects a complete converted model
+value through an explicit `ScalarCodec`, including nullable JSON objects and
+enums. The selector must name the mapped member directly and the codec must
+declare its exact model type; computed quotations retain the scalar vocabulary.

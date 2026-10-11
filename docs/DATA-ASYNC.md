@@ -40,8 +40,10 @@ non-null, floating values are finite, and binary snapshots retain their bytes.
 same terminals with `AsyncNavigation<D,P>`. They collect roots, request related
 rows in batches of at most 50 keys, validate identities and local relationship
 state, and publish collection/reference state after all related reads succeed.
-Navigation loaders require the context's registered tracking query roots;
-detached and isolated no-tracking query modes do not load relationship graphs.
+Navigation loaders accept registered tracking roots and isolated detached graph
+scopes. `asNoTracking` on a collection or reference loader creates fresh identity
+resolvers for each materialization and publishes a detached graph. For a chained
+graph, reuse one `detachedGraph` query for every occurrence of the same entity set.
 Filtered collection loading retains the same per-principal ordering and
 pagination contract as synchronous loading. Root and related result sets are
 bounded by their navigation limits. Cancellation or a failed related read
@@ -56,11 +58,37 @@ subsequent ordinary queries can apply their registered fixup again.
 The `all` and `allAsync` terminals also checkpoint known navigation state before
 the root query, so root materialization fixup participates in failure recovery.
 
+Typed paths use `query.include(db.navigation.authors.books).thenInclude(
+db.navigation.books.publisher)` and support `allAsync` and `loadAsync`. Every
+stage shares the operation's deadline, cancellation token and publication
+journal. Additional `include` branches start from the original roots. A single
+collection loader offers `asSingleQuery` to issue one LEFT JOIN command, or
+`asSplitQuery` to batch related reads; both support synchronous and asynchronous
+terminals and per-principal filtered collection pagination.
+Chained and branched paths also offer `asSingleQuery`: typed CTE roles select each
+stage by its predecessor's keys, and one UNION ALL command returns all role rows.
+Every role is decoded before identity resolution and journalled publication.
+Collection, reference, many-to-many and keyed references from keyless roots
+contribute to this command. `asSplitQuery` returns the batched path strategy.
+
+Tracked collection includes merge coherent existing tracked members, including
+Added children, with returned rows. A filtered include can therefore contain
+previously tracked members outside its SQL filter, following EF's fixup behavior.
+Their references and foreign keys remain intact; loading alone does not infer
+relationship writes. Detached graph scopes start with their own empty identity
+map and return the filtered membership from that query.
+
+`includeKeylessReference` loads detached keyless rows and their keyed principal
+references with shared target identities inside that materialization. It adds
+no inverse collection or write tracking.
+
 `lazyCollectionAsync` and `lazyReferenceAsync` return owned `AsyncLoad<T>`
 operations. A loaded navigation completes from tracked memory. Unknown and
 partial navigation states use the asynchronous coordinator. While a lazy
 load is pending its state is `Loading`; failure, cancellation and abandonment
 restore the previous state. Ordinary entity field access remains local.
+`LazyField<T>.get` and `getAsync` provide a bound field-like accessor through
+`lazyCollectionField` and `lazyReferenceField`.
 
 Dispose owned operations with `using`. Closing an unfinished PostgreSQL
 operation aborts its connection. Before COMMIT is sent, this rolls back its

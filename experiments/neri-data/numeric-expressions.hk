@@ -1,0 +1,241 @@
+namespace neri_data
+
+## Typed numeric casts preserve SQL NULL and explicitly truncate Float to Int.
+class NumericExpression<T, V>
+  internal builder: fn(EntityMapping, CompileState, SqlDialect): ScalarSqlResult
+  internal codec: ScalarCodec<V>
+  internal parameter: fn(V): Parameter
+
+  def init(
+    builder: fn(EntityMapping, CompileState, SqlDialect): ScalarSqlResult,
+    codec: ScalarCodec<V>,
+    parameter: fn(V): Parameter
+  ): Void
+    this.builder = builder
+    this.codec = codec
+    this.parameter = parameter
+  end
+
+  public def shape(): RowShape<T, V>
+    return builtScalarShape<T, V>(this.codec, this.builder)
+  end
+
+  public def toFloat(): NumericExpression<T, Float>
+    return new NumericExpression<T, Float>(
+      numericCastBuilder(this.builder, this.codec.typeName(), "Float"),
+      floatScalar(),
+      numericFloatParameter
+    )
+  end
+
+  public def toIntTruncated(): NumericExpression<T, Int>
+    return new NumericExpression<T, Int>(
+      numericCastBuilder(this.builder, this.codec.typeName(), "Int"),
+      intScalar(),
+      numericIntParameter
+    )
+  end
+end
+
+class OptionalNumericExpression<T, V>
+  private builder: fn(EntityMapping, CompileState, SqlDialect): ScalarSqlResult
+  private codec: ScalarCodec<V?>
+  private required: ScalarCodec<V>
+  private parameter: fn(V): Parameter
+
+  def init(
+    builder: fn(EntityMapping, CompileState, SqlDialect): ScalarSqlResult,
+    codec: ScalarCodec<V?>,
+    required: ScalarCodec<V>,
+    parameter: fn(V): Parameter
+  ): Void
+    this.builder = builder
+    this.codec = codec
+    this.required = required
+    this.parameter = parameter
+  end
+
+  public def shape(): RowShape<T, V?>
+    return builtScalarShape<T, V?>(this.codec, this.builder)
+  end
+
+  internal def buildSql(mapping: EntityMapping, state: CompileState, dialect: SqlDialect): ScalarSqlResult
+    return this.builder(mapping, state, dialect)
+  end
+
+  public def coalesce(fallback: V): NumericExpression<T, V>
+    let source = this.builder
+    let captured = this.parameter(fallback)
+    let build: fn(
+      EntityMapping,
+      CompileState,
+      SqlDialect
+    ): ScalarSqlResult = fn(
+      mapping: EntityMapping,
+      state: CompileState,
+      dialect: SqlDialect
+    ): ScalarSqlResult do
+      match captured
+        case Parameter.Float(value)
+          if !dataFloatFinite(value)
+            return scalarSqlFailure("numeric coalesce fallback must be finite")
+          end
+        case Parameter.Int(value)
+        case Parameter.Bool(value)
+        case Parameter.Text(value)
+        case Parameter.Binary(value)
+      end
+      match source(mapping, state, dialect)
+        case ScalarSqlResult.Failure(error)
+          return ScalarSqlResult.Failure(error)
+        case ScalarSqlResult.Value(value)
+          state.bind(captured)
+          return scalarSqlValue(
+            "COALESCE(" + value.sql + ", " + dialectPlaceholder(dialect, state.count) + ")",
+            value.checkedScalars
+          )
+      end
+    end
+
+    return new NumericExpression<T, V>(build, this.required, this.parameter)
+  end
+
+  public def toFloat(): OptionalNumericExpression<T, Float>
+    return new OptionalNumericExpression<T, Float>(
+      numericCastBuilder(this.builder, this.required.typeName(), "Float"),
+      optionalFloatScalar(),
+      floatScalar(),
+      numericFloatParameter
+    )
+  end
+
+  public def toIntTruncated(): OptionalNumericExpression<T, Int>
+    return new OptionalNumericExpression<T, Int>(
+      numericCastBuilder(this.builder, this.required.typeName(), "Int"),
+      optionalIntScalar(),
+      intScalar(),
+      numericIntParameter
+    )
+  end
+end
+
+def numericIntParameter(value: Int): Parameter
+  return Parameter.Int(value)
+end
+
+def numericFloatParameter(value: Float): Parameter
+  return Parameter.Float(value)
+end
+
+def numericFieldBuilder(
+  field: readonly quotation::Tree,
+  type: String
+): fn(
+  EntityMapping,
+  CompileState,
+  SqlDialect
+): ScalarSqlResult
+  let build: fn(
+    EntityMapping,
+    CompileState,
+    SqlDialect
+  ): ScalarSqlResult = fn(
+    mapping: EntityMapping,
+    state: CompileState,
+    dialect: SqlDialect
+  ): ScalarSqlResult do
+    match translateSelection(mapping, field)
+      case SelectionResult.Failure(error)
+        return ScalarSqlResult.Failure(error)
+      case SelectionResult.Column(column)
+        if column.typeName() != type || column.storageTypeName() != type || column.conversionId() != null
+          return scalarSqlFailure("numeric field expression requires unconverted native numeric storage")
+        end
+        return scalarSqlValue(quoted(mapping.table(), column.column()))
+    end
+  end
+
+  return build
+end
+
+def intField<T>(field: quote fn(T): Int): NumericExpression<T, Int>
+  return new NumericExpression<T, Int>(numericFieldBuilder(field.tree(), "Int"), intScalar(), numericIntParameter)
+end
+
+def floatField<T>(field: quote fn(T): Float): NumericExpression<T, Float>
+  return new NumericExpression<T, Float>(
+    numericFieldBuilder(field.tree(), "Float"),
+    floatScalar(),
+    numericFloatParameter
+  )
+end
+
+def optionalIntField<T>(field: quote fn(T): Int?): OptionalNumericExpression<T, Int>
+  return new OptionalNumericExpression<T, Int>(
+    numericFieldBuilder(field.tree(), "Int?"),
+    optionalIntScalar(),
+    intScalar(),
+    numericIntParameter
+  )
+end
+
+def optionalFloatField<T>(field: quote fn(T): Float?): OptionalNumericExpression<T, Float>
+  return new OptionalNumericExpression<T, Float>(
+    numericFieldBuilder(field.tree(), "Float?"),
+    optionalFloatScalar(),
+    floatScalar(),
+    numericFloatParameter
+  )
+end
+
+def numericCastBuilder(
+  source: fn(EntityMapping, CompileState, SqlDialect): ScalarSqlResult,
+  type: String,
+  target: String
+): fn(
+  EntityMapping,
+  CompileState,
+  SqlDialect
+): ScalarSqlResult
+  let build: fn(
+    EntityMapping,
+    CompileState,
+    SqlDialect
+  ): ScalarSqlResult = fn(
+    mapping: EntityMapping,
+    state: CompileState,
+    dialect: SqlDialect
+  ): ScalarSqlResult do
+    if (type != "Int" && type != "Float") || (target != "Int" && target != "Float")
+      return scalarSqlFailure("numeric cast requires native Int or Float operands")
+    end
+    match source(mapping, state, dialect)
+      case ScalarSqlResult.Failure(error)
+        return ScalarSqlResult.Failure(error)
+      case ScalarSqlResult.Value(value)
+        let input = "\"__neri_numeric_cast\".\"value\""
+        var conversion = "CAST(" + input + " AS " + (target == "Float" ? "DOUBLE PRECISION" : "BIGINT") + ")"
+
+        if type == "Float"
+          let range = target == "Int" ? input + " >= -9223372036854775808.0 AND " + input + " < 9223372036854775808.0" : input + " >= -1.7976931348623157e308 AND " + input + " <= 1.7976931348623157e308"
+          var invalid = "json_extract('invalid numeric cast', '$')"
+
+          match dialect
+            case SqlDialect.QuestionMark()
+            case SqlDialect.PostgreSql()
+              invalid = "CAST(CAST(" + input + " AS TEXT) || ' invalid numeric cast' AS " + (target == "Float" ? "DOUBLE PRECISION" : "BIGINT") + ")"
+              if target == "Int"
+                conversion = "CAST(trunc(" + input + ") AS BIGINT)"
+              end
+          end
+          conversion = "CASE WHEN " + input + " IS NULL THEN NULL WHEN " + range + " THEN " + conversion + " ELSE " + invalid + " END"
+        end
+        return scalarSqlValue(
+          "(SELECT " + conversion + " FROM (SELECT " + value.sql + " AS \"value\") AS \"__neri_numeric_cast\")",
+          type == "Float" || value.checkedScalars
+        )
+    end
+  end
+
+  return build
+end

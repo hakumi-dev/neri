@@ -1,0 +1,377 @@
+use host
+use quotation
+namespace neri_data
+
+## Portable string functions use character offsets and propagate SQL NULL.
+class StringExpression<T>
+  private builder: fn(EntityMapping, CompileState, SqlDialect): ScalarSqlResult
+  private size: Int
+
+  def init(builder: fn(EntityMapping, CompileState, SqlDialect): ScalarSqlResult, size: Int = 1): Void
+    this.builder = builder
+    this.size = size
+  end
+
+  internal readonly def expressionSize(): Int
+    return this.size
+  end
+
+  internal def buildSql(mapping: EntityMapping, state: CompileState, dialect: SqlDialect): ScalarSqlResult
+    if this.size > 128
+      return scalarSqlFailure("string expression exceeds 128 nodes")
+    end
+    return this.builder(mapping, state, dialect)
+  end
+
+  public def lower(): StringExpression<T>
+    return stringFunction(this, "lower")
+  end
+
+  public def upper(): StringExpression<T>
+    return stringFunction(this, "upper")
+  end
+
+  public def trim(): StringExpression<T>
+    return stringFunction(this, "trim")
+  end
+
+  ## Start is zero based; length is a nonnegative character count.
+  public def substring(start: Int, length: Int): StringExpression<T>
+    return stringFunction(this, "substring", start, length)
+  end
+
+  public def contains(literal: String): ComputedPredicate<T>
+    return stringLiteralPredicate(this, literal, 0)
+  end
+
+  public def startsWith(literal: String): ComputedPredicate<T>
+    return stringLiteralPredicate(this, literal, 1)
+  end
+
+  public def endsWith(literal: String): ComputedPredicate<T>
+    return stringLiteralPredicate(this, literal, 2)
+  end
+end
+
+class OptionalStringExpression<T>
+  private value: StringExpression<T>
+
+  def init(value: StringExpression<T>): Void
+    this.value = value
+  end
+
+  internal def expression(): StringExpression<T>
+    return this.value
+  end
+
+  public def coalesce(fallback: String): StringExpression<T>
+    let source = this.value
+    let build: fn(
+      EntityMapping,
+      CompileState,
+      SqlDialect
+    ): ScalarSqlResult = fn(
+      mapping: EntityMapping,
+      state: CompileState,
+      dialect: SqlDialect
+    ): ScalarSqlResult do
+      match source.buildSql(mapping, state, dialect)
+        case ScalarSqlResult.Failure(error)
+          return ScalarSqlResult.Failure(error)
+        case ScalarSqlResult.Value(value)
+          state.bind(Parameter.Text(fallback))
+          return ScalarSqlResult.Value(new ScalarSql(
+              "COALESCE(" + value.sql + ", CAST(" + dialectPlaceholder(dialect, state.count) + " AS TEXT))",
+              true
+            ))
+      end
+    end
+
+    return new StringExpression<T>(build, source.expressionSize() >= 128 ? 129 : source.expressionSize() + 1)
+  end
+
+  public def lower(): OptionalStringExpression<T>
+    return new OptionalStringExpression<T>(this.value.lower())
+  end
+
+  public def upper(): OptionalStringExpression<T>
+    return new OptionalStringExpression<T>(this.value.upper())
+  end
+
+  public def trim(): OptionalStringExpression<T>
+    return new OptionalStringExpression<T>(this.value.trim())
+  end
+
+  public def substring(start: Int, length: Int): OptionalStringExpression<T>
+    return new OptionalStringExpression<T>(this.value.substring(start, length))
+  end
+
+  public def contains(literal: String): ComputedPredicate<T>
+    return this.value.contains(literal)
+  end
+
+  public def startsWith(literal: String): ComputedPredicate<T>
+    return this.value.startsWith(literal)
+  end
+
+  public def endsWith(literal: String): ComputedPredicate<T>
+    return this.value.endsWith(literal)
+  end
+end
+
+def stringFieldExpression<T>(field: readonly quotation::Tree, optional: Bool): StringExpression<T>
+  let build: fn(
+    EntityMapping,
+    CompileState,
+    SqlDialect
+  ): ScalarSqlResult = fn(
+    mapping: EntityMapping,
+    state: CompileState,
+    dialect: SqlDialect
+  ): ScalarSqlResult do
+    match translateSelection(mapping, field)
+      case SelectionResult.Failure(error)
+        return ScalarSqlResult.Failure(error)
+      case SelectionResult.Column(column)
+        let expected = optional ? "String?" : "String"
+
+        if column.typeName() != expected || column.storageTypeName() != expected || column.conversionId() != null
+          return scalarSqlFailure("string field requires a " + expected + " mapping")
+        end
+        return ScalarSqlResult.Value(new ScalarSql(quoted(mapping.table(), column.column()), true))
+    end
+  end
+
+  return new StringExpression<T>(build)
+end
+
+def stringField<T>(field: quote fn(T): String): StringExpression<T>
+  return stringFieldExpression<T>(field.tree(), false)
+end
+
+def optionalStringField<T>(field: quote fn(T): String?): OptionalStringExpression<T>
+  return new OptionalStringExpression<T>(stringFieldExpression<T>(field.tree(), true))
+end
+
+def stringValueExpression<T>(value: String?): StringExpression<T>
+  let build: fn(
+    EntityMapping,
+    CompileState,
+    SqlDialect
+  ): ScalarSqlResult = fn(
+    mapping: EntityMapping,
+    state: CompileState,
+    dialect: SqlDialect
+  ): ScalarSqlResult do
+    if value == null
+      return ScalarSqlResult.Value(new ScalarSql("CAST(NULL AS TEXT)", true))
+    end
+    state.bind(Parameter.Text(value))
+    let marker = dialectPlaceholder(dialect, state.count)
+
+    return ScalarSqlResult.Value(new ScalarSql("CAST(" + marker + " AS TEXT)", true))
+  end
+
+  return new StringExpression<T>(build)
+end
+
+def stringValue<T>(value: String): StringExpression<T>
+  return stringValueExpression<T>(value)
+end
+
+def optionalStringValue<T>(value: String?): OptionalStringExpression<T>
+  return new OptionalStringExpression<T>(stringValueExpression<T>(value))
+end
+
+def stringFunction<T>(
+  source: StringExpression<T>,
+  operation: String,
+  start: Int = 0,
+  length: Int = 0
+): StringExpression<T>
+  let build: fn(
+    EntityMapping,
+    CompileState,
+    SqlDialect
+  ): ScalarSqlResult = fn(
+    mapping: EntityMapping,
+    state: CompileState,
+    dialect: SqlDialect
+  ): ScalarSqlResult do
+    if operation != "lower" && operation != "upper" && operation != "trim" && operation != "substring"
+      return scalarSqlFailure("unsupported string function")
+    end
+    if operation == "substring" && (start < 0 || start > 2147483646 || length < 0 || length > 2147483647)
+      return scalarSqlFailure("substring requires a nonnegative start and length within the portable integer range")
+    end
+    match source.buildSql(mapping, state, dialect)
+      case ScalarSqlResult.Failure(error)
+        return ScalarSqlResult.Failure(error)
+      case ScalarSqlResult.Value(value)
+        if operation == "substring"
+          state.bind(Parameter.Int(start + 1))
+          var first = dialectPlaceholder(dialect, state.count)
+
+          state.bind(Parameter.Int(length))
+          var count = dialectPlaceholder(dialect, state.count)
+
+          match dialect
+            case SqlDialect.PostgreSql()
+              first = "CAST(" + first + " AS INTEGER)"
+              count = "CAST(" + count + " AS INTEGER)"
+            case SqlDialect.QuestionMark()
+          end
+          return ScalarSqlResult.Value(new ScalarSql(
+              "substr(" + value.sql + ", " + first + ", " + count + ")",
+              true
+            ))
+        end
+        return ScalarSqlResult.Value(new ScalarSql(operation + "(" + value.sql + ")", true))
+    end
+  end
+
+  return new StringExpression<T>(build, source.expressionSize() >= 128 ? 129 : source.expressionSize() + 1)
+end
+
+## Position and equality treat wildcard characters as bound literal text.
+def stringLiteralPredicate<T>(source: StringExpression<T>, literal: String, operation: Int): ComputedPredicate<T>
+  let build: fn(
+    EntityMapping,
+    CompileState,
+    SqlDialect
+  ): ScalarSqlResult = fn(
+    mapping: EntityMapping,
+    state: CompileState,
+    dialect: SqlDialect
+  ): ScalarSqlResult do
+    if operation < 0 || operation > 2
+      return scalarSqlFailure("unsupported string literal predicate")
+    end
+    var byte = 0
+
+    while byte < host::stringByteLength(literal)
+      if host::stringByteAt(literal, byte) as Int == 0
+        return scalarSqlFailure("string predicates require a literal without NUL")
+      end
+      byte = byte + 1
+    end
+    match source.buildSql(mapping, state, dialect)
+      case ScalarSqlResult.Failure(error)
+        return ScalarSqlResult.Failure(error)
+      case ScalarSqlResult.Value(value)
+        state.bind(Parameter.Text(literal))
+        let marker = "CAST(" + dialectPlaceholder(dialect, state.count) + " AS TEXT)"
+        var position = ""
+        var collation = ""
+
+        match dialect
+          case SqlDialect.QuestionMark()
+            position = "instr(" + value.sql + ", " + marker + ")"
+            collation = " COLLATE BINARY"
+          case SqlDialect.PostgreSql()
+            position = "strpos(" + value.sql + ", " + marker + ")"
+            collation = " COLLATE \"C\""
+        end
+        if operation == 0
+          return ScalarSqlResult.Value(new ScalarSql("(" + position + " > 0)", true))
+        end
+        if operation == 1
+          return ScalarSqlResult.Value(new ScalarSql("(" + position + " = 1)", true))
+        end
+        let text = "\"__neri_string_suffix\".\"value\""
+        let suffix = "\"__neri_string_suffix\".\"literal\""
+
+        return ScalarSqlResult.Value(new ScalarSql(
+            "(SELECT CASE WHEN length(" + suffix + ") = 0 THEN " + text + " IS NOT NULL ELSE substr(" + text + ", length(" + text + ") - length(" + suffix + ") + 1)" + collation + " = " + suffix + collation + " END FROM (SELECT " + value.sql + " AS \"value\", " + marker + " AS \"literal\") AS \"__neri_string_suffix\")",
+            true
+          ))
+    end
+  end
+
+  return new ComputedPredicate<T>(build)
+end
+
+def stringScalarShape<T, R>(
+  expression: StringExpression<T>,
+  kind: ResultColumnKind,
+  nullable: Bool,
+  scalarType: String,
+  decoder: fn(RawRow, String): DecodeResult<R>,
+  length: Bool = false
+): RowShape<T, R>
+  let build: fn(
+    EntityMapping,
+    Int,
+    CompileState,
+    SqlDialect,
+    String?
+  ): ShapeCompileResult<R> = fn(
+    mapping: EntityMapping,
+    offset: Int,
+    state: CompileState,
+    dialect: SqlDialect,
+    presence: String?
+  ): ShapeCompileResult<R> do
+    match expression.buildSql(mapping, state, dialect)
+      case ScalarSqlResult.Failure(error)
+        return ShapeCompileResult<R>.Failure(error)
+      case ScalarSqlResult.Value(value)
+        let alias = "__neri_shape_" + (offset as String)
+        let columns = new ResultColumns([new ResultColumn(alias, kind, nullable)])
+        let prepare: fn(RawRow): ShapePrepareResult<R> = fn(row: RawRow): ShapePrepareResult<R> do
+          match decoder(row, alias)
+            case DecodeResult.Failure(error)
+              return ShapePrepareResult<R>.Failure(error)
+            case DecodeResult.Value(decoded)
+              let make: fn(): R = fn(): R do
+                return decoded
+              end
+
+              return ShapePrepareResult<R>.Ready(new ShapePrepared<R>(make))
+          end
+        end
+        let sql = length ? "length(" + value.sql + ")" : value.sql
+
+        return ShapeCompileResult<R>.Plan(new ShapePlan<R>(
+            sql + " AS \"" + alias + "\"",
+            columns,
+            1,
+            prepare,
+            true,
+            scalar: alias,
+            scalarType: scalarType
+          ))
+    end
+  end
+
+  return new RowShape<T, R>(build)
+end
+
+def stringShape<T>(expression: StringExpression<T>): RowShape<T, String>
+  return stringScalarShape<T, String>(expression, ResultColumnKind.Text(), false, "String", decodeString)
+end
+
+def optionalStringShape<T>(expression: OptionalStringExpression<T>): RowShape<T, String?>
+  return stringScalarShape<T, String?>(
+    expression.expression(),
+    ResultColumnKind.Text(),
+    true,
+    "String?",
+    decodeNullableString
+  )
+end
+
+def stringLengthShape<T>(expression: StringExpression<T>): RowShape<T, Int>
+  return stringScalarShape<T, Int>(expression, ResultColumnKind.Int(), false, "Int", decodeInt, true)
+end
+
+def optionalStringLengthShape<T>(expression: OptionalStringExpression<T>): RowShape<T, Int?>
+  return stringScalarShape<T, Int?>(
+    expression.expression(),
+    ResultColumnKind.Int(),
+    true,
+    "Int?",
+    decodeNullableInt,
+    true
+  )
+end

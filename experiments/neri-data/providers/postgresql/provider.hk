@@ -33,9 +33,71 @@ class PostgreSQLProvider: Provider
   private lastState: TransactionState = TransactionState.Invalid()
   private nextSavepoint: Int = 1
   private savepoints: PostgreSQLSavepoint?
+  private ownsHandle: Bool = true
+  private reconnectInfo: String?
 
   unsafe def init(connection: Void*): Void
     this.connection = connection
+  end
+
+  ## The caller retains the native connection and exclusively owns its lifetime.
+  public static unsafe def borrowNativeTransaction(connection: Void*): result::Result<PostgreSQLProvider, ProviderFailure>
+    if pgTransactionStatus(connection) != (2 as Int32)
+      return result::Result<PostgreSQLProvider, ProviderFailure>.Error(ProviderFailure.State("native PostgreSQL transaction must be idle and active"))
+    end
+    let provider = new PostgreSQLProvider(connection)
+
+    provider.ownsHandle = false
+    provider.activeLease = 1
+    provider.lastLease = 1
+    provider.nextLease = 2
+    provider.lastState = TransactionState.Active()
+    return result::Result<PostgreSQLProvider, ProviderFailure>.Ok(provider)
+  end
+
+  ## Reuses a borrowed wrapper after the native owner starts its next transaction.
+  public def enlistNativeTransaction(): TransactionOpenResult
+    if this.ownsHandle || this.busy || this.activeLease != 0 || this.nextLease <= 0 || this.nextLease == 9223372036854775807
+      return TransactionOpenResult.Failure(WriteFailure.Transaction("borrowed PostgreSQL transaction enrollment requires an idle wrapper"))
+    end
+    unsafe
+      let handle = this.connection
+
+      if handle == null || !(pgTransactionStatus(handle) == (2 as Int32))
+        return TransactionOpenResult.Failure(WriteFailure.Transaction("native PostgreSQL transaction must be idle and active"))
+      end
+    end
+    let lease = this.nextLease
+
+    this.nextLease = lease + 1
+    this.activeLease = lease
+    this.lastLease = lease
+    this.lastState = TransactionState.Active()
+    this.savepoints = null
+    return TransactionOpenResult.Begun(lease)
+  end
+
+  public readonly def nativeTransactionLease(): Int?
+    return this.activeLease == 0 ? null : this.activeLease
+  end
+
+  ## The external owner supplies its observed outcome after completing native control.
+  public def acknowledgeNativeTransaction(committed: Bool): WriteResult
+    if this.ownsHandle || this.busy || this.activeLease == 0
+      return WriteResult.Failure(WriteFailure.Transaction("no idle borrowed PostgreSQL transaction to acknowledge"))
+    end
+    unsafe
+      let connection = this.connection
+
+      if connection == null || pgTransactionStatus(connection) != (0 as Int32)
+        return WriteResult.Failure(WriteFailure.Transaction("native PostgreSQL transaction has not exited"))
+      end
+    end
+    this.lastLease = this.activeLease
+    this.activeLease = 0
+    this.savepoints = null
+    this.lastState = committed ? TransactionState.Committed() : TransactionState.RolledBack()
+    return WriteResult.Saved(0)
   end
 
   public static def open(
@@ -55,6 +117,7 @@ class PostgreSQLProvider: Provider
               return result::Result<PostgreSQLProvider, ProviderFailure>.Error(error)
             case PostgreSQLOpenPoll.Opened(provider)
               operation.close()
+              provider.reconnectInfo = conninfo
               return result::Result<PostgreSQLProvider, ProviderFailure>.Ok(provider)
             case PostgreSQLOpenPoll.Pending(socket, interest)
               pgWait(socket, interest)
@@ -62,6 +125,34 @@ class PostgreSQLProvider: Provider
         end
     end
     return result::Result<PostgreSQLProvider, ProviderFailure>.Error(ProviderFailure.State("PostgreSQL connect did not complete"))
+  end
+
+  ## Replaces the physical connection while preserving this provider's identity.
+  public def reconnectAfterRollback(): WriteFailure?
+    let info = this.reconnectInfo
+
+    if !this.ownsHandle || this.busy || this.activeLease != 0 || info == null
+      return WriteFailure.Transaction("PostgreSQL reconnect requires an idle owned connection with connection information")
+    end
+    match PostgreSQLProvider.open(info)
+      case result::Result.Error(error)
+        return WriteFailure.Provider(error)
+      case result::Result.Ok(replacement)
+        unsafe
+          let old = this.connection
+
+          if old != null
+            pgFinish(old)
+          end
+          this.connection = replacement.connection
+          replacement.connection = null
+          replacement.opened = false
+        end
+        this.opened = true
+        this.savepoints = null
+        return null
+    end
+    return WriteFailure.Transaction("PostgreSQL reconnect did not finish")
   end
 
   internal unsafe def nativeHandle(): Void*?
@@ -78,7 +169,7 @@ class PostgreSQLProvider: Provider
       let connection = this.connection
 
       if connection != null
-        pgFinish(connection)
+        pgFinish(connection) if this.ownsHandle
         this.connection = null
       end
     end
@@ -95,6 +186,9 @@ class PostgreSQLProvider: Provider
   public def closeFailure(): ProviderFailure?
     if this.busy
       return ProviderFailure.State("PostgreSQL close requires disposing the active operation first")
+    end
+    if !this.ownsHandle && this.activeLease != 0
+      return ProviderFailure.State("borrowed PostgreSQL transaction requires acknowledged completion before close")
     end
     if this.activeLease != 0
       let lease = this.activeLease
@@ -277,6 +371,17 @@ class PostgreSQLProvider: Provider
     action: AsyncTransactionAction,
     options: StreamOptions? = null
   ): AsyncControlStart
+    if !this.ownsHandle
+      match action
+        case AsyncTransactionAction.Begin()
+        case AsyncTransactionAction.Commit(lease)
+        case AsyncTransactionAction.Rollback(lease)
+          return AsyncControlStart.Failure(WriteFailure.Transaction("external PostgreSQL owner controls transaction completion"))
+        case AsyncTransactionAction.Savepoint(lease)
+        case AsyncTransactionAction.RollbackTo(lease, id)
+        case AsyncTransactionAction.Release(lease, id)
+      end
+    end
     let unavailable = this.available()
 
     if unavailable != null
@@ -687,6 +792,9 @@ class PostgreSQLProvider: Provider
   end
 
   public override def beginTransaction(): TransactionOpenResult
+    if !this.ownsHandle
+      return TransactionOpenResult.Failure(WriteFailure.Transaction("external PostgreSQL owner controls transaction completion"))
+    end
     if this.activeLease != 0
       return TransactionOpenResult.Failure(WriteFailure.Transaction("PostgreSQL transaction already active"))
     end
@@ -723,13 +831,18 @@ class PostgreSQLProvider: Provider
         if connection == null || pgTransactionStatus(connection) == (4 as Int32)
           return TransactionState.Failed()
         end
-        return pgTransactionStatus(connection) == (3 as Int32) ? TransactionState.Failed() : TransactionState.Active()
+        let status = pgTransactionStatus(connection)
+
+        return status == (3 as Int32) || (!this.ownsHandle && status != (2 as Int32)) ? TransactionState.Failed() : TransactionState.Active()
       end
     end
     return lease == this.lastLease ? this.lastState : TransactionState.Invalid()
   end
 
   public override def commitTransaction(lease: Int): WriteResult
+    if !this.ownsHandle
+      return WriteResult.Failure(WriteFailure.Transaction("external PostgreSQL owner controls transaction completion"))
+    end
     if lease != this.activeLease || lease == 0
       return WriteResult.Failure(WriteFailure.Transaction("PostgreSQL transaction lease is invalid"))
     end
@@ -761,6 +874,9 @@ class PostgreSQLProvider: Provider
   end
 
   public override def rollbackTransaction(lease: Int): WriteResult
+    if !this.ownsHandle
+      return WriteResult.Failure(WriteFailure.Transaction("external PostgreSQL owner controls transaction completion"))
+    end
     if lease != this.activeLease || lease == 0
       return WriteResult.Failure(WriteFailure.Transaction("PostgreSQL transaction lease is invalid"))
     end

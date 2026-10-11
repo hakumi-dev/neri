@@ -8,6 +8,14 @@ object identities and publish both skip collections. Existing inverse members ou
 the loaded root selection remain present. All queries must use the same tracked
 context and provider. Limits follow ordinary navigation batching.
 
+Generated contexts register `trackCollectionChanges` and materialization fixup.
+Independently reading tracked endpoints and active join rows discovers the same
+skip relationships through their mapped key tuples and fills both arrays. A
+discovered pair is published once, so rereading an endpoint preserves a pending
+collection removal. Fixup leaves navigation loading states unchanged and ignores
+deleted joins or endpoints. Manual descriptors register this behavior by calling
+`trackCollectionChanges(lefts, joins, rights)` once during context construction.
+
 `allAsync` returns an owned `AsyncLoad<L>` with the same traversal. Its operation
 shares one deadline and cancellation token across both stages. A navigation journal
 reverses completed stage publications if a subsequent read fails, is cancelled or is
@@ -34,6 +42,14 @@ atomically. It does not synthesize distinct temporary composite join identities.
 
 `unlink(joins, left, right)` requires the complete loaded left join collection. It
 validates tracked joins before scheduling their removal and updating both collections.
-Neither method interprets arbitrary application edits to collection arrays. Ordinary
-tracked saves persist the enrolled joins. Implicit join class synthesis and automatic
-collection-difference tracking remain separate capabilities.
+Ordinary tracked saves persist the enrolled joins. Generated descriptors register
+`trackCollectionChanges`, which compares both ordinary skip arrays with tracked
+join membership before saving and calls `link` or `unlink` for each changed pair.
+Editing either side updates both inverses. Removal requires a complete loaded
+left join collection; inconsistent tracked endpoints fail before writes.
+The save journal restores navigation publication and tracker enrollment on a
+detector failure. Manually constructed descriptors can register the same hook.
+
+A many-to-many mapping may supply an explicit join entity, or omit it and supply
+`joinTable` so the generator creates an internal join entity and typed navigation
+descriptors. Implicit joins use the same tracking and write graph contracts.

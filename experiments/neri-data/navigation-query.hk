@@ -4,18 +4,22 @@ namespace neri_data
 class NavigationQuery<R, T>
   private root: Query<R>
   private runPath: fn(TypedRows<R>, NavigationJournal): QueryResult<T>
-  private checkPath: fn(): QueryFailure?
+  private checkPath: fn(Bool): QueryFailure?
   private depth: Int
   private currentTracker: EntityTracker<T>?
   private checkpointKnown: (fn(NavigationJournal): Void)?
+  private asyncPath: fn(TypedRows<R>, NavigationJournal, StreamOptions?): AsyncLoadDriver<T>
+  private singleFactory: (fn(): SingleNavigationGraph<R, T>)?
 
   def init(
     root: Query<R>,
     runPath: fn(TypedRows<R>, NavigationJournal): QueryResult<T>,
-    checkPath: fn(): QueryFailure?,
+    checkPath: fn(Bool): QueryFailure?,
     depth: Int,
     currentTracker: EntityTracker<T>?,
-    checkpoint: (fn(NavigationJournal): Void)? = null
+    checkpoint: (fn(NavigationJournal): Void)?,
+    asyncPath: fn(TypedRows<R>, NavigationJournal, StreamOptions?): AsyncLoadDriver<T>,
+    singleFactory: (fn(): SingleNavigationGraph<R, T>)? = null
   ): Void
     this.root = root
     this.runPath = runPath
@@ -23,6 +27,8 @@ class NavigationQuery<R, T>
     this.depth = depth
     this.currentTracker = currentTracker
     this.checkpointKnown = checkpoint
+    this.asyncPath = asyncPath
+    this.singleFactory = singleFactory
   end
 
   ## Continues from the entities selected by the current path.
@@ -33,6 +39,7 @@ class NavigationQuery<R, T>
     let depth = this.depth + 1
     let currentTracker = this.currentTracker
     let previousCheckpoint = this.checkpointKnown
+    let previousAsync = this.asyncPath
     let checkpoint: fn(NavigationJournal): Void = fn(journal: NavigationJournal): Void do
       if previousCheckpoint != null
         previousCheckpoint(journal)
@@ -53,16 +60,49 @@ class NavigationQuery<R, T>
           return step.run(current, journal)
       end
     end
-    let check: fn(): QueryFailure? = fn(): QueryFailure? do
-      let prior = previousCheck()
+    let check: fn(Bool): QueryFailure? = fn(asynchronous: Bool): QueryFailure? do
+      let prior = previousCheck(asynchronous)
 
       if prior != null
         return prior
       end
-      return navigationStepValid(root.provider(), root.changeOwner(), currentTracker, step)
+      return navigationStepValid(root.provider(), root.changeOwner(), currentTracker, step, asynchronous)
     end
 
-    return new NavigationQuery<R, N>(root, run, check, depth, step.targetTracker(), checkpoint)
+    let runAsync: fn(
+      TypedRows<R>,
+      NavigationJournal,
+      StreamOptions?
+    ): AsyncLoadDriver<N> = fn(
+      rows: TypedRows<R>,
+      journal: NavigationJournal,
+      options: StreamOptions?
+    ): AsyncLoadDriver<N> do
+      let next: fn(TypedRows<T>): AsyncLoadDriver<N> = fn(current: TypedRows<T>): AsyncLoadDriver<N> do
+        return step.runAsync(current, journal, options)
+      end
+
+      return new AsyncThenLoad<T, N>(previousAsync(rows, journal, options), next)
+    end
+
+    let previousSingle = this.singleFactory
+    let single: fn(): SingleNavigationGraph<R, N> = fn(): SingleNavigationGraph<R, N> do
+      if previousSingle == null
+        let base = singleNavigationRoot(root)
+
+        base.scope.failure = QueryFailure.UnsupportedCapability("previous navigation path has no single SQL contribution")
+        return new SingleNavigationGraph<R, N>(base.scope, base.roots, new SingleNavigationRows<N>(1))
+      end
+      let previous = previousSingle()
+
+      return new SingleNavigationGraph<R, N>(
+        previous.scope,
+        previous.roots,
+        step.contributeSingle(previous.scope, previous.current)
+      )
+    end
+
+    return new NavigationQuery<R, N>(root, run, check, depth, step.targetTracker(), checkpoint, runAsync, single)
   end
 
   ## Adds another branch from the original root entities.
@@ -72,6 +112,7 @@ class NavigationQuery<R, T>
     let root = this.root
     let depth = this.depth + 1
     let previousCheckpoint = this.checkpointKnown
+    let previousAsync = this.asyncPath
     let checkpoint: fn(NavigationJournal): Void = fn(journal: NavigationJournal): Void do
       if previousCheckpoint != null
         previousCheckpoint(journal)
@@ -92,16 +133,94 @@ class NavigationQuery<R, T>
           return step.run(rows, journal)
       end
     end
-    let check: fn(): QueryFailure? = fn(): QueryFailure? do
-      let prior = previousCheck()
+    let check: fn(Bool): QueryFailure? = fn(asynchronous: Bool): QueryFailure? do
+      let prior = previousCheck(asynchronous)
 
       if prior != null
         return prior
       end
-      return navigationStepValid(root.provider(), root.changeOwner(), root.rowTracker(), step)
+      return navigationStepValid(root.provider(), root.changeOwner(), root.rowTracker(), step, asynchronous)
     end
 
-    return new NavigationQuery<R, N>(root, run, check, depth, step.targetTracker(), checkpoint)
+    let runAsync: fn(
+      TypedRows<R>,
+      NavigationJournal,
+      StreamOptions?
+    ): AsyncLoadDriver<N> = fn(
+      rows: TypedRows<R>,
+      journal: NavigationJournal,
+      options: StreamOptions?
+    ): AsyncLoadDriver<N> do
+      let next: fn(TypedRows<T>): AsyncLoadDriver<N> = fn(current: TypedRows<T>): AsyncLoadDriver<N> do
+        return step.runAsync(rows, journal, options)
+      end
+
+      return new AsyncThenLoad<T, N>(previousAsync(rows, journal, options), next)
+    end
+
+    let previousSingle = this.singleFactory
+    let single: fn(): SingleNavigationGraph<R, N> = fn(): SingleNavigationGraph<R, N> do
+      if previousSingle == null
+        let base = singleNavigationRoot(root)
+
+        base.scope.failure = QueryFailure.UnsupportedCapability("previous navigation path has no single SQL contribution")
+        return new SingleNavigationGraph<R, N>(base.scope, base.roots, new SingleNavigationRows<N>(1))
+      end
+      let previous = previousSingle()
+
+      return new SingleNavigationGraph<R, N>(
+        previous.scope,
+        previous.roots,
+        step.contributeSingle(previous.scope, previous.roots)
+      )
+    end
+
+    return new NavigationQuery<R, N>(root, run, check, depth, step.targetTracker(), checkpoint, runAsync, single)
+  end
+
+  public def allAsync(options: StreamOptions? = null): result::Result<AsyncLoad<R>, QueryFailure>
+    let invalid = this.validate(true)
+
+    if invalid != null
+      return result::Result<AsyncLoad<R>, QueryFailure>.Error(invalid)
+    end
+    let journal = new NavigationJournal()
+    let checkpoint = this.checkpointKnown
+
+    if checkpoint != null
+      checkpoint(journal)
+    end
+    match prepareQueryAsync<R>(this.root, options)
+      case AsyncQueryPreparation.Failure(error)
+        journal.rollback()
+        return result::Result<AsyncLoad<R>, QueryFailure>.Error(error)
+      case AsyncQueryPreparation.Ready(driver, plan, tracker)
+        let owned = new AsyncLoad<R>(new AsyncPathLoad<R, T>(
+            this.asyncPath,
+            journal,
+            options,
+            new AsyncBufferedRead<R>(driver, plan, tracker)
+          ))
+
+        return result::Result<AsyncLoad<R>, QueryFailure>.Ok(transfer owned)
+    end
+  end
+
+  public def loadAsync(rows: TypedRows<R>, options: StreamOptions? = null): result::Result<AsyncLoad<R>, QueryFailure>
+    let invalid = this.validate(true)
+
+    if invalid != null
+      return result::Result<AsyncLoad<R>, QueryFailure>.Error(invalid)
+    end
+    let journal = new NavigationJournal()
+    let checkpoint = this.checkpointKnown
+
+    if checkpoint != null
+      checkpoint(journal)
+    end
+    let owned = new AsyncLoad<R>(new AsyncPathLoad<R, T>(this.asyncPath, journal, options, rows: rows))
+
+    return result::Result<AsyncLoad<R>, QueryFailure>.Ok(transfer owned)
   end
 
   ## Executes the root query and all navigation steps as one mutation unit.
@@ -156,7 +275,7 @@ class NavigationQuery<R, T>
     end
   end
 
-  private def validate(): QueryFailure?
+  internal def validate(asynchronous: Bool = false): QueryFailure?
     if this.depth > 32
       return QueryFailure.UnsupportedCapability("navigation path exceeds 32 steps")
     end
@@ -165,7 +284,39 @@ class NavigationQuery<R, T>
     if rootFailure != null
       return rootFailure
     end
-    return this.checkPath()
+    return this.checkPath(asynchronous)
+  end
+
+  public def asSingleQuery(): SingleNavigationQuery<R, T>
+    return new SingleNavigationQuery<R, T>(this)
+  end
+
+  public def asSplitQuery(): NavigationQuery<R, T>
+    return this
+  end
+
+  internal def rootQuery(): Query<R>
+    return this.root
+  end
+
+  internal def buildSingleGraph(): SingleNavigationGraph<R, T>
+    let factory = this.singleFactory
+
+    if factory != null
+      return factory()
+    end
+    let base = singleNavigationRoot(this.root)
+
+    base.scope.failure = QueryFailure.UnsupportedCapability("navigation path has no single SQL contribution")
+    return new SingleNavigationGraph<R, T>(base.scope, base.roots, new SingleNavigationRows<T>(1))
+  end
+
+  internal def checkpointSingle(journal: NavigationJournal): Void
+    let checkpoint = this.checkpointKnown
+
+    if checkpoint != null
+      checkpoint(journal)
+    end
   end
 end
 
@@ -173,9 +324,10 @@ def navigationStepValid<A, B>(
   rootProvider: Provider?,
   rootOwner: ChangeContext?,
   expectedTracker: EntityTracker<A>?,
-  step: NavigationStep<A, B>
+  step: NavigationStep<A, B>,
+  asynchronous: Bool = false
 ): QueryFailure?
-  let invalid = step.validate()
+  let invalid = step.validate(asynchronous)
 
   if invalid != null
     return invalid
@@ -188,11 +340,14 @@ def navigationStepValid<A, B>(
   if rootProvider == null || stepProvider == null || !reference::same(rootProvider, stepProvider)
     return QueryFailure.Provider(ProviderFailure.State("navigation steps require the same provider"))
   end
-  if rootOwner == null || stepOwner == null || !reference::same(
-    rootOwner,
-    stepOwner
-  ) || !rootOwner.matchesProvider(rootProvider)
+  if !(rootOwner == null && stepOwner == null && !step.requiresSourceTracker) && (rootOwner == null || stepOwner == null || !reference::same(
+      rootOwner,
+      stepOwner
+    ) || !rootOwner.matchesProvider(rootProvider))
     return QueryFailure.Provider(ProviderFailure.State("navigation steps require the same change context and provider"))
+  end
+  if !step.requiresSourceTracker && expectedTracker == null && sourceTracker == null
+    return null
   end
   if expectedTracker == null || sourceTracker == null || targetTracker == null || !reference::same(
     expectedTracker,
@@ -213,13 +368,31 @@ def includePath<R, T>(root: Query<R>, step: NavigationStep<R, T>): NavigationQue
   ): QueryResult<T> do
     return step.run(rows, journal)
   end
-  let check: fn(): QueryFailure? = fn(): QueryFailure? do
-    return navigationStepValid(root.provider(), root.changeOwner(), root.rowTracker(), step)
+  let check: fn(Bool): QueryFailure? = fn(asynchronous: Bool): QueryFailure? do
+    return navigationStepValid(root.provider(), root.changeOwner(), root.rowTracker(), step, asynchronous)
   end
 
   let checkpoint: fn(NavigationJournal): Void = fn(journal: NavigationJournal): Void do
     step.checkpoint(journal)
   end
 
-  return new NavigationQuery<R, T>(root, run, check, 1, step.targetTracker(), checkpoint)
+  let runAsync: fn(
+    TypedRows<R>,
+    NavigationJournal,
+    StreamOptions?
+  ): AsyncLoadDriver<T> = fn(
+    rows: TypedRows<R>,
+    journal: NavigationJournal,
+    options: StreamOptions?
+  ): AsyncLoadDriver<T> do
+    return step.runAsync(rows, journal, options)
+  end
+
+  let single: fn(): SingleNavigationGraph<R, T> = fn(): SingleNavigationGraph<R, T> do
+    let base = singleNavigationRoot(root)
+
+    return new SingleNavigationGraph<R, T>(base.scope, base.roots, step.contributeSingle(base.scope, base.roots))
+  end
+
+  return new NavigationQuery<R, T>(root, run, check, 1, step.targetTracker(), checkpoint, runAsync, single)
 end

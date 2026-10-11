@@ -1,0 +1,306 @@
+use neri_data
+use test
+use console
+namespace neri_data_schema_contract
+
+def facetModel(evolved: Bool, postgres: Bool): SchemaModel
+  let computed = evolved ? "score + 2" : "score + 1"
+  let fields = [
+    new SchemaField("id", new SchemaColumn("id", SchemaType.Int(), primaryKey: true)),
+    new SchemaField(
+      "label",
+      new SchemaColumn(
+        "label",
+        SchemaType.Text(),
+        defaultSql: "'default'",
+        checkSql: evolved ? "length(label) < 200" : "length(label) < 100",
+        collation: postgres ? "C" : "NOCASE"
+      )
+    ),
+    new SchemaField("score", new SchemaColumn("score", SchemaType.Int(), defaultSql: "5")),
+    new SchemaField("computed", new SchemaColumn("computed", SchemaType.Int(), computedSql: computed))
+  ]
+  let include: String[] = postgres ? ["id"] : []
+  let index = new SchemaIndex(
+    "facet_expression",
+    [],
+    descending: [true],
+    expressions: ["lower(label)"],
+    include: include,
+    predicate: "score > 0"
+  )
+
+  return new SchemaModel([new SchemaTable(
+        "facets",
+        "facet_records",
+        fields,
+        [index],
+        [new SchemaSeed(["id"], [Cell.Int(1)], ["label", "score"], [Cell.Text("First"), Cell.Int(5)])]
+      )])
+end
+
+def rewriteModel(evolved: Bool): SchemaModel
+  let parentId = evolved ? 2 : 1
+  let parent = new SchemaTable(
+    "rewrite_parent",
+    "rewrite_parents",
+    [new SchemaField("id", new SchemaColumn("id", SchemaType.Int(), primaryKey: true))],
+    seeds: [new SchemaSeed(["id"], [Cell.Int(parentId)], [], [])]
+  )
+  let foreignColumn = evolved ? "owner_id" : "parent_id"
+  let fields = new TypedRows<SchemaField>()
+
+  fields.add(new SchemaField("id", new SchemaColumn("id", SchemaType.Int(), primaryKey: true)))
+  fields.add(new SchemaField(
+      "parent",
+      new SchemaColumn(
+        foreignColumn,
+        SchemaType.Int(),
+        reference: new SchemaReference("rewrite_parents", ["id"], [foreignColumn])
+      )
+    ))
+  if evolved
+    fields.add(new SchemaField("label", new SchemaColumn("label", SchemaType.Text(), defaultSql: "'new'")))
+  end
+  let seedFields: String[] = evolved ? ["parent", "label"] : ["parent"]
+  let seedValues: Cell[] = evolved ? [Cell.Int(parentId), Cell.Text("new")] : [Cell.Int(parentId)]
+  let child = new SchemaTable(
+    "rewrite_child",
+    "rewrite_children",
+    navigationArray(fields),
+    seeds: [new SchemaSeed(["id"], [Cell.Int(7)], seedFields, seedValues)]
+  )
+
+  return new SchemaModel([parent, child])
+end
+
+def cycleModel(): SchemaModel
+  let left = new SchemaTable("cycle_left", "cycle_left", [
+      new SchemaField("id", new SchemaColumn("id", SchemaType.Int(), primaryKey: true)),
+      new SchemaField(
+        "other",
+        new SchemaColumn(
+          "other_id",
+          SchemaType.Int(),
+          reference: new SchemaReference("cycle_right", ["id"], ["other_id"], deferred: true)
+        )
+      )
+    ], seeds: [new SchemaSeed(["id"], [Cell.Int(1)], ["other"], [Cell.Int(1)])])
+  let right = new SchemaTable("cycle_right", "cycle_right", [
+      new SchemaField("id", new SchemaColumn("id", SchemaType.Int(), primaryKey: true)),
+      new SchemaField(
+        "other",
+        new SchemaColumn(
+          "other_id",
+          SchemaType.Int(),
+          reference: new SchemaReference("cycle_left", ["id"], ["other_id"], deferred: true)
+        )
+      )
+    ], seeds: [new SchemaSeed(["id"], [Cell.Int(1)], ["other"], [Cell.Int(1)])])
+
+  return new SchemaModel([left, right])
+end
+
+def featurePlan(id: String, before: SchemaModel, after: SchemaModel): Migration
+  match diffSchema(id, before, after)
+    case SchemaDiffResult.Plan(plan)
+      return plan.migration()
+    case SchemaDiffResult.Failure(error)
+      match error
+        case MigrationFailure.Validation(message)
+          console::println(message)
+        case MigrationFailure.Unsupported(message)
+          console::println(message)
+        case MigrationFailure.Drift(message)
+          console::println(message)
+        case MigrationFailure.Provider(failure)
+          console::println(providerFailureMessage(failure))
+        case MigrationFailure.Cleanup(failure)
+      end
+
+      test::assertTrue(false)
+    case SchemaDiffResult.Unchanged()
+      test::assertTrue(false)
+  end
+  return new Migration("unreachable", [], [])
+end
+
+def featureApplied(result: MigrationResult, expected: Int): Void
+  match result
+    case MigrationResult.Applied(count)
+      test::assertEqual(count, expected)
+    case MigrationResult.Failure(error)
+      match error
+        case MigrationFailure.Validation(message)
+        case MigrationFailure.Unsupported(message)
+        case MigrationFailure.Drift(message)
+          console::println(message)
+        case MigrationFailure.Provider(error)
+          console::println(providerFailureMessage(error))
+        case MigrationFailure.Cleanup(error)
+      end
+
+      test::assertTrue(false)
+  end
+end
+
+def featureInt(provider: Provider, sql: String, expected: Int): Void
+  match provider.execute(new SqlPlan(
+      sql,
+      new ParameterValues(),
+      1,
+      new ResultColumns([new ResultColumn("value", ResultColumnKind.Int())])
+    ))
+    case ProviderResult.Rows(rows)
+      test::assertEqual(rows.Length, 1)
+      if rows.Length == 1
+        match decodeInt(rows[0], "value")
+          case DecodeResult.Value(value)
+            test::assertEqual(value, expected)
+          case DecodeResult.Failure(error)
+            test::assertTrue(false)
+        end
+      end
+    case ProviderResult.Failure(error)
+      console::println(providerFailureMessage(error))
+
+      test::assertTrue(false)
+  end
+end
+
+def verifySchemaFeatures(provider: Provider, migrate: fn(MigrationSet, String?): MigrationResult, postgres: Bool): Void
+  let empty = new SchemaModel([])
+  let initial = featurePlan("facet_initial", empty, facetModel(false, postgres))
+  let evolved = featurePlan("facet_evolved", facetModel(false, postgres), facetModel(true, postgres))
+  let catalog = new MigrationSet([initial, evolved])
+
+  featureApplied(migrate(catalog, "facet_initial"), 1)
+  featureInt(provider, "SELECT computed AS value FROM facet_records WHERE id=1", 6)
+  featureApplied(migrate(catalog, null), 1)
+  featureInt(provider, "SELECT computed AS value FROM facet_records WHERE id=1", 7)
+  featureApplied(migrate(catalog, "facet_initial"), 1)
+  featureInt(provider, "SELECT computed AS value FROM facet_records WHERE id=1", 6)
+  featureApplied(migrate(catalog, ""), 1)
+  let rewriteInitial = featurePlan("rewrite_initial", empty, rewriteModel(false))
+  let rewrite = featurePlan("rewrite_evolved", rewriteModel(false), rewriteModel(true))
+  let rewriteCatalog = new MigrationSet([rewriteInitial, rewrite])
+
+  featureApplied(migrate(rewriteCatalog, "rewrite_initial"), 1)
+  featureApplied(migrate(rewriteCatalog, null), 1)
+  featureInt(provider, "SELECT owner_id AS value FROM rewrite_children WHERE id=7", 2)
+  featureInt(provider, "SELECT count(*) AS value FROM rewrite_parents WHERE id=1", 0)
+  featureApplied(migrate(rewriteCatalog, "rewrite_initial"), 1)
+  featureInt(provider, "SELECT parent_id AS value FROM rewrite_children WHERE id=7", 1)
+  featureInt(provider, "SELECT count(*) AS value FROM rewrite_parents WHERE id=2", 0)
+  featureApplied(migrate(rewriteCatalog, ""), 1)
+  let cycle = featurePlan("cycle_initial", empty, cycleModel())
+  let cycleCatalog = new MigrationSet([cycle])
+
+  featureApplied(migrate(cycleCatalog, null), 1)
+  featureInt(provider, "SELECT other_id AS value FROM cycle_left WHERE id=1", 1)
+  featureInt(provider, "SELECT other_id AS value FROM cycle_right WHERE id=1", 1)
+  featureApplied(migrate(cycleCatalog, ""), 1)
+  if postgres
+    verifyDropConstraintCollision(provider, migrate)
+  end
+  verifyTrustedMigrationSql(provider, migrate, postgres)
+end
+
+def verifyDropConstraintCollision(provider: Provider, migrate: fn(MigrationSet, String?): MigrationResult): Void
+  let owned = "CREATE TABLE drop_collision_owned(id BIGINT PRIMARY KEY, parent_id BIGINT CONSTRAINT shared_deferral REFERENCES drop_collision_owned(id) DEFERRABLE INITIALLY DEFERRED)"
+  let surviving = "CREATE TABLE drop_collision_surviving(id BIGINT PRIMARY KEY, parent_id BIGINT CONSTRAINT shared_deferral REFERENCES drop_collision_surviving(id) DEFERRABLE INITIALLY IMMEDIATE)"
+  let initial = new Migration("drop_collision_initial", [SchemaOp.Sql(owned), SchemaOp.Sql(surviving)], [
+      SchemaOp.Sql("DROP TABLE drop_collision_owned"),
+      SchemaOp.Sql("DROP TABLE drop_collision_surviving")
+    ])
+  let attempted = new Migration(
+    "drop_collision_attempt",
+    [SchemaOp.DropTable("drop_collision_owned")],
+    [SchemaOp.Sql(owned)]
+  )
+  let catalog = new MigrationSet([initial, attempted])
+
+  featureApplied(migrate(catalog, "drop_collision_initial"), 1)
+  match migrate(catalog, null)
+    case MigrationResult.Applied(count)
+      test::assertTrue(false)
+    case MigrationResult.Failure(error)
+      match error
+        case MigrationFailure.Provider(failure)
+          test::assertTrue(providerFailureMessage(failure).contains("deferred DROP constraint name also belongs to a surviving table"))
+        case MigrationFailure.Validation(message)
+          test::assertTrue(false)
+        case MigrationFailure.Unsupported(message)
+          test::assertTrue(false)
+        case MigrationFailure.Drift(message)
+          test::assertTrue(false)
+        case MigrationFailure.Cleanup(failure)
+          test::assertTrue(false)
+      end
+  end
+  featureInt(provider, "SELECT count(*) AS value FROM drop_collision_owned", 0)
+  featureInt(provider, "SELECT count(*) AS value FROM drop_collision_surviving", 0)
+  featureApplied(migrate(catalog, ""), 1)
+end
+
+def verifyTrustedMigrationSql(
+  provider: Provider,
+  migrate: fn(MigrationSet, String?): MigrationResult,
+  postgres: Bool
+): Void
+  let initial = new Migration("trusted_initial", [
+      SchemaOp.CreateTable(
+        "trusted_records",
+        [new SchemaColumn("id", SchemaType.Int(), primaryKey: true), new SchemaColumn("value", SchemaType.Int())]
+      ),
+      SchemaOp.InsertData("trusted_records", ["id", "value"], [Cell.Int(1), Cell.Int(1)])
+    ], [SchemaOp.DropTable("trusted_records")])
+  let operations = new TypedRows<SchemaOp>()
+  let undo = new TypedRows<SchemaOp>()
+
+  if postgres
+    operations.add(SchemaOp.Sql("CREATE FUNCTION trusted_increment() RETURNS trigger LANGUAGE plpgsql AS $body$ BEGIN NEW.value := NEW.value + 1; RETURN NEW; END $body$"))
+    operations.add(SchemaOp.Sql("CREATE TRIGGER trusted_increment BEFORE UPDATE ON trusted_records FOR EACH ROW EXECUTE FUNCTION trusted_increment()"))
+    undo.add(SchemaOp.Sql("DROP TRIGGER trusted_increment ON trusted_records"))
+    undo.add(SchemaOp.Sql("DROP FUNCTION trusted_increment()"))
+  else
+    operations.add(SchemaOp.Sql("CREATE TRIGGER trusted_increment AFTER UPDATE OF value ON trusted_records WHEN NEW.value % 10 = 0 BEGIN UPDATE trusted_records SET value = NEW.value + 1 WHERE id = NEW.id; END"))
+    undo.add(SchemaOp.Sql("DROP TRIGGER trusted_increment"))
+  end
+  operations.add(SchemaOp.Sql("UPDATE trusted_records SET value = value * 10 WHERE id = 1"))
+  undo.add(SchemaOp.Sql("UPDATE trusted_records SET value = 1 WHERE id = 1"))
+  let transformed = new Migration("trusted_transform", navigationArray(operations), navigationArray(undo))
+  let failed = new Migration("trusted_fail", [
+      SchemaOp.Sql("UPDATE trusted_records SET value = value * 2 WHERE id = 1"),
+      SchemaOp.Sql("INSERT INTO trusted_records(id,value) VALUES(1,0)")
+    ], [SchemaOp.Sql("UPDATE trusted_records SET value = 11 WHERE id = 1")])
+  let catalog = new MigrationSet([initial, transformed, failed])
+
+  featureApplied(migrate(catalog, "trusted_transform"), 2)
+  featureInt(provider, "SELECT value AS value FROM trusted_records WHERE id=1", 11)
+  match migrate(catalog, null)
+    case MigrationResult.Applied(count)
+      test::assertTrue(false)
+    case MigrationResult.Failure(error)
+      test::assertTrue(true)
+  end
+  featureInt(provider, "SELECT value AS value FROM trusted_records WHERE id=1", 11)
+  featureApplied(migrate(catalog, "trusted_initial"), 1)
+  featureInt(provider, "SELECT value AS value FROM trusted_records WHERE id=1", 1)
+  featureApplied(migrate(catalog, ""), 1)
+
+  test::assertTrue(schemaTrustedSqlFailure("UPDATE trusted_records SET value = 3; COMMIT") != null)
+  test::assertTrue(schemaTrustedSqlFailure("/* prefix */ COMMIT") != null)
+  test::assertTrue(schemaTrustedSqlFailure(
+      "UPDATE trusted_records SET value = 3; /* outer /* inner */ COMMIT; */",
+      SqlDialect.QuestionMark()
+    ) != null)
+  test::assertTrue(schemaTrustedSqlFailure("ROLLBACK") != null)
+  test::assertTrue(schemaTrustedSqlFailure("UPDATE trusted_records SET value = ?") != null)
+  test::assertTrue(schemaTrustedSqlFailure("UPDATE trusted_records SET value = 3 /* COMMIT; ignored */") == null)
+  test::assertTrue(schemaTrustedSqlFailure("UPDATE trusted_records SET value = E'a\\\''; COMMIT; --'") != null)
+  test::assertTrue(schemaTrustedSqlFailure(
+      "UPDATE trusted_records SET value = $body$; COMMIT; -- $body$",
+      SqlDialect.QuestionMark()
+    ) != null)
+end

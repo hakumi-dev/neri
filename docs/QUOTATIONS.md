@@ -73,15 +73,29 @@ reads in the expression refer to the same capture slot. Optional `Bool?`, `Int?`
 `Float?` and `String?` values use the standard `quotation::captureBool`,
 `quotation::captureInt`, `quotation::captureFloat` and `quotation::captureText` helpers, preserving either
 the scalar value or `CaptureValue.Null` without a conversion. Field packs use
-the same validated capture ABI. A different optional type is rejected.
+the same validated capture ABI.
+
+A managed class can opt into scalar capture with a public safe static
+`captureQuotation(value: readonly Type?): quotation::CaptureValue` method.
+The optional argument handles both present and absent captures. A mutable
+`Type?` argument is also accepted for mutable captures. Resource classes,
+unsafe hooks, inaccessible hooks and incompatible signatures are rejected.
+The hook runs once during construction and returns the stored scalar snapshot;
+subsequent mutations of the original object do not change that snapshot.
+Consumers validate the declared model type and their configured storage conversion.
+
+Readonly comparison operators on an opted-in class have comparison nodes when
+their single argument is the same class or its readonly view. Their capture
+encoding and comparison semantics must agree. This lets a mapped consumer compare
+complete converted values while preserving the model type in the tree.
 
 Standard `String` equality, inequality and concatenation operator syntax is
 represented by dedicated nodes. The standard `String.contains`, `startsWith`,
 `endsWith` and `byteLength` methods also have dedicated nodes. These methods
 preserve ordinal UTF-8 byte semantics; an empty search string matches every
 string. Only the standard library declarations qualify for these nodes.
-Other direct method calls and custom overloaded
-operators produce `NR276`, as do unsupported operations such as indexing and
+Other direct method calls and overloaded operators without a scalar capture policy
+produce `NR276`, as do unsupported operations such as indexing and
 casts. Ordinary type and member errors retain their standard diagnostics.
 Operation diagnostics point to the bound operation's source span.
 
