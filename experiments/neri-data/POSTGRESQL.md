@@ -27,12 +27,19 @@ Bool accepts PostgreSQL bool, Float accepts finite float4/float8, String accepts
 text/varchar/char, and Binary accepts bytea. Required NULL values and mismatched
 column names, counts, types, or encodings fail explicitly. Decimal mappings retain
 their canonical exact decimal representation in TEXT.
+Binary decoding accepts both hexadecimal and legacy octal escape output,
+including empty bytea and embedded zero bytes.
 
 Transactions use provider-issued leases. Savepoints require the latest active
 savepoint ID and its owning lease. Atomic batches validate affected-row counts
 and typed RETURNING rows before committing. A batch inside an explicit transaction
 uses a recovery savepoint. SQLSTATE, operation, native diagnostic message, and
 cleanup causes remain structured. The provider never retries a failed transaction.
+`beginWriteAsync` and `beginControlAsync` use native send/flush/consume polling
+without waiting; returned-value validation runs before the final commit boundary.
+Cancellation after that boundary preserves the command's actual outcome. Driver
+polls copy and clear each native result, and abort the owned connection if an
+unsupported COPY response changes the wire protocol.
 
 Migrations take a transaction-scoped advisory lock, validate the catalog history
 prefix and signatures, apply the requested target, and commit schema and stamps
