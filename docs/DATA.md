@@ -173,6 +173,12 @@ an isolated worker and exposes an asynchronous provider. Socket interest and
 local rescheduling are explicit, so applications can integrate their event loop.
 See [asynchronous operations and lazy loading](../experiments/neri-data/ASYNC-AND-LAZY.md).
 
+Generated contexts expose `saveChangesAsync`, asynchronous transaction controls,
+and polling methods for cleanup after pending resource disposal. Tracked saves
+preserve dependency order, generated values and transaction checkpoints while
+allowing later application edits to remain dirty. See
+[asynchronous tracked saves and transactions](../experiments/neri-data/ASYNC-SAVING.md).
+
 Neri Data is an explicit relational API for this release. Its supported
 surface is defined here and does not imply feature parity with Entity Framework
 Core.
