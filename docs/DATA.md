@@ -16,6 +16,12 @@ The toolchain includes the runtime source project at
 own installed toolchain. Keep those commands and the Data source projects from
 the same release.
 
+`neri-data-migration` also requires the platform's libpq 14 or later shared
+library, including when managing SQLite migrations. Install the PostgreSQL
+client library used by the package build and keep it available to the system
+loader. Release CI uses Homebrew `libpq` on macOS and Debian/Ubuntu `libpq-dev`
+on Linux; deployed Linux installations need its `libpq5` runtime package.
+
 The installed Data package is verified on Apple silicon with macOS 15 or newer
 and LLVM 22.1.8. This release gate does not establish installed Data support on
 other targets.

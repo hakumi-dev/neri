@@ -91,8 +91,9 @@ if [ "$action" = prepare ]; then
     brew install llvm@22 cmake ninja
     test "$("$(brew --prefix llvm@22)/bin/llvm-config" --version)" = 22.1.8
     if [ "$job" = macos-release-package ]; then
-      brew install openssl@3
+      brew install openssl@3 libpq
       install_sqlite
+      ln -sf "$(brew --prefix libpq)/lib/libpq.dylib" build/native/native-release/libpq.dylib
     fi
   else
     sudo apt-get update
@@ -103,7 +104,7 @@ if [ "$action" = prepare ]; then
     sudo apt-get install -y llvm-22-dev
     test "$(llvm-config-22 --version)" = 22.1.8
     if [ "$job" = linux-release-package ]; then
-      sudo apt-get install -y openssl pkg-config
+      sudo apt-get install -y openssl pkg-config libpq-dev
       install_sqlite
     fi
   fi
