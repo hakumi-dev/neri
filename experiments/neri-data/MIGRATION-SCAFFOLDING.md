@@ -100,8 +100,9 @@ the lock for explicit recovery. The command does not downgrade a database.
 `sqlite` or `postgres` dialect. It writes a new SQL file, verifies the starting
 history prefix inside the script, emits the selected up/down operations, and
 updates migration stamps transactionally. PostgreSQL scripts share the provider's
-advisory migration lock. SQLite scripts disable foreign keys before beginning
-and check them before committing. Execute scripts with an SQL runner that stops
+advisory migration lock. SQLite scripts set `legacy_alter_table` off, disable
+foreign keys before beginning, and check references before committing. The
+script leaves modern table-rename behavior enabled. Execute scripts with an SQL runner that stops
 on the first error, rolls back an open transaction, and restores SQLite foreign
 keys after failure. Scripts contain DDL and history checks; the SQLite provider
 also performs live schema and strict copied-value validation during rebuilds.

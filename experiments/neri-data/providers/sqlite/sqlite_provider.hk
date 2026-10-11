@@ -182,6 +182,7 @@ class SQLiteProvider: neri_data::Provider
   private closed: Bool = false
   private writable: Bool = false
   private poisoned: Bool = false
+  private migrationLegacyAlter: Bool = false
   private streaming: Bool = false
   private workerCancellation: Bool = false
   private windowFunctions: Bool = false
@@ -528,19 +529,28 @@ class SQLiteProvider: neri_data::Provider
         this.poisoned = true
         return MigrationResult.Failure(MigrationFailure.Provider(ProviderFailure.State("SQLite connection already has an unowned transaction")))
       end
-      let legacy = sqliteRebuildCheck(
-        database,
-        "SELECT 1 FROM pragma_legacy_alter_table WHERE legacy_alter_table != 0",
-        MigrationFailure.Unsupported("SQLite migrations require legacy_alter_table OFF")
-      )
+      match sqliteConfigurationScalar(database, "PRAGMA legacy_alter_table")
+        case result::Result.Error(error)
+          return MigrationResult.Failure(MigrationFailure.Provider(error))
+        case result::Result.Ok(value)
+          if value != "0" && value != "1"
+            return MigrationResult.Failure(MigrationFailure.Provider(ProviderFailure.State("SQLite legacy_alter_table state is invalid")))
+          end
+          this.migrationLegacyAlter = value == "1"
+      end
+      let modern = sqliteExecuteLiteral(database, "PRAGMA legacy_alter_table = OFF")
 
-      if legacy != null
-        return MigrationResult.Failure(legacy)
+      if modern != (0 as Int32)
+        return this.failMigration(MigrationFailure.Provider(sqliteFailure(
+              database,
+              "migration.legacy_alter_table",
+              modern
+            )))
       end
       let disabled = sqliteExecuteLiteral(database, "PRAGMA foreign_keys = OFF")
 
       if disabled != (0 as Int32)
-        return MigrationResult.Failure(MigrationFailure.Provider(sqliteFailure(
+        return this.failMigration(MigrationFailure.Provider(sqliteFailure(
               database,
               "migration.foreign_keys",
               disabled
@@ -643,14 +653,7 @@ class SQLiteProvider: neri_data::Provider
           if sqliteAutoCommit(database) == (0 as Int32)
             return this.failMigration(MigrationFailure.Provider(ProviderFailure.State("SQLite migration commit did not end the transaction")))
           end
-          if sqliteExecuteLiteral(database, "PRAGMA foreign_keys = ON") != (0 as Int32)
-            this.poisoned = true
-            return MigrationResult.Failure(MigrationFailure.Provider(sqliteFailure(
-                  database,
-                  "migration.restore_foreign_keys"
-                )))
-          end
-          let restored = sqliteForeignKeysFailure(database)
+          let restored = this.restoreMigrationPragmas()
 
           if restored != null
             this.poisoned = true
@@ -687,20 +690,33 @@ class SQLiteProvider: neri_data::Provider
               )))
         end
       end
-      if sqliteExecuteLiteral(database, "PRAGMA foreign_keys = ON") != (0 as Int32)
-        this.poisoned = true
-        return MigrationResult.Failure(MigrationFailure.Cleanup(new MigrationCleanupFailure(
-              error,
-              sqliteFailure(database, "migration.restore_foreign_keys")
-            )))
-      end
-      let restored = sqliteForeignKeysFailure(database)
+      let restored = this.restoreMigrationPragmas()
 
       if restored != null
         this.poisoned = true
         return MigrationResult.Failure(MigrationFailure.Cleanup(new MigrationCleanupFailure(error, restored)))
       end
       return MigrationResult.Failure(error)
+    end
+  end
+
+  private def restoreMigrationPragmas(): ProviderFailure?
+    unsafe
+      let database = this.database
+
+      if database == null
+        return ProviderFailure.State("migration pragma restoration cannot access database")
+      end
+      let legacySql = this.migrationLegacyAlter ? "PRAGMA legacy_alter_table = ON" : "PRAGMA legacy_alter_table = OFF"
+      let legacyStatus = sqliteExecuteLiteral(database, legacySql)
+
+      if legacyStatus != (0 as Int32)
+        return sqliteFailure(database, "migration.restore_legacy_alter_table", legacyStatus)
+      end
+      if sqliteExecuteLiteral(database, "PRAGMA foreign_keys = ON") != (0 as Int32)
+        return sqliteFailure(database, "migration.restore_foreign_keys")
+      end
+      return sqliteForeignKeysFailure(database)
     end
   end
 

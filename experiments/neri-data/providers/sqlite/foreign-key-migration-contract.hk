@@ -1,3 +1,4 @@
+use console
 use resources
 use result
 use test
@@ -42,8 +43,42 @@ def applied(result: MigrationResult): Void
     case MigrationResult.Applied(count)
       test::assertEqual(count, 1)
     case MigrationResult.Failure(error)
+      console::println(sqliteMigrationFailureMessage(error))
+
       test::assertTrue(false)
   end
+end
+
+def legacyAlter(provider: SQLiteProvider): Int
+  let columns = new ResultColumns([new ResultColumn("legacy_alter_table", ResultColumnKind.Int())])
+
+  match provider.execute(new SqlPlan(
+      "SELECT legacy_alter_table FROM pragma_legacy_alter_table",
+      new ParameterValues(),
+      1,
+      columns
+    ))
+    case ProviderResult.Failure(error)
+      test::assertTrue(false)
+    case ProviderResult.Rows(rows)
+      test::assertEqual(rows.Length, 1)
+      match rows[0].value("legacy_alter_table")
+        case CellLookup.Missing()
+          test::assertTrue(false)
+        case CellLookup.Found(cell)
+          match cell
+            case Cell.Int(value)
+              return value
+            case Cell.Null()
+            case Cell.Bool(value)
+            case Cell.Float(value)
+            case Cell.Text(value)
+            case Cell.Binary(value)
+              test::assertTrue(false)
+          end
+      end
+  end
+  return -1
 end
 
 def verify(path: String): Void
@@ -51,13 +86,17 @@ def verify(path: String): Void
   let evolved = foreignKeyPlan("evolved", foreignKeyModel(false), foreignKeyModel(true))
   let catalog = new MigrationSet([initial, evolved])
 
-  test::assertTrue(createSQLiteFixture(path, ""))
+  test::assertTrue(createSQLiteFixture(path, "SELECT 1;"))
 
   match SQLiteProvider.openWritable(path)
     case SQLiteOpenResult.Failure(error)
       test::assertTrue(false)
     case SQLiteOpenResult.Opened(provider)
+      let originalLegacy = legacyAlter(provider)
+
       applied(provider.migrate(new MigrationSet([initial])))
+
+      test::assertEqual(legacyAlter(provider), originalLegacy)
 
       test::assertTrue(createSQLiteFixture(
           path,
@@ -65,6 +104,17 @@ def verify(path: String): Void
         ))
 
       applied(provider.migrate(catalog))
+
+      test::assertEqual(legacyAlter(provider), originalLegacy)
+      let broken = new Migration("broken", [SchemaOp.DropTable("absent")], [SchemaOp.DropTable("absent")])
+
+      match provider.migrate(new MigrationSet([initial, evolved, broken]))
+        case MigrationResult.Applied(count)
+          test::assertTrue(false)
+        case MigrationResult.Failure(error)
+      end
+
+      test::assertEqual(legacyAlter(provider), originalLegacy)
       match provider.migrationHistory(catalog)
         case MigrationHistoryResult.Failure(error)
           test::assertTrue(false)
@@ -81,9 +131,57 @@ def verify(path: String): Void
   end
 end
 
+def compositeForeignKeyModel(evolved: Bool): SchemaModel
+  let parent = new SchemaTable("tuple-principal", "tuple_principals", [
+      new SchemaField("id", new SchemaColumn("id", SchemaType.Int(), primaryKey: true, keyPosition: 2)),
+      new SchemaField("tenant", new SchemaColumn("tenant", SchemaType.Int(), primaryKey: true, keyPosition: 1)),
+      new SchemaField("name", new SchemaColumn("name", SchemaType.Text(), nullable: evolved))
+    ])
+  let child = new SchemaTable("tuple-dependent", "tuple_dependents", [
+      new SchemaField("id", new SchemaColumn("id", SchemaType.Int(), primaryKey: true)),
+      new SchemaField("principal-id", new SchemaColumn("principal_id", SchemaType.Int(), reference: new SchemaReference(
+            "tuple_principals", ["tenant", "id"], ["principal_tenant", "principal_id"], "CASCADE"
+          ))),
+      new SchemaField("principal-tenant", new SchemaColumn("principal_tenant", SchemaType.Int()))
+    ])
+
+  return new SchemaModel([parent, child])
+end
+
+def verifyComposite(path: String): Void
+  let initial = foreignKeyPlan("tuple_initial", new SchemaModel([]), compositeForeignKeyModel(false))
+  let evolved = foreignKeyPlan("tuple_evolved", compositeForeignKeyModel(false), compositeForeignKeyModel(true))
+  let catalog = new MigrationSet([initial, evolved])
+
+  match SQLiteProvider.createWritable(path)
+    case SQLiteOpenResult.Failure(error)
+      test::assertTrue(false)
+    case SQLiteOpenResult.Opened(provider)
+      applied(provider.migrate(new MigrationSet([initial])))
+
+      test::assertTrue(createSQLiteFixture(
+          path,
+          "INSERT INTO tuple_principals(id,tenant,name) VALUES(7, 8, 'pair'); INSERT INTO tuple_dependents(id,principal_id,principal_tenant) VALUES(1, 7, 8);"
+        ))
+      applied(provider.migrate(catalog))
+
+      test::assertTrue(provider.close())
+      test::assertTrue(createSQLiteFixture(
+          path,
+          "CREATE TABLE assertion(value INTEGER CHECK(value = 1)); INSERT INTO assertion SELECT COUNT(*) FROM tuple_dependents; DROP TABLE assertion;"
+        ))
+      test::assertTrue(!createSQLiteFixture(
+          path,
+          "PRAGMA foreign_keys = ON; INSERT INTO tuple_dependents(id,principal_id,principal_tenant) VALUES(2, 8, 7);"
+        ))
+  end
+end
+
 def isolatedForeignKeys(): resources::Outcome<Int, result::Failure>
   using temporary <- files::TemporaryDirectory.create("neri-foreign-key-migration-")
     verify(temporary.path() + "/model.sqlite")
+    console::println("SQLite composite foreign key migration")
+    verifyComposite(temporary.path() + "/tuple.sqlite")
     return 0
   end
   return 1
