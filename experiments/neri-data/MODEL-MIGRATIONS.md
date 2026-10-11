@@ -1,6 +1,7 @@
 # Model snapshots and migration planning
 
-`SchemaModel` describes desired tables, scalar columns and indexes. Each
+`SchemaModel` describes desired tables, scalar columns, ordered primary keys,
+foreign-key references and indexes. Each
 `SchemaTable` and `SchemaField` has a stable logical identity separate from its
 physical SQL name. `SchemaIndex` lists logical field identities in index-key
 order. Models copy their inputs and canonicalize table/field identities and
@@ -11,7 +12,9 @@ representations, not cryptographic hashes.
 The data generator emits `schema_<Context>()` in an owned `schema.hk` artifact.
 It describes the mapped scalar types, nullability, primary key, constant defaults
 and named indexes. Mapping v1 declares defaults on column entries and indexes on
-entities; foreign keys and computed columns remain outside this metadata.
+entities. Relation metadata contributes physical foreign-key column tuples;
+client delete policies retain the database NO ACTION behavior. Computed columns
+remain outside this metadata.
 Explicit `SchemaModel` values can also declare typed constant defaults and
 indexes. Historical snapshots should
 be kept as independent, source-controlled definitions; regenerating the current
@@ -122,9 +125,15 @@ may reject such objects; the migration transaction preserves the pre-call
 database on failure.
 
 [Migration scaffolding](MIGRATION-SCAFFOLDING.md) persists typed operations and
-independent historical snapshots as reviewable bundles. Compound/alternate key
-constraints, database foreign-key modeling and reverse engineering remain
-unsupported. Callers assemble and apply their migration catalog explicitly.
+independent historical snapshots as reviewable bundles and discovers their
+ordered catalog automatically. Alternate keys use unique indexes.
+`SchemaColumn.keyPosition()` preserves composite primary-key order. A
+`SchemaReference(table, columns, fields, onDelete)` is stored on the first
+dependent column and validates matching scalar types and a declared principal
+primary or unique tuple. Supported database delete actions are NO ACTION,
+RESTRICT, CASCADE and SET NULL; SET NULL requires all dependent columns to be
+nullable. References are copied into snapshots and migration signatures.
+General database reverse engineering remains outside this model.
 
 ## References
 

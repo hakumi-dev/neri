@@ -22,19 +22,25 @@ class SchemaColumn
   private storedNullable: Bool
   private storedPrimaryKey: Bool
   private storedDefault: SchemaDefault?
+  private storedReference: SchemaReference?
+  private storedKeyPosition: Int
 
   def init(
     name: String,
     type: SchemaType,
     nullable: Bool = false,
     primaryKey: Bool = false,
-    defaultValue: SchemaDefault? = null
+    defaultValue: SchemaDefault? = null,
+    reference: SchemaReference? = null,
+    keyPosition: Int = 0
   ): Void
     this.storedName = name
     this.storedType = type
     this.storedNullable = nullable
     this.storedPrimaryKey = primaryKey
-    this.storedDefault = defaultValue
+    this.storedDefault = schemaCloneDefault(defaultValue)
+    this.storedReference = schemaCloneReference(reference)
+    this.storedKeyPosition = keyPosition
   end
 
   public readonly def name(): String
@@ -51,6 +57,14 @@ class SchemaColumn
 
   public readonly def primaryKey(): Bool
     return this.storedPrimaryKey
+  end
+
+  public readonly def keyPosition(): Int
+    return this.storedKeyPosition
+  end
+
+  public readonly def reference(): readonly SchemaReference?
+    return this.storedReference
   end
 
   public readonly def defaultValue(): readonly SchemaDefault?
@@ -81,6 +95,11 @@ enum MigrationFailure
   case Unsupported(message: String)
   case Provider(error: ProviderFailure)
   case Cleanup(error: MigrationCleanupFailure)
+end
+
+enum MigrationHistoryResult
+  case Loaded(stamps: MigrationStamp[])
+  case Failure(error: MigrationFailure)
 end
 
 enum MigrationResult
@@ -175,7 +194,7 @@ def schemaDefaultCode(value: readonly SchemaDefault?): String
 end
 
 def schemaColumnCode(column: readonly SchemaColumn): String
-  return schemaPiece(column.name()) + schemaTypeCode(column.type()) + (column.nullable() ? "1" : "0") + (column.primaryKey() ? "1" : "0") + schemaDefaultCode(column.defaultValue())
+  return schemaPiece(column.name()) + schemaTypeCode(column.type()) + (column.nullable() ? "1" : "0") + (column.primaryKey() ? "1" : "0") + schemaDefaultCode(column.defaultValue()) + schemaReferenceCode(column.reference()) + (column.keyPosition() == 0 ? "" : "K" + schemaPiece(column.keyPosition() as String))
 end
 
 def schemaCloneType(type: readonly SchemaType): SchemaType
@@ -253,7 +272,9 @@ def schemaCloneOp(op: readonly SchemaOp): SchemaOp
           schemaCloneType(column.type()),
           column.nullable(),
           column.primaryKey(),
-          schemaCloneDefault(column.defaultValue())
+          schemaCloneDefault(column.defaultValue()),
+          schemaCloneReference(column.reference()),
+          column.keyPosition()
         )
       end
 
@@ -418,13 +439,13 @@ def schemaRebuildValidation(before: readonly SchemaTable, after: readonly Schema
     return "table rebuild exceeds 1000 objects"
   end
   let oldModel = new SchemaModel([before.copy()])
-  let oldError = oldModel.validate()
+  let oldError = oldModel.validate(false)
 
   if oldError != null
     return oldError
   end
   let newModel = new SchemaModel([after.copy()])
-  let newError = newModel.validate()
+  let newError = newModel.validate(false)
 
   if newError != null
     return newError
@@ -465,21 +486,31 @@ def schemaRebuildValidation(before: readonly SchemaTable, after: readonly Schema
     end
     targetIndex = targetIndex + 1
   end
-  var keyIdentity = ""
+  var oldKeys = 0
+  var newKeys = 0
   var index = 0
 
   while index < before.count()
     let field = before.at(index)
 
     if field != null && field.column().primaryKey()
-      keyIdentity = field.identity()
+      oldKeys = oldKeys + 1
+      let other = after.find(field.identity())
+
+      if other == null || !other.column().primaryKey() || schemaTypeCode(field.column().type()) != schemaTypeCode(other.column().type()) || field.column().nullable() != other.column().nullable() || schemaDefaultCode(field.column().defaultValue()) != schemaDefaultCode(other.column().defaultValue()) || field.column().keyPosition() != other.column().keyPosition()
+        return "primary key change is unsupported"
+      end
     end
     index = index + 1
   end
-  let oldKey = before.find(keyIdentity)
-  let newKey = after.find(keyIdentity)
+  index = 0
+  while index < after.count()
+    let field = after.at(index)
 
-  if oldKey == null || newKey == null || !newKey.column().primaryKey() || schemaTypeCode(oldKey.column().type()) != schemaTypeCode(newKey.column().type()) || oldKey.column().nullable() != newKey.column().nullable() || schemaDefaultCode(oldKey.column().defaultValue()) != schemaDefaultCode(newKey.column().defaultValue())
+    newKeys = newKeys + 1 if field != null && field.column().primaryKey()
+    index = index + 1
+  end
+  if oldKeys != newKeys
     return "primary key change is unsupported"
   end
   return null
@@ -710,12 +741,24 @@ def schemaTextLiteral(value: String): String
   return output + host::stringSlice(value, start, host::stringByteLength(value) - start) + "'"
 end
 
-def schemaColumnSql(column: readonly SchemaColumn, adding: Bool = false): SchemaCompileResult
+def schemaColumnSql(
+  column: readonly SchemaColumn,
+  adding: Bool = false,
+  dialect: SqlDialect = SqlDialect.QuestionMark(),
+  compositeKey: Bool = false
+): SchemaCompileResult
   if !identifierValid(column.name())
     return SchemaCompileResult.Failure("invalid column identifier")
   end
   if column.primaryKey() && (column.nullable() || column.defaultValue() != null || adding)
     return SchemaCompileResult.Failure("primary key must be required Int or Text without default and created with table")
+  end
+  var postgres = false
+
+  match dialect
+    case SqlDialect.PostgreSql()
+      postgres = true
+    case SqlDialect.QuestionMark()
   end
   var kind = ""
 
@@ -724,21 +767,21 @@ def schemaColumnSql(column: readonly SchemaColumn, adding: Bool = false): Schema
       if column.primaryKey()
         return SchemaCompileResult.Failure("primary key must be Int or Text")
       end
-      kind = "INTEGER"
+      kind = postgres ? "BOOLEAN" : "INTEGER"
     case SchemaType.Int()
-      kind = "INTEGER"
+      kind = postgres ? "BIGINT" : "INTEGER"
     case SchemaType.Float()
       if column.primaryKey()
         return SchemaCompileResult.Failure("primary key must be Int or Text")
       end
-      kind = "REAL"
+      kind = postgres ? "DOUBLE PRECISION" : "REAL"
     case SchemaType.Text()
       kind = "TEXT"
   end
   var sql = schemaQuote(column.name()) + " " + kind
 
   if column.primaryKey()
-    sql = sql + (kind == "TEXT" ? " NOT NULL PRIMARY KEY" : " PRIMARY KEY")
+    sql = sql + (compositeKey ? " NOT NULL" : (kind == "INTEGER" ? " PRIMARY KEY" : " NOT NULL PRIMARY KEY"))
   else if !column.nullable()
     sql = sql + " NOT NULL"
   end
@@ -757,7 +800,7 @@ def schemaColumnSql(column: readonly SchemaColumn, adding: Bool = false): Schema
       case SchemaDefault.Bool(value)
         match column.type()
           case SchemaType.Bool()
-            sql = sql + (value ? " DEFAULT 1" : " DEFAULT 0")
+            sql = sql + (postgres ? (value ? " DEFAULT TRUE" : " DEFAULT FALSE") : (value ? " DEFAULT 1" : " DEFAULT 0"))
           case SchemaType.Int()
             return SchemaCompileResult.Failure("column default type mismatch")
           case SchemaType.Float()
@@ -821,7 +864,6 @@ end
 def compileSchema(op: readonly SchemaOp, dialect: SqlDialect): SchemaCompileResult
   match dialect
     case SqlDialect.PostgreSql()
-      return SchemaCompileResult.Failure("schema compiler supports SQLite dialect only")
     case SqlDialect.QuestionMark()
   end
   match op
@@ -831,14 +873,14 @@ def compileSchema(op: readonly SchemaOp, dialect: SqlDialect): SchemaCompileResu
       end
       var columnsSql = ""
       var primaryKeys = 0
+
+      for column in columns
+        primaryKeys = primaryKeys + 1 if column.primaryKey()
+      end
       var index = 0
 
       while index < columns.Length
         let column = columns[index]
-
-        if column.primaryKey()
-          primaryKeys = primaryKeys + 1
-        end
         var prior = 0
 
         while prior < index
@@ -847,7 +889,7 @@ def compileSchema(op: readonly SchemaOp, dialect: SqlDialect): SchemaCompileResu
           end
           prior = prior + 1
         end
-        match schemaColumnSql(column)
+        match schemaColumnSql(column, dialect: dialect, compositeKey: primaryKeys > 1)
           case SchemaCompileResult.Failure(message)
             return SchemaCompileResult.Failure(message)
           case SchemaCompileResult.Statement(sql)
@@ -855,8 +897,14 @@ def compileSchema(op: readonly SchemaOp, dialect: SqlDialect): SchemaCompileResu
         end
         index = index + 1
       end
-      if primaryKeys != 1
-        return SchemaCompileResult.Failure("table requires exactly one Int or Text primary key")
+      if primaryKeys == 0
+        return SchemaCompileResult.Failure("table requires an Int or Text primary key")
+      end
+      match schemaTableConstraints(columns)
+        case SchemaCompileResult.Failure(message)
+          return SchemaCompileResult.Failure(message)
+        case SchemaCompileResult.Statement(sql)
+          columnsSql = columnsSql + sql
       end
       return SchemaCompileResult.Statement("CREATE TABLE " + schemaQuote(table) + " (" + columnsSql + ")")
     case SchemaOp.DropTable(table)
@@ -868,7 +916,10 @@ def compileSchema(op: readonly SchemaOp, dialect: SqlDialect): SchemaCompileResu
       if !schemaTableValid(table)
         return SchemaCompileResult.Failure("invalid or reserved table name")
       end
-      match schemaColumnSql(column, true)
+      if column.reference() != null
+        return SchemaCompileResult.Failure("foreign-key additions require a table rebuild")
+      end
+      match schemaColumnSql(column, true, dialect)
         case SchemaCompileResult.Failure(message)
           return SchemaCompileResult.Failure(message)
         case SchemaCompileResult.Statement(sql)
@@ -918,6 +969,11 @@ def compileSchema(op: readonly SchemaOp, dialect: SqlDialect): SchemaCompileResu
       end
       return SchemaCompileResult.Statement("DROP INDEX " + schemaQuote(name))
     case SchemaOp.RebuildTable(before, after)
-      return SchemaCompileResult.Failure("table rebuild requires SQLite provider execution")
+      match dialect
+        case SqlDialect.PostgreSql()
+          return schemaPostgresRebuild(before, after)
+        case SqlDialect.QuestionMark()
+          return SchemaCompileResult.Failure("table rebuild requires SQLite provider execution")
+      end
   end
 end

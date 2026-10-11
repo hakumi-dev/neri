@@ -388,6 +388,67 @@ class SQLiteProvider: neri_data::Provider
     end
   end
 
+  public override def migrationHistory(catalog: readonly MigrationSet): MigrationHistoryResult
+    if this.closed || this.streaming || this.poisoned
+      return MigrationHistoryResult.Failure(MigrationFailure.Unsupported("SQLite provider is unavailable for migration history"))
+    end
+    let invalid = catalog.validate()
+
+    if invalid != null
+      return MigrationHistoryResult.Failure(MigrationFailure.Validation(invalid))
+    end
+    unsafe
+      let database = this.database
+
+      if database == null
+        return MigrationHistoryResult.Failure(MigrationFailure.Provider(ProviderFailure.State("SQLite handle is unavailable")))
+      end
+      let present = sqliteRebuildCheck(
+        database,
+        "SELECT 1 FROM main.sqlite_schema WHERE lower(name) = '__neri_migrations'",
+        MigrationFailure.Validation("history exists")
+      )
+
+      if present == null
+        return MigrationHistoryResult.Loaded([])
+      end
+      match present
+        case MigrationFailure.Validation(message)
+          if message != "history exists"
+            return MigrationHistoryResult.Failure(present)
+          end
+        case MigrationFailure.Drift(message)
+          return MigrationHistoryResult.Failure(present)
+        case MigrationFailure.Unsupported(message)
+          return MigrationHistoryResult.Failure(present)
+        case MigrationFailure.Provider(error)
+          return MigrationHistoryResult.Failure(present)
+        case MigrationFailure.Cleanup(error)
+          return MigrationHistoryResult.Failure(present)
+      end
+      let wrongKind = sqliteRebuildCheck(
+        database,
+        "SELECT 1 FROM main.sqlite_schema WHERE lower(name) = '__neri_migrations' AND type != 'table'",
+        MigrationFailure.Drift("migration history object is not a table")
+      )
+
+      if wrongKind != null
+        return MigrationHistoryResult.Failure(wrongKind)
+      end
+      match sqliteMigrationHistory(database, catalog.count())
+        case SQLiteMigrationHistory.Failure(error)
+          return MigrationHistoryResult.Failure(error)
+        case SQLiteMigrationHistory.Loaded(stamps)
+          let mismatch = catalog.historyPrefix(stamps)
+
+          if mismatch != null
+            return MigrationHistoryResult.Failure(MigrationFailure.Drift(mismatch))
+          end
+          return MigrationHistoryResult.Loaded(stamps)
+      end
+    end
+  end
+
   public def migrate(catalog: readonly MigrationSet, target: String? = null): MigrationResult
     if this.streaming
       return MigrationResult.Failure(MigrationFailure.Unsupported("SQLite provider is busy streaming"))
@@ -449,13 +510,31 @@ class SQLiteProvider: neri_data::Provider
         this.poisoned = true
         return MigrationResult.Failure(MigrationFailure.Provider(ProviderFailure.State("SQLite connection already has an unowned transaction")))
       end
+      let legacy = sqliteRebuildCheck(
+        database,
+        "SELECT 1 FROM pragma_legacy_alter_table WHERE legacy_alter_table != 0",
+        MigrationFailure.Unsupported("SQLite migrations require legacy_alter_table OFF")
+      )
+
+      if legacy != null
+        return MigrationResult.Failure(legacy)
+      end
+      let disabled = sqliteExecuteLiteral(database, "PRAGMA foreign_keys = OFF")
+
+      if disabled != (0 as Int32)
+        return MigrationResult.Failure(MigrationFailure.Provider(sqliteFailure(
+              database,
+              "migration.foreign_keys",
+              disabled
+            )))
+      end
       let begun = sqliteExecuteLiteral(database, "BEGIN IMMEDIATE")
 
       if begun != (0 as Int32)
         if sqliteAutoCommit(database) == (0 as Int32)
           this.poisoned = true
         end
-        return MigrationResult.Failure(MigrationFailure.Provider(sqliteFailure(database, "migration.begin", begun)))
+        return this.failMigration(MigrationFailure.Provider(sqliteFailure(database, "migration.begin", begun)))
       end
       let historyCreated = sqliteExecuteLiteral(
         database,
@@ -529,6 +608,15 @@ class SQLiteProvider: neri_data::Provider
               index = index - 1
             end
           end
+          let foreignKeyCheck = sqliteRebuildCheck(
+            database,
+            "PRAGMA main.foreign_key_check",
+            MigrationFailure.Validation("migration violates a database foreign key")
+          )
+
+          if foreignKeyCheck != null
+            return this.failMigration(foreignKeyCheck)
+          end
           let committed = sqliteExecuteLiteral(database, "COMMIT")
 
           if committed != (0 as Int32)
@@ -536,6 +624,19 @@ class SQLiteProvider: neri_data::Provider
           end
           if sqliteAutoCommit(database) == (0 as Int32)
             return this.failMigration(MigrationFailure.Provider(ProviderFailure.State("SQLite migration commit did not end the transaction")))
+          end
+          if sqliteExecuteLiteral(database, "PRAGMA foreign_keys = ON") != (0 as Int32)
+            this.poisoned = true
+            return MigrationResult.Failure(MigrationFailure.Provider(sqliteFailure(
+                  database,
+                  "migration.restore_foreign_keys"
+                )))
+          end
+          let restored = sqliteForeignKeysFailure(database)
+
+          if restored != null
+            this.poisoned = true
+            return MigrationResult.Failure(MigrationFailure.Provider(restored))
           end
           return MigrationResult.Applied(count)
       end
@@ -567,6 +668,19 @@ class SQLiteProvider: neri_data::Provider
                 ) : ProviderFailure.State("rollback did not end transaction")
               )))
         end
+      end
+      if sqliteExecuteLiteral(database, "PRAGMA foreign_keys = ON") != (0 as Int32)
+        this.poisoned = true
+        return MigrationResult.Failure(MigrationFailure.Cleanup(new MigrationCleanupFailure(
+              error,
+              sqliteFailure(database, "migration.restore_foreign_keys")
+            )))
+      end
+      let restored = sqliteForeignKeysFailure(database)
+
+      if restored != null
+        this.poisoned = true
+        return MigrationResult.Failure(MigrationFailure.Cleanup(new MigrationCleanupFailure(error, restored)))
       end
       return MigrationResult.Failure(error)
     end
@@ -823,6 +937,15 @@ class SQLiteProvider: neri_data::Provider
         case SQLiteSetStep.Failure(error)
           return this.failBatch(error)
         case SQLiteSetStep.Success(changed)
+          let foreignKeyCheck = sqliteRebuildCheck(
+            database,
+            "PRAGMA main.foreign_key_check",
+            MigrationFailure.Validation("migration violates a database foreign key")
+          )
+
+          if foreignKeyCheck != null
+            return this.failMigration(foreignKeyCheck)
+          end
           let committed = sqliteExecuteLiteral(database, "COMMIT")
 
           if committed != (0 as Int32)

@@ -1,0 +1,98 @@
+use neri_data
+
+def dataMigrationTarget(catalog: DataMigrationCatalog, id: String): Int
+  if id == "empty"
+    return 0
+  end
+  var index = 0
+
+  while index < catalog.entries.Length
+    if catalog.entries[index].id == id
+      return index + 1
+    end
+    index = index + 1
+  end
+  return -1
+end
+
+## A guarded script starts at an exact catalog prefix and records the resulting history.
+def dataMigrationScript(catalog: DataMigrationCatalog, from: String, to: String, dialect: SqlDialect): SchemaCompileResult
+  if catalog.error != ""
+    return SchemaCompileResult.Failure(catalog.error)
+  end
+  let first = dataMigrationTarget(catalog, from)
+  let last = dataMigrationTarget(catalog, to)
+
+  if first < 0 || last < 0
+    return SchemaCompileResult.Failure("script endpoints must be catalog ids or empty")
+  end
+  var prefix = "BEGIN;\nSET LOCAL standard_conforming_strings = on;\n"
+  var sqlite = false
+
+  match dialect
+    case SqlDialect.QuestionMark()
+      sqlite = true
+      prefix = "PRAGMA foreign_keys = OFF;\nBEGIN IMMEDIATE;\n"
+    case SqlDialect.PostgreSql()
+      prefix = prefix + "SELECT pg_advisory_xact_lock(1852142185);\n"
+  end
+  var output = prefix + "CREATE TABLE IF NOT EXISTS \"__neri_migrations\" (ordinal " + (sqlite ? "INTEGER" : "BIGINT") + " PRIMARY KEY, id TEXT NOT NULL, signature TEXT NOT NULL);\n"
+  var predicate = "(SELECT COUNT(*) FROM \"__neri_migrations\") = " + (first as String)
+  var index = 0
+
+  while index < first
+    let migration = catalog.entries[index].migration
+
+    if migration == null
+      return SchemaCompileResult.Failure("catalog migration is missing")
+    end
+    predicate = predicate + " AND EXISTS (SELECT 1 FROM \"__neri_migrations\" WHERE ordinal = " + ((index + 1) as String) + " AND id = " + schemaTextLiteral(migration.id()) + " AND signature = " + schemaTextLiteral(migration.signature()) + ")"
+    index = index + 1
+  end
+  if sqlite
+    output = output + "CREATE TEMP TABLE \"__neri_script_assert\" (value INTEGER NOT NULL CHECK(value = 1));\nINSERT INTO \"__neri_script_assert\" VALUES (CASE WHEN " + predicate + " THEN 1 ELSE 0 END);\n"
+  else
+    output = output + "SELECT 1 / CASE WHEN " + predicate + " THEN 1 ELSE 0 END;\n"
+  end
+  if first < last
+    index = first
+    while index < last
+      let migration = catalog.entries[index].migration
+
+      if migration == null
+        return SchemaCompileResult.Failure("catalog migration is missing")
+      end
+      match compileMigration(migration, true, dialect)
+        case SchemaCompileResult.Failure(message)
+          return SchemaCompileResult.Failure(message)
+        case SchemaCompileResult.Statement(sql)
+          output = output + sql
+      end
+      output = output + "INSERT INTO \"__neri_migrations\" (ordinal, id, signature) VALUES (" + ((index + 1) as String) + ", " + schemaTextLiteral(migration.id()) + ", " + schemaTextLiteral(migration.signature()) + ");\n"
+      index = index + 1
+    end
+  else
+    index = first - 1
+    while index >= last
+      let migration = catalog.entries[index].migration
+
+      if migration == null
+        return SchemaCompileResult.Failure("catalog migration is missing")
+      end
+      match compileMigration(migration, false, dialect)
+        case SchemaCompileResult.Failure(message)
+          return SchemaCompileResult.Failure(message)
+        case SchemaCompileResult.Statement(sql)
+          output = output + sql
+      end
+      output = output + "DELETE FROM \"__neri_migrations\" WHERE ordinal = " + ((index + 1) as String) + ";\n"
+      index = index - 1
+    end
+  end
+  if sqlite
+    output = output + "INSERT INTO \"__neri_script_assert\" SELECT CASE WHEN EXISTS (SELECT 1 FROM pragma_foreign_key_check) THEN 0 ELSE 1 END;\nDROP TABLE \"__neri_script_assert\";\nCOMMIT;\nPRAGMA foreign_keys = ON;\n"
+  else
+    output = output + "COMMIT;\n"
+  end
+  return SchemaCompileResult.Statement(output)
+end

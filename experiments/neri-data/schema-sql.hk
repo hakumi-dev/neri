@@ -1,0 +1,267 @@
+namespace neri_data
+
+def schemaReferenceConstraint(column: readonly SchemaColumn): String
+  return "neri_fk_" + column.name()
+end
+
+def schemaReferenceSql(column: readonly SchemaColumn, columns: readonly SchemaColumn[]): SchemaCompileResult
+  let reference = column.reference()
+
+  if reference == null
+    return SchemaCompileResult.Statement("")
+  end
+  let invalid = reference.validate()
+
+  if invalid != null
+    return SchemaCompileResult.Failure(invalid)
+  end
+  if reference.fieldAt(0) != column.name()
+    return SchemaCompileResult.Failure("foreign key must be stored on its first dependent column")
+  end
+  var fieldsSql = ""
+  var columnsSql = ""
+  var index = 0
+
+  while index < reference.count()
+    let field = reference.fieldAt(index)
+    let target = reference.columnAt(index)
+
+    if field == null || target == null
+      return SchemaCompileResult.Failure("foreign key column tuple is missing")
+    end
+    var found = false
+
+    for candidate in columns
+      if candidate.name() == field
+        found = true
+        if reference.onDelete() == "SET NULL" && !candidate.nullable()
+          return SchemaCompileResult.Failure("SET NULL foreign key requires nullable columns")
+        end
+      end
+    end
+    if !found
+      return SchemaCompileResult.Failure("foreign key references an unknown dependent column")
+    end
+    fieldsSql = fieldsSql + (index == 0 ? "" : ", ") + schemaQuote(field)
+    columnsSql = columnsSql + (index == 0 ? "" : ", ") + schemaQuote(target)
+    index = index + 1
+  end
+  return SchemaCompileResult.Statement("CONSTRAINT " + schemaQuote(schemaReferenceConstraint(column)) + " FOREIGN KEY (" + fieldsSql + ") REFERENCES " + schemaQuote(reference.table()) + " (" + columnsSql + ") ON DELETE " + reference.onDelete())
+end
+
+def schemaTableConstraints(columns: readonly SchemaColumn[]): SchemaCompileResult
+  var output = ""
+  var primary = ""
+  var keyCount = 0
+  var positioned = 0
+
+  for column in columns
+    if column.keyPosition() < 0 || (!column.primaryKey() && column.keyPosition() != 0)
+      return SchemaCompileResult.Failure("primary-key position requires a key column")
+    end
+    if column.primaryKey()
+      primary = primary + (keyCount == 0 ? "" : ", ") + schemaQuote(column.name())
+      keyCount = keyCount + 1
+      positioned = positioned + 1 if column.keyPosition() > 0
+    end
+    match schemaReferenceSql(column, columns)
+      case SchemaCompileResult.Failure(message)
+        return SchemaCompileResult.Failure(message)
+      case SchemaCompileResult.Statement(sql)
+        output = output + ", " + sql if sql != ""
+    end
+  end
+  if positioned != 0
+    if positioned != keyCount
+      return SchemaCompileResult.Failure("composite primary-key positions must cover every key column")
+    end
+    primary = ""
+    var ordinal = 1
+
+    while ordinal <= keyCount
+      var found: readonly SchemaColumn? = null
+
+      for column in columns
+        if column.primaryKey() && column.keyPosition() == ordinal
+          if found != null
+            return SchemaCompileResult.Failure("duplicate composite primary-key position")
+          end
+          found = column
+        end
+      end
+      if found == null
+        return SchemaCompileResult.Failure("missing composite primary-key position")
+      end
+      primary = primary + (ordinal == 1 ? "" : ", ") + schemaQuote(found.name())
+      ordinal = ordinal + 1
+    end
+  end
+  if keyCount > 1
+    output = ", PRIMARY KEY (" + primary + ")" + output
+  end
+  return SchemaCompileResult.Statement(output)
+end
+
+def schemaPostgresType(column: readonly SchemaColumn): String
+  match column.type()
+    case SchemaType.Bool()
+      return "BOOLEAN"
+    case SchemaType.Int()
+      return "BIGINT"
+    case SchemaType.Float()
+      return "DOUBLE PRECISION"
+    case SchemaType.Text()
+      return "TEXT"
+    case SchemaType.Binary()
+      return "BYTEA"
+  end
+end
+
+## PostgreSQL preserves table identity and inbound constraints with ALTER operations.
+def schemaPostgresRebuild(
+  before: readonly SchemaTable,
+  after: readonly SchemaTable,
+  references: Bool = true
+): SchemaCompileResult
+  let invalid = schemaRebuildValidation(before, after)
+
+  if invalid != null
+    return SchemaCompileResult.Failure(invalid)
+  end
+  var output = ""
+  var prefix = "ALTER TABLE " + schemaQuote(before.name()) + " "
+  var index = 0
+
+  while index < before.count()
+    let field = before.at(index)
+
+    if references && field != null && field.column().reference() != null
+      output = output + prefix + "DROP CONSTRAINT " + schemaQuote(schemaReferenceConstraint(field.column())) + ";\n"
+    end
+    index = index + 1
+  end
+  if before.name() != after.name()
+    output = output + prefix + "RENAME TO " + schemaQuote(after.name()) + ";\n"
+  end
+  prefix = "ALTER TABLE " + schemaQuote(after.name()) + " "
+  index = 0
+  while index < before.count()
+    let field = before.at(index)
+
+    if field != null
+      let other = after.find(field.identity())
+
+      if other == null
+        output = output + prefix + "DROP COLUMN " + schemaQuote(field.column().name()) + ";\n"
+      else
+        let oldColumn = field.column()
+        let column = other.column()
+
+        if oldColumn.name() != column.name()
+          output = output + prefix + "RENAME COLUMN " + schemaQuote(oldColumn.name()) + " TO " + schemaQuote(column.name()) + ";\n"
+        end
+        let alter = prefix + "ALTER COLUMN " + schemaQuote(column.name()) + " "
+
+        if schemaTypeCode(oldColumn.type()) != schemaTypeCode(column.type())
+          output = output + alter + "DROP DEFAULT;\n"
+          output = output + alter + "TYPE " + schemaPostgresType(column) + " USING " + schemaQuote(column.name()) + "::" + schemaPostgresType(column) + ";\n"
+        end
+        if oldColumn.nullable() != column.nullable()
+          output = output + alter + (column.nullable() ? "DROP NOT NULL" : "SET NOT NULL") + ";\n"
+        end
+        if schemaDefaultCode(oldColumn.defaultValue()) != schemaDefaultCode(column.defaultValue()) || schemaTypeCode(oldColumn.type()) != schemaTypeCode(column.type())
+          match schemaColumnSql(column, dialect: SqlDialect.PostgreSql())
+            case SchemaCompileResult.Failure(message)
+              return SchemaCompileResult.Failure(message)
+            case SchemaCompileResult.Statement(sql)
+              let defaultValue = schemaDefaultSql(column.defaultValue(), SqlDialect.PostgreSql())
+
+              output = output + alter + (defaultValue == null ? "DROP DEFAULT" : "SET DEFAULT " + defaultValue) + ";\n"
+          end
+        end
+      end
+    end
+    index = index + 1
+  end
+  index = 0
+  while index < after.count()
+    let field = after.at(index)
+
+    if field != null && before.find(field.identity()) == null
+      match schemaColumnSql(field.column(), true, SqlDialect.PostgreSql())
+        case SchemaCompileResult.Failure(message)
+          return SchemaCompileResult.Failure(message)
+        case SchemaCompileResult.Statement(sql)
+          output = output + prefix + "ADD COLUMN " + sql + ";\n"
+      end
+    end
+    index = index + 1
+  end
+  var ordinal = 0
+
+  while ordinal < before.indexCount()
+    let definition = before.indexAt(ordinal)
+
+    let other = definition == null ? null : after.findIndex(definition.name())
+
+    if definition != null && (other == null || !schemaDiffIndexEqual(definition, other))
+      output = output + "DROP INDEX " + schemaQuote(definition.name()) + ";\n"
+    end
+    ordinal = ordinal + 1
+  end
+  ordinal = 0
+
+  while ordinal < after.indexCount()
+    let definition = after.indexAt(ordinal)
+
+    let other = definition == null ? null : before.findIndex(definition.name())
+
+    if definition != null && (other == null || !schemaDiffIndexEqual(definition, other))
+      match compileSchema(schemaIndexCreate(after, definition), SqlDialect.PostgreSql())
+        case SchemaCompileResult.Failure(message)
+          return SchemaCompileResult.Failure(message)
+        case SchemaCompileResult.Statement(sql)
+          output = output + sql + ";\n"
+      end
+    end
+    ordinal = ordinal + 1
+  end
+  index = 0
+  while index < after.count()
+    let field = after.at(index)
+
+    if references && field != null && field.column().reference() != null
+      match schemaReferenceSql(field.column(), after.columns())
+        case SchemaCompileResult.Failure(message)
+          return SchemaCompileResult.Failure(message)
+        case SchemaCompileResult.Statement(sql)
+          output = output + prefix + "ADD " + sql + ";\n"
+      end
+    end
+    index = index + 1
+  end
+  return SchemaCompileResult.Statement(output)
+end
+
+def schemaDefaultSql(value: readonly SchemaDefault?, dialect: SqlDialect): String?
+  if value == null
+    return null
+  end
+  match value
+    case SchemaDefault.Null()
+      return "NULL"
+    case SchemaDefault.Bool(item)
+      match dialect
+        case SqlDialect.PostgreSql()
+          return item ? "TRUE" : "FALSE"
+        case SqlDialect.QuestionMark()
+          return item ? "1" : "0"
+      end
+    case SchemaDefault.Int(item)
+      return item as String
+    case SchemaDefault.Float(item)
+      return item as String
+    case SchemaDefault.Text(item)
+      return schemaTextLiteral(item)
+  end
+end

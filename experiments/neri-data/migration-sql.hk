@@ -1,0 +1,250 @@
+namespace neri_data
+
+def schemaSqliteRebuild(before: readonly SchemaTable, after: readonly SchemaTable): SchemaCompileResult
+  let invalid = schemaRebuildValidation(before, after)
+
+  if invalid != null
+    return SchemaCompileResult.Failure(invalid)
+  end
+  var definitions = ""
+  var keys = 0
+  var index = 0
+
+  while index < after.count()
+    let field = after.at(index)
+
+    keys = keys + 1 if field != null && field.column().primaryKey()
+    index = index + 1
+  end
+  index = 0
+  var targets = ""
+  var sources = ""
+
+  while index < after.count()
+    let field = after.at(index)
+
+    if field == null
+      return SchemaCompileResult.Failure("rebuild field is missing")
+    end
+    match schemaColumnSql(field.column(), compositeKey: keys > 1)
+      case SchemaCompileResult.Failure(message)
+        return SchemaCompileResult.Failure(message)
+      case SchemaCompileResult.Statement(sql)
+        definitions = definitions + (index == 0 ? "" : ", ") + sql
+    end
+    let original = before.find(field.identity())
+
+    if original != null
+      targets = targets + (targets == "" ? "" : ", ") + schemaQuote(field.column().name())
+      sources = sources + (sources == "" ? "" : ", ") + schemaQuote(original.column().name())
+    end
+    index = index + 1
+  end
+  match schemaTableConstraints(after.columns())
+    case SchemaCompileResult.Failure(message)
+      return SchemaCompileResult.Failure(message)
+    case SchemaCompileResult.Statement(sql)
+      definitions = definitions + sql
+  end
+  var output = "CREATE TABLE \"__neri_rebuild\" (" + definitions + ");\nINSERT INTO \"__neri_rebuild\" (" + targets + ") SELECT " + sources + " FROM " + schemaQuote(before.name()) + ";\nDROP TABLE " + schemaQuote(before.name()) + ";\nALTER TABLE \"__neri_rebuild\" RENAME TO " + schemaQuote(after.name()) + ";\n"
+
+  index = 0
+  while index < after.indexCount()
+    let definition = after.indexAt(index)
+
+    if definition != null
+      match compileSchema(schemaIndexCreate(after, definition), SqlDialect.QuestionMark())
+        case SchemaCompileResult.Failure(message)
+          return SchemaCompileResult.Failure(message)
+        case SchemaCompileResult.Statement(sql)
+          output = output + sql + ";\n"
+      end
+    end
+    index = index + 1
+  end
+  return SchemaCompileResult.Statement(output)
+end
+
+## Initial foreign keys are installed after tables and unique indexes, including cycles.
+def compilePostgresMigration(migration: readonly Migration, up: Bool): SchemaCompileResult
+  var output = ""
+  var references = ""
+  var drops = ""
+  let count = up ? migration.upCount() : migration.downCount()
+  var index = 0
+
+  while index < count
+    let operation = up ? migration.upAt(index) : migration.downAt(index)
+
+    if operation != null
+      match operation
+        case SchemaOp.RebuildTable(before, after)
+          var fieldIndex = 0
+
+          while fieldIndex < before.count()
+            let field = before.at(fieldIndex)
+
+            if field != null && field.column().reference() != null
+              output = output + "ALTER TABLE " + schemaQuote(before.name()) + " DROP CONSTRAINT " + schemaQuote(schemaReferenceConstraint(field.column())) + ";\n"
+            end
+            fieldIndex = fieldIndex + 1
+          end
+        case SchemaOp.CreateTable(table, columns)
+        case SchemaOp.DropTable(table)
+        case SchemaOp.AddColumn(table, column)
+        case SchemaOp.DropColumn(table, column)
+        case SchemaOp.RenameTable(from, to)
+        case SchemaOp.RenameColumn(table, from, to)
+        case SchemaOp.CreateIndex(name, table, columns, unique)
+        case SchemaOp.DropIndex(name)
+      end
+    end
+    index = index + 1
+  end
+  index = 0
+
+  while index < count
+    let operation = up ? migration.upAt(index) : migration.downAt(index)
+
+    if operation == null
+      return SchemaCompileResult.Failure("migration has a missing operation")
+    end
+    var drop = false
+
+    match operation
+      case SchemaOp.DropTable(table)
+        drops = drops + (drops == "" ? "" : ", ") + schemaQuote(table)
+        drop = true
+      case SchemaOp.CreateTable(table, columns)
+      case SchemaOp.AddColumn(table, column)
+      case SchemaOp.DropColumn(table, column)
+      case SchemaOp.RenameTable(from, to)
+      case SchemaOp.RenameColumn(table, from, to)
+      case SchemaOp.CreateIndex(name, table, columns, unique)
+      case SchemaOp.DropIndex(name)
+      case SchemaOp.RebuildTable(before, after)
+    end
+    if !drop
+      if drops != ""
+        output = output + "DROP TABLE " + drops + ";\n"
+        drops = ""
+      end
+      match operation
+        case SchemaOp.CreateTable(table, columns)
+          let bare: SchemaColumn[] = tasks::generate(columns.Length, 1) do |position|
+            let column = columns[position]
+
+            return new SchemaColumn(
+              column.name(),
+              schemaCloneType(column.type()),
+              column.nullable(),
+              column.primaryKey(),
+              schemaCloneDefault(column.defaultValue()),
+              keyPosition: column.keyPosition()
+            )
+          end
+
+          match compileSchema(SchemaOp.CreateTable(table, bare), SqlDialect.PostgreSql())
+            case SchemaCompileResult.Failure(message)
+              return SchemaCompileResult.Failure(message)
+            case SchemaCompileResult.Statement(sql)
+              output = output + sql + ";\n"
+          end
+          for column in columns
+            if column.reference() != null
+              match schemaReferenceSql(column, columns)
+                case SchemaCompileResult.Failure(message)
+                  return SchemaCompileResult.Failure(message)
+                case SchemaCompileResult.Statement(sql)
+                  references = references + "ALTER TABLE " + schemaQuote(table) + " ADD " + sql + ";\n"
+              end
+            end
+          end
+        case SchemaOp.RebuildTable(before, after)
+          match schemaPostgresRebuild(before, after, false)
+            case SchemaCompileResult.Failure(message)
+              return SchemaCompileResult.Failure(message)
+            case SchemaCompileResult.Statement(sql)
+              output = output + sql
+          end
+          var fieldIndex = 0
+
+          while fieldIndex < after.count()
+            let field = after.at(fieldIndex)
+
+            if field != null && field.column().reference() != null
+              match schemaReferenceSql(field.column(), after.columns())
+                case SchemaCompileResult.Failure(message)
+                  return SchemaCompileResult.Failure(message)
+                case SchemaCompileResult.Statement(sql)
+                  references = references + "ALTER TABLE " + schemaQuote(after.name()) + " ADD " + sql + ";\n"
+              end
+            end
+            fieldIndex = fieldIndex + 1
+          end
+        case SchemaOp.DropTable(table)
+        case SchemaOp.AddColumn(table, column)
+        case SchemaOp.DropColumn(table, column)
+        case SchemaOp.RenameTable(from, to)
+        case SchemaOp.RenameColumn(table, from, to)
+        case SchemaOp.CreateIndex(name, table, columns, unique)
+        case SchemaOp.DropIndex(name)
+          match compileSchema(operation, SqlDialect.PostgreSql())
+            case SchemaCompileResult.Failure(message)
+              return SchemaCompileResult.Failure(message)
+            case SchemaCompileResult.Statement(sql)
+              output = output + sql + ";\n"
+          end
+      end
+    end
+    index = index + 1
+  end
+  if drops != ""
+    output = output + "DROP TABLE " + drops + ";\n"
+  end
+  return SchemaCompileResult.Statement(output + references)
+end
+
+def compileMigration(migration: readonly Migration, up: Bool, dialect: SqlDialect): SchemaCompileResult
+  match dialect
+    case SqlDialect.PostgreSql()
+      return compilePostgresMigration(migration, up)
+    case SqlDialect.QuestionMark()
+  end
+  var output = ""
+  let count = up ? migration.upCount() : migration.downCount()
+  var index = 0
+
+  while index < count
+    let operation = up ? migration.upAt(index) : migration.downAt(index)
+
+    if operation == null
+      return SchemaCompileResult.Failure("migration has a missing operation")
+    end
+    match operation
+      case SchemaOp.RebuildTable(before, after)
+        match schemaSqliteRebuild(before, after)
+          case SchemaCompileResult.Failure(message)
+            return SchemaCompileResult.Failure(message)
+          case SchemaCompileResult.Statement(sql)
+            output = output + sql
+        end
+      case SchemaOp.CreateTable(table, columns)
+      case SchemaOp.DropTable(table)
+      case SchemaOp.AddColumn(table, column)
+      case SchemaOp.DropColumn(table, column)
+      case SchemaOp.RenameTable(from, to)
+      case SchemaOp.RenameColumn(table, from, to)
+      case SchemaOp.CreateIndex(name, table, columns, unique)
+      case SchemaOp.DropIndex(name)
+        match compileSchema(operation, dialect)
+          case SchemaCompileResult.Failure(message)
+            return SchemaCompileResult.Failure(message)
+          case SchemaCompileResult.Statement(sql)
+            output = output + sql + ";\n"
+        end
+    end
+    index = index + 1
+  end
+  return SchemaCompileResult.Statement(output)
+end
