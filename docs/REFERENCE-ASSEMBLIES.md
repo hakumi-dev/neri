@@ -89,7 +89,7 @@ and signature changes, missing or corrupted objects, incompatible metadata, and
 explicit rejection of unsupported exports and body dependencies. This contract
 has macOS arm64 coverage with LLVM 22.1.8; coverage on other native targets is
 not established here. Performance measurements follow the
-[benchmark result policy](../benchmarks/README.md#source-and-result-policy).
+[local measurement policy](PERFORMANCE.md#local-measurements).
 
 ## Design basis
 

@@ -1,6 +1,6 @@
 # Persistent checked analysis
 
-Neri stores checked compiler data between processes in a private, versioned cache.
+Neri stores checked compiler data between processes in a private, producer-bound cache.
 The first layer retains a whole eligible analysis context. It supports classes,
 contracts, generic template syntax, instantiated generic bodies, aliases, native
 record metadata and bound expressions. Normal object construction recreates the
@@ -41,11 +41,14 @@ used by editor analysis and models with parent arenas are outside this format.
 
 ## Identity and publication
 
-A cache entry identifies the format version, compiler executable digest, runtime
+A cache entry identifies its producer-bound format, compiler executable digest, runtime
 manifest contents, cache purpose and length-framed analysis inputs. Session inputs
 include configuration, ordered source identities and contents, imports, and loaded
 library identities and contents. Dependency inputs include ordered source IDs,
 ownership, contents, boundaries and effective consumer imports.
+
+The shared [compiler cache contracts](CACHE.md) define domain separation,
+file hashing, incompatible-format rejection and each layer's producer inputs.
 
 Entries live under `$NERI_CACHE_DIR/semantic`, or `$HOME/.neri-run-cache/semantic`.
 Both directories must be owned by the current user and have mode 0700. A checksum

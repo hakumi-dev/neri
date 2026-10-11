@@ -74,11 +74,14 @@ create_target_machine(target_platform target, optimization_mode optimization) {
     options.FunctionSections = true;
     options.DataSections = true;
   }
+  // Match the platform baseline used by Clang and Rust for Apple Silicon.
+  // Keep cross-compilation deterministic rather than selecting the host CPU.
+  const auto *cpu = target == target_platform::macos_arm64 ? "apple-m1" : "generic";
   auto machine = std::unique_ptr<llvm::TargetMachine>(backend->createTargetMachine(
-      triple, "generic", "", options, llvm::Reloc::PIC_,
+      triple, cpu, "", options, llvm::Reloc::PIC_,
       llvm::CodeModel::Small,
       optimization == optimization_mode::debug ? llvm::CodeGenOptLevel::None
-                                               : llvm::CodeGenOptLevel::Default));
+                                               : llvm::CodeGenOptLevel::Aggressive));
   if (machine == nullptr) {
     throw codegen_error(codegen_error_kind::emission,
                         "LLVM could not create a target machine for '" +
@@ -114,7 +117,7 @@ void optimize_module(llvm::Module &module, llvm::TargetMachine &machine,
   auto pipeline = optimization == optimization_mode::debug
                       ? passes.buildO0DefaultPipeline(llvm::OptimizationLevel::O0)
                       : passes.buildPerModuleDefaultPipeline(
-                            llvm::OptimizationLevel::O2);
+                            llvm::OptimizationLevel::O3);
   pipeline.run(module, modules);
 }
 

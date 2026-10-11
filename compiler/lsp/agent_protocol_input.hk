@@ -1,0 +1,172 @@
+use buffers
+use host
+
+class AgentProtocolInput
+  private input: LspInput
+  private bytes: buffers::ByteBuffer = new buffers::ByteBuffer(2097152, 256)
+  private exceeded: Bool = false
+  private ended: Bool = false
+  private queued: ValueBuffer<AgentInputLine?> = new ValueBuffer<AgentInputLine?>(null)
+  private position: Int = 0
+  private queuedCount: Int = 0
+  private queuedBytes: Int = 0
+  private activeId: String = ""
+  private cancelled: Bool = false
+
+  def init(input: LspInput): Void
+    this.input = input
+    while this.queued.size < 64
+      this.queued.add(null)
+    end
+  end
+
+  def begin(id: String): AnalysisControl
+    this.activeId = id
+    this.cancelled = false
+    this.consumeQueuedCancellations()
+    return new AnalysisControl() do
+      return this.poll()
+    end
+  end
+
+  def finish(): Void
+    this.activeId = ""
+  end
+
+  private def accept(byte: Int): AgentInputLine?
+    if byte < 0
+      this.ended = true
+      if this.bytes.length() == 0 && !this.exceeded
+        return AgentInputLine.eof()
+      end
+    else if byte != 10
+      if !this.exceeded && !this.bytes.append(byte as Byte)
+        this.exceeded = true
+      end
+      return null
+    end
+    let text = this.bytes.text()
+    let exceeded = this.exceeded
+
+    this.bytes = new buffers::ByteBuffer(2097152, 256)
+    this.exceeded = false
+    if exceeded
+      return AgentInputLine.limit()
+    end
+    if text == null
+      return AgentInputLine.invalid()
+    end
+    return byte < 0 ? AgentInputLine.truncated(text) : AgentInputLine.complete(text)
+  end
+
+  def readLine(): AgentInputLine
+    if this.queuedCount > 0
+      let line = this.queued.get(this.position)
+
+      this.queued.set(this.position, null)
+      this.position = this.position == 63 ? 0 : this.position + 1
+      this.queuedCount = this.queuedCount - 1
+      if line != null
+        let text = line.text()
+
+        if text != null
+          this.queuedBytes = this.queuedBytes - host::stringByteLength(text)
+        end
+        return line
+      end
+    end
+    if this.ended
+      return AgentInputLine.eof()
+    end
+    while true
+      let line = this.accept(this.input.readByte())
+
+      if line != null
+        return line
+      end
+    end
+    return AgentInputLine.eof()
+  end
+
+  private def cancellation(line: AgentInputLine): Bool
+    let text = line.completeText()
+
+    if text == null
+      return false
+    end
+    let parser = new LspJsonParser(text)
+    let message = parser.parse()
+
+    parser.spaces()
+    if parser.failed || parser.position != host::stringByteLength(text) || !agentValidEnvelope(message)
+      return false
+    end
+    return !agentHasId(message) && message.get("method").scalarText() == "notifications/cancelled" && lspJsonStringify(message.get("params").get("requestId")) == this.activeId
+  end
+
+  private def consumeQueuedCancellations(): Void
+    var index = 0
+
+    while index < this.queuedCount
+      let offset = this.position + index
+      let slot = offset >= 64 ? offset - 64 : offset
+      let line = this.queued.get(slot)
+
+      if line != null && this.cancellation(line)
+        this.cancelled = true
+        let text = line.text()
+
+        if text != null
+          this.queuedBytes = this.queuedBytes - host::stringByteLength(text)
+        end
+        var following = index + 1
+
+        while following < this.queuedCount
+          let previous = this.position + following - 1
+          let next = this.position + following
+
+          this.queued.set(previous >= 64 ? previous - 64 : previous, this.queued.get(next >= 64 ? next - 64 : next))
+          following = following + 1
+        end
+        let last = this.position + this.queuedCount - 1
+
+        this.queued.set(last >= 64 ? last - 64 : last, null)
+        this.queuedCount = this.queuedCount - 1
+      else
+        index = index + 1
+      end
+    end
+  end
+
+  def poll(): Bool
+    this.consumeQueuedCancellations()
+    var count = 0
+
+    while !this.ended && this.queuedCount < 64 && this.queuedBytes + this.bytes.length() < 8388608 && count < 65536
+      let byte = this.input.tryReadByte()
+
+      if byte == -2
+        break
+      end
+      count = count + 1
+      let line = this.accept(byte)
+
+      if line != null
+        if this.cancellation(line)
+          this.cancelled = true
+        else
+          let tail = this.position + this.queuedCount
+
+          this.queued.set(tail >= 64 ? tail - 64 : tail, line)
+          this.queuedCount = this.queuedCount + 1
+          let text = line.text()
+
+          if text != null
+            this.queuedBytes = this.queuedBytes + host::stringByteLength(text)
+          end
+        end
+      end
+    end
+    return !this.cancelled
+  end
+end

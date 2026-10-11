@@ -1,17 +1,31 @@
 # Memory and performance checks
 
 This document describes workloads, measurement boundaries and enforced contracts.
-Store and publish per-run evidence according to the
-[benchmark source and result policy](../benchmarks/README.md#source-and-result-policy).
 For managed allocation and GC diagnostics, see [runtime memory profiling](MEMORY-PROFILING.md).
+
+## Local measurements
+
+Exploratory benchmark programs, comparison implementations and per-run evidence
+live in the ignored `benchmark/` directory. Product builds and CI correctness
+checks operate independently of that local workspace.
+
+Record workload inputs, correctness oracles, source and executable hashes,
+compiler/runtime versions, build settings, hardware, process order and raw samples.
+Separate startup, steady execution and instrumented memory measurements. Repeat
+independent processes and inspect warmup behavior before interpreting VM timings.
+Peak process RSS includes runtime and allocator overhead; it is distinct from
+live payload and cumulative allocated bytes.
+
+These boundaries follow [Georges et al., OOPSLA 2007](https://users.elis.ugent.be/~leeckhou/papers/oopsla07-stat.pdf)
+and the experimental-bias analysis of [Mytkowicz et al., ASPLOS 2009](https://www2.ccs.neu.edu/racket/Performance/mytkowicz.pdf).
+Measurements characterize the recorded workloads and host. Correctness tests
+enforce language and runtime contracts independently of timing results.
 
 ## UTF-8 construction
 
-`benchmarks/text.hk` compares the `String` concatenation operator, the `text::concat` library
+A UTF-8 construction workload compares the `String` concatenation operator, the `text::concat` library
 wrapper and `buffers::TextBuffer` with a reserved final capacity. Each appends
 `abcdé😀` (10 bytes, six scalars) and checks the resulting byte/scalar lengths.
-Build with `neri build benchmarks/text.hk --release --output build/text-benchmark`;
-run `/usr/bin/time -l build/text-benchmark <concat|library|builder> <count>` on macOS.
 
 Milliseconds measure the construction region inside the executable;
 RSS covers the entire process, including runtime and final validation.
@@ -171,15 +185,8 @@ Concurrent builders may duplicate work; readers only accept complete entries.
 Arguments and runtime environment are applied on every execution. Program output
 and exit status are never memoized. Cache I/O failures preserve uncached execution.
 
-Run the standalone Neri benchmark from the repository root:
-
-```sh
-scripts/neri.sh build benchmarks/run-latency.hk compiler/ir/process.hk --release --output build/run-latency
-./build/run-latency scripts/neri.sh examples/hello.hk build/run-latency.jsonl
-```
-
-It creates an isolated empty cache, records its first run, warms both cases,
-then records ten alternating-order samples each for warm-cache and uncached runs.
+Use an isolated empty cache, record its first run, warm both cases,
+then record alternating-order samples for warm-cache and uncached runs.
 The monotonic wall measurements include the launcher and child program, with
 millisecond resolution. An empty Neri cache does not imply a cold OS filesystem
 or loader cache. Compare medians and retain raw samples; small samples do not
@@ -306,13 +313,13 @@ access paths contributes `sum(d(b))` path segments; one binding per frame can
 therefore contribute `H(H-1)/2` segments after `H` submissions. Typed query
 parameters remove that source expansion, while retained symbol lookup remains.
 
-The benchmark measures synthetic semantic queries. RSS includes context preparation, retained analysis and
-the runtime. Reproduction commands and workload parameters are in the
-[benchmark instructions](../benchmarks/session/README.md#semantic-completion).
+Synthetic semantic-query measurements include context preparation, retained
+analysis and the runtime in process RSS. Keep reproduction commands and workload
+parameters with the local evidence.
 
 ## Executable sessions
 
-The Neri-owned session benchmark measures an application initializer and typed
+A local session workload measures an application initializer and typed
 incremental submissions through `ExecutableSession`. The driver is built in
 Release mode; submitted modules use `SessionToolchain`'s default Debug mode.
 Initializer timing includes preparation, compilation, linking or object loading,
@@ -320,10 +327,10 @@ and execution. Submission execution rows exclude separately recorded preparation
 
 Use a separate new private code-cache directory for each backend and workload.
 The first artifact is a Neri code-cache miss; operating-system file, loader and
-disk caches retain their own state. The benchmark invokes application initializers
+disk caches retain their own state. Invoke application initializers
 through the session API. Measure application command-line startup and full
-console rebuilds separately. Commands, workload parameters and report formats
-are in the [session benchmark instructions](../benchmarks/session/README.md).
+console rebuilds separately. Keep commands, workload parameters and report formats
+with the local evidence.
 
 Dependency-keyed reuse follows the task/rebuild distinction in
 [Build Systems à la Carte](https://simon.peytonjones.org/assets/pdfs/build-systems-original.pdf).
@@ -338,9 +345,8 @@ an implementation of that paper's formal proof.
 Release kernels retain checked arithmetic, bounds checks and managed collection.
 `tasks::generate` executes independent index callbacks on a bounded worker pool,
 shares captured graphs through read-only views and joins before returning ordered
-results. Task-local allocation and mutation are permitted. Workload definitions,
-configuration controls and reproduction commands are in the
-[benchmark instructions](../benchmarks/README.md#multicore-execution).
+results. Task-local allocation and mutation are permitted. Keep workload definitions,
+configuration controls and reproduction commands with the local evidence.
 
 Compute scaling within one run against the implementation's ordinary sequential
 loop. Include scheduling, result storage and joining. Record core topology and
@@ -349,7 +355,7 @@ modes using the same reference assembly and tiering configuration, and retain
 sample distributions and whole-process metrics. Process RSS includes runtime and
 JIT memory as well as managed objects. A warmup alone does not prove steady state.
 
-The analytical boundaries are [work/span and Roofline](../benchmarks/README.md#analytical-foundations):
+The analytical boundaries are total work, critical-path length and memory traffic:
 independent work exposes parallelism, while allocation, collection and memory
 access can limit scaling. A ratio alone does not identify which cost dominates.
 
@@ -394,16 +400,11 @@ indexing rather than on each lookup. Source loading likewise indexes supplied
 canonical paths and source identities; each source's library imports are lexed
 once during that load.
 
-`scripts/build.sh benchmark` compiles `benchmarks/collections.hk` with the current
-compiler and runtime. It compares flat-array append with the compiler's actual
-`IntBuffer`, using 2048, 4096 and 8192 elements. Each process performs 16 complete
-append-and-traverse rounds and must print the expected sum. One warmup process
-precedes five measured processes per case. The report is `build/tmp/work.*/collections.jsonl`;
-process sidecars retain wall time, user/system CPU time and peak RSS from `wait4`.
-
-The workload enforces exact results and a 30-second process deadline. CPU/RSS
-samples are recorded for trend review. Wall time includes the helper's polling
-interval; CPU time is the more useful signal for these short processes.
+Collection workloads compare flat-array append with the compiler's actual buffers
+and verify exact append-and-traverse checksums. Retain wall time, user/system CPU
+time and peak RSS from independent processes. When a process helper polls for
+completion, its wall time includes the polling interval; CPU time is the more
+useful signal for short processes.
 
 `host::appendByte`, `host::appendInt`, and `host::appendString` return a new flat
 array and copy its prior contents. Appending N elements copies N(N-1)/2 existing

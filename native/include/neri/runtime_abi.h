@@ -164,6 +164,10 @@ typedef struct neri_array_prefix_v1 {
 } neri_array_prefix_v1;
 
 typedef void (*neri_gc_visit_slot_fn_v1)(neri_ref_v1 *slot, void *context);
+/* Trace callbacks only read application memory and report reference slots.
+ * They must not mutate payloads or roots, allocate managed objects, or reenter
+ * collection. Each visitor call forwards the supplied context unchanged.
+ * The nonmoving visitor leaves reference slot contents unchanged. */
 typedef void (*neri_gc_trace_fn_v1)(neri_ref_v1 object,
                                       neri_gc_visit_slot_fn_v1 visit,
                                       void *context);
@@ -281,10 +285,26 @@ NERI_RT_API void neri_rt_v1_foreign_leave(neri_foreign_entry_v1 *entry);
 NERI_RT_API neri_ref_v1
 neri_rt_v1_gc_alloc(const neri_type_descriptor_v1 *type,
                       uint64_t payload_size, uint64_t payload_alignment);
+/* ABI 1.35: reference-free array construction. The header and length are
+ * initialized, but elements are not. The caller must initialize every element
+ * before exposing the array or reading it, and set its length explicitly.
+ * Descriptors with references or trace callbacks are rejected. */
+NERI_RT_API neri_ref_v1 neri_rt_v1_array_alloc_uninitialized(
+    const neri_type_descriptor_v1 *type, uint64_t payload_size,
+    uint64_t payload_alignment);
 NERI_RT_API void
 neri_rt_v1_gc_root_frame_enter(neri_gc_root_frame_v1 *frame);
 NERI_RT_API void
 neri_rt_v1_gc_root_frame_leave(neri_gc_root_frame_v1 *frame);
+
+/* ABI 1.36: compiler-proven, nonescaping allocation scopes. Entry suspends the
+ * current heap and activates a fresh child heap. Normal collection remains
+ * enabled inside the child. Leave reclaims it in bulk and resumes the parent.
+ * Tokens are thread-confined and leave in LIFO order, after all child roots and
+ * borrows have ended. No child reference may survive leave. */
+typedef struct neri_region_v1 neri_region_v1;
+NERI_RT_API neri_region_v1 *neri_rt_v1_region_enter(void);
+NERI_RT_API void neri_rt_v1_region_leave(neri_region_v1 *region);
 NERI_RT_API void neri_rt_v1_gc_store_ref(neri_ref_v1 owner,
                                              neri_ref_v1 *slot,
                                              neri_ref_v1 value);
@@ -486,6 +506,9 @@ NERI_RT_API neri_int_v1 neri_rt_v1_net_open(void);
  * immediately after failure. Paths are UTF-8 bytes without embedded NUL. */
 NERI_RT_API neri_int_v1 neri_rt_v1_file_open(const uint8_t *path, neri_int_v1 length);
 NERI_RT_API neri_int_v1 neri_rt_v1_file_size(neri_int_v1 fd);
+/* ABI 1.34: 64 opaque bytes of in-process descriptor metadata for comparison.
+ * The bytes are not a persistent identity or portable serialization. */
+NERI_RT_API neri_int_v1 neri_rt_v1_file_identity(neri_int_v1 fd, uint8_t *output64);
 NERI_RT_API neri_int_v1 neri_rt_v1_file_read(neri_int_v1 fd, uint8_t *bytes, neri_int_v1 length);
 /* ABI 1.25: wait without consuming input. 1 means readable/EOF, 0 timeout,
  * -2 interrupted, -1 error. The timeout is a nonnegative millisecond count. */
@@ -553,6 +576,12 @@ NERI_RT_API neri_int_v1 neri_rt_v1_clock_milliseconds(void);
 NERI_RT_API neri_int_v1 neri_rt_v1_clock_wall_milliseconds(neri_int_v1 *value);
 /* ABI 1.14: exact-byte SHA-256 and bounded OS entropy; zero succeeds. */
 NERI_RT_API neri_int_v1 neri_rt_v1_crypto_sha256(const uint8_t *input, neri_int_v1 length, uint8_t *digest32);
+/* ABI 1.34: finish does not dispose. Call finish at most once, then dispose
+ * exactly once for every successful begin, including after update/final failure. */
+NERI_RT_API void *neri_rt_v1_crypto_sha256_begin(void);
+NERI_RT_API neri_int_v1 neri_rt_v1_crypto_sha256_update(void *context, const uint8_t *input, neri_int_v1 length);
+NERI_RT_API neri_int_v1 neri_rt_v1_crypto_sha256_finish(void *context, uint8_t *digest32);
+NERI_RT_API neri_int_v1 neri_rt_v1_crypto_sha256_dispose(void *context);
 NERI_RT_API neri_int_v1 neri_rt_v1_crypto_random(uint8_t *output, neri_int_v1 length);
 NERI_RT_API neri_int_v1 neri_rt_v1_net_configure(neri_int_v1 fd);
 NERI_RT_API neri_int_v1 neri_rt_v1_net_bind(neri_int_v1 fd, neri_int_v1 port);

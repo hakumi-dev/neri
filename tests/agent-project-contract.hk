@@ -1,4 +1,3 @@
-use host
 use test
 
 def projectFeedbackWrite(path: String, text: String): Void
@@ -17,19 +16,192 @@ def projectFeedbackUnit(report: LspJson, key: String): LspJson
   return new LspJson()
 end
 
+def projectFeedbackStdlibContract(): Void
+  let library = host::environment("NERI_STDLIB")
+
+  test::assertTrue(library != null)
+  if library == null
+    return
+  end
+  let coreWorkspace = new NeriAgentWorkspace(library + "/manifest.json", "core")
+  let coreReport = (new LspJsonParser((new AgentDiskAnalysis(coreWorkspace)).run("core-module"))).parse()
+
+  test::assertEqual(coreReport.get("status").scalarText(), "valid")
+
+  let workspace = new NeriAgentWorkspace(library + "/manifest.json", "json")
+  let analysis = new AgentDiskAnalysis(workspace)
+  let report = (new LspJsonParser(analysis.run("json-module"))).parse()
+  let document = analysis.document
+
+  test::assertEqual(report.get("status").scalarText(), "valid")
+  test::assertTrue(document != null)
+  if document == null
+    return
+  end
+  document.uri = lspUri(bootstrapDirectory(document.sourcePath)) + "/%6Ason.hk"
+  document.text = document.text + "\ndef jsonModuleInvalid(): Int\n  return \"invalid\"\nend\n"
+  workspace.server.invalidate(document)
+  workspace.server.ensureAnalyzed(document)
+  let diagnostics = document.lastDiagnostics
+
+  test::assertTrue(document.analysisStatus.isInvalid())
+  test::assertTrue(diagnostics != null)
+  if diagnostics != null
+    test::assertEqual(diagnostics.count(), 1)
+    test::assertEqual(diagnostics.codes.get(0), "NR143")
+  end
+end
+
+def projectFeedbackCoreReferenceContract(root: String): Void
+  let core = bootstrapCoreLibraryPath()
+  let canonical = neriCanonicalPath(root)
+
+  test::assertTrue(core != null && canonical != null)
+  if core == null || canonical == null
+    return
+  end
+  var base: String = canonical
+  let libraryManifest = bootstrapDirectory(core) + "/manifest.json"
+  var reference = ""
+
+  while base != "/" && !bootstrapStartsWith(libraryManifest, base + "/")
+    reference = reference + "../"
+    let parent = bootstrapDirectory(base)
+
+    if parent == base || parent == "."
+      test::assertTrue(false)
+
+      return
+    end
+    base = parent
+  end
+  let offset = base == "/" ? 1 : host::stringByteLength(base) + 1
+
+  reference = reference + host::stringSlice(libraryManifest, offset, host::stringByteLength(libraryManifest) - offset)
+  projectFeedbackWrite(
+    root + "/manifest.json",
+    "{\"version\":2,\"units\":{\"app\":{\"kind\":\"executable\",\"sources\":[\"main.hk\"],\"references\":[{\"project\":" + lspQuote(reference) + ",\"unit\":\"core\"}]}}}"
+  )
+  projectFeedbackWrite(root + "/main.hk", "def main(): Void\nend\n")
+  let report = (new LspJsonParser((new AgentDiskAnalysis(new NeriAgentWorkspace(
+            root,
+            "app"
+          ))).run("supplied-core"))).parse()
+
+  test::assertEqual(report.get("status").scalarText(), "valid")
+end
+
+def projectFeedbackAdvisoryContract(root: String): Void
+  projectFeedbackWrite(
+    root + "/manifest.json",
+    "{\"version\":2,\"units\":{\"app\":{\"kind\":\"executable\",\"sources\":[\"main.hk\",\"imports.hk\"]}}}"
+  )
+  projectFeedbackWrite(root + "/main.hk", "def main(): Void\nend\n")
+  projectFeedbackWrite(root + "/imports.hk", "# 😀\nuse console\n")
+  let session = new AgentProjectFeedback(root)
+  let initialText = session.collect("advisory")
+  let initial = (new LspJsonParser(initialText)).parse()
+  let inputs = session.inputs
+  let unit = initial.get("units").first
+  let canonical = neriCanonicalPath(root)
+
+  test::assertEqual(initial.get("status").scalarText(), "valid")
+  test::assertEqual(initial.get("diagnosticCount").scalarText(), "1")
+  test::assertTrue(unit != null)
+  test::assertTrue(canonical != null)
+  if unit == null || canonical == null
+    return
+  end
+  let diagnostic = unit.get("diagnostics").first
+
+  test::assertTrue(diagnostic != null)
+  if diagnostic != null
+    test::assertEqual(diagnostic.get("code").scalarText(), "NR_UNUSED_USE")
+    test::assertEqual(diagnostic.get("severity").scalarText(), "4")
+    test::assertEqual(diagnostic.get("uri").scalarText(), lspUri(canonical + "/imports.hk"))
+    test::assertEqual(diagnostic.get("range").get("start").get("line").scalarText(), "1")
+    test::assertEqual(diagnostic.get("range").get("end").get("character").scalarText(), "11")
+  end
+  let cached = (new LspJsonParser(session.collect("cached-advisory", inputs, initialText, false))).parse()
+
+  test::assertEqual(cached.get("unitsReused").scalarText(), "1")
+  test::assertEqual(cached.get("diagnosticCount").scalarText(), "1")
+  projectFeedbackWrite(root + "/main.hk", "def main(): Void\n  println(\"used\")\nend\n")
+  let changed = (new LspJsonParser(session.collect("resolved-advisory", inputs, initialText))).parse()
+
+  test::assertEqual(changed.get("status").scalarText(), "valid")
+  test::assertEqual(changed.get("diagnosticCount").scalarText(), "0")
+  test::assertEqual(changed.get("unitsAnalyzed").scalarText(), "1")
+  let compact = (new LspJsonParser(agentHookFeedback(lspJsonStringify(changed)))).parse()
+
+  test::assertTrue(compact.get("units").first == null)
+  let changedInputs = session.inputs
+
+  projectFeedbackWrite(root + "/imports.hk", "use console\n\ndef helper(): Void\nend\ndef another(): Void\nend\n")
+  let styledText = session.collect("style", changedInputs, lspJsonStringify(changed))
+  let styled = (new LspJsonParser(styledText)).parse()
+  let styledInputs = session.inputs
+
+  test::assertEqual(styled.get("status").scalarText(), "valid")
+  test::assertEqual(styled.get("diagnosticCount").scalarText(), "1")
+  projectFeedbackWrite(root + "/.editorconfig", "root = true\n[*.hk]\nneri_diagnostic.NRSTYLE009.severity = none\n")
+  let configured = (new LspJsonParser(session.collect("configuration", styledInputs, styledText))).parse()
+
+  test::assertEqual(configured.get("status").scalarText(), "valid")
+  test::assertEqual(configured.get("diagnosticCount").scalarText(), "0")
+  test::assertEqual(configured.get("unitsAnalyzed").scalarText(), "1")
+  test::assertTrue(configured.get("snapshot").scalarText() != styled.get("snapshot").scalarText())
+end
+
 def main(): Void
+  let mode = host::argumentAt(0)
+
+  if mode != null && mode == "feedback-worker"
+    let root = host::argumentAt(2)
+
+    if root != null && host::readText(bootstrapDirectory(root) + "/.worker-crash") != null
+      host::removeFile(bootstrapDirectory(root) + "/.worker-crash")
+      return
+    end
+    agentFeedbackWorkerMain()
+    return
+  end
+  if mode != null && mode == "feedback-client"
+    let manifest = host::argumentAt(1)
+    let operation = host::argumentAt(2)
+    let output = host::argumentAt(3)
+
+    if manifest != null && operation != null && output != null
+      let report = agentPersistentProjectFeedback(manifest, operation)
+      let current = (new LspJsonParser(report)).parse()
+      let fresh = (new LspJsonParser((new AgentProjectFeedback(manifest)).collect(operation))).parse()
+
+      test::assertEqual(current.get("status").scalarText(), fresh.get("status").scalarText())
+      test::assertEqual(current.get("snapshot").scalarText(), fresh.get("snapshot").scalarText())
+      projectFeedbackWrite(output, report)
+    end
+    return
+  end
+  projectFeedbackDiagnosticPages()
+  projectFeedbackStdlibContract()
   let work = host::argumentAt(2)
 
   test::assertTrue(work != null)
   if work == null
     return
   end
+  projectFeedbackPersistentContract(work)
+  projectFeedbackDeliveryContract(work)
+  projectFeedbackTransportContract(work)
+  projectFeedbackSymlinkContract(work)
   let root = bootstrapTemporaryDirectory(work, "agent-project")
 
   test::assertTrue(root != null)
   if root == null
     return
   end
+  projectFeedbackCoreReferenceContract(root)
+  projectFeedbackAdvisoryContract(root)
   let manifest = root + "/manifest.json"
   let config = "{\"version\":2,\"units\":{\"model\":{\"kind\":\"library\",\"sources\":[\"model.hk\"]},\"first\":{\"kind\":\"executable\",\"sources\":[\"first.hk\"],\"references\":[\"model\"]},\"second\":{\"kind\":\"executable\",\"sources\":[\"second.hk\"],\"references\":[\"model\"]},\"isolated\":{\"kind\":\"executable\",\"sources\":[\"isolated.hk\"]}}}"
 
@@ -65,7 +237,11 @@ def main(): Void
   test::assertEqual(missingReport.get("unitsAnalyzed").scalarText(), "4")
   # A complete-looking record with inconsistent totals is not reusable.
   initial.get("diagnosticCount").replace(LspJsonValue.Number("1"))
-  let inconsistent = (new LspJsonParser(session.collect("inconsistent-cache", initialInputs, lspJsonStringify(initial)))).parse()
+  let inconsistent = (new LspJsonParser(session.collect(
+        "inconsistent-cache",
+        initialInputs,
+        lspJsonStringify(initial)
+      ))).parse()
 
   test::assertEqual(inconsistent.get("unitsAnalyzed").scalarText(), "4")
   projectFeedbackWrite(root + "/model.hk", "def value(): String\n  return \"changed\"\nend\n")
@@ -93,4 +269,378 @@ def main(): Void
   test::assertEqual(unavailable.get("status").scalarText(), "unavailable")
   test::assertTrue(unavailable.get("complete").isFalse())
   test::assertEqual(session.inputs, "")
+end
+
+def projectFeedbackSymlinkContract(work: String): Void
+  let directory = bootstrapTemporaryDirectory(work, "feedback-symlink")
+  let external = bootstrapTemporaryDirectory(work, "feedback-symlink-target")
+
+  test::assertTrue(directory != null && external != null)
+  if directory == null || external == null
+    return
+  end
+  projectFeedbackWrite(
+    directory + "/manifest.json",
+    "{\"version\":2,\"units\":{\"app\":{\"kind\":\"executable\",\"sources\":[\"linked\"]}}}"
+  )
+  projectFeedbackWrite(external + "/main.hk", "def main(): Void\nend\n")
+  let linked = host::run("/bin/ln", ["-s", external, directory + "/linked"])
+
+  test::assertTrue(linked != null && linked == 0)
+  let rejected = projectFeedbackPersistentCompare(
+    new AgentDiskFeedbackService(directory + "/manifest.json"),
+    directory + "/manifest.json",
+    "symlink-root"
+  )
+
+  test::assertEqual(rejected.get("status").scalarText(), "unavailable")
+  projectFeedbackWrite(
+    external + "/manifest.json",
+    "{\"version\":2,\"units\":{\"library\":{\"kind\":\"library\",\"sources\":[\".\"]}}}"
+  )
+  projectFeedbackWrite(external + "/main.hk", "def dependency(): Int\n  return 1\nend\n")
+  projectFeedbackWrite(directory + "/main.hk", "def main(): Void\nend\n")
+  projectFeedbackWrite(
+    directory + "/manifest.json",
+    "{\"version\":2,\"units\":{\"app\":{\"kind\":\"executable\",\"sources\":[\"main.hk\"],\"references\":[{\"project\":\"linked/manifest.json\",\"unit\":\"library\"}]}}}"
+  )
+  let service = new AgentDiskFeedbackService(directory + "/manifest.json")
+  let initial = projectFeedbackPersistentCompare(service, directory + "/manifest.json", "symlink-reference")
+
+  projectFeedbackWrite(external + "/added.hk", "def added(): Int\n  return \"invalid\"\nend\n")
+  let changed = projectFeedbackPersistentCompare(service, directory + "/manifest.json", "symlink-member")
+
+  test::assertEqual(initial.get("status").scalarText(), "valid")
+  test::assertEqual(changed.get("status").scalarText(), "invalid")
+  test::assertTrue(initial.get("snapshot").scalarText() != changed.get("snapshot").scalarText())
+end
+
+def projectFeedbackTransportContract(work: String): Void
+  let directory = bootstrapTemporaryDirectory(work, "feedback-transport")
+  let executable = host::executablePath()
+
+  test::assertTrue(directory != null && executable != null)
+  if directory == null || executable == null
+    return
+  end
+  let manifest = directory + "/manifest.json"
+
+  projectFeedbackWrite(
+    manifest,
+    "{\"version\":2,\"units\":{\"app\":{\"kind\":\"executable\",\"sources\":[\"main.hk\"]}}}"
+  )
+  projectFeedbackWrite(directory + "/main.hk", "def main(): Void\nend\n")
+  projectFeedbackWrite(directory + "/.worker-crash", "once")
+  let recovered = (new LspJsonParser(agentPersistentProjectFeedback(manifest, "crash"))).parse()
+  let restarted = (new LspJsonParser(agentPersistentProjectFeedback(manifest, "restart"))).parse()
+
+  test::assertEqual(recovered.get("status").scalarText(), "valid")
+  test::assertEqual(recovered.get("execution").get("mode").scalarText(), "fresh-fallback")
+  test::assertTrue(recovered.get("execution").get("cause").scalarText() != "")
+  test::assertEqual(restarted.get("execution").get("mode").scalarText(), "persistent")
+  test::assertEqual(restarted.get("snapshot").scalarText(), recovered.get("snapshot").scalarText())
+  let firstOptions = new process::SpawnOptions(executable)
+  let secondOptions = new process::SpawnOptions(executable)
+  let firstOutput = work + "/feedback-client-first.json"
+  let secondOutput = work + "/feedback-client-second.json"
+
+  firstOptions.arguments = ["feedback-client", manifest, "first", firstOutput]
+  secondOptions.arguments = ["feedback-client", manifest, "second", secondOutput]
+  let first = process::spawn(firstOptions).child()
+  let second = process::spawn(secondOptions).child()
+
+  test::assertTrue(first != null && second != null)
+  if first == null || second == null
+    return
+  end
+  let firstDone = first.wait(30000)
+  let secondDone = second.wait(30000)
+  let firstText = host::readText(firstOutput)
+  let secondText = host::readText(secondOutput)
+
+  test::assertTrue(!firstDone.running && !secondDone.running && firstDone.failure == null && secondDone.failure == null)
+  test::assertTrue(first.dispose() && second.dispose())
+  test::assertTrue(firstText != null && secondText != null)
+  if firstText != null && secondText != null
+    let firstReport = (new LspJsonParser(firstText)).parse()
+    let secondReport = (new LspJsonParser(secondText)).parse()
+
+    test::assertEqual(firstReport.get("status").scalarText(), "valid")
+    test::assertEqual(secondReport.get("status").scalarText(), "valid")
+    test::assertEqual(firstReport.get("operationId").scalarText(), "first")
+    test::assertEqual(secondReport.get("operationId").scalarText(), "second")
+    test::assertEqual(firstReport.get("snapshot").scalarText(), secondReport.get("snapshot").scalarText())
+  end
+  let runtimePath = host::environment("NERI_RUNTIME_MANIFEST")
+  let runtime = runtimePath == null ? null : host::readText(runtimePath)
+
+  test::assertTrue(runtime != null)
+  if runtime != null
+    let configuredPath = work + "/feedback-toolchain.json"
+    let configured = new process::SpawnOptions(executable)
+
+    configured.arguments = ["feedback-client", manifest, "toolchain", firstOutput]
+    configured.environment = [new process::EnvironmentEntry("NERI_RUNTIME_MANIFEST", configuredPath)]
+    projectFeedbackWrite(configuredPath, runtime)
+    let initial = projectFeedbackTransportClient(configured, firstOutput)
+
+    projectFeedbackWrite(configuredPath, runtime + "\n")
+    let changed = projectFeedbackTransportClient(configured, firstOutput)
+
+    test::assertEqual(initial.get("status").scalarText(), "valid")
+    test::assertEqual(changed.get("status").scalarText(), "valid")
+    test::assertTrue(initial.get("snapshot").scalarText() != changed.get("snapshot").scalarText())
+  end
+end
+
+def projectFeedbackTransportClient(options: process::SpawnOptions, output: String): LspJson
+  let child = process::spawn(options).child()
+
+  test::assertTrue(child != null)
+  if child == null
+    return new LspJson()
+  end
+  let completed = child.wait(30000)
+  let exit = completed.exit
+  let text = host::readText(output)
+
+  test::assertTrue(!completed.running && completed.failure == null && exit != null && exit.isExited() && exit.value() == 0)
+  test::assertTrue(child.dispose())
+  test::assertTrue(text != null)
+  return text == null ? new LspJson() : (new LspJsonParser(text)).parse()
+end
+
+def projectFeedbackPersistentCompare(service: AgentDiskFeedbackService, manifest: String, operation: String): LspJson
+  let current = (new LspJsonParser(service.collect(operation))).parse()
+  let fresh = (new LspJsonParser((new AgentProjectFeedback(manifest)).collect(operation))).parse()
+
+  test::assertEqual(current.get("status").scalarText(), fresh.get("status").scalarText())
+  test::assertEqual(current.get("snapshot").scalarText(), fresh.get("snapshot").scalarText())
+  test::assertEqual(current.get("diagnosticCount").scalarText(), fresh.get("diagnosticCount").scalarText())
+  var diagnostics = projectFeedbackDiagnosticIdentity(current)
+  var cursor = current.get("nextCursor").scalarText()
+  var pages = 0
+
+  while cursor != "" && pages < 512
+    let page = (new LspJsonParser(service.collect(operation, current.get("snapshot").scalarText(), cursor))).parse()
+
+    test::assertEqual(page.get("snapshot").scalarText(), current.get("snapshot").scalarText())
+    test::assertTrue(page.get("pageFailure").scalarText() == "")
+    diagnostics = diagnostics + projectFeedbackDiagnosticIdentity(page)
+    cursor = page.get("nextCursor").scalarText()
+    pages = pages + 1
+  end
+
+  test::assertTrue(cursor == "")
+  test::assertEqual(diagnostics, projectFeedbackDiagnosticIdentity(fresh))
+  return current
+end
+
+def projectFeedbackDiagnosticIdentity(report: LspJson): String
+  let parts = new StringBuffer()
+  var unit = report.get("units").first
+
+  while unit != null
+    var diagnostic = unit.get("diagnostics").first
+
+    while diagnostic != null
+      parts.add(runCacheFrame(unit.get("projectKey").scalarText()) + runCacheFrame(lspJsonStringify(diagnostic)))
+      diagnostic = diagnostic.next
+    end
+    unit = unit.next
+  end
+  return parts.join()
+end
+
+def projectFeedbackPersistentContract(work: String): Void
+  let directory = bootstrapTemporaryDirectory(work, "persistent-feedback")
+
+  test::assertTrue(directory != null)
+  if directory == null
+    return
+  end
+  let manifest = directory + "/manifest.json"
+
+  projectFeedbackWrite(manifest, "{\"version\":2,\"units\":{\"app\":{\"kind\":\"executable\",\"sources\":[\".\"]}}}")
+  projectFeedbackWrite(directory + "/main.hk", "def main(): Void\nend\n")
+  let service = new AgentDiskFeedbackService(manifest)
+  let cold = projectFeedbackPersistentCompare(service, manifest, "cold")
+  let warm = projectFeedbackPersistentCompare(service, manifest, "warm")
+
+  test::assertEqual(cold.get("unitsAnalyzed").scalarText(), "1")
+  test::assertEqual(warm.get("unitsReused").scalarText(), "1")
+  projectFeedbackWrite(directory + "/main.hk", "def main(): Void\n  let value: Int = \"invalid\"\nend\n")
+  let edited = projectFeedbackPersistentCompare(service, manifest, "edit")
+  let conflict = (new LspJsonParser(service.collect("stale", warm.get("snapshot").scalarText()))).parse()
+
+  test::assertEqual(edited.get("status").scalarText(), "invalid")
+  test::assertTrue(!agentCachedProjectReport(edited))
+  test::assertEqual(conflict.get("status").scalarText(), "conflict")
+  projectFeedbackWrite(
+    directory + "/main.hk",
+    "# Shift the error range.\n\ndef main(): Void\n  let value: Int = \"invalid\"\nend\n"
+  )
+  let shifted = projectFeedbackPersistentCompare(service, manifest, "shifted-error")
+
+  test::assertEqual(shifted.get("diagnosticCount").scalarText(), edited.get("diagnosticCount").scalarText())
+  test::assertTrue(projectFeedbackDiagnosticIdentity(shifted) != projectFeedbackDiagnosticIdentity(edited))
+  projectFeedbackWrite(directory + "/main.hk", "def main(): Void\n  let value: Int = \"invalid\"\nend\n")
+  projectFeedbackWrite(directory + "/extra.hk", "def extra(): Int\n  return 1\nend\n")
+  let created = projectFeedbackPersistentCompare(service, manifest, "create")
+
+  test::assertTrue(created.get("snapshot").scalarText() != edited.get("snapshot").scalarText())
+  test::assertTrue(host::removeFile(directory + "/extra.hk"))
+  let deleted = projectFeedbackPersistentCompare(service, manifest, "delete")
+
+  test::assertEqual(deleted.get("snapshot").scalarText(), edited.get("snapshot").scalarText())
+  projectFeedbackWrite(
+    directory + "/.editorconfig",
+    "root = true\n[*.hk]\nneri_diagnostic.NRSTYLE001.severity = none\n"
+  )
+  let configured = projectFeedbackPersistentCompare(service, manifest, "config")
+
+  test::assertTrue(configured.get("snapshot").scalarText() != deleted.get("snapshot").scalarText())
+  projectFeedbackWrite(directory + "/unrelated.json", "{}")
+  let inventory = projectFeedbackPersistentCompare(service, manifest, "inventory")
+
+  test::assertEqual(inventory.get("snapshot").scalarText(), configured.get("snapshot").scalarText())
+  projectFeedbackPageContract(manifest)
+end
+
+def projectFeedbackPageContract(manifest: String): Void
+  let followingName = "feedback_unit_with_a_deliberately_longer_protocol_identity_for_response_budget_coverage"
+
+  projectFeedbackWrite(
+    manifest,
+    "{\"version\":2,\"units\":{\"app\":{\"kind\":\"executable\",\"sources\":[\"main.hk\"]}," + lspQuote(followingName) + ":{\"kind\":\"executable\",\"sources\":[\"main.hk\"]}}}"
+  )
+  let graph = new AgentProjectGraph(manifest)
+  let key = graph.manifest + "#app"
+  let following = graph.manifest + "#" + followingName
+  let followingUnit = "{\"projectKey\":" + lspQuote(following) + ",\"status\":\"unavailable\",\"message\":\"second missing input\",\"diagnosticCount\":0,\"diagnosticsTruncated\":false,\"diagnostics\":[]}"
+  let actionable = "{\"snapshot\":\"page\",\"status\":\"unavailable\",\"units\":[{\"projectKey\":" + lspQuote(key) + ",\"status\":\"unavailable\",\"message\":\"required input missing\",\"diagnosticCount\":0,\"diagnosticsTruncated\":false,\"diagnostics\":[]}," + followingUnit + "]}"
+  let page = new AgentFeedbackPage("page", "", 1, 2048)
+  let encoded = page.render(actionable, graph, "page")
+
+  test::assertTrue(encoded != null)
+  if encoded == null
+    return
+  end
+  let report = (new LspJsonParser(encoded)).parse()
+  let first = report.get("units").first
+
+  test::assertTrue(host::stringByteLength(encoded) <= 2048)
+  test::assertTrue(first != null)
+  if first != null
+    test::assertEqual(first.get("message").scalarText(), "required input missing")
+  end
+  let continuation = (new LspJsonParser(report.get("nextCursor").scalarText())).parse()
+
+  test::assertEqual(continuation.get("unit").scalarText(), following)
+  var oversized = ""
+  var index = 0
+
+  while index < 2048
+    oversized = oversized + "x"
+    index = index + 1
+  end
+  let diagnostics = "{\"snapshot\":\"page\",\"status\":\"invalid\",\"units\":[{\"projectKey\":" + lspQuote(key) + ",\"status\":\"invalid\",\"diagnosticCount\":1,\"diagnosticsTruncated\":false,\"diagnostics\":[{\"message\":" + lspQuote(oversized) + "}]}]}"
+  let limited = (new AgentFeedbackPage("page", "", 1, 1024)).render(diagnostics, graph, "page")
+
+  test::assertTrue(limited != null)
+  if limited != null
+    let result = (new LspJsonParser(limited)).parse()
+    let unit = result.get("units").first
+
+    test::assertTrue(host::stringByteLength(limited) <= 1024)
+    test::assertTrue(result.get("pageFailure").scalarText() != "")
+    test::assertTrue(result.get("nextCursor").scalarText() != "")
+    test::assertTrue(unit != null)
+    if unit != null
+      test::assertTrue(unit.get("diagnostics").first == null)
+    end
+  end
+end
+
+def projectFeedbackDeliveryContract(work: String): Void
+  let directory = bootstrapTemporaryDirectory(work, "feedback-delivery")
+
+  test::assertTrue(directory != null)
+  if directory == null
+    return
+  end
+  let state = directory + "/state"
+  let first = new AgentFeedbackDelivery(state)
+
+  test::assertTrue(!first.seen("A", "snapshot", "page"))
+  first.remember("A", "snapshot", "page")
+  let second = new AgentFeedbackDelivery(state)
+
+  test::assertTrue(!second.seen("B", "snapshot", "page"))
+  second.remember("B", "snapshot", "page")
+  let returned = new AgentFeedbackDelivery(state)
+
+  test::assertTrue(returned.seen("A", "snapshot", "page"))
+  test::assertTrue(!returned.seen("A", "changed", "page"))
+  test::assertTrue(!returned.seen("", "snapshot", "page"))
+  test::assertEqual(agentFeedbackShellQuote("a'b'c"), "'a'\\''b'\\''c'")
+end
+
+def projectFeedbackDiagnosticPages(): Void
+  let document = new LspDocument()
+  let diagnostics = new DiagnosticBuffer()
+
+  document.uri = "untitled:diagnostic-pages"
+  document.text = "x"
+  document.sourceUris.add(document.uri)
+  document.sourceTexts.add(document.text)
+  document.sourceStarts.add(0)
+  document.lastDiagnostics = diagnostics
+  var index = 0
+
+  while index < 260
+    diagnostics.add("NR_PAGE", 0, 1, index as String)
+    index = index + 1
+  end
+  var offset = 0
+  var received = 0
+
+  while offset >= 0
+    let page = agentDocumentDiagnosticPage(document, offset, 37)
+    var item = (new LspJsonParser(page.items)).parse().first
+
+    test::assertEqual(page.failure, "")
+    test::assertEqual(page.total, 260)
+    while item != null
+      test::assertEqual(item.get("message").scalarText(), received as String)
+      received = received + 1
+      item = item.next
+    end
+    offset = page.nextOffset
+  end
+
+  test::assertEqual(received, 260)
+  let message = new StringBuffer()
+
+  index = 0
+  while index < 70000
+    message.add("x")
+    index = index + 1
+  end
+  diagnostics.messages.set(1, message.join())
+  let narrow = agentDocumentDiagnosticPage(document, 0, 128, 100000)
+  let continued = agentDocumentDiagnosticPage(document, narrow.nextOffset, 128, 100000)
+  let first = (new LspJsonParser(continued.items)).parse().first
+
+  test::assertEqual(narrow.failure, "")
+  test::assertEqual(narrow.nextOffset, 1)
+  test::assertEqual(continued.failure, "")
+  test::assertTrue(first != null)
+  if first != null
+    test::assertEqual(first.get("message").scalarText(), message.join())
+  end
+  let unavailable = agentDocumentDiagnosticPage(document, 1, 128, 1024)
+
+  test::assertTrue(unavailable.failure != "")
+  test::assertEqual(unavailable.emittedCount, 0)
 end

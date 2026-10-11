@@ -36,13 +36,13 @@ contains protocol messages only.
 | Find declarations by name, signature or type | `neri.describe` | Saved project graph |
 | Check all declared units | `neri.feedback` | Saved project graph |
 | Open source and inspect types at a position | `neri.open`, `neri.inspect` | In-memory buffers |
-| Try one source replacement | `neri.edit` | In-memory buffer, guarded by `expectedRevision` |
+| Preview or apply coordinated source edits | `neri.edit` | In-memory buffers, guarded by revision and snapshot |
 | Build and run registered tests | `neri.test` | Saved project graph |
 | Measure release compilation | `neri.profile` | Saved project graph; applications are not run |
 
 ### neri.open, neri.inspect and neri.edit
 
-`neri.open` opens an existing source from the selected unit or its references.
+`neri.open` opens an existing source owned by the complete project graph.
 The optional `text` value supplies an unsaved overlay; otherwise Neri reads the
 current file. A source can have only one open buffer.
 
@@ -54,11 +54,50 @@ ranges. `insertText` and `textEdit.newText` contain the same actual insertion;
 `cursorByteOffset` is the UTF-8 byte offset of the suggested cursor within that
 text.
 
-`neri.edit` applies one UTF-16 range replacement to an open in-memory buffer.
-The edit is atomic after its arguments, bounds, workspace revision, and buffer
-limits validate. It advances the buffer version and workspace revision, then
-reanalyzes the source's owning compilation unit and its references. The result reports
-`persisted: false` and `executed: false`.
+`neri.edit` accepts `operationId`, `expectedRevision`, `expectedSnapshot` and
+an `edits` array of `{uri, range, text}` replacements. The single replacement
+form supplies `uri`, `range` and `text` directly and uses the same batch engine.
+All affected buffers must already be open. Every range refers to the original
+version of its buffer; ranges must fit complete UTF-16 scalars and must not
+overlap. A batch contains at most 256 replacements.
+
+With `preview: true`, the result contains proposed changes and diagnostics while
+buffer text, versions and workspace revision remain unchanged. The compiler
+analyzes each owning unit and its transitive consumers with every staged overlay
+visible together. Unrelated units retain their separate source visibility.
+Syntax and type errors remain reportable proposal results; they do not prevent
+applying an intentional intermediate state.
+
+The compiler checks the complete input snapshot again after analysis and polls
+cancellation immediately before publishing the batch. A successful apply
+advances each changed buffer once and advances the workspace revision once.
+A conflict, invalid range, resource limit or cancellation publishes no buffer
+changes. Results include UTF-16 edit ranges, `oldText`, `newText`,
+`beforeVersion`, `afterVersion`, `snapshot`, `proposedSnapshot`, `proposalId`,
+`requestDigest`, `applied` and `persisted: false`. The host owns saving files.
+This is Neri's in-memory transaction contract; the LSP specification describes
+related [transactional workspace edit semantics](https://raw.githubusercontent.com/microsoft/language-server-protocol/gh-pages/_specifications/lsp/3.17/types/workspaceEdit.md).
+
+Each consumer reports diagnostic counts and a `nextCursor` when its first page
+is incomplete. To retrieve another page, call `neri.edit` with `operationId`,
+`expectedRevision`, `expectedSnapshot` and that `cursor`. Pages contain up to
+128 diagnostics and fit the 2 MiB protocol message limit. A diagnostic that
+cannot fit produces an explicit limit result without advancing its offset.
+Pagination reanalyzes only the requested consumer with the proposal's overlays;
+it neither applies edits nor advances the revision.
+
+The workspace retains the latest transaction view, limited to 16 MiB of plan
+text and consumer keys and 256 consumers. It releases each consumer's semantic
+model before analyzing the next. Another transaction replaces the retained view.
+Cursors bind the proposal, input snapshot, consumer and diagnostic offset;
+changed inputs or a replaced proposal produce `conflict`. Preview cursors use
+the base snapshot. Applying a proposal requires that base snapshot; the proposed
+snapshot describes the resulting state.
+
+MCP `notifications/cancelled` messages match the active request ID. The transport
+also recognizes a cancellation already queued behind a future request. A bounded
+64-slot queue preserves ordinary request order while analysis polls input;
+queued and partially received message text share an 8 MiB polling budget.
 
 ### neri.feedback
 
@@ -70,6 +109,55 @@ Independent units remain separate. The result reports `scope: "project"`, a
 snapshot, unit diagnostics, `complete`, `unitsTotal`, `unitsAnalyzed` and
 `unitsReused`. `invalidatedUnits` identifies units whose input closure required
 analysis; `removedUnits` identifies previously reported units absent now.
+
+Feedback includes parser and binder errors, code style findings and unused
+import hints from the same semantic tracking used by the editor. Each diagnostic
+contains its source URI, code, message, UTF-16 range and explicit severity:
+error `1`, warning `2`, information `3` or hint `4`, following the
+[LSP diagnostic contract](https://raw.githubusercontent.com/microsoft/language-server-protocol/gh-pages/_specifications/lsp/3.17/types/diagnostic.md).
+Ranges use zero-based positions and an exclusive end. Project feedback reports
+advisories for sources owned by each unit; referenced sources retain their
+existing compiler error reporting. Parser and binder errors determine analysis
+validity. Style findings remain advisories even when their configured severity
+is error; warnings and hints also preserve a valid analysis status. Diagnostic
+counts and truncation include all these findings.
+
+Snapshots include applicable ancestor `.editorconfig` files and their absence,
+source contents, manifest membership, discovery directories and effective
+compiler, host, runtime, code-generation and standard-library inputs. Feedback
+rechecks contents and membership before publishing a result; concurrent changes
+produce `conflict`. File timestamps and elapsed time do not establish validity.
+Analysis reuse follows input dependencies. This separation of dependency
+tracking, rebuilding and reuse is
+consistent with the model in [Build systems à la carte](https://simon.peytonjones.org/assets/pdfs/build-systems-original.pdf).
+
+On macOS and Linux, feedback shares one local persistent worker per canonical
+project and effective toolchain configuration within the current user account.
+The worker retains one graph, reusable unit reports and at most one semantic
+document. Pages for an evicted document can reanalyze its unit under the same
+input checks. Disk analysis remains independent of editor overlays. Workers
+serialize requests, recycle after 256 requests and stop after 120 seconds without
+a request. Transport failure uses a fresh analysis and reports
+`execution.mode: "fresh-fallback"` with its cause; a persistent response reports
+`execution.mode: "persistent"` and a correlated `requestId`. Platforms without
+the persistent transport use the same explicit fresh fallback.
+
+`expectedSnapshot` rejects a request for changed inputs. `pageSize` is between
+1 and 128. Each response presents at most one unit with diagnostics or an actionable
+state, preserving its message even when its diagnostic count is zero. Global
+counts and `complete` describe analysis coverage; `nextCursor` describes remaining
+presentation. An empty cursor marks the end. Cursors bind the snapshot, unit,
+offset and page size. A stale cursor produces `conflict`.
+
+Responses fit a 2 MiB byte budget. An individual diagnostic that cannot fit
+produces `pageFailure` and a cursor for the same offset; it is not skipped.
+The hook uses a smaller budget and includes an exact `nextCommand` to retrieve
+the continuation through the CLI with the larger budget. For direct CLI paging:
+
+```sh
+neri feedback --project . --page-size 32
+neri feedback --project . --page-size 32 --expected-snapshot SNAPSHOT --cursor CURSOR
+```
 
 ### neri.describe
 
@@ -134,7 +222,7 @@ requested position. Clients can inspect another position to obtain more text.
 
 ### Overlay edit cycle
 
-For a source owned by the selected unit, call `neri.open` with these tool
+For a source owned by the project graph, call `neri.open` with these tool
 arguments, replacing the URI with that source's absolute URI:
 
 ```json
@@ -145,8 +233,8 @@ arguments, replacing the URI with that source's absolute URI:
 ```
 
 Use the returned workspace revision as `expectedRevision` on the next
-`neri.inspect` or `neri.edit` call. Positions and edit ranges count UTF-16 code
-units. After a conflict, use the returned state to inspect again before editing.
+`neri.inspect` or `neri.edit` call. Edits also use the returned `snapshot` as
+`expectedSnapshot`. Positions and edit ranges count UTF-16 code units. After a conflict, use the returned state to inspect again before editing.
 
 ```mermaid
 sequenceDiagram
@@ -157,9 +245,9 @@ sequenceDiagram
     N-->>A: Workspace revision and diagnostics
     A->>N: neri.inspect(uri, expectedRevision, position)
     N-->>A: Types, candidates and diagnostics
-    A->>N: neri.edit(uri, expectedRevision, range, text)
+    A->>N: neri.edit(edits, expectedRevision, expectedSnapshot)
     alt Revision and inputs remain valid
-        N-->>A: New revision, persisted=false, executed=false
+        N-->>A: New revision and snapshot, persisted=false
         A->>D: Save chosen source through host file tools
         A->>N: neri.feedback / neri.test
         N->>D: Read saved project inputs
@@ -177,6 +265,14 @@ what the test runner builds.
 
 Each tool publishes its own output schema through the
 [MCP tools contract](https://modelcontextprotocol.io/specification/2025-11-25/server/tools).
+Tool results expose the complete typed result in `structuredContent`. Clients
+consume that object; `content.text` is a brief status summary. The summary keeps
+compiler data in one representation. Preview, apply and page results are
+successful tool responses; compiler-invalid analyses also remain normal results.
+The transport budgets the serialized request ID and result envelope before edits
+and verifies every final MCP message against its 2 MiB limit. Request IDs that
+leave less than 256 KiB for a tool response are rejected before tool execution.
+
 Malformed arguments produce an error content item without a fabricated domain
 result. Compiler syntax and type diagnostics remain normal analyzed results.
 
@@ -198,12 +294,15 @@ The **analysis revision** identifies the internal LSP analysis generation.
 Invalidation and reanalysis can advance it independently of workspace revision,
 so clients use it to correlate feedback, not to authorize an edit.
 
-The **overlay snapshot digest** is a SHA-256 digest of the analyzed project key and the
-ordered source URIs and texts used by that analysis. Equal digests identify
-equal values for those recorded fields; they do not compare every process or
-toolchain setting. The digest does not state that external files remained
-unchanged after the response. The server checks its workspace inputs again
-before returning and reports a conflict if it observes a concurrent change.
+The **overlay snapshot** returned as `snapshot` binds the complete project graph,
+compiler binary, configuration and every open buffer's URI, text and version.
+Clients reuse it as `expectedSnapshot` for edits and transaction pages. Changes
+to another buffer, a sibling unit's dependencies or project membership invalidate
+that token. The server validates the same domain before returning or applying.
+
+The **analysis snapshot** returned as `analysisSnapshot` hashes the analyzed
+project key and that document analysis's ordered source URIs and texts. It
+correlates analysis content; `expectedSnapshot` accepts the full overlay snapshot.
 
 The **project snapshot** hashes the complete unit inventory, canonical member
 identities, each unit's observed inputs and the running compiler's binary digest.
@@ -218,7 +317,7 @@ through `projects`; directories of negative fixtures retain their own validation
 workflows. The MCP feedback reports compiler
 diagnostics; it does not subscribe to Rider's inspection panel.
 
-The selected unit's reference closure defines which files can be opened. Each
+Complete project membership defines which files can be opened. Each
 source is analyzed in its owning unit's closure, preserving the same dependency
 visibility as the editor. Inspecting a library source therefore does not report
 errors in its consumers; inspect the consumer source to analyze that unit with
@@ -315,6 +414,16 @@ adapter accepts a final JSON value terminated by either a newline or EOF. A
 malformed event produces explicit unavailable feedback. Diagnostic messages and
 source excerpts are identified as program data in the enclosing context.
 
+Project hook reports use `schemaVersion: 2` and `view: "diagnostics"`. Their
+`units` array contains units with diagnostics, truncated diagnostics or a status
+other than valid. A valid unit with zero diagnostics is represented by the
+aggregate coverage counts. The report retains the snapshot, complete counts,
+truncation flags, `invalidatedUnits` and `removedUnits`, so clients can identify
+resolved diagnostics and removed units. Unit fingerprints remain in the full
+project API and analysis cache. This compact presentation preserves every
+diagnostic admitted by the normal response limits and is delivered to each new
+recipient scope, including when analysis is reused.
+
 Configure the project's `.codex/hooks.json`:
 
 ```json
@@ -341,34 +450,41 @@ incorporates it before the agent's next decision. The adapter responds at tool
 completion boundaries, including completed editing commands.
 Delivery follows the host's supported tool paths. Changes made by an external
 editor are observed at the next invocation.
-Codex's default hook context limit is approximately 2,500 tokens. Larger reports
-arrive as a preview and a path to the complete saved output; the agent reads that
-file for omitted unit diagnostics. The aggregate status, coverage and diagnostic
-count precede the unit list. Host preview limits and Neri's explicit diagnostic
-truncation are separate limits.
+The hook requests a page of at most 16 diagnostics within a 16 KiB feedback
+budget. Aggregate status, coverage, diagnostic count and snapshot accompany the
+page. `nextCursor` and `nextCommand` preserve access to later diagnostics. Host
+preview limits remain independent of this byte budget and the JSON envelope.
 
 Optional `--state FILE` enables deduplication for hook invocations. The parent
-directory must exist. State is a disposable cache: it records input identity and
-the host session, turn and transcript identity. An unchanged invocation in that
-scope emits `{}`. A new scope receives feedback correlated with its current
-operation, reusing valid project analyses when their inputs match. Missing turn
-identity disables message deduplication while permitting project-analysis reuse.
+directory must exist. A bounded delivery ledger records up to 64 recipient
+scopes with their snapshot and page identity. Alternating recipients retain their
+delivery records: an unchanged page previously delivered to the same recipient
+emits `{}`, while a new recipient receives its first page. Eviction or missing
+recipient identity permits repeat delivery. Recipient scopes include the host
+session, turn and transcript. Project-analysis reuse belongs to the persistent
+service and remains independent of delivery records.
+On macOS and Linux, invocations sharing a canonical state path serialize analysis
+with a process-owned OS lock. Each waiter reads the latest delivery ledger after
+acquiring the lock and requests feedback for the current disk snapshot. The
+stable `FILE.lock` remains on disk; the OS releases ownership when the analyzing
+process exits or crashes. Delivery records are written under this lock before
+delivery. Missing or unreadable records permit repeat delivery.
+Windows project feedback uses fresh analysis without this serialization optimization.
 The input identity includes
 project and unit selection, compiler version and executable digest, the canonical standard-library
 location, its manifest and required sources, and observed project inputs.
-Project scope also records per-unit results.
+The persistent project worker retains reusable per-unit results.
 When one input closure changes, unaffected units reuse their recorded results.
 Each graph pass shares bounded file-content, digest and import observations
-across units. Verification creates a fresh pass and reads disk again. Project
-feedback brackets unit analysis with these graph checks; standalone unit feedback
+across units. Verification reads disk again. Project
+feedback brackets analysis and page construction with input checks; standalone unit feedback
 performs its own input checks. Diagnostics use the complete parser and binder
 without recording editor navigation symbols. Inspection and documentation retain
 their semantic symbol indexes.
-The response identifies reused units and keeps their truncation flags. Version 2
-state records carry an integrity digest over scope, inputs and the report.
-Project reports must satisfy their schema and correlated totals before reuse.
-The digest detects accidental corruption; it does not authenticate a writer
-with access to the state file.
+The response identifies reused units and keeps explicit continuation state.
+Standalone unit feedback retains version 2 state records with an integrity digest
+over scope, inputs and report. This digest detects accidental corruption and does
+not authenticate a writer with access to the state file.
 
 State writes concern only this cache. `effects.persisted` describes source-file
 persistence and remains false. A missing, partial or unwritable cache causes

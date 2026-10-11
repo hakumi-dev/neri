@@ -1,0 +1,311 @@
+use host
+use json
+use result
+
+# Cursors identify a disk snapshot and a diagnostic offset, never an overlay.
+class AgentFeedbackPage
+  public failure: String = ""
+  private snapshot: String
+  private unit: String = ""
+  private offset: Int = 0
+  private pageSize: Int
+  private responseBytes: Int
+
+  def init(snapshot: String, cursor: String, pageSize: Int, responseBytes: Int = 2097152): Void
+    this.snapshot = snapshot
+    this.pageSize = pageSize
+    this.responseBytes = responseBytes
+    if pageSize < 1 || pageSize > 128
+      this.failure = "Feedback page size must be between 1 and 128."
+      return
+    end
+    if cursor == ""
+      return
+    end
+    let parser = new LspJsonParser(cursor)
+    let value = parser.parse()
+    let offset = agentInputInteger(value.get("offset"))
+    let size = agentInputInteger(value.get("pageSize"))
+
+    parser.spaces()
+    if parser.failed || parser.position != host::stringByteLength(cursor) || value.get("snapshot").scalarText() != snapshot || offset == null || offset < 0 || size == null || size != pageSize
+      this.failure = "Feedback cursor does not match the current snapshot or query."
+      return
+    end
+    this.unit = value.get("unit").scalarText()
+    this.offset = offset
+    if this.unit == ""
+      this.failure = "Feedback cursor has no owning unit."
+    end
+  end
+
+  def cursor(unit: String, offset: Int): String
+    let value = json::Json.object()
+
+    value.put("snapshot", json::Json.string(this.snapshot))
+    value.put("unit", json::Json.string(unit))
+    value.put("offset", json::Json.integer(offset))
+    value.put("pageSize", json::Json.integer(this.pageSize))
+    let encoded = agentFeedbackJson(value)
+
+    return encoded == null ? "" : encoded
+  end
+
+  def render(
+    report: String,
+    graph: AgentProjectGraph,
+    operation: String,
+    execution: AgentFeedbackExecution? = null
+  ): String?
+    let options = new json::Options()
+
+    options.maxInputBytes = (new AgentLimits()).messageBytes()
+    options.maxOutputBytes = this.responseBytes
+    match json::Json.parse(report, options)
+      case result::Result.Ok(value)
+        let all = value.get("units")
+        var selected: json::Value? = null
+        var following = ""
+        var found = false
+
+        if all != null
+          var index = 0
+
+          while index < all.count()
+            let candidate = all.at(index)
+
+            if candidate == null
+              this.failure = "Diagnostic unit entry is unavailable."
+              return null
+            end
+            let key = candidate.get("projectKey")
+            let count = candidate.get("diagnosticCount")
+            let status = candidate.get("status")
+
+            if key != null && count != null && (count.text() != "0" || (status != null && status.text() != "valid"))
+              if selected == null && (this.unit == "" || key.text() == this.unit)
+                selected = candidate
+                found = true
+              else if found && following == ""
+                let name = key.text()
+
+                following = name if name != null
+              end
+            end
+            index = index + 1
+          end
+        end
+        if this.unit != "" && selected == null
+          this.failure = "Feedback cursor unit is not present in the current diagnostic set."
+          return null
+        end
+        var continuation = ""
+        var items = json::Json.array()
+        var pageFailure = ""
+        var unitTruncated = false
+
+        if selected != null
+          let key = selected.get("projectKey")
+          let truncated = selected.get("diagnosticsTruncated")
+          let name = key == null ? null : key.text()
+
+          if name == null
+            this.failure = "Diagnostic owner has no identity."
+            return null
+          end
+          let unit = graph.find(name)
+
+          if unit == null
+            this.failure = "Diagnostic owner is unavailable."
+            return null
+          end
+          let page = new AgentDiagnosticPage()
+          let currentCursor = this.cursor(unit.key, 2147483647)
+          let followingCursor = following == "" ? "" : this.cursor(following, 2147483647)
+          let reservedCursor = host::stringByteLength(followingCursor) > host::stringByteLength(currentCursor) ? followingCursor : currentCursor
+          let envelope = this.encode(
+            this.compose(
+              value,
+              selected,
+              items,
+              reservedCursor,
+              true,
+              "A diagnostic exceeds the available response byte budget.",
+              execution
+            ),
+            options
+          )
+
+          if envelope == null
+            this.failure = "Feedback envelope exceeds the response limit."
+            return null
+          end
+          page.byteBudget = options.maxOutputBytes - host::stringByteLength(envelope) + 2
+
+          if truncated != null && truncated.text() == "true"
+            var other = graph.first
+
+            while other != null
+              if other.key != unit.key
+                other.workspace.server.documents = null
+                other.workspace.server.priorityDocument = null
+              end
+              other = other.next
+            end
+            var document = unit.workspace.server.documents
+
+            if document == null
+              let analysis = new AgentDiskAnalysis(unit.workspace)
+
+              analysis.run(operation)
+              document = analysis.document
+            end
+
+            if document == null
+              this.failure = "Diagnostic analysis is unavailable."
+              return null
+            end
+            let full = agentDocumentDiagnosticPage(document, this.offset, this.pageSize, page.byteBudget)
+
+            page.items = full.items
+            page.total = full.total
+            page.emittedCount = full.emittedCount
+            page.nextOffset = full.nextOffset
+            page.failure = full.failure
+          else
+            let diagnostics = selected.get("diagnostics")
+            var offset = 0
+            var stopped = false
+
+            if diagnostics != null
+              page.total = diagnostics.count()
+              while offset < diagnostics.count() && !stopped
+                let entry = diagnostics.at(offset)
+
+                if entry == null
+                  this.failure = "Diagnostic entry is unavailable."
+                  return null
+                end
+                if offset >= this.offset
+                  if page.emittedCount == this.pageSize
+                    page.nextOffset = offset
+                    stopped = true
+                  else
+                    let encoded = agentFeedbackJson(new json::Json(entry))
+
+                    if encoded == null
+                      page.failure = "Diagnostic serialization exceeds the response limit."
+                      page.nextOffset = offset
+                      stopped = true
+                    else if !page.append(encoded, offset)
+                      stopped = true
+                    end
+                  end
+                end
+                offset = offset + 1
+              end
+            end
+            page.items = page.items + "]"
+          end
+          if (page.total > 0 && this.offset >= page.total) || (page.total == 0 && this.offset != 0)
+            this.failure = "Feedback cursor offset is outside the diagnostic set."
+            return null
+          end
+          pageFailure = page.failure
+          match json::Json.parse(page.items, options)
+            case result::Result.Ok(parsedItems)
+              items = new json::Json(parsedItems)
+              unitTruncated = page.nextOffset >= 0
+            case result::Result.Error(problem)
+              this.failure = "Diagnostic page is malformed."
+              return null
+          end
+          continuation = page.nextOffset >= 0 ? this.cursor(
+            unit.key,
+            page.nextOffset
+          ) : (following == "" ? "" : this.cursor(
+              following,
+              0
+            ))
+        end
+        let encoded = this.encode(
+          this.compose(value, selected, items, continuation, unitTruncated, pageFailure, execution),
+          options
+        )
+
+        if encoded != null
+          return encoded
+        end
+        if selected != null
+          let key = selected.get("projectKey")
+          let name = key == null ? null : key.text()
+
+          if name != null
+            return this.encode(
+              this.compose(
+                value,
+                selected,
+                json::Json.array(),
+                this.cursor(name, this.offset),
+                true,
+                "Feedback page exceeds the response limit; retry this cursor with a larger response budget.",
+                execution
+              ),
+              options
+            )
+          end
+        end
+        return null
+      case result::Result.Error(problem)
+        this.failure = "Project feedback is malformed."
+        return null
+    end
+  end
+
+  private def compose(
+    value: json::Value,
+    selected: json::Value?,
+    items: json::Json,
+    continuation: String,
+    unitTruncated: Bool,
+    pageFailure: String,
+    execution: AgentFeedbackExecution?
+  ): json::Json
+    let output = json::Json.object()
+    let units = json::Json.array()
+
+    value.each() do |key, field|
+      if key != null && key != "units" && key != "diagnosticsTruncated"
+        output.put(key, new json::Json(field))
+      end
+    end
+    execution.write(output) if execution != null
+    if selected != null
+      let entry = json::Json.object()
+
+      selected.each() do |key, field|
+        if key != null && key != "diagnostics" && key != "diagnosticsTruncated"
+          entry.put(key, new json::Json(field))
+        end
+      end
+      entry.put("diagnostics", items)
+      entry.put("diagnosticsTruncated", json::Json.boolean(unitTruncated))
+      units.add(entry)
+    end
+    output.put("units", units)
+    output.put("nextCursor", json::Json.string(continuation))
+    output.put("diagnosticsTruncated", json::Json.boolean(continuation != ""))
+    output.put("pageFailure", json::Json.string(pageFailure)) if pageFailure != ""
+    return output
+  end
+
+  private def encode(value: json::Json, options: json::Options): String?
+    match value.stringify(options)
+      case result::Result.Ok(encoded)
+        return encoded
+      case result::Result.Error(problem)
+        this.failure = "Feedback serialization exceeds the response limit or contains an invalid value."
+        return null
+    end
+  end
+end

@@ -190,14 +190,14 @@ static void documentation_disabled_contract(const char *compiler, const char *ro
     "## Hidden prose.\n"
     "def answer(): Int\n"
     "  return 42\n"
-    "end\n"
+    "end\n\n"
     "def main(): Void\n"
     "  let value = answer()\n"
     "end\n", 0);
   empty_diagnostics(1);
   send_message("{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/hover\",\"id\":\"disabled-hover\","
     "\"params\":{\"textDocument\":{\"uri\":\"file:///documentation-disabled.hk\"},"
-    "\"position\":{\"line\":5,\"character\":17}}}", 0);
+    "\"position\":{\"line\":6,\"character\":17}}}", 0);
   reply = receive();
   const char *contents = field(field(reply, "result"), "contents");
   require(string_is(field(contents, "kind"), "markdown") &&

@@ -759,7 +759,7 @@ int main(int argc, char **argv) {
   free(reply);
 
   open_document("file:///capture.hk", "def main(): Void\n  let value = 1\n"
-    "  let callback: fn(Int): Int = fn(arg)\n    let local = arg\n"
+    "  let callback: fn(Int): Int = fn(arg) do\n    let local = arg\n"
     "    return value + value + local\n  end\nend\n", 0);
   empty_diagnostics(1);
   send_message("{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/references\",\"id\":\"captures\","

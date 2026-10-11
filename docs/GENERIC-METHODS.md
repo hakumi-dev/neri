@@ -32,8 +32,8 @@ Method type parameters must have distinct, non-reserved names. A method type
 parameter that shadows a containing class parameter is rejected explicitly.
 Neri does not use C#'s warning-and-shadowing rule. Generic constructors, abstract
 methods, overrides, method annotations, and labels parameters remain unsupported.
-Generic class inheritance and separately
-compiled generic template ABIs retain the existing language restrictions.
+Inherited generic methods retain the specialized base class as their owner.
+Separately compiled generic template ABIs retain the existing language restrictions.
 Generic methods are called through their receiver; extracting one as a function
 value reports `NR220`. Generic module function values remain a separate feature.
 

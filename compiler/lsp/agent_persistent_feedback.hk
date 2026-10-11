@@ -1,0 +1,156 @@
+use console
+use host
+use json
+use result
+
+# Transport failures remain visible even when fresh disk analysis is available.
+def agentPersistentProjectFeedback(
+  root: String,
+  operationId: String,
+  expectedSnapshot: String = "",
+  cursor: String = "",
+  pageSize: Int = 128,
+  responseBytes: Int = 2097152
+): String
+  let helper = neriProjectHost()
+  let compiler = agentCompilerExecutable()
+  let identity = agentFeedbackIdentity()
+  let canonical = neriCanonicalPath(root)
+  var cause = "Persistent feedback transport is unavailable."
+
+  if helper != null && compiler != null && identity != null && canonical != null
+    let directory = bootstrapRunDirectory()
+
+    if directory == null
+      return agentFeedbackFallback(
+        root,
+        operationId,
+        expectedSnapshot,
+        cursor,
+        pageSize,
+        responseBytes,
+        "Persistent feedback request directory is unavailable."
+      )
+    end
+    let key = sha256FastText(runCacheFrame(canonical) + runCacheFrame(identity))
+    let payload = json::Json.object()
+    let requestId = sha256FastText(runCacheFrame(directory) + runCacheFrame(operationId))
+
+    payload.put("operationId", json::Json.string(operationId))
+    payload.put("requestId", json::Json.string(requestId))
+    payload.put("expectedSnapshot", json::Json.string(expectedSnapshot))
+    payload.put("cursor", json::Json.string(cursor))
+    payload.put("pageSize", json::Json.integer(pageSize))
+    payload.put("responseBytes", json::Json.integer(responseBytes))
+    let request = agentFeedbackJson(payload)
+    var response: String? = null
+
+    if request != null && host::writeText(directory + "/request", request)
+      let status = host::run(
+        helper,
+        ["feedback-service", key, compiler, canonical, directory + "/request", directory + "/response"]
+      )
+
+      if status != null && status == 0
+        response = host::readText(directory + "/response")
+      else
+        cause = "Persistent feedback transport failed (host status " + (status == null ? "unavailable" : status as String) + ")."
+      end
+    end
+    host::removeFile(directory + "/request")
+    host::removeFile(directory + "/response")
+    neriRemoveProjectListing(directory)
+    if response != null
+      let parser = new LspJsonParser(response)
+      let value = parser.parse()
+
+      parser.spaces()
+      if !parser.failed && parser.position == host::stringByteLength(response) && value.get("operationId").scalarText() == operationId && value.get("requestId").scalarText() == requestId
+        return response
+      end
+      cause = "Persistent feedback response is malformed or belongs to another request."
+    end
+  end
+  return agentFeedbackFallback(root, operationId, expectedSnapshot, cursor, pageSize, responseBytes, cause)
+end
+
+def agentFeedbackJson(value: json::Json): String?
+  let options = new json::Options()
+
+  options.maxInputBytes = (new AgentLimits()).messageBytes()
+  options.maxOutputBytes = options.maxInputBytes
+  match value.stringify(options)
+    case result::Result.Ok(text)
+      return text
+    case result::Result.Error(failure)
+      return null
+  end
+end
+
+def agentFeedbackFallback(
+  root: String,
+  operationId: String,
+  expectedSnapshot: String,
+  cursor: String,
+  pageSize: Int,
+  responseBytes: Int,
+  cause: String
+): String
+  let fresh = new AgentDiskFeedbackService(root)
+
+  return fresh.collect(
+    operationId,
+    expectedSnapshot,
+    cursor,
+    pageSize,
+    responseBytes,
+    new AgentFeedbackExecution("", AgentFeedbackExecutionKind.FreshFallback(), cause)
+  )
+end
+
+def agentFeedbackWorkerMain(): Void
+  let flag = host::argumentAt(1)
+  let root = host::argumentAt(2)
+
+  if host::argumentCount() != 3 || flag == null || flag != "--project" || root == null
+    return
+  end
+  let service = new AgentDiskFeedbackService(root)
+  let input = new LspInput()
+  var requests = 0
+
+  while requests < 256
+    let line = agentReadLine(input)
+
+    if line.isEof()
+      return
+    end
+    let text = line.text()
+
+    if text == null || line.isTruncated() || host::stringByteLength(text) > (new AgentLimits()).messageBytes()
+      return
+    end
+    let parser = new LspJsonParser(text)
+    let request = parser.parse()
+    let operation = request.get("operationId").scalarText()
+    let requestId = request.get("requestId").scalarText()
+    let pageSize = agentInputInteger(request.get("pageSize"))
+    let responseBytes = agentInputInteger(request.get("responseBytes"))
+
+    parser.spaces()
+    if parser.failed || parser.position != host::stringByteLength(text) || operation == "" || requestId == "" || pageSize == null || pageSize < 1 || pageSize > 128 || responseBytes == null || responseBytes < 1024 || responseBytes > (new AgentLimits()).messageBytes()
+      return
+    end
+    let report = service.collect(
+      operation,
+      request.get("expectedSnapshot").scalarText(),
+      request.get("cursor").scalarText(),
+      pageSize,
+      responseBytes,
+      new AgentFeedbackExecution(requestId, AgentFeedbackExecutionKind.Persistent())
+    )
+
+    console::println(report)
+    requests = requests + 1
+  end
+end

@@ -1,0 +1,156 @@
+use host
+
+# Content and membership are re-observed; time is never a validity predicate.
+class AgentDiskBarrier
+  private roots: StringBuffer = new StringBuffer()
+  private seen: StringTable<Bool> = new StringTable<Bool>()
+  public failure: String = ""
+
+  def init(root: String): Void
+    this.add(neriProjectManifestName(root) ? bootstrapDirectory(root) : root)
+    let stdlib = host::environment("NERI_STDLIB")
+
+    if stdlib != null && stdlib != ""
+      this.add(stdlib)
+    end
+  end
+
+  def add(path: String): Void
+    if path != "" && this.seen.add(path, true)
+      this.roots.add(path)
+    end
+  end
+
+  def include(graph: AgentProjectGraph): Void
+    let projects = graph.projects.cursor()
+
+    while projects.hasValue()
+      let path = projects.current()
+
+      this.add(neriProjectManifestName(path) ? bootstrapDirectory(path) : path)
+      projects.advance()
+    end
+    let inputs = graph.observations.paths.cursor()
+
+    while inputs.hasValue()
+      this.add(inputs.current())
+      inputs.advance()
+    end
+    var unit = graph.first
+
+    while unit != null
+      let directories = unit.project.discoveryRoots.cursor()
+
+      while directories.hasValue()
+        this.add(directories.current())
+        directories.advance()
+      end
+      unit = unit.next
+    end
+  end
+
+  def observe(): String?
+    this.failure = ""
+    let helper = neriProjectHost()
+
+    if helper == null
+      this.failure = "Disk observation host is unavailable."
+      return null
+    end
+    let directory = bootstrapRunDirectory()
+
+    if directory == null
+      this.failure = "Disk observation directory is unavailable."
+      return null
+    end
+    var request = ""
+    let roots = this.roots.cursor()
+
+    while roots.hasValue()
+      request = request + roots.current() + "\n"
+      roots.advance()
+    end
+    let written = host::writeText(directory + "/roots", request)
+    var listing: String? = null
+
+    if written
+      let status = host::run(helper, ["feedback-inventory", directory + "/roots", directory + "/inventory"])
+
+      if status != null && status == 0
+        listing = host::readText(directory + "/inventory")
+      end
+    end
+    host::removeFile(directory + "/roots")
+    host::removeFile(directory + "/inventory")
+    neriRemoveProjectListing(directory)
+    if listing == null || host::stringByteLength(listing) > (new AgentLimits()).messageBytes()
+      this.failure = "Disk membership observation failed or exceeded its limit."
+      return null
+    end
+    let inventory = listing
+    let parts = new StringBuffer()
+    let observed = new AgentInputSnapshot()
+    var start = 0
+    var index = 0
+    var firstTab = -1
+    var secondTab = -1
+    var bytes = 0
+
+    parts.add(runCacheFrame(inventory))
+    while index < host::stringByteLength(inventory)
+      let byte = host::stringByteAt(inventory, index) as Int
+
+      if byte == 9
+        if firstTab < 0
+          firstTab = index
+        else
+          secondTab = index
+        end
+      else if byte == 10
+        if firstTab < 0 || secondTab <= firstTab
+          this.failure = "Disk membership observation is malformed."
+          return null
+        end
+        if host::stringByteAt(inventory, start) == (70 as Byte)
+          let path = host::stringSlice(inventory, firstTab + 1, secondTab - firstTab - 1)
+          let file = observed.read(path)
+          let text = file.text
+
+          if text != null
+            bytes = bytes + host::stringByteLength(text)
+          end
+          if bytes > 67108864
+            this.failure = "Disk content observation exceeds 64 MiB."
+            return null
+          end
+          parts.add(runCacheFrame(path) + runCacheFrame(file.digest))
+        end
+        start = index + 1
+        firstTab = -1
+        secondTab = -1
+      end
+      index = index + 1
+    end
+    let identity = agentCompilerIdentity()
+
+    if identity == null
+      this.failure = "Cannot verify the running compiler."
+      return null
+    end
+    parts.add(runCacheFrame(identity))
+    for name in ["NERI_HOST", "NERI_RUNTIME_MANIFEST", "NERI_CODEGEN"]
+      let path = host::environment(name)
+
+      if path != null && path != ""
+        let digest = agentArtifactDigest(path)
+
+        if digest == null
+          this.failure = "Cannot verify toolchain input: " + name
+          return null
+        end
+        parts.add(runCacheFrame(name) + runCacheFrame(path) + runCacheFrame(digest))
+      end
+    end
+    return sha256FastText(parts.join())
+  end
+end

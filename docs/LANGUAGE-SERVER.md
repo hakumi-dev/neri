@@ -232,7 +232,7 @@ against their document version and verified source generation.
 The selected unit's source graph is still lexed and parsed for each repaired
 query. Declaration registration is shared with full binding; unrelated callable
 bodies are deferred. Filesystem operations and work between checkpoints remain
-synchronous. [Completion measurements](../benchmarks/lsp/README.md) cover cold,
+synchronous. [Completion measurements](PERFORMANCE.md#session-completion) distinguish cold,
 warm and unrelated-unit workloads.
 Transport limits are 2 MiB per message, 8 KiB of headers and 64 nested JSON
 containers. Malformed framing terminates the session; malformed JSON gets a

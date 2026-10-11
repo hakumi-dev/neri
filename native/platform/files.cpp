@@ -47,6 +47,51 @@ neri_int_v1 neri_rt_v1_file_size(neri_int_v1 fd) {
   return info.st_size;
 }
 
+neri_int_v1 neri_rt_v1_file_identity(neri_int_v1 fd, uint8_t *output64) {
+  if (fd < 0 || fd > INT_MAX || output64 == nullptr) {
+    errno = EINVAL;
+    return -1;
+  }
+  uint64_t fields[8] = {};
+#if defined(_WIN32)
+  const auto handle = reinterpret_cast<HANDLE>(_get_osfhandle(static_cast<int>(fd)));
+  BY_HANDLE_FILE_INFORMATION info {};
+  FILE_BASIC_INFO basic {};
+  if (handle == INVALID_HANDLE_VALUE ||
+      !GetFileInformationByHandle(handle, &info) ||
+      !GetFileInformationByHandleEx(handle, FileBasicInfo, &basic, sizeof(basic))) {
+    errno = EIO;
+    return -1;
+  }
+  fields[0] = info.dwVolumeSerialNumber;
+  fields[1] = (static_cast<uint64_t>(info.nFileIndexHigh) << 32) | info.nFileIndexLow;
+  fields[2] = (static_cast<uint64_t>(info.nFileSizeHigh) << 32) | info.nFileSizeLow;
+  fields[3] = static_cast<uint64_t>(basic.LastWriteTime.QuadPart);
+  fields[4] = static_cast<uint64_t>(basic.ChangeTime.QuadPart);
+  fields[5] = info.dwFileAttributes;
+#else
+  struct stat info {};
+  if (fstat(static_cast<int>(fd), &info) != 0) return -1;
+  fields[0] = static_cast<uint64_t>(info.st_dev);
+  fields[1] = static_cast<uint64_t>(info.st_ino);
+  fields[2] = static_cast<uint64_t>(info.st_size);
+#if defined(__APPLE__)
+  fields[3] = static_cast<uint64_t>(info.st_mtimespec.tv_sec);
+  fields[4] = static_cast<uint64_t>(info.st_mtimespec.tv_nsec);
+  fields[5] = static_cast<uint64_t>(info.st_ctimespec.tv_sec);
+  fields[6] = static_cast<uint64_t>(info.st_ctimespec.tv_nsec);
+#else
+  fields[3] = static_cast<uint64_t>(info.st_mtim.tv_sec);
+  fields[4] = static_cast<uint64_t>(info.st_mtim.tv_nsec);
+  fields[5] = static_cast<uint64_t>(info.st_ctim.tv_sec);
+  fields[6] = static_cast<uint64_t>(info.st_ctim.tv_nsec);
+#endif
+  fields[7] = static_cast<uint64_t>(info.st_mode);
+#endif
+  std::memcpy(output64, fields, sizeof(fields));
+  return 0;
+}
+
 neri_int_v1 neri_rt_v1_file_read(neri_int_v1 fd, uint8_t *bytes, neri_int_v1 length) {
   if (fd < 0 || fd > INT_MAX || length < 0 || length > INT_MAX) { errno = EINVAL; return -1; }
 #if defined(_WIN32)

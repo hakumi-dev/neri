@@ -1,0 +1,384 @@
+use host
+use json
+use test
+
+def transactionPosition(text: String, offset: Int): AgentPosition
+  let utf16 = (new IrSourceMap(host::stringSlice(text, 0, offset))).utf16Length()
+  let position = agentDecodedPosition((new LspJsonParser(lspPosition(text, utf16))).parse())
+
+  test::assertTrue(position != null)
+  if position != null
+    return position
+  end
+  return new AgentPosition(0, 0)
+end
+
+def transactionReplace(document: LspDocument, before: String, after: String): AgentTextEdit
+  let first = bootstrapFindText(document.text, before)
+
+  test::assertTrue(first >= 0)
+  return new AgentTextEdit(
+    document.uri,
+    new AgentRange(
+      transactionPosition(document.text, first),
+      transactionPosition(document.text, first + host::stringByteLength(before))
+    ),
+    after
+  )
+end
+
+def transactionConsumer(report: LspJson, name: String): LspJson
+  var consumer = report.get("consumers").first
+
+  while consumer != null
+    if semanticEndsWith(consumer.get("projectKey").scalarText(), "#" + name)
+      return consumer
+    end
+    consumer = consumer.next
+  end
+  return new LspJson()
+end
+
+def transactionCount(items: LspJson): Int
+  var count = 0
+  var item = items.first
+
+  while item != null
+    count = count + 1
+    item = item.next
+  end
+  return count
+end
+
+def main(): Void
+  if host::argumentAt(0) == "protocol-input"
+    transactionProtocolInput()
+    return
+  end
+  transactionProtocolQueue()
+  transactionProtocolBudget()
+  let work = host::argumentAt(2)
+
+  test::assertTrue(work != null)
+  if work == null
+    return
+  end
+  let directory = bootstrapTemporaryDirectory(work, "agent-transaction")
+
+  test::assertTrue(directory != null)
+  if directory == null
+    return
+  end
+  let manifest = directory + "/manifest.json"
+  let modelPath = directory + "/model.hk"
+  let appPath = directory + "/app.hk"
+  let siblingPath = directory + "/sibling.hk"
+  let dependencyPath = directory + "/dependency.hk"
+  let middlePath = directory + "/middle.hk"
+  let modelText = "namespace Model\n\ndef choose<T>(value: T): T\n  return value\nend\n"
+  let appText = "use Alias = Model\n\n# 😀\n\ndef main(): Void\n  let value: Int = Alias::choose<Int>(1)\nend\n"
+  let siblingText = "use Dependency\n\nnamespace Model\n\ndef choose<T>(value: T): String\n  return \"unrelated\"\nend\n\ndef dependency(): Int\n  return answer()\nend\n"
+
+  test::assertTrue(host::writeText(
+      manifest,
+      "{\"version\":2,\"units\":{\"model\":{\"kind\":\"library\",\"sources\":[\"model.hk\"]},\"middle\":{\"kind\":\"library\",\"sources\":[\"middle.hk\"],\"references\":[\"model\"]},\"app\":{\"kind\":\"executable\",\"sources\":[\"app.hk\"],\"references\":[\"middle\"]},\"dependency\":{\"kind\":\"library\",\"sources\":[\"dependency.hk\"]},\"sibling\":{\"kind\":\"library\",\"sources\":[\"sibling.hk\"],\"references\":[\"dependency\"]}}}"
+    ))
+  test::assertTrue(host::writeText(modelPath, modelText))
+  test::assertTrue(host::writeText(appPath, appText))
+  test::assertTrue(host::writeText(middlePath, "namespace Middle\n\ndef stable(): Int\n  return 1\nend\n"))
+  test::assertTrue(host::writeText(siblingPath, siblingText))
+  test::assertTrue(host::writeText(
+      dependencyPath,
+      "namespace Dependency\n\ndef answer(): Int\n  return 1\nend\n"
+    ))
+  let workspace = new NeriAgentWorkspace(manifest, "model")
+  let modelUri = lspUri(modelPath)
+  let appUri = lspUri(appPath)
+  let siblingUri = lspUri(siblingPath)
+
+  let openedModelText = (new AgentOpenRequest("model", modelUri, null)).execute(workspace)
+  let openedModel = (new LspJsonParser(openedModelText)).parse()
+  let openedApp = (new LspJsonParser((new AgentOpenRequest("app", appUri, null)).execute(workspace))).parse()
+  let opened = (new LspJsonParser((new AgentOpenRequest("sibling", siblingUri, null)).execute(workspace))).parse()
+  let model = workspace.server.find(modelUri)
+  let app = workspace.server.find(appUri)
+
+  test::assertTrue(model != null)
+  test::assertTrue(app != null)
+  test::assertEqual(openedModel.get("status").scalarText(), "valid")
+  test::assertEqual(openedApp.get("status").scalarText(), "valid")
+  test::assertEqual(opened.get("status").scalarText(), "valid")
+  if model == null || app == null
+    return
+  end
+  let revision = workspace.revision
+  let snapshot = opened.get("snapshot").scalarText()
+  let modelVersion = model.version
+  let appVersion = app.version
+  let edits = transactionReplace(model, "value: T", "value: T, label: Int")
+
+  edits.next = transactionReplace(app, "choose<Int>(1)", "choose<Int>(1, 2)")
+  let preview = (new LspJsonParser(transactionCall(workspace, "preview", revision, snapshot, edits, true))).parse()
+
+  test::assertEqual(preview.get("status").scalarText(), "preview")
+  test::assertEqual(transactionConsumer(preview, "model").get("analysisStatus").scalarText(), "valid")
+  test::assertEqual(transactionConsumer(preview, "app").get("analysisStatus").scalarText(), "valid")
+  test::assertEqual(transactionConsumer(preview, "middle").get("analysisStatus").scalarText(), "valid")
+  test::assertTrue(transactionConsumer(preview, "sibling").isMissing())
+  test::assertEqual(model.text, modelText)
+  test::assertEqual(app.text, appText)
+  test::assertEqual(workspace.revision, revision)
+  let invalid = transactionReplace(model, "value: T", "value: T, label: Int")
+
+  invalid.next = new AgentTextEdit(appUri, new AgentRange(new AgentPosition(2, 3), new AgentPosition(2, 3)), "broken")
+  let failed = (new LspJsonParser(transactionCall(workspace, "bad-last", revision, snapshot, invalid))).parse()
+
+  test::assertEqual(failed.get("status").scalarText(), "invalidRequest")
+  test::assertEqual(model.text, modelText)
+  test::assertEqual(app.text, appText)
+  test::assertEqual(workspace.revision, revision)
+  let polls = new StringBuffer()
+  let cancellation = new AnalysisControl() do
+    polls.add("poll")
+    return polls.size < 4
+  end
+
+  workspace.operationControl = cancellation
+  let cancelled = (new LspJsonParser(transactionCall(workspace, "cancel", revision, snapshot, edits))).parse()
+
+  workspace.operationControl = null
+
+  test::assertEqual(cancelled.get("status").scalarText(), "cancelled")
+  test::assertEqual(model.text, modelText)
+  test::assertEqual(app.text, appText)
+  let applied = (new LspJsonParser(transactionCall(workspace, "apply", revision, snapshot, edits))).parse()
+
+  test::assertEqual(applied.get("status").scalarText(), "applied")
+  test::assertEqual(workspace.revision, revision + 1)
+  test::assertEqual(model.version, modelVersion + 1)
+  test::assertEqual(app.version, appVersion + 1)
+  test::assertTrue(bootstrapFindText(model.text, "label: Int") >= 0)
+  test::assertTrue(bootstrapFindText(app.text, "choose<Int>(1, 2)") >= 0)
+  test::assertTrue(host::readText(modelPath) == modelText)
+  test::assertTrue(host::readText(appPath) == appText)
+  transactionPreviewPages(workspace, app, applied.get("snapshot").scalarText())
+
+  test::assertTrue(host::writeText(
+      dependencyPath,
+      "namespace Dependency\n\ndef answer(): String\n  return \"changed\"\nend\n"
+    ))
+  let siblingChanged = (new LspJsonParser((new AgentInspectRequest(
+          "dependency-changed", siblingUri, workspace.revision, new AgentPosition(0, 0)
+        )).execute(workspace))).parse()
+
+  test::assertEqual(siblingChanged.get("status").scalarText(), "invalid")
+  test::assertTrue(transactionCount(siblingChanged.get("diagnostics")) > 0)
+
+end
+
+def transactionPreviewPages(workspace: NeriAgentWorkspace, document: LspDocument, snapshot: String): Void
+  let original = document.text
+  let revision = workspace.revision
+  let lines = new StringBuffer()
+
+  lines.add("def main(): Void\n")
+  var index = 0
+
+  while index < 260
+    lines.add("  let value" + (index as String) + ": Int = \"bad\"\n")
+    index = index + 1
+  end
+  lines.add("end\n")
+  let edits = transactionReplace(document, original, lines.join())
+  let preview = (new LspJsonParser(transactionCall(workspace, "many", revision, snapshot, edits, true))).parse()
+  let consumer = transactionConsumer(preview, "app")
+  let total = agentInputInteger(consumer.get("diagnosticCount"))
+  var received = transactionCount(consumer.get("diagnostics"))
+  var cursor = consumer.get("nextCursor").scalarText()
+
+  test::assertEqual(preview.get("status").scalarText(), "preview")
+  test::assertTrue(total != null && total >= 260)
+  test::assertTrue(cursor != "")
+  while cursor != ""
+    let page = (new LspJsonParser(transactionCall(workspace, "page", revision, snapshot, null, false, cursor))).parse()
+
+    test::assertEqual(page.get("status").scalarText(), "page")
+    received = received + transactionCount(page.get("diagnostics"))
+    cursor = page.get("nextCursor").scalarText()
+  end
+
+  test::assertTrue(total != null && received == total)
+  test::assertEqual(document.text, original)
+  test::assertEqual(workspace.revision, revision)
+  let staleCursor = consumer.get("nextCursor").scalarText()
+  let change = transactionReplace(document, "choose<Int>(1, 2)", "choose<Int>(1, 3)")
+  let applied = (new LspJsonParser(transactionCall(
+        workspace,
+        "other",
+        revision,
+        snapshot,
+        change,
+        false,
+        "",
+        true
+      ))).parse()
+  let stale = (new LspJsonParser(transactionCall(
+        workspace,
+        "stale",
+        workspace.revision,
+        applied.get("snapshot").scalarText(),
+        null,
+        false,
+        staleCursor
+      ))).parse()
+
+  test::assertEqual(applied.get("status").scalarText(), "applied")
+  test::assertEqual(stale.get("status").scalarText(), "conflict")
+end
+
+def transactionCall(
+  workspace: NeriAgentWorkspace,
+  operation: String,
+  revision: Int,
+  snapshot: String,
+  edits: AgentTextEdit?,
+  preview: Bool = false,
+  cursor: String = "",
+  single: Bool = false
+): String
+  let arguments = json::Json.object()
+
+  arguments.put("operationId", json::Json.string(operation))
+  arguments.put("expectedRevision", json::Json.integer(revision))
+  arguments.put("expectedSnapshot", json::Json.string(snapshot))
+  if cursor != ""
+    arguments.put("cursor", json::Json.string(cursor))
+  else if single && edits != null
+    arguments.put("uri", json::Json.string(edits.uri))
+    arguments.put("range", agentRangeJson(edits.range))
+    arguments.put("text", json::Json.string(edits.text))
+  else
+    let items = json::Json.array()
+    var edit = edits
+
+    while edit != null
+      let item = json::Json.object()
+
+      item.put("uri", json::Json.string(edit.uri))
+      item.put("range", agentRangeJson(edit.range))
+      item.put("text", json::Json.string(edit.text))
+      items.add(item)
+      edit = edit.next
+    end
+    arguments.put("edits", items)
+    arguments.put("preview", json::Json.boolean(preview))
+  end
+  let request = (new AgentEditTool()).decode((new LspJsonParser(lspSchemaText(arguments))).parse())
+
+  test::assertTrue(request != null)
+  if request == null
+    return ""
+  end
+  let output = request.execute(workspace)
+  let wrapped = (new LspJsonParser(agentToolResult(output))).parse()
+  let status = wrapped.get("structuredContent").get("status").scalarText()
+  let summary = wrapped.get("content").first
+
+  test::assertEqual(wrapped.get("isError").isFalse(), status == "preview" || status == "applied" || status == "page")
+  test::assertTrue(summary != null)
+  if summary != null
+    test::assertTrue(host::stringByteLength(summary.get("text").scalarText()) < 64)
+  end
+  return output
+
+end
+
+def transactionProtocolInput(): Void
+  let input = new AgentProtocolInput(new LspInput())
+  var control = input.begin("0")
+  var index = 0
+  var cancelled = false
+
+  while true
+    if !control.poll()
+      test::assertFalse(cancelled)
+      test::assertEqual(index, 2)
+      cancelled = true
+      control = input.begin("0")
+    end
+    let line = input.readLine()
+
+    if line.isEof()
+      break
+    end
+    let text = line.completeText()
+
+    test::assertTrue(text != null)
+    if text != null
+      let message = (new LspJsonParser(text)).parse()
+
+      test::assertEqual(message.get("id").scalarText(), index as String)
+      index = index + 1
+      control = input.begin(lspJsonStringify(message.get("id")))
+    end
+  end
+
+  test::assertEqual(index, 320)
+  test::assertTrue(cancelled)
+end
+
+def transactionProtocolQueue(): Void
+  let executable = host::executablePath()
+
+  test::assertTrue(executable != null)
+  if executable == null
+    return
+  end
+  let input = new buffers::ByteBuffer(1048576, 4096)
+  var index = 0
+
+  while index < 320
+    if index == 2
+      input.appendText("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":1}}\n")
+    end
+    input.appendText("{\"jsonrpc\":\"2.0\",\"id\":" + (index as String) + ",\"method\":\"tools/list\",\"params\":{}}\n")
+    index = index + 1
+  end
+  let options = new process::SpawnOptions(executable)
+
+  options.arguments = ["protocol-input"]
+  options.input = input.snapshot()
+  let run = AgentProcessResult.run(options, 20000)
+
+  test::assertTrue(run.exitedWith(0))
+end
+
+def transactionProtocolBudget(): Void
+  let id = lspQuote("request\"\\\n😀")
+  let budget = agentToolResponseBudget(id)
+  let prefix = "{\"status\":\"preview\",\"data\":\""
+  let count = budget - host::stringByteLength(prefix) - 2
+  let bytes = new buffers::ByteBuffer(count, 4096)
+  var index = 0
+
+  while index < count
+    bytes.append(120 as Byte)
+    index = index + 1
+  end
+  let text = bytes.text()
+
+  test::assertTrue(text != null)
+  if text == null
+    return
+  end
+  let output = prefix + text + "\"}"
+  let frame = "{\"jsonrpc\":\"2.0\",\"id\":" + id + ",\"result\":" + agentToolResult(output) + "}"
+  let decoded = (new LspJsonParser(frame)).parse()
+
+  test::assertTrue(host::stringByteLength(frame) <= (new AgentLimits()).messageBytes())
+  test::assertEqual(
+    host::stringByteLength(decoded.get("result").get("structuredContent").get("data").scalarText()),
+    count
+  )
+  test::assertTrue(decoded.get("result").get("isError").isFalse())
+end

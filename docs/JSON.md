@@ -44,3 +44,28 @@ value tree. Framework adapters can validate caller options before applying a
 smaller transport-specific limit to a copy.
 
 Failure codes are `invalid_options`, `input_limit`, `output_limit`, `depth_limit`, `node_limit`, `invalid_utf8`, `invalid_json`, and `duplicate_key`. Parse errors report a zero-based input byte offset at detection. Invalid UTF-8 reports the offending byte, or the start of a truncated final sequence. The diagnostic scan runs only after byte decoding fails. Option/input-limit failures and stringify failures use offset zero. Stringify emits compact JSON in insertion order, escaping controls, quotation marks, and backslashes; other Unicode scalars remain UTF-8. It does not perform canonical sorting or number normalization.
+
+## Fluent construction
+
+`Json.object()`, `Json.array(Json[] = [])`, `Json.string(String)`,
+`Json.integer(Int)`, `Json.boolean(Bool)`, and `Json.nullValue()` build values.
+`put(key, Json)` and `add(Json)` return the builder, so construction can be chained.
+`stringify(Options? = null)` returns `Result<String, Failure>` through the same
+bounded codec. `Json.parse(String, Options? = null)` returns the queryable
+`Result<Value, Failure>` tree.
+
+```neri
+let document = json::Json.object().put("enabled", json::Json.boolean(true))
+match document.stringify()
+  case result::Result.Ok(output)
+    # Use the complete JSON output.
+  case result::Result.Error(error)
+    # Handle error.code.
+end
+```
+
+Builders retain their first rejected insertion as `invalid_property` or
+`invalid_item`. Serialization reports construction failures instead of emitting
+partial objects or arrays. Children remain shared references: a construction
+failure introduced after inserting a child is also reported when its parent is
+serialized.

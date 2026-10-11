@@ -12,6 +12,7 @@ arithmetic, null, bounds, evaluation-order, and lifetime rules.
 | Declarations, visibility, inheritance | [Functions, modules and classes](#functions-modules-and-classes) |
 | Type parameters and constraints | [Generics](#generics), [generic contracts](#generic-contracts) |
 | Enumerated cases and matching | [Closed alternatives](#closed-alternatives) |
+| Compile-time field iteration and typed reads | [Field reflection](REFLECTION.md) |
 | `fn`, captures, shared callbacks and tasks | [Function values and closures](#function-values-and-closures) |
 | C scalar types, records, pointers and borrows | [Unsafe and memory boundary](#unsafe-and-memory-boundary) |
 | `@cabiImport`, `@cabiExport`, `cabi fn`, C headers | [C interoperability](C-INTEROP.md) |
@@ -21,6 +22,9 @@ arithmetic, null, bounds, evaluation-order, and lifetime rules.
 ## Source and expressions
 
 Names are case-sensitive Unicode identifiers. `#` introduces a line comment.
+Reserved words are defined by the [token catalog](../tooling/kinds/tokens.hk).
+`compile` is reserved and introduces [compile-time field iteration](REFLECTION.md)
+with `compile for`.
 Newlines separate statements, blocks end with `end`, and indentation is cosmetic.
 Delimited arguments and array literals may span lines. String literals support
 `\"`, `\\`, `\0`, `\n`, `\t`, and `\r` and contain canonical UTF-8.
@@ -394,9 +398,17 @@ An explicit `super(args)` occurs once, as the first statement of a derived
 A class without `init` has an implicit zero-argument constructor. Construction
 initializes its ancestors first, invoking the nearest declared initializer with
 its default arguments, then initializes the remaining fields in inheritance
-order. That initializer must be accessible from the derived class and accept
-zero supplied arguments. Intermediate classes cannot skip initialization or
-constructor visibility.
+order. That initializer must accept zero supplied arguments. Intermediate
+classes cannot skip initialization.
+
+Constructors are always public. Declare them as `def init(...): Void` with no
+access modifier. Explicit `public` is unnecessary; `private`, `protected`, and
+`internal` conflict with constructor access. All explicit constructor access
+modifiers produce `NR286`.
+An `unsafe def init` is also public, but its calls require an unsafe declaration
+or block (`NR189`). This requirement applies to explicit and implicit base
+initialization. Standard-library raw-handle and unchecked time-value constructors
+use this boundary; their validated factories remain safe entry points.
 
 ### Library operators and explicit conversions
 
@@ -526,9 +538,18 @@ on an ordinary or specialized generic class; for example,
 See [generic methods](GENERIC-METHODS.md) for inference, scope, and restrictions.
 Static methods accept an explicitly specialized class
 receiver, such as `Container<Int>.create(42)` or
-`library::Container<String>.create("value")`; constructor and method visibility
-still apply. Generic class inheritance,
-class bounds, multiple bounds, generic contracts, and higher-kinded types are
+`library::Container<String>.create("value")`; class and method visibility
+still apply. Classes can inherit from a concrete specialization, such as
+`class IntBox: Box<Int>`, and generic classes can pass their parameters to a base,
+such as `class NamedBox<T>: Box<T>`. Generic classes can also inherit from ordinary
+classes. Each specialization substitutes its type arguments into the base type,
+fields, and method signatures. Inherited members, `super`, exact overrides, and
+abstract method obligations follow the ordinary class rules. Class type arguments
+are invariant: inheriting from `Box<Int>` does not make a class assignable to
+`Box<String>`. Generic inheritance is checked when the class is specialized,
+including base restrictions and inheritance cycles.
+
+Class bounds, multiple bounds, generic contracts, and higher-kinded types are
 outside this surface. Templates are supplied as source files in the same
 compilation invocation, including across namespaces. A compiled specialization is concrete; it is not a separately
 importable generic template or a package ABI promise.
@@ -592,7 +613,7 @@ def apply(value: Int, operation: fn(Int): Int): Int
 end
 
 def offsetBy(offset: Int): fn(Int): Int
-  return fn(value)
+  return fn(value) do
     return value + offset
   end
 end
@@ -621,17 +642,20 @@ Assign its call result to a local binding before passing that result elsewhere.
 Nested calls with their own `do` blocks inside the body are supported. `return`
 returns from the callback, not from the function enclosing the call.
 
-`fn(parameters) ... end` creates a standalone closure for a binding, field,
+`fn(parameters) do ... end` creates a standalone closure for a binding, field,
 return or array element. Inline `fn` closures inside call arguments are rejected
 with `NR009`; use `do` or pass a named callback instead. `NR009` also rejects a
 block attached to a non-call or an invalid block ending. The function type syntax
 remains `fn(Int): Int`.
 
+The closure's `do` follows its parameter list or explicit return type on the
+same line. Its body starts on the next line, and `end` occupies its own line.
+
 An expected function type supplies
 omitted parameter and return annotations in trailing blocks, returns, annotated
 initializers, assignments and typed array elements. Explicit annotations must
 match that contract. Without an expected type, annotate every parameter and the
-return type, such as `fn(value: Int): Int ... end`. Every non-Void callback must
+return type, such as `fn(value: Int): Int do ... end`. Every non-Void callback must
 return on all statically recognized paths, just like a named function.
 
 Parentheses apply a suffix to the whole function type: `(fn(Int): Int)?` is an
@@ -966,6 +990,14 @@ feature in transport 1.2. Modules without this feature retain transport 1.1.
 The runtime [ABI and collection contract](ABI.md) defines roots and allocation
 boundaries. Bounds and arithmetic failures panic with exit status 70. Compile
 errors produce diagnostics and prevent artifact emission.
+
+Release compilation can reclaim temporary object graphs at a proven function
+boundary through automatic allocation regions. Source code continues to use
+ordinary constructors. The compiler retains ordinary GC allocation when it
+cannot prove the graph stays within the selected scope. Regions do not change
+reference semantics, and collection remains available within long-lived scopes.
+See [execution and optimization boundaries](ARCHITECTURE.md#execution-and-optimization-boundaries)
+for the current eligibility rules.
 
 ## Resources
 

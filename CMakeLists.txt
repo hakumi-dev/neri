@@ -114,6 +114,7 @@ add_library(neri_codegen STATIC
   native/codegen/ir_verifier.cpp
   native/codegen/llvm_emitter.cpp
   native/codegen/llvm_lowering.cpp
+  native/codegen/allocation_regions.cpp
 )
 target_include_directories(neri_codegen PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/native/include")
 target_include_directories(neri_codegen SYSTEM PRIVATE ${LLVM_INCLUDE_DIRS})
@@ -153,6 +154,7 @@ add_library(neri_runtime STATIC
   native/platform/session_loader.cpp
   native/runtime/entry.cpp
   native/runtime/math.cpp
+  native/runtime/managed_storage.cpp
   native/runtime/runtime.cpp
   native/runtime/task_executor.cpp
   native/runtime/worker_pool.cpp

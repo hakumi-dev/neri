@@ -186,6 +186,14 @@ entry points through the existing host services.
 
 `native/codegen/` is a narrow C++ LLVM consumer. It accepts only verified Neri IR and emits LLVM IR, assembly, or native objects.
 
+Sequential array generation lowers to a checked allocation and an LLVM loop in
+the caller. The callback and partially initialized array remain rooted across
+callback execution, and each result is stored before another safepoint. An
+allocation followed only by class upcasts proves the callback's exact dynamic
+type and permits a direct call; other callbacks retain virtual dispatch. This
+keeps known callback bodies and loop bounds visible to LLVM without changing
+callback order or the source-level API.
+
 `native/runtime/` implements the runtime and precise tracing garbage collector in
 C++. Generated programs link to its static archive through the versioned
 [runtime ABI](ABI.md).
@@ -230,6 +238,18 @@ intrinsic IDs in source.
 `tooling/abi` defines the declarative catalog for effect bits, runtime capability
 bits, native intrinsics, and symbol-specific runtime requirements. Its Neri
 generator produces the typed compiler definitions and the shared native header.
+`AbiEffects` and `AbiFeatures` declare typed descriptors with explicit bit values.
+Compile-time field reflection supplies their canonical names; shared naming
+rules derive C identifiers and effect spellings, with explicit spelling overrides
+where required. Intrinsics and runtime requirements reference those descriptors
+directly. Registration sorts by bit value, and validation rejects repeated
+registrations, conflicting codes or names, and references outside the catalog.
+Reordering fields preserves emitted order; renaming a field changes its derived
+ABI names and requires reviewing and regenerating the public artifacts.
+`AbiRuntimeRequirements` declares named rules with an explicit `Exact` or
+`Prefix` match kind. Reflection derives runtime symbol spellings from field
+names. Generated `RuntimeSymbols` methods own the text comparisons at the
+link-name boundary; version and capability requirements share those methods.
 The compiler linker and native code generator combine all matching symbol rules;
 exact rules can raise the minimum version required by a broader prefix rule.
 The runtime and its package manifest obtain advertised capabilities from the
@@ -361,7 +381,7 @@ already inside a task. Callbacks must not depend on sibling execution order or
 block waiting for siblings.
 
 Range calls include worker startup, queue access, task execution and joining.
-The [benchmark methodology](../benchmarks/README.md#analytical-foundations)
+The [measurement methodology](PERFORMANCE.md#local-measurements)
 distinguishes measured execution costs from theoretical work/span bounds.
 
 `tasks::generate` binds an index callback with a `parallel fn` signature. Shared
@@ -380,11 +400,34 @@ Terminal leases and window state are process-wide, thread-confined services.
 Native integrations must preserve their operating-system resource ownership and
 synchronization requirements across runtime contexts.
 
-LLVM Release uses the O2 module pipeline and generic target CPU settings for
-ARM64 and x86-64. Checked arithmetic, bounds and strict floating-point semantics
+LLVM Release uses the O3 module pipeline and aggressive machine-code optimization.
+macOS ARM64 uses the Apple M1 CPU baseline; other targets use generic CPU settings.
+Closed executable modules give internal linkage to private definitions so LLVM can
+propagate values across calls. Retained modules and external entry points preserve
+their linkage. Checked arithmetic, bounds and strict floating-point semantics
 remain enabled. Native records describe C-compatible memory layouts; they do not
 provide a general ownership or cross-thread transfer contract. Native memory access
 through `unsafe` does not establish synchronization.
+
+The `automatic-regions-v1` IR feature permits Release allocation scopes for
+functions whose managed allocation graphs cannot escape. The native analysis
+requires scalar parameters and results, including optional scalars, and a fully
+known direct-call graph. It admits operations on local objects and immutable
+literals; imports, virtual calls, unsafe operations and recursive call cycles
+prevent selection. Loops in an allocating function or its callees identify
+potential bulk allocation, avoiding a separate heap for single-allocation leaves.
+Unknown operations remain in the ordinary heap.
+
+Selected functions enter a child heap before registering their roots and release
+it after removing roots on every normal return. Intermediate graphs returned by
+callees remain in the enclosing scope. The parent stays suspended, preserving
+caller objects, and collection remains enabled inside the child to reclaim
+temporary objects during long-running scopes. This combines scoped reclamation
+with tracing, as studied in
+[Combining Region Inference and Garbage Collection (2002)](https://www.cs.cmu.edu/afs/cs/academic/class/15745-s06/web/handouts/hallenberg-pldi02.pdf).
+Neri uses conservative scalar boundaries rather than a general region type
+inference system. The optimization introduces no source syntax or object-layout
+changes. Manual region creation is not part of the safe language API.
 
 The compiler owns distinct syntax, semantic and IR representations. Binding and
 lowering currently operate on a combined program, and those mutable graphs are
@@ -404,6 +447,6 @@ Capability boundaries relevant to performance:
 | Data modeling | Classes and native records. |
 | Machine targeting | Generic ARM64/x86-64 emission; no language-level SIMD or per-CPU feature selection. |
 
-The [compute benchmarks](../benchmarks/README.md) separate kernel throughput from
-run-loop latency and include an independent C# scaling reference. Native x86-64
+Local [compute measurements](PERFORMANCE.md#compute-and-scoped-tasks) separate kernel throughput from
+run-loop latency and compare equivalent reference workloads. Native x86-64
 ABI/codegen CI is a correctness gate, not evidence of Neri multicore scaling.

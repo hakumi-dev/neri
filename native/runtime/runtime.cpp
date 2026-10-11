@@ -5,6 +5,7 @@
 #include "../platform/session_loader.h"
 #include "terminal.h"
 #include "task_heap.h"
+#include "managed_storage.h"
 #include "worker_pool.h"
 
 #include <algorithm>
@@ -47,22 +48,11 @@ constexpr uint32_t known_type_flags = NERI_TYPE_FLAG_CONTAINS_REFS_V1 |
 
 struct runtime_state;
 
-struct managed_allocation final {
-  managed_allocation *previous;
-  managed_allocation *next;
-  neri_ref_v1 object;
-  uint64_t payload_size;
-  const runtime_state *owner;
-  bool marked;
-};
+using managed_storage = neri::runtime::managed_storage;
 
-// One reservation per managed object. The private prefix preserves the public
-// object/payload alignment and is the address passed back to the allocator.
-constexpr size_t managed_prefix_size =
-    (sizeof(managed_allocation) + alignof(std::max_align_t) - 1) &
-    ~(alignof(std::max_align_t) - 1);
-static_assert(managed_prefix_size % alignof(neri_object_header_v1) == 0);
-static_assert(sizeof(neri_object_header_v1) % alignof(std::max_align_t) == 0);
+std::size_t payload_size(const neri_object_header_v1 *object) {
+  return managed_storage::size(object) - sizeof(neri_object_header_v1);
+}
 
 struct native_allocation final {
   native_allocation *previous;
@@ -77,7 +67,7 @@ struct native_allocation final {
 enum class heap_phase { uninitialized, active, collecting, suspended };
 
 struct runtime_state final {
-  managed_allocation *managed_head;
+  neri::runtime::managed_storage storage;
   native_allocation *native_head;
   neri_gc_root_frame_v1 *root_frame;
   neri_gc_borrow_v1 *borrow;
@@ -91,6 +81,7 @@ struct runtime_state final {
   const char *const *process_arguments;
   heap_phase phase = heap_phase::uninitialized;
   const runtime_state *read_parent;
+  runtime_state *region_parent;
   std::string host_error;
   std::vector<neri_ref_v1 *> persistent_roots;
 };
@@ -163,9 +154,14 @@ struct neri_task_ticket final {
 
 namespace {
 struct mark_stack final {
-  managed_allocation **items;
+  neri_ref_v1 *items;
   size_t count;
   size_t capacity;
+};
+
+struct mark_context final {
+  runtime_state &heap;
+  mark_stack &stack;
 };
 
 // The active context may be a scoped task on a worker or on its waiting parent.
@@ -433,14 +429,8 @@ void require_initialized() {
   return value != 0 && (value & (value - 1)) == 0;
 }
 
-[[nodiscard]] managed_allocation *find_managed(neri_ref_v1 object) {
-  if (object == nullptr) {
-    return nullptr;
-  }
-  auto *allocation = reinterpret_cast<managed_allocation *>(object->runtime_word);
-  return allocation != nullptr && allocation->owner == &current_state() &&
-                 allocation->object == object
-             ? allocation : nullptr;
+[[nodiscard]] neri_ref_v1 find_managed(neri_ref_v1 object) {
+  return managed_storage::owner(object) == &current_state() ? object : nullptr;
 }
 
 [[nodiscard]] bool is_string_literal(neri_ref_v1 object) {
@@ -448,22 +438,15 @@ void require_initialized() {
          object->type == &neri_rt_v1_string_literal_type;
 }
 
-[[nodiscard]] const managed_allocation *find_readable(neri_ref_v1 object) {
-  if (object == nullptr) {
-    return nullptr;
-  }
-  const auto *allocation =
-      reinterpret_cast<const managed_allocation *>(object->runtime_word);
-  if (allocation == nullptr || allocation->object != object) {
-    return nullptr;
-  }
-  if (allocation->owner == &current_state()) {
-    return allocation;
+[[nodiscard]] neri_ref_v1 find_readable(neri_ref_v1 object) {
+  const auto *owner = managed_storage::owner(object);
+  if (owner == &current_state()) {
+    return object;
   }
   for (auto *parent = current_state().read_parent; parent != nullptr;
        parent = parent->read_parent) {
-    if (allocation->owner == parent && parent->phase == heap_phase::suspended) {
-      return allocation;
+    if (owner == parent && parent->phase == heap_phase::suspended) {
+      return object;
     }
   }
   return nullptr;
@@ -481,21 +464,16 @@ void require_initialized() {
 
 void assert_consistent() {
 #ifndef NDEBUG
-  uint64_t managed_count = 0;
-  uint64_t managed_bytes = 0;
-  managed_allocation *managed_previous = nullptr;
-  for (auto *allocation = current_state().managed_head; allocation != nullptr;
-       allocation = allocation->next) {
-    assert(allocation->previous == managed_previous);
-    assert(allocation->object != nullptr);
-    assert(allocation->owner == &current_state());
-    assert(current_state().phase == heap_phase::collecting || !allocation->marked);
-    managed_previous = allocation;
-    ++managed_count;
-    managed_bytes += sizeof(neri_object_header_v1) + allocation->payload_size;
-  }
-  assert(managed_count == current_state().managed_object_count);
-  assert(managed_bytes == current_state().managed_byte_count);
+  managed_storage::reclaimed totals;
+  current_state().storage.visit([](neri_ref_v1 object, std::size_t bytes, void *context) {
+    assert(managed_storage::owner(object) == &current_state());
+    assert(current_state().phase == heap_phase::collecting || !managed_storage::marked(object));
+    auto &count = *static_cast<managed_storage::reclaimed *>(context);
+    ++count.objects;
+    count.bytes += bytes;
+  }, &totals);
+  assert(totals.objects == current_state().managed_object_count);
+  assert(totals.bytes == current_state().managed_byte_count);
 
   uint64_t native_bytes = 0;
   native_allocation *native_previous = nullptr;
@@ -510,66 +488,55 @@ void assert_consistent() {
 #endif
 }
 
-void push_mark(mark_stack &stack, managed_allocation *allocation) {
+void push_mark(mark_stack &stack, neri_ref_v1 allocation) {
   if (stack.count == stack.capacity) {
     const size_t next_capacity = stack.capacity == 0 ? 64 : stack.capacity * 2;
     if (next_capacity < stack.capacity ||
-        next_capacity > SIZE_MAX / sizeof(managed_allocation *)) {
+        next_capacity > SIZE_MAX / sizeof(neri_ref_v1)) {
       out_of_memory("GC mark worklist is too large");
     }
     void *replacement = std::realloc(
-        stack.items, next_capacity * sizeof(managed_allocation *));
+        stack.items, next_capacity * sizeof(neri_ref_v1));
     if (replacement == nullptr) {
       out_of_memory("GC mark worklist allocation failed");
     }
-    stack.items = static_cast<managed_allocation **>(replacement);
+    stack.items = static_cast<neri_ref_v1 *>(replacement);
     stack.capacity = next_capacity;
   }
   stack.items[stack.count++] = allocation;
 }
 
-void mark_object(neri_ref_v1 object) {
+void mark_object(neri_ref_v1 object, mark_context &context) {
   if (object == nullptr) {
     return;
   }
   if (is_string_literal(object)) {
     return;
   }
-  auto *allocation = find_managed(object);
-  if (allocation == nullptr) {
+  const auto *owner = managed_storage::owner(object);
+  if (owner != &context.heap) {
     // Ancestor heaps remain intact. Their mark bits and tracing belong to
     // their suspended owners; child collections never touch them.
-    if (find_readable(object) != nullptr) {
-      return;
+    for (auto *parent = context.heap.read_parent; parent != nullptr;
+         parent = parent->read_parent) {
+      if (owner == parent && parent->phase == heap_phase::suspended) return;
     }
     contract_panic("GC encountered a reference outside the managed heap");
   }
-  if (allocation->marked) {
+  if (!managed_storage::mark(object)) {
     return;
   }
-  if (active_mark_stack == nullptr) {
+  push_mark(context.stack, object);
+}
+
+void mark_slot(neri_ref_v1 *slot, void *opaque_context) {
+  if (slot == nullptr || opaque_context == nullptr) {
+    contract_panic("GC trace callback supplied a null slot or context");
+  }
+  auto &context = *static_cast<mark_context *>(opaque_context);
+  if (context.heap.phase != heap_phase::collecting)
     contract_panic("GC trace callback ran outside collection");
-  }
-  allocation->marked = true;
-  push_mark(*active_mark_stack, allocation);
-}
-
-void mark_slot(neri_ref_v1 *slot, void *) {
-  if (slot == nullptr) {
-    contract_panic("GC trace callback supplied a null slot");
-  }
-  mark_object(*slot);
-}
-
-void unlink_managed(runtime_state &heap, managed_allocation *allocation) {
-  if (allocation->previous != nullptr) {
-    allocation->previous->next = allocation->next;
-  } else {
-    heap.managed_head = allocation->next;
-  }
-  if (allocation->next != nullptr) {
-    allocation->next->previous = allocation->previous;
-  }
+  mark_object(*slot, context);
 }
 
 void unlink_native(native_allocation *allocation) {
@@ -593,6 +560,7 @@ void collect_impl() {
   }
   heap.phase = heap_phase::collecting;
   mark_stack stack{};
+  mark_context context{heap, stack};
   active_mark_stack = &stack;
   for (auto *frame = heap.root_frame; frame != nullptr;
        frame = frame->previous) {
@@ -601,12 +569,12 @@ void collect_impl() {
       contract_panic("GC root-frame chain is corrupt");
     }
     for (uint64_t index = 0; index < frame->slot_count; ++index) {
-      mark_object(frame->slots[index]);
+      mark_object(frame->slots[index], context);
     }
   }
   for (auto *slot : heap.persistent_roots) {
     if (slot == nullptr) contract_panic("persistent GC root is corrupt");
-    mark_object(*slot);
+    mark_object(*slot, context);
   }
   for (auto *borrow = heap.borrow; borrow != nullptr;
        borrow = reinterpret_cast<neri_gc_borrow_v1 *>(
@@ -614,39 +582,26 @@ void collect_impl() {
     if (borrow_word(borrow, borrow_slot::cookie) != borrow_cookie) {
       contract_panic("managed-borrow chain is corrupt");
     }
-    mark_object(reinterpret_cast<neri_ref_v1>(borrow_word(borrow, borrow_slot::owner)));
+    mark_object(reinterpret_cast<neri_ref_v1>(borrow_word(borrow, borrow_slot::owner)), context);
   }
 
   while (stack.count != 0) {
     auto *allocation = stack.items[--stack.count];
-    const auto *type = allocation->object->type;
+    const auto *type = allocation->type;
     if (type != nullptr && type->trace != nullptr) {
-      type->trace(allocation->object, mark_slot, nullptr);
+      type->trace(allocation, mark_slot, &context);
     }
   }
   active_mark_stack = nullptr;
   std::free(stack.items);
 
-  for (auto *allocation = heap.managed_head; allocation != nullptr;) {
-    auto *next = allocation->next;
-    if (!allocation->marked) {
-      unlink_managed(heap, allocation);
-      heap.managed_object_count -= 1;
-      heap.managed_byte_count -=
-          sizeof(neri_object_header_v1) + allocation->payload_size;
-      if (profiling) {
-        profile_free(allocation->object->type,
-                     sizeof(neri_object_header_v1) + allocation->payload_size,
-                     true);
-      }
-      std::free(allocation);
-    } else {
-      // Outside collection every live object is unmarked. Reset survivors
-      // while sweeping instead of traversing the entire heap before marking.
-      allocation->marked = false;
-    }
-    allocation = next;
-  }
+  const auto reclaimed = heap.storage.sweep(profiling
+      ? +[](neri_ref_v1 object, std::size_t bytes, void *) {
+          profile_free(object->type, bytes, true);
+        }
+      : nullptr);
+  heap.managed_object_count -= reclaimed.objects;
+  heap.managed_byte_count -= reclaimed.bytes;
   heap.collection_count += 1;
   heap.next_collection_bytes = std::max(collection_floor_bytes,
       heap.managed_byte_count > UINT64_MAX / 2 ? UINT64_MAX : heap.managed_byte_count * 2);
@@ -763,9 +718,9 @@ struct string_view final {
 
   const auto *allocation = find_readable(value);
   if (allocation == nullptr || value->type != &dynamic_string_type ||
-      allocation->payload_size < sizeof(uint64_t) + 1U ||
+      payload_size(allocation) < sizeof(uint64_t) + 1U ||
       prefix->byte_length >
-          allocation->payload_size - sizeof(uint64_t) - 1U) {
+          payload_size(allocation) - sizeof(uint64_t) - 1U) {
     contract_panic("invalid managed string object");
   }
   const auto *bytes = reinterpret_cast<const uint8_t *>(value) +
@@ -913,12 +868,12 @@ struct array_view final {
     contract_panic("array operation received an invalid array");
   }
   const auto *prefix = reinterpret_cast<const neri_array_prefix_v1 *>(value);
-  if (prefix->length >
+  if (prefix->length > INT64_MAX || prefix->length >
       (UINT64_MAX - type->payload_size) / type->element_size) {
     contract_panic("array length is corrupt");
   }
   const auto required = type->payload_size + prefix->length * type->element_size;
-  if (required > allocation->payload_size) {
+  if (required > payload_size(allocation)) {
     contract_panic("array payload is corrupt");
   }
   return {type, prefix->length,
@@ -930,7 +885,7 @@ struct array_view final {
                                          const void *value,
                                          bool value_is_reference) {
   const auto initial = inspect_array(values);
-  if (initial.length == UINT64_MAX ||
+  if (initial.length == INT64_MAX ||
       initial.length + 1U >
           (UINT64_MAX - initial.type->payload_size) /
               initial.type->element_size) {
@@ -1158,15 +1113,10 @@ void release_heap() {
     contract_panic("runtime shutdown requires no live roots, borrows or foreign entries");
   }
   neri_worker_close_owned(&heap);
-  while (heap.managed_head != nullptr) {
-    auto *allocation = heap.managed_head;
-    heap.managed_head = allocation->next;
-    if (memory_profile_enabled()) {
-      profile_free(allocation->object->type,
-                   sizeof(neri_object_header_v1) + allocation->payload_size,
-                   false);
-    }
-    std::free(allocation);
+  if (memory_profile_enabled()) {
+    heap.storage.visit([](neri_ref_v1 object, std::size_t bytes, void *) {
+      profile_free(object->type, bytes, false);
+    }, nullptr);
   }
   release_native_allocations(heap);
   heap = {};
@@ -1182,22 +1132,9 @@ void adopt_results(neri_task_scope &scope) {
         parent.managed_byte_count > UINT64_MAX - child.managed_byte_count) {
       out_of_memory("task result allocation accounting overflow");
     }
-    managed_allocation *tail = nullptr;
-    for (auto *allocation = child.managed_head; allocation != nullptr;
-         allocation = allocation->next) {
-      assert(allocation->owner == &child);
-      allocation->owner = &parent;
-      tail = allocation;
-    }
-    if (tail != nullptr) {
-      tail->next = parent.managed_head;
-      if (parent.managed_head != nullptr) {
-        parent.managed_head->previous = tail;
-      }
-      parent.managed_head = child.managed_head;
-    }
     parent.managed_object_count += child.managed_object_count;
     parent.managed_byte_count += child.managed_byte_count;
+    parent.storage.adopt(child.storage, &parent);
     delete result;
   }
 }
@@ -1672,9 +1609,8 @@ NERI_RT_API void neri_rt_v1_shutdown(void) {
   }
 }
 
-NERI_RT_API neri_ref_v1
-neri_rt_v1_gc_alloc(const neri_type_descriptor_v1 *type,
-                      uint64_t payload_size, uint64_t payload_alignment) {
+static neri_ref_v1 allocate_managed(const neri_type_descriptor_v1 *type,
+    uint64_t payload_size, uint64_t payload_alignment, bool zeroed) {
   require_initialized();
   auto &heap = current_state();
   if (heap.phase == heap_phase::collecting) {
@@ -1684,44 +1620,46 @@ neri_rt_v1_gc_alloc(const neri_type_descriptor_v1 *type,
 
   const size_t total_size =
       sizeof(neri_object_header_v1) + static_cast<size_t>(payload_size);
-  if (total_size > SIZE_MAX - managed_prefix_size) {
-    out_of_memory("managed allocation size is not representable");
-  }
+  if (heap.managed_byte_count > UINT64_MAX - total_size ||
+      heap.managed_object_count == UINT64_MAX)
+    out_of_memory("managed allocation accounting overflow");
   if (heap.managed_byte_count >= heap.next_collection_bytes ||
       total_size > heap.next_collection_bytes - heap.managed_byte_count) {
     collect_impl();
   }
 
-  const size_t physical_size = managed_prefix_size + total_size;
-  auto *metadata =
-      static_cast<managed_allocation *>(std::calloc(1, physical_size));
-  if (metadata == nullptr) {
+  auto *object = heap.storage.allocate(total_size, &heap, zeroed);
+  if (object == nullptr) {
     collect_impl();
-    metadata = static_cast<managed_allocation *>(
-        std::calloc(1, physical_size));
+    object = heap.storage.allocate(total_size, &heap, zeroed);
   }
-  if (metadata == nullptr ||
-      heap.managed_byte_count > UINT64_MAX - total_size ||
-      heap.managed_object_count == UINT64_MAX) {
-    std::free(metadata);
+  if (object == nullptr) {
     out_of_memory("managed allocation failed");
   }
 
-  auto *object = reinterpret_cast<neri_ref_v1>(
-      reinterpret_cast<unsigned char *>(metadata) + managed_prefix_size);
-
-  *metadata = {nullptr, heap.managed_head, object, payload_size, &heap, false};
-  if (heap.managed_head != nullptr) {
-    heap.managed_head->previous = metadata;
-  }
-  heap.managed_head = metadata;
   object->type = type;
-  object->runtime_word = reinterpret_cast<uintptr_t>(metadata);
   heap.managed_object_count += 1;
   heap.managed_byte_count += total_size;
   if (memory_profile_enabled()) profile_alloc(type, total_size);
   assert_consistent();
   return object;
+}
+
+NERI_RT_API neri_ref_v1 neri_rt_v1_gc_alloc(const neri_type_descriptor_v1 *type,
+    uint64_t payload_size, uint64_t payload_alignment) {
+  return allocate_managed(type, payload_size, payload_alignment, true);
+}
+
+NERI_RT_API neri_ref_v1 neri_rt_v1_array_alloc_uninitialized(
+    const neri_type_descriptor_v1 *type, uint64_t payload_size,
+    uint64_t payload_alignment) {
+  if (type == nullptr || type->kind != NERI_TYPE_KIND_ARRAY_V1 ||
+      (type->flags & NERI_TYPE_FLAG_CONTAINS_REFS_V1) != 0 || type->trace != nullptr) {
+    contract_panic("uninitialized arrays require reference-free elements");
+  }
+  auto *array = allocate_managed(type, payload_size, payload_alignment, false);
+  reinterpret_cast<neri_array_prefix_v1 *>(array)->length = 0;
+  return array;
 }
 
 NERI_RT_API void
@@ -1748,6 +1686,38 @@ neri_rt_v1_gc_root_frame_leave(neri_gc_root_frame_v1 *frame) {
   frame->runtime_cookie = 0;
 }
 
+NERI_RT_API neri_region_v1 *neri_rt_v1_region_enter(void) {
+  require_initialized();
+  auto &parent = current_state();
+  if (parent.phase != heap_phase::active || active_mark_stack != nullptr) {
+    contract_panic("allocation regions require an active heap outside tracing");
+  }
+  auto *child = new (std::nothrow) runtime_state{};
+  if (child == nullptr) out_of_memory("allocation region creation failed");
+  child->phase = heap_phase::active;
+  child->read_parent = &parent;
+  child->region_parent = &parent;
+  child->process_argument_count = parent.process_argument_count;
+  child->process_arguments = parent.process_arguments;
+  parent.phase = heap_phase::suspended;
+  active_state = child;
+  return reinterpret_cast<neri_region_v1 *>(child);
+}
+
+NERI_RT_API void neri_rt_v1_region_leave(neri_region_v1 *region) {
+  require_initialized();
+  auto *child = &current_state();
+  auto *parent = child->region_parent;
+  if (region != reinterpret_cast<neri_region_v1 *>(child) || parent == nullptr ||
+      parent->phase != heap_phase::suspended) {
+    contract_panic("allocation regions must leave in LIFO order");
+  }
+  release_heap();
+  active_state = parent;
+  parent->phase = heap_phase::active;
+  delete child;
+}
+
 NERI_RT_API void neri_rt_v1_gc_store_ref(neri_ref_v1 owner,
                                              neri_ref_v1 *slot,
                                              neri_ref_v1 value) {
@@ -1758,9 +1728,9 @@ NERI_RT_API void neri_rt_v1_gc_store_ref(neri_ref_v1 owner,
   }
   const uintptr_t payload_begin =
       reinterpret_cast<uintptr_t>(owner) + sizeof(neri_object_header_v1);
-  const uintptr_t payload_end = payload_begin + allocation->payload_size;
+  const uintptr_t payload_end = payload_begin + payload_size(allocation);
   const uintptr_t slot_address = reinterpret_cast<uintptr_t>(slot);
-  if (allocation->payload_size < sizeof(neri_ref_v1) ||
+  if (payload_size(allocation) < sizeof(neri_ref_v1) ||
       slot_address < payload_begin ||
       slot_address > payload_end - sizeof(neri_ref_v1) ||
       slot_address % alignof(neri_ref_v1) != 0) {
@@ -2364,8 +2334,8 @@ NERI_RT_API void *neri_rt_v1_gc_borrow_begin(
                            borrow_word(borrow, borrow_slot::byte_length) == 0 &&
                            borrow_word(borrow, borrow_slot::cookie) == 0;
   if (allocation == nullptr || !empty_token ||
-      payload_offset > allocation->payload_size ||
-      byte_length > allocation->payload_size - payload_offset) {
+      payload_offset > payload_size(allocation) ||
+      byte_length > payload_size(allocation) - payload_offset) {
     contract_panic("invalid managed borrow");
   }
   borrow_word(borrow, borrow_slot::previous) = reinterpret_cast<uintptr_t>(current_state().borrow);

@@ -1,4 +1,5 @@
 #include "llvm_lowering.h"
+#include "allocation_regions.h"
 #include "llvm_numeric.h"
 #include "native_layout.h"
 
@@ -13,6 +14,7 @@
 #include <llvm/IR/Attributes.h>
 #include <llvm/IR/BasicBlock.h>
 #include <llvm/IR/Constants.h>
+#include <llvm/IR/ConstantRange.h>
 #include <llvm/IR/DataLayout.h>
 #include <llvm/IR/DIBuilder.h>
 #include <llvm/IR/DebugInfoMetadata.h>
@@ -23,6 +25,7 @@
 #include <llvm/IR/Intrinsics.h>
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/Module.h>
+#include <llvm/Support/ModRef.h>
 #include <llvm/TargetParser/Triple.h>
 
 #include <array>
@@ -98,11 +101,15 @@ constexpr std::uint16_t native_class_runtime_minor = 4U;
   return is_array(value) || std::ranges::any_of(value.arguments, contains_array);
 }
 
-[[nodiscard]] bool owns_program_entry(const ir_module &module) {
-  return std::ranges::any_of(module.functions, [&](const function &value) {
-    return !value.retained && value.id.module == module.id &&
+[[nodiscard]] bool is_program_entry(const ir_module &module, const function &value) {
+  return !value.retained && value.id.module == module.id &&
            value.id.kind == NERI_IR_SYMBOL_FUNCTION_V1 && value.id.semantic_name == "main" &&
            value.kind == NERI_IR_FUNCTION_V1 && value.parameter_types.empty() && is_void(value.result_type);
+}
+
+[[nodiscard]] bool owns_program_entry(const ir_module &module) {
+  return std::ranges::any_of(module.functions, [&](const function &value) {
+    return is_program_entry(module, value);
   });
 }
 
@@ -269,6 +276,10 @@ public:
     }
     initialize_debug_information();
     build_class_layouts();
+    if (!emit_debug_information_ && std::ranges::find(input_.required_features,
+            ir_feature::AutomaticRegions) != input_.required_features.end()) {
+      allocation_regions_ = allocation_regions(input_);
+    }
     emit_program_requirements();
     declare_globals();
     declare_imports();
@@ -615,6 +626,7 @@ private:
         for (const auto &instruction : block.instructions) {
           for (const auto &result : instruction.results) {
             value_types_.try_emplace(result.id, &result.value_type);
+            definitions_.try_emplace(result.id, &instruction);
           }
         }
       }
@@ -631,9 +643,11 @@ private:
       for (const auto &block : input_.blocks) {
         builder_.SetInsertPoint(blocks_.at(block.id));
         for (const auto &instruction : block.instructions) {
+          if (redundant_null_store(block, instruction)) continue;
           builder_.SetCurrentDebugLocation(
               module_.debug_location(instruction.location,
                                      debug_scope(instruction.debug_scope_id)));
+          synchronize_roots(instruction);
           lower_instruction(instruction);
         }
         builder_.SetCurrentDebugLocation(
@@ -644,12 +658,26 @@ private:
     }
 
   private:
-    [[nodiscard]] llvm::Value *value(std::uint32_t id) {
-      if (const auto rooted = root_slots_.find(id); rooted != root_slots_.end()) {
-        return builder_.CreateLoad(module_.semantic_type(value_type(id)),
-                                   rooted->second,
-                                   "v" + std::to_string(id) + ".rooted");
+    bool redundant_null_store(const block &block, const instruction &instruction) {
+      if (instruction.opcode != NERI_IR_OPCODE_FIELD_STORE_V1 ||
+          !llvm::isa<llvm::ConstantPointerNull>(value(instruction.operands[1]))) return false;
+      // A later store checks the same owner and slot. Null needs no value
+      // validation, and no read, call or control-flow edge may observe it.
+      const auto first = &instruction - block.instructions.data() + 1;
+      for (auto index = static_cast<std::size_t>(first); index < block.instructions.size(); ++index) {
+        const auto &next = block.instructions[index];
+        if (next.opcode == NERI_IR_OPCODE_CONSTANT_V1 ||
+            next.opcode == NERI_IR_OPCODE_OPTIONAL_NONE_V1) continue;
+        if (next.opcode != NERI_IR_OPCODE_FIELD_STORE_V1 ||
+            next.operands[0] != instruction.operands[0]) return false;
+        if (symbol_key(*next.symbol) == symbol_key(*instruction.symbol)) return true;
       }
+      return false;
+    }
+
+    [[nodiscard]] llvm::Value *value(std::uint32_t id) {
+      // The collector is nonmoving. Roots keep SSA values alive; they never
+      // replace their addresses or require reloads after a collection.
       return values_.at(id);
     }
 
@@ -686,6 +714,104 @@ private:
       return input;
     }
 
+    using live_references = std::set<std::uint32_t>;
+
+    [[nodiscard]] bool can_collect(const instruction &instruction) const {
+      constexpr auto collecting_effects = NERI_IR_EFFECT_MANAGED_ALLOCATE_V1 |
+          NERI_IR_EFFECT_NATIVE_ALLOCATE_V1 | NERI_IR_EFFECT_SAFEPOINT_V1 |
+          NERI_IR_EFFECT_UNSAFE_V1;
+      switch (instruction.opcode) {
+      case NERI_IR_OPCODE_CALL_V1:
+      case NERI_IR_OPCODE_CALL_DIRECT_V1:
+        return (module_.input_functions_by_id_.at(symbol_key(*instruction.symbol))->effects &
+                collecting_effects) != 0;
+      case NERI_IR_OPCODE_CALL_IMPORT_V1:
+        return (module_.input_imports_by_id_.at(symbol_key(*instruction.symbol))->effects &
+                collecting_effects) != 0;
+      case NERI_IR_OPCODE_CALL_UNSAFE_V1:
+      case NERI_IR_OPCODE_CALL_VIRTUAL_V1:
+      case NERI_IR_OPCODE_CALL_C_ABI_V1:
+      case NERI_IR_OPCODE_CALL_C_INDIRECT_V1:
+      case NERI_IR_OPCODE_OBJECT_ALLOC_V1:
+      case NERI_IR_OPCODE_ARRAY_NEW_V1:
+      case NERI_IR_OPCODE_ARRAY_GENERATE_V1:
+      case NERI_IR_OPCODE_TASK_GENERATE_V1:
+      case NERI_IR_OPCODE_WORKER_ENTRY_V1:
+      case NERI_IR_OPCODE_STRING_CONCAT_V1:
+      case NERI_IR_OPCODE_STRING_FROM_INT_V1:
+      case NERI_IR_OPCODE_STRING_FROM_BYTE_V1:
+      case NERI_IR_OPCODE_STRING_FROM_FLOAT_V1:
+      case NERI_IR_OPCODE_NATIVE_ALLOC_V1:
+      case NERI_IR_OPCODE_NATIVE_REALLOC_V1:
+      case NERI_IR_OPCODE_NATIVE_FREE_V1:
+      case NERI_IR_OPCODE_BORROW_BEGIN_V1:
+      case NERI_IR_OPCODE_BORROW_END_V1:
+        return true;
+      default:
+        return false;
+      }
+    }
+
+    void add_reference(live_references &live, std::uint32_t id) const {
+      if (is_managed_reference(value_type(id))) live.insert(id);
+    }
+
+    live_references live_at_end(
+        const block &block,
+        const std::map<std::uint32_t, live_references> &entries) const {
+      live_references live;
+      for (const auto &edge : block.ending.edges) {
+        auto incoming = entries.at(edge.target);
+        const auto &target = *input_blocks_by_id_.at(edge.target);
+        for (std::size_t index = 0; index < target.parameters.size(); ++index) {
+          incoming.erase(target.parameters[index].id);
+          add_reference(live, edge.arguments[index]);
+        }
+        live.insert(incoming.begin(), incoming.end());
+      }
+      if (block.ending.return_value) add_reference(live, *block.ending.return_value);
+      if (block.ending.condition) add_reference(live, *block.ending.condition);
+      return live;
+    }
+
+    void live_before(live_references &live, const instruction &instruction) const {
+      for (const auto &result : instruction.results) live.erase(result.id);
+      for (const auto operand : instruction.operands) add_reference(live, operand);
+    }
+
+    std::size_t plan_roots() {
+      std::map<std::uint32_t, live_references> entries;
+      for (const auto &block : input_.blocks) entries.emplace(block.id, live_references{});
+      bool changed;
+      do {
+        changed = false;
+        for (const auto &block : std::ranges::reverse_view(input_.blocks)) {
+          auto live = live_at_end(block, entries);
+          for (const auto &instruction : std::ranges::reverse_view(block.instructions))
+            live_before(live, instruction);
+          if (live != entries.at(block.id)) {
+            entries.at(block.id) = std::move(live);
+            changed = true;
+          }
+        }
+      } while (changed);
+
+      std::size_t capacity = 0;
+      for (const auto &block : input_.blocks) {
+        auto live = live_at_end(block, entries);
+        for (const auto &instruction : std::ranges::reverse_view(block.instructions)) {
+          live_before(live, instruction);
+          if (can_collect(instruction)) {
+            // Slot zero protects the partially constructed ARRAY_GENERATE
+            // result across callbacks, in addition to the live input values.
+            capacity = std::max(capacity, live.size() + 1);
+            roots_before_.emplace(&instruction, live);
+          }
+        }
+      }
+      return capacity;
+    }
+
     void create_root_frame_storage() {
       // Verified transitive effects bound every possible collection point.
       // Foreign/unsafe calls retain roots even without an allocation effect.
@@ -693,36 +819,20 @@ private:
           NERI_IR_EFFECT_NATIVE_ALLOCATE_V1 | NERI_IR_EFFECT_SAFEPOINT_V1 |
           NERI_IR_EFFECT_UNSAFE_V1;
       if ((input_.effects & may_collect) == 0U) return;
-      std::vector<std::uint32_t> root_ids;
-      for (const auto &block : input_.blocks) {
-        for (const auto &parameter : block.parameters) {
-          if (is_managed_reference(parameter.value_type)) {
-            root_ids.push_back(parameter.id);
-          }
-        }
-        for (const auto &instruction : block.instructions) {
-          for (const auto &result : instruction.results) {
-            if (is_managed_reference(result.value_type)) {
-              root_ids.push_back(result.id);
-            }
-          }
-        }
-      }
-      if (root_ids.empty()) {
-        return;
-      }
+      const auto capacity = plan_roots();
+      if (capacity == 0) return;
 
       auto *pointer_type = llvm::PointerType::getUnqual(module_.context_);
-      auto *array_type = llvm::ArrayType::get(pointer_type, root_ids.size());
+      auto *array_type = llvm::ArrayType::get(pointer_type, capacity);
       root_array_ = create_entry_alloca(array_type, "gc.roots");
       builder_.CreateStore(llvm::ConstantAggregateZero::get(array_type),
                            root_array_);
-      for (std::size_t index = 0; index < root_ids.size(); ++index) {
+      for (std::size_t index = 0; index < capacity; ++index) {
         auto *slot = builder_.CreateInBoundsGEP(
             array_type, root_array_,
             {builder_.getInt32(0), builder_.getInt32(index)},
-            "gc.root." + std::to_string(root_ids[index]));
-        root_slots_.emplace(root_ids[index], slot);
+            "gc.root." + std::to_string(index));
+        root_slots_.push_back(slot);
       }
 
       root_frame_type_ = llvm::StructType::get(
@@ -737,14 +847,19 @@ private:
           array_type, root_array_,
           {builder_.getInt32(0), builder_.getInt32(0)});
       builder_.CreateStore(first, slots);
-      auto *count = builder_.CreateStructGEP(root_frame_type_, root_frame_, 2U);
-      builder_.CreateStore(builder_.getInt64(root_ids.size()), count);
+      root_count_ = builder_.CreateStructGEP(root_frame_type_, root_frame_, 2U);
+      builder_.CreateStore(builder_.getInt64(1), root_count_);
     }
 
-    void root_value(std::uint32_t id, llvm::Value *value) {
-      if (const auto slot = root_slots_.find(id); slot != root_slots_.end()) {
-        builder_.CreateStore(value, slot->second);
-      }
+    void synchronize_roots(const instruction &instruction) {
+      const auto found = roots_before_.find(&instruction);
+      if (found == roots_before_.end()) return;
+      builder_.CreateStore(llvm::ConstantPointerNull::get(
+          llvm::PointerType::getUnqual(module_.context_)), root_slots_.front());
+      std::size_t index = 1;
+      for (const auto id : found->second)
+        builder_.CreateStore(value(id), root_slots_[index++]);
+      builder_.CreateStore(builder_.getInt64(index), root_count_);
     }
 
     void enter_root_frame() {
@@ -755,11 +870,14 @@ private:
       }
     }
 
-    void leave_root_frame() {
+    void leave_function_scope() {
       if (root_frame_ != nullptr) {
         auto *call = builder_.CreateCall(module_.root_frame_leave_function(),
                                          {root_frame_});
         call->setCallingConv(llvm::CallingConv::C);
+      }
+      if (allocation_region_ != nullptr) {
+        builder_.CreateCall(module_.region_leave_function(), {allocation_region_});
       }
     }
 
@@ -805,8 +923,10 @@ private:
           lowered = from_physical_scalar(physical, semantic);
         }
         values_.emplace(entry.parameters[index].id, lowered);
-        root_value(entry.parameters[index].id, lowered);
         emit_debug_local(entry.parameters[index].id, lowered);
+      }
+      if (module_.allocation_regions_.contains(&input_)) {
+        allocation_region_ = builder_.CreateCall(module_.region_enter_function(), {}, "allocation.region");
       }
       enter_root_frame();
 
@@ -830,7 +950,6 @@ private:
           block_phis.emplace_back(parameter.id, phi);
         }
         for (const auto &[id, phi] : block_phis) {
-          root_value(id, phi);
           emit_debug_local(id, phi);
         }
       }
@@ -1140,7 +1259,9 @@ private:
       auto *nonnegative = builder_.CreateICmpSGE(
           index, llvm::ConstantInt::get(builder_.getInt64Ty(), 0U),
           "array.index.nonnegative");
-      auto *inside = builder_.CreateICmpULT(index, length, "array.index.inside");
+      // Array lengths and indices are Neri Ints. Use the same signed comparison
+      // as a source-level index < array.Length guard so LLVM can reuse it.
+      auto *inside = builder_.CreateICmpSLT(index, length, "array.index.inside");
       emit_guard(builder_.CreateAnd(nonnegative, inside),
                  NERI_PANIC_BOUNDS_V1, "Array index is out of bounds.",
                  location);
@@ -1228,6 +1349,86 @@ private:
                  NERI_PANIC_ARITHMETIC_V1,
                  "Allocation size is outside the supported range.", location);
       return bytes;
+    }
+
+    [[nodiscard]] const symbol_id *allocated_class(std::uint32_t id) const {
+      // Only allocation provenance proves an exact dynamic type. A declared
+      // class type may name a base class, and block parameters may merge types.
+      while (true) {
+        const auto found = definitions_.find(id);
+        if (found == definitions_.end()) break;
+        const auto &definition = *found->second;
+        if (definition.opcode == NERI_IR_OPCODE_OBJECT_ALLOC_V1)
+          return &*definition.symbol;
+        if (definition.opcode != NERI_IR_OPCODE_CLASS_UPCAST_V1) break;
+        id = definition.operands.front();
+      }
+      return nullptr;
+    }
+
+    [[nodiscard]] llvm::Value *generate_array(const instruction &instruction) {
+      const auto &element = instruction.type_arguments.front();
+      auto *count = value(instruction.operands[0]);
+      auto *callback = value(instruction.operands[1]);
+      emit_guard(builder_.CreateICmpSGE(count, builder_.getInt64(0)),
+                 NERI_PANIC_RUNTIME_CONTRACT_V1,
+                 "invalid sequential array generation contract", instruction.location);
+      const auto prefix = module_.array_payload_element_offset(element);
+      const auto maximum = (std::numeric_limits<std::size_t>::max() -
+          sizeof(neri_object_header_v1) - prefix) / module_.storage_size(element);
+      emit_guard(builder_.CreateICmpULE(count, builder_.getInt64(maximum)),
+                 NERI_PANIC_OUT_OF_MEMORY_V1,
+                 "array generation size overflow", instruction.location);
+      auto *bytes = builder_.CreateAdd(builder_.getInt64(prefix),
+          builder_.CreateMul(count, builder_.getInt64(module_.storage_size(element))));
+      auto *array = builder_.CreateCall(
+          is_managed_reference(element) ? module_.gc_alloc_function()
+                                        : module_.array_alloc_uninitialized_function(),
+          {module_.array_descriptor(element), bytes,
+           builder_.getInt64(module_.array_payload_alignment(element))}, "array.generated");
+      // Callback execution may collect. Publish the array to the reserved
+      // temporary root before the first call; unwritten reference slots are null.
+      // Reference-free elements stay private until this loop initializes them.
+      builder_.CreateStore(array, root_slots_.front());
+      auto *length_slot = builder_.CreateInBoundsGEP(builder_.getInt8Ty(), array,
+          builder_.getInt64(sizeof(neri_object_header_v1)));
+      builder_.CreateAlignedStore(count, length_slot, llvm::Align(alignof(uint64_t)));
+
+      const auto &signature = module_.find_virtual_signature(*instruction.symbol);
+      llvm::Value *callee = nullptr;
+      if (const auto *exact = allocated_class(instruction.operands[1])) {
+        const auto &layout = module_.layout_for_class(*exact);
+        const auto index = layout.dispatch_slots.at(symbol_key(*instruction.symbol));
+        callee = module_.functions_.at(symbol_key(layout.virtual_methods.at(index)->id));
+      } else {
+        callee = module_.virtual_target(builder_, callback, *instruction.symbol);
+      }
+      auto *entry = builder_.GetInsertBlock();
+      auto *loop = llvm::BasicBlock::Create(module_.context_, "array.generate.loop", &output_);
+      auto *done = llvm::BasicBlock::Create(module_.context_, "array.generate.done", &output_);
+      builder_.CreateCondBr(builder_.CreateICmpEQ(count, builder_.getInt64(0)), done, loop);
+      builder_.SetInsertPoint(loop);
+      auto *index = builder_.CreatePHI(builder_.getInt64Ty(), 2, "array.generate.index");
+      index->addIncoming(builder_.getInt64(0), entry);
+      auto *slot = array_element_slot(array, index, element);
+      std::vector<llvm::Value *> arguments;
+      const bool indirect = is_indirect_optional(signature.result_type);
+      if (indirect) arguments.push_back(slot);
+      arguments.push_back(callback);
+      arguments.push_back(index);
+      auto *call = builder_.CreateCall(
+          module_.physical_function_type(signature.parameter_types, signature.result_type),
+          callee, arguments);
+      call->setCallingConv(llvm::CallingConv::C);
+      // As in the runtime adapter, no safepoint separates return from storing
+      // the result. Scalar optionals already write into their aligned slot.
+      if (!indirect)
+        builder_.CreateAlignedStore(call, slot, llvm::Align(module_.storage_alignment(element)));
+      auto *next = builder_.CreateAdd(index, builder_.getInt64(1), "array.generate.next");
+      index->addIncoming(next, loop);
+      builder_.CreateCondBr(builder_.CreateICmpULT(next, count), loop, done);
+      builder_.SetInsertPoint(done);
+      return array;
     }
 
     [[nodiscard]] llvm::Value *compare_pointer(
@@ -1658,13 +1859,7 @@ private:
         break;
       }
       case NERI_IR_OPCODE_ARRAY_GENERATE_V1: {
-        const auto &element = instruction.type_arguments.front();
-        auto *call = builder_.CreateCall(module_.array_generate_function(),
-            {value(instruction.operands[0]), module_.array_descriptor(element),
-             value(instruction.operands[1]),
-             module_.task_adapter(*instruction.symbol)}, "array.generated");
-        call->setCallingConv(llvm::CallingConv::C);
-        result = call;
+        result = generate_array(instruction);
         break;
       }
       case NERI_IR_OPCODE_STACK_ALLOC_V1: {
@@ -1812,7 +2007,6 @@ private:
 
       if (!instruction.results.empty()) {
         values_.emplace(instruction.results.front().id, result);
-        root_value(instruction.results.front().id, result);
         if (auto *named = llvm::dyn_cast<llvm::Instruction>(result);
             named != nullptr && !named->hasName()) {
           named->setName("v" + std::to_string(instruction.results.front().id));
@@ -1867,16 +2061,16 @@ private:
       }
       case NERI_IR_TERMINATOR_RETURN_V1:
         if (is_void(input_.result_type)) {
-          leave_root_frame();
+          leave_function_scope();
           builder_.CreateRetVoid();
         } else if (is_indirect_optional(input_.result_type)) {
           builder_.CreateStore(value(*terminator.return_value), result_slot_);
-          leave_root_frame();
+          leave_function_scope();
           builder_.CreateRetVoid();
         } else {
           auto *returned = to_physical_scalar(value(*terminator.return_value),
                                               input_.result_type);
-          leave_root_frame();
+          leave_function_scope();
           builder_.CreateRet(returned);
         }
         return;
@@ -1899,13 +2093,17 @@ private:
     llvm::Argument *result_slot_{};
     llvm::AllocaInst *root_array_{};
     llvm::AllocaInst *root_frame_{};
+    llvm::Value *allocation_region_{};
     llvm::StructType *root_frame_type_{};
     llvm::DISubprogram *subprogram_{};
     std::map<std::uint32_t, llvm::BasicBlock *> blocks_;
     std::map<std::uint32_t, llvm::Value *> values_;
     std::map<std::uint32_t, llvm::PHINode *> phis_;
-    std::map<std::uint32_t, llvm::Value *> root_slots_;
+    llvm::Value *root_count_{};
+    std::vector<llvm::Value *> root_slots_;
+    std::map<const instruction *, live_references> roots_before_;
     std::unordered_map<std::uint32_t, const type *> value_types_;
+    std::unordered_map<std::uint32_t, const instruction *> definitions_;
     std::unordered_map<std::uint32_t, std::vector<const debug_local *>>
         debug_locals_by_value_;
     std::unordered_map<std::uint32_t, const block *> input_blocks_by_id_;
@@ -2175,6 +2373,12 @@ private:
   }
 
   [[nodiscard]] llvm::Type *semantic_type(const type &value) const {
+    const auto scalar = scalar_properties(value.tag);
+    if (scalar.semantic_bits != 0U) {
+      if (!scalar.floating) return llvm::IntegerType::get(context_, scalar.semantic_bits);
+      return scalar.semantic_bits == 32U ? llvm::Type::getFloatTy(context_)
+                                         : llvm::Type::getDoubleTy(context_);
+    }
     switch (value.tag) {
     case NERI_IR_TYPE_NATIVE_RECORD_V1: {
       const auto layout = native_layouts(input_).layout(value);
@@ -2183,21 +2387,6 @@ private:
     }
     case NERI_IR_TYPE_FIXED_ARRAY_V1:
       return llvm::ArrayType::get(physical_scalar_type(value.arguments.front()), value.element_count);
-    case NERI_IR_TYPE_BOOL_V1:
-      return llvm::Type::getInt1Ty(context_);
-    case NERI_IR_TYPE_BYTE_V1:
-      return llvm::Type::getInt8Ty(context_);
-    case NERI_IR_TYPE_INT_V1:
-      return llvm::Type::getInt64Ty(context_);
-    case NERI_IR_TYPE_FLOAT_V1:
-      return llvm::Type::getDoubleTy(context_);
-    case NERI_IR_TYPE_INT32_V1:
-    case NERI_IR_TYPE_UINT32_V1:
-      return llvm::Type::getInt32Ty(context_);
-    case NERI_IR_TYPE_UINT64_V1:
-      return llvm::Type::getInt64Ty(context_);
-    case NERI_IR_TYPE_FLOAT32_V1:
-      return llvm::Type::getFloatTy(context_);
     case NERI_IR_TYPE_STRING_V1:
     case NERI_IR_TYPE_ARRAY_V1:
     case NERI_IR_TYPE_CLASS_V1:
@@ -2430,23 +2619,10 @@ private:
     }
     const auto scalar_kind = [&] {
       if (is_indirect_optional(value)) return NERI_SCALAR_KIND_NONE_V1;
-      switch (value.tag) {
-      case NERI_IR_TYPE_BOOL_V1:
-        return NERI_SCALAR_KIND_BOOL_V1;
-      case NERI_IR_TYPE_BYTE_V1:
-        return NERI_SCALAR_KIND_BYTE_V1;
-      case NERI_IR_TYPE_INT_V1:
-        return NERI_SCALAR_KIND_INT_V1;
-      case NERI_IR_TYPE_FLOAT_V1:
-        return NERI_SCALAR_KIND_FLOAT_V1;
-      case NERI_IR_TYPE_INT32_V1: return NERI_SCALAR_KIND_INT32_V1;
-      case NERI_IR_TYPE_UINT32_V1: return NERI_SCALAR_KIND_UINT32_V1;
-      case NERI_IR_TYPE_UINT64_V1: return NERI_SCALAR_KIND_UINT64_V1;
-      case NERI_IR_TYPE_FLOAT32_V1: return NERI_SCALAR_KIND_FLOAT32_V1;
-      default:
-        throw codegen_error(codegen_error_kind::lowering,
-                            "Array element has no scalar ABI descriptor.");
-      }
+      const auto kind = scalar_properties(value.tag).runtime_kind;
+      if (kind != NERI_SCALAR_KIND_NONE_V1) return kind;
+      throw codegen_error(codegen_error_kind::lowering,
+                          "Array element has no scalar ABI descriptor.");
     }();
     auto *pointer = llvm::PointerType::getUnqual(context_);
     auto *null_pointer = llvm::ConstantPointerNull::get(pointer);
@@ -3077,6 +3253,12 @@ private:
              (contract->effects & NERI_IR_EFFECT_NO_RETURN_V1) != 0U)) {
           created->addFnAttr(llvm::Attribute::NoReturn);
         }
+        if (contract != nullptr && import.link_name == "neri_rt_v1_host_argument_count") {
+          // Runtime initialization stores max(argc - 1, 0), where argc is a
+          // signed 32-bit C int on every supported target.
+          created->addRetAttr(llvm::Attribute::get(context_, llvm::Attribute::Range,
+              llvm::ConstantRange(llvm::APInt(64, 0), llvm::APInt(64, INT32_MAX))));
+        }
         declarations.emplace(import.link_name, created);
         return created;
       }();
@@ -3089,10 +3271,12 @@ private:
       auto *declaration = llvm::Function::Create(
           physical_function_type(function.parameter_types,
                                  function.result_type),
-          function.retained || retained_modules_
+          function.retained || retained_modules_ ||
+                  (!input_.session.has_value() && is_program_entry(input_, function))
               ? llvm::GlobalValue::ExternalLinkage
-              : (input_.session.has_value() || c_library_module_ ? llvm::GlobalValue::InternalLinkage
-                                            : llvm::GlobalValue::ExternalLinkage),
+              : (input_.session.has_value() || c_library_module_ || owns_program_entry(input_)
+                     ? llvm::GlobalValue::InternalLinkage
+                     : llvm::GlobalValue::ExternalLinkage),
           mangle_function(function),
           output_.get());
       declaration->setCallingConv(llvm::CallingConv::C);
@@ -3204,6 +3388,16 @@ private:
     return declaration;
   }
 
+  [[nodiscard]] llvm::Function *region_enter_function() {
+    return runtime_function("neri_rt_v1_region_enter",
+        llvm::PointerType::getUnqual(context_), {});
+  }
+
+  [[nodiscard]] llvm::Function *region_leave_function() {
+    return runtime_function("neri_rt_v1_region_leave", llvm::Type::getVoidTy(context_),
+        {llvm::PointerType::getUnqual(context_)});
+  }
+
   [[nodiscard]] llvm::Function *root_frame_enter_function() {
     return runtime_function(
         "neri_rt_v1_gc_root_frame_enter",
@@ -3218,13 +3412,6 @@ private:
         {integer, integer, pointer, pointer, pointer});
   }
 
-  [[nodiscard]] llvm::Function *array_generate_function() {
-    auto *pointer = llvm::PointerType::getUnqual(context_);
-    auto *integer = llvm::Type::getInt64Ty(context_);
-    return runtime_function("neri_rt_v1_array_generate", pointer,
-        {integer, pointer, pointer, pointer});
-  }
-
   [[nodiscard]] llvm::Function *root_frame_leave_function() {
     return runtime_function(
         "neri_rt_v1_gc_root_frame_leave",
@@ -3234,9 +3421,31 @@ private:
 
   [[nodiscard]] llvm::Function *gc_alloc_function() {
     auto *pointer = llvm::PointerType::getUnqual(context_);
-    return runtime_function("neri_rt_v1_gc_alloc", pointer,
+    auto *function = runtime_function("neri_rt_v1_gc_alloc", pointer,
                             {pointer, llvm::Type::getInt64Ty(context_),
                              llvm::Type::getInt64Ty(context_)});
+    function->addRetAttr(llvm::Attribute::NoAlias);
+    function->addRetAttr(llvm::Attribute::NonNull);
+    apply_allocation_effects(*function);
+    return function;
+  }
+
+  [[nodiscard]] llvm::Function *array_alloc_uninitialized_function() {
+    auto *pointer = llvm::PointerType::getUnqual(context_);
+    auto *function = runtime_function("neri_rt_v1_array_alloc_uninitialized", pointer,
+        {pointer, llvm::Type::getInt64Ty(context_), llvm::Type::getInt64Ty(context_)});
+    function->addRetAttr(llvm::Attribute::NoAlias);
+    function->addRetAttr(llvm::Attribute::NonNull);
+    apply_allocation_effects(*function);
+    return function;
+  }
+
+  void apply_allocation_effects(llvm::Function &function) {
+    // Collection reads roots and traced fields, but only mutates private
+    // collector/allocator state and fresh storage. Trace callbacks obey the
+    // same read-only application-memory contract.
+    function.setMemoryEffects(llvm::MemoryEffects::readOnly().getWithModRef(
+        llvm::MemoryEffects::Location::InaccessibleMem, llvm::ModRefInfo::ModRef));
   }
 
   [[nodiscard]] llvm::Function *gc_store_ref_function() {
@@ -3462,6 +3671,7 @@ private:
   std::map<decltype(symbol_key(symbol_id{})), llvm::Function *> functions_;
   std::map<decltype(symbol_key(symbol_id{})), llvm::Function *> c_exports_;
   llvm::GlobalVariable *program_requirements_{};
+  std::set<const function *> allocation_regions_;
   std::map<decltype(symbol_key(symbol_id{})), lowered_class> class_layouts_;
   std::map<decltype(symbol_key(symbol_id{})), lowered_field> field_layouts_;
   std::map<decltype(symbol_key(symbol_id{})), std::size_t>
