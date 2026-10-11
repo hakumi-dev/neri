@@ -49,9 +49,12 @@ Operation and context polling/close do not join native workers. Final
 `SQLiteAsyncSession` disposal cancels and joins its worker, closes its owned
 connection and reports cleanup failures, following the standard workers resource
 contract. Dispose active operations and complete pending rollback before closing
-the session. Asynchronous set-based writes and migration execution are currently
-explicitly unsupported; tracked batches, context saves and transaction control
-use the asynchronous surface.
+the session. Set-based update/delete and migration execution also expose owned
+polling operations. Set writes use a transaction or recovery savepoint and report
+the actual affected count. Migration history, schema changes and stamps share
+one transaction; PostgreSQL retains its advisory transaction lock and SQLite
+copies complete schema metadata to its worker. See the
+[asynchronous relational operation contract](../../docs/DATA-ASYNC.md).
 
 Stable, context-owned `CollectionNavigation` objects record Unknown, Loading,
 Partial, and Loaded state per entity. Complete collection and reference loads mark
@@ -73,3 +76,13 @@ return cached typed rows after Loaded state, and reject recursive loading. A
 Partial collection triggers a complete load. A failed load restores its previous
 metadata and keeps the error observable. These accessors perform explicit work;
 generated entity field access itself remains an ordinary Neri field read.
+
+`IncludedQuery.allAsync/loadAsync` and `ReferencedQuery.allAsync/loadAsync`
+coordinate root and related reads in bounded key batches. Related rows are staged
+before navigation validation and publication; a failed related read preserves
+existing navigation values and metadata. Root tracking retains ordinary
+materialization and registered fixup behavior. `lazyCollectionAsync` and
+`lazyReferenceAsync` use the same coordinator, complete locally for Loaded state,
+and restore previous load metadata on failure or cancellation. Closing a pending
+lazy operation also restores its prior load state. `clearLoadedStates()` clears
+the descriptor's collection and reference caches when a context is reset.

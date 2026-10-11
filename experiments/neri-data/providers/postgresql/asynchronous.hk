@@ -21,6 +21,7 @@ class PostgreSQLCommandCursor
   private count: Int = 0
   private row: RawRow?
   private error: ProviderFailure?
+  private history: TypedRows<RawRow>?
 
   def init(owner: PostgreSQLProvider, columns: readonly ResultColumns?): Void
     this.owner = owner
@@ -31,18 +32,34 @@ class PostgreSQLCommandCursor
     owner: PostgreSQLProvider,
     sql: String,
     parameters: readonly WriteValues,
-    columns: readonly ResultColumns? = null
+    columns: readonly ResultColumns? = null,
+    script: Bool = false,
+    history: Bool = false
   ): PostgreSQLCommandCursor
     let cursor = new PostgreSQLCommandCursor(owner, columns)
 
+    if history
+      cursor.history = new TypedRows<RawRow>()
+    end
     unsafe
       let connection = owner.nativeHandle()
 
-      cursor.error = connection == null ? ProviderFailure.State("PostgreSQL asynchronous connection is closed") : pgSend(
-        connection,
-        sql,
-        parameters
-      )
+      if connection == null
+        cursor.error = ProviderFailure.State("PostgreSQL asynchronous connection is closed")
+      else if script
+        if pgHasNul(sql) || parameters.count() != 0
+          cursor.error = ProviderFailure.State("PostgreSQL async migration script contains NUL or parameters")
+        else
+          let statement = pgCString(sql)
+
+          if pgSendQuery(connection, statement) != (1 as Int32)
+            cursor.error = pgFailure(connection, "async.script.send")
+          end
+          native::free(statement)
+        end
+      else
+        cursor.error = pgSend(connection, sql, parameters)
+      end
       cursor.terminal = cursor.error != null
     end
     return cursor
@@ -104,7 +121,27 @@ class PostgreSQLCommandCursor
         end
         let columns = this.columns
 
-        if columns != null
+        let history = this.history
+
+        if columns != null && history != null
+          let count = pgNtuples(result) as Int
+
+          if status != 2 || count > 1001 || history.count() != 0
+            this.error = ProviderFailure.State("PostgreSQL migration history response is invalid")
+          else
+            var index = 0
+
+            while index < count
+              match pgDecodeRow(result, index, columns)
+                case PostgreSQLRowResult.Row(row)
+                  history.add(row)
+                case PostgreSQLRowResult.Failure(failure)
+                  this.error = failure
+              end
+              index = index + 1
+            end
+          end
+        else if columns != null
           if status != 2 || pgNtuples(result) != (1 as Int32) || this.row != null
             this.error = ProviderFailure.State("PostgreSQL RETURNING requires exactly one row per write")
           else
@@ -128,6 +165,10 @@ class PostgreSQLCommandCursor
       end
       return PostgreSQLCommandPoll.Pending(-1, AsyncInterest.Read())
     end
+  end
+
+  public def historyRows(): TypedRows<RawRow>?
+    return this.history
   end
 end
 
@@ -161,6 +202,18 @@ class PostgreSQLAsyncControl: AsyncControlDriver
   public override def close(): WriteFailure?
     if this.terminal == null
       this.owner.abortOperation()
+      match this.action
+        case AsyncTransactionAction.Commit(lease)
+          let unknown = WriteFailure.Transaction("PostgreSQL commit outcome is unknown because the operation was closed before its response")
+
+          this.terminal = AsyncControlResult.Failure(unknown)
+          return unknown
+        case AsyncTransactionAction.Begin()
+        case AsyncTransactionAction.Rollback(lease)
+        case AsyncTransactionAction.Savepoint(lease)
+        case AsyncTransactionAction.RollbackTo(lease, id)
+        case AsyncTransactionAction.Release(lease, id)
+      end
       this.terminal = AsyncControlResult.Failure(WriteFailure.Provider(pgInterrupted("async.transaction")))
     end
     return null
@@ -173,8 +226,19 @@ class PostgreSQLAsyncControl: AsyncControlDriver
       return AsyncControlPoll.Completed(terminal)
     end
     let token = this.token
+    var commit = false
 
-    if this.cancelled || (token != null && token.cancelled()) || streamTimedOut(this.deadline)
+    match this.action
+      case AsyncTransactionAction.Commit(lease)
+        commit = true
+      case AsyncTransactionAction.Begin()
+      case AsyncTransactionAction.Rollback(lease)
+      case AsyncTransactionAction.Savepoint(lease)
+      case AsyncTransactionAction.RollbackTo(lease, id)
+      case AsyncTransactionAction.Release(lease, id)
+    end
+
+    if !commit && (this.cancelled || (token != null && token.cancelled()) || streamTimedOut(this.deadline))
       this.close()
       return AsyncControlPoll.Completed(AsyncControlResult.Failure(WriteFailure.Provider(pgInterrupted("async.transaction"))))
     end
@@ -184,8 +248,10 @@ class PostgreSQLAsyncControl: AsyncControlDriver
       case PostgreSQLCommandPoll.Failure(error)
         this.owner.finishOperation()
         this.owner.reconcileAsyncFailure()
-        this.terminal = AsyncControlResult.Failure(WriteFailure.Provider(error))
-        return AsyncControlPoll.Completed(AsyncControlResult.Failure(WriteFailure.Provider(error)))
+        let failure = commit ? WriteFailure.Transaction("PostgreSQL commit failed or its outcome is unknown: " + providerFailureMessage(error)) : WriteFailure.Provider(error)
+
+        this.terminal = AsyncControlResult.Failure(failure)
+        return AsyncControlPoll.Completed(AsyncControlResult.Failure(failure))
       case PostgreSQLCommandPoll.Completed(count, row)
         let result = this.owner.acceptAsyncControl(this.action)
 
@@ -215,6 +281,7 @@ class PostgreSQLAsyncWrite: AsyncWriteDriver
   private failure: WriteFailure?
   private terminal: WriteResult?
   private cancelled: Bool = false
+  private setWrite: Bool
 
   def init(
     owner: PostgreSQLProvider,
@@ -222,7 +289,8 @@ class PostgreSQLAsyncWrite: AsyncWriteDriver
     lease: Int?,
     deadline: Int?,
     token: CancellationToken?,
-    validate: (fn(readonly WriteReturnedRows): WriteFailure?)?
+    validate: (fn(readonly WriteReturnedRows): WriteFailure?)?,
+    setWrite: Bool = false
   ): Void
     this.owner = owner
     this.batch = batch
@@ -231,6 +299,7 @@ class PostgreSQLAsyncWrite: AsyncWriteDriver
     this.deadline = deadline
     this.token = token
     this.validate = validate
+    this.setWrite = setWrite
   end
 
   public override def cancel(): Void
@@ -242,6 +311,12 @@ class PostgreSQLAsyncWrite: AsyncWriteDriver
       this.owner.abortOperation()
       let primary = this.failure
 
+      if this.phase == 4 && this.savepoint == 0
+        let unknown = WriteFailure.Transaction("PostgreSQL write commit outcome is unknown because the operation was closed before its response")
+
+        this.terminal = WriteResult.Failure(unknown)
+        return unknown
+      end
       this.terminal = WriteResult.Failure(primary == null ? WriteFailure.Provider(pgInterrupted("async.write")) : primary)
     end
     return null
@@ -330,6 +405,9 @@ class PostgreSQLAsyncWrite: AsyncWriteDriver
           if this.phase >= 4
             let primary = this.failure
 
+            if this.phase == 4 && this.savepoint == 0 && !this.owner.supports(ProviderCapability.BoundedTypedReads())
+              return this.complete(WriteResult.Failure(WriteFailure.Transaction("PostgreSQL write commit outcome is unknown after connection loss: " + providerFailureMessage(error))))
+            end
             if this.phase == 4 && primary == null
               return this.recover(WriteFailure.Provider(error))
             end
@@ -386,7 +464,7 @@ class PostgreSQLAsyncWrite: AsyncWriteDriver
             if current == null
               return this.recover(WriteFailure.Validation("PostgreSQL asynchronous write command is missing"))
             end
-            if changed != current.command().expectedRows()
+            if changed < 0 || (!this.setWrite && changed != current.command().expectedRows())
               return this.recover(WriteFailure.Concurrency("PostgreSQL asynchronous write affected " + (changed as String) + " rows; expected " + (current.command().expectedRows() as String)))
             end
             this.count = this.count + changed
@@ -434,5 +512,340 @@ class PostgreSQLAsyncWrite: AsyncWriteDriver
       )
     end
     return AsyncWritePoll.Pending(-1, AsyncInterest.Read())
+  end
+end
+
+## The advisory lock, history validation, DDL, stamps and commit share one lease.
+class PostgreSQLAsyncMigration: AsyncMigrationDriver
+  private owner: PostgreSQLProvider
+  private catalog: readonly MigrationSet
+  private target: Int
+  private deadline: Int?
+  private token: CancellationToken?
+  private cursor: PostgreSQLCommandCursor?
+  private action: AsyncTransactionAction?
+  private lease: Int = 0
+  private phase: Int = 0
+  private applied: Int = 0
+  private changed: Int = 0
+  private operationIndex: Int = 0
+  private terminal: MigrationResult?
+  private failure: MigrationFailure?
+  private cancelled: Bool = false
+
+  def init(
+    owner: PostgreSQLProvider,
+    catalog: readonly MigrationSet,
+    target: Int,
+    deadline: Int?,
+    token: CancellationToken?
+  ): Void
+    this.owner = owner
+    this.catalog = catalog
+    this.target = target
+    this.deadline = deadline
+    this.token = token
+  end
+
+  public override def cancel(): Void
+    this.cancelled = true
+  end
+
+  private def complete(result: MigrationResult): AsyncMigrationPoll
+    this.owner.finishOperation()
+    this.terminal = result
+    return AsyncMigrationPoll.Completed(result)
+  end
+
+  private def command(sql: String, phase: Int, values: WriteValues? = null, script: Bool = false): AsyncMigrationPoll
+    this.cursor = PostgreSQLCommandCursor.start(
+      this.owner,
+      sql,
+      values == null ? new WriteValues() : values,
+      script: script
+    )
+    this.phase = phase
+    return AsyncMigrationPoll.Pending(-1, AsyncInterest.Write())
+  end
+
+  private def control(action: AsyncTransactionAction, phase: Int): AsyncMigrationPoll
+    match this.owner.asyncControlSql(action)
+      case PostgreSQLControlSql.Statement(sql)
+        this.action = action
+        return this.command(sql, phase)
+      case PostgreSQLControlSql.Failure(error)
+        let primary = this.failure
+        let nativeError = pgWriteProviderFailure(error)
+
+        return this.complete(MigrationResult.Failure(primary == null ? MigrationFailure.Provider(nativeError) : MigrationFailure.Cleanup(new MigrationCleanupFailure(
+                primary,
+                nativeError
+              ))))
+    end
+  end
+
+  private def recover(error: MigrationFailure): AsyncMigrationPoll
+    this.failure = error
+    this.cursor = null
+    this.action = null
+    this.owner.reconcileAsyncFailure()
+    if this.lease == 0
+      return this.complete(MigrationResult.Failure(error))
+    end
+    match this.owner.transactionState(this.lease)
+      case TransactionState.RolledBack()
+        return this.complete(MigrationResult.Failure(error))
+      case TransactionState.Invalid()
+        return this.complete(MigrationResult.Failure(error))
+      case TransactionState.Active()
+      case TransactionState.Failed()
+      case TransactionState.Committed()
+    end
+    return this.control(AsyncTransactionAction.Rollback(this.lease), 7)
+  end
+
+  private def history(cursor: PostgreSQLCommandCursor): MigrationFailure?
+    let rows = cursor.historyRows()
+
+    if rows == null || rows.count() > 1000
+      return MigrationFailure.Drift("PostgreSQL migration history exceeds catalog bounds")
+    end
+    let stamps = arrays::generate<MigrationStamp>(rows.count()) do |index|
+      return new MigrationStamp("", "")
+    end
+    var current = rows.first()
+    var index = 0
+
+    while current != null
+      var ordinal = -1
+      var id = ""
+      var signature = ""
+
+      match current.value.value("ordinal")
+        case CellLookup.Found(value)
+          match value
+            case Cell.Int(number)
+              ordinal = number
+            case Cell.Null()
+            case Cell.Bool(item)
+            case Cell.Float(item)
+            case Cell.Text(item)
+            case Cell.Binary(item)
+          end
+        case CellLookup.Missing()
+      end
+      match current.value.value("id")
+        case CellLookup.Found(value)
+          match value
+            case Cell.Text(item)
+              id = item
+            case Cell.Null()
+            case Cell.Bool(item)
+            case Cell.Int(item)
+            case Cell.Float(item)
+            case Cell.Binary(item)
+          end
+        case CellLookup.Missing()
+      end
+      match current.value.value("signature")
+        case CellLookup.Found(value)
+          match value
+            case Cell.Text(item)
+              signature = item
+            case Cell.Null()
+            case Cell.Bool(item)
+            case Cell.Int(item)
+            case Cell.Float(item)
+            case Cell.Binary(item)
+          end
+        case CellLookup.Missing()
+      end
+      if ordinal != index + 1
+        return MigrationFailure.Drift("PostgreSQL migration history ordinal is not contiguous")
+      end
+      stamps[index] = new MigrationStamp(id, signature)
+      index = index + 1
+      current = current.next
+    end
+    let drift = this.catalog.historyPrefix(stamps)
+
+    this.applied = stamps.Length
+    return drift == null ? null : MigrationFailure.Drift(drift)
+  end
+
+  public override def poll(): AsyncMigrationPoll
+    let terminal = this.terminal
+
+    if terminal != null
+      return AsyncMigrationPoll.Completed(terminal)
+    end
+    let token = this.token
+
+    if this.phase != 6 && this.phase != 7 && (this.cancelled || (token != null && token.cancelled()) || streamTimedOut(this.deadline))
+      this.close()
+      let stopped = this.terminal
+
+      return AsyncMigrationPoll.Completed(stopped == null ? MigrationResult.Failure(MigrationFailure.Provider(pgInterrupted("async.migration"))) : stopped)
+    end
+    if this.phase == 0
+      return this.control(AsyncTransactionAction.Begin(), 1)
+    end
+    let cursor = this.cursor
+
+    if cursor != null
+      match cursor.poll()
+        case PostgreSQLCommandPoll.Pending(socket, interest)
+          return AsyncMigrationPoll.Pending(socket, interest)
+        case PostgreSQLCommandPoll.Failure(error)
+          this.cursor = null
+          if this.phase == 6 && !this.owner.supports(ProviderCapability.BoundedTypedReads())
+            return this.complete(MigrationResult.Failure(MigrationFailure.Provider(ProviderFailure.State("PostgreSQL migration commit outcome is unknown after connection loss: " + providerFailureMessage(error)))))
+          end
+          if this.phase == 7
+            let primary = this.failure
+
+            return this.complete(MigrationResult.Failure(primary == null ? MigrationFailure.Provider(error) : MigrationFailure.Cleanup(new MigrationCleanupFailure(
+                    primary,
+                    error
+                  ))))
+          end
+          return this.recover(MigrationFailure.Provider(error))
+        case PostgreSQLCommandPoll.Completed(count, row)
+          this.cursor = null
+          let action = this.action
+
+          if action != null
+            this.action = null
+            match this.owner.acceptAsyncControl(action)
+              case AsyncControlResult.Begun(lease)
+                this.lease = lease
+              case AsyncControlResult.Saved()
+              case AsyncControlResult.Created(id)
+                return this.recover(MigrationFailure.Provider(ProviderFailure.State("PostgreSQL migration control returned a savepoint")))
+              case AsyncControlResult.Failure(error)
+                return this.recover(MigrationFailure.Provider(pgWriteProviderFailure(error)))
+            end
+          end
+          if this.phase == 1
+            return this.command(
+              "DO $$BEGIN PERFORM pg_advisory_xact_lock(1852142185); END$$; CREATE TABLE IF NOT EXISTS __neri_migrations (ordinal BIGINT PRIMARY KEY, id TEXT NOT NULL, signature TEXT NOT NULL)",
+              2,
+              script: true
+            )
+          else if this.phase == 2
+            let columns = new ResultColumns([
+                new ResultColumn("ordinal", ResultColumnKind.Int()),
+                new ResultColumn("id", ResultColumnKind.Text()),
+                new ResultColumn("signature", ResultColumnKind.Text())
+              ])
+
+            this.cursor = PostgreSQLCommandCursor.start(
+              this.owner,
+              "SELECT ordinal, id, signature FROM __neri_migrations ORDER BY ordinal LIMIT 1001",
+              new WriteValues(),
+              columns,
+              history: true
+            )
+            this.phase = 3
+            return AsyncMigrationPoll.Pending(-1, AsyncInterest.Write())
+          else if this.phase == 3
+            let drift = this.history(cursor)
+
+            if drift != null
+              return this.recover(drift)
+            end
+          else if this.phase == 4
+            return this.nextOperation()
+          else if this.phase == 8
+            if count != 1
+              return this.recover(MigrationFailure.Drift("PostgreSQL seed write must affect exactly one row"))
+            end
+            return this.nextOperation()
+          else if this.phase == 5
+            if count != 1
+              return this.recover(MigrationFailure.Drift("PostgreSQL migration stamp write count mismatch"))
+            end
+            this.applied = this.applied < this.target ? this.applied + 1 : this.applied - 1
+            this.changed = this.changed + 1
+          else if this.phase == 6
+            return this.complete(MigrationResult.Applied(this.changed))
+          else if this.phase == 7
+            let primary = this.failure
+
+            return this.complete(MigrationResult.Failure(primary == null ? MigrationFailure.Provider(ProviderFailure.State("PostgreSQL migration rolled back")) : primary))
+          end
+      end
+    end
+    if this.applied == this.target
+      return this.control(AsyncTransactionAction.Commit(this.lease), 6)
+    end
+    this.operationIndex = 0
+    return this.nextOperation()
+  end
+
+  private def nextOperation(): AsyncMigrationPoll
+    let forward = this.applied < this.target
+    let index = forward ? this.applied : this.applied - 1
+    let migration = this.catalog.at(index)
+
+    if migration == null
+      return this.recover(MigrationFailure.Validation("migration catalog has a missing entry"))
+    end
+    let count = forward ? migration.upCount() : migration.downCount()
+
+    if this.operationIndex == count
+      let values = new WriteValues()
+
+      values.add(Cell.Int(index + 1))
+      if forward
+        values.add(Cell.Text(migration.id()))
+        values.add(Cell.Text(migration.signature()))
+      end
+      return this.command(
+        forward ? "INSERT INTO __neri_migrations(ordinal,id,signature) VALUES($1,$2,$3)" : "DELETE FROM __neri_migrations WHERE ordinal=$1",
+        5,
+        values
+      )
+    end
+    let operation = forward ? migration.upAt(this.operationIndex) : migration.downAt(this.operationIndex)
+
+    if operation == null
+      return this.recover(MigrationFailure.Validation("migration has a missing operation"))
+    end
+    if schemaSeedOperation(operation)
+      this.operationIndex = this.operationIndex + 1
+      match compileSeed(operation, SqlDialect.PostgreSql())
+        case SetPlanResult.Failure(error)
+          return this.recover(MigrationFailure.Validation(writeFailureMessage(error)))
+        case SetPlanResult.Plan(plan)
+          return this.command(plan.sql(), 8, copyWriteValues(plan.parameters()))
+      end
+    end
+    let finish = schemaMigrationSegmentEnd(migration, forward, this.operationIndex)
+    let start = this.operationIndex
+
+    this.operationIndex = finish
+    match compilePostgresSchemaSegment(migration, forward, start, finish)
+      case SchemaCompileResult.Failure(message)
+        return this.recover(MigrationFailure.Unsupported(message))
+      case SchemaCompileResult.Statement(sql)
+        return this.command(sql, 4, script: true)
+    end
+  end
+
+  public override def close(): MigrationFailure?
+    if this.terminal == null
+      this.owner.abortOperation()
+      let primary = this.failure
+
+      if this.phase == 6
+        let unknown = MigrationFailure.Provider(ProviderFailure.State("PostgreSQL migration commit outcome is unknown because the operation was closed before its response"))
+
+        this.terminal = MigrationResult.Failure(unknown)
+        return unknown
+      end
+      this.terminal = MigrationResult.Failure(primary == null ? MigrationFailure.Provider(pgInterrupted("async.migration")) : primary)
+    end
+    return null
   end
 end

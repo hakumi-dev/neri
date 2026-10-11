@@ -154,8 +154,9 @@ contract. See [scalars and keys](../experiments/neri-data/SCALARS-KEYS.md).
 Binary and decimal equality use `whereBinary(column, value)` and
 `whereDecimal(column, value)` with validated mapping metadata. Decimal parsing,
 comparison, addition, subtraction and negation preserve exact values without
-passing through binary floating point. SQL decimal arithmetic and ordering are
-rejected because TEXT storage does not establish numeric ordering.
+passing through binary floating point. The explicit Decimal expression DSL adds
+exact SQL comparison, ordering, addition and subtraction across both providers;
+see [query composition](DATA-QUERIES.md).
 Typed shape projections compose mapped scalar fields and supported expression
 quotations; arbitrary application constructors and narrower integer field types
 remain unsupported.
@@ -163,8 +164,9 @@ remain unsupported.
 The [PostgreSQL provider](../experiments/neri-data/POSTGRESQL.md) links libpq 14
 or later and implements parameterized typed reads, tracked writes, transaction
 leases, savepoints and migrations against a real database. Its text values use
-UTF-8 and reject embedded NUL. Its checked arithmetic expressions fail explicitly;
-SQLite implements those operations through its checked scalar functions.
+UTF-8 and reject embedded NUL. PostgreSQL implements checked scalar arithmetic
+with native numeric operations and finite-value validation; SQLite uses checked
+scalar functions.
 Provider differences remain explicit capabilities and structured failures.
 Both adapters reject embedded NUL in text parameters. Use binary values for
 parameterized byte payloads; SQLite byte string expressions can inspect existing
@@ -183,8 +185,15 @@ allowing later application edits to remain dirty. See
 [asynchronous tracked saves and transactions](../experiments/neri-data/ASYNC-SAVING.md).
 
 Neri Data is an explicit relational API for this release. Its supported
-surface is defined here and does not imply feature parity with Entity Framework
-Core.
+surface is defined here and compared explicitly in the
+[relational capability matrix](DATA-PARITY.md). Model and lifecycle contracts include
+[keyless views, complex fields and inheritance](DATA-MODEL-MAPPING.md),
+[many-to-many navigation](DATA-MANY-TO-MANY.md),
+[versioned seed data](DATA-SEEDING.md),
+[async operations](DATA-ASYNC.md), and
+[pooling, save interception and retries](DATA-CONTEXT-LIFECYCLE.md).
+[Live schema scaffolding](DATA-SCHEMA-SCAFFOLDING.md) creates source and mapping
+for supported existing SQLite and PostgreSQL schemas.
 
 `Query<T>.all()` and its scalar and shape projections materialize the selected rows. Without an explicit query bound, execution
 collects the provider's typed streaming read; providers must support

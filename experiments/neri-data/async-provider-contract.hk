@@ -382,3 +382,206 @@ def verifyAsyncProviderWrites(provider: Provider): Void
 
   test::assertEqual(asyncProviderCount(provider), 1)
 end
+
+## Set writes preserve free affected-row counts and transaction rollback semantics.
+def verifyAsyncProviderSetWrites(provider: Provider): Void
+  let context = new ChangeContext(provider)
+  let update = new SetWritePlan("UPDATE neri_async_write_values SET label='bulk async'", new WriteValues())
+
+  match awaitAsyncWrite(context.prepareSetAsync(update, provider))
+    case WriteResult.Saved(count)
+      test::assertEqual(count, 1)
+    case WriteResult.SavedWithValues(count, rows)
+      test::assertTrue(false)
+    case WriteResult.Failure(error)
+      console::println(writeFailureMessage(error))
+
+      test::assertTrue(false)
+  end
+  match awaitAsyncControl(provider.beginControlAsync(AsyncTransactionAction.Begin()))
+    case AsyncControlResult.Begun(lease)
+      let delete = new SetWritePlan("DELETE FROM neri_async_write_values", new WriteValues())
+
+      match awaitAsyncWrite(provider.beginSetAsync(delete, lease: lease))
+        case WriteResult.Saved(count)
+          test::assertEqual(count, 1)
+        case WriteResult.SavedWithValues(count, rows)
+          test::assertTrue(false)
+        case WriteResult.Failure(error)
+          test::assertTrue(false)
+      end
+      asyncControlSaved(awaitAsyncControl(provider.beginControlAsync(AsyncTransactionAction.Rollback(lease))))
+    case AsyncControlResult.Created(id)
+      test::assertTrue(false)
+    case AsyncControlResult.Saved()
+      test::assertTrue(false)
+    case AsyncControlResult.Failure(error)
+      test::assertTrue(false)
+  end
+
+  test::assertEqual(asyncProviderCount(provider), 1)
+  let token = new CancellationToken()
+
+  token.cancel()
+  match provider.beginSetAsync(update, new StreamOptions(token: token))
+    case AsyncWriteStart.Failure(error)
+    case AsyncWriteStart.Started(driver)
+      driver.close()
+
+      test::assertTrue(false)
+  end
+end
+
+def awaitAsyncMigration(start: AsyncMigrationStart): MigrationResult
+  match start
+    case AsyncMigrationStart.Failure(error)
+      return MigrationResult.Failure(error)
+    case AsyncMigrationStart.Started(driver)
+      while true
+        match driver.poll()
+          case AsyncMigrationPoll.Pending(socket, interest)
+            continue
+          case AsyncMigrationPoll.Completed(result)
+            test::assertTrue(driver.close() == null)
+
+            return result
+        end
+      end
+  end
+  return MigrationResult.Failure(MigrationFailure.Validation("async migration did not terminate"))
+end
+
+def asyncMigrationApplied(result: MigrationResult, expected: Int): Void
+  match result
+    case MigrationResult.Applied(count)
+      test::assertEqual(count, expected)
+    case MigrationResult.Failure(error)
+      test::assertTrue(false)
+  end
+end
+
+def verifyAsyncProviderMigrations(provider: Provider): Void
+  let migration = new Migration("async_provider_001", [
+      SchemaOp.CreateTable("neri_async_migrated", [new SchemaColumn("id", SchemaType.Int(), primaryKey: true)])
+    ], [SchemaOp.DropTable("neri_async_migrated")])
+  let catalog = new MigrationSet([migration])
+
+  asyncMigrationApplied(awaitAsyncMigration(provider.beginMigrationAsync(catalog)), 1)
+  asyncMigrationApplied(awaitAsyncMigration(provider.beginMigrationAsync(catalog)), 0)
+  let drift = new MigrationSet([new Migration("async_provider_001", [
+          SchemaOp.CreateTable(
+            "neri_async_migrated",
+            [new SchemaColumn("id", SchemaType.Int(), primaryKey: true), new SchemaColumn("label", SchemaType.Text())]
+          )
+        ], [SchemaOp.DropTable("neri_async_migrated")])])
+
+  match awaitAsyncMigration(provider.beginMigrationAsync(drift))
+    case MigrationResult.Applied(count)
+      test::assertTrue(false)
+    case MigrationResult.Failure(error)
+      match error
+        case MigrationFailure.Drift(message)
+          test::assertTrue(message != "")
+        case MigrationFailure.Validation(message)
+          test::assertTrue(false)
+        case MigrationFailure.Unsupported(message)
+          test::assertTrue(false)
+        case MigrationFailure.Provider(error)
+          test::assertTrue(false)
+        case MigrationFailure.Cleanup(error)
+          test::assertTrue(false)
+      end
+  end
+  asyncMigrationApplied(awaitAsyncMigration(provider.beginMigrationAsync(catalog, "")), 1)
+  let broken = new MigrationSet([new Migration("async_provider_broken", [
+          SchemaOp.CreateTable("neri_async_rolled_back", [new SchemaColumn("id", SchemaType.Int(), primaryKey: true)]),
+          SchemaOp.AddColumn("neri_async_missing_table", new SchemaColumn("label", SchemaType.Text()))
+        ], [SchemaOp.DropTable("neri_async_rolled_back")])])
+
+  match awaitAsyncMigration(provider.beginMigrationAsync(broken))
+    case MigrationResult.Failure(error)
+    case MigrationResult.Applied(count)
+      test::assertTrue(false)
+  end
+  # A clean catalog succeeds after a failed migration has rolled back.
+  asyncMigrationApplied(awaitAsyncMigration(provider.beginMigrationAsync(catalog)), 1)
+  asyncMigrationApplied(awaitAsyncMigration(provider.beginMigrationAsync(catalog, "")), 1)
+  verifyAsyncProviderSeeds(provider)
+end
+
+def verifyAsyncSeedLabel(provider: Provider, expected: String): Void
+  let columns = new ResultColumns([new ResultColumn("name", ResultColumnKind.Text())])
+  var count = 0
+
+  match provider.beginReadAsync(new SqlPlan(
+      "SELECT name FROM neri_async_seed WHERE id=1",
+      new ParameterValues(),
+      1,
+      columns
+    ))
+    case AsyncReadStart.Failure(error)
+      test::assertTrue(false)
+    case AsyncReadStart.Started(driver)
+      var done = false
+
+      while !done
+        match driver.poll()
+          case AsyncReadPoll.Pending(socket, interest)
+            continue
+          case AsyncReadPoll.Row(row)
+            count = count + 1
+            match decodeString(row, "name")
+              case DecodeResult.Value(value)
+                test::assertEqual(value, expected)
+              case DecodeResult.Failure(error)
+                test::assertTrue(false)
+            end
+          case AsyncReadPoll.Completed()
+            done = true
+          case AsyncReadPoll.Failure(error)
+            test::assertTrue(false)
+
+            done = true
+        end
+      end
+
+      test::assertTrue(driver.close() == null)
+  end
+
+  test::assertEqual(count, 1)
+end
+
+def verifyAsyncProviderSeeds(provider: Provider): Void
+  let label = "'; DROP TABLE neri_async_seed; -- bound seed"
+  let initial = new Migration("async_seed_001", [
+      SchemaOp.CreateTable("neri_async_seed", [
+          new SchemaColumn("id", SchemaType.Int(), primaryKey: true),
+          new SchemaColumn("label", SchemaType.Text())
+        ]),
+      SchemaOp.InsertData("neri_async_seed", ["id", "label"], [Cell.Int(1), Cell.Text("initial")]),
+      SchemaOp.UpdateData("neri_async_seed", ["id"], [Cell.Int(1)], ["label"], [Cell.Text("before rename")]),
+      SchemaOp.RenameColumn("neri_async_seed", "label", "name"),
+      SchemaOp.UpdateData("neri_async_seed", ["id"], [Cell.Int(1)], ["name"], [Cell.Text(label)])
+    ], [
+      SchemaOp.DeleteData("neri_async_seed", ["id"], [Cell.Int(1)]),
+      SchemaOp.DropTable("neri_async_seed")
+    ])
+  let catalog = new MigrationSet([initial])
+
+  asyncMigrationApplied(awaitAsyncMigration(provider.beginMigrationAsync(catalog)), 1)
+  asyncMigrationApplied(awaitAsyncMigration(provider.beginMigrationAsync(catalog)), 0)
+  verifyAsyncSeedLabel(provider, label)
+  let failed = new Migration("async_seed_002", [
+      SchemaOp.UpdateData("neri_async_seed", ["id"], [Cell.Int(1)], ["name"], [Cell.Text("must roll back")]),
+      SchemaOp.UpdateData("neri_async_seed", ["id"], [Cell.Int(999)], ["name"], [Cell.Text("missing row")])
+    ], [SchemaOp.UpdateData("neri_async_seed", ["id"], [Cell.Int(1)], ["name"], [Cell.Text(label)])])
+
+  match awaitAsyncMigration(provider.beginMigrationAsync(new MigrationSet([initial, failed])))
+    case MigrationResult.Failure(error)
+    case MigrationResult.Applied(count)
+      test::assertTrue(false)
+  end
+  verifyAsyncSeedLabel(provider, label)
+  asyncMigrationApplied(awaitAsyncMigration(provider.beginMigrationAsync(catalog)), 0)
+  asyncMigrationApplied(awaitAsyncMigration(provider.beginMigrationAsync(catalog, "")), 1)
+end

@@ -129,10 +129,10 @@ def sqliteWireControlRequest(action: AsyncTransactionAction, deadline: Int?): By
   return wire.bytes()
 end
 
-def sqliteWireBatchRequest(batch: readonly WriteBatch, lease: Int, deadline: Int?): Byte[]?
+def sqliteWireBatchRequest(batch: readonly WriteBatch, lease: Int, deadline: Int?, setWrite: Bool = false): Byte[]?
   let wire = new SQLiteWireWriter()
 
-  wire.string("neri-sqlite-write-v1")
+  wire.string(setWrite ? "neri-sqlite-set-v1" : "neri-sqlite-write-v1")
   wire.integer(deadline == null ? -1 : deadline)
   wire.integer(lease)
   wire.integer(batch.count())
@@ -316,7 +316,7 @@ def sqliteAsyncWriteWorkerResponse(provider: SQLiteProvider, input: Byte[]): Byt
   var failure: WriteFailure? = null
   var command = 0
 
-  if version != "neri-sqlite-write-v1" || count < 0 || count > 1000
+  if (version != "neri-sqlite-write-v1" && version != "neri-sqlite-set-v1") || count < 0 || count > 1000 || (version == "neri-sqlite-set-v1" && count != 1)
     failure = WriteFailure.Validation("SQLite async batch metadata is invalid")
   end
   while command < count && failure == null
@@ -359,6 +359,19 @@ def sqliteAsyncWriteWorkerResponse(provider: SQLiteProvider, input: Byte[]): Byt
     return sqliteWireWriteResponse(WriteResult.Failure(failure), provider.transactionState(lease))
   end
   let operation: fn(): WriteResult = fn(): WriteResult do
+    if version == "neri-sqlite-set-v1"
+      let selected = batch.first()
+
+      if selected == null || selected.command().returningColumns() != null
+        return WriteResult.Failure(WriteFailure.Validation("SQLite async set request is malformed"))
+      end
+      let statement = selected.command()
+
+      return provider.executeSetInTransaction(
+        new SetWritePlan(statement.sql(), copyWriteValues(statement.parameters())),
+        lease
+      )
+    end
     return provider.writeBatchInTransaction(batch, lease)
   end
   let result = provider.workerGuard(deadline < 0 ? null : deadline, operation)
@@ -368,8 +381,12 @@ end
 
 def sqliteAsyncOpenFailure(input: Byte[], error: ProviderFailure): Byte[]
   let reader = new SQLiteWireReader(input)
+  let version = reader.string()
 
-  if reader.string() != "neri-sqlite-read-v1"
+  if version == "neri-sqlite-migration-v1"
+    return sqliteWireMigrationResponse(MigrationResult.Failure(MigrationFailure.Provider(error)))
+  end
+  if version != "neri-sqlite-read-v1"
     return sqliteWireWriteResponse(WriteResult.Failure(WriteFailure.Provider(error)), TransactionState.Invalid())
   end
   let wire = new SQLiteWireWriter()
@@ -389,5 +406,566 @@ def sqliteAsyncCloseWorker(provider: SQLiteProvider?): Void
     if error != null
       workers::fail(text::bytes(providerFailureMessage(error)))
     end
+  end
+end
+
+def sqliteWireMigrationFailure(wire: SQLiteWireWriter, error: MigrationFailure): Void
+  match error
+    case MigrationFailure.Validation(message)
+      wire.integer(0)
+      wire.string(message)
+    case MigrationFailure.Drift(message)
+      wire.integer(1)
+      wire.string(message)
+    case MigrationFailure.Unsupported(message)
+      wire.integer(2)
+      wire.string(message)
+    case MigrationFailure.Provider(failure)
+      wire.integer(3)
+      sqliteWireFailure(wire, failure)
+    case MigrationFailure.Cleanup(cleanup)
+      wire.integer(4)
+      sqliteWireMigrationFailure(wire, cleanup.primary())
+      sqliteWireFailure(wire, cleanup.cleanup())
+  end
+end
+
+def sqliteWireReadMigrationFailure(reader: SQLiteWireReader, depth: Int = 0): MigrationFailure
+  let tag = reader.integer()
+
+  if depth > 8
+    reader.reject()
+    return MigrationFailure.Validation("SQLite migration error exceeds wire nesting bound")
+  end
+  if tag == 3
+    return MigrationFailure.Provider(sqliteWireReadFailure(reader))
+  end
+  if tag == 4
+    let primary = sqliteWireReadMigrationFailure(reader, depth + 1)
+
+    return MigrationFailure.Cleanup(new MigrationCleanupFailure(primary, sqliteWireReadFailure(reader)))
+  end
+  let message = reader.string()
+
+  if tag == 0
+    return MigrationFailure.Validation(message)
+  else if tag == 1
+    return MigrationFailure.Drift(message)
+  else if tag == 2
+    return MigrationFailure.Unsupported(message)
+  end
+  reader.reject()
+  return MigrationFailure.Validation("SQLite migration error tag is invalid")
+end
+
+def sqliteWireSchemaColumn(wire: SQLiteWireWriter, column: readonly SchemaColumn): Void
+  wire.string(column.name())
+  wire.string(schemaTypeCode(column.type()))
+  wire.integer(column.nullable() ? 1 : 0)
+  wire.integer(column.primaryKey() ? 1 : 0)
+  wire.integer(column.keyPosition())
+  let value = column.defaultValue()
+
+  wire.integer(value == null ? 0 : 1)
+  if value != null
+    match value
+      case SchemaDefault.Null()
+        wire.cell(Cell.Null())
+      case SchemaDefault.Bool(item)
+        wire.cell(Cell.Bool(item))
+      case SchemaDefault.Int(item)
+        wire.cell(Cell.Int(item))
+      case SchemaDefault.Float(item)
+        wire.cell(Cell.Float(item))
+      case SchemaDefault.Text(item)
+        wire.cell(Cell.Text(item))
+    end
+  end
+  let reference = column.reference()
+
+  wire.integer(reference == null ? 0 : 1)
+  if reference != null
+    wire.string(reference.table())
+    wire.string(reference.onDelete())
+    wire.integer(reference.count())
+    var index = 0
+
+    while index < reference.count()
+      let principal = reference.columnAt(index)
+
+      wire.string(principal == null ? "" : principal)
+      index = index + 1
+    end
+    index = 0
+    while index < reference.count()
+      let dependent = reference.fieldAt(index)
+
+      wire.string(dependent == null ? "" : dependent)
+      index = index + 1
+    end
+  end
+end
+
+def sqliteWireBoundedCount(reader: SQLiteWireReader): Int
+  let count = reader.integer()
+
+  if count < 0 || count > 1000
+    reader.reject()
+    return 0
+  end
+  return count
+end
+
+def sqliteWireReadSchemaColumn(reader: SQLiteWireReader): SchemaColumn
+  let name = reader.string()
+  let typeCode = reader.string()
+  let nullable = reader.integer()
+  let primary = reader.integer()
+  let keyPosition = reader.integer()
+  var type = SchemaType.Text()
+  var defaultValue: SchemaDefault? = null
+  var reference: SchemaReference? = null
+
+  if typeCode == "B"
+    type = SchemaType.Bool()
+  else if typeCode == "I"
+    type = SchemaType.Int()
+  else if typeCode == "F"
+    type = SchemaType.Float()
+  else if typeCode == "Y"
+    type = SchemaType.Binary()
+  else if typeCode != "T"
+    reader.reject()
+  end
+  if reader.integer() == 1
+    match reader.cell()
+      case Cell.Null()
+        defaultValue = SchemaDefault.Null()
+      case Cell.Bool(item)
+        defaultValue = SchemaDefault.Bool(item)
+      case Cell.Int(item)
+        defaultValue = SchemaDefault.Int(item)
+      case Cell.Float(item)
+        defaultValue = SchemaDefault.Float(item)
+      case Cell.Text(item)
+        defaultValue = SchemaDefault.Text(item)
+      case Cell.Binary(item)
+        reader.reject()
+    end
+  end
+  if reader.integer() == 1
+    let table = reader.string()
+    let onDelete = reader.string()
+    let count = sqliteWireBoundedCount(reader)
+    let columns = arrays::generate<String>(count) do |index|
+      return reader.string()
+    end
+    let fields = arrays::generate<String>(count) do |index|
+      return reader.string()
+    end
+
+    reference = new SchemaReference(table, columns, fields, onDelete)
+  end
+  if (nullable != 0 && nullable != 1) || (primary != 0 && primary != 1)
+    reader.reject()
+  end
+  return new SchemaColumn(name, type, nullable == 1, primary == 1, defaultValue, reference, keyPosition)
+end
+
+def sqliteWireSchemaTable(wire: SQLiteWireWriter, table: readonly SchemaTable): Void
+  wire.string(table.identity())
+  wire.string(table.name())
+  wire.integer(table.count())
+  var index = 0
+
+  while index < table.count()
+    let field = table.at(index)
+
+    if field != null
+      wire.string(field.identity())
+      sqliteWireSchemaColumn(wire, field.column())
+    end
+    index = index + 1
+  end
+  wire.integer(table.indexCount())
+  index = 0
+  while index < table.indexCount()
+    let item = table.indexAt(index)
+
+    if item != null
+      wire.string(item.name())
+      wire.integer(item.unique() ? 1 : 0)
+      wire.integer(item.count())
+      var position = 0
+
+      while position < item.count()
+        let field = item.at(position)
+
+        wire.string(field == null ? "" : field)
+        position = position + 1
+      end
+    end
+    index = index + 1
+  end
+  wire.integer(table.seedCount())
+  index = 0
+  while index < table.seedCount()
+    let seed = table.seedAt(index)
+
+    if seed != null
+      wire.integer(seed.keyCount())
+      var position = 0
+
+      while position < seed.keyCount()
+        let field = seed.keyAt(position)
+        let value = seed.keyValueAt(position)
+
+        wire.string(field == null ? "" : field)
+        if value == null
+          wire.cell(Cell.Null())
+        else
+          wire.cell(value)
+        end
+        position = position + 1
+      end
+      wire.integer(seed.count())
+      position = 0
+      while position < seed.count()
+        let field = seed.at(position)
+        let value = seed.valueAt(position)
+
+        wire.string(field == null ? "" : field)
+        if value == null
+          wire.cell(Cell.Null())
+        else
+          wire.cell(value)
+        end
+        position = position + 1
+      end
+    end
+    index = index + 1
+  end
+end
+
+def sqliteWireReadSchemaTable(reader: SQLiteWireReader): SchemaTable
+  let identity = reader.string()
+  let name = reader.string()
+  let fields = arrays::generate<SchemaField>(sqliteWireBoundedCount(reader)) do |index|
+    let fieldIdentity = reader.string()
+
+    return new SchemaField(fieldIdentity, sqliteWireReadSchemaColumn(reader))
+  end
+  let indexes = arrays::generate<SchemaIndex>(sqliteWireBoundedCount(reader)) do |index|
+    let indexName = reader.string()
+    let unique = reader.integer()
+    let names = arrays::generate<String>(sqliteWireBoundedCount(reader)) do |position|
+      return reader.string()
+    end
+
+    return new SchemaIndex(indexName, names, unique == 1)
+  end
+
+  let seeds = arrays::generate<SchemaSeed>(sqliteWireBoundedCount(reader)) do |index|
+    let keyCount = sqliteWireBoundedCount(reader)
+    let keys = arrays::generate<String>(keyCount) do |position|
+      return ""
+    end
+    let keyValues = arrays::generate<Cell>(keyCount) do |position|
+      return Cell.Null()
+    end
+    var position = 0
+
+    while position < keyCount
+      keys[position] = reader.string()
+      keyValues[position] = reader.cell()
+      position = position + 1
+    end
+    let count = sqliteWireBoundedCount(reader)
+    let columns = arrays::generate<String>(count) do |position|
+      return ""
+    end
+    let values = arrays::generate<Cell>(count) do |position|
+      return Cell.Null()
+    end
+
+    position = 0
+    while position < count
+      columns[position] = reader.string()
+      values[position] = reader.cell()
+      position = position + 1
+    end
+    return new SchemaSeed(keys, keyValues, columns, values)
+  end
+
+  return new SchemaTable(identity, name, fields, indexes, seeds)
+end
+
+def sqliteWireSchemaOp(wire: SQLiteWireWriter, op: readonly SchemaOp): Void
+  match op
+    case SchemaOp.InsertData(table, columns, values)
+      wire.integer(9)
+      wire.string(table)
+      sqliteWireSeedTuple(wire, columns, values)
+    case SchemaOp.UpdateData(table, keys, keyValues, columns, values)
+      wire.integer(10)
+      wire.string(table)
+      sqliteWireSeedTuple(wire, keys, keyValues)
+      sqliteWireSeedTuple(wire, columns, values)
+    case SchemaOp.DeleteData(table, keys, keyValues)
+      wire.integer(11)
+      wire.string(table)
+      sqliteWireSeedTuple(wire, keys, keyValues)
+    case SchemaOp.CreateTable(table, columns)
+      wire.integer(0)
+      wire.string(table)
+      wire.integer(columns.Length)
+      for column in columns
+        sqliteWireSchemaColumn(wire, column)
+      end
+    case SchemaOp.DropTable(table)
+      wire.integer(1)
+      wire.string(table)
+    case SchemaOp.AddColumn(table, column)
+      wire.integer(2)
+      wire.string(table)
+      sqliteWireSchemaColumn(wire, column)
+    case SchemaOp.DropColumn(table, column)
+      wire.integer(3)
+      wire.string(table)
+      wire.string(column)
+    case SchemaOp.RenameTable(from, to)
+      wire.integer(4)
+      wire.string(from)
+      wire.string(to)
+    case SchemaOp.RenameColumn(table, from, to)
+      wire.integer(5)
+      wire.string(table)
+      wire.string(from)
+      wire.string(to)
+    case SchemaOp.CreateIndex(name, table, columns, unique)
+      wire.integer(6)
+      wire.string(name)
+      wire.string(table)
+      wire.integer(unique ? 1 : 0)
+      wire.integer(columns.Length)
+      for column in columns
+        wire.string(column)
+      end
+    case SchemaOp.DropIndex(name)
+      wire.integer(7)
+      wire.string(name)
+    case SchemaOp.RebuildTable(before, after)
+      wire.integer(8)
+      sqliteWireSchemaTable(wire, before)
+      sqliteWireSchemaTable(wire, after)
+  end
+end
+
+def sqliteWireSeedTuple(wire: SQLiteWireWriter, columns: readonly String[], values: readonly Cell[]): Void
+  wire.integer(columns.Length)
+  for column in columns
+    wire.string(column)
+  end
+  wire.integer(values.Length)
+  for value in values
+    wire.cell(value)
+  end
+end
+
+def sqliteWireReadSchemaOp(reader: SQLiteWireReader): SchemaOp
+  let tag = reader.integer()
+
+  if tag == 8
+    let before = sqliteWireReadSchemaTable(reader)
+    let after = sqliteWireReadSchemaTable(reader)
+
+    return SchemaOp.RebuildTable(before, after)
+  end
+  let first = reader.string()
+
+  if tag >= 9 && tag <= 11
+    let columns = arrays::generate<String>(sqliteWireBoundedCount(reader)) do |index|
+      return reader.string()
+    end
+    let values = arrays::generate<Cell>(sqliteWireBoundedCount(reader)) do |index|
+      return reader.cell()
+    end
+
+    if tag == 9
+      return SchemaOp.InsertData(first, columns, values)
+    else if tag == 11
+      return SchemaOp.DeleteData(first, columns, values)
+    end
+    let fields = arrays::generate<String>(sqliteWireBoundedCount(reader)) do |index|
+      return reader.string()
+    end
+    let cells = arrays::generate<Cell>(sqliteWireBoundedCount(reader)) do |index|
+      return reader.cell()
+    end
+
+    return SchemaOp.UpdateData(first, columns, values, fields, cells)
+  end
+  if tag == 0
+    let columns = arrays::generate<SchemaColumn>(sqliteWireBoundedCount(reader)) do |index|
+      return sqliteWireReadSchemaColumn(reader)
+    end
+
+    return SchemaOp.CreateTable(first, columns)
+  else if tag == 1
+    return SchemaOp.DropTable(first)
+  else if tag == 2
+    return SchemaOp.AddColumn(first, sqliteWireReadSchemaColumn(reader))
+  else if tag == 3
+    return SchemaOp.DropColumn(first, reader.string())
+  else if tag == 4
+    return SchemaOp.RenameTable(first, reader.string())
+  else if tag == 5
+    let from = reader.string()
+
+    return SchemaOp.RenameColumn(first, from, reader.string())
+  else if tag == 6
+    let table = reader.string()
+    let unique = reader.integer()
+    let columns = arrays::generate<String>(sqliteWireBoundedCount(reader)) do |index|
+      return reader.string()
+    end
+
+    return SchemaOp.CreateIndex(first, table, columns, unique == 1)
+  else if tag == 7
+    return SchemaOp.DropIndex(first)
+  end
+  reader.reject()
+  return SchemaOp.DropTable("")
+end
+
+def sqliteWireMigrationRequest(catalog: readonly MigrationSet, target: String?, deadline: Int?): Byte[]?
+  let wire = new SQLiteWireWriter()
+
+  wire.string("neri-sqlite-migration-v1")
+  wire.integer(deadline == null ? -1 : deadline)
+  wire.integer(target == null ? 0 : 1)
+  wire.string(target == null ? "" : target)
+  wire.integer(catalog.count())
+  var index = 0
+
+  while index < catalog.count()
+    let migration = catalog.at(index)
+
+    if migration != null
+      wire.string(migration.id())
+      wire.integer(migration.upCount())
+      var position = 0
+
+      while position < migration.upCount()
+        let op = migration.upAt(position)
+
+        if op != null
+          sqliteWireSchemaOp(wire, op)
+        end
+        position = position + 1
+      end
+      wire.integer(migration.downCount())
+      position = 0
+      while position < migration.downCount()
+        let op = migration.downAt(position)
+
+        if op != null
+          sqliteWireSchemaOp(wire, op)
+        end
+        position = position + 1
+      end
+    end
+    index = index + 1
+  end
+  return wire.bytes()
+end
+
+class SQLiteMigrationWorkerResult
+  public result: MigrationResult = MigrationResult.Applied(0)
+end
+
+def sqliteWireMigrationResponse(result: MigrationResult): Byte[]
+  let wire = new SQLiteWireWriter()
+
+  match result
+    case MigrationResult.Applied(count)
+      wire.integer(0)
+      wire.integer(count)
+    case MigrationResult.Failure(error)
+      wire.integer(1)
+      sqliteWireMigrationFailure(wire, error)
+  end
+  let bytes = wire.bytes()
+  let empty: Byte[] = []
+
+  return bytes == null ? empty : bytes
+end
+
+def sqliteAsyncMigrationWorkerResponse(provider: SQLiteProvider, input: Byte[]): Byte[]
+  let reader = new SQLiteWireReader(input)
+  let version = reader.string()
+  let deadline = reader.integer()
+  let hasTarget = reader.integer()
+  let target = reader.string()
+  let migrations = arrays::generate<Migration>(sqliteWireBoundedCount(reader)) do |index|
+    let id = reader.string()
+    let up = arrays::generate<SchemaOp>(sqliteWireBoundedCount(reader)) do |position|
+      return sqliteWireReadSchemaOp(reader)
+    end
+    let down = arrays::generate<SchemaOp>(sqliteWireBoundedCount(reader)) do |position|
+      return sqliteWireReadSchemaOp(reader)
+    end
+
+    return new Migration(id, up, down)
+  end
+
+  if version != "neri-sqlite-migration-v1" || !reader.finished() || (hasTarget != 0 && hasTarget != 1)
+    return sqliteWireMigrationResponse(MigrationResult.Failure(MigrationFailure.Validation("SQLite async migration request is malformed")))
+  end
+  let catalog = new MigrationSet(migrations)
+  let output = new SQLiteMigrationWorkerResult()
+  let operation: fn(): WriteResult = fn(): WriteResult do
+    output.result = provider.migrate(catalog, hasTarget == 0 ? null : target)
+    return WriteResult.Saved(0)
+  end
+
+  match provider.workerGuard(deadline < 0 ? null : deadline, operation)
+    case WriteResult.Failure(error)
+      let cleanup = sqliteAsyncWriteProviderFailure(error)
+
+      match output.result
+        case MigrationResult.Failure(primary)
+          output.result = MigrationResult.Failure(MigrationFailure.Cleanup(new MigrationCleanupFailure(
+                primary,
+                cleanup
+              )))
+        case MigrationResult.Applied(count)
+          output.result = MigrationResult.Failure(MigrationFailure.Provider(cleanup))
+      end
+    case WriteResult.Saved(count)
+    case WriteResult.SavedWithValues(count, rows)
+  end
+  return sqliteWireMigrationResponse(output.result)
+end
+
+def sqliteAsyncWriteProviderFailure(error: WriteFailure): ProviderFailure
+  match error
+    case WriteFailure.Provider(failure)
+      return failure
+    case WriteFailure.Cleanup(cleanup)
+      return ProviderFailure.Cleanup(new ProviderCleanupFailure(
+          sqliteAsyncWriteProviderFailure(cleanup.primary()),
+          sqliteAsyncWriteProviderFailure(cleanup.cleanup())
+        ))
+    case WriteFailure.Validation(message)
+      return ProviderFailure.State(message)
+    case WriteFailure.Concurrency(message)
+      return ProviderFailure.State(message)
+    case WriteFailure.Constraint(message)
+      return ProviderFailure.State(message)
+    case WriteFailure.Unsupported(message)
+      return ProviderFailure.State(message)
+    case WriteFailure.Transaction(message)
+      return ProviderFailure.State(message)
   end
 end

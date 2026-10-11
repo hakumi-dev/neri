@@ -1,0 +1,260 @@
+use host
+use neri_data
+namespace neri_data_postgresql
+
+## One visible column of a PostgreSQL table, partitioned table, or view.
+class PostgreSQLSchemaColumn
+  private storedSchema: String
+  private storedTable: String
+  private storedName: String
+  private storedType: String
+  private storedDefault: String?
+  private storedRequired: Bool
+  private storedKeyPosition: Int
+  private storedGenerated: String
+  private storedIdentity: String
+  private storedView: Bool
+
+  def init(
+    schema: String,
+    table: String,
+    name: String,
+    declaredType: String,
+    defaultSql: String?,
+    required: Bool,
+    keyPosition: Int,
+    generated: String,
+    identity: String,
+    view: Bool
+  ): Void
+    this.storedSchema = schema
+    this.storedTable = table
+    this.storedName = name
+    this.storedType = declaredType
+    this.storedDefault = defaultSql
+    this.storedRequired = required
+    this.storedKeyPosition = keyPosition
+    this.storedGenerated = generated
+    this.storedIdentity = identity
+    this.storedView = view
+  end
+
+  public readonly def schema(): String
+    return this.storedSchema
+  end
+
+  public readonly def table(): String
+    return this.storedTable
+  end
+
+  public readonly def name(): String
+    return this.storedName
+  end
+
+  public readonly def declaredType(): String
+    return this.storedType
+  end
+
+  public readonly def defaultSql(): String?
+    return this.storedDefault
+  end
+
+  public readonly def required(): Bool
+    return this.storedRequired
+  end
+
+  public readonly def keyPosition(): Int
+    return this.storedKeyPosition
+  end
+
+  ## PostgreSQL attgenerated code: empty for ordinary, s stored, v virtual.
+  public readonly def generated(): String
+    return this.storedGenerated
+  end
+
+  ## PostgreSQL attidentity code: empty for ordinary, a always, d by default.
+  public readonly def identity(): String
+    return this.storedIdentity
+  end
+
+  public readonly def view(): Bool
+    return this.storedView
+  end
+end
+
+class PostgreSQLSchemaSnapshot
+  private columns: PostgreSQLSchemaColumn?[]
+  private size: Int = 0
+
+  def init(): Void
+    this.columns = arrays::generate<PostgreSQLSchemaColumn?>(1000) do |index|
+      return null
+    end
+  end
+
+  internal def add(column: PostgreSQLSchemaColumn): Void
+    this.columns[this.size] = column
+    this.size = this.size + 1
+  end
+
+  public readonly def count(): Int
+    return this.size
+  end
+
+  public readonly def at(index: Int): readonly PostgreSQLSchemaColumn?
+    return index < 0 || index >= this.size ? null : this.columns[index]
+  end
+end
+
+enum PostgreSQLSchemaResult
+  case Snapshot(value: PostgreSQLSchemaSnapshot)
+  case Failure(error: ProviderFailure)
+end
+
+def pgInspectSchema(provider: PostgreSQLProvider, schema: String?): PostgreSQLSchemaResult
+  if schema != null && (!identifierValid(schema) || pgHasNul(schema))
+    return PostgreSQLSchemaResult.Failure(ProviderFailure.State("PostgreSQL schema inspection requires a valid schema identifier"))
+  end
+  let parameters = new CompileState()
+  var filter = "left(n.nspname,3) <> 'pg_' AND n.nspname <> 'information_schema'"
+
+  if schema != null
+    parameters.bind(Parameter.Text(schema))
+    filter = "n.nspname = $1"
+  end
+  let sql = "SELECT n.nspname::text AS schema_name,c.relname::text AS table_name,a.attname::text AS column_name,pg_catalog.format_type(a.atttypid,a.atttypmod)::text AS declared_type,pg_catalog.pg_get_expr(d.adbin,d.adrelid)::text AS default_sql,a.attnotnull AS required,COALESCE((SELECT k.ordinality FROM pg_catalog.pg_index i CROSS JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS k(attnum,ordinality) WHERE i.indrelid=c.oid AND i.indisprimary AND k.attnum=a.attnum LIMIT 1),0)::bigint AS key_position,a.attgenerated::text AS generated,a.attidentity::text AS identity,(c.relkind IN ('v','m')) AS is_view FROM pg_catalog.pg_namespace n JOIN pg_catalog.pg_class c ON c.relnamespace=n.oid JOIN pg_catalog.pg_attribute a ON a.attrelid=c.oid LEFT JOIN pg_catalog.pg_attrdef d ON d.adrelid=c.oid AND d.adnum=a.attnum WHERE " + filter + " AND c.relkind IN ('r','p','v','m') AND a.attnum > 0 AND NOT a.attisdropped AND left(lower(c.relname),7) <> '__neri_' ORDER BY n.nspname COLLATE \"C\",c.relname COLLATE \"C\",a.attnum LIMIT 1001"
+  let columns = new ResultColumns([
+      new ResultColumn("schema_name", ResultColumnKind.Text()),
+      new ResultColumn("table_name", ResultColumnKind.Text()),
+      new ResultColumn("column_name", ResultColumnKind.Text()),
+      new ResultColumn("declared_type", ResultColumnKind.Text()),
+      new ResultColumn("default_sql", ResultColumnKind.Text(), true),
+      new ResultColumn("required", ResultColumnKind.Bool()),
+      new ResultColumn("key_position", ResultColumnKind.Int()),
+      new ResultColumn("generated", ResultColumnKind.Text()),
+      new ResultColumn("identity", ResultColumnKind.Text()),
+      new ResultColumn("is_view", ResultColumnKind.Bool())
+    ])
+
+  match provider.execute(new SqlPlan(sql, new ParameterValues(parameters.head, parameters.count), 1001, columns))
+    case ProviderResult.Failure(error)
+      return PostgreSQLSchemaResult.Failure(error)
+    case ProviderResult.Rows(rows)
+      if rows.Length > 1000
+        return PostgreSQLSchemaResult.Failure(ProviderFailure.State("PostgreSQL schema inspection exceeds 1000 visible columns"))
+      end
+      let snapshot = new PostgreSQLSchemaSnapshot()
+
+      for row in rows
+        match pgDecodeSchemaColumn(row)
+          case PostgreSQLSchemaColumnResult.Column(column)
+            snapshot.add(column)
+          case PostgreSQLSchemaColumnResult.Failure(error)
+            return PostgreSQLSchemaResult.Failure(error)
+        end
+      end
+      return PostgreSQLSchemaResult.Snapshot(snapshot)
+  end
+end
+
+enum PostgreSQLSchemaColumnResult
+  case Column(value: PostgreSQLSchemaColumn)
+  case Failure(error: ProviderFailure)
+end
+
+def pgSchemaText(row: RawRow, name: String): String
+  match decodeString(row, name)
+    case DecodeResult.Value(value)
+      return value
+    case DecodeResult.Failure(error)
+      return ""
+  end
+end
+
+def pgDecodeSchemaColumn(row: RawRow): PostgreSQLSchemaColumnResult
+  let schema = pgSchemaText(row, "schema_name")
+  let table = pgSchemaText(row, "table_name")
+  let name = pgSchemaText(row, "column_name")
+  let type = pgSchemaText(row, "declared_type")
+  let generated = pgSchemaText(row, "generated")
+  let identity = pgSchemaText(row, "identity")
+  var defaultSql: String? = null
+  var required = false
+  var key = -1
+  var view = false
+
+  match decodeNullableString(row, "default_sql")
+    case DecodeResult.Value(value)
+      defaultSql = value
+    case DecodeResult.Failure(error)
+      return PostgreSQLSchemaColumnResult.Failure(ProviderFailure.State("PostgreSQL schema default metadata is invalid"))
+  end
+  match decodeBool(row, "required")
+    case DecodeResult.Value(value)
+      required = value
+    case DecodeResult.Failure(error)
+      return PostgreSQLSchemaColumnResult.Failure(ProviderFailure.State("PostgreSQL schema nullability metadata is invalid"))
+  end
+  match decodeInt(row, "key_position")
+    case DecodeResult.Value(value)
+      key = value
+    case DecodeResult.Failure(error)
+      return PostgreSQLSchemaColumnResult.Failure(ProviderFailure.State("PostgreSQL schema key metadata is invalid"))
+  end
+  match decodeBool(row, "is_view")
+    case DecodeResult.Value(value)
+      view = value
+    case DecodeResult.Failure(error)
+      return PostgreSQLSchemaColumnResult.Failure(ProviderFailure.State("PostgreSQL schema relation metadata is invalid"))
+  end
+  if schema == "" || table == "" || name == "" || type == "" || key < 0 || (identity != "" && identity != "a" && identity != "d") || (generated != "" && generated != "s" && generated != "v")
+    return PostgreSQLSchemaColumnResult.Failure(ProviderFailure.State("PostgreSQL schema column metadata is invalid"))
+  end
+  return PostgreSQLSchemaColumnResult.Column(new PostgreSQLSchemaColumn(
+      schema,
+      table,
+      name,
+      type,
+      defaultSql,
+      required,
+      key,
+      generated,
+      identity,
+      view
+    ))
+end
+
+def pgScaffoldSchema(snapshot: readonly PostgreSQLSchemaSnapshot, options: SchemaScaffoldOptions?): SchemaScaffoldResult
+  let columns = arrays::generate<SchemaScaffoldColumn>(snapshot.count()) do |index|
+    let column = snapshot.at(index)
+
+    if column == null
+      return new SchemaScaffoldColumn("", "", "", true)
+    end
+    var type = ""
+
+    if column.declaredType() == "bigint"
+      type = "Int"
+    else if column.declaredType() == "double precision"
+      type = "Float"
+    else if column.declaredType() == "boolean"
+      type = "Bool"
+    else if column.declaredType() == "text"
+      type = "String"
+    else if column.declaredType() == "bytea"
+      type = "ByteBuffer"
+    end
+    if column.schema() != "public"
+      type = ""
+    end
+    let generated = column.generated() != ""
+
+    return new SchemaScaffoldColumn(
+      column.table(), column.name(), type, !column.required(),
+      column.keyPosition(), generated || column.identity() != "" || column.defaultSql() != null,
+      generated, column.view(), column.defaultSql()
+    )
+  end
+
+  return neri_data::scaffoldSchema(columns, options)
+end

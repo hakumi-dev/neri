@@ -129,10 +129,26 @@ class PostgreSQLProvider: Provider
     return pgMigrate(this, catalog, target)
   end
 
+  public def inspectSchema(schema: String? = null): PostgreSQLSchemaResult
+    return pgInspectSchema(this, schema)
+  end
+
+  public def scaffoldSchema(schema: String = "public", options: SchemaScaffoldOptions? = null): SchemaScaffoldResult
+    if schema != "public"
+      return SchemaScaffoldResult.Failure(ProviderFailure.State("PostgreSQL scaffolding requires the public schema until schema-qualified mapping is available"))
+    end
+    match this.inspectSchema(schema)
+      case PostgreSQLSchemaResult.Snapshot(snapshot)
+        return pgScaffoldSchema(snapshot, options)
+      case PostgreSQLSchemaResult.Failure(error)
+        return SchemaScaffoldResult.Failure(error)
+    end
+  end
+
   public override readonly def supports(capability: ProviderCapability): Bool
     match capability
       case ProviderCapability.CheckedScalarExpressions()
-        return false
+        return this.opened
       case ProviderCapability.BoundedTypedReads()
         return this.opened
       case ProviderCapability.StreamingReads()
@@ -318,6 +334,101 @@ class PostgreSQLProvider: Provider
       ))
   end
 
+  public override def beginSetAsync(
+    plan: readonly SetWritePlan,
+    options: StreamOptions? = null,
+    lease: Int? = null
+  ): AsyncWriteStart
+    let unavailable = this.available()
+
+    if unavailable != null
+      return AsyncWriteStart.Failure(WriteFailure.Provider(unavailable))
+    end
+    if plan.requiresCheckedScalars() && !this.supports(ProviderCapability.CheckedScalarExpressions())
+      return AsyncWriteStart.Failure(WriteFailure.Unsupported("checked-scalar-expressions"))
+    end
+    if (lease == null && this.activeLease != 0) || (lease != null && (lease <= 0 || lease != this.activeLease))
+      return AsyncWriteStart.Failure(WriteFailure.Transaction("PostgreSQL asynchronous set write requires a valid lease or idle connection"))
+    end
+    let deadline = pgDeadline(options)
+    let token = options == null ? null : options.token()
+
+    if options != null && options.timeoutMilliseconds() != null && deadline == null
+      return AsyncWriteStart.Failure(WriteFailure.Validation("invalid PostgreSQL asynchronous timeout"))
+    end
+    if token != null && token.cancelled()
+      return AsyncWriteStart.Failure(WriteFailure.Provider(pgInterrupted("async.set")))
+    end
+    let batch = new WriteBatch()
+
+    batch.add(plan.sql(), copyWriteValues(plan.parameters()), 0)
+    this.busy = true
+    return AsyncWriteStart.Started(new PostgreSQLAsyncWrite(this, batch, lease, deadline, token, null, true))
+  end
+
+  public override def beginMigrationAsync(
+    catalog: readonly MigrationSet,
+    target: String? = null,
+    options: StreamOptions? = null
+  ): AsyncMigrationStart
+    let unavailable = this.available()
+    let invalid = catalog.validate()
+
+    if unavailable != null
+      return AsyncMigrationStart.Failure(MigrationFailure.Provider(unavailable))
+    end
+    if this.activeLease != 0
+      return AsyncMigrationStart.Failure(MigrationFailure.Unsupported("PostgreSQL migrations require an idle connection"))
+    end
+    if invalid != null || catalog.count() > 1000
+      return AsyncMigrationStart.Failure(MigrationFailure.Validation(invalid == null ? "PostgreSQL migration catalog exceeds 1000 entries" : invalid))
+    end
+    var count = catalog.count()
+
+    if target != null
+      count = target == "" ? 0 : -1
+      var index = 0
+
+      while index < catalog.count()
+        let migration = catalog.at(index)
+
+        if migration != null && migration.id() == target
+          count = index + 1
+        end
+        index = index + 1
+      end
+      if count < 0
+        return AsyncMigrationStart.Failure(MigrationFailure.Validation("migration target is not in catalog"))
+      end
+    end
+    let deadline = pgDeadline(options)
+    let token = options == null ? null : options.token()
+
+    if options != null && options.timeoutMilliseconds() != null && deadline == null
+      return AsyncMigrationStart.Failure(MigrationFailure.Validation("invalid PostgreSQL asynchronous timeout"))
+    end
+    if token != null && token.cancelled()
+      return AsyncMigrationStart.Failure(MigrationFailure.Provider(pgInterrupted("async.migration")))
+    end
+    this.busy = true
+    return AsyncMigrationStart.Started(new PostgreSQLAsyncMigration(this, catalog, count, deadline, token))
+  end
+
+  public def migrateAsync(
+    catalog: readonly MigrationSet,
+    target: String? = null,
+    options: StreamOptions? = null
+  ): result::Result<AsyncMigration, MigrationFailure>
+    match this.beginMigrationAsync(catalog, target, options)
+      case AsyncMigrationStart.Failure(error)
+        return result::Result<AsyncMigration, MigrationFailure>.Error(error)
+      case AsyncMigrationStart.Started(driver)
+        let owned = new AsyncMigration(driver)
+
+        return result::Result<AsyncMigration, MigrationFailure>.Ok(transfer owned)
+    end
+  end
+
   private def startRead(
     sql: String,
     parameters: readonly ParameterValues,
@@ -359,9 +470,6 @@ class PostgreSQLProvider: Provider
     options: StreamOptions? = null,
     maximumRows: Int? = null
   ): AsyncReadStart
-    if plan.requiresCheckedScalars()
-      return AsyncReadStart.Failure(ProviderFailure.State("PostgreSQL checked scalar expressions are unsupported"))
-    end
     let deadline = pgDeadline(options)
 
     if options != null && options.timeoutMilliseconds() != null && deadline == null
@@ -878,9 +986,6 @@ class PostgreSQLProvider: Provider
   public override def executeSetInTransaction(plan: readonly SetWritePlan, lease: Int): WriteResult
     if lease == 0 || lease != this.activeLease
       return WriteResult.Failure(WriteFailure.Transaction("PostgreSQL set write lease is invalid"))
-    end
-    if plan.requiresCheckedScalars()
-      return WriteResult.Failure(WriteFailure.Unsupported("PostgreSQL checked scalar expressions are unsupported"))
     end
     match this.command(plan.sql(), plan.parameters())
       case PostgreSQLCommandResult.Failure(error)

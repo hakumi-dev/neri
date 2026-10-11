@@ -1,5 +1,6 @@
 use neri_data
 use test
+use resources
 
 class ReferenceParent
   public id: Int
@@ -33,6 +34,8 @@ class ReferenceProbe: Provider
   public parentId: Int? = 1
   public principalRows: Int = 1
   public badPrincipal: Bool = false
+  public failPublication: Bool = false
+  public failRoot: Bool = false
 
   public override readonly def supports(capability: ProviderCapability): Bool
     return true
@@ -80,6 +83,60 @@ class ReferenceProbe: Provider
       end
     end
     return StreamResult.Completed(count)
+  end
+
+  public override def beginReadAsync(
+    plan: readonly SqlPlan,
+    options: StreamOptions? = null,
+    maximumRows: Int? = null
+  ): AsyncReadStart
+    if plan.columns().count() == 3
+      match this.execute(plan)
+        case ProviderResult.Rows(rows)
+          return AsyncReadStart.Started(new ReferenceAsyncRead(rows))
+        case ProviderResult.Failure(error)
+          return AsyncReadStart.Failure(error)
+      end
+    end
+    this.streams = this.streams + 1
+    let rows = arrays::generate<RawRow>(this.principalRows) do |index|
+      return this.badPrincipal ? new RawRow([]) : new RawRow([
+          new RawColumn("id", Cell.Int(1)), new RawColumn("name", Cell.Text("group"))
+        ])
+    end
+
+    return AsyncReadStart.Started(new ReferenceAsyncRead(rows))
+  end
+end
+
+class ReferenceAsyncRead: AsyncReadDriver
+  private rows: RawRow[]
+  private index: Int = 0
+  private cancelled: Bool = false
+
+  def init(rows: RawRow[]): Void
+    this.rows = rows
+  end
+
+  public override def poll(): AsyncReadPoll
+    if this.cancelled
+      return AsyncReadPoll.Failure(ProviderFailure.State("cancelled reference fixture"))
+    end
+    if this.index == this.rows.Length
+      return AsyncReadPoll.Completed()
+    end
+    let row = this.rows[this.index]
+
+    this.index = this.index + 1
+    return AsyncReadPoll.Row(row)
+  end
+
+  public override def cancel(): Void
+    this.cancelled = true
+  end
+
+  public override def close(): ProviderFailure?
+    return null
   end
 end
 
@@ -260,6 +317,74 @@ def main(): Void
 
   test::assertEqual(parent.children.Length, 1)
   test::assertTrue(reference::same(parent.children[0], first))
+  let asyncOutcome = verifyAsyncReference(children.take(1), parents, relation, firstRows)
+
+  test::assertEqual(asyncOutcome.closeFailures.count(), 0)
+  match asyncOutcome.completion
+    case resources::Completion.Value(value)
+      test::assertEqual(value, 0)
+    case resources::Completion.Failure(error)
+      test::assertTrue(false)
+  end
+  let cachedStreams = provider.streams
+  let lazyOutcome = verifyAsyncLazyReference(children, parents, relation, first)
+
+  test::assertEqual(lazyOutcome.closeFailures.count(), 0)
+  test::assertEqual(provider.streams, cachedStreams)
+  let conflicting = new ReferenceParent(99, "conflicting")
+  let failedFixup: fn(): QueryFailure? = fn(): QueryFailure? do
+    if provider.failPublication
+      parent.children = []
+      first.parent = conflicting
+      relation.markCollection(parent, NavigationLoadState.Unknown())
+      relation.markReference(first, NavigationLoadState.Unknown())
+      return QueryFailure.Provider(ProviderFailure.State("publication observer failed"))
+    end
+    return null
+  end
+
+  parentTracker.observeMaterialization(failedFixup)
+  provider.failPublication = true
+  referenceFailure(includeReference(children, parents, relation).load(firstRows))
+  provider.failPublication = false
+
+  test::assertEqual(parent.children.Length, 1)
+  test::assertTrue(reference::same(parent.children[0], first))
+  test::assertTrue(first.parent != null && reference::same(first.parent, parent))
+  match relation.referenceState(first)
+    case NavigationLoadState.Loaded()
+    case NavigationLoadState.Unknown()
+      test::assertTrue(false)
+    case NavigationLoadState.Loading()
+      test::assertTrue(false)
+    case NavigationLoadState.Partial()
+      test::assertTrue(false)
+  end
+  let rootFixup: fn(): QueryFailure? = fn(): QueryFailure? do
+    if provider.failRoot
+      parent.children = []
+      first.parent = conflicting
+      relation.markReference(first, NavigationLoadState.Unknown())
+    end
+    return null
+  end
+
+  childTracker.observeMaterialization(rootFixup)
+  provider.failRoot = true
+  referenceFailure(includeReference(children.take(1), parents, relation).all())
+  let failedAsyncRoot = verifyAsyncRootReference(children.take(1), parents, relation)
+
+  test::assertEqual(failedAsyncRoot.closeFailures.count(), 0)
+  match failedAsyncRoot.completion
+    case resources::Completion.Failure(error)
+    case resources::Completion.Value(value)
+      test::assertTrue(false)
+  end
+
+  test::assertEqual(parent.children.Length, 1)
+  test::assertTrue(reference::same(parent.children[0], first))
+  test::assertTrue(first.parent != null && reference::same(first.parent, parent))
+  provider.failRoot = false
   first.title = "local scalar edit"
   let repeated = referenceRows(includeReference(children.take(1), parents, relation).all())
 
@@ -314,4 +439,92 @@ def main(): Void
   referenceFailure(includeReference(children.take(1), parents, relation).all())
 
   test::assertEqual(parent.children.Length, 1)
+end
+
+def verifyAsyncReference(
+  children: Query<ReferenceChild>,
+  parents: Query<ReferenceParent>,
+  relation: CollectionNavigation<ReferenceParent, ReferenceChild>,
+  rows: TypedRows<ReferenceChild>
+): resources::Outcome<Int, QueryFailure>
+  using operation <- includeReference(children, parents, relation).loadAsync(rows)
+    while true
+      match operation.poll()
+        case AsyncQueryPoll.Pending(socket, interest)
+          continue
+        case AsyncQueryPoll.Completed(result)
+          match result
+            case QueryResult.Rows(loaded)
+              test::assertEqual(loaded.count(), rows.count())
+
+              return 0
+            case QueryResult.Failure(error)
+              match error
+                case QueryFailure.Provider(failure)
+                  console::println(providerFailureMessage(failure))
+                case QueryFailure.InvalidIdentifier(name)
+                case QueryFailure.InvalidLimit(value, maximum)
+                case QueryFailure.MissingLimit(maximum)
+                case QueryFailure.SourceMismatch(expected, actual)
+                case QueryFailure.UnsupportedCapability(name)
+                  console::println(name)
+                case QueryFailure.Cleanup(cleanup)
+                case QueryFailure.MissingColumn(name)
+                  console::println(name)
+                case QueryFailure.TypeMismatch(column, expected, actual)
+                  console::println(column + expected + actual)
+                case QueryFailure.Cardinality(expected, actual)
+              end
+              return error
+          end
+      end
+    end
+  end
+  return 1
+end
+
+def verifyAsyncRootReference(
+  children: Query<ReferenceChild>, parents: Query<ReferenceParent>, relation: CollectionNavigation<ReferenceParent, ReferenceChild>
+): resources::Outcome<Int, QueryFailure>
+  using operation <- includeReference(children, parents, relation).allAsync()
+    while true
+      match operation.poll()
+        case AsyncQueryPoll.Pending(socket, interest)
+          continue
+        case AsyncQueryPoll.Completed(result)
+          match result
+            case QueryResult.Failure(error)
+              return error
+            case QueryResult.Rows(rows)
+              return 0
+          end
+      end
+    end
+  end
+  return 1
+end
+
+def verifyAsyncLazyReference(
+  children: Query<ReferenceChild>,
+  parents: Query<ReferenceParent>,
+  relation: CollectionNavigation<ReferenceParent, ReferenceChild>,
+  child: ReferenceChild
+): resources::Outcome<Int, QueryFailure>
+  using operation <- lazyReferenceAsync(children, parents, relation, child)
+    match operation.poll()
+      case AsyncQueryPoll.Pending(socket, interest)
+        test::assertTrue(false)
+      case AsyncQueryPoll.Completed(result)
+        match result
+          case QueryResult.Rows(rows)
+            test::assertEqual(rows.count(), 1)
+
+            return 0
+          case QueryResult.Failure(error)
+            return error
+        end
+    end
+    return 1
+  end
+  return 1
 end

@@ -1,0 +1,295 @@
+use host
+namespace neri_data
+
+class SchemaScaffoldOptions
+  public modelNamespace: String = "scaffolded_model"
+  public dataNamespace: String = "scaffolded_data"
+  public context: String = "ScaffoldedContext"
+  public project: String = "manifest.json"
+  public unit: String = "entities"
+  public output: String = "generated"
+end
+
+## Provider adapters supply visible columns in relation and physical column order.
+class SchemaScaffoldColumn
+  public table: String
+  public name: String
+  public type: String
+  public nullable: Bool
+  public keyPosition: Int
+  public generatedOnAdd: Bool
+  public generatedOnUpdate: Bool
+  public view: Bool
+  public defaultSql: String?
+
+  def init(
+    table: String,
+    name: String,
+    type: String,
+    nullable: Bool,
+    keyPosition: Int = 0,
+    generatedOnAdd: Bool = false,
+    generatedOnUpdate: Bool = false,
+    view: Bool = false,
+    defaultSql: String? = null
+  ): Void
+    this.table = table
+    this.name = name
+    this.type = type
+    this.nullable = nullable
+    this.keyPosition = keyPosition
+    this.generatedOnAdd = generatedOnAdd
+    this.generatedOnUpdate = generatedOnUpdate
+    this.view = view
+    this.defaultSql = defaultSql
+  end
+end
+
+enum SchemaScaffoldResult
+  case Source(modelSource: String, mappingJson: String)
+  case Failure(error: ProviderFailure)
+end
+
+def scaffoldJson(value: String): String
+  var output = "\""
+  var index = 0
+  var start = 0
+
+  while index < host::stringByteLength(value)
+    let byte = host::stringByteAt(value, index) as Int
+
+    if byte == 34 || byte == 92 || byte < 32
+      output = output + host::stringSlice(value, start, index - start)
+      if byte == 34 || byte == 92
+        output = output + "\\" + host::stringSlice(value, index, 1)
+      else
+        output = output + "\\u00" + schemaSeedHex([byte as Byte])
+      end
+      start = index + 1
+    end
+    index = index + 1
+  end
+  return output + host::stringSlice(value, start, host::stringByteLength(value) - start) + "\""
+end
+
+## Prefixes prevent keyword collisions; UTF-8 bytes use an unambiguous ASCII escape.
+def scaffoldIdentifier(value: String, prefix: String): String
+  var output = prefix
+  var index = 0
+
+  while index < host::stringByteLength(value)
+    let byte = host::stringByteAt(value, index) as Int
+    let letter = (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122)
+
+    if letter || (byte >= 48 && byte <= 57)
+      output = output + host::stringSlice(value, index, 1)
+    else
+      output = output + "_" + schemaSeedHex([byte as Byte]) + "_"
+    end
+    index = index + 1
+  end
+  return output
+end
+
+def scaffoldTypeSupported(value: String): Bool
+  return value == "Int" || value == "Bool" || value == "Float" || value == "String" || value == "ByteBuffer"
+end
+
+def scaffoldCodeIdentifierValid(value: String): Bool
+  if !identifierValid(value)
+    return false
+  end
+  for keyword in [
+    "class",
+    "namespace",
+    "use",
+    "public",
+    "internal",
+    "private",
+    "protected",
+    "def",
+    "static",
+    "var",
+    "let",
+    "return",
+    "if",
+    "else",
+    "end",
+    "while",
+    "for",
+    "in",
+    "do",
+    "match",
+    "case",
+    "enum",
+    "true",
+    "false",
+    "null",
+    "readonly",
+    "transfer",
+    "resource",
+    "using",
+    "override",
+    "abstract",
+    "base",
+    "this",
+    "new",
+    "as",
+    "labels",
+    "out",
+    "ref",
+    "break",
+    "continue"
+  ]
+    if value == keyword
+      return false
+    end
+  end
+  return true
+end
+
+def scaffoldInitialValue(column: readonly SchemaScaffoldColumn): String
+  if column.nullable
+    return "null"
+  end
+  if column.type == "Int"
+    return "0"
+  end
+  if column.type == "Float"
+    return "0.0"
+  end
+  if column.type == "Bool"
+    return "false"
+  end
+  return column.type == "String" ? "\"\"" : "new ByteBuffer(33554432, 0)"
+end
+
+def scaffoldSchema(
+  columns: readonly SchemaScaffoldColumn[],
+  options: SchemaScaffoldOptions? = null
+): SchemaScaffoldResult
+  let settings = options == null ? new SchemaScaffoldOptions() : options
+
+  if !scaffoldCodeIdentifierValid(settings.modelNamespace) || !scaffoldCodeIdentifierValid(settings.dataNamespace) || !scaffoldCodeIdentifierValid(settings.context) || !scaffoldCodeIdentifierValid(settings.unit) || settings.project == "" || settings.output == ""
+    return SchemaScaffoldResult.Failure(ProviderFailure.State("schema scaffolding requires valid namespace, context, unit and output options"))
+  end
+  if columns.Length > 1000
+    return SchemaScaffoldResult.Failure(ProviderFailure.State("schema scaffolding exceeds 1000 columns"))
+  end
+  var source = "use buffers\nnamespace " + settings.modelNamespace + "\n\n# Database scaffolding preserves query/write metadata. Foreign keys, indexes and\n# database expression definitions remain owned by the inspected database.\n"
+  var entities = ""
+  var index = 0
+
+  while index < columns.Length
+    let table = columns[index].table
+    let entity = scaffoldIdentifier(table, "Entity_")
+    let set = scaffoldIdentifier(table, "set_")
+    let start = index
+    var keys = 0
+
+    if !schemaTableValid(table)
+      return SchemaScaffoldResult.Failure(ProviderFailure.State("schema scaffolding cannot represent this physical table identifier: " + table))
+    end
+    var earlier = 0
+
+    while earlier < start
+      if schemaSameIdentifier(
+        columns[earlier].table,
+        table
+      ) || scaffoldIdentifier(
+        columns[earlier].table,
+        "Entity_"
+      ) == entity
+        return SchemaScaffoldResult.Failure(ProviderFailure.State("schema scaffolding has a relation identifier collision or noncontiguous relation"))
+      end
+      earlier = earlier + 1
+    end
+    while index < columns.Length && columns[index].table == table
+      let column = columns[index]
+
+      if !identifierValid(column.name) || !scaffoldTypeSupported(column.type) || column.keyPosition < 0 || column.view != columns[start].view || (column.generatedOnUpdate && !column.generatedOnAdd)
+        return SchemaScaffoldResult.Failure(ProviderFailure.State("schema scaffolding has unsupported column metadata: " + table + "." + column.name))
+      end
+      if column.keyPosition > 0
+        keys = keys + 1
+        if column.nullable || column.view
+          return SchemaScaffoldResult.Failure(ProviderFailure.State("schema scaffolding requires non-null table primary keys"))
+        end
+      end
+      var prior = start
+
+      while prior < index
+        if schemaSameIdentifier(
+          columns[prior].name,
+          column.name
+        ) || scaffoldIdentifier(
+          columns[prior].name,
+          "field_"
+        ) == scaffoldIdentifier(
+          column.name,
+          "field_"
+        )
+          return SchemaScaffoldResult.Failure(ProviderFailure.State("schema scaffolding has a field identifier collision"))
+        end
+        prior = prior + 1
+      end
+      index = index + 1
+    end
+    var keyJson = ""
+    var ordinal = 1
+    var generatedKey = false
+
+    while ordinal <= keys
+      var found = false
+      var position = start
+
+      while position < index
+        let column = columns[position]
+
+        if column.keyPosition == ordinal
+          if found || (column.generatedOnAdd && (keys != 1 || column.type != "Int" || column.generatedOnUpdate))
+            return SchemaScaffoldResult.Failure(ProviderFailure.State("schema scaffolding has an unsupported generated or duplicate primary key"))
+          end
+          found = true
+          generatedKey = generatedKey || column.generatedOnAdd
+          keyJson = keyJson + (ordinal == 1 ? "" : ",") + scaffoldJson(scaffoldIdentifier(column.name, "field_"))
+        end
+        position = position + 1
+      end
+      if !found
+        return SchemaScaffoldResult.Failure(ProviderFailure.State("schema scaffolding primary-key order is not contiguous"))
+      end
+      ordinal = ordinal + 1
+    end
+    let keyless = keys == 0
+
+    source = source + "\nclass " + entity + "\n"
+    var fields = ""
+    var position = start
+
+    while position < index
+      let column = columns[position]
+      let member = scaffoldIdentifier(column.name, "field_")
+      let defaultSql = column.defaultSql
+
+      if defaultSql != null
+        source = source + "  # Database expression: " + scaffoldJson(defaultSql) + "\n"
+      end
+      source = source + "  public " + member + ": " + column.type + (column.nullable ? "?" : "") + " = " + scaffoldInitialValue(column) + "\n"
+      fields = fields + (position == start ? "" : ",") + "{\"member\":" + scaffoldJson(member) + ",\"column\":" + scaffoldJson(column.name)
+      if !keyless && column.keyPosition == 0 && column.generatedOnAdd
+        fields = fields + ",\"valueGeneration\":" + scaffoldJson(column.generatedOnUpdate ? "onAddOrUpdate" : "onAdd")
+      end
+      fields = fields + "}"
+      position = position + 1
+    end
+    source = source + "end\n"
+    entities = entities + (entities == "" ? "" : ",") + "{\"type\":" + scaffoldJson(settings.modelNamespace + "." + entity) + ",\"set\":" + scaffoldJson(set)
+    entities = entities + (columns[start].view ? ",\"view\":" : ",\"table\":") + scaffoldJson(table)
+    entities = entities + (keyless ? ",\"keyless\":true" : ",\"key\":[" + keyJson + "]")
+    entities = entities + (generatedKey ? ",\"keyGeneration\":\"onAdd\"" : "") + ",\"columns\":[" + fields + "]}"
+  end
+  let mapping = "{\"version\":1,\"project\":" + scaffoldJson(settings.project) + ",\"unit\":" + scaffoldJson(settings.unit) + ",\"namespace\":" + scaffoldJson(settings.dataNamespace) + ",\"context\":" + scaffoldJson(settings.context) + ",\"output\":" + scaffoldJson(settings.output) + ",\"entities\":[" + entities + "]}"
+
+  return SchemaScaffoldResult.Source(source, mapping)
+end

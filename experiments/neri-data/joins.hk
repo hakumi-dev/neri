@@ -72,19 +72,31 @@ class Relation<T>
   private stages: JoinStage?
   private bound: Int?
   private stickyFailure: QueryFailure?
+  private resolverFactory: (fn(): AsyncRowResolver<T>?)?
+  private changeContext: ChangeContext?
+  private physicalSource: String?
+  private trackingActive: Bool
 
   def init(
     builder: fn(SqlDialect): RelationBuildResult<T>,
     provider: Provider?,
     stages: JoinStage? = null,
     bound: Int? = null,
-    failure: QueryFailure? = null
+    failure: QueryFailure? = null,
+    resolver: (fn(): AsyncRowResolver<T>?)? = null,
+    owner: ChangeContext? = null,
+    physicalSource: String? = null,
+    trackingActive: Bool = false
   ): Void
     this.builder = builder
     this.boundProvider = provider
     this.stages = stages
     this.bound = bound
     this.stickyFailure = failure
+    this.resolverFactory = resolver
+    this.changeContext = owner
+    this.physicalSource = physicalSource
+    this.trackingActive = trackingActive
   end
 
   internal def build(dialect: SqlDialect): RelationBuildResult<T>
@@ -141,8 +153,50 @@ class Relation<T>
     return this.boundProvider
   end
 
+  internal def resolutionFactory(): (fn(): AsyncRowResolver<T>?)?
+    return this.resolverFactory
+  end
+
+  internal def contextOwner(): ChangeContext?
+    return this.changeContext
+  end
+
+  internal readonly def physicalEntitySource(): String?
+    return this.physicalSource
+  end
+
+  internal readonly def tracksEntities(): Bool
+    return this.trackingActive
+  end
+
   public def asRelation(): Relation<T>
     return this
+  end
+
+  public def matchingDecimal(predicate: DecimalPredicate<T>): Relation<T>
+    return decimalFiltered(this, predicate)
+  end
+
+  public def orderByDecimal(expression: DecimalExpression<T>, descending: Bool = false): Relation<T>
+    return decimalOrdered(this, expression, descending)
+  end
+
+  ## Combines complete typed rows and removes duplicates.
+  public def unionWith(other: Relation<T>): Relation<T>
+    return relationSetOperation(this, other, "UNION")
+  end
+
+  ## Combines complete typed rows while retaining duplicates.
+  public def concat(other: Relation<T>): Relation<T>
+    return relationSetOperation(this, other, "UNION ALL")
+  end
+
+  public def intersect(other: Relation<T>): Relation<T>
+    return relationSetOperation(this, other, "INTERSECT")
+  end
+
+  public def except(other: Relation<T>): Relation<T>
+    return relationSetOperation(this, other, "EXCEPT")
   end
 
   public def matching(predicate: quote fn(T): Bool): Relation<T>
@@ -151,7 +205,11 @@ class Relation<T>
       this.boundProvider,
       new JoinStage(1, this.stages, predicate.tree()),
       this.bound,
-      this.stickyFailure
+      this.stickyFailure,
+      resolver: this.resolverFactory,
+      owner: this.changeContext,
+      physicalSource: this.physicalSource,
+      trackingActive: this.trackingActive
     )
   end
 
@@ -161,7 +219,11 @@ class Relation<T>
       this.boundProvider,
       new JoinStage(5, this.stages, selector.tree(), descending),
       this.bound,
-      this.stickyFailure
+      this.stickyFailure,
+      resolver: this.resolverFactory,
+      owner: this.changeContext,
+      physicalSource: this.physicalSource,
+      trackingActive: this.trackingActive
     )
   end
 
@@ -171,7 +233,11 @@ class Relation<T>
       this.boundProvider,
       new JoinStage(7, this.stages, selector.tree(), descending),
       this.bound,
-      this.stickyFailure
+      this.stickyFailure,
+      resolver: this.resolverFactory,
+      owner: this.changeContext,
+      physicalSource: this.physicalSource,
+      trackingActive: this.trackingActive
     )
   end
 
@@ -196,7 +262,11 @@ class Relation<T>
       this.boundProvider,
       new JoinStage(9, this.stages, count: count),
       this.bound,
-      this.stickyFailure
+      this.stickyFailure,
+      resolver: this.resolverFactory,
+      owner: this.changeContext,
+      physicalSource: this.physicalSource,
+      trackingActive: this.trackingActive
     )
   end
 
@@ -218,7 +288,11 @@ class Relation<T>
       this.boundProvider,
       new JoinStage(10, this.stages, count: count),
       joinTakeBound(this.bound, count),
-      this.stickyFailure
+      this.stickyFailure,
+      resolver: this.resolverFactory,
+      owner: this.changeContext,
+      physicalSource: this.physicalSource,
+      trackingActive: this.trackingActive
     )
   end
 
@@ -250,10 +324,59 @@ class Relation<T>
     if selected == null
       return QueryResult<T>.Failure(QueryFailure.UnsupportedCapability("relation requires a provider"))
     end
-    if !selected.supports(ProviderCapability.BoundedTypedReads())
+    match this.materialize(selected)
+      case QueryResult.Failure(error)
+        return QueryResult<T>.Failure(error)
+      case QueryResult.Rows(rows)
+        let factory = this.resolverFactory
+
+        if factory != null && provider == null
+          let resolver = factory()
+
+          if resolver != null
+            return resolver.resolveRows(rows)
+          end
+        end
+        return QueryResult<T>.Rows(rows)
+    end
+  end
+
+  private def materialize(selected: Provider): QueryResult<T>
+    if this.bound != null && !selected.supports(ProviderCapability.BoundedTypedReads())
       return QueryResult<T>.Failure(QueryFailure.UnsupportedCapability("bounded-typed-reads"))
     end
+    if this.bound == null
+      let buildPlan: fn(SqlDialect): CompileResult<T> = fn(dialect: SqlDialect): CompileResult<T> do
+        return this.streamPlan(dialect)
+      end
+
+      return materializeStream<T>(selected, buildPlan)
+    end
     return execute<T>(this.buildPlan(selected.dialect()), selected)
+  end
+
+  public def allAsync(options: StreamOptions? = null): result::Result<AsyncQuery<T>, QueryFailure>
+    let provider = this.boundProvider
+
+    if provider == null
+      return result::Result<AsyncQuery<T>, QueryFailure>.Error(QueryFailure.UnsupportedCapability("asynchronous relation requires a provider"))
+    end
+    match this.streamPlan(provider.dialect())
+      case CompileResult.Failure(error)
+        return result::Result<AsyncQuery<T>, QueryFailure>.Error(error)
+      case CompileResult.Plan(compiled)
+        let factory = this.resolverFactory
+        let resolver = factory == null ? null : factory()
+
+        match prepareAsyncQuery<T>(provider, compiled, options, resolver, this.bound)
+          case AsyncQueryPreparation.Failure(error)
+            return result::Result<AsyncQuery<T>, QueryFailure>.Error(error)
+          case AsyncQueryPreparation.Ready(driver, plan, tracker)
+            let owned = new AsyncQuery<T>(driver, plan, tracker)
+
+            return result::Result<AsyncQuery<T>, QueryFailure>.Ok(transfer owned)
+        end
+    end
   end
 
   public def stream(visit: fn(T): Bool, options: StreamOptions? = null): StreamResult
@@ -377,6 +500,173 @@ enum JoinResolvedResult<L, R>
   case Failure(error: QueryFailure)
 end
 
+def relationSetKind(kind: readonly ResultColumnKind): Int
+  match kind
+    case ResultColumnKind.Binary()
+      return 0
+    case ResultColumnKind.Bool()
+      return 1
+    case ResultColumnKind.Int()
+      return 2
+    case ResultColumnKind.Float()
+      return 3
+    case ResultColumnKind.Text()
+      return 4
+  end
+end
+
+def relationSetColumn(mapping: EntityMapping, index: Int): String?
+  if index < mapping.count()
+    let column = mapping.columnAt(index)
+
+    return column == null ? null : column.column()
+  end
+  let presence = mapping.presenceAt(index - mapping.count())
+
+  return presence == null ? null : presence.column()
+end
+
+def relationSetLayoutEqual(left: EntityMapping, right: EntityMapping): Bool
+  if left.entityType() != right.entityType() || left.count() != right.count() || left.presenceCount() != right.presenceCount()
+    return false
+  end
+  var index = 0
+
+  while index < left.count()
+    let first = left.columnAt(index)
+    let second = right.columnAt(index)
+
+    if first == null || second == null || first.typeName() != second.typeName() || !mappingPathEqual(
+      first.path(),
+      second.path()
+    )
+      return false
+    end
+    index = index + 1
+  end
+  index = 0
+  while index < left.presenceCount()
+    let first = left.presenceAt(index)
+    let second = right.presenceAt(index)
+
+    if first == null || second == null || !mappingPathEqual(first.path(), second.path())
+      return false
+    end
+    index = index + 1
+  end
+  return true
+end
+
+def relationSetPlan<T>(
+  left: RelationPlan<T>,
+  right: RelationPlan<T>,
+  operation: String,
+  dialect: SqlDialect
+): RelationBuildResult<T>
+  if !relationSetLayoutEqual(left.mapping, right.mapping)
+    return RelationBuildResult<T>.Failure(QueryFailure.UnsupportedCapability("set operations require matching typed row layouts"))
+  end
+  let size = left.mapping.count() + left.mapping.presenceCount()
+
+  if size == 0
+    return RelationBuildResult<T>.Failure(QueryFailure.UnsupportedCapability("set operations require mapped result columns"))
+  end
+  let values: ResultColumn[] = tasks::generate(size, 1) do |index|
+    return new ResultColumn("unused", ResultColumnKind.Int())
+  end
+  var leftSelection = ""
+  var rightSelection = ""
+  var index = 0
+
+  while index < size
+    let first = relationSetColumn(left.mapping, index)
+    let second = relationSetColumn(right.mapping, index)
+
+    if first == null || second == null
+      return RelationBuildResult<T>.Failure(QueryFailure.Provider(ProviderFailure.State("set operation layout is incomplete")))
+    end
+    let leftIndex = relationColumnIndex(left.columns, first)
+    let rightIndex = relationColumnIndex(right.columns, second)
+
+    if leftIndex < 0 || rightIndex < 0
+      return RelationBuildResult<T>.Failure(QueryFailure.MissingColumn(leftIndex < 0 ? first : second))
+    end
+    let leftColumn = left.columns.at(leftIndex)
+    let rightColumn = right.columns.at(rightIndex)
+
+    if relationSetKind(leftColumn.kind()) != relationSetKind(rightColumn.kind()) || leftColumn.nullable() != rightColumn.nullable()
+      return RelationBuildResult<T>.Failure(QueryFailure.UnsupportedCapability("set operations require matching scalar storage types"))
+    end
+    values[index] = new ResultColumn(first, shapeKind(leftColumn.kind()), leftColumn.nullable())
+    let separator = index == 0 ? "" : ", "
+
+    leftSelection = leftSelection + separator + quoted("__neri_set_left", first) + " AS \"" + first + "\""
+    rightSelection = rightSelection + separator + quoted("__neri_set_right", second) + " AS \"" + first + "\""
+    index = index + 1
+  end
+  let state = new CompileState()
+
+  joinParameterCopy(left.parameters, state)
+  let shifted = joinShiftSql(right.sql, state.count, dialect)
+
+  if shifted == null
+    return RelationBuildResult<T>.Failure(QueryFailure.Provider(ProviderFailure.State("set operation parameters cannot be rebased")))
+  end
+  joinParameterCopy(right.parameters, state)
+  let sql = "SELECT " + leftSelection + " FROM (" + left.sql + ") AS \"__neri_set_left\" " + operation + " SELECT " + rightSelection + " FROM (" + shifted + ") AS \"__neri_set_right\""
+
+  return RelationBuildResult<T>.Plan(new RelationPlan<T>(
+      sql,
+      new ParameterValues(state.head, state.count),
+      new ResultColumns(values),
+      left.decoder,
+      left.mapping,
+      left.checkedScalars || right.checkedScalars
+    ))
+end
+
+def relationSetOperation<T>(left: Relation<T>, right: Relation<T>, operation: String): Relation<T>
+  let build: fn(SqlDialect): RelationBuildResult<T> = fn(dialect: SqlDialect): RelationBuildResult<T> do
+    match left.build(dialect)
+      case RelationBuildResult.Failure(error)
+        return RelationBuildResult<T>.Failure(error)
+      case RelationBuildResult.Plan(first)
+        match right.build(dialect)
+          case RelationBuildResult.Failure(error)
+            return RelationBuildResult<T>.Failure(error)
+          case RelationBuildResult.Plan(second)
+            return relationSetPlan(first, second, operation, dialect)
+        end
+    end
+  end
+  let leftProvider = left.provider()
+  let rightProvider = right.provider()
+  let provider = leftProvider == null ? rightProvider : leftProvider
+  let leftOwner = left.contextOwner()
+  let rightOwner = right.contextOwner()
+  let owner = leftOwner == null ? rightOwner : leftOwner
+  let leftResolver = left.resolutionFactory()
+  let rightResolver = right.resolutionFactory()
+  let resolver = leftResolver == null ? rightResolver : leftResolver
+  var failure: QueryFailure? = null
+
+  if leftProvider != null && rightProvider != null && !reference::same(leftProvider, rightProvider)
+    failure = QueryFailure.UnsupportedCapability("set operations require the same provider")
+  end
+  if leftOwner != null && rightOwner != null && !reference::same(leftOwner, rightOwner)
+    failure = QueryFailure.UnsupportedCapability("set operations require the same context")
+  end
+  let leftSource = left.physicalEntitySource()
+  let rightSource = right.physicalEntitySource()
+
+  if (left.tracksEntities() || right.tracksEntities()) && leftSource != null && rightSource != null && leftSource != rightSource
+    failure = QueryFailure.UnsupportedCapability("tracking set operations require the same physical entity source")
+  end
+  return new Relation<T>(build, provider, failure: failure, resolver: resolver, owner: owner,
+    physicalSource: leftResolver == null ? rightSource : leftSource,
+    trackingActive: leftResolver == null ? right.tracksEntities() : left.tracksEntities())
+end
+
 def joinParameterCopy(source: readonly ParameterValues, target: CompileState): Void
   var current = source.first()
 
@@ -412,7 +702,84 @@ def joinShiftSql(sql: String, amount: Int, dialect: SqlDialect): String?
   let length = host::stringByteLength(sql)
 
   while index < length
-    if host::stringByteAt(sql, index) as Int == 36
+    let byte = host::stringByteAt(sql, index) as Int
+
+    if byte == 39 || byte == 34
+      let quote = byte
+      var escaped = false
+
+      if quote == 39 && index > 0
+        let prior = host::stringByteAt(sql, index - 1) as Int
+
+        escaped = prior == 69 || prior == 101
+      end
+      index = index + 1
+      while index < length
+        let current = host::stringByteAt(sql, index) as Int
+
+        if escaped && current == 92
+          index = index + 2
+        else if current == quote
+          index = index + 1
+          if index < length && host::stringByteAt(sql, index) as Int == quote
+            index = index + 1
+          else
+            break
+          end
+        else
+          index = index + 1
+        end
+      end
+    else if byte == 45 && index + 1 < length && host::stringByteAt(sql, index + 1) as Int == 45
+      index = index + 2
+      while index < length && host::stringByteAt(sql, index) as Int != 10 && host::stringByteAt(sql, index) as Int != 13
+        index = index + 1
+      end
+    else if byte == 47 && index + 1 < length && host::stringByteAt(sql, index + 1) as Int == 42
+      var nesting = 1
+
+      index = index + 2
+      while index + 1 < length && nesting > 0
+        let current = host::stringByteAt(sql, index) as Int
+        let following = host::stringByteAt(sql, index + 1) as Int
+
+        if current == 47 && following == 42
+          nesting = nesting + 1
+          index = index + 2
+        else if current == 42 && following == 47
+          nesting = nesting - 1
+          index = index + 2
+        else
+          index = index + 1
+        end
+      end
+    else if byte == 36
+      var delimiterEnd = index + 1
+
+      while delimiterEnd < length
+        let current = host::stringByteAt(sql, delimiterEnd) as Int
+        let letter = (current >= 65 && current <= 90) || (current >= 97 && current <= 122) || current == 95
+        let digit = current >= 48 && current <= 57
+
+        if !letter && !(digit && delimiterEnd > index + 1)
+          break
+        end
+        delimiterEnd = delimiterEnd + 1
+      end
+      if delimiterEnd < length && host::stringByteAt(sql, delimiterEnd) as Int == 36
+        let delimiter = host::stringSlice(sql, index, delimiterEnd - index + 1)
+        let delimiterLength = delimiterEnd - index + 1
+
+        index = delimiterEnd + 1
+        while index + delimiterLength <= length
+          if host::stringSlice(sql, index, delimiterLength) == delimiter
+            index = index + delimiterLength
+            break
+          end
+          index = index + 1
+        end
+        continue
+      end
       var stop = index + 1
 
       while stop < length
@@ -538,7 +905,8 @@ def joinOutputMapping(mapping: EntityMapping, columns: ResultColumns, source: St
       column.identity(),
       column.typeName(),
       prefix + (physical as String),
-      column.path()
+      column.path(),
+      column.boolToInt()
     )
     index = index + 1
   end
@@ -599,7 +967,8 @@ def joinRelationMapping(
       column.identity(),
       column.typeName(),
       column.column(),
-      mappingPathPrefix(column.path(), leftRoot.identity(), leftRoot.typeName())
+      mappingPathPrefix(column.path(), leftRoot.identity(), leftRoot.typeName()),
+      column.boolToInt()
     )
     index = index + 1
   end
@@ -615,7 +984,8 @@ def joinRelationMapping(
       column.identity(),
       column.typeName(),
       column.column(),
-      mappingPathPrefix(column.path(), rightRoot.identity(), rightRoot.typeName())
+      mappingPathPrefix(column.path(), rightRoot.identity(), rightRoot.typeName()),
+      column.boolToInt()
     )
     index = index + 1
   end

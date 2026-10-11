@@ -1,7 +1,8 @@
 use host
+use neri_data
 namespace neri_data_sqlite
 
-## One column of a main-database table, in declared column order.
+## One visible column of a main-database table or view, in declared order.
 class SQLiteSchemaColumn
   private storedTable: String
   private storedName: String
@@ -11,6 +12,9 @@ class SQLiteSchemaColumn
   private storedKeyPosition: Int
   private storedHidden: Int
   private storedCreateSql: String
+  private storedView: Bool
+  private storedRowidKey: Bool
+  private storedKeyRequired: Bool
 
   def init(
     table: String,
@@ -20,7 +24,10 @@ class SQLiteSchemaColumn
     required: Bool,
     keyPosition: Int,
     hidden: Int,
-    createSql: String
+    createSql: String,
+    view: Bool = false,
+    rowidKey: Bool = false,
+    keyRequired: Bool = false
   ): Void
     this.storedTable = table
     this.storedName = name
@@ -30,6 +37,9 @@ class SQLiteSchemaColumn
     this.storedKeyPosition = keyPosition
     this.storedHidden = hidden
     this.storedCreateSql = createSql
+    this.storedView = view
+    this.storedRowidKey = rowidKey
+    this.storedKeyRequired = keyRequired
   end
 
   public readonly def table(): String
@@ -64,6 +74,18 @@ class SQLiteSchemaColumn
 
   public readonly def createSql(): String
     return this.storedCreateSql
+  end
+
+  public readonly def view(): Bool
+    return this.storedView
+  end
+
+  public readonly def rowidKey(): Bool
+    return this.storedRowidKey
+  end
+
+  public readonly def keyRequired(): Bool
+    return this.storedKeyRequired
   end
 end
 
@@ -101,7 +123,8 @@ end
 
 ## A single statement provides a coherent schema view. No caller SQL is accepted.
 unsafe def sqliteInspectSchema(database: Void*): SQLiteSchemaResult
-  let sql = "SELECT s.name, p.name, p.type, p.dflt_value, p.\"notnull\", p.pk, p.hidden, s.sql FROM main.sqlite_schema AS s JOIN pragma_table_xinfo(s.name, 'main') AS p WHERE s.type = 'table' AND substr(lower(s.name), 1, 7) <> 'sqlite_' AND substr(lower(s.name), 1, 7) <> '__neri_' ORDER BY s.name COLLATE BINARY, p.cid"
+  let rowid = "(p.pk=1 AND upper(p.type)='INTEGER' AND NOT EXISTS(SELECT 1 FROM pragma_index_list(s.name,'main') AS pi WHERE pi.origin='pk'))"
+  let sql = "SELECT s.name,p.name,p.type,p.dflt_value,p.\"notnull\",p.pk,p.hidden,s.sql,s.type," + rowid + ", (p.pk>0 AND (" + rowid + " OR EXISTS(SELECT 1 FROM pragma_table_list AS tl WHERE tl.schema='main' AND tl.name=s.name AND (tl.wr=1 OR tl.strict=1)))) FROM main.sqlite_schema AS s JOIN pragma_table_xinfo(s.name,'main') AS p WHERE s.type IN ('table','view') AND substr(lower(s.name),1,7)<>'sqlite_' AND substr(lower(s.name),1,7)<>'__neri_' ORDER BY s.name COLLATE BINARY,p.cid"
   let length = host::stringByteLength(sql)
   let bytes = native::alloc<Byte>(length + 1)
   var index = 0
@@ -165,8 +188,9 @@ unsafe def sqliteReadSchema(database: Void*, statement: Void*): SQLiteSchemaResu
     let declaredType = sqliteSchemaText(statement, 2)
     let defaultSql = sqliteSchemaText(statement, 3)
     let createSql = sqliteSchemaText(statement, 7)
+    let relationType = sqliteSchemaText(statement, 8)
 
-    if table == null || name == null || declaredType == null || createSql == null
+    if table == null || name == null || declaredType == null || createSql == null || (relationType != "table" && relationType != "view")
       return SQLiteSchemaResult.Failure(ProviderFailure.State("SQLite schema contains invalid text metadata"))
     end
     if defaultSql == null && sqliteColumnType(statement, 3 as Int32) != (5 as Int32)
@@ -187,8 +211,10 @@ unsafe def sqliteReadSchema(database: Void*, statement: Void*): SQLiteSchemaResu
     let required = sqliteColumnInt(statement, 4 as Int32)
     let keyPosition = sqliteColumnInt(statement, 5 as Int32)
     let hidden = sqliteColumnInt(statement, 6 as Int32)
+    let rowidKey = sqliteColumnInt(statement, 9 as Int32)
+    let keyRequired = sqliteColumnInt(statement, 10 as Int32)
 
-    if (required != 0 && required != 1) || keyPosition < 0 || hidden < 0 || hidden > 3
+    if (required != 0 && required != 1) || keyPosition < 0 || hidden < 0 || hidden > 3 || (rowidKey != 0 && rowidKey != 1) || (keyRequired != 0 && keyRequired != 1)
       return SQLiteSchemaResult.Failure(ProviderFailure.State("SQLite schema contains unsupported column flags"))
     end
     snapshot.add(new SQLiteSchemaColumn(
@@ -199,7 +225,10 @@ unsafe def sqliteReadSchema(database: Void*, statement: Void*): SQLiteSchemaResu
         required == 1,
         keyPosition,
         hidden,
-        createSql
+        createSql,
+        relationType == "view",
+        rowidKey == 1,
+        keyRequired == 1
       ))
     status = sqliteStep(statement)
   end
@@ -207,4 +236,39 @@ unsafe def sqliteReadSchema(database: Void*, statement: Void*): SQLiteSchemaResu
     return SQLiteSchemaResult.Failure(sqliteFailure(database, "schema"))
   end
   return SQLiteSchemaResult.Snapshot(snapshot)
+end
+
+def sqliteScaffoldSchema(snapshot: readonly SQLiteSchemaSnapshot, options: SchemaScaffoldOptions?): SchemaScaffoldResult
+  let columns = arrays::generate<SchemaScaffoldColumn>(snapshot.count()) do |index|
+    let column = snapshot.at(index)
+
+    if column == null
+      return new SchemaScaffoldColumn("", "", "", true)
+    end
+    var type = ""
+
+    if schemaSameIdentifier(column.declaredType(), "INTEGER")
+      type = "Int"
+    else if schemaSameIdentifier(column.declaredType(), "REAL")
+      type = "Float"
+    else if schemaSameIdentifier(column.declaredType(), "TEXT")
+      type = "String"
+    else if schemaSameIdentifier(column.declaredType(), "BLOB")
+      type = "ByteBuffer"
+    end
+    let rowidKey = column.rowidKey()
+    let generated = column.hidden() == 2 || column.hidden() == 3
+
+    if column.hidden() == 1
+      type = ""
+    end
+    return new SchemaScaffoldColumn(
+      column.table(), column.name(), type,
+      !column.required() && !column.keyRequired(), column.keyPosition(),
+      generated || rowidKey || column.defaultSql() != null,
+      generated, column.view(), generated ? column.createSql() : column.defaultSql()
+    )
+  end
+
+  return neri_data::scaffoldSchema(columns, options)
 end

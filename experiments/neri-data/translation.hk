@@ -104,11 +104,19 @@ class MappingColumn
   private storedTypeName: String
   private storedColumn: String
   private storedPath: readonly MappingPath
+  private storedBoolToInt: Bool
 
-  def init(identity: String, typeName: String, column: String, path: readonly MappingPath? = null): Void
+  def init(
+    identity: String,
+    typeName: String,
+    column: String,
+    path: readonly MappingPath? = null,
+    boolToInt: Bool = false
+  ): Void
     this.storedIdentity = identity
     this.storedTypeName = typeName
     this.storedColumn = column
+    this.storedBoolToInt = boolToInt
 
     if path == null
       this.storedPath = new MappingPath(identity, typeName)
@@ -129,9 +137,26 @@ class MappingColumn
     return this.storedColumn
   end
 
+  public readonly def boolToInt(): Bool
+    return this.storedBoolToInt
+  end
+
+  public readonly def storageTypeName(): String
+    if this.storedBoolToInt
+      return translationOptional(this.storedTypeName) ? "Int?" : "Int"
+    end
+    return this.storedTypeName
+  end
+
   internal readonly def path(): readonly MappingPath
     return this.storedPath
   end
+end
+
+def mappingColumnSql(mapping: EntityMapping, column: readonly MappingColumn): String
+  let sql = quoted(mapping.table(), column.column())
+
+  return column.boolToInt() ? "(" + sql + " = 1)" : sql
 end
 
 class MappingColumnNode
@@ -179,6 +204,7 @@ class EntityMapping
   private columnCount: Int = 0
   private firstPresence: MappingPresenceNode?
   private storedPresenceCount: Int = 0
+  private storedReadOnly: Bool
 
   def init(
     entityType: String,
@@ -186,11 +212,13 @@ class EntityMapping
     columns: MappingColumn[],
     keyColumn: String? = null,
     presences: MappingPresence[]? = null,
-    primaryKeyColumns: String[]? = null
+    primaryKeyColumns: String[]? = null,
+    readOnly: Bool = false
   ): Void
     this.storedEntityType = entityType
     this.storedTable = table
     this.storedKeyColumn = keyColumn
+    this.storedReadOnly = readOnly
     if primaryKeyColumns != null
       this.storedKeyColumns = tasks::generate(primaryKeyColumns.Length, 1) do |index|
         return primaryKeyColumns[index]
@@ -239,6 +267,10 @@ class EntityMapping
     return this.storedTable
   end
 
+  public readonly def readOnly(): Bool
+    return this.storedReadOnly
+  end
+
   public readonly def keyColumn(): String?
     return this.storedKeyColumn
   end
@@ -260,6 +292,15 @@ class EntityMapping
 
   public readonly def count(): Int
     return this.columnCount
+  end
+
+  internal readonly def scalarColumn(): readonly MappingColumn?
+    if (!translationScalar(this.storedEntityType) && this.storedEntityType != "neri_data.Decimal" && this.storedEntityType != "Decimal") || this.columnCount != 1 || this.storedPresenceCount != 0
+      return null
+    end
+    let column = this.columnAt(0)
+
+    return column != null && column.typeName() == this.storedEntityType ? column : null
   end
 
   internal readonly def presenceCount(): Int
@@ -442,6 +483,9 @@ class EntityMapping
       if value.identity() == "" || !translationMappedScalar(value.typeName())
         return QueryFailure.Provider(ProviderFailure.State("entity mapping contains an invalid field identity or type"))
       end
+      if value.boolToInt() && semanticTranslationInner(value.typeName()) != "Bool"
+        return QueryFailure.Provider(ProviderFailure.State("Bool-to-Int conversion requires a Bool mapped field"))
+      end
       if !identifierValid(value.column())
         return QueryFailure.InvalidIdentifier(value.column())
       end
@@ -569,7 +613,19 @@ def translationValueType(value: readonly quotation::CaptureValue): String
 end
 
 def translationEqual(mapping: EntityMapping, column: readonly MappingColumn, parameter: Parameter): Expression
-  let equal = new Expression(ExpressionKind.Equal(), mapping.table(), column.column(), parameter)
+  var stored = parameter
+
+  if column.boolToInt()
+    match parameter
+      case Parameter.Bool(value)
+        stored = Parameter.Int(value ? 1 : 0)
+      case Parameter.Int(value)
+      case Parameter.Float(value)
+      case Parameter.Text(value)
+      case Parameter.Binary(value)
+    end
+  end
+  let equal = new Expression(ExpressionKind.Equal(), mapping.table(), column.column(), stored)
 
   if translationOptional(column.typeName())
     let present = new Expression(ExpressionKind.IsNotNull(), mapping.table(), column.column())
@@ -1252,7 +1308,7 @@ class QuotationTranslator
   ): Void
     this.mapping = mapping
     this.tree = tree
-    this.scalarColumn = scalarColumn
+    this.scalarColumn = scalarColumn == null ? mapping.scalarColumn() : scalarColumn
     this.rightMapping = rightMapping
     this.optionalRight = optionalRight
     this.guardedMembers = guardedMembers
@@ -1454,6 +1510,9 @@ class QuotationTranslator
     let secondColumn = right.column
 
     if firstColumn != null && secondColumn != null
+      if firstColumn.boolToInt() != secondColumn.boolToInt()
+        return translationFailure("mixed storage conversions require scalar comparison translation")
+      end
       if semanticTranslationInner(firstColumn.typeName()) != semanticTranslationInner(secondColumn.typeName()) || !translationScalar(firstColumn.typeName())
         return translationFailure("quotation comparison mapped member types do not match")
       end
@@ -1803,6 +1862,14 @@ def translateSelection(mapping: EntityMapping, tree: readonly quotation::Tree): 
       end
       return SelectionResult.Column(column)
     case quotation::NodeKind.Parameter()
+      let scalarRootColumn = mapping.scalarColumn()
+
+      if scalarRootColumn == null
+        return SelectionResult.Failure(QueryFailure.UnsupportedCapability("selection must be a direct entity member"))
+      end
+      if node.index() == 0 && scalarRootColumn.typeName() == node.typeName() && tree.resultType() == node.typeName()
+        return SelectionResult.Column(scalarRootColumn)
+      end
       return SelectionResult.Failure(QueryFailure.UnsupportedCapability("selection must be a direct entity member"))
     case quotation::NodeKind.Capture()
       return SelectionResult.Failure(QueryFailure.UnsupportedCapability("selection must be a direct entity member"))
@@ -1967,6 +2034,29 @@ def scalarSqlFunction(code: Int, typeName: String): String
   return "__neri_text_concat"
 end
 
+## PostgreSQL arithmetic uses explicitly typed operands and native range errors.
+## The dynamic invalid cast rejects nonfinite floats without a planner-folded
+## constant error in an unselected CASE branch.
+def postgresCheckedScalar(code: Int, typeName: String, first: String, second: String = ""): String
+  if typeName == "String"
+    return "(CAST(" + first + " AS text) || CAST(" + second + " AS text))"
+  end
+  let sqlType = typeName == "Int" ? "bigint" : "double precision"
+  let left = "CAST(" + first + " AS " + sqlType + ")"
+  var expression = "(-" + left + ")"
+
+  if code != 16
+    let right = "CAST(" + second + " AS " + sqlType + ")"
+    let operation = code == 18 ? "+" : (code == 19 ? "-" : (code == 20 ? "*" : "/"))
+
+    expression = "(" + left + " " + operation + " " + right + ")"
+  end
+  if typeName == "Int"
+    return expression
+  end
+  return "(CASE WHEN " + expression + " > '-Infinity'::double precision AND " + expression + " < 'Infinity'::double precision THEN " + expression + " ELSE CAST(CAST(" + expression + " AS text) || ' is not finite' AS double precision) END)"
+end
+
 def guardedPresenceColumn(
   left: EntityMapping,
   right: EntityMapping?,
@@ -2039,6 +2129,20 @@ def compileScalarNode(
   end
   let code = translationNodeCode(node.kind())
 
+  if code == 0
+    let source = guardedMemberMapping(mapping, rightMapping, node.index())
+
+    if source == null
+      return scalarSqlFailure("computed scalar root parameter is invalid")
+    end
+    let scalar = source.scalarColumn()
+
+    if scalar == null || scalar.typeName() != node.typeName()
+      return scalarSqlFailure("computed scalar root requires a matching scalar mapping")
+    end
+    return scalarSqlValue(mappingColumnSql(source, scalar))
+  end
+
   if code >= 1 && code <= 6 || code == 17
     if (code == 3 && node.typeName() != "Int") || (code == 17 && node.typeName() != "Float") || (code == 4 && node.typeName() != "Bool") || (code == 5 && node.typeName() != "String") || (code == 6 && node.typeName() != "Null")
       return scalarSqlFailure("computed literal type is invalid")
@@ -2056,7 +2160,7 @@ def compileScalarNode(
         let column = value.column
 
         if column != null
-          return scalarSqlValue(quoted(mapping.table(), column.column()))
+          return scalarSqlValue(mappingColumnSql(mapping, column))
         end
         if value.isNull
           if node.typeName() != "Null" && !translationOptional(node.typeName())
@@ -2273,11 +2377,6 @@ def compileScalarNode(
     end
   end
   if code == 16 || (code >= 18 && code <= 22)
-    match dialect
-      case SqlDialect.PostgreSql()
-        return scalarSqlFailure("checked scalar expressions are unavailable for PostgreSQL")
-      case SqlDialect.QuestionMark()
-    end
     let typeName = node.typeName()
 
     if code == 22
@@ -2299,6 +2398,11 @@ def compileScalarNode(
         let functionName = scalarSqlFunction(code, typeName)
 
         if code == 16
+          match dialect
+            case SqlDialect.PostgreSql()
+              return scalarSqlValue(postgresCheckedScalar(code, typeName, first.sql), true)
+            case SqlDialect.QuestionMark()
+          end
           return scalarSqlValue(functionName + "(" + first.sql + ")", true)
         end
         let secondNode = tree.nodeAt(node.second())
@@ -2320,6 +2424,11 @@ def compileScalarNode(
           case ScalarSqlResult.Failure(error)
             return ScalarSqlResult.Failure(error)
           case ScalarSqlResult.Value(second)
+            match dialect
+              case SqlDialect.PostgreSql()
+                return scalarSqlValue(postgresCheckedScalar(code, typeName, first.sql, second.sql), true)
+              case SqlDialect.QuestionMark()
+            end
             return scalarSqlValue(functionName + "(" + first.sql + ", " + second.sql + ")", true)
         end
     end

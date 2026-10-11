@@ -1,0 +1,714 @@
+use clock
+use result
+namespace neri_data
+
+def navigationArray<T>(rows: TypedRows<T>): T[]
+  let first = rows.first()
+
+  if first == null
+    return []
+  end
+  return arrays::generate<T>(rows.count()) do |index|
+    var current = first
+    var position = 0
+
+    while position < index && current.next != null
+      current = current.next
+      position = position + 1
+    end
+    return current.value
+  end
+end
+
+## A skip navigation backed by an explicitly mapped join entity.
+class ManyToManyNavigation<L, J, R>
+  private leftJoin: CollectionNavigation<L, J>
+  private rightJoin: CollectionNavigation<R, J>
+  private leftGetter: fn(L): R[]
+  private leftSetter: fn(L, R[]): Void
+  private rightGetter: fn(R): L[]
+  private rightSetter: fn(R, L[]): Void
+  private joinFactory: fn(L, R): J
+  private graphEnrollment: (fn(J): QueryFailure?)?
+
+  def init(
+    leftJoin: CollectionNavigation<L, J>,
+    rightJoin: CollectionNavigation<R, J>,
+    getLeft: fn(L): R[],
+    setLeft: fn(L, R[]): Void,
+    getRight: fn(R): L[],
+    setRight: fn(R, L[]): Void,
+    createJoin: fn(L, R): J,
+    enrollGraph: (fn(J): QueryFailure?)? = null
+  ): Void
+    this.leftJoin = leftJoin
+    this.rightJoin = rightJoin
+    this.leftGetter = getLeft
+    this.leftSetter = setLeft
+    this.rightGetter = getRight
+    this.rightSetter = setRight
+    this.joinFactory = createJoin
+    this.graphEnrollment = enrollGraph
+  end
+
+  public def load(
+    lefts: Query<L>,
+    joins: Query<J>,
+    rights: Query<R>,
+    rows: TypedRows<L>,
+    maximum: Int = 10000
+  ): QueryResult<L>
+    let firstStep = collectionStep(lefts, joins, this.leftJoin, maximum)
+    let secondStep = referenceStep(joins, rights, this.rightJoin)
+    let firstFailure = firstStep.validate()
+    let secondFailure = secondStep.validate()
+
+    if firstFailure != null
+      return QueryResult<L>.Failure(firstFailure)
+    end
+    if secondFailure != null
+      return QueryResult<L>.Failure(secondFailure)
+    end
+    let journal = new NavigationJournal()
+
+    this.checkpoint(lefts, joins, rights, new TypedRows<L>(), new TypedRows<J>(), journal)
+    let beforeLeft: fn(TypedRows<L>, TypedRows<J>): Void = fn(roots: TypedRows<L>, related: TypedRows<J>): Void do
+      this.checkpoint(lefts, joins, rights, roots, related, journal)
+    end
+    let beforeRight: fn(TypedRows<J>, TypedRows<R>): Void = fn(roots: TypedRows<J>, related: TypedRows<R>): Void do
+      var current = related.first()
+
+      while current != null
+        this.checkpointRight(current.value, journal)
+        current = current.next
+      end
+    end
+    let firstPlan = include(
+      lefts,
+      joins,
+      navigationJournalled(this.leftJoin, journal)
+    ).maxChildren(maximum).beforePublication(beforeLeft)
+
+    match firstPlan.load(rows)
+      case QueryResult.Failure(error)
+        journal.rollback()
+        return QueryResult<L>.Failure(error)
+      case QueryResult.Rows(loaded)
+        let joinRows = new TypedRows<J>()
+        var current = loaded.first()
+
+        while current != null
+          for join in this.leftJoin.collection(current.value)
+            navigationDistinct(joinRows, join)
+          end
+          current = current.next
+        end
+        let secondPlan = includeReference(
+          joins,
+          rights,
+          navigationJournalled(this.rightJoin, journal)
+        ).beforePublication(beforeRight)
+
+        match secondPlan.load(joinRows)
+          case QueryResult.Failure(error)
+            journal.rollback()
+            return QueryResult<L>.Failure(error)
+          case QueryResult.Rows(loadedJoins)
+            let rightRows = new TypedRows<R>()
+            var join = loadedJoins.first()
+
+            while join != null
+              let right = this.rightJoin.reference(join.value)
+
+              if right != null
+                navigationDistinct(rightRows, right)
+              end
+              join = join.next
+            end
+            this.publish(rows, rightRows, journal)
+        end
+    end
+    journal.discard()
+    return QueryResult<L>.Rows(rows)
+  end
+
+  public def allAsync(
+    lefts: Query<L>, joins: Query<J>, rights: Query<R>,
+    maximum: Int = 10000, options: StreamOptions? = null
+  ): result::Result<AsyncLoad<L>, QueryFailure>
+    let first = include(lefts, joins, this.leftJoin).maxChildren(maximum)
+    let second = includeReference(joins, rights, this.rightJoin)
+    let firstFailure = first.validateQueries(true)
+    let secondFailure = second.validateQueries()
+
+    if firstFailure != null
+      return result::Result<AsyncLoad<L>, QueryFailure>.Error(firstFailure)
+    end
+    if secondFailure != null
+      return result::Result<AsyncLoad<L>, QueryFailure>.Error(secondFailure)
+    end
+    let journal = new NavigationJournal()
+
+    this.checkpoint(lefts, joins, rights, new TypedRows<L>(), new TypedRows<J>(), journal)
+    let beforeLeft: fn(TypedRows<L>, TypedRows<J>): Void = fn(roots: TypedRows<L>, related: TypedRows<J>): Void do
+      this.checkpoint(lefts, joins, rights, roots, related, journal)
+    end
+    let beforeRight: fn(TypedRows<J>, TypedRows<R>): Void = fn(roots: TypedRows<J>, related: TypedRows<R>): Void do
+      var current = related.first()
+
+      while current != null
+        this.checkpointRight(current.value, journal)
+        current = current.next
+      end
+    end
+    let leftPlan = include(
+      lefts,
+      joins,
+      navigationJournalled(this.leftJoin, journal)
+    ).maxChildren(maximum).beforePublication(beforeLeft)
+    let rightPlan = includeReference(
+      joins,
+      rights,
+      navigationJournalled(this.rightJoin, journal)
+    ).beforePublication(beforeRight)
+
+    match prepareAsyncNavigation<L, J>(leftPlan, options)
+      case AsyncNavigationStart.Failure(error)
+        journal.rollback()
+        return result::Result<AsyncLoad<L>, QueryFailure>.Error(error)
+      case AsyncNavigationStart.Started(firstDriver)
+        let driver = new AsyncManyToManyDriver<L, J, R>(
+          this,
+          this.leftJoin,
+          this.rightJoin,
+          rightPlan,
+          firstDriver,
+          journal,
+          options
+        )
+        let owned = new AsyncLoad<L>(driver)
+
+        return result::Result<AsyncLoad<L>, QueryFailure>.Ok(transfer owned)
+    end
+  end
+
+  public def all(
+    lefts: Query<L>,
+    joins: Query<J>,
+    rights: Query<R>,
+    maximum: Int = 10000
+  ): QueryResult<L>
+    let firstFailure = collectionStep(lefts, joins, this.leftJoin, maximum).validate()
+    let secondFailure = referenceStep(joins, rights, this.rightJoin).validate()
+
+    if firstFailure != null
+      return QueryResult<L>.Failure(firstFailure)
+    end
+    if secondFailure != null
+      return QueryResult<L>.Failure(secondFailure)
+    end
+    let journal = new NavigationJournal()
+
+    this.checkpoint(lefts, joins, rights, new TypedRows<L>(), new TypedRows<J>(), journal)
+    match lefts.all()
+      case QueryResult.Failure(error)
+        journal.rollback()
+        return QueryResult<L>.Failure(error)
+      case QueryResult.Rows(rows)
+        let result = this.load(lefts, joins, rights, rows, maximum)
+
+        match result
+          case QueryResult.Failure(error)
+            journal.rollback()
+          case QueryResult.Rows(loaded)
+            journal.discard()
+        end
+        return result
+    end
+  end
+
+  private def checkpointLeft(entity: L, journal: NavigationJournal): Void
+    let joins = this.leftJoin.collection(entity)
+    let skip = this.leftGetter(entity)
+    let state = this.leftJoin.collectionState(entity)
+    let undo: fn(): Void = fn(): Void do
+      this.leftJoin.setCollection(entity, joins)
+      this.leftSetter(entity, skip)
+      this.leftJoin.markCollection(entity, state)
+    end
+
+    journal.record(undo)
+  end
+
+  private def checkpointJoin(entity: J, journal: NavigationJournal): Void
+    let left = this.leftJoin.reference(entity)
+    let right = this.rightJoin.reference(entity)
+    let leftState = this.leftJoin.referenceState(entity)
+    let rightState = this.rightJoin.referenceState(entity)
+    let undo: fn(): Void = fn(): Void do
+      this.leftJoin.setReference(entity, left)
+      this.rightJoin.setReference(entity, right)
+      this.leftJoin.markReference(entity, leftState)
+      this.rightJoin.markReference(entity, rightState)
+    end
+
+    journal.record(undo)
+  end
+
+  private def checkpointRight(entity: R, journal: NavigationJournal): Void
+    let joins = this.rightJoin.collection(entity)
+    let skip = this.rightGetter(entity)
+    let state = this.rightJoin.collectionState(entity)
+    let undo: fn(): Void = fn(): Void do
+      this.rightJoin.setCollection(entity, joins)
+      this.rightSetter(entity, skip)
+      this.rightJoin.markCollection(entity, state)
+    end
+
+    journal.record(undo)
+  end
+
+  private def checkpoint(
+    lefts: Query<L>, joins: Query<J>, rights: Query<R>,
+    rows: TypedRows<L>, incoming: TypedRows<J>, journal: NavigationJournal
+  ): Void
+    let leftTracker = lefts.rowTracker()
+    let joinTracker = joins.rowTracker()
+    let rightTracker = rights.rowTracker()
+    let visitLeft: fn(L): Bool = fn(value: L): Bool do
+      this.checkpointLeft(value, journal)
+      return true
+    end
+    let visitJoin: fn(J): Bool = fn(value: J): Bool do
+      this.checkpointJoin(value, journal)
+      return true
+    end
+    let visitRight: fn(R): Bool = fn(value: R): Bool do
+      this.checkpointRight(value, journal)
+      return true
+    end
+
+    if leftTracker != null
+      leftTracker.visitTracked(visitLeft)
+    end
+    if joinTracker != null
+      joinTracker.visitTracked(visitJoin)
+    end
+    if rightTracker != null
+      rightTracker.visitTracked(visitRight)
+    end
+    var root = rows.first()
+
+    while root != null
+      this.checkpointLeft(root.value, journal)
+      root = root.next
+    end
+    var join = incoming.first()
+
+    while join != null
+      this.checkpointJoin(join.value, journal)
+      join = join.next
+    end
+  end
+
+  internal def publish(rows: TypedRows<L>, rights: TypedRows<R>, journal: NavigationJournal): Void
+    let affectedRights = new TypedRows<R>()
+    var supplied = rights.first()
+
+    while supplied != null
+      navigationDistinct(affectedRights, supplied.value)
+      supplied = supplied.next
+    end
+    var leftNode = rows.first()
+
+    while leftNode != null
+      let left = leftNode.value
+      let selected = new TypedRows<R>()
+
+      for previous in this.leftGetter(left)
+        navigationDistinct(affectedRights, previous)
+      end
+
+      for join in this.leftJoin.collection(left)
+        let right = this.rightJoin.reference(join)
+
+        if right != null
+          navigationDistinct(selected, right)
+        end
+      end
+      let previous = this.leftGetter(left)
+      let undo: fn(): Void = fn(): Void do
+        this.leftSetter(left, previous)
+      end
+
+      journal.record(undo)
+      this.leftSetter(left, navigationArray(selected))
+      leftNode = leftNode.next
+    end
+    var rightNode = affectedRights.first()
+
+    while rightNode != null
+      let right = rightNode.value
+      let selected = new TypedRows<L>()
+
+      for existing in this.rightGetter(right)
+        var replaced = false
+        var current = rows.first()
+
+        while current != null
+          if reference::same(current.value, existing)
+            replaced = true
+          end
+          current = current.next
+        end
+        if !replaced
+          navigationDistinct(selected, existing)
+        end
+      end
+      var current = rows.first()
+
+      while current != null
+        for candidate in this.leftGetter(current.value)
+          if reference::same(candidate, right)
+            navigationDistinct(selected, current.value)
+          end
+        end
+        current = current.next
+      end
+      let previous = this.rightGetter(right)
+      let undo: fn(): Void = fn(): Void do
+        this.rightSetter(right, previous)
+      end
+
+      journal.record(undo)
+      this.rightSetter(right, navigationArray(selected))
+      rightNode = rightNode.next
+    end
+  end
+
+  ## Enrollment uses the join mapping's registered write links for generated keys.
+  public def link(joins: Query<J>, left: L, right: R): QueryFailure?
+    let invalid = joins.queryFailure()
+
+    if invalid != null
+      return invalid
+    end
+    if !joins.isUnfilteredRoot() || joins.rowTracker() == null
+      return QueryFailure.UnsupportedCapability("many-to-many links require a tracked join query root")
+    end
+    let owner = joins.changeOwner()
+
+    if owner == null
+      return QueryFailure.UnsupportedCapability("many-to-many links require a tracked join query")
+    end
+    let blocked = owner.operationFailure()
+
+    if blocked != null
+      return blocked
+    end
+    let join = this.joinFactory(left, right)
+
+    this.leftJoin.setReference(join, left)
+    this.rightJoin.setReference(join, right)
+    let enrollment = this.graphEnrollment
+    let error = enrollment == null ? joins.add(join) : enrollment(join)
+
+    if error != null
+      return error
+    end
+    let joinLefts = new TypedRows<J>()
+    let joinRights = new TypedRows<J>()
+    let leftRights = new TypedRows<R>()
+    let rightLefts = new TypedRows<L>()
+
+    for item in this.leftJoin.collection(left)
+      navigationDistinct(joinLefts, item)
+    end
+    for item in this.rightJoin.collection(right)
+      navigationDistinct(joinRights, item)
+    end
+    for item in this.leftGetter(left)
+      navigationDistinct(leftRights, item)
+    end
+    for item in this.rightGetter(right)
+      navigationDistinct(rightLefts, item)
+    end
+    navigationDistinct(joinLefts, join)
+    navigationDistinct(joinRights, join)
+    navigationDistinct(leftRights, right)
+    navigationDistinct(rightLefts, left)
+    this.leftJoin.setCollection(left, navigationArray(joinLefts))
+    this.rightJoin.setCollection(right, navigationArray(joinRights))
+    this.leftSetter(left, navigationArray(leftRights))
+    this.rightSetter(right, navigationArray(rightLefts))
+    return null
+  end
+
+  ## Unlink requires a complete join collection so unseen rows cannot survive silently.
+  public def unlink(joins: Query<J>, left: L, right: R): QueryFailure?
+    let invalid = joins.queryFailure()
+
+    if invalid != null
+      return invalid
+    end
+    let tracker = joins.rowTracker()
+
+    if !joins.isUnfilteredRoot() || tracker == null
+      return QueryFailure.UnsupportedCapability("many-to-many unlink requires a tracked join query root")
+    end
+    var complete = false
+
+    match this.leftJoin.collectionState(left)
+      case NavigationLoadState.Loaded()
+        complete = true
+      case NavigationLoadState.Unknown()
+      case NavigationLoadState.Loading()
+      case NavigationLoadState.Partial()
+    end
+    if !complete
+      return QueryFailure.UnsupportedCapability("many-to-many unlink requires the complete loaded join collection")
+    end
+    let selected = new TypedRows<J>()
+    let retainedLeft = new TypedRows<J>()
+    let retainedRight = new TypedRows<J>()
+
+    for join in this.leftJoin.collection(left)
+      let target = this.rightJoin.reference(join)
+
+      if target != null && reference::same(target, right)
+        let find: fn(J): Bool = fn(entity: J): Bool do
+          return !reference::same(entity, join)
+        end
+
+        if tracker.visitTracked(find)
+          return QueryFailure.Provider(ProviderFailure.State("many-to-many join is not the tracked instance"))
+        end
+        let state = joins.stateOf(join)
+
+        if state == null
+          return QueryFailure.Provider(ProviderFailure.State("many-to-many join is not tracked"))
+        end
+        match state
+          case TrackingState.Detached()
+            return QueryFailure.Provider(ProviderFailure.State("many-to-many join is detached"))
+          case TrackingState.Added()
+          case TrackingState.Unchanged()
+          case TrackingState.Modified()
+          case TrackingState.Deleted()
+            return QueryFailure.Provider(ProviderFailure.State("many-to-many join is already deleted"))
+        end
+        selected.add(join)
+      else
+        retainedLeft.add(join)
+      end
+    end
+    for join in this.rightJoin.collection(right)
+      var removed = false
+      var current = selected.first()
+
+      while current != null
+        removed = removed || reference::same(current.value, join)
+        current = current.next
+      end
+      if !removed
+        retainedRight.add(join)
+      end
+    end
+    var current = selected.first()
+
+    while current != null
+      let error = joins.remove(current.value)
+
+      if error != null
+        return error
+      end
+      current = current.next
+    end
+    let leftRights = new TypedRows<R>()
+    let rightLefts = new TypedRows<L>()
+
+    for existing in this.leftGetter(left)
+      if !reference::same(existing, right)
+        leftRights.add(existing)
+      end
+    end
+    for existing in this.rightGetter(right)
+      if !reference::same(existing, left)
+        rightLefts.add(existing)
+      end
+    end
+    this.leftJoin.setCollection(left, navigationArray(retainedLeft))
+    this.rightJoin.setCollection(right, navigationArray(retainedRight))
+    this.leftSetter(left, navigationArray(leftRights))
+    this.rightSetter(right, navigationArray(rightLefts))
+    return null
+  end
+
+end
+
+
+class AsyncManyToManyDriver<L, J, R>: AsyncLoadDriver<L>
+  private relation: ManyToManyNavigation<L, J, R>
+  private leftJoin: CollectionNavigation<L, J>
+  private rightJoin: CollectionNavigation<R, J>
+  private secondPlan: ReferencedQuery<R, J>
+  private first: AsyncNavigationDriver<L, J>
+  private second: AsyncNavigationDriver<J, R>?
+  private journal: NavigationJournal
+  private roots: TypedRows<L>?
+  private options: StreamOptions?
+  private deadline: Int?
+  private terminal: QueryResult<L>?
+  private closed: Bool = false
+
+  def init(
+    relation: ManyToManyNavigation<L, J, R>,
+    leftJoin: CollectionNavigation<L, J>, rightJoin: CollectionNavigation<R, J>,
+    secondPlan: ReferencedQuery<R, J>, first: AsyncNavigationDriver<L, J>,
+    journal: NavigationJournal, options: StreamOptions?
+  ): Void
+    this.relation = relation
+    this.leftJoin = leftJoin
+    this.rightJoin = rightJoin
+    this.secondPlan = secondPlan
+    this.first = first
+    this.journal = journal
+    this.options = options
+    let timeout = options == null ? null : options.timeoutMilliseconds()
+
+    if timeout != null
+      let now = clock::milliseconds()
+
+      if timeout < 1 || timeout > 86400000 || now == null || now > 9223372036854775807 - timeout
+        this.cancel()
+        this.terminal = QueryResult<L>.Failure(QueryFailure.Provider(ProviderFailure.State("many-to-many async deadline is invalid or unavailable")))
+      else
+        this.deadline = now + timeout
+      end
+    end
+  end
+
+  private def fail(error: QueryFailure): AsyncQueryPoll<L>
+    let cleanup = this.close()
+    let failure = cleanup == null ? error : QueryFailure.Cleanup(new QueryCleanupFailure(error, cleanup))
+
+    let result = QueryResult<L>.Failure(failure)
+
+    this.terminal = result
+    return AsyncQueryPoll<L>.Completed(result)
+  end
+
+  public override def poll(): AsyncQueryPoll<L>
+    let terminal = this.terminal
+
+    if terminal != null
+      return AsyncQueryPoll<L>.Completed(terminal)
+    end
+    if this.closed
+      return this.fail(QueryFailure.Provider(ProviderFailure.State("many-to-many async load is closed")))
+    end
+    let options = this.options
+    let token = options == null ? null : options.token()
+    let deadline = this.deadline
+    var remaining: Int? = null
+
+    if token != null && token.cancelled()
+      return this.fail(QueryFailure.Provider(ProviderFailure.State("many-to-many async load cancelled")))
+    end
+    if deadline != null
+      let now = clock::milliseconds()
+
+      if now == null || now >= deadline
+        return this.fail(QueryFailure.Provider(ProviderFailure.State("many-to-many async deadline elapsed")))
+      end
+      remaining = deadline - now
+    end
+    let second = this.second
+
+    if second == null
+      match this.first.poll()
+        case AsyncQueryPoll.Pending(socket, interest)
+          return AsyncQueryPoll<L>.Pending(socket, interest)
+        case AsyncQueryPoll.Completed(result)
+          match result
+            case QueryResult.Failure(error)
+              return this.fail(error)
+            case QueryResult.Rows(rows)
+              this.roots = rows
+              let joins = new TypedRows<J>()
+              var current = rows.first()
+
+              while current != null
+                for join in this.leftJoin.collection(current.value)
+                  navigationDistinct(joins, join)
+                end
+                current = current.next
+              end
+              let nextOptions = options == null ? null : new StreamOptions(token, remaining)
+
+              this.second = new AsyncNavigationDriver<J, R>(this.secondPlan, nextOptions, rows: joins)
+              return AsyncQueryPoll<L>.Pending(-1, AsyncInterest.Read())
+          end
+      end
+    end
+    match second.poll()
+      case AsyncQueryPoll.Pending(socket, interest)
+        return AsyncQueryPoll<L>.Pending(socket, interest)
+      case AsyncQueryPoll.Completed(result)
+        match result
+          case QueryResult.Failure(error)
+            return this.fail(error)
+          case QueryResult.Rows(joins)
+            let roots = this.roots
+
+            if roots == null
+              return this.fail(QueryFailure.Provider(ProviderFailure.State("many-to-many async roots are unavailable")))
+            end
+            let rights = new TypedRows<R>()
+            var current = joins.first()
+
+            while current != null
+              let right = this.rightJoin.reference(current.value)
+
+              if right != null
+                navigationDistinct(rights, right)
+              end
+              current = current.next
+            end
+            this.relation.publish(roots, rights, this.journal)
+            this.journal.discard()
+            this.terminal = QueryResult<L>.Rows(roots)
+            return AsyncQueryPoll<L>.Completed(QueryResult<L>.Rows(roots))
+        end
+    end
+  end
+
+  public override def cancel(): Void
+    if this.terminal != null
+      return
+    end
+    let error = QueryFailure.Provider(ProviderFailure.State("many-to-many async load cancelled"))
+    let cleanup = this.close()
+    let failure = cleanup == null ? error : QueryFailure.Cleanup(new QueryCleanupFailure(error, cleanup))
+
+    this.terminal = QueryResult<L>.Failure(failure)
+  end
+
+  public override def close(): ProviderFailure?
+    if this.closed
+      return null
+    end
+    this.closed = true
+    let firstError = this.first.close()
+    let second = this.second
+    let secondError = second == null ? null : second.close()
+
+    if this.terminal == null
+      this.journal.rollback()
+    end
+    if firstError != null && secondError != null
+      return ProviderFailure.Cleanup(new ProviderCleanupFailure(firstError, secondError))
+    end
+    return firstError == null ? secondError : firstError
+  end
+end

@@ -110,6 +110,36 @@ def dataEmissionPublicNames(mapping: DataMapping, emission: DataEmission): Bool
     )
       return false
     end
+    var derived = entity.firstDerived
+
+    while derived != null
+      let child = derived.entity
+
+      if !dataEmissionAddName(
+        emission,
+        declarations,
+        dataEntityDecoderName(child),
+        "hierarchy decoder"
+      ) || !dataEmissionAddName(
+        emission,
+        declarations,
+        dataEntityMappingName(child),
+        "hierarchy mapping"
+      ) || !dataEmissionAddName(
+        emission,
+        declarations,
+        "upcast_" + child.generatedName,
+        "hierarchy cast"
+      ) || !dataEmissionAddName(
+        emission,
+        declarations,
+        "downcast_" + child.generatedName,
+        "hierarchy cast"
+      )
+        return false
+      end
+      derived = derived.nextDerived
+    end
     entity = entity.nextEntity
   end
   let contextMembers = new StringBuffer()
@@ -132,6 +162,8 @@ def dataEmissionPublicNames(mapping: DataMapping, emission: DataEmission): Bool
   end
   for name in [
     "clear",
+    "resetForPool",
+    "addSaveInterceptor",
     "beginTransaction",
     "commitTransaction",
     "rollbackTransaction",
@@ -148,6 +180,14 @@ def dataEmissionPublicNames(mapping: DataMapping, emission: DataEmission): Bool
   end
   entity = mapping.firstEntity
   while entity != null
+    var derived = entity.firstDerived
+
+    while derived != null
+      if !dataEmissionAddName(emission, contextMembers, "ofType_" + derived.entity.generatedName, "hierarchy query")
+        return false
+      end
+      derived = derived.nextDerived
+    end
     if !dataEmissionAddName(
       emission,
       contextMembers,
@@ -279,6 +319,24 @@ def dataEmissionPublicNames(mapping: DataMapping, emission: DataEmission): Bool
     relation = relation.nextRelation
   end
   let graphMembers = new StringBuffer()
+  var many = mapping.firstMany
+
+  while many != null
+    for prefix in ["skip_get_left_", "skip_get_right_", "skip_set_left_", "skip_set_right_", "skip_create_"]
+      if !dataEmissionAddName(emission, declarations, prefix + many.name, "skip navigation callback")
+        return false
+      end
+    end
+    for prefix in ["skip_", "include_", "link_", "unlink_"]
+      if !dataEmissionAddName(emission, contextMembers, prefix + many.name, "skip navigation member")
+        return false
+      end
+    end
+    if !dataEmissionAddName(emission, contextMembers, "include_" + many.name + "Async", "skip navigation member")
+      return false
+    end
+    many = many.nextMany
+  end
 
   if !dataEmissionAddName(
     emission,
@@ -365,9 +423,17 @@ def dataInitialValue(field: DataField): String
 end
 
 def dataResultColumn(field: DataField): String
-  let kind = dataScalarColumn(field.domain)
+  let kind = dataStorageColumn(field)
 
-  return "new neri_data::ResultColumn(" + lspQuote(field.columnName) + ", neri_data::ResultColumnKind." + kind + "(), " + (field.optional ? "true" : "false") + ")"
+  return "new neri_data::ResultColumn(" + lspQuote(field.columnName) + ", neri_data::ResultColumnKind." + kind + "(), " + (field.optional || field.hierarchyType != "" ? "true" : "false") + ")"
+end
+
+def dataStorageColumn(field: DataField): String
+  return field.boolToInt ? "Int" : dataScalarColumn(field.domain)
+end
+
+def dataDecoderKind(field: DataField): String
+  return field.boolToInt ? "BoolToInt" : dataScalarName(field.domain)
 end
 
 def dataResultColumns(entity: DataEntity): String
@@ -379,6 +445,9 @@ def dataResultColumns(entity: DataEntity): String
     result = result + separator + dataResultColumn(field)
     separator = ", "
     field = field.nextField
+  end
+  if entity.discriminatorColumn != ""
+    result = result + separator + "new neri_data::ResultColumn(" + lspQuote(entity.discriminatorColumn) + ", neri_data::ResultColumnKind.Text())"
   end
   return result + "])"
 end
@@ -417,12 +486,19 @@ def dataPrivateLocal(entity: DataEntity, requested: String): String
 end
 
 def dataFieldIdentity(field: DataField): String
+  if field.schemaIdentity != ""
+    return field.schemaIdentity
+  end
   let symbol = field.symbol
 
   if symbol != null
     return symbol.owner + "." + symbol.name
   end
   return ""
+end
+
+def dataFieldLocal(field: DataField): String
+  return "value_" + field.columnName
 end
 
 def dataRelationName(
@@ -540,6 +616,15 @@ def dataRelationNavigationName(
   return "nav_" + prefix + "_" + dataRelationName(relation, principal, dependent, foreignKey)
 end
 
+def dataOwnField(first: DataField?): DataField?
+  var field = first
+
+  while field != null && field.hierarchyType != ""
+    field = field.nextField
+  end
+  return field
+end
+
 def dataEmitDecoder(output: DataArtifact, entity: DataEntity): Void
   var field = entity.firstField
 
@@ -547,37 +632,59 @@ def dataEmitDecoder(output: DataArtifact, entity: DataEntity): Void
   output.write("def ")
   output.write(dataEntityDecoderName(entity), entity.origin)
   output.write("(row: neri_data::RawRow): neri_data::DecodeResult<" + semanticNamespaceDisplay(entity.typeName) + ">\n")
-  field = entity.firstField
+  if entity.firstDerived != null
+    output.write("  var discriminator = \"\"\n\n  match neri_data::decodeString(row, " + lspQuote(entity.discriminatorColumn) + ")\n    case neri_data::DecodeResult.Value(value)\n      discriminator = value\n    case neri_data::DecodeResult.Failure(error)\n      return neri_data::DecodeResult<" + semanticNamespaceDisplay(entity.typeName) + ">.Failure(error)\n  end\n")
+    var derived = entity.firstDerived
+
+    while derived != null
+      output.write("  if discriminator == " + lspQuote(derived.discriminator) + "\n    match " + dataEntityDecoderName(derived.entity) + "(row)\n      case neri_data::DecodeResult.Value(value)\n        return neri_data::DecodeResult<" + semanticNamespaceDisplay(entity.typeName) + ">.Value(value)\n      case neri_data::DecodeResult.Failure(error)\n        return neri_data::DecodeResult<" + semanticNamespaceDisplay(entity.typeName) + ">.Failure(error)\n    end\n  end\n")
+      derived = derived.nextDerived
+    end
+    output.write("  if discriminator != " + lspQuote(entity.discriminatorValue) + "\n    return neri_data::DecodeResult<" + semanticNamespaceDisplay(entity.typeName) + ">.Failure(neri_data::QueryFailure.TypeMismatch(" + lspQuote(entity.discriminatorColumn) + ", \"mapped hierarchy discriminator\", discriminator))\n  end\n")
+    let symbol = entity.symbol
+
+    if symbol != null && symbol.isAbstract
+      output.write("  return neri_data::DecodeResult<" + semanticNamespaceDisplay(entity.typeName) + ">.Failure(neri_data::QueryFailure.TypeMismatch(" + lspQuote(entity.discriminatorColumn) + ", \"concrete hierarchy discriminator\", discriminator))\nend\n\n")
+      return
+    end
+  end
+  field = dataOwnField(entity.firstField)
 
   while field != null
-    let local = "value_" + field.memberName
+    let local = dataFieldLocal(field)
 
     output.write("  var " + local + ": " + semanticNamespaceDisplay(field.typeName) + " = " + dataInitialValue(field) + "\n")
-    output.write("\n  match neri_data::decode" + (field.optional ? "Nullable" : "") + dataScalarName(field.domain) + "(row, ")
+    output.write("\n  match neri_data::decode" + (field.optional ? "Nullable" : "") + dataDecoderKind(field) + "(row, ")
     output.write(lspQuote(field.columnName), field.origin)
     output.write(")\n    case neri_data::DecodeResult.Value(value)\n      " + local + " = value\n    case neri_data::DecodeResult.Failure(error)\n      return neri_data::DecodeResult<" + semanticNamespaceDisplay(entity.typeName) + ">.Failure(error)\n  end\n")
-    field = field.nextField
+    field = dataOwnField(field.nextField)
   end
   let decodedEntity = dataPrivateLocal(entity, "decodedEntity")
 
   output.write("  let " + decodedEntity + " = new " + semanticNamespaceDisplay(entity.typeName) + "(")
   if !entity.initializeWithFields
-    field = entity.firstField
+    field = dataOwnField(entity.firstField)
     var first = true
 
     while field != null
-      output.write((first ? "" : ", ") + field.memberName + ": value_" + field.memberName)
+      output.write((first ? "" : ", ") + field.memberName + ": " + dataFieldLocal(field))
       first = false
-      field = field.nextField
+      field = dataOwnField(field.nextField)
     end
   end
   output.write(")\n")
   if entity.initializeWithFields
-    field = entity.firstField
+    var complex = entity.firstComplex
+
+    while complex != null
+      output.write("  " + decodedEntity + "." + complex.memberName + " = new " + semanticNamespaceDisplay(complex.typeName) + "()\n")
+      complex = complex.nextComplex
+    end
+    field = dataOwnField(entity.firstField)
 
     while field != null
-      output.write("  " + decodedEntity + "." + field.memberName + " = value_" + field.memberName + "\n")
-      field = field.nextField
+      output.write("  " + decodedEntity + "." + field.memberName + " = " + dataFieldLocal(field) + "\n")
+      field = dataOwnField(field.nextField)
     end
   end
   output.write("\n  return neri_data::DecodeResult<" + semanticNamespaceDisplay(entity.typeName) + ">.Value(" + decodedEntity + ")\nend\n\n")
@@ -594,17 +701,36 @@ def dataEmitMapping(output: DataArtifact, entity: DataEntity): Void
   while field != null
     output.write(separator + "new neri_data::MappingColumn(")
     output.write(lspQuote(dataFieldIdentity(field)), field.origin)
-    output.write(", " + lspQuote(field.typeName) + ", " + lspQuote(field.columnName) + ")")
+    output.write(", " + lspQuote(field.typeName) + ", " + lspQuote(field.columnName))
+    if field.pathCode != ""
+      output.write(", " + field.pathCode)
+    end
+    if field.boolToInt
+      output.write(", boolToInt: true")
+    end
+    output.write(")")
     separator = ", "
     field = field.nextField
+  end
+  if entity.discriminatorColumn != ""
+    output.write(separator + "new neri_data::MappingColumn(" + lspQuote(entity.typeName + ".__discriminator") + ", \"String\", " + lspQuote(entity.discriminatorColumn) + ")")
   end
   let key = entity.field(entity.keyMember)
 
   if key != null
     output.write("], " + lspQuote(key.columnName) + (entity.keyMembers.size > 1 ? ", primaryKeyColumns: " + dataEntityKeyColumns(entity) : "") + ")\nend\n\n")
   else
-    output.write("])\nend\n\n")
+    output.write("], readOnly: true)\nend\n\n")
   end
+end
+
+def dataTrackedEntity(first: DataEntity?): DataEntity?
+  var entity = first
+
+  while entity != null && entity.keyless
+    entity = entity.nextEntity
+  end
+  return entity
 end
 
 def dataEmitSchema(mapping: DataMapping): DataArtifact
@@ -613,7 +739,7 @@ def dataEmitSchema(mapping: DataMapping): DataArtifact
   output.name = "schema.hk"
   output.write("namespace " + semanticNamespaceDisplay(mapping.namespaceName) + "\n\n")
   output.write("## Describes the mapped tables and columns for schema comparison.\ndef schema_" + mapping.contextName + "(): neri_data::SchemaModel\n  return new neri_data::SchemaModel([")
-  var entity = mapping.firstEntity
+  var entity = dataTrackedEntity(mapping.firstEntity)
   var tableSeparator = ""
 
   while entity != null
@@ -630,7 +756,7 @@ def dataEmitSchema(mapping: DataMapping): DataArtifact
       output.write(lspQuote(dataFieldIdentity(field)), field.origin)
       output.write(", new neri_data::SchemaColumn(")
       output.write(lspQuote(field.columnName), field.origin)
-      output.write(", neri_data::SchemaType." + dataScalarColumn(field.domain) + "(), nullable: " + (field.optional ? "true" : "false") + ", primaryKey: " + (entity.isKeyMember(field.memberName) ? "true" : "false"))
+      output.write(", neri_data::SchemaType." + dataStorageColumn(field) + "(), nullable: " + (field.optional || field.hierarchyType != "" ? "true" : "false") + ", primaryKey: " + (field.hierarchyType == "" && entity.isKeyMember(field.memberName) ? "true" : "false"))
       if field.defaultCode != ""
         output.write(", defaultValue: " + field.defaultCode)
       end
@@ -641,6 +767,9 @@ def dataEmitSchema(mapping: DataMapping): DataArtifact
       output.write("))")
       fieldSeparator = ","
       field = field.nextField
+    end
+    if entity.discriminatorColumn != ""
+      output.write(fieldSeparator + "\n          new neri_data::SchemaField(" + lspQuote(entity.typeName + ".__discriminator") + ", new neri_data::SchemaColumn(" + lspQuote(entity.discriminatorColumn) + ", neri_data::SchemaType.Text()))")
     end
     output.write("\n        ]")
     var index = entity.firstIndex
@@ -666,9 +795,22 @@ def dataEmitSchema(mapping: DataMapping): DataArtifact
     if entity.firstIndex != null
       output.write("\n        ]")
     end
+    if entity.firstSeed != null
+      output.write(", []") if entity.firstIndex == null
+      output.write(", [")
+      var seed = entity.firstSeed
+      var seedSeparator = ""
+
+      while seed != null
+        output.write(seedSeparator + "\n          " + seed.code)
+        seedSeparator = ","
+        seed = seed.nextSeed
+      end
+      output.write("\n        ]")
+    end
     output.write(")")
     tableSeparator = ","
-    entity = entity.nextEntity
+    entity = dataTrackedEntity(entity.nextEntity)
   end
   output.write("\n    ])\nend\n")
   return output
@@ -704,9 +846,12 @@ def dataEmitSnapshot(output: DataArtifact, entity: DataEntity): Void
   end
 end
 
-def dataCaptureCell(field: DataField): String
-  let member = "entity." + field.memberName
+def dataCaptureCell(field: DataField, receiver: String = "entity"): String
+  let member = receiver + "." + field.memberName
 
+  if field.boolToInt
+    return "neri_data::cell" + (field.optional ? "Optional" : "") + "BoolToInt(" + member + ")"
+  end
   if field.optional
     return "neri_data::cellOptional" + dataScalarName(field.domain) + "(" + member + ")"
   end
@@ -726,7 +871,14 @@ end
 def dataEmitCapture(output: DataArtifact, entity: DataEntity): Void
   output.write(dataOriginDoc(entity.origin))
   output.write("def capture_" + entity.generatedName, entity.origin)
-  output.write("(entity: " + semanticNamespaceDisplay(entity.typeName) + "): neri_data::RawRow\n  return new neri_data::RawRow([")
+  output.write("(entity: " + semanticNamespaceDisplay(entity.typeName) + "): neri_data::RawRow\n")
+  var derived = entity.firstDerived
+
+  while derived != null
+    output.write("  let subtype_" + derived.entity.generatedName + " = reference::cast<" + semanticNamespaceDisplay(derived.entity.typeName) + ", " + semanticNamespaceDisplay(entity.typeName) + ">(entity)\n")
+    derived = derived.nextDerived
+  end
+  output.write("  return new neri_data::RawRow([")
   var field = entity.firstField
   var separator = ""
 
@@ -734,10 +886,31 @@ def dataEmitCapture(output: DataArtifact, entity: DataEntity): Void
     output.write(separator + "new neri_data::RawColumn(")
     output.write(lspQuote(field.columnName), field.origin)
     output.write(", ")
-    output.write(dataCaptureCell(field), field.origin)
+    if field.hierarchyType == ""
+      output.write(dataCaptureCell(field), field.origin)
+    else
+      derived = entity.firstDerived
+      while derived != null && derived.entity.typeName != field.hierarchyType
+        derived = derived.nextDerived
+      end
+      if derived != null
+        let receiver = "subtype_" + derived.entity.generatedName
+
+        output.write(receiver + " == null ? neri_data::Cell.Null() : " + dataCaptureCell(field, receiver), field.origin)
+      end
+    end
     output.write(")")
     separator = ", "
     field = field.nextField
+  end
+  if entity.discriminatorColumn != ""
+    output.write(separator + "new neri_data::RawColumn(" + lspQuote(entity.discriminatorColumn) + ", neri_data::Cell.Text(")
+    derived = entity.firstDerived
+    while derived != null
+      output.write("subtype_" + derived.entity.generatedName + " != null ? " + lspQuote(derived.discriminator) + " : ")
+      derived = derived.nextDerived
+    end
+    output.write(lspQuote(entity.discriminatorValue) + "))")
   end
   output.write("])\nend\n\n")
 end
@@ -749,12 +922,32 @@ def dataEmitApply(output: DataArtifact, entity: DataEntity): Void
   var field = entity.firstField
 
   while field != null
-    output.write("  target.")
-    output.write(field.memberName, field.origin)
-    output.write(" = source.")
-    output.write(field.memberName, field.origin)
-    output.write("\n")
+    if field.hierarchyType == ""
+      output.write("  target.")
+      output.write(field.memberName, field.origin)
+      output.write(" = source.")
+      output.write(field.memberName, field.origin)
+      output.write("\n")
+    end
     field = field.nextField
+  end
+  var derived = entity.firstDerived
+
+  while derived != null
+    let suffix = derived.entity.generatedName
+
+    output.write("  let target_" + suffix + " = reference::cast<" + semanticNamespaceDisplay(derived.entity.typeName) + ", " + semanticNamespaceDisplay(entity.typeName) + ">(target)\n")
+    output.write("  let source_" + suffix + " = reference::cast<" + semanticNamespaceDisplay(derived.entity.typeName) + ", " + semanticNamespaceDisplay(entity.typeName) + ">(source)\n")
+    output.write("\n  if target_" + suffix + " != null && source_" + suffix + " != null\n")
+    field = entity.firstField
+    while field != null
+      if field.hierarchyType == derived.entity.typeName
+        output.write("    target_" + suffix + "." + field.memberName + " = source_" + suffix + "." + field.memberName + "\n")
+      end
+      field = field.nextField
+    end
+    output.write("  end\n")
+    derived = derived.nextDerived
   end
   output.write("end\n\n")
 end
@@ -787,8 +980,13 @@ def dataEmitGeneratedFieldsSetter(output: DataArtifact, entity: DataEntity): Voi
       end
       for kind in ["Bool", "Int", "Float", "Text", "Binary"]
         output.write("        case neri_data::Cell." + kind + "(value)\n")
-        if kind == dataScalarColumn(field.domain)
-          if dataScalarName(field.domain) == "Decimal"
+        if kind == dataStorageColumn(field)
+          if field.boolToInt
+            output.write(
+              "          if value == 0 || value == 1\n            entity." + field.memberName + " = value == 1\n          end\n",
+              field.origin
+            )
+          else if dataScalarName(field.domain) == "Decimal"
             output.write(
               "          let decimal = neri_data::Decimal.parse(value)\n\n          if decimal != null\n            entity." + field.memberName + " = decimal\n          end\n",
               field.origin
@@ -814,7 +1012,7 @@ def dataEmitGeneratedFieldsMetadata(output: DataArtifact, entity: DataEntity): V
 
   while field != null
     if field.generatedOnAdd
-      output.write(separator + "new neri_data::GeneratedValueColumn(new neri_data::ResultColumn(" + lspQuote(field.columnName) + ", neri_data::ResultColumnKind." + dataScalarColumn(field.domain) + "(), " + (field.optional ? "true" : "false") + "), neri_data::GeneratedValueTiming." + (field.generatedOnUpdate ? "OnAddOrUpdate" : "OnAdd") + "()" + (dataScalarName(field.domain) == "Decimal" ? ", canonicalDecimal: true" : "") + ")")
+      output.write(separator + "new neri_data::GeneratedValueColumn(new neri_data::ResultColumn(" + lspQuote(field.columnName) + ", neri_data::ResultColumnKind." + dataStorageColumn(field) + "(), " + (field.optional ? "true" : "false") + "), neri_data::GeneratedValueTiming." + (field.generatedOnUpdate ? "OnAddOrUpdate" : "OnAdd") + "()" + (dataScalarName(field.domain) == "Decimal" ? ", canonicalDecimal: true" : "") + ")")
       separator = ", "
     end
     field = field.nextField
@@ -1016,32 +1214,32 @@ def dataEmitGraph(mapping: DataMapping): DataArtifact
   output.name = "graph.hk"
   output.write("namespace " + semanticNamespaceDisplay(mapping.namespaceName) + "\n\n")
   output.write("## Collects one reachable mapped graph before atomic enrollment.\nclass GraphTraversal_" + mapping.contextName + "\n  private graph: neri_data::GraphRegistration\n")
-  var entity = mapping.firstEntity
+  var entity = dataTrackedEntity(mapping.firstEntity)
 
   while entity != null
     let typeName = semanticNamespaceDisplay(entity.typeName)
 
     output.write("  private tracker_" + entity.generatedName + ": neri_data::EntityTracker<" + typeName + ">\n")
     output.write("  private visits_" + entity.generatedName + ": neri_data::GraphVisitList<" + typeName + ">\n")
-    entity = entity.nextEntity
+    entity = dataTrackedEntity(entity.nextEntity)
   end
   output.write("\n  def init(changes: neri_data::ChangeContext")
-  entity = mapping.firstEntity
+  entity = dataTrackedEntity(mapping.firstEntity)
   while entity != null
     output.write(", tracker_" + entity.generatedName + ": neri_data::EntityTracker<" + semanticNamespaceDisplay(entity.typeName) + ">")
-    entity = entity.nextEntity
+    entity = dataTrackedEntity(entity.nextEntity)
   end
   output.write("): Void\n    this.graph = new neri_data::GraphRegistration(changes)\n")
-  entity = mapping.firstEntity
+  entity = dataTrackedEntity(mapping.firstEntity)
   while entity != null
     let typeName = semanticNamespaceDisplay(entity.typeName)
 
     output.write("    this.tracker_" + entity.generatedName + " = tracker_" + entity.generatedName + "\n")
     output.write("    this.visits_" + entity.generatedName + " = new neri_data::GraphVisitList<" + typeName + ">(this.graph)\n")
-    entity = entity.nextEntity
+    entity = dataTrackedEntity(entity.nextEntity)
   end
   output.write("  end\n")
-  entity = mapping.firstEntity
+  entity = dataTrackedEntity(mapping.firstEntity)
   while entity != null
     let typeName = semanticNamespaceDisplay(entity.typeName)
 
@@ -1068,7 +1266,7 @@ def dataEmitGraph(mapping: DataMapping): DataArtifact
       relation = relation.nextRelation
     end
     output.write("    return null\n  end\n")
-    entity = entity.nextEntity
+    entity = dataTrackedEntity(entity.nextEntity)
   end
   var relation = mapping.firstRelation
 
@@ -1230,8 +1428,10 @@ def dataEmitContext(mapping: DataMapping): DataArtifact
     end
     relation = relation.nextRelation
   end
+  dataEmitManyCallbacks(output, mapping)
   output.write("## Entry point for the mapped entity query surfaces.\nclass " + mapping.contextName + "\n")
   output.write("  private changes: neri_data::ChangeContext\n")
+  dataEmitManyFields(output, mapping)
   relation = mapping.firstRelation
 
   while relation != null
@@ -1252,7 +1452,9 @@ def dataEmitContext(mapping: DataMapping): DataArtifact
   var entity = mapping.firstEntity
 
   while entity != null
-    output.write("  private tracker_" + entity.generatedName + ": neri_data::EntityTracker<" + semanticNamespaceDisplay(entity.typeName) + ">\n")
+    if !entity.keyless
+      output.write("  private tracker_" + entity.generatedName + ": neri_data::EntityTracker<" + semanticNamespaceDisplay(entity.typeName) + ">\n")
+    end
     output.write("  " + dataOriginDoc(entity.origin))
     output.write("  public ")
     output.write(entity.setName, entity.origin)
@@ -1300,10 +1502,29 @@ def dataEmitContext(mapping: DataMapping): DataArtifact
       if foreignKeys != "[]"
         output.write(", foreignKeyColumns: " + foreignKeys)
       end
+      if entity.discriminatorColumn != ""
+        output.write(", hierarchyColumn: " + lspQuote(entity.discriminatorColumn))
+      end
       output.write(")\n")
       output.write("    this.changes.register(this.tracker_" + entity.generatedName + ".changeSet())\n")
     end
-    output.write("    this." + entity.setName + " = new neri_data::Query<" + semanticNamespaceDisplay(entity.typeName) + ">(" + lspQuote(entity.tableName) + ", new neri_data::Decoder<" + semanticNamespaceDisplay(entity.typeName) + ">(" + dataEntityDecoderName(entity) + ", " + dataResultColumns(entity) + "), mapping: " + dataEntityMappingName(entity) + "(), provider: provider, tracker: this.tracker_" + entity.generatedName + ", changes: this.changes)\n")
+    output.write("    this." + entity.setName + " = new neri_data::Query<" + semanticNamespaceDisplay(entity.typeName) + ">(" + lspQuote(entity.tableName) + ", new neri_data::Decoder<" + semanticNamespaceDisplay(entity.typeName) + ">(" + dataEntityDecoderName(entity) + ", " + dataResultColumns(entity) + "), mapping: " + dataEntityMappingName(entity) + "(), provider: provider")
+    if !entity.keyless
+      output.write(", tracker: this.tracker_" + entity.generatedName + ", changes: this.changes")
+    else
+      output.write(", changes: this.changes")
+    end
+    output.write(")")
+    if entity.queryFilter != ""
+      output.write(".withGlobalFilter(" + semanticNamespaceDisplay(entity.queryFilter) + "())")
+    end
+    var filter = entity.firstQueryFilter
+
+    while filter != null
+      output.write(".withNamedGlobalFilter(" + lspQuote(filter.name) + ", " + semanticNamespaceDisplay(filter.factory) + "())")
+      filter = filter.nextFilter
+    end
+    output.write("\n")
     entity = entity.nextEntity
   end
   relation = mapping.firstRelation
@@ -1326,25 +1547,61 @@ def dataEmitContext(mapping: DataMapping): DataArtifact
     end
     relation = relation.nextRelation
   end
-  output.write("  end\n\n  ## Saves tracked inserts, changes, and removals as one atomic batch.\n  public def saveChanges(): neri_data::WriteResult\n    return this.changes.saveChanges()\n  end\n")
+  dataEmitManyInit(output, mapping)
+  output.write("  end\n")
+  entity = mapping.firstEntity
+
+  while entity != null
+    var derived = entity.firstDerived
+
+    while derived != null
+      let child = derived.entity
+
+      output.write("\n  ## Selects a mapped subtype through the root identity tracker.\n  public def ofType_" + child.generatedName + "(): neri_data::Relation<" + semanticNamespaceDisplay(child.typeName) + ">\n    return neri_data::hierarchyOfType<" + semanticNamespaceDisplay(entity.typeName) + ", " + semanticNamespaceDisplay(child.typeName) + ">(this." + entity.setName + ", " + dataEntityMappingName(child) + "(), " + lspQuote(entity.discriminatorColumn) + ", " + lspQuote(child.discriminatorValue) + ", upcast_" + child.generatedName + ", downcast_" + child.generatedName + ")\n  end\n")
+      derived = derived.nextDerived
+    end
+    entity = entity.nextEntity
+  end
+  dataEmitManyMethods(output, mapping)
+  output.write("\n  ## Saves tracked inserts, changes, and removals as one atomic batch.\n  public def saveChanges(): neri_data::WriteResult\n    return this.changes.saveChanges()\n  end\n")
   output.write("\n  ## Starts an owned asynchronous tracked save.\n  public def saveChangesAsync(options: neri_data::StreamOptions? = null): result::Result<neri_data::AsyncSave, neri_data::WriteFailure>\n    match this.changes.beginSaveAsync(options)\n      case neri_data::AsyncSaveStart.Failure(error)\n        return result::Result<neri_data::AsyncSave, neri_data::WriteFailure>.Error(error)\n      case neri_data::AsyncSaveStart.Started(driver)\n        let owned = new neri_data::AsyncSave(driver)\n\n        return result::Result<neri_data::AsyncSave, neri_data::WriteFailure>.Ok(transfer owned)\n    end\n  end\n")
   output.write("\n  ## Finishes rollback retained after an unfinished save is disposed.\n  public def pollSaveCleanup(): neri_data::AsyncWritePoll\n    return this.changes.pollSaveCleanup()\n  end\n")
-  entity = mapping.firstEntity
+  output.write("\n  ## Registers an interceptor for synchronous and asynchronous saves.\n  public def addSaveInterceptor(interceptor: neri_data::SaveInterceptor): neri_data::WriteFailure?\n    return this.changes.addSaveInterceptor(interceptor)\n  end\n")
+  entity = dataTrackedEntity(mapping.firstEntity)
 
   while entity != null
     output.write("\n  ## Marks a tracked root and its explicitly linked client-cascade descendants for removal.\n  public def removeCascade_" + entity.setName + "(handle: neri_data::TrackedHandle<" + semanticNamespaceDisplay(entity.typeName) + ">): neri_data::QueryFailure?\n    return neri_data::removeCascade(this.changes, handle)\n  end\n")
     output.write("\n  ## Enrolls a reachable graph through mapped navigation members.\n  public def addGraph_" + entity.setName + "(root: " + semanticNamespaceDisplay(entity.typeName) + "): neri_data::TrackHandleResult<" + semanticNamespaceDisplay(entity.typeName) + ">\n")
     output.write("    let traversal = new GraphTraversal_" + mapping.contextName + "(this.changes")
-    var tracked = mapping.firstEntity
+    var tracked = dataTrackedEntity(mapping.firstEntity)
 
     while tracked != null
       output.write(", this.tracker_" + tracked.generatedName)
-      tracked = tracked.nextEntity
+      tracked = dataTrackedEntity(tracked.nextEntity)
     end
     output.write(")\n\n    return traversal.add_" + entity.setName + "(root)\n  end\n")
-    entity = entity.nextEntity
+    entity = dataTrackedEntity(entity.nextEntity)
   end
   output.write("\n  ## Detaches tracked entities without writing to the database.\n  public def clear(): Void\n    this.changes.clear()\n  end\n")
+  output.write("\n  ## Resets an idle context before its next pool lease.\n  public def resetForPool(): neri_data::WriteFailure?\n    let failure = this.changes.resetForPool()\n\n    if failure != null\n      return failure\n    end\n")
+  relation = mapping.firstRelation
+
+  while relation != null
+    let principal = relation.principal
+    let dependent = relation.dependent
+    let foreignKey = relation.foreignKey
+
+    if principal != null && dependent != null && foreignKey != null && relation.collectionMember != ""
+      output.write("    this.navigation_" + dataRelationName(
+          relation,
+          principal,
+          dependent,
+          foreignKey
+        ) + ".clearLoadedStates()\n")
+    end
+    relation = relation.nextRelation
+  end
+  output.write("    return null\n  end\n")
   for name in ["beginTransaction", "commitTransaction", "rollbackTransaction"]
     output.write("\n  public def " + name + "(): neri_data::WriteResult\n    return this.changes." + name + "()\n  end\n")
     let driverName = name + "DriverAsync"
@@ -1551,18 +1808,29 @@ def dataEmit(mapping: DataMapping): DataEmission
     let output = new DataArtifact()
 
     output.name = dataEntityArtifactName(entity)
-    output.write("namespace " + semanticNamespaceDisplay(mapping.namespaceName) + "\n\n")
+    output.write((entity.firstDerived == null ? "" : "use reference\n\n") + "namespace " + semanticNamespaceDisplay(mapping.namespaceName) + "\n\n")
     dataEmitMapping(output, entity)
     dataEmitDecoder(output, entity)
-    dataEmitCapture(output, entity)
-    dataEmitApply(output, entity)
-    if entity.generatedKey
-      dataEmitGeneratedKeySetter(output, entity)
+    var derived = entity.firstDerived
+
+    while derived != null
+      dataEmitMapping(output, derived.entity)
+      dataEmitDecoder(output, derived.entity)
+      output.write("def upcast_" + derived.entity.generatedName + "(entity: " + semanticNamespaceDisplay(derived.entity.typeName) + "): " + semanticNamespaceDisplay(entity.typeName) + "\n  return entity\nend\n\n")
+      output.write("def downcast_" + derived.entity.generatedName + "(entity: " + semanticNamespaceDisplay(entity.typeName) + "): " + semanticNamespaceDisplay(derived.entity.typeName) + "?\n  return reference::cast<" + semanticNamespaceDisplay(derived.entity.typeName) + ", " + semanticNamespaceDisplay(entity.typeName) + ">(entity)\nend\n\n")
+      derived = derived.nextDerived
     end
-    if dataHasGeneratedFields(entity)
-      dataEmitGeneratedFieldsSetter(output, entity)
+    if !entity.keyless
+      dataEmitCapture(output, entity)
+      dataEmitApply(output, entity)
+      if entity.generatedKey
+        dataEmitGeneratedKeySetter(output, entity)
+      end
+      if dataHasGeneratedFields(entity)
+        dataEmitGeneratedFieldsSetter(output, entity)
+      end
+      dataEmitSnapshot(output, entity)
     end
-    dataEmitSnapshot(output, entity)
     emission.add(output)
     entity = entity.nextEntity
   end
@@ -1695,10 +1963,13 @@ def dataEmitCompositeForeignKeySetter(
 end
 
 def dataEntityHasExtendedScalars(entity: DataEntity): Bool
+  if entity.firstComplex != null || entity.discriminatorColumn != ""
+    return true
+  end
   var field = entity.firstField
 
   while field != null
-    if dataScalarName(field.domain) == "ByteBuffer" || dataScalarName(field.domain) == "Decimal"
+    if field.boolToInt || dataScalarName(field.domain) == "ByteBuffer" || dataScalarName(field.domain) == "Decimal"
       return true
     end
     field = field.nextField

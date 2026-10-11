@@ -11,6 +11,141 @@ class PostgreSQLTrackedValue
   public version: Int = 1
 end
 
+class PostgreSQLDecimalValue
+  public amount: Decimal = Decimal.zero()
+end
+
+def pgDecodeDecimalValue(row: RawRow): DecodeResult<PostgreSQLDecimalValue>
+  match decodeDecimal(row, "amount")
+    case DecodeResult.Failure(error)
+      return DecodeResult<PostgreSQLDecimalValue>.Failure(error)
+    case DecodeResult.Value(amount)
+      let value = new PostgreSQLDecimalValue()
+
+      value.amount = amount
+      return DecodeResult<PostgreSQLDecimalValue>.Value(value)
+  end
+end
+
+def pgDecimalQuery(provider: PostgreSQLProvider, sql: String): Query<PostgreSQLDecimalValue>
+  let columns = new ResultColumns([new ResultColumn("amount", ResultColumnKind.Text())])
+  let mapping = new EntityMapping("PostgreSQLDecimalValue", "decimal_values", [
+      new MappingColumn("PostgreSQLDecimalValue.amount", "neri_data.Decimal", "amount")
+    ], readOnly: true)
+
+  return sqlQuery<PostgreSQLDecimalValue>(
+    sql,
+    new ParameterValues(),
+    new Decoder<PostgreSQLDecimalValue>(pgDecodeDecimalValue, columns),
+    provider,
+    mapping
+  )
+end
+
+def verifyPostgreSQLDecimalQueries(provider: PostgreSQLProvider): Void
+  let increment = Decimal.parse("0.09")
+  let boundary = Decimal.parse("9007199254740993.01")
+
+  test::assertTrue(increment != null && boundary != null)
+  if increment == null || boundary == null
+    return
+  end
+  let query = pgDecimalQuery(provider, "SELECT v AS amount FROM (VALUES ('0'),('1'),('9007199254740993.01')) AS d(v)")
+  let amount = decimalField(quote do |value: PostgreSQLDecimalValue|: Decimal
+      return value.amount
+    end)
+
+  match query.orderByDecimal(amount.subtract(decimalValue<PostgreSQLDecimalValue>(boundary))).take(3).all()
+    case QueryResult.Failure(error)
+      match error
+        case QueryFailure.Provider(failure)
+          console::println(providerFailureMessage(failure))
+        case QueryFailure.UnsupportedCapability(name)
+          console::println(name)
+        case QueryFailure.MissingColumn(name)
+          console::println(name)
+        case QueryFailure.SourceMismatch(expected, actual)
+          console::println(expected + " != " + actual)
+        case QueryFailure.TypeMismatch(column, expected, actual)
+          console::println(column + ": " + expected + " != " + actual)
+        case QueryFailure.InvalidIdentifier(name)
+          console::println(name)
+        case QueryFailure.InvalidLimit(value, maximum)
+          console::println("invalid Decimal limit")
+        case QueryFailure.MissingLimit(maximum)
+          console::println("missing Decimal limit")
+        case QueryFailure.Cleanup(cleanup)
+          console::println("Decimal query cleanup failed")
+        case QueryFailure.Cardinality(expected, actual)
+          console::println("Decimal query cardinality failed")
+      end
+
+      test::assertTrue(false)
+    case QueryResult.Rows(rows)
+      let first = rows.first()
+
+      test::assertEqual(rows.count(), 3)
+      test::assertTrue(first != null)
+      if first != null
+        test::assertEqual(first.value.amount.text(), "0")
+        let second = first.next
+
+        test::assertTrue(second != null)
+        if second != null
+          test::assertEqual(second.value.amount.text(), "1")
+        end
+      end
+  end
+  match query.matchingDecimal(amount.equalTo(decimalValue<PostgreSQLDecimalValue>(boundary))).take(1).selectDecimal(amount.add(decimalValue<PostgreSQLDecimalValue>(increment))).all()
+    case QueryResult.Failure(error)
+      test::assertTrue(false)
+    case QueryResult.Rows(rows)
+      let first = rows.first()
+
+      test::assertTrue(first != null)
+      if first != null
+        test::assertEqual(first.value.text(), "9007199254740993.1")
+      end
+  end
+  for sql in ["SELECT '1.00' AS amount", "SELECT NULL::text AS amount"]
+    match pgDecimalQuery(provider, sql).take(1).selectDecimal(amount).all()
+      case QueryResult.Failure(error)
+      case QueryResult.Rows(rows)
+        test::assertTrue(false)
+    end
+  end
+end
+
+def verifyPostgreSQLCommitCancellation(provider: PostgreSQLProvider): Void
+  match awaitAsyncControl(provider.beginControlAsync(AsyncTransactionAction.Begin()))
+    case AsyncControlResult.Begun(lease)
+      match provider.beginControlAsync(AsyncTransactionAction.Commit(lease))
+        case AsyncControlStart.Failure(error)
+          test::assertTrue(false)
+        case AsyncControlStart.Started(driver)
+          driver.cancel()
+          asyncControlSaved(awaitAsyncControl(AsyncControlStart.Started(driver)))
+      end
+      match provider.transactionState(lease)
+        case TransactionState.Committed()
+        case TransactionState.Active()
+          test::assertTrue(false)
+        case TransactionState.Failed()
+          test::assertTrue(false)
+        case TransactionState.Invalid()
+          test::assertTrue(false)
+        case TransactionState.RolledBack()
+          test::assertTrue(false)
+      end
+    case AsyncControlResult.Failure(error)
+      test::assertTrue(false)
+    case AsyncControlResult.Saved()
+      test::assertTrue(false)
+    case AsyncControlResult.Created(id)
+      test::assertTrue(false)
+  end
+end
+
 def pgCaptureTracked(value: PostgreSQLTrackedValue): RawRow
   return new RawRow([
       new RawColumn("id", Cell.Int(value.id)),
@@ -40,6 +175,112 @@ def pgDecodeTracked(row: RawRow): DecodeResult<PostgreSQLTrackedValue>
               return DecodeResult<PostgreSQLTrackedValue>.Value(entity)
           end
       end
+  end
+end
+
+def pgComputedUpdateAsync(
+  query: Query<PostgreSQLTrackedValue>,
+  setters: UpdateSet<PostgreSQLTrackedValue>
+): resources::Outcome<Int, WriteFailure>
+  using operation <- query.executeUpdateSetAsync(setters)
+    while true
+      match operation.poll()
+        case AsyncWritePoll.Pending(socket, interest)
+          continue
+        case AsyncWritePoll.Completed(result)
+          match result
+            case WriteResult.Failure(error)
+              return error
+            case WriteResult.Saved(count)
+              test::assertEqual(count, 1)
+            case WriteResult.SavedWithValues(count, rows)
+              test::assertTrue(false)
+          end
+          return 0
+      end
+    end
+  end
+  return 1
+end
+
+def verifyPostgreSQLComputedUpdates(provider: PostgreSQLProvider): Void
+  saved(provider.executeSet(new SetWritePlan(
+        "CREATE TEMP TABLE neri_computed_entities(id BIGINT PRIMARY KEY,label TEXT,version BIGINT)",
+        new WriteValues()
+      )))
+  saved(provider.executeSet(new SetWritePlan(
+        "INSERT INTO neri_computed_entities VALUES(1,'bulk',1)",
+        new WriteValues()
+      )))
+  let mapping = new EntityMapping("PostgreSQLTrackedValue", "neri_computed_entities", [
+      new MappingColumn("PostgreSQLTrackedValue.id", "Int", "id"),
+      new MappingColumn("PostgreSQLTrackedValue.label", "String", "label"),
+      new MappingColumn("PostgreSQLTrackedValue.version", "Int", "version")
+    ], "id")
+  let columns = new ResultColumns([
+      new ResultColumn("id", ResultColumnKind.Int()),
+      new ResultColumn("label", ResultColumnKind.Text()),
+      new ResultColumn("version", ResultColumnKind.Int())
+    ])
+  let query = new Query<PostgreSQLTrackedValue>(
+    mapping.table(), new Decoder<PostgreSQLTrackedValue>(pgDecodeTracked, columns), mapping: mapping, provider: provider
+  )
+  let version = quote do |entity: PostgreSQLTrackedValue|: Int
+    return entity.version
+  end
+  let increment = quote do |entity: PostgreSQLTrackedValue|: Int
+    return entity.version + 1
+  end
+  let suffix = quote do |entity: PostgreSQLTrackedValue|: String
+    return entity.label + "!"
+  end
+  let setters = updateSet<PostgreSQLTrackedValue>().set(version, increment).set(pgTrackedLabel(), suffix)
+
+  saved(query.executeUpdateSet(setters))
+  asyncContextSaved(pgComputedUpdateAsync(query, setters))
+  match query.all()
+    case QueryResult.Failure(error)
+      test::assertTrue(false)
+    case QueryResult.Rows(rows)
+      let first = rows.first()
+
+      test::assertTrue(first != null)
+      if first != null
+        test::assertEqual(first.value.version, 3)
+        test::assertEqual(first.value.label, "bulk!!")
+      end
+  end
+  for invalid in ["9223372036854775807", "NULL"]
+    saved(provider.executeSet(new SetWritePlan(
+          "UPDATE neri_computed_entities SET version=" + invalid,
+          new WriteValues()
+        )))
+    match query.executeUpdateSet(setters)
+      case WriteResult.Failure(error)
+      case WriteResult.Saved(count)
+        test::assertTrue(false)
+      case WriteResult.SavedWithValues(count, rows)
+        test::assertTrue(false)
+    end
+    let failedAsync = pgComputedUpdateAsync(query, setters)
+
+    test::assertEqual(failedAsync.closeFailures.count(), 0)
+    match failedAsync.completion
+      case resources::Completion.Value(value)
+        test::assertTrue(false)
+      case resources::Completion.Failure(error)
+    end
+    match query.select(textScalar(), pgTrackedLabel()).all()
+      case QueryResult.Failure(error)
+        test::assertTrue(false)
+      case QueryResult.Rows(rows)
+        let first = rows.first()
+
+        test::assertTrue(first != null)
+        if first != null
+          test::assertEqual(first.value, "bulk!!")
+        end
+    end
   end
 end
 
@@ -112,6 +353,7 @@ def verifyPostgreSQLTrackedWrites(provider: PostgreSQLProvider): Void
   pgTypedAsyncSucceeded(verifyPostgreSQLPairAsync(query))
   pgTypedAsyncSucceeded(verifyPostgreSQLShapeAsync(query))
   verifyPostgreSQLAggregates(provider, query, entity.id)
+  verifyPostgreSQLCheckedExpressions(provider, query, entity.id)
   entity.label = "local update"
   entity.version = 2
   saved(context.saveChanges())
@@ -517,5 +759,203 @@ def pgTypedAsyncSucceeded(outcome: resources::Outcome<Int, QueryFailure>): Void
       test::assertEqual(code, 0)
     case resources::Completion.Failure(error)
       test::assertTrue(false)
+  end
+end
+
+def pgCheckedFailure(result: ProviderResult, state: String): Void
+  match result
+    case ProviderResult.Rows(rows)
+      test::assertTrue(false)
+    case ProviderResult.Failure(error)
+      match error
+        case ProviderFailure.Driver(details)
+          test::assertTrue(details.sqlState() == state)
+        case ProviderFailure.State(message)
+          test::assertTrue(false)
+        case ProviderFailure.Cleanup(cleanup)
+          test::assertTrue(false)
+      end
+  end
+end
+
+def verifyPostgreSQLCheckedExpressions(
+  provider: PostgreSQLProvider,
+  query: Query<PostgreSQLTrackedValue>,
+  id: Int
+): Void
+  let increment = quote do |entity: PostgreSQLTrackedValue|: Int
+    return entity.id + 2
+  end
+  let suffix = quote do |entity: PostgreSQLTrackedValue|: String
+    return entity.label + "!"
+  end
+
+  match query.select(intScalar(), increment).all()
+    case QueryResult.Rows(rows)
+      let first = rows.first()
+
+      test::assertTrue(first != null)
+      if first != null
+        test::assertEqual(first.value, id + 2)
+      end
+    case QueryResult.Failure(error)
+      test::assertTrue(false)
+  end
+  match query.select(textScalar(), suffix).all()
+    case QueryResult.Rows(rows)
+      let first = rows.first()
+
+      test::assertTrue(first != null)
+      if first != null
+        test::assertEqual(first.value, "generated!")
+      end
+    case QueryResult.Failure(error)
+      test::assertTrue(false)
+  end
+  let intColumns = new ResultColumns([new ResultColumn("value", ResultColumnKind.Int())])
+  let floatColumns = new ResultColumns([new ResultColumn("value", ResultColumnKind.Float())])
+  let values = new CompileState()
+
+  values.bind(Parameter.Int(9223372036854775807))
+  pgCheckedFailure(provider.execute(new SqlPlan(
+        "SELECT " + postgresCheckedScalar(18, "Int", "$1", "1") + " AS value",
+        new ParameterValues(values.head, values.count), 1, intColumns, true
+      )), "22003")
+  let zero = new CompileState()
+
+  zero.bind(Parameter.Int(0))
+  pgCheckedFailure(provider.execute(new SqlPlan(
+        "SELECT " + postgresCheckedScalar(21, "Int", "1", "$1") + " AS value",
+        new ParameterValues(zero.head, zero.count), 1, intColumns, true
+      )), "22012")
+  let floating = new CompileState()
+
+  floating.bind(Parameter.Float(1.25))
+  match provider.execute(new SqlPlan(
+      "SELECT " + postgresCheckedScalar(18, "Float", "$1", "2.5") + " AS value",
+      new ParameterValues(floating.head, floating.count), 1, floatColumns, true
+    ))
+    case ProviderResult.Failure(error)
+      test::assertTrue(false)
+    case ProviderResult.Rows(rows)
+      test::assertEqual(rows.Length, 1)
+      match decodeFloat(rows[0], "value")
+        case DecodeResult.Value(value)
+          test::assertEqual(value, 3.75)
+        case DecodeResult.Failure(error)
+          test::assertTrue(false)
+      end
+  end
+  let nonfinite = new CompileState()
+
+  nonfinite.bind(Parameter.Text("NaN"))
+  pgCheckedFailure(provider.execute(new SqlPlan(
+        "SELECT " + postgresCheckedScalar(18, "Float", "$1", "1.0") + " AS value",
+        new ParameterValues(nonfinite.head, nonfinite.count), 1, floatColumns, true
+      )), "22P02")
+  let shortCircuit = quote do |entity: PostgreSQLTrackedValue|: Bool
+    return entity.id > 0 || entity.version / (entity.id - entity.id) > 0
+  end
+
+  match query.matching(shortCircuit).all()
+    case QueryResult.Rows(rows)
+      test::assertEqual(rows.count(), 1)
+    case QueryResult.Failure(error)
+      test::assertTrue(false)
+  end
+end
+
+## Schema inspection reports physical order, tuple-key position and generation policy.
+def verifyPostgreSQLSchemaInspection(provider: PostgreSQLProvider): Void
+  match provider.command(
+    "CREATE SCHEMA neri_contract_inspection; CREATE TABLE neri_contract_inspection.items(tenant BIGINT NOT NULL, id BIGINT GENERATED BY DEFAULT AS IDENTITY, label TEXT DEFAULT 'new', normalized TEXT GENERATED ALWAYS AS (lower(label)) STORED, PRIMARY KEY(tenant,id)); CREATE VIEW neri_contract_inspection.item_view AS SELECT label FROM neri_contract_inspection.items",
+    new WriteValues(),
+    script: true
+  )
+    case PostgreSQLCommandResult.Failure(error)
+      test::assertTrue(false)
+    case PostgreSQLCommandResult.Completed(count, row)
+  end
+  match provider.inspectSchema("neri_contract_inspection")
+    case PostgreSQLSchemaResult.Failure(error)
+      console::println(providerFailureMessage(error))
+
+      test::assertTrue(false)
+    case PostgreSQLSchemaResult.Snapshot(snapshot)
+      test::assertEqual(snapshot.count(), 5)
+      let view = snapshot.at(0)
+      let tenant = snapshot.at(1)
+      let id = snapshot.at(2)
+      let label = snapshot.at(3)
+      let generated = snapshot.at(4)
+
+      test::assertTrue(view != null && tenant != null && id != null && label != null && generated != null)
+      if view != null
+        test::assertTrue(view.view())
+        test::assertEqual(view.table(), "item_view")
+      end
+      if tenant != null
+        test::assertEqual(tenant.keyPosition(), 1)
+        test::assertTrue(tenant.required())
+        test::assertEqual(tenant.declaredType(), "bigint")
+      end
+      if id != null
+        test::assertEqual(id.keyPosition(), 2)
+        test::assertEqual(id.identity(), "d")
+      end
+      if label != null
+        test::assertTrue(label.defaultSql() != null)
+        test::assertTrue(!label.required())
+      end
+      if generated != null
+        test::assertEqual(generated.generated(), "s")
+      end
+  end
+  match provider.inspectSchema("invalid;schema")
+    case PostgreSQLSchemaResult.Failure(error)
+    case PostgreSQLSchemaResult.Snapshot(snapshot)
+      test::assertTrue(false)
+  end
+  match provider.command(
+    "CREATE TABLE public.neri_contract_scaffold(id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,label TEXT DEFAULT 'new',normalized TEXT GENERATED ALWAYS AS (lower(label)) STORED); CREATE VIEW public.neri_contract_scaffold_view AS SELECT label FROM public.neri_contract_scaffold",
+    new WriteValues(), script: true
+  )
+    case PostgreSQLCommandResult.Failure(error)
+      test::assertTrue(false)
+    case PostgreSQLCommandResult.Completed(count, row)
+  end
+  match provider.scaffoldSchema()
+    case SchemaScaffoldResult.Failure(error)
+      test::assertTrue(false)
+    case SchemaScaffoldResult.Source(source, mapping)
+      test::assertTrue(source.contains("public field_id: Int = 0"))
+      test::assertTrue(source.contains("public field_label: String? = null"))
+      test::assertTrue(mapping.contains("\"keyGeneration\":\"onAdd\""))
+      test::assertTrue(mapping.contains("\"valueGeneration\":\"onAddOrUpdate\""))
+      test::assertTrue(mapping.contains("\"view\":\"neri_contract_scaffold_view\",\"keyless\":true"))
+  end
+  match provider.command("CREATE TABLE public.neri_contract_scaffold_lossy(v NUMERIC(10,2))", new WriteValues())
+    case PostgreSQLCommandResult.Failure(error)
+      test::assertTrue(false)
+    case PostgreSQLCommandResult.Completed(count, row)
+  end
+  match provider.scaffoldSchema()
+    case SchemaScaffoldResult.Failure(error)
+    case SchemaScaffoldResult.Source(source, mapping)
+      test::assertTrue(false)
+  end
+  match provider.command(
+    "DROP VIEW public.neri_contract_scaffold_view; DROP TABLE public.neri_contract_scaffold,public.neri_contract_scaffold_lossy",
+    new WriteValues(),
+    script: true
+  )
+    case PostgreSQLCommandResult.Failure(error)
+      test::assertTrue(false)
+    case PostgreSQLCommandResult.Completed(count, row)
+  end
+  match provider.command("DROP SCHEMA neri_contract_inspection CASCADE", new WriteValues(), script: true)
+    case PostgreSQLCommandResult.Failure(error)
+      test::assertTrue(false)
+    case PostgreSQLCommandResult.Completed(count, row)
   end
 end

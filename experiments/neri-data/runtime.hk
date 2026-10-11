@@ -201,6 +201,22 @@ abstract class Provider
     return AsyncControlStart.Failure(WriteFailure.Unsupported("provider does not support asynchronous transaction control"))
   end
 
+  public def beginSetAsync(
+    plan: readonly SetWritePlan,
+    options: StreamOptions? = null,
+    lease: Int? = null
+  ): AsyncWriteStart
+    return AsyncWriteStart.Failure(WriteFailure.Unsupported("provider does not support asynchronous set writes"))
+  end
+
+  public def beginMigrationAsync(
+    catalog: readonly MigrationSet,
+    target: String? = null,
+    options: StreamOptions? = null
+  ): AsyncMigrationStart
+    return AsyncMigrationStart.Failure(MigrationFailure.Unsupported("provider does not support asynchronous migrations"))
+  end
+
   ## Read-only providers retain a typed unsupported write result.
   public def writeBatch(batch: readonly WriteBatch): WriteResult
     return WriteResult.Failure(WriteFailure.Unsupported("provider does not support transactional writes"))
@@ -496,6 +512,7 @@ class TypedRows<T>
 end
 
 enum ExpressionKind
+  case Decimal()
   case Scalar()
   case Equal()
   case Greater()
@@ -521,6 +538,7 @@ class Expression
   internal scalarTree: readonly quotation::Tree?
   internal scalarMapping: EntityMapping?
   internal hasScalar: Bool
+  internal decimalBuilder: (fn(EntityMapping, CompileState, SqlDialect): ScalarSqlResult)?
 
   def init(
     kind: ExpressionKind,
@@ -532,7 +550,8 @@ class Expression
     rightTable: String? = null,
     rightColumn: String? = null,
     scalarTree: readonly quotation::Tree? = null,
-    scalarMapping: EntityMapping? = null
+    scalarMapping: EntityMapping? = null,
+    decimalBuilder: (fn(EntityMapping, CompileState, SqlDialect): ScalarSqlResult)? = null
   ): Void
     this.kind = kind
     this.table = table
@@ -544,7 +563,8 @@ class Expression
     this.right = right
     this.scalarTree = scalarTree
     this.scalarMapping = scalarMapping
-    this.hasScalar = scalarTree != null || (left != null && left.hasScalar) || (right != null && right.hasScalar)
+    this.decimalBuilder = decimalBuilder
+    this.hasScalar = decimalBuilder != null || scalarTree != null || (left != null && left.hasScalar) || (right != null && right.hasScalar)
   end
 end
 
@@ -613,6 +633,49 @@ class Predicate<T>
   public def not(): Predicate<T>
     return new Predicate<T>(new Expression(ExpressionKind.Not(), left: this.expression))
   end
+end
+
+class QueryFilterName
+  internal name: String
+  internal next: QueryFilterName?
+
+  def init(name: String, next: QueryFilterName? = null): Void
+    this.name = name
+    this.next = next
+  end
+end
+
+class NamedQueryFilter<T>
+  internal name: String
+  internal predicate: Predicate<T>
+  internal next: NamedQueryFilter<T>?
+
+  def init(name: String, predicate: Predicate<T>, next: NamedQueryFilter<T>? = null): Void
+    this.name = name
+    this.predicate = predicate
+    this.next = next
+  end
+end
+
+def queryFilterIgnored(names: QueryFilterName?, name: String): Bool
+  var current = names
+
+  while current != null
+    if current.name == name
+      return true
+    end
+    current = current.next
+  end
+  return false
+end
+
+def queryFilterRemove<T>(filters: NamedQueryFilter<T>?, name: String): NamedQueryFilter<T>?
+  if filters == null
+    return null
+  end
+  let next = queryFilterRemove(filters.next, name)
+
+  return filters.name == name ? next : new NamedQueryFilter<T>(filters.name, filters.predicate, next)
 end
 
 enum ExpressionCompileResult
@@ -698,6 +761,20 @@ def compileExpression(
   dialect: SqlDialect
 ): ExpressionCompileResult
   match expression.kind
+    case ExpressionKind.Decimal()
+      let decimalMapping = expression.scalarMapping
+      let decimalBuilder = expression.decimalBuilder
+
+      if decimalMapping == null || decimalBuilder == null || decimalMapping.table() != source
+        return ExpressionCompileResult.Failure(QueryFailure.UnsupportedCapability("decimal predicate source is invalid"))
+      end
+      match decimalBuilder(decimalMapping, state, dialect)
+        case ScalarSqlResult.Failure(error)
+          return ExpressionCompileResult.Failure(error)
+        case ScalarSqlResult.Value(value)
+          state.requiresCheckedScalars = true
+          return ExpressionCompileResult.Sql(value.sql)
+      end
     case ExpressionKind.Scalar()
       let tree = expression.scalarTree
       let mapping = expression.scalarMapping
@@ -875,6 +952,15 @@ class Query<T>
   private thenTerms: OrderTerm?
   private changes: ChangeContext?
   private primaryOrderTree: readonly quotation::Tree?
+  private trackingDisabled: Bool
+  private identityOnly: Bool
+  private globalFilter: Predicate<T>?
+  private filtersDisabled: Bool
+  private tagComments: String
+  private rawSource: SqlSource?
+  private rawParameters: readonly ParameterValues?
+  private namedFilters: NamedQueryFilter<T>?
+  private ignoredFilterNames: QueryFilterName?
 
   def init(
     source: String,
@@ -893,7 +979,16 @@ class Query<T>
     unique: Bool = false,
     thenTerms: OrderTerm? = null,
     changes: ChangeContext? = null,
-    primaryOrderTree: readonly quotation::Tree? = null
+    primaryOrderTree: readonly quotation::Tree? = null,
+    trackingDisabled: Bool = false,
+    identityOnly: Bool = false,
+    globalFilter: Predicate<T>? = null,
+    filtersDisabled: Bool = false,
+    tagComments: String = "",
+    rawSource: SqlSource? = null,
+    rawParameters: readonly ParameterValues? = null,
+    namedFilters: NamedQueryFilter<T>? = null,
+    ignoredFilterNames: QueryFilterName? = null
   ): Void
     this.source = source
     this.decoder = decoder
@@ -912,6 +1007,226 @@ class Query<T>
     this.thenTerms = thenTerms
     this.changes = changes
     this.primaryOrderTree = primaryOrderTree
+    this.trackingDisabled = trackingDisabled
+    this.identityOnly = identityOnly
+    this.globalFilter = globalFilter
+    this.filtersDisabled = filtersDisabled
+    this.tagComments = tagComments
+    this.rawSource = rawSource
+    this.rawParameters = rawParameters
+    this.namedFilters = namedFilters
+    this.ignoredFilterNames = ignoredFilterNames
+  end
+
+  ## Exposes the staged query as a deferred source for further joins.
+  private def configured(
+    trackingDisabled: Bool,
+    identityOnly: Bool,
+    globalFilter: Predicate<T>?,
+    filtersDisabled: Bool,
+    previous: Query<T>?,
+    tagComments: String? = null,
+    rawSource: SqlSource? = null,
+    rawParameters: readonly ParameterValues? = null,
+    namedFilters: NamedQueryFilter<T>? = null,
+    ignoredFilterNames: QueryFilterName? = null
+  ): Query<T>
+    return new Query<T>(
+      this.source,
+      this.decoder,
+      this.predicate,
+      this.orderTable,
+      this.orderColumn,
+      this.descending,
+      this.limit,
+      this.mapping,
+      this.failure,
+      this.boundProvider,
+      this.tracker,
+      previous,
+      this.offset,
+      this.unique,
+      this.thenTerms,
+      changes: this.changes,
+      primaryOrderTree: this.primaryOrderTree,
+      trackingDisabled: trackingDisabled,
+      identityOnly: identityOnly,
+      globalFilter: globalFilter,
+      filtersDisabled: filtersDisabled,
+      tagComments: tagComments == null ? this.tagComments : tagComments,
+      rawSource: rawSource == null ? this.rawSource : rawSource,
+      rawParameters: rawParameters == null ? this.rawParameters : rawParameters,
+      namedFilters: namedFilters == null ? this.namedFilters : namedFilters,
+      ignoredFilterNames: ignoredFilterNames == null ? this.ignoredFilterNames : ignoredFilterNames
+    )
+  end
+
+  ## Materializes fresh entities without enrolling them in the context tracker.
+  public def asNoTracking(): Query<T>
+    return this.configured(true, false, this.globalFilter, this.filtersDisabled, this.previous)
+  end
+
+  ## Resolves repeated keys within one materialization without context enrollment.
+  public def asNoTrackingWithIdentityResolution(): Query<T>
+    let mapping = this.mapping
+
+    if this.tracker == null && (mapping == null || !mapping.readOnly())
+      return this.failed(QueryFailure.UnsupportedCapability("identity resolution requires entity tracker metadata"))
+    end
+    return this.configured(true, true, this.globalFilter, this.filtersDisabled, this.previous)
+  end
+
+  public def asTracking(): Query<T>
+    return this.configured(false, false, this.globalFilter, this.filtersDisabled, this.previous)
+  end
+
+  ## Uses trusted composable SQL with separately bound provider-dialect parameters.
+  ## The SQL must expose mapped physical columns and form a valid SQL subquery.
+  public def fromSql(sql: String, parameters: readonly ParameterValues): Query<T>
+    if !this.isUnfilteredRoot() || this.rawSource != null
+      return this.failed(QueryFailure.UnsupportedCapability("SQL sources require an unfiltered query root"))
+    end
+    if host::stringByteLength(sql) == 0 || host::stringByteLength(sql) > 65536
+      return this.failed(QueryFailure.UnsupportedCapability("SQL source length must be between 1 and 65536 bytes"))
+    end
+    var index = 0
+
+    while index < host::stringByteLength(sql)
+      if host::stringByteAt(sql, index) == (0 as Byte)
+        return this.failed(QueryFailure.UnsupportedCapability("SQL source contains NUL"))
+      end
+      index = index + 1
+    end
+    let copied = new CompileState()
+
+    joinParameterCopy(parameters, copied)
+    let source = new SqlSource("(" + sql + "\n) AS \"" + this.source + "\"")
+
+    return this.configured(
+      this.trackingDisabled,
+      this.identityOnly,
+      this.globalFilter,
+      this.filtersDisabled,
+      this.previous,
+      rawSource: source,
+      rawParameters: new ParameterValues(copied.head, copied.count)
+    )
+  end
+
+  ## Includes each tag line as a SQL comment, retaining cumulative query tags.
+  public def tagWith(tag: String): Query<T>
+    if host::stringByteLength(tag) > 4096
+      return this.failed(QueryFailure.UnsupportedCapability("query tag exceeds 4096 bytes"))
+    end
+    var comments = "-- "
+    var index = 0
+    var start = 0
+
+    while index < host::stringByteLength(tag)
+      let byte = host::stringByteAt(tag, index) as Int
+
+      if byte == 0
+        return this.failed(QueryFailure.UnsupportedCapability("query tag contains NUL"))
+      end
+      if byte == 10 || byte == 13
+        comments = comments + host::stringSlice(tag, start, index - start) + "\n-- "
+        start = index + 1
+      end
+      index = index + 1
+    end
+    comments = this.tagComments + comments + host::stringSlice(tag, start, index - start) + "\n"
+
+    return this.configured(
+      this.trackingDisabled,
+      this.identityOnly,
+      this.globalFilter,
+      this.filtersDisabled,
+      this.previous,
+      comments
+    )
+  end
+
+  ## Installs a root predicate applied before every later pipeline stage.
+  public def withGlobalFilter(predicate: quote fn(T): Bool): Query<T>
+    if !this.isUnfilteredRoot()
+      return this.failed(QueryFailure.UnsupportedCapability("global filters require an unfiltered query root"))
+    end
+    let mapping = this.mapping
+
+    if mapping == null
+      return this.failed(QueryFailure.UnsupportedCapability("global filters require entity mapping metadata"))
+    end
+    let translated = new Predicate<T>(new Expression(
+        ExpressionKind.Scalar(),
+        scalarTree: predicate.tree(),
+        scalarMapping: mapping
+      ))
+    let current = this.globalFilter
+    let combined = current == null ? translated : current.and(translated)
+
+    return this.configured(this.trackingDisabled, this.identityOnly, combined, false, this.previous)
+  end
+
+  ## Disables root filters throughout this query's staged pipeline.
+  public def withNamedGlobalFilter(name: String, predicate: quote fn(T): Bool): Query<T>
+    if !this.isUnfilteredRoot()
+      return this.failed(QueryFailure.UnsupportedCapability("global filters require an unfiltered query root"))
+    end
+    if host::stringByteLength(name) == 0 || host::stringByteLength(name) > 256
+      return this.failed(QueryFailure.UnsupportedCapability("query filter name length must be between 1 and 256 bytes"))
+    end
+    let mapping = this.mapping
+
+    if mapping == null
+      return this.failed(QueryFailure.UnsupportedCapability("global filters require entity mapping metadata"))
+    end
+    let translated = new Predicate<T>(new Expression(
+        ExpressionKind.Scalar(),
+        scalarTree: predicate.tree(),
+        scalarMapping: mapping
+      ))
+    let named = new NamedQueryFilter<T>(name, translated, queryFilterRemove(this.namedFilters, name))
+
+    return this.configured(
+      this.trackingDisabled,
+      this.identityOnly,
+      this.globalFilter,
+      false,
+      this.previous,
+      namedFilters: named
+    )
+  end
+
+  ## Disables all root filters, or selected named filters, throughout the pipeline.
+  public def ignoreQueryFilters(names: String[]? = null): Query<T>
+    let prior = this.previous
+    var previous: Query<T>? = null
+
+    if names == null
+      if prior != null
+        previous = prior.ignoreQueryFilters()
+      end
+      return this.configured(this.trackingDisabled, this.identityOnly, this.globalFilter, true, previous)
+    end
+    if names.Length == 0
+      return this
+    end
+    var ignored = this.ignoredFilterNames
+
+    for name in names
+      ignored = new QueryFilterName(name, ignored)
+    end
+    if prior != null
+      previous = prior.ignoreQueryFilters(names)
+    end
+    return this.configured(
+      this.trackingDisabled,
+      this.identityOnly,
+      this.globalFilter,
+      this.filtersDisabled,
+      previous,
+      ignoredFilterNames: ignored
+    )
   end
 
   ## Exposes the staged query as a deferred source for further joins.
@@ -937,7 +1252,49 @@ class Query<T>
       end
     end
 
-    return new Relation<T>(build, this.provider(), bound: streamMaximum<T>(this))
+    let resolve: fn(): AsyncRowResolver<T>? = fn(): AsyncRowResolver<T>? do
+      let tracker = this.rowTracker()
+      var resolver: AsyncRowResolver<T>? = null
+
+      if tracker != null
+        resolver = tracker
+      end
+      return resolver
+    end
+
+    return new Relation<T>(
+      build,
+      this.provider(),
+      bound: streamMaximum<T>(this),
+      resolver: resolve,
+      owner: this.changeOwner(),
+      physicalSource: this.source,
+      trackingActive: this.tracker != null && !this.trackingDisabled
+    )
+  end
+
+  public def unionWith(other: Query<T>): Relation<T>
+    return this.asRelation().unionWith(other.asRelation())
+  end
+
+  public def concat(other: Query<T>): Relation<T>
+    return this.asRelation().concat(other.asRelation())
+  end
+
+  public def intersect(other: Query<T>): Relation<T>
+    return this.asRelation().intersect(other.asRelation())
+  end
+
+  public def except(other: Query<T>): Relation<T>
+    return this.asRelation().except(other.asRelation())
+  end
+
+  public def compileQuery(dialect: SqlDialect? = null): CompiledQueryResult<T>
+    return compileTypedQuery<T>(this, dialect)
+  end
+
+  internal readonly def identityResolutionOnly(): Bool
+    return this.identityOnly
   end
 
   ## Adds equality filters checked against the entity's declared public fields.
@@ -957,6 +1314,23 @@ class Query<T>
 
   public def selectShape<R>(shape: RowShape<T, R>): ShapeProjection<T, R>
     return neri_data::project(this, shape)
+  end
+
+  public def selectDecimal(expression: DecimalExpression<T>): ShapeProjection<T, Decimal>
+    return this.selectShape(decimalShape(expression))
+  end
+
+  public def matchingDecimal(predicate: DecimalPredicate<T>): Query<T>
+    let mapping = this.mapping
+
+    if mapping == null
+      return this.failed(QueryFailure.UnsupportedCapability("decimal predicates require mapped fields"))
+    end
+    return this.filtered(predicate.expression(mapping))
+  end
+
+  public def orderByDecimal(expression: DecimalExpression<T>, descending: Bool = false): Relation<T>
+    return decimalOrdered(this.asRelation(), expression, descending)
   end
 
   public def matching(predicate: quote fn(T): Bool): Query<T>
@@ -1015,7 +1389,16 @@ class Query<T>
       this.unique,
       this.thenTerms,
       changes: this.changes,
-      primaryOrderTree: this.primaryOrderTree
+      primaryOrderTree: this.primaryOrderTree,
+      trackingDisabled: this.trackingDisabled,
+      identityOnly: this.identityOnly,
+      globalFilter: this.globalFilter,
+      filtersDisabled: this.filtersDisabled,
+      tagComments: this.tagComments,
+      rawSource: this.rawSource,
+      rawParameters: this.rawParameters,
+      namedFilters: this.namedFilters,
+      ignoredFilterNames: this.ignoredFilterNames
     )
   end
 
@@ -1043,7 +1426,16 @@ class Query<T>
         this.unique,
         this.thenTerms,
         changes: this.changes,
-        primaryOrderTree: this.primaryOrderTree
+        primaryOrderTree: this.primaryOrderTree,
+        trackingDisabled: this.trackingDisabled,
+        identityOnly: this.identityOnly,
+        globalFilter: this.globalFilter,
+        filtersDisabled: this.filtersDisabled,
+        tagComments: this.tagComments,
+        rawSource: this.rawSource,
+        rawParameters: this.rawParameters,
+        namedFilters: this.namedFilters,
+        ignoredFilterNames: this.ignoredFilterNames
       )
     end
     return new Query<T>(
@@ -1063,7 +1455,16 @@ class Query<T>
       this.unique,
       this.thenTerms,
       changes: this.changes,
-      primaryOrderTree: this.primaryOrderTree
+      primaryOrderTree: this.primaryOrderTree,
+      trackingDisabled: this.trackingDisabled,
+      identityOnly: this.identityOnly,
+      globalFilter: this.globalFilter,
+      filtersDisabled: this.filtersDisabled,
+      tagComments: this.tagComments,
+      rawSource: this.rawSource,
+      rawParameters: this.rawParameters,
+      namedFilters: this.namedFilters,
+      ignoredFilterNames: this.ignoredFilterNames
     )
   end
 
@@ -1250,7 +1651,16 @@ class Query<T>
       previous: this,
       thenTerms: this.thenTerms,
       changes: this.changes,
-      primaryOrderTree: this.primaryOrderTree
+      primaryOrderTree: this.primaryOrderTree,
+      trackingDisabled: this.trackingDisabled,
+      identityOnly: this.identityOnly,
+      globalFilter: this.globalFilter,
+      filtersDisabled: this.filtersDisabled,
+      tagComments: this.tagComments,
+      rawSource: this.rawSource,
+      rawParameters: this.rawParameters,
+      namedFilters: this.namedFilters,
+      ignoredFilterNames: this.ignoredFilterNames
     )
   end
 
@@ -1286,7 +1696,16 @@ class Query<T>
       this.unique,
       this.thenTerms,
       changes: this.changes,
-      primaryOrderTree: this.primaryOrderTree
+      primaryOrderTree: this.primaryOrderTree,
+      trackingDisabled: this.trackingDisabled,
+      identityOnly: this.identityOnly,
+      globalFilter: this.globalFilter,
+      filtersDisabled: this.filtersDisabled,
+      tagComments: this.tagComments,
+      rawSource: this.rawSource,
+      rawParameters: this.rawParameters,
+      namedFilters: this.namedFilters,
+      ignoredFilterNames: this.ignoredFilterNames
     )
   end
 
@@ -1321,7 +1740,16 @@ class Query<T>
       this.unique,
       this.thenTerms,
       changes: this.changes,
-      primaryOrderTree: this.primaryOrderTree
+      primaryOrderTree: this.primaryOrderTree,
+      trackingDisabled: this.trackingDisabled,
+      identityOnly: this.identityOnly,
+      globalFilter: this.globalFilter,
+      filtersDisabled: this.filtersDisabled,
+      tagComments: this.tagComments,
+      rawSource: this.rawSource,
+      rawParameters: this.rawParameters,
+      namedFilters: this.namedFilters,
+      ignoredFilterNames: this.ignoredFilterNames
     )
   end
 
@@ -1347,7 +1775,16 @@ class Query<T>
       true,
       this.thenTerms,
       changes: this.changes,
-      primaryOrderTree: this.primaryOrderTree
+      primaryOrderTree: this.primaryOrderTree,
+      trackingDisabled: this.trackingDisabled,
+      identityOnly: this.identityOnly,
+      globalFilter: this.globalFilter,
+      filtersDisabled: this.filtersDisabled,
+      tagComments: this.tagComments,
+      rawSource: this.rawSource,
+      rawParameters: this.rawParameters,
+      namedFilters: this.namedFilters,
+      ignoredFilterNames: this.ignoredFilterNames
     )
   end
 
@@ -1428,7 +1865,16 @@ class Query<T>
           this.unique,
           appendOrder(this.thenTerms, "", descending, tree),
           changes: this.changes,
-          primaryOrderTree: this.primaryOrderTree
+          primaryOrderTree: this.primaryOrderTree,
+          trackingDisabled: this.trackingDisabled,
+          identityOnly: this.identityOnly,
+          globalFilter: this.globalFilter,
+          filtersDisabled: this.filtersDisabled,
+          tagComments: this.tagComments,
+          rawSource: this.rawSource,
+          rawParameters: this.rawParameters,
+          namedFilters: this.namedFilters,
+          ignoredFilterNames: this.ignoredFilterNames
         )
       case SelectionResult.Column(column)
         return new Query<T>(
@@ -1448,7 +1894,16 @@ class Query<T>
           this.unique,
           appendOrder(this.thenTerms, column.column(), descending),
           changes: this.changes,
-          primaryOrderTree: this.primaryOrderTree
+          primaryOrderTree: this.primaryOrderTree,
+          trackingDisabled: this.trackingDisabled,
+          identityOnly: this.identityOnly,
+          globalFilter: this.globalFilter,
+          filtersDisabled: this.filtersDisabled,
+          tagComments: this.tagComments,
+          rawSource: this.rawSource,
+          rawParameters: this.rawParameters,
+          namedFilters: this.namedFilters,
+          ignoredFilterNames: this.ignoredFilterNames
         )
     end
   end
@@ -1478,7 +1933,16 @@ class Query<T>
           offset: this.offset,
           unique: this.unique,
           changes: this.changes,
-          primaryOrderTree: tree
+          primaryOrderTree: tree,
+          trackingDisabled: this.trackingDisabled,
+          identityOnly: this.identityOnly,
+          globalFilter: this.globalFilter,
+          filtersDisabled: this.filtersDisabled,
+          tagComments: this.tagComments,
+          rawSource: this.rawSource,
+          rawParameters: this.rawParameters,
+          namedFilters: this.namedFilters,
+          ignoredFilterNames: this.ignoredFilterNames
         )
       case SelectionResult.Column(column)
         return new Query<T>(
@@ -1496,7 +1960,16 @@ class Query<T>
           this.previous,
           this.offset,
           this.unique,
-          changes: this.changes
+          changes: this.changes,
+          trackingDisabled: this.trackingDisabled,
+          identityOnly: this.identityOnly,
+          globalFilter: this.globalFilter,
+          filtersDisabled: this.filtersDisabled,
+          tagComments: this.tagComments,
+          rawSource: this.rawSource,
+          rawParameters: this.rawParameters,
+          namedFilters: this.namedFilters,
+          ignoredFilterNames: this.ignoredFilterNames
         )
     end
   end
@@ -1535,6 +2008,90 @@ class Query<T>
 
   public def streamWith(provider: Provider, visit: fn(T): Bool, options: StreamOptions? = null): StreamResult
     return streamTypedWith<T>(this, provider, visit, options)
+  end
+
+  ## Deletes all rows selected by the complete typed query pipeline.
+  private def startSetAsync(
+    compiled: SetPlanResult,
+    provider: Provider,
+    options: StreamOptions?
+  ): AsyncWriteStart
+    if !provider.supports(ProviderCapability.SetWrites())
+      return AsyncWriteStart.Failure(WriteFailure.Unsupported("provider does not support set writes"))
+    end
+    match compiled
+      case SetPlanResult.Failure(error)
+        return AsyncWriteStart.Failure(error)
+      case SetPlanResult.Plan(plan)
+        if plan.requiresCheckedScalars() && !provider.supports(ProviderCapability.CheckedScalarExpressions())
+          return AsyncWriteStart.Failure(WriteFailure.Unsupported("provider does not support checked scalar expressions"))
+        end
+        let owner = this.changes
+
+        return owner == null ? provider.beginSetAsync(
+          plan,
+          options
+        ) : owner.prepareSetAsync(
+          plan,
+          provider,
+          options
+        )
+
+    end
+  end
+
+  public def executeDeleteAsync(options: StreamOptions? = null): result::Result<AsyncWrite, WriteFailure>
+    let provider = this.boundProvider
+
+    if provider == null
+      return result::Result<AsyncWrite, WriteFailure>.Error(WriteFailure.Unsupported("bulk delete requires a provider"))
+    end
+    match this.startSetAsync(compileSetDelete<T>(this, provider.dialect()), provider, options)
+      case AsyncWriteStart.Failure(error)
+        return result::Result<AsyncWrite, WriteFailure>.Error(error)
+      case AsyncWriteStart.Started(driver)
+        let owned = new AsyncWrite(driver)
+
+        return result::Result<AsyncWrite, WriteFailure>.Ok(transfer owned)
+    end
+  end
+
+  public def executeUpdateAsync(
+    options: StreamOptions? = null,
+    labels changes: fields of T
+  ): result::Result<AsyncWrite, WriteFailure>
+    let provider = this.boundProvider
+
+    if provider == null
+      return result::Result<AsyncWrite, WriteFailure>.Error(WriteFailure.Unsupported("bulk update requires a provider"))
+    end
+    match this.startSetAsync(compileSetUpdate<T>(this, changes.pack(), provider.dialect()), provider, options)
+      case AsyncWriteStart.Failure(error)
+        return result::Result<AsyncWrite, WriteFailure>.Error(error)
+      case AsyncWriteStart.Started(driver)
+        let owned = new AsyncWrite(driver)
+
+        return result::Result<AsyncWrite, WriteFailure>.Ok(transfer owned)
+    end
+  end
+
+  public def executeUpdateSetAsync(
+    setters: readonly UpdateSet<T>,
+    options: StreamOptions? = null
+  ): result::Result<AsyncWrite, WriteFailure>
+    let provider = this.boundProvider
+
+    if provider == null
+      return result::Result<AsyncWrite, WriteFailure>.Error(WriteFailure.Unsupported("computed bulk update requires a provider"))
+    end
+    match this.startSetAsync(compileSetUpdateExpressions<T>(this, setters, provider.dialect()), provider, options)
+      case AsyncWriteStart.Failure(error)
+        return result::Result<AsyncWrite, WriteFailure>.Error(error)
+      case AsyncWriteStart.Started(driver)
+        let owned = new AsyncWrite(driver)
+
+        return result::Result<AsyncWrite, WriteFailure>.Ok(transfer owned)
+    end
   end
 
   ## Deletes all rows selected by the complete typed query pipeline.
@@ -1629,10 +2186,10 @@ class Query<T>
       case QueryResult.Failure(error)
         return QueryResult<T>.Failure(error)
       case QueryResult.Rows(rows)
-        let entityTracker = this.tracker
+        let entityTracker = this.rowTracker()
 
         ## An explicit provider override never populates this context's tracker.
-        if entityTracker != null && provider == null
+        if entityTracker != null && (provider == null || this.identityOnly)
           return entityTracker.resolveRows(rows)
         end
         return QueryResult<T>.Rows(rows)
@@ -1650,8 +2207,23 @@ class Query<T>
     return materializeStream<T>(provider, buildPlan)
   end
 
-  ## Returns the first decoded row, or null when the bounded query has no rows.
-  public def first(provider: Provider? = null): QueryValue<T?>
+  ## Requires a first row and reports an empty result as a cardinality failure.
+  public def first(provider: Provider? = null): QueryValue<T>
+    match this.take(1).all(provider)
+      case QueryResult.Failure(error)
+        return QueryValue<T>.Failure(error)
+      case QueryResult.Rows(rows)
+        let first = rows.first()
+
+        if first == null
+          return QueryValue<T>.Failure(QueryFailure.Cardinality("at least one", 0))
+        end
+        return QueryValue<T>.Value(first.value)
+    end
+  end
+
+  ## Returns the first decoded row, or null when the query has no rows.
+  public def firstOrDefault(provider: Provider? = null): QueryValue<T?>
     match this.take(1).all(provider)
       case QueryResult.Failure(error)
         return QueryValue<T?>.Failure(error)
@@ -1663,10 +2235,6 @@ class Query<T>
         end
         return QueryValue<T?>.Value(first.value)
     end
-  end
-
-  public def firstOrDefault(provider: Provider? = null): QueryValue<T?>
-    return this.first(provider)
   end
 
   private def probeSingle(provider: Provider?): QueryResult<T>
@@ -1685,9 +2253,9 @@ class Query<T>
         if rows.count() > 1
           return QueryResult<T>.Failure(QueryFailure.Cardinality("at most one", rows.count()))
         end
-        let entityTracker = this.tracker
+        let entityTracker = this.rowTracker()
 
-        if rows.count() == 1 && entityTracker != null && provider == null
+        if rows.count() == 1 && entityTracker != null && (provider == null || this.identityOnly)
           return entityTracker.resolveRows(rows)
         end
         return QueryResult<T>.Rows(rows)
@@ -1721,6 +2289,73 @@ class Query<T>
           return QueryValue<T?>.Value(null)
         end
         return QueryValue<T?>.Value(first.value)
+    end
+  end
+
+  ## Reports whether this query yields at least one row without materializing entities.
+  public def firstAsync(options: StreamOptions? = null): result::Result<AsyncValue<T>, QueryFailure>
+    match prepareRequiredTerminalAsync<T>(this, false, options)
+      case AsyncValueStart.Failure(error)
+        return result::Result<AsyncValue<T>, QueryFailure>.Error(error)
+      case AsyncValueStart.Started(driver)
+        let owned = new AsyncValue<T>(driver)
+
+        return result::Result<AsyncValue<T>, QueryFailure>.Ok(transfer owned)
+    end
+  end
+
+  public def firstOrDefaultAsync(options: StreamOptions? = null): result::Result<AsyncValue<T?>, QueryFailure>
+    match prepareOptionalTerminalAsync<T>(this, false, options)
+      case AsyncValueStart.Failure(error)
+        return result::Result<AsyncValue<T?>, QueryFailure>.Error(error)
+      case AsyncValueStart.Started(driver)
+        let owned = new AsyncValue<T?>(driver)
+
+        return result::Result<AsyncValue<T?>, QueryFailure>.Ok(transfer owned)
+    end
+  end
+
+  public def singleAsync(options: StreamOptions? = null): result::Result<AsyncValue<T>, QueryFailure>
+    match prepareRequiredTerminalAsync<T>(this, true, options)
+      case AsyncValueStart.Failure(error)
+        return result::Result<AsyncValue<T>, QueryFailure>.Error(error)
+      case AsyncValueStart.Started(driver)
+        let owned = new AsyncValue<T>(driver)
+
+        return result::Result<AsyncValue<T>, QueryFailure>.Ok(transfer owned)
+    end
+  end
+
+  public def singleOrDefaultAsync(options: StreamOptions? = null): result::Result<AsyncValue<T?>, QueryFailure>
+    match prepareOptionalTerminalAsync<T>(this, true, options)
+      case AsyncValueStart.Failure(error)
+        return result::Result<AsyncValue<T?>, QueryFailure>.Error(error)
+      case AsyncValueStart.Started(driver)
+        let owned = new AsyncValue<T?>(driver)
+
+        return result::Result<AsyncValue<T?>, QueryFailure>.Ok(transfer owned)
+    end
+  end
+
+  public def anyAsync(options: StreamOptions? = null): result::Result<AsyncValue<Bool>, QueryFailure>
+    match prepareAnyAsync<T>(this, options)
+      case AsyncValueStart.Failure(error)
+        return result::Result<AsyncValue<Bool>, QueryFailure>.Error(error)
+      case AsyncValueStart.Started(driver)
+        let owned = new AsyncValue<Bool>(driver)
+
+        return result::Result<AsyncValue<Bool>, QueryFailure>.Ok(transfer owned)
+    end
+  end
+
+  public def countAsync(options: StreamOptions? = null): result::Result<AsyncValue<Int>, QueryFailure>
+    match prepareCountAsync<T>(this, options)
+      case AsyncValueStart.Failure(error)
+        return result::Result<AsyncValue<Int>, QueryFailure>.Error(error)
+      case AsyncValueStart.Started(driver)
+        let owned = new AsyncValue<Int>(driver)
+
+        return result::Result<AsyncValue<Int>, QueryFailure>.Ok(transfer owned)
     end
   end
 
@@ -1764,92 +2399,16 @@ class Query<T>
     if !selected.supports(ProviderCapability.BoundedTypedReads())
       return QueryValue<Int>.Failure(QueryFailure.UnsupportedCapability("bounded-typed-reads"))
     end
-    let alias = "__neri_count"
-    let decoder = intScalar().decoder(alias)
-    let configured = this.limit
-
-    if this.previous != null || this.offset > 0 || this.unique
-      let mapping = this.mapping
-
-      if mapping == null
-        return QueryValue<Int>.Failure(QueryFailure.UnsupportedCapability("staged count requires entity mapping metadata"))
-      end
-      match compilePipeline<T, T>(
-        this,
-        this.decoder,
-        mappedSelection(mapping),
-        configured,
-        selected.dialect(),
-        true,
-        true
-      )
-        case CompileResult.Failure(error)
-          return QueryValue<Int>.Failure(error)
-        case CompileResult.Plan(inner)
-          let sql = "SELECT COUNT(*) AS \"" + alias + "\" FROM (" + inner.sql().sql() + ") AS \"__neri_count_source\" LIMIT 1"
-          let compiled = CompileResult<Int>.Plan(new TypedPlan<Int>(
-              new SqlPlan(sql, inner.parameterValues(), 1, decoder.columns(), inner.sql().requiresCheckedScalars()),
-              decoder
-            ))
-
-          match execute<Int>(compiled, selected)
-            case QueryResult.Failure(error)
-              return QueryValue<Int>.Failure(error)
-            case QueryResult.Rows(rows)
-              let first = rows.first()
-
-              if first == null
-                return QueryValue<Int>.Failure(QueryFailure.Provider(ProviderFailure.State("count query returned no row")))
-              end
-              return QueryValue<Int>.Value(first.value)
-          end
-      end
-    end
-
-    if configured == null
-      match execute<Int>(
-        compileTerminal(this, decoder, new SqlSelection("COUNT(*) AS \"" + alias + "\""), 1, selected.dialect(), false),
-        selected
-      )
-        case QueryResult.Failure(error)
-          return QueryValue<Int>.Failure(error)
-        case QueryResult.Rows(rows)
-          let first = rows.first()
-
-          if first == null
-            return QueryValue<Int>.Failure(QueryFailure.Provider(ProviderFailure.State("count query returned no row")))
-          end
-          return QueryValue<Int>.Value(first.value)
-      end
-    end
-    match compileTerminal(
-      this,
-      intScalar().decoder("__neri_count_input"),
-      new SqlSelection("1 AS \"__neri_count_input\""),
-      configured,
-      selected.dialect()
-    )
-      case CompileResult.Failure(error)
+    match execute<Int>(compileCountTerminal<T>(this, selected.dialect()), selected)
+      case QueryResult.Failure(error)
         return QueryValue<Int>.Failure(error)
-      case CompileResult.Plan(inner)
-        let plan = inner.sql()
-        let sql = "SELECT COUNT(*) AS \"" + alias + "\" FROM (" + plan.sql() + ") AS \"__neri_count_source\" LIMIT 1"
-        let compiled = CompileResult<Int>.Plan(new TypedPlan<Int>(
-            new SqlPlan(sql, inner.parameterValues(), 1, decoder.columns(), plan.requiresCheckedScalars()),
-            decoder
-          ))
+      case QueryResult.Rows(rows)
+        let first = rows.first()
 
-        match execute<Int>(compiled, selected)
-          case QueryResult.Failure(error)
-            return QueryValue<Int>.Failure(error)
-          case QueryResult.Rows(rows)
-            let first = rows.first()
-
-            if first == null
-              return QueryValue<Int>.Failure(QueryFailure.Provider(ProviderFailure.State("count query returned no row")))
-            end
-            return QueryValue<Int>.Value(first.value)
+        if first == null
+          return QueryValue<Int>.Failure(QueryFailure.Provider(ProviderFailure.State("count query returned no row")))
         end
+        return QueryValue<Int>.Value(first.value)
     end
   end
 
@@ -1997,12 +2556,17 @@ class Query<T>
   end
 
   private def mutationFailure(): QueryFailure?
-    let failure = this.failure
+    let failure = this.queryFailure()
 
     if failure != null
       return failure
     end
-    if this.predicate != null || this.orderTable != null || this.orderColumn != null || this.limit != null || this.previous != null || this.offset > 0 || this.unique
+    let mapping = this.mapping
+
+    if mapping != null && mapping.readOnly()
+      return QueryFailure.UnsupportedCapability("read-only entities cannot be tracked for writes")
+    end
+    if !this.isUnfilteredRoot() || this.rawSource != null
       return QueryFailure.UnsupportedCapability("entity mutations require an unfiltered query root")
     end
     return null
@@ -2026,7 +2590,7 @@ class Query<T>
     end
     let owner = this.changes
 
-    if this.tracker != null && owner != null
+    if owner != null
       return owner.operationFailure()
     end
     return this.failure
@@ -2034,6 +2598,25 @@ class Query<T>
 
   internal def filterExpression(): Expression?
     let value = this.predicate
+    var global = this.globalFilter
+
+    if !this.filtersDisabled && this.previous == null
+      var named = this.namedFilters
+
+      while named != null
+        if !queryFilterIgnored(this.ignoredFilterNames, named.name)
+          global = global == null ? named.predicate : global.and(named.predicate)
+        end
+        named = named.next
+      end
+    end
+
+    if global != null && !this.filtersDisabled && this.previous == null
+      if value != null
+        return new Expression(ExpressionKind.And(), left: global.expression, right: value.expression)
+      end
+      return global.expression
+    end
 
     if value != null
       return value.expression
@@ -2094,11 +2677,35 @@ class Query<T>
   end
 
   internal def rowTracker(): EntityTracker<T>?
+    let mapping = this.mapping
+    let tracker = this.tracker
+
+    if mapping != null && mapping.readOnly()
+      return null
+    end
+    if this.trackingDisabled
+      if this.identityOnly && tracker != null
+        return tracker.identityResolver()
+      end
+      return null
+    end
     return this.tracker
   end
 
   internal def changeOwner(): ChangeContext?
     return this.changes
+  end
+
+  internal readonly def queryComments(): String
+    return this.tagComments
+  end
+
+  internal def sqlSource(): SqlSource?
+    return this.rawSource
+  end
+
+  internal readonly def sqlSourceParameters(): readonly ParameterValues?
+    return this.rawParameters
   end
 
   internal readonly def isUnfilteredRoot(): Bool
@@ -2162,7 +2769,17 @@ def compileQueryRelationPlan<T>(
     let field = mapping.columnAt(fieldIndex)
 
     if field != null
-      sourceColumns = joinOrderColumns(sourceColumns, field.column(), field.typeName(), false)
+      var nullable = false
+      let decoderColumns = query.rowDecoder().columns()
+      var decoderIndex = 0
+
+      while decoderIndex < decoderColumns.count()
+        let decoderColumn = decoderColumns.at(decoderIndex)
+
+        nullable = decoderColumn.nullable() if decoderColumn.name() == field.column()
+        decoderIndex = decoderIndex + 1
+      end
+      sourceColumns = joinOrderColumns(sourceColumns, field.column(), field.storageTypeName(), nullable)
     end
     fieldIndex = fieldIndex + 1
   end
@@ -2170,7 +2787,7 @@ def compileQueryRelationPlan<T>(
 
   if orders == null
     return RelationBuildResult<T>.Plan(new RelationPlan<T>(
-        sourcePlan.sql().sql(),
+        query.queryComments() + sourcePlan.sql().sql(),
         sourcePlan.parameterValues(),
         sourceColumns,
         new Decoder<T>(read, sourceColumns),
@@ -2238,7 +2855,7 @@ def compileQueryRelationPlan<T>(
     return RelationBuildResult<T>.Failure(QueryFailure.Provider(ProviderFailure.State("relation source parameters cannot be rebased")))
   end
   joinParameterCopy(sourcePlan.parameterValues(), state)
-  let sql = "SELECT * FROM (SELECT " + selection + " FROM (" + shifted + ") AS \"" + source + "\") AS \"" + output + "\"" + joinOrderSql(
+  let sql = query.queryComments() + "SELECT * FROM (SELECT " + selection + " FROM (" + shifted + ") AS \"" + source + "\") AS \"" + output + "\"" + joinOrderSql(
     outputOrder,
     output
   )
@@ -2338,13 +2955,14 @@ def compilePipeline<T, R>(
           allowUnbounded: inner || unbounded,
           secondary: secondary,
           primaryOrderTree: primaryTree,
-          orderMapping: mapping
+          orderMapping: mapping,
+          comments: inner ? "" : query.queryComments()
         )
     end
   end
   let previous = query.prior()
-  var fromSql: SqlSource? = null
-  var prefix: readonly ParameterValues? = null
+  var fromSql = query.sqlSource()
+  var prefix = query.sqlSourceParameters()
 
   if previous != null
     if mapping == null
@@ -2406,7 +3024,8 @@ def compilePipeline<T, R>(
     inner || unbounded,
     secondary,
     primaryTree,
-    mapping
+    mapping,
+    inner ? "" : query.queryComments()
   )
 end
 
@@ -2741,7 +3360,8 @@ def compileQuery<T>(
   allowUnbounded: Bool = false,
   secondary: OrderTerm? = null,
   primaryOrderTree: readonly quotation::Tree? = null,
-  orderMapping: EntityMapping? = null
+  orderMapping: EntityMapping? = null,
+  comments: String = ""
 ): CompileResult<T>
   if !dialectIdentifierValid(source, dialect)
     return CompileResult<T>.Failure(QueryFailure.InvalidIdentifier(source))
@@ -2851,7 +3471,7 @@ def compileQuery<T>(
     end
     relation = shifted
   end
-  var sql = "SELECT " + (unique ? "DISTINCT " : "") + selection + " FROM " + relation
+  var sql = comments + "SELECT " + (unique ? "DISTINCT " : "") + selection + " FROM " + relation
 
   if predicate != null
     match compileExpression(predicate, state, source, dialect)

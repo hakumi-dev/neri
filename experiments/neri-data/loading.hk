@@ -227,6 +227,17 @@ class CollectionNavigation<P, D>
     this.stateJournal = stateJournal
   end
 
+  public def clearLoadedStates(): Void
+    let owner = this.stateOwner
+
+    if owner != null
+      owner.clearLoadedStates()
+      return
+    end
+    this.collectionStates.clear()
+    this.referenceStates.clear()
+  end
+
   public def collectionState(entity: P): NavigationLoadState
     let owner = this.stateOwner
 
@@ -474,7 +485,8 @@ def navigationWindowOrder<T>(
   return NavigationOrderResult.Sql(order)
 end
 
-class IncludedQuery<P, D>
+class IncludedQuery<P, D>: AsyncNavigationPlan<P, D>
+  private publicationObserver: (fn(TypedRows<P>, TypedRows<D>): Void)?
   private principals: Query<P>
   private dependents: Query<D>
   private selectedChildren: Query<D>?
@@ -493,10 +505,19 @@ class IncludedQuery<P, D>
     this.selectedChildren = selectedChildren
   end
 
+  public def beforePublication(observer: fn(TypedRows<P>, TypedRows<D>): Void): IncludedQuery<P, D>
+    let clone = new IncludedQuery<P, D>(this.principals, this.dependents, this.relation, this.selectedChildren)
+
+    clone.childMaximum = this.childMaximum
+    clone.publicationObserver = observer
+    return clone
+  end
+
   public def maxChildren(maximum: Int): IncludedQuery<P, D>
     let copy = new IncludedQuery<P, D>(this.principals, this.dependents, this.relation, this.selectedChildren)
 
     copy.childMaximum = maximum
+    copy.publicationObserver = this.publicationObserver
     return copy
   end
 
@@ -505,7 +526,109 @@ class IncludedQuery<P, D>
     let copy = new IncludedQuery<P, D>(this.principals, this.dependents, this.relation, query)
 
     copy.childMaximum = this.childMaximum
+    copy.publicationObserver = this.publicationObserver
     return copy
+  end
+
+  public def allAsync(options: StreamOptions? = null): result::Result<AsyncNavigation<P, D>, QueryFailure>
+    let invalid = this.validateQueries(true)
+
+    if invalid != null
+      return result::Result<AsyncNavigation<P, D>, QueryFailure>.Error(invalid)
+    end
+    match prepareAsyncNavigation<P, D>(this, options)
+      case AsyncNavigationStart.Failure(error)
+        return result::Result<AsyncNavigation<P, D>, QueryFailure>.Error(error)
+      case AsyncNavigationStart.Started(driver)
+        let owned = new AsyncNavigation<P, D>(driver)
+
+        return result::Result<AsyncNavigation<P, D>, QueryFailure>.Ok(transfer owned)
+    end
+  end
+
+  public def loadAsync(
+    rows: TypedRows<P>,
+    options: StreamOptions? = null
+  ): result::Result<AsyncNavigation<P, D>, QueryFailure>
+    let invalid = this.validateQueries(true)
+
+    if invalid != null
+      return result::Result<AsyncNavigation<P, D>, QueryFailure>.Error(invalid)
+    end
+    let owned = new AsyncNavigation<P, D>(new AsyncNavigationDriver<P, D>(this, options, rows: rows))
+
+    return result::Result<AsyncNavigation<P, D>, QueryFailure>.Ok(transfer owned)
+  end
+
+  public override def prepareRoot(options: StreamOptions?): AsyncQueryPreparation<P>
+    let invalid = this.validateQueries(true)
+
+    return invalid == null ? prepareQueryAsync<P>(this.principals, options) : AsyncQueryPreparation<P>.Failure(invalid)
+  end
+
+  internal override def checkpointRoots(journal: NavigationJournal): Void
+    let parents = this.principals.rowTracker()
+    let children = this.dependents.rowTracker()
+
+    if parents != null && children != null
+      checkpointNavigation(this.relation, parents, children, new TypedRows<P>(), new TypedRows<D>(), journal)
+    end
+  end
+
+  public override def navigationKeys(rows: TypedRows<P>): TypedRows<Cell>
+    let keys = new TypedRows<Cell>()
+    var row = rows.first()
+
+    while row != null
+      let key = this.relation.principalKey(row.value)
+      var existing = keys.first()
+      var found = false
+
+      while existing != null
+        found = found || navigationCellEqual(existing.value, key)
+        existing = existing.next
+      end
+      if !found
+        keys.add(key)
+      end
+      row = row.next
+    end
+    return keys
+  end
+
+  public override def navigationMaximum(): Int
+    return this.childMaximum
+  end
+
+  public override def prepareNavigation(
+    keys: TypedRows<Cell>,
+    maximum: Int,
+    options: StreamOptions?
+  ): AsyncQueryPreparation<D>
+    let selected = this.selectedChildren
+    let query = selected == null ? this.dependents.matchingTupleCells(this.relation.columns(), keys) : selected
+    let provider = query.provider()
+
+    if provider == null
+      return AsyncQueryPreparation<D>.Failure(QueryFailure.UnsupportedCapability("asynchronous navigation loading requires a provider"))
+    end
+    var compiled = CompileResult<D>.Failure(QueryFailure.UnsupportedCapability("navigation query is unavailable"))
+
+    if selected == null
+      compiled = compilePipeline<D, D>(query, query.rowDecoder(), null, null, provider.dialect(), unbounded: true)
+    else
+      compiled = this.compileSelectedChildren(selected, keys, maximum, provider.dialect())
+    end
+    match compiled
+      case CompileResult.Failure(error)
+        return AsyncQueryPreparation<D>.Failure(error)
+      case CompileResult.Plan(plan)
+        return prepareAsyncQuery<D>(provider, plan, options, maximumRows: maximum)
+    end
+  end
+
+  public override def publishNavigation(rows: TypedRows<P>, related: TypedRows<D>): QueryResult<P>
+    return this.load(rows, related)
   end
 
   public def all(): QueryResult<P>
@@ -514,15 +637,27 @@ class IncludedQuery<P, D>
     if invalid != null
       return QueryResult<P>.Failure(invalid)
     end
+    let journal = new NavigationJournal()
+
+    this.checkpointRoots(journal)
     match this.principals.all()
       case QueryResult.Failure(error)
+        journal.rollback()
         return QueryResult<P>.Failure(error)
       case QueryResult.Rows(rows)
-        return this.load(rows)
+        let result = this.load(rows)
+
+        match result
+          case QueryResult.Failure(error)
+            journal.rollback()
+          case QueryResult.Rows(loaded)
+            journal.discard()
+        end
+        return result
     end
   end
 
-  internal def validateQueries(): QueryFailure?
+  internal def validateQueries(asynchronous: Bool = false): QueryFailure?
     if this.childMaximum < 1 || this.childMaximum > 10000
       return QueryFailure.Provider(ProviderFailure.State("navigation child limit must be between 1 and 10000"))
     end
@@ -636,7 +771,7 @@ class IncludedQuery<P, D>
       return QueryFailure.UnsupportedCapability("navigation key tuple mappings do not match")
     end
     if selected != null
-      if !leftProvider.supports(ProviderCapability.StreamingReads())
+      if !asynchronous && !leftProvider.supports(ProviderCapability.StreamingReads())
         return QueryFailure.UnsupportedCapability("streaming-reads")
       end
       if (selected.rowOffset() > 0 || selected.rowLimit() != null) && !leftProvider.supports(ProviderCapability.WindowFunctions())
@@ -836,8 +971,21 @@ class IncludedQuery<P, D>
     end
   end
 
-  public def load(rows: TypedRows<P>): QueryResult<P>
-    let invalid = this.validateQueries()
+  public def load(rows: TypedRows<P>, prefetched: TypedRows<D>? = null): QueryResult<P>
+    let journal = new NavigationJournal()
+    let result = this.loadCore(rows, prefetched, journal)
+
+    match result
+      case QueryResult.Failure(error)
+        journal.rollback()
+      case QueryResult.Rows(loaded)
+        journal.discard()
+    end
+    return result
+  end
+
+  private def loadCore(rows: TypedRows<P>, prefetched: TypedRows<D>?, journal: NavigationJournal): QueryResult<P>
+    let invalid = this.validateQueries(prefetched != null)
 
     if invalid != null
       return QueryResult<P>.Failure(invalid)
@@ -908,7 +1056,17 @@ class IncludedQuery<P, D>
     let staged = new NavigationStage<D>(this.childMaximum)
     var batch: NavigationBucket<P, D>? = first
 
-    while batch != null
+    if prefetched != null
+      var current = prefetched.first()
+
+      while current != null
+        if !staged.accept(current.value)
+          return QueryResult<P>.Failure(QueryFailure.Provider(ProviderFailure.State("navigation child limit exceeded")))
+        end
+        current = current.next
+      end
+    end
+    while batch != null && prefetched == null
       let keys = new TypedRows<Cell>()
       var taken = 0
       var cursor: NavigationBucket<P, D>? = batch
@@ -1005,6 +1163,12 @@ class IncludedQuery<P, D>
       end
       stagedChild = stagedChild.next
     end
+    let publicationObserver = this.publicationObserver
+
+    if publicationObserver != null
+      publicationObserver(rows, staged.rows)
+    end
+    checkpointNavigation(this.relation, parentTracker, childTracker, rows, staged.rows, journal)
     match childTracker.resolveRows(staged.rows)
       case QueryResult.Failure(error)
         return QueryResult<P>.Failure(error)

@@ -162,6 +162,15 @@ class AsyncSaveProvider: Provider
     lease: Int? = null,
     validate: (fn(readonly WriteReturnedRows): WriteFailure?)? = null
   ): AsyncWriteStart
+    return this.startWriteAsync(batch, options, lease, validate)
+  end
+
+  internal def startWriteAsync(
+    batch: readonly WriteBatch,
+    options: StreamOptions? = null,
+    lease: Int? = null,
+    validate: (fn(readonly WriteReturnedRows): WriteFailure?)? = null
+  ): AsyncWriteStart
     this.writes = this.writes + 1
     let position = this.writes
     let edit = this.editOnSend
@@ -619,7 +628,292 @@ def emptyAsyncSave(): resources::Outcome<Int, WriteFailure>
   return 0
 end
 
+class AsyncSetContextProvider: AsyncSaveProvider
+  public setCalls: Int = 0
+
+  public override def beginSetAsync(
+    plan: readonly SetWritePlan,
+    options: StreamOptions? = null,
+    lease: Int? = null
+  ): AsyncWriteStart
+    this.setCalls = this.setCalls + 1
+    let finish: fn(): WriteResult = fn(): WriteResult do
+      return WriteResult.Saved(3)
+    end
+
+    return AsyncWriteStart.Started(new SaveContractWrite(finish))
+  end
+end
+
+def asyncSetAdmission(): Void
+  let provider = new AsyncSetContextProvider()
+  let context = new ChangeContext(provider)
+  let plan = new SetWritePlan("DELETE FROM items", new WriteValues())
+  let other = new AsyncSetContextProvider()
+
+  match context.prepareSetAsync(plan, other)
+    case AsyncWriteStart.Failure(error)
+    case AsyncWriteStart.Started(driver)
+      test::assertTrue(false)
+  end
+
+  test::assertEqual(provider.setCalls, 0)
+  match context.prepareSetAsync(plan, provider)
+    case AsyncWriteStart.Failure(error)
+      test::assertTrue(false)
+    case AsyncWriteStart.Started(driver)
+      match context.beginSaveAsync()
+        case AsyncSaveStart.Failure(error)
+        case AsyncSaveStart.Started(save)
+          test::assertTrue(false)
+      end
+      match context.prepareSetAsync(plan, provider)
+        case AsyncWriteStart.Failure(error)
+        case AsyncWriteStart.Started(second)
+          test::assertTrue(false)
+      end
+      match driver.poll()
+        case AsyncWritePoll.Pending(socket, interest)
+        case AsyncWritePoll.Completed(result)
+          test::assertTrue(false)
+      end
+      match context.pollSetCleanup()
+        case AsyncWritePoll.Completed(result)
+          expectAsyncSaved(result, 3)
+        case AsyncWritePoll.Pending(socket, interest)
+          test::assertTrue(false)
+      end
+
+      test::assertTrue(driver.close() == null)
+  end
+
+  test::assertEqual(provider.setCalls, 1)
+  test::assertEqual(provider.writes, 0)
+  match context.beginSaveAsync()
+    case AsyncSaveStart.Failure(error)
+      test::assertTrue(false)
+    case AsyncSaveStart.Started(save)
+      match save.poll()
+        case AsyncWritePoll.Completed(result)
+          expectAsyncSaved(result, 0)
+        case AsyncWritePoll.Pending(socket, interest)
+          test::assertTrue(false)
+      end
+
+      test::assertTrue(save.close() == null)
+  end
+end
+
+class PoolContractState
+  public created: Int = 0
+  public failReset: Bool = false
+end
+
+def pooledLease(pool: ContextPool<AsyncSaveItem>): resources::Outcome<Int, WriteFailure>
+  using lease <- pool.acquire()
+    let context = lease.context()
+
+    test::assertTrue(context != null)
+    if context != null
+      test::assertEqual(context.name, "sent")
+      context.name = "changed by previous borrower"
+    end
+    let blocked = blockedPoolLease(pool)
+
+    match blocked.completion
+      case resources::Completion.Failure(error)
+      case resources::Completion.Value(value)
+        test::assertTrue(false)
+    end
+
+    test::assertTrue(pool.close() != null)
+  end
+  return 0
+end
+
+def blockedPoolLease(pool: ContextPool<AsyncSaveItem>): resources::Outcome<Int, WriteFailure>
+  using lease <- pool.acquire()
+    test::assertTrue(false)
+  end
+  return 0
+end
+
+def poolResetBoundary(): Void
+  let state = new PoolContractState()
+  let factory: fn(): AsyncSaveItem = fn(): AsyncSaveItem do
+    state.created = state.created + 1
+    return new AsyncSaveItem()
+  end
+  let reset: fn(AsyncSaveItem): WriteFailure? = fn(context: AsyncSaveItem): WriteFailure? do
+    if state.failReset
+      return WriteFailure.Transaction("incomplete context cleanup")
+    end
+    context.name = "sent"
+    return null
+  end
+  let pool = new ContextPool<AsyncSaveItem>(factory, reset, 1)
+
+  assertAsyncOutcome(pooledLease(pool))
+  assertAsyncOutcome(pooledLease(pool))
+
+  test::assertEqual(state.created, 1)
+  test::assertEqual(pool.activeLeases(), 0)
+  state.failReset = true
+  let failedReturn = pooledLease(pool)
+
+  test::assertEqual(failedReturn.closeFailures.count(), 1)
+  test::assertEqual(pool.activeLeases(), 0)
+  state.failReset = false
+  assertAsyncOutcome(pooledLease(pool))
+
+  test::assertEqual(state.created, 2)
+  test::assertTrue(pool.close() == null)
+end
+
+class ContractSaveInterceptor: SaveInterceptor
+  public beforeCalls: Int = 0
+  public afterCalls: Int = 0
+  public reject: Bool = false
+
+  public override def beforeSave(context: ChangeContext): WriteFailure?
+    this.beforeCalls = this.beforeCalls + 1
+    match context.saveChanges()
+      case WriteResult.Failure(error)
+      case WriteResult.Saved(count)
+        test::assertTrue(false)
+      case WriteResult.SavedWithValues(count, values)
+        test::assertTrue(false)
+    end
+    return this.reject ? WriteFailure.Validation("save vetoed before database execution") : null
+  end
+
+  public override def afterSave(context: ChangeContext, result: WriteResult): Void
+    this.afterCalls = this.afterCalls + 1
+    expectAsyncSaved(result, 0)
+  end
+end
+
+def interceptedEmptySave(): resources::Outcome<Int, WriteFailure>
+  let provider = new AsyncSaveProvider()
+  let context = new ChangeContext(provider)
+  let interceptor = new ContractSaveInterceptor()
+
+  test::assertTrue(context.addSaveInterceptor(interceptor) == null)
+  using operation <- context.saveChangesAsync()
+    match operation.poll()
+      case AsyncWritePoll.Completed(result)
+        expectAsyncSaved(result, 0)
+      case AsyncWritePoll.Pending(socket, interest)
+        test::assertTrue(false)
+    end
+  end
+
+  test::assertEqual(interceptor.beforeCalls, 1)
+  test::assertEqual(interceptor.afterCalls, 1)
+  expectAsyncSaved(context.saveChanges(), 0)
+
+  test::assertEqual(interceptor.beforeCalls, 2)
+  test::assertEqual(interceptor.afterCalls, 2)
+  interceptor.reject = true
+  match context.beginSaveAsync()
+    case AsyncSaveStart.Failure(error)
+    case AsyncSaveStart.Started(driver)
+      test::assertTrue(false)
+  end
+
+  test::assertEqual(interceptor.beforeCalls, 3)
+  test::assertEqual(interceptor.afterCalls, 2)
+  test::assertEqual(provider.writes, 0)
+  return 0
+end
+
+class TransientSaveProvider: AsyncSaveProvider
+  private firstAttempt: Bool = true
+
+  public override def beginWriteAsync(
+    batch: readonly WriteBatch,
+    options: StreamOptions? = null,
+    lease: Int? = null,
+    validate: (fn(readonly WriteReturnedRows): WriteFailure?)? = null
+  ): AsyncWriteStart
+    if this.firstAttempt
+      this.firstAttempt = false
+      this.writes = this.writes + 1
+      let finish: fn(): WriteResult = fn(): WriteResult do
+        return WriteResult.Failure(WriteFailure.Provider(ProviderFailure.Driver(new DriverError(
+                "postgresql",
+                "write",
+                DriverErrorKind.Other(),
+                null,
+                null,
+                "40001",
+                "serialization conflict"
+              ))))
+      end
+
+      return AsyncWriteStart.Started(new SaveContractWrite(finish))
+    end
+    let parent: AsyncSaveProvider = this
+
+    return parent.startWriteAsync(batch, options, lease, validate)
+  end
+end
+
+def retriedSave(): resources::Outcome<Int, WriteFailure>
+  let provider = new TransientSaveProvider()
+  let context = new ChangeContext(provider)
+  let tracker = asyncTracker()
+  let item = new AsyncSaveItem()
+
+  context.register(tracker.changeSet())
+
+  test::assertTrue(tracker.add(item) == null)
+  using operation <- new SaveExecutionStrategy(1).saveChangesAsync(context)
+    test::assertTrue(tracker.remove(item) != null)
+    var complete: WriteResult? = null
+    var polls = 0
+
+    while complete == null && polls < 100
+      match operation.poll()
+        case AsyncWritePoll.Pending(socket, interest)
+        case AsyncWritePoll.Completed(result)
+          complete = result
+      end
+      polls = polls + 1
+    end
+
+    test::assertTrue(complete != null)
+    if complete != null
+      expectAsyncSaved(complete, 1)
+    end
+  end
+
+  test::assertEqual(provider.writes, 2)
+  test::assertEqual(provider.rollbacks, 1)
+  test::assertEqual(provider.commits, 1)
+  test::assertEqual(item.id, 51)
+  let contention = WriteFailure.Provider(ProviderFailure.Driver(new DriverError(
+        "sqlite",
+        "write",
+        DriverErrorKind.Contention(),
+        5,
+        5,
+        null,
+        "busy"
+      )))
+  let uncertain = WriteFailure.Cleanup(new WriteCleanupFailure(contention, WriteFailure.Transaction("rollback failed")))
+
+  test::assertTrue(retryableSaveFailure(contention))
+  test::assertTrue(!retryableSaveFailure(uncertain))
+  test::assertTrue(!retryableSaveFailure(WriteFailure.Concurrency("changed")))
+  return 0
+end
+
 def main(): Void
+  assertAsyncOutcome(retriedSave())
+  asyncSetAdmission()
+  poolResetBoundary()
+  assertAsyncOutcome(interceptedEmptySave())
   assertAsyncOutcome(emptyAsyncSave())
   assertAsyncOutcome(frozenSnapshot())
   assertAsyncOutcome(graphSave(false))

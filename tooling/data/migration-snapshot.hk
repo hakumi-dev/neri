@@ -1,5 +1,59 @@
 use host
 use neri_data
+use crypto
+
+def dataMigrationJsonCell(value: readonly Cell): String
+  match value
+    case Cell.Null()
+      return "{\"kind\":\"Null\"}"
+    case Cell.Bool(item)
+      return "{\"kind\":\"Bool\",\"value\":" + (item ? "true" : "false") + "}"
+    case Cell.Int(item)
+      return "{\"kind\":\"Int\",\"value\":" + lspQuote(item as String) + "}"
+    case Cell.Float(item)
+      return "{\"kind\":\"Float\",\"value\":" + lspQuote(item as String) + "}"
+    case Cell.Text(item)
+      return "{\"kind\":\"Text\",\"value\":" + lspQuote(item) + "}"
+    case Cell.Binary(item)
+      let encoded = crypto::encodeHex(item.snapshot())
+
+      return encoded == null ? "" : "{\"kind\":\"Binary\",\"value\":" + lspQuote(encoded) + "}"
+  end
+end
+
+def dataMigrationJsonSeed(seed: readonly SchemaSeed): String
+  var keys = "["
+  var keyValues = "["
+  var fields = "["
+  var values = "["
+  var index = 0
+
+  while index < seed.keyCount() + seed.count()
+    let key = index < seed.keyCount()
+    let position = key ? index : index - seed.keyCount()
+    let identity = key ? seed.keyAt(position) : seed.at(position)
+    let value = key ? seed.keyValueAt(position) : seed.valueAt(position)
+
+    if identity == null || value == null
+      return ""
+    end
+    let separator = position == 0 ? "" : ","
+    let code = dataMigrationJsonCell(value)
+
+    if code == ""
+      return ""
+    end
+    if key
+      keys = keys + separator + lspQuote(identity)
+      keyValues = keyValues + separator + code
+    else
+      fields = fields + separator + lspQuote(identity)
+      values = values + separator + code
+    end
+    index = index + 1
+  end
+  return "{\"keys\":" + keys + "],\"keyValues\":" + keyValues + "],\"fields\":" + fields + "],\"values\":" + values + "]}"
+end
 
 def dataMigrationJsonDefault(value: readonly SchemaDefault?): String
   if value == null
@@ -68,6 +122,21 @@ def dataMigrationJsonTable(table: readonly SchemaTable): String
         fieldIndex = fieldIndex + 1
       end
       output = output + "],\"unique\":" + (definition.unique() ? "true" : "false") + "}"
+    end
+    index = index + 1
+  end
+  output = output + "],\"seeds\":["
+  index = 0
+  while index < table.seedCount()
+    let seed = table.seedAt(index)
+
+    if seed != null
+      let code = dataMigrationJsonSeed(seed)
+
+      if code == ""
+        return ""
+      end
+      output = output + (index == 0 ? "" : ",") + code
     end
     index = index + 1
   end
@@ -310,7 +379,7 @@ def dataMigrationReadIndex(result: DataMigrationSnapshot, node: LspJson): Schema
 end
 
 def dataMigrationReadTable(result: DataMigrationSnapshot, node: LspJson): SchemaTable?
-  if !dataMigrationJsonObject(result, node, "table", ["identity", "name", "fields", "indexes"])
+  if !dataMigrationJsonObject(result, node, "table", ["identity", "name", "fields", "indexes", "seeds"])
     return null
   end
   let identity = dataMigrationJsonRequired(result, node, "identity", LspJsonType.String())
@@ -346,7 +415,89 @@ def dataMigrationReadTable(result: DataMigrationSnapshot, node: LspJson): Schema
     return definition == null ? new SchemaIndex("", []) : definition
   end
 
-  return result.error == "" ? new SchemaTable(identity.scalarText(), name.scalarText(), fields, indexes) : null
+  let seedsNode = node.get("seeds")
+  let seedCount = seedsNode.isMissing() ? 0 : dataMigrationJsonArrayLength(result, seedsNode)
+  let seeds = arrays::generate<SchemaSeed>(seedCount) do |position|
+    let current = dataMigrationNodeAt(seedsNode, position)
+
+    if current == null
+      result.fail("snapshot seed is missing")
+      return new SchemaSeed([], [], [], [])
+    end
+    return dataMigrationReadSeed(result, current)
+  end
+
+  return result.error == "" ? new SchemaTable(identity.scalarText(), name.scalarText(), fields, indexes, seeds) : null
+end
+
+def dataMigrationReadCell(result: DataMigrationSnapshot, node: LspJson): Cell
+  if node.get("kind").scalarText() == "Binary"
+    if !dataMigrationJsonObject(result, node, "binary seed value", ["kind", "value"]) || !node.get("value").isString()
+      result.fail("invalid binary seed value")
+      return Cell.Null()
+    end
+    let bytes = crypto::decodeHex(node.get("value").scalarText(), 2097152).bytes()
+
+    if bytes == null
+      result.fail("invalid binary seed value")
+      return Cell.Null()
+    end
+    return cellBinaryBytes(bytes)
+  end
+  let value = dataMigrationReadDefault(result, node)
+
+  if value == null
+    result.fail("invalid typed seed value")
+    return Cell.Null()
+  end
+  match value
+    case SchemaDefault.Null()
+      return Cell.Null()
+    case SchemaDefault.Bool(item)
+      return Cell.Bool(item)
+    case SchemaDefault.Int(item)
+      return Cell.Int(item)
+    case SchemaDefault.Float(item)
+      return Cell.Float(item)
+    case SchemaDefault.Text(item)
+      return Cell.Text(item)
+  end
+end
+
+def dataMigrationReadSeed(result: DataMigrationSnapshot, node: LspJson): SchemaSeed
+  if !dataMigrationJsonObject(result, node, "seed", ["keys", "keyValues", "fields", "values"])
+    return new SchemaSeed([], [], [], [])
+  end
+  return new SchemaSeed(
+    dataMigrationReadStrings(result, node.get("keys")),
+    dataMigrationReadCells(result, node.get("keyValues")),
+    dataMigrationReadStrings(result, node.get("fields")),
+    dataMigrationReadCells(result, node.get("values"))
+  )
+end
+
+def dataMigrationReadStrings(result: DataMigrationSnapshot, node: LspJson): String[]
+  return arrays::generate<String>(dataMigrationJsonArrayLength(result, node)) do |position|
+    let value = dataMigrationNodeAt(node, position)
+
+    if value == null || !value.isString()
+      result.fail("seed field must be a string")
+      return ""
+    end
+    return value.scalarText()
+  end
+end
+
+def dataMigrationReadCells(result: DataMigrationSnapshot, node: LspJson): Cell[]
+  return arrays::generate<Cell>(dataMigrationJsonArrayLength(result, node)) do |position|
+    let value = dataMigrationNodeAt(node, position)
+
+    if value == null
+      result.fail("seed value is missing")
+      return Cell.Null()
+    end
+    return dataMigrationReadCell(result, value)
+  end
 end
 
 def dataMigrationReadSnapshot(text: String): DataMigrationSnapshot

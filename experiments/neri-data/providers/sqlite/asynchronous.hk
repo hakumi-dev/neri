@@ -100,7 +100,7 @@ class SQLiteAsyncProvider: Provider
       case ProviderCapability.StreamingReads()
         return false
       case ProviderCapability.SetWrites()
-        return false
+        return !this.closed
     end
   end
 
@@ -319,6 +319,90 @@ class SQLiteAsyncProvider: Provider
         token,
         validate
       ))
+  end
+
+  public override def beginSetAsync(
+    plan: readonly SetWritePlan,
+    options: StreamOptions? = null,
+    lease: Int? = null
+  ): AsyncWriteStart
+    let unavailable = this.admit()
+
+    if unavailable != null
+      return AsyncWriteStart.Failure(WriteFailure.Provider(unavailable))
+    end
+    if (lease == null && this.activeLease != 0) || (lease != null && (lease <= 0 || lease != this.activeLease))
+      return AsyncWriteStart.Failure(WriteFailure.Transaction("SQLite asynchronous set write requires a valid lease or idle connection"))
+    end
+    let deadline = sqliteAsyncDeadline(options, true)
+    let token = options == null ? null : options.token()
+
+    if deadline == null
+      return AsyncWriteStart.Failure(WriteFailure.Validation("invalid SQLite asynchronous timeout"))
+    end
+    if token != null && token.cancelled()
+      return AsyncWriteStart.Failure(WriteFailure.Provider(sqliteAsyncInterrupted()))
+    end
+    let batch = new WriteBatch()
+
+    batch.add(plan.sql(), copyWriteValues(plan.parameters()), 0)
+    this.busy = true
+    return AsyncWriteStart.Started(new SQLiteAsyncWrite(this, batch, lease, deadline, token, null, true))
+  end
+
+  public override def beginMigrationAsync(
+    catalog: readonly MigrationSet,
+    target: String? = null,
+    options: StreamOptions? = null
+  ): AsyncMigrationStart
+    let unavailable = this.admit()
+    let invalid = catalog.validate()
+
+    if unavailable != null
+      return AsyncMigrationStart.Failure(MigrationFailure.Provider(unavailable))
+    end
+    if this.activeLease != 0
+      return AsyncMigrationStart.Failure(MigrationFailure.Unsupported("SQLite migrations require an idle connection"))
+    end
+    if invalid != null || catalog.count() > 1000
+      return AsyncMigrationStart.Failure(MigrationFailure.Validation(invalid == null ? "SQLite migration catalog exceeds 1000 entries" : invalid))
+    end
+    let deadline = sqliteAsyncDeadline(options, true)
+    let token = options == null ? null : options.token()
+
+    if deadline == null
+      return AsyncMigrationStart.Failure(MigrationFailure.Validation("invalid SQLite asynchronous timeout"))
+    end
+    if token != null && token.cancelled()
+      return AsyncMigrationStart.Failure(MigrationFailure.Provider(sqliteAsyncInterrupted()))
+    end
+    let input = sqliteWireMigrationRequest(catalog, target, deadline)
+
+    if input == null
+      return AsyncMigrationStart.Failure(MigrationFailure.Validation("SQLite async migration request exceeds 32 MiB"))
+    end
+    match this.submitJob(input)
+      case SQLiteJobStart.Failure(error)
+        return AsyncMigrationStart.Failure(MigrationFailure.Provider(error))
+      case SQLiteJobStart.Started(ticket)
+        this.busy = true
+        return AsyncMigrationStart.Started(new SQLiteAsyncMigration(this, ticket, deadline, token))
+    end
+  end
+
+  public def migrateAsync(
+    catalog: readonly MigrationSet,
+    target: String? = null,
+    options: StreamOptions? = null
+  ): result::Result<AsyncMigration, MigrationFailure>
+    match this.beginMigrationAsync(catalog, target, options)
+      case AsyncMigrationStart.Failure(error)
+        return result::Result<AsyncMigration, MigrationFailure>.Error(error)
+      case AsyncMigrationStart.Started(driver)
+        let owned = new AsyncMigration(driver)
+
+        return result::Result<AsyncMigration, MigrationFailure>.Ok(transfer owned)
+    end
   end
 
   internal def cancelJob(ticket: UInt64): ProviderFailure?
@@ -553,5 +637,102 @@ resource class SQLiteAsyncSession
     let error = this.owned.closeFailure()
 
     return error == null ? null : providerResourceFailure(error, "sqlite.async.close")
+  end
+end
+
+## Migration work and rollback stay on the connection's isolated worker heap.
+class SQLiteAsyncMigration: AsyncMigrationDriver
+  private owner: SQLiteAsyncProvider
+  private ticket: UInt64
+  private deadline: Int?
+  private token: CancellationToken?
+  private terminal: MigrationResult?
+  private cancelled: Bool = false
+  private cancelFailure: ProviderFailure?
+
+  def init(owner: SQLiteAsyncProvider, ticket: UInt64, deadline: Int?, token: CancellationToken?): Void
+    this.owner = owner
+    this.ticket = ticket
+    this.deadline = deadline
+    this.token = token
+  end
+
+  public override def cancel(): Void
+    if !this.cancelled && this.terminal == null
+      this.cancelled = true
+      this.cancelFailure = this.owner.cancelJob(this.ticket)
+    end
+  end
+
+  private def complete(result: MigrationResult): AsyncMigrationPoll
+    this.owner.finishOperation()
+    this.terminal = result
+    return AsyncMigrationPoll.Completed(result)
+  end
+
+  public override def poll(): AsyncMigrationPoll
+    let terminal = this.terminal
+
+    if terminal != null
+      return AsyncMigrationPoll.Completed(terminal)
+    end
+    let token = this.token
+
+    if (token != null && token.cancelled()) || streamTimedOut(this.deadline)
+      this.cancel()
+    end
+    match this.owner.pollJob(this.ticket)
+      case SQLiteWorkerPoll.Pending()
+        return AsyncMigrationPoll.Pending(this.owner.readiness(), AsyncInterest.Read())
+      case SQLiteWorkerPoll.Failure(error)
+        return this.complete(MigrationResult.Failure(MigrationFailure.Provider(error)))
+      case SQLiteWorkerPoll.Completed(bytes)
+        let reader = new SQLiteWireReader(bytes)
+        let tag = reader.integer()
+        var result = MigrationResult.Applied(0)
+
+        if tag == 0
+          let count = reader.integer()
+
+          if count < 0 || count > 1000
+            reader.reject()
+          end
+          result = MigrationResult.Applied(count)
+        else if tag == 1
+          result = MigrationResult.Failure(sqliteWireReadMigrationFailure(reader))
+        else
+          reader.reject()
+        end
+        if !reader.finished()
+          result = MigrationResult.Failure(MigrationFailure.Provider(ProviderFailure.State("SQLite async migration response is malformed")))
+        end
+        let cancelFailure = this.cancelFailure
+
+        if cancelFailure != null
+          match result
+            case MigrationResult.Failure(primary)
+              result = MigrationResult.Failure(MigrationFailure.Cleanup(new MigrationCleanupFailure(
+                    primary,
+                    cancelFailure
+                  )))
+            case MigrationResult.Applied(count)
+              result = MigrationResult.Failure(MigrationFailure.Provider(cancelFailure))
+          end
+        end
+        return this.complete(result)
+    end
+  end
+
+  public override def close(): MigrationFailure?
+    if this.terminal == null
+      this.cancel()
+      match this.poll()
+        case AsyncMigrationPoll.Completed(result)
+        case AsyncMigrationPoll.Pending(socket, interest)
+          this.owner.finishOperation()
+          return MigrationFailure.Provider(ProviderFailure.State("SQLite async migration cleanup is pending; the worker drains before reusing the session"))
+      end
+    end
+    return null
   end
 end

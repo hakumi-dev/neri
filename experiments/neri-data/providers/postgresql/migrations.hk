@@ -147,6 +147,50 @@ def pgMigrationFailure(provider: PostgreSQLProvider, lease: Int, primary: Migrat
   end
 end
 
+def pgMigrationOperations(provider: PostgreSQLProvider, migration: readonly Migration, forward: Bool): MigrationFailure?
+  let count = forward ? migration.upCount() : migration.downCount()
+  var index = 0
+
+  while index < count
+    let operation = forward ? migration.upAt(index) : migration.downAt(index)
+
+    if operation == null
+      return MigrationFailure.Validation("migration has a missing operation")
+    end
+    if schemaSeedOperation(operation)
+      match compileSeed(operation, SqlDialect.PostgreSql())
+        case SetPlanResult.Failure(error)
+          return MigrationFailure.Validation(writeFailureMessage(error))
+        case SetPlanResult.Plan(plan)
+          match provider.command(plan.sql(), copyWriteValues(plan.parameters()))
+            case PostgreSQLCommandResult.Failure(error)
+              return MigrationFailure.Provider(error)
+            case PostgreSQLCommandResult.Completed(changed, row)
+              if changed != 1
+                return MigrationFailure.Drift("PostgreSQL seed write must affect exactly one row")
+              end
+          end
+      end
+      index = index + 1
+    else
+      let finish = schemaMigrationSegmentEnd(migration, forward, index)
+
+      match compilePostgresSchemaSegment(migration, forward, index, finish)
+        case SchemaCompileResult.Failure(message)
+          return MigrationFailure.Unsupported(message)
+        case SchemaCompileResult.Statement(sql)
+          match provider.command(sql, new WriteValues(), script: true)
+            case PostgreSQLCommandResult.Failure(error)
+              return MigrationFailure.Provider(error)
+            case PostgreSQLCommandResult.Completed(changed, row)
+          end
+      end
+      index = finish
+    end
+  end
+  return null
+end
+
 def pgMigrate(provider: PostgreSQLProvider, catalog: readonly MigrationSet, target: String?): MigrationResult
   let invalid = catalog.validate()
 
@@ -207,15 +251,10 @@ def pgMigrate(provider: PostgreSQLProvider, catalog: readonly MigrationSet, targ
                 MigrationFailure.Validation("migration catalog has a missing entry")
               )
             end
-            match compilePostgresMigration(migration, forward)
-              case SchemaCompileResult.Failure(message)
-                return pgMigrationFailure(provider, lease, MigrationFailure.Unsupported(message))
-              case SchemaCompileResult.Statement(sql)
-                match provider.command(sql, new WriteValues(), script: true)
-                  case PostgreSQLCommandResult.Failure(error)
-                    return pgMigrationFailure(provider, lease, MigrationFailure.Provider(error))
-                  case PostgreSQLCommandResult.Completed(count, row)
-                end
+            let operationFailure = pgMigrationOperations(provider, migration, forward)
+
+            if operationFailure != null
+              return pgMigrationFailure(provider, lease, operationFailure)
             end
             let values = new CompileState()
 

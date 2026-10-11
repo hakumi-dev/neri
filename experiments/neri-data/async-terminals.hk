@@ -1,0 +1,248 @@
+use result
+namespace neri_data
+
+enum AsyncValuePoll<T>
+  case Pending(socket: Int, interest: AsyncInterest)
+  case Completed(result: QueryValue<T>)
+end
+
+abstract class AsyncValueDriver<T>
+  public abstract def poll(): AsyncValuePoll<T>
+  public abstract def cancel(): Void
+  public abstract def close(): ProviderFailure?
+end
+
+enum AsyncValueStart<T>
+  case Started(driver: AsyncValueDriver<T>)
+  case Failure(error: QueryFailure)
+end
+
+## Owns a nonblocking scalar terminal until completion or explicit cancellation.
+resource class AsyncValue<T>
+  private driver: AsyncValueDriver<T>
+
+  def init(driver: AsyncValueDriver<T>): Void
+    this.driver = driver
+  end
+
+  public def poll(): AsyncValuePoll<T>
+    return this.driver.poll()
+  end
+
+  public def cancel(): Void
+    this.driver.cancel()
+  end
+
+  public def close(): result::Failure?
+    let failure = this.driver.close()
+
+    return failure == null ? null : providerResourceFailure(failure, "data.async.scalar.close")
+  end
+end
+
+class AsyncScalarRead<T, R>: AsyncValueDriver<R>
+  private read: AsyncBufferedRead<T>
+  private finish: fn(TypedRows<T>): QueryValue<R>
+  private terminal: QueryValue<R>?
+
+  def init(read: AsyncBufferedRead<T>, finish: fn(TypedRows<T>): QueryValue<R>): Void
+    this.read = read
+    this.finish = finish
+  end
+
+  public override def poll(): AsyncValuePoll<R>
+    let terminal = this.terminal
+
+    if terminal != null
+      return AsyncValuePoll<R>.Completed(terminal)
+    end
+    match this.read.poll()
+      case AsyncQueryPoll.Pending(socket, interest)
+        return AsyncValuePoll<R>.Pending(socket, interest)
+      case AsyncQueryPoll.Completed(result)
+        match result
+          case QueryResult.Failure(error)
+            this.terminal = QueryValue<R>.Failure(error)
+          case QueryResult.Rows(rows)
+            this.terminal = this.finish(rows)
+        end
+    end
+    let completed = this.terminal
+
+    if completed != null
+      return AsyncValuePoll<R>.Completed(completed)
+    end
+    return AsyncValuePoll<R>.Pending(-1, AsyncInterest.Read())
+  end
+
+  public override def cancel(): Void
+    let failure = this.read.close()
+
+    if this.terminal == null
+      this.terminal = QueryValue<R>.Failure(failure == null ? QueryFailure.Provider(ProviderFailure.State("asynchronous scalar query cancelled")) : QueryFailure.Provider(failure))
+    end
+  end
+
+  public override def close(): ProviderFailure?
+    return this.read.close()
+  end
+end
+
+def prepareScalarAsync<T, R>(
+  provider: Provider?,
+  compiled: CompileResult<T>,
+  finish: fn(TypedRows<T>): QueryValue<R>,
+  options: StreamOptions?
+): AsyncValueStart<R>
+  match compiled
+    case CompileResult.Failure(error)
+      return AsyncValueStart<R>.Failure(error)
+    case CompileResult.Plan(plan)
+      match prepareAsyncQuery<T>(provider, plan, options, maximumRows: plan.sql().limit())
+        case AsyncQueryPreparation.Failure(error)
+          return AsyncValueStart<R>.Failure(error)
+        case AsyncQueryPreparation.Ready(driver, readyPlan, tracker)
+          return AsyncValueStart<R>.Started(new AsyncScalarRead<T, R>(
+              new AsyncBufferedRead<T>(driver, readyPlan),
+              finish
+            ))
+      end
+  end
+end
+
+def resolveTerminalRows<T>(query: Query<T>, rows: TypedRows<T>, single: Bool): QueryResult<T>
+  if single && rows.count() > 1
+    return QueryResult<T>.Failure(QueryFailure.Cardinality("at most one", rows.count()))
+  end
+  let tracker = query.rowTracker()
+
+  return tracker == null ? QueryResult<T>.Rows(rows) : tracker.resolveRows(rows)
+end
+
+def prepareRequiredTerminalAsync<T>(query: Query<T>, single: Bool, options: StreamOptions?): AsyncValueStart<T>
+  let provider = query.provider()
+  let bounded = query.take(single ? 2 : 1)
+  let finish: fn(TypedRows<T>): QueryValue<T> = fn(rows: TypedRows<T>): QueryValue<T> do
+    match resolveTerminalRows(query, rows, single)
+      case QueryResult.Failure(error)
+        return QueryValue<T>.Failure(error)
+      case QueryResult.Rows(resolved)
+        let first = resolved.first()
+
+        if first == null
+          return QueryValue<T>.Failure(QueryFailure.Cardinality(single ? "exactly one" : "at least one", 0))
+        end
+        return QueryValue<T>.Value(first.value)
+    end
+  end
+
+  return prepareScalarAsync<T, T>(
+    provider,
+    bounded.buildPlan(provider == null ? SqlDialect.QuestionMark() : provider.dialect()),
+    finish,
+    options
+  )
+end
+
+def prepareOptionalTerminalAsync<T>(query: Query<T>, single: Bool, options: StreamOptions?): AsyncValueStart<T?>
+  let provider = query.provider()
+  let bounded = query.take(single ? 2 : 1)
+  let finish: fn(TypedRows<T>): QueryValue<T?> = fn(rows: TypedRows<T>): QueryValue<T?> do
+    match resolveTerminalRows(query, rows, single)
+      case QueryResult.Failure(error)
+        return QueryValue<T?>.Failure(error)
+      case QueryResult.Rows(resolved)
+        let first = resolved.first()
+
+        return QueryValue<T?>.Value(first == null ? null : first.value)
+    end
+  end
+
+  return prepareScalarAsync<T, T?>(
+    provider,
+    bounded.buildPlan(provider == null ? SqlDialect.QuestionMark() : provider.dialect()),
+    finish,
+    options
+  )
+end
+
+def prepareAnyAsync<T>(query: Query<T>, options: StreamOptions?): AsyncValueStart<Bool>
+  let provider = query.provider()
+  let finish: fn(TypedRows<Int>): QueryValue<Bool> = fn(rows: TypedRows<Int>): QueryValue<Bool> do
+    return QueryValue<Bool>.Value(rows.count() != 0)
+  end
+  let compiled = compileTerminal<T, Int>(
+    query,
+    intScalar().decoder("__neri_any"),
+    new SqlSelection("1 AS \"__neri_any\""),
+    1,
+    provider == null ? SqlDialect.QuestionMark() : provider.dialect(),
+    false
+  )
+
+  return prepareScalarAsync<Int, Bool>(provider, compiled, finish, options)
+end
+
+def compileCountTerminal<T>(query: Query<T>, dialect: SqlDialect): CompileResult<Int>
+  let alias = "__neri_count"
+  let decoder = intScalar().decoder(alias)
+  let configured = query.rowLimit()
+
+  if query.prior() != null || query.rowOffset() > 0 || query.isDistinct()
+    let mapping = query.entityMapping()
+
+    if mapping == null
+      return CompileResult<Int>.Failure(QueryFailure.UnsupportedCapability("staged count requires entity mapping metadata"))
+    end
+    match compilePipeline<T, T>(query, query.rowDecoder(), mappedSelection(mapping), configured, dialect, true, true)
+      case CompileResult.Failure(error)
+        return CompileResult<Int>.Failure(error)
+      case CompileResult.Plan(plan)
+        let sql = query.queryComments() + "SELECT COUNT(*) AS \"" + alias + "\" FROM (" + plan.sql().sql() + ") AS \"__neri_count_source\" LIMIT 1"
+
+        return CompileResult<Int>.Plan(new TypedPlan<Int>(
+            new SqlPlan(sql, plan.parameterValues(), 1, decoder.columns(), plan.sql().requiresCheckedScalars()),
+            decoder
+          ))
+    end
+  end
+  if configured == null
+    return compileTerminal<T, Int>(query, decoder, new SqlSelection("COUNT(*) AS \"" + alias + "\""), 1, dialect, false)
+  end
+  match compileTerminal<T, Int>(
+    query,
+    intScalar().decoder("__neri_count_input"),
+    new SqlSelection("1 AS \"__neri_count_input\""),
+    configured,
+    dialect
+  )
+    case CompileResult.Failure(error)
+      return CompileResult<Int>.Failure(error)
+    case CompileResult.Plan(plan)
+      let sql = "SELECT COUNT(*) AS \"" + alias + "\" FROM (" + plan.sql().sql() + ") AS \"__neri_count_source\" LIMIT 1"
+
+      return CompileResult<Int>.Plan(new TypedPlan<Int>(
+          new SqlPlan(sql, plan.parameterValues(), 1, decoder.columns(), plan.sql().requiresCheckedScalars()),
+          decoder
+        ))
+  end
+end
+
+def prepareCountAsync<T>(query: Query<T>, options: StreamOptions?): AsyncValueStart<Int>
+  let provider = query.provider()
+  let finish: fn(TypedRows<Int>): QueryValue<Int> = fn(rows: TypedRows<Int>): QueryValue<Int> do
+    let first = rows.first()
+
+    if first == null
+      return QueryValue<Int>.Failure(QueryFailure.Provider(ProviderFailure.State("count query returned no row")))
+    end
+    return QueryValue<Int>.Value(first.value)
+  end
+
+  return prepareScalarAsync<Int, Int>(
+    provider,
+    compileCountTerminal(query, provider == null ? SqlDialect.QuestionMark() : provider.dialect()),
+    finish,
+    options
+  )
+end

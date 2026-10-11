@@ -1,18 +1,18 @@
 # Provider architecture and verified references
 
 Neri Data separates typed query construction, SQL planning, provider execution,
-and entity decoding. Its first concrete provider reads and writes SQLite databases.
+and entity decoding. Its concrete providers read and write SQLite and PostgreSQL databases.
 The generated `Database` accepts a borrowed provider, so application queries use
 `db.customers.where(active: true).take(20).all()` without repeating connection
 selection. Explicit `all(provider)` remains available.
 
 The context tracks mapped scalar snapshots and one entity instance per key.
 Its `saveChanges()` submits inserts, changed-column updates, and deletes as one
-atomic provider batch. SQLite writes require an explicit writable open. There
-are no lazy loading or automatic connection pooling. Typed
+atomic provider batch. SQLite writes require an explicit writable open. Explicit lazy accessors and bounded context pooling are available; provider
+connections remain application-owned. Typed
 [joins and compositional projections](JOINS-AND-PROJECTIONS.md) produce
 untracked query results. Typed
-[migrations and schema inspection](MIGRATIONS.md) expose SQLite schema lifecycle
+[migrations and schema inspection](MIGRATIONS.md) expose guarded schema lifecycle
 operations separately from tracked entity writes. The
 context borrows its provider: the caller closes it after all operations.
 `SQLiteSession.open(path)`, `openWritable(path)`, and `createWritable(path)`

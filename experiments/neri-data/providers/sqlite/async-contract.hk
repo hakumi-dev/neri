@@ -13,6 +13,9 @@ def asyncMaterialization(path: String): resources::Outcome<Int, QueryFailure>
     case result::Result.Ok(provider)
       verifyAsyncProviderWrites(provider)
       verifyAsyncProviderTrackedSave(provider)
+      verifyAsyncProviderSetWrites(provider)
+      verifyAsyncProviderMigrations(provider)
+      verifySQLiteAsyncSchemaRebuild(provider)
       let columns = new ResultColumns([new ResultColumn("id", ResultColumnKind.Int())])
       let read: fn(RawRow): DecodeResult<Int> = fn(row: RawRow): DecodeResult<Int> do
         return decodeInt(row, "id")
@@ -122,4 +125,111 @@ def main(): Void
     case resources::Completion.Failure(error)
       test::assertTrue(false)
   end
+end
+
+## Full worker catalog copies preserve rebuild definitions and foreign-key tuples.
+def verifySQLiteAsyncSchemaRebuild(provider: SQLiteAsyncProvider): Void
+  let principal = new SchemaColumn("id", SchemaType.Int(), primaryKey: true)
+  let dependent = new SchemaColumn(
+    "parent_id",
+    SchemaType.Int(),
+    reference: new SchemaReference("neri_async_parent", ["id"], ["parent_id"], "CASCADE")
+  )
+  let fields = [
+    new SchemaField("id", new SchemaColumn("id", SchemaType.Int(), primaryKey: true)),
+    new SchemaField("parent", dependent)
+  ]
+  let before = new SchemaTable("async_child", "neri_async_child", fields)
+  let after = new SchemaTable("async_child", "neri_async_child", [
+      fields[0], fields[1], new SchemaField("label", new SchemaColumn("label", SchemaType.Text(), nullable: true))
+    ])
+  let catalog = new MigrationSet([
+      new Migration("async_rebuild_001", [
+          SchemaOp.CreateTable("neri_async_parent", [principal]),
+          SchemaOp.CreateTable(
+            "neri_async_child",
+            [new SchemaColumn("id", SchemaType.Int(), primaryKey: true), dependent]
+          )
+        ], [SchemaOp.DropTable("neri_async_child"), SchemaOp.DropTable("neri_async_parent")]),
+      new Migration("async_rebuild_002", [SchemaOp.RebuildTable(before, after)], [SchemaOp.RebuildTable(after, before)])
+    ])
+
+  asyncMigrationApplied(awaitAsyncMigration(provider.beginMigrationAsync(catalog, "async_rebuild_001")), 1)
+  match awaitAsyncWrite(provider.beginSetAsync(new SetWritePlan(
+        "INSERT INTO neri_async_parent VALUES(7)",
+        new WriteValues()
+      )))
+    case WriteResult.Saved(count)
+      test::assertEqual(count, 1)
+    case WriteResult.SavedWithValues(count, rows)
+      test::assertTrue(false)
+    case WriteResult.Failure(error)
+      test::assertTrue(false)
+  end
+  match awaitAsyncWrite(provider.beginSetAsync(new SetWritePlan(
+        "INSERT INTO neri_async_child VALUES(9,7)",
+        new WriteValues()
+      )))
+    case WriteResult.Saved(count)
+      test::assertEqual(count, 1)
+    case WriteResult.SavedWithValues(count, rows)
+      test::assertTrue(false)
+    case WriteResult.Failure(error)
+      test::assertTrue(false)
+  end
+  asyncMigrationApplied(awaitAsyncMigration(provider.beginMigrationAsync(catalog)), 1)
+  let columns = new ResultColumns([
+      new ResultColumn("id", ResultColumnKind.Int()),
+      new ResultColumn("label", ResultColumnKind.Text(), true)
+    ])
+
+  match provider.beginReadAsync(new SqlPlan("SELECT id,label FROM neri_async_child", new ParameterValues(), 1, columns))
+    case AsyncReadStart.Failure(error)
+      test::assertTrue(false)
+    case AsyncReadStart.Started(driver)
+      var done = false
+      var count = 0
+
+      while !done
+        match driver.poll()
+          case AsyncReadPoll.Pending(socket, interest)
+            continue
+          case AsyncReadPoll.Row(row)
+            count = count + 1
+            match decodeInt(row, "id")
+              case DecodeResult.Value(value)
+                test::assertEqual(value, 9)
+              case DecodeResult.Failure(error)
+                test::assertTrue(false)
+            end
+            match row.value("label")
+              case CellLookup.Found(value)
+                match value
+                  case Cell.Null()
+                  case Cell.Text(item)
+                    test::assertTrue(false)
+                  case Cell.Bool(item)
+                    test::assertTrue(false)
+                  case Cell.Int(item)
+                    test::assertTrue(false)
+                  case Cell.Float(item)
+                    test::assertTrue(false)
+                  case Cell.Binary(item)
+                    test::assertTrue(false)
+                end
+              case CellLookup.Missing()
+                test::assertTrue(false)
+            end
+          case AsyncReadPoll.Failure(error)
+            test::assertTrue(false)
+            done = true
+          case AsyncReadPoll.Completed()
+            done = true
+        end
+      end
+
+      test::assertEqual(count, 1)
+      test::assertTrue(driver.close() == null)
+  end
+  asyncMigrationApplied(awaitAsyncMigration(provider.beginMigrationAsync(catalog, "")), 2)
 end

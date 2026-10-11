@@ -1,5 +1,6 @@
 use test
 use neri_data
+use resources
 
 class Record
   public id: Int
@@ -20,6 +21,71 @@ class RecordSummary
   def init(id: Int, active: Bool): Void
     this.id = id
     this.active = active
+  end
+end
+
+class DecimalRecord
+  public amount: Decimal = Decimal.zero()
+end
+
+def decodeDecimalRecord(row: RawRow): DecodeResult<DecimalRecord>
+  match decodeDecimal(row, "amount")
+    case DecodeResult.Failure(error)
+      return DecodeResult<DecimalRecord>.Failure(error)
+    case DecodeResult.Value(value)
+      let record = new DecimalRecord()
+
+      record.amount = value
+      return DecodeResult<DecimalRecord>.Value(record)
+  end
+end
+
+def verifyDecimalPlanning(): Void
+  let mapping = new EntityMapping(
+    "DecimalRecord",
+    "decimals",
+    [new MappingColumn("DecimalRecord.amount", "neri_data.Decimal", "amount")]
+  )
+  let decoder = new Decoder<DecimalRecord>(
+    decodeDecimalRecord,
+    new ResultColumns([new ResultColumn("amount", ResultColumnKind.Text())])
+  )
+  let query = new Query<DecimalRecord>("decimals", decoder, mapping: mapping)
+  let amount = decimalField(quote do |value: DecimalRecord|: Decimal
+      return value.amount
+    end)
+  let added = amount.add(decimalValue<DecimalRecord>(Decimal.zero()))
+
+  match query.matchingDecimal(added.greaterThanOrEqual(amount)).take(2).selectDecimal(added).buildPlan()
+    case CompileResult.Failure(error)
+      test::assertTrue(false)
+    case CompileResult.Plan(plan)
+      test::assertTrue(plan.sql().requiresCheckedScalars())
+      test::assertTrue(plan.sql().sql().contains("__neri_decimal_add"))
+      test::assertEqual(plan.sql().parameters().count(), 2)
+  end
+  match query.take(4).orderByDecimal(added).take(2).buildPlan(SqlDialect.PostgreSql())
+    case CompileResult.Failure(error)
+      test::assertTrue(false)
+    case CompileResult.Plan(plan)
+      test::assertTrue(plan.sql().sql().contains("COLLATE \"C\""))
+      test::assertTrue(plan.sql().sql().contains("trim_scale"))
+      test::assertTrue(plan.sql().requiresCheckedScalars())
+      test::assertEqual(relationSetKind(plan.sql().columns().at(0).kind()), 4)
+      test::assertEqual(relationSetKind(plan.sql().columns().at(1).kind()), 4)
+  end
+  let projected = query.take(4).selectDecimal(added).asRelation()
+  let projectedValue = decimalField(quote do |value: Decimal|: Decimal
+      return value
+    end)
+
+  match projected.unionWith(projected).matchingDecimal(projectedValue.equalTo(decimalValue<Decimal>(Decimal.zero()))).orderByDecimal(projectedValue).take(2).buildPlan()
+    case CompileResult.Failure(error)
+      test::assertTrue(false)
+    case CompileResult.Plan(plan)
+      test::assertTrue(plan.sql().sql().contains("UNION"))
+      test::assertTrue(plan.sql().sql().contains("__neri_decimal_compare"))
+      test::assertTrue(plan.sql().sql().contains("__neri_decimal_sort"))
   end
 end
 
@@ -86,6 +152,38 @@ def isMissingProvider(error: QueryFailure): Bool
   end
 end
 
+class RuntimeAsyncRead: AsyncReadDriver
+  private rows: RawRow[]
+  private index: Int = 0
+  private closed: Bool = false
+
+  def init(rows: RawRow[]): Void
+    this.rows = rows
+  end
+
+  public override def poll(): AsyncReadPoll
+    if this.closed
+      return AsyncReadPoll.Failure(ProviderFailure.State("read cancelled"))
+    end
+    if this.index < this.rows.Length
+      let row = this.rows[this.index]
+
+      this.index = this.index + 1
+      return AsyncReadPoll.Row(row)
+    end
+    return AsyncReadPoll.Completed()
+  end
+
+  public override def cancel(): Void
+    this.closed = true
+  end
+
+  public override def close(): ProviderFailure?
+    this.closed = true
+    return null
+  end
+end
+
 class MemoryProvider: Provider
   public supported: Bool
   public rows: RawRow[]
@@ -122,6 +220,16 @@ class MemoryProvider: Provider
 
   public override def writeBatch(batch: readonly WriteBatch): WriteResult
     return WriteResult.Failure(WriteFailure.Unsupported("memory provider does not support transactional writes"))
+  end
+
+  public override def beginReadAsync(
+    plan: readonly SqlPlan,
+    options: StreamOptions? = null,
+    maximumRows: Int? = null
+  ): AsyncReadStart
+    this.calls = this.calls + 1
+    this.seenSql = plan.sql()
+    return AsyncReadStart.Started(new RuntimeAsyncRead(this.rows))
   end
 end
 
@@ -196,7 +304,289 @@ def assertIntParameterValues(parameters: readonly ParameterValues, expected: Int
   end
 end
 
+def captureRecord(record: Record): RawRow
+  return new RawRow([new RawColumn("id", Cell.Int(record.id))])
+end
+
+def runtimeAsyncCompleted(outcome: resources::Outcome<Int, QueryFailure>): Void
+  test::assertEqual(outcome.closeFailures.count(), 0)
+  match outcome.completion
+    case resources::Completion.Value(value)
+      test::assertEqual(value, 0)
+    case resources::Completion.Failure(error)
+      test::assertTrue(false)
+  end
+end
+
+def verifyEmptyFirstAsync(query: Query<Record>): resources::Outcome<Int, QueryFailure>
+  using operation <- query.firstAsync()
+    while true
+      match operation.poll()
+        case AsyncValuePoll.Pending(socket, interest)
+          continue
+        case AsyncValuePoll.Completed(result)
+          match result
+            case QueryValue.Value(value)
+              test::assertTrue(false)
+            case QueryValue.Failure(error)
+              test::assertEqual(diagnosticQueryFailureKind(error), "decode")
+          end
+          return 0
+      end
+    end
+  end
+  return 1
+end
+
+def verifyDuplicateSingleAsync(query: Query<Record>): resources::Outcome<Int, QueryFailure>
+  using operation <- query.singleAsync()
+    while true
+      match operation.poll()
+        case AsyncValuePoll.Pending(socket, interest)
+          continue
+        case AsyncValuePoll.Completed(result)
+          match result
+            case QueryValue.Value(value)
+              test::assertTrue(false)
+            case QueryValue.Failure(error)
+              test::assertEqual(diagnosticQueryFailureKind(error), "decode")
+          end
+          return 0
+      end
+    end
+  end
+  return 1
+end
+
+def verifyCountAsync(query: Query<Record>): resources::Outcome<Int, QueryFailure>
+  using operation <- query.take(4).skip(3).countAsync()
+    while true
+      match operation.poll()
+        case AsyncValuePoll.Pending(socket, interest)
+          continue
+        case AsyncValuePoll.Completed(result)
+          match result
+            case QueryValue.Value(value)
+              test::assertEqual(value, 1)
+            case QueryValue.Failure(error)
+              test::assertTrue(false)
+          end
+          return 0
+      end
+    end
+  end
+  return 1
+end
+
+def verifyQueryPolicies(): Void
+  let named = records().withNamedGlobalFilter(
+    "Tenant",
+    idAbove(10)
+  ).withNamedGlobalFilter(
+    "SoftDelete",
+    idAbove(5)
+  ).withNamedGlobalFilter(
+    "Tenant",
+    idAbove(20)
+  ).take(8).matching(idAbove(30))
+
+  match named.buildPlan(SqlDialect.PostgreSql())
+    case CompileResult.Failure(error)
+      test::assertTrue(false)
+    case CompileResult.Plan(plan)
+      assertIntParameterValues(plan.sql().parameters(), [20, 5, 30])
+  end
+  match named.ignoreQueryFilters(["SoftDelete"]).asNoTracking().buildPlan(SqlDialect.PostgreSql())
+    case CompileResult.Failure(error)
+      test::assertTrue(false)
+    case CompileResult.Plan(plan)
+      assertIntParameterValues(plan.sql().parameters(), [20, 30])
+  end
+  let scalarSql = sqlScalar(
+    intScalar(),
+    "SELECT $1::bigint AS \"Value\"",
+    new ParameterValues(new ParameterNode(Parameter.Int(2)), 1)
+  ).matching(quote do |value: Int|: Bool
+      return value > 5
+    end).orderBy(quote do |value: Int|: Int
+      return value + 3
+    end).take(4)
+
+  match scalarSql.buildPlan(SqlDialect.PostgreSql())
+    case CompileResult.Failure(error)
+      test::assertTrue(false)
+    case CompileResult.Plan(plan)
+      assertIntParameterValues(plan.sql().parameters(), [3, 2, 5])
+
+      test::assertTrue(plan.sql().sql().contains("SELECT $2::bigint AS \"Value\""))
+      test::assertTrue(plan.sql().sql().contains("\"__neri_join_stage\".\"Value\" > $3"))
+  end
+  let byId: quote fn(Record): Int = quote do |record: Record|: Int
+    return record.id
+  end
+  let filtered = records().withGlobalFilter(idAbove(10)).take(8).matching(idAbove(20)).orderBy(byId).take(3)
+
+  match filtered.buildPlan(SqlDialect.PostgreSql())
+    case CompileResult.Failure(error)
+      test::assertTrue(false)
+    case CompileResult.Plan(plan)
+      assertIntParameterValues(plan.sql().parameters(), [10, 20])
+  end
+  match filtered.ignoreQueryFilters().asNoTracking().buildPlan(SqlDialect.PostgreSql())
+    case CompileResult.Failure(error)
+      test::assertTrue(false)
+    case CompileResult.Plan(plan)
+      assertIntParameterValues(plan.sql().parameters(), [20])
+  end
+  match filtered.buildPlan(SqlDialect.PostgreSql())
+    case CompileResult.Failure(error)
+      test::assertTrue(false)
+    case CompileResult.Plan(plan)
+      assertIntParameterValues(plan.sql().parameters(), [10, 20])
+  end
+  let tags = records().tagWith("Report 水\nSELECT unsafe").take(8).matching(idAbove(20)).tagWith("Second").take(3)
+
+  match tags.buildPlan()
+    case CompileResult.Failure(error)
+      test::assertTrue(false)
+    case CompileResult.Plan(plan)
+      test::assertTrue(plan.sql().sql().contains("-- Report 水\n-- SELECT unsafe\n-- Second\nSELECT "))
+      assertIntParameterValues(plan.sql().parameters(), [20])
+  end
+  let supplied = new ParameterValues(new ParameterNode(Parameter.Int(7)), 1)
+  let raw = records().fromSql(
+    "SELECT id, active, nickname FROM records WHERE id = $1 AND '$1' = '$1' /* $1 /* $2 */ */ AND $$literal $1$$ = $$literal $1$$ -- $1\n",
+    supplied
+  ).matching(idAbove(20)).take(2).select(intScalar(), projectedIdWith(9))
+
+  match raw.buildPlan(SqlDialect.PostgreSql())
+    case CompileResult.Failure(error)
+      test::assertTrue(false)
+    case CompileResult.Plan(plan)
+      assertIntParameterValues(plan.sql().parameters(), [9, 7, 20])
+
+      test::assertTrue(plan.sql().sql().contains("WHERE id = $2 AND '$1' = '$1' /* $1 /* $2 */ */"))
+      test::assertTrue(plan.sql().sql().contains("$$literal $1$$ = $$literal $1$$ -- $1\n"))
+  end
+  let provider = new MemoryProvider(
+    true,
+    [new RawRow([new RawColumn("id", Cell.Int(7))]), new RawRow([new RawColumn("id", Cell.Int(7))])]
+  )
+  let columns = new ResultColumns([new ResultColumn("id", ResultColumnKind.Int())])
+  let tracker = new EntityTracker<Record>("records", "id", columns, captureRecord)
+  let root = new Query<Record>(
+    "records",
+    new Decoder<Record>(decodeRecord, columns),
+    mapping: recordMapping(),
+    provider: provider,
+    tracker: tracker
+  )
+  let alternateMapping = new EntityMapping("Record", "other_records", [
+      new MappingColumn("Record.id", "Int", "id"),
+      new MappingColumn("Record.active", "Bool", "active"),
+      new MappingColumn("Record.nickname", "String?", "nickname")
+    ])
+  let alternate = new Query<Record>(
+    "other_records",
+    new Decoder<Record>(decodeRecord, columns),
+    mapping: alternateMapping,
+    provider: provider,
+    tracker: tracker
+  )
+
+  match root.unionWith(alternate).take(4).buildPlan()
+    case CompileResult.Failure(error)
+      test::assertEqual(diagnosticQueryFailureKind(error), "unsupported")
+    case CompileResult.Plan(plan)
+      test::assertTrue(false)
+  end
+  match root.asNoTracking().unionWith(alternate.asNoTracking()).take(4).buildPlan()
+    case CompileResult.Failure(error)
+      test::assertTrue(false)
+    case CompileResult.Plan(plan)
+      test::assertTrue(plan.sql().sql().contains("UNION"))
+  end
+
+  runtimeAsyncCompleted(verifyDuplicateSingleAsync(root))
+
+  test::assertTrue(tracker.stateOf(new Record(7)) == null)
+
+  let empty = new Query<Record>(
+    "records",
+    new Decoder<Record>(decodeRecord, columns),
+    mapping: recordMapping(),
+    provider: new MemoryProvider(true, [])
+  )
+
+  runtimeAsyncCompleted(verifyEmptyFirstAsync(empty))
+  let countProvider = new MemoryProvider(true, [new RawRow([new RawColumn("__neri_count", Cell.Int(1))])])
+  let counted = new Query<Record>(
+    "records",
+    new Decoder<Record>(decodeRecord, columns),
+    mapping: recordMapping(),
+    provider: countProvider
+  )
+
+  runtimeAsyncCompleted(verifyCountAsync(counted))
+
+  test::assertTrue(countProvider.seenSql.contains("COUNT(*)"))
+  test::assertTrue(countProvider.seenSql.contains("LIMIT 4"))
+  test::assertTrue(countProvider.seenSql.contains("OFFSET 3"))
+
+  match root.asNoTrackingWithIdentityResolution().take(2).all()
+    case QueryResult.Failure(error)
+      test::assertTrue(false)
+    case QueryResult.Rows(rows)
+      let first = rows.first()
+
+      test::assertTrue(first != null)
+      if first != null
+        let second = first.next
+
+        test::assertTrue(second != null)
+        if second != null
+          first.value.active = true
+
+          test::assertTrue(second.value.active)
+          test::assertTrue(tracker.stateOf(first.value) == null)
+        end
+      end
+  end
+  match root.asNoTracking().take(2).all()
+    case QueryResult.Failure(error)
+      test::assertTrue(false)
+    case QueryResult.Rows(rows)
+      let first = rows.first()
+
+      test::assertTrue(first != null)
+      if first != null
+        let second = first.next
+
+        test::assertTrue(second != null)
+        if second != null
+          first.value.active = true
+
+          test::assertFalse(second.value.active)
+          test::assertTrue(tracker.stateOf(first.value) == null)
+        end
+      end
+  end
+  match root.asNoTracking().asTracking().take(2).all()
+    case QueryResult.Failure(error)
+      test::assertTrue(false)
+    case QueryResult.Rows(rows)
+      let first = rows.first()
+
+      test::assertTrue(first != null)
+      if first != null
+        test::assertTrue(tracker.stateOf(first.value) != null)
+      end
+  end
+end
+
 def main(): Void
+  verifyDecimalPlanning()
+  verifyQueryPolicies()
   let mappingColumns = [new MappingColumn("Record.id", "Int", "id")]
   let stableMapping = new EntityMapping("Record", "records", mappingColumns)
 
@@ -580,18 +970,21 @@ def main(): Void
   end
   match query.first(provider)
     case QueryValue.Value(value)
-      test::assertTrue(value != null)
-      if value != null
-        test::assertEqual(value.id, 7)
-      end
+      test::assertEqual(value.id, 7)
+    case QueryValue.Failure(error)
+      test::assertTrue(false)
+  end
+  match records().firstOrDefault(new MemoryProvider(true, []))
+    case QueryValue.Value(value)
+      test::assertTrue(value == null)
     case QueryValue.Failure(error)
       test::assertTrue(false)
   end
   match records().first(new MemoryProvider(true, []))
     case QueryValue.Value(value)
-      test::assertTrue(value == null)
-    case QueryValue.Failure(error)
       test::assertTrue(false)
+    case QueryValue.Failure(error)
+      test::assertEqual(diagnosticQueryFailureKind(error), "decode")
   end
   let anyProvider = new MemoryProvider(true, [new RawRow([new RawColumn("__neri_any", Cell.Int(1))])])
 

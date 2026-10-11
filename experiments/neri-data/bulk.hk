@@ -198,6 +198,9 @@ def compileSetDelete<T>(query: Query<T>, dialect: SqlDialect): SetPlanResult
   if mapping == null
     return SetPlanResult.Failure(WriteFailure.Validation("bulk delete requires entity mapping"))
   end
+  if mapping.readOnly()
+    return SetPlanResult.Failure(WriteFailure.Unsupported("read-only entities cannot be modified"))
+  end
   let key = mapping.keyColumn()
 
   if key == null
@@ -227,6 +230,9 @@ def compileSetUpdate<T>(query: Query<T>, changes: readonly fields::Pack, dialect
 
   if mapping == null
     return SetPlanResult.Failure(WriteFailure.Validation("bulk update requires entity mapping"))
+  end
+  if mapping.readOnly()
+    return SetPlanResult.Failure(WriteFailure.Unsupported("read-only entities cannot be modified"))
   end
   let key = mapping.keyColumn()
 
@@ -289,7 +295,7 @@ def compileSetUpdate<T>(query: Query<T>, changes: readonly fields::Pack, dialect
           end
           match value
             case quotation::CaptureValue.Bool(item)
-              values.add(Cell.Bool(item))
+              values.add(column.boolToInt() ? Cell.Int(item ? 1 : 0) : Cell.Bool(item))
             case quotation::CaptureValue.Int(item)
               values.add(Cell.Int(item))
             case quotation::CaptureValue.Float(item)
@@ -359,11 +365,29 @@ def bulkResultValidator(typeName: String): String
   return "__neri_value_text"
 end
 
+def bulkPostgresResultValidator(sql: String, typeName: String): String
+  let base = semanticTranslationInner(typeName)
+  let sqlType = base == "Int" ? "BIGINT" : (base == "Bool" ? "BOOLEAN" : (base == "Float" ? "DOUBLE PRECISION" : "TEXT"))
+  let value = "\"__neri_set_value\".\"value\""
+  let errorText = "(coalesce(CAST(" + value + " AS TEXT), 'NULL') || ' invalid " + base + " assignment')"
+  let invalid = base == "String" ? "CAST(CAST(" + errorText + " AS BIGINT) AS TEXT)" : "CAST(" + errorText + " AS " + sqlType + ")"
+  let nullValue = translationOptional(typeName) ? "CAST(NULL AS " + sqlType + ")" : invalid
+  var checked = value
+
+  if base == "Float"
+    checked = "CASE WHEN " + value + " > '-Infinity'::DOUBLE PRECISION AND " + value + " < 'Infinity'::DOUBLE PRECISION THEN " + value + " ELSE " + invalid + " END"
+  end
+  return "(SELECT CASE WHEN " + value + " IS NULL THEN " + nullValue + " ELSE " + checked + " END FROM (SELECT CAST(" + sql + " AS " + sqlType + ") AS \"value\") AS \"__neri_set_value\")"
+end
+
 def compileSetUpdateExpressions<T>(query: Query<T>, setters: readonly UpdateSet<T>, dialect: SqlDialect): SetPlanResult
   let mapping = query.entityMapping()
 
   if mapping == null
     return SetPlanResult.Failure(WriteFailure.Validation("computed bulk update requires entity mapping"))
+  end
+  if mapping.readOnly()
+    return SetPlanResult.Failure(WriteFailure.Unsupported("read-only entities cannot be modified"))
   end
   let key = mapping.keyColumn()
 
@@ -375,11 +399,6 @@ def compileSetUpdateExpressions<T>(query: Query<T>, setters: readonly UpdateSet<
   end
   if setters.count() == 0 || setters.count() > mapping.count()
     return SetPlanResult.Failure(WriteFailure.Validation("computed bulk update requires distinct mapped fields"))
-  end
-  match dialect
-    case SqlDialect.PostgreSql()
-      return SetPlanResult.Failure(WriteFailure.Unsupported("checked scalar updates are unavailable for PostgreSQL"))
-    case SqlDialect.QuestionMark()
   end
   match bulkKeySelection<T>(query, mapping, key, dialect)
     case CompileResult.Failure(error)
@@ -443,7 +462,18 @@ def compileSetUpdateExpressions<T>(query: Query<T>, setters: readonly UpdateSet<
                 return SetPlanResult.Failure(bulkScalarFailure(error))
               case ScalarSqlResult.Value(value)
                 let allowNull = translationOptional(column.typeName()) ? "1" : "0"
-                let guarded = bulkResultValidator(column.typeName()) + "(" + value.sql + ", " + allowNull + ")"
+                var guarded = ""
+
+                match dialect
+                  case SqlDialect.QuestionMark()
+                    guarded = bulkResultValidator(column.typeName()) + "(" + value.sql + ", " + allowNull + ")"
+                  case SqlDialect.PostgreSql()
+                    guarded = bulkPostgresResultValidator(value.sql, column.typeName())
+                end
+
+                if column.boolToInt()
+                  guarded = "(SELECT CASE WHEN \"__neri_bool_value\".\"value\" IS NULL THEN NULL WHEN \"__neri_bool_value\".\"value\" THEN 1 ELSE 0 END FROM (SELECT " + guarded + " AS \"value\") AS \"__neri_bool_value\")"
+                end
 
                 assignments = assignments + (index == 0 ? "" : ", ") + "\"" + column.column() + "\" = " + guarded
             end

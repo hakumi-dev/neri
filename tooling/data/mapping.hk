@@ -113,9 +113,11 @@ def dataStringLiteral(value: String): String
   while index < host::stringByteLength(value)
     let byte = host::stringByteAt(value, index) as Int
 
-    if byte == 34 || byte == 92 || byte == 10 || byte == 13 || byte == 9
+    if byte == 0 || byte == 34 || byte == 92 || byte == 10 || byte == 13 || byte == 9
       result = result + host::stringSlice(value, start, index - start)
-      if byte == 34 || byte == 92
+      if byte == 0
+        result = result + "\\0"
+      else if byte == 34 || byte == 92
         result = result + "\\" + host::stringSlice(value, index, 1)
       else if byte == 10
         result = result + "\\n"
@@ -424,7 +426,7 @@ def dataParseDefault(mapping: DataMapping, field: DataField, value: LspJson, con
       if !value.isBoolean()
         return mapping.fail(context + ".default must be a JSON boolean.")
       end
-      field.defaultCode = "neri_data::SchemaDefault.Bool(" + (value.isTrue() ? "true" : "false") + ")"
+      field.defaultCode = field.boolToInt ? "neri_data::SchemaDefault.Int(" + (value.isTrue() ? "1" : "0") + ")" : "neri_data::SchemaDefault.Bool(" + (value.isTrue() ? "true" : "false") + ")"
     case DataScalarKind.Int()
       if !value.isNumber()
         return mapping.fail(context + ".default must be a signed 64-bit JSON integer.")
@@ -486,10 +488,70 @@ def dataParseDefault(mapping: DataMapping, field: DataField, value: LspJson, con
   return true
 end
 
+def dataResolveMember(mapping: DataMapping, entity: DataEntity, name: String, field: DataField): SemanticField?
+  let model = mapping.semantic
+  var owner = entity.symbol
+
+  if model == null || owner == null
+    return null
+  end
+  let tokens = (new BootstrapLexer(name)).lex()
+  var token = 0
+  var memberPath = ""
+  var parentPath = ""
+
+  while token + 1 < tokens.count()
+    let member = tokens.textAt(token)
+    let symbol = dataFindField(model, owner, member)
+
+    if symbol == null || !symbol.access.isPublic()
+      mapping.fail("Mapped member path '" + entity.typeName + "." + name + "' requires existing public fields.")
+      return null
+    end
+    memberPath = memberPath + (memberPath == "" ? "" : ".") + member
+    let path = "new neri_data::MappingPath(" + lspQuote(symbol.owner + "." + symbol.name) + ", " + lspQuote(symbol.typeName) + (parentPath == "" ? "" : ", " + parentPath) + ")"
+
+    if token + 2 >= tokens.count()
+      field.pathCode = path if parentPath != ""
+      field.schemaIdentity = entity.typeName + "." + memberPath if parentPath != ""
+      return symbol
+    end
+    if semanticIsOptional(symbol.typeName)
+      mapping.fail("Complex member '" + entity.typeName + "." + memberPath + "' must be non-optional.")
+      return null
+    end
+    let complexType = dataFindClass(model, symbol.typeName)
+
+    if complexType == null || (!complexType.access.isPublic() && !complexType.access.isInternal())
+      mapping.fail("Complex member '" + entity.typeName + "." + memberPath + "' requires an accessible class type.")
+      return null
+    end
+    if entity.complex(memberPath) == null
+      let construction = new DataEntity()
+
+      construction.symbol = complexType
+      if !dataInitializer(construction)
+        mapping.fail("Complex member '" + entity.typeName + "." + memberPath + "' requires accessible zero-argument construction.")
+        return null
+      end
+      let complex = new DataComplex()
+
+      complex.memberName = memberPath
+      complex.typeName = symbol.typeName
+      complex.pathCode = path
+      entity.addComplex(complex)
+    end
+    owner = complexType
+    parentPath = path
+    token = token + 2
+  end
+  return null
+end
+
 def dataParseField(mapping: DataMapping, entity: DataEntity, node: LspJson, index: Int): Bool
   let context = "entities[" + (index as String) + "].columns"
 
-  if !dataObject(mapping, node, context, ["member", "column", "default", "valueGeneration"])
+  if !dataObject(mapping, node, context, ["member", "column", "default", "valueGeneration", "conversion"])
     return false
   end
   let memberName = dataString(mapping, node, "member", context)
@@ -498,8 +560,8 @@ def dataParseField(mapping: DataMapping, entity: DataEntity, node: LspJson, inde
   if mapping.error != ""
     return false
   end
-  if !dataIdentifier(memberName)
-    return mapping.fail(context + ".member must be a Neri identifier.")
+  if !dataIdentifier(memberName, true)
+    return mapping.fail(context + ".member must be a public Neri field path.")
   end
   if !dataSqlIdentifier(columnName)
     return mapping.fail(context + ".column must be an unquoted SQL identifier.")
@@ -520,7 +582,8 @@ def dataParseField(mapping: DataMapping, entity: DataEntity, node: LspJson, inde
   if classSymbol == null
     return false
   end
-  let symbol = dataFindField(mapping.semantic, classSymbol, memberName)
+  let field = new DataField(DataScalarKind.Int())
+  let symbol = dataResolveMember(mapping, entity, memberName, field)
 
   if symbol == null
     return mapping.fail("Mapped member '" + entity.typeName + "." + memberName + "' does not exist; regenerate or update the mapping after a rename.")
@@ -533,12 +596,19 @@ def dataParseField(mapping: DataMapping, entity: DataEntity, node: LspJson, inde
   if domain == null
     return mapping.fail("Mapped member '" + entity.typeName + "." + memberName + "' has unsupported type '" + symbol.typeName + "'; expected Int, Bool, Float, String, buffers.ByteBuffer, neri_data.Decimal, or an optional of one of those types.")
   end
-  let field = new DataField(domain)
-
+  field.domain = domain
   field.memberName = memberName
   field.columnName = columnName
   field.typeName = symbol.typeName
   field.optional = semanticIsOptional(symbol.typeName)
+  let conversion = node.get("conversion")
+
+  if !conversion.isMissing()
+    if !conversion.isString() || conversion.scalarText() != "boolToInt" || dataScalarName(field.domain) != "Bool"
+      return mapping.fail(context + ".conversion supports 'boolToInt' on Bool or Bool? fields.")
+    end
+    field.boolToInt = true
+  end
   if !dataParseDefault(mapping, field, node.get("default"), context)
     return false
   end
@@ -548,6 +618,9 @@ def dataParseField(mapping: DataMapping, entity: DataEntity, node: LspJson, inde
   let generation = node.get("valueGeneration")
 
   if !generation.isMissing()
+    if entity.keyless
+      return mapping.fail(context + ".valueGeneration is not allowed on a keyless query source.")
+    end
     if !generation.isString() || (generation.scalarText() != "onAdd" && generation.scalarText() != "onAddOrUpdate")
       return mapping.fail(context + ".valueGeneration must be 'onAdd' or 'onAddOrUpdate'.")
     end
@@ -661,7 +734,23 @@ def dataParseEntity(mapping: DataMapping, node: LspJson, index: Int): Bool
     mapping,
     node,
     context,
-    ["type", "set", "table", "key", "keyGeneration", "columns", "indexes", "alternateKeys", "concurrencyTokens"]
+    [
+      "type",
+      "set",
+      "table",
+      "view",
+      "keyless",
+      "queryFilter",
+      "queryFilters",
+      "hierarchy",
+      "seeds",
+      "key",
+      "keyGeneration",
+      "columns",
+      "indexes",
+      "alternateKeys",
+      "concurrencyTokens"
+    ]
   )
     return false
   end
@@ -669,11 +758,37 @@ def dataParseEntity(mapping: DataMapping, node: LspJson, index: Int): Bool
 
   entity.typeName = dataString(mapping, node, "type", context)
   entity.setName = dataString(mapping, node, "set", context)
-  entity.tableName = dataString(mapping, node, "table", context)
-  if !dataParseMembers(mapping, node.get("key"), entity.keyMembers, context + ".key")
-    return false
+  let keyless = node.get("keyless")
+
+  if !keyless.isMissing()
+    if !keyless.isTrue() && !keyless.isFalse()
+      return mapping.fail(context + ".keyless must be a JSON boolean.")
+    end
+    entity.keyless = keyless.isTrue()
   end
-  entity.keyMember = entity.keyMembers.get(0)
+  let view = node.get("view")
+
+  if !view.isMissing()
+    if !entity.keyless || !node.get("table").isMissing()
+      return mapping.fail(context + ".view requires keyless: true and replaces table.")
+    end
+    entity.view = true
+    entity.tableName = dataString(mapping, node, "view", context)
+  else
+    entity.tableName = dataString(mapping, node, "table", context)
+  end
+  if entity.keyless
+    for option in ["key", "keyGeneration", "indexes", "alternateKeys", "concurrencyTokens"]
+      if !node.get(option).isMissing()
+        return mapping.fail(context + "." + option + " is not allowed on a keyless query source.")
+      end
+    end
+  else
+    if !dataParseMembers(mapping, node.get("key"), entity.keyMembers, context + ".key")
+      return false
+    end
+    entity.keyMember = entity.keyMembers.get(0)
+  end
   let keyGeneration = node.get("keyGeneration")
 
   if !keyGeneration.isMissing()
@@ -700,7 +815,7 @@ def dataParseEntity(mapping: DataMapping, node: LspJson, index: Int): Bool
   if !dataSqlIdentifier(entity.tableName) || dataSqlReserved(entity.tableName)
     return mapping.fail(context + ".table must be a valid, non-reserved SQL identifier.")
   end
-  if !dataIdentifier(entity.keyMember)
+  if !entity.keyless && !dataIdentifier(entity.keyMember)
     return mapping.fail(context + ".key must be a Neri member identifier.")
   end
   if mapping.entity(entity.typeName) != null
@@ -731,6 +846,51 @@ def dataParseEntity(mapping: DataMapping, node: LspJson, index: Int): Bool
     return mapping.fail("Mapped entity type '" + entity.typeName + "' must be public or internal.")
   end
   entity.symbol = symbol
+  let queryFilter = node.get("queryFilter")
+
+  if !queryFilter.isMissing()
+    if !queryFilter.isString() || !dataIdentifier(queryFilter.scalarText(), true)
+      return mapping.fail(context + ".queryFilter must name a qualified quotation factory function.")
+    end
+    let factory = semantic.findFunction(queryFilter.scalarText())
+
+    if factory == null || factory.parameterCount != 0 || factory.returnType != "quote fn(" + entity.typeName + "):(Bool)" || (!factory.access.isPublic() && !factory.access.isInternal())
+      return mapping.fail(context + ".queryFilter requires an accessible zero-argument function returning quote fn(" + entity.typeName + "): Bool.")
+    end
+    entity.queryFilter = factory.fullName
+  end
+  let queryFilters = node.get("queryFilters")
+
+  if !queryFilters.isMissing() && !queryFilters.isArray()
+    return mapping.fail(context + ".queryFilters must be an array of named quotation factories.")
+  end
+  var filter = queryFilters.first
+
+  while filter != null
+    if !dataObject(mapping, filter, context + ".queryFilters", ["name", "factory"])
+      return false
+    end
+    let name = dataString(mapping, filter, "name", context)
+    let factoryName = dataString(mapping, filter, "factory", context)
+    let factory = semantic.findFunction(factoryName)
+
+    if host::stringByteLength(name) == 0 || host::stringByteLength(name) > 256 || !dataIdentifier(
+      factoryName,
+      true
+    ) || factory == null || factory.parameterCount != 0 || factory.returnType != "quote fn(" + entity.typeName + "):(Bool)" || (!factory.access.isPublic() && !factory.access.isInternal())
+      return mapping.fail(context + ".queryFilters requires a bounded nonempty name and accessible zero-argument typed quotation factory.")
+    end
+    var previous = entity.firstQueryFilter
+
+    while previous != null
+      if previous.name == name
+        return mapping.fail(context + ".queryFilters repeats a filter name.")
+      end
+      previous = previous.nextFilter
+    end
+    entity.addQueryFilter(new DataQueryFilter(name, factory.fullName))
+    filter = filter.next
+  end
   entity.generatedName = symbol.name
   entity.declaration = dataDeclaration(semantic, "type:" + entity.typeName)
   entity.origin = dataOrigin(mapping, entity.declaration)
@@ -851,6 +1011,12 @@ def dataParseEntity(mapping: DataMapping, node: LspJson, index: Int): Bool
     indexNumber = indexNumber + 1
   end
   mapping.addEntity(entity)
+  if !dataParseHierarchy(mapping, entity, node.get("hierarchy"), context + ".hierarchy")
+    return false
+  end
+  if !dataParseSeeds(mapping, entity, node.get("seeds"), context + ".seeds")
+    return false
+  end
   return true
 end
 
@@ -922,6 +1088,9 @@ def dataParseRelation(mapping: DataMapping, node: LspJson, index: Int): Bool
   if dependent == null
     return mapping.fail(context + ".dependent must name a mapped entity.")
   end
+  if principal.keyless || dependent.keyless
+    return mapping.fail(context + " relationships require keyed entity types.")
+  end
   let key = principal.field(relation.keyMember)
   let foreignKey = dependent.field(relation.foreignKeyMember)
 
@@ -945,6 +1114,9 @@ def dataParseRelation(mapping: DataMapping, node: LspJson, index: Int): Bool
 
     if principalField == null || dependentField == null || principalField.optional || !dataScalarSupportsKey(principalField.domain)
       return mapping.fail(context + " keys must name mapped non-optional Int or String principal members.")
+    end
+    if principalField.hierarchyType != "" || dependentField.hierarchyType != ""
+      return mapping.fail(context + " subtype navigation fields require a separately supported hierarchy navigation contract.")
     end
     let foreignType = dependentField.optional ? semanticInnerType(dependentField.typeName) : dependentField.typeName
 
@@ -1164,7 +1336,7 @@ def dataLoadMapping(path: String): DataMapping
     mapping,
     root,
     "mapping",
-    ["version", "project", "unit", "namespace", "context", "output", "entities", "relations"]
+    ["version", "project", "unit", "namespace", "context", "output", "entities", "relations", "manyToMany"]
   )
     return mapping
   end
@@ -1250,6 +1422,20 @@ def dataLoadMapping(path: String): DataMapping
     mapping.fail("mapping.entities must contain at least one entity.")
     return mapping
   end
+  var hierarchyRoot: DataEntity? = mapping.firstEntity
+
+  while hierarchyRoot != null
+    var derived = hierarchyRoot.firstDerived
+
+    while derived != null
+      if mapping.entity(derived.entity.typeName) != null
+        mapping.fail("Hierarchy subtypes use their root set and cannot have separate mapped sets.")
+        return mapping
+      end
+      derived = derived.nextDerived
+    end
+    hierarchyRoot = hierarchyRoot.nextEntity
+  end
   if !dataValidateSchemaNames(mapping)
     return mapping
   end
@@ -1264,6 +1450,9 @@ def dataLoadMapping(path: String): DataMapping
     relationIndex = relationIndex + 1
   end
   dataAssignReferenceAnchors(mapping)
+  if !dataParseMany(mapping, root.get("manyToMany"))
+    return mapping
+  end
   return mapping
 end
 
