@@ -104,6 +104,135 @@ def exactValues(): Void
   end
 end
 
+class GeneratedDecimalRecord
+  public id: Int = 1
+  public amount: Decimal = Decimal.zero()
+  public applied: Int = 0
+end
+
+class GeneratedDecimalProvider: Provider
+  public returned: String = "invalid"
+  public rollbacks: Int = 0
+  private state: TransactionState = TransactionState.RolledBack()
+
+  public override readonly def dialect(): SqlDialect
+    return SqlDialect.QuestionMark()
+  end
+
+  public override readonly def supports(capability: ProviderCapability): Bool
+    match capability
+      case ProviderCapability.TrackedWrites()
+        return true
+      case ProviderCapability.ExplicitTransactions()
+        return true
+      case ProviderCapability.BoundedTypedReads()
+      case ProviderCapability.CheckedScalarExpressions()
+      case ProviderCapability.WindowFunctions()
+      case ProviderCapability.StreamingReads()
+      case ProviderCapability.SetWrites()
+      case ProviderCapability.Savepoints()
+        return false
+    end
+  end
+
+  public override def execute(plan: readonly SqlPlan): ProviderResult
+    return ProviderResult.Rows([])
+  end
+
+  public override def beginTransaction(): TransactionOpenResult
+    this.state = TransactionState.Active()
+    return TransactionOpenResult.Begun(1)
+  end
+
+  public override def writeBatchInTransaction(batch: readonly WriteBatch, lease: Int): WriteResult
+    let rows = new WriteReturnedRows()
+
+    rows.add(new RawRow([new RawColumn("amount", Cell.Text(this.returned))]))
+    return WriteResult.SavedWithValues(1, rows)
+  end
+
+  public override def transactionState(lease: Int): TransactionState
+    return this.state
+  end
+
+  public override def commitTransaction(lease: Int): WriteResult
+    this.state = TransactionState.Committed()
+    return WriteResult.Saved(0)
+  end
+
+  public override def rollbackTransaction(lease: Int): WriteResult
+    this.state = TransactionState.RolledBack()
+    this.rollbacks = this.rollbacks + 1
+    return WriteResult.Saved(0)
+  end
+end
+
+def captureGeneratedDecimal(value: GeneratedDecimalRecord): RawRow
+  return new RawRow([new RawColumn("id", Cell.Int(value.id)), new RawColumn("amount", cellDecimal(value.amount))])
+end
+
+def applyGeneratedDecimal(value: GeneratedDecimalRecord, row: readonly RawRow): Void
+  match row.value("amount")
+    case CellLookup.Missing()
+      test::assertTrue(false)
+    case CellLookup.Found(cell)
+      match decodeScalarDecimal(cell)
+        case DecodeResult.Failure(error)
+          test::assertTrue(false)
+        case DecodeResult.Value(decoded)
+          value.amount = decoded
+          value.applied = value.applied + 1
+      end
+  end
+end
+
+def generatedDecimalValidation(): Void
+  let provider = new GeneratedDecimalProvider()
+  let changes = new ChangeContext(provider)
+  let columns = new ResultColumns([
+      new ResultColumn("id", ResultColumnKind.Int()),
+      new ResultColumn("amount", ResultColumnKind.Text())
+    ])
+  let tracker = new EntityTracker<GeneratedDecimalRecord>(
+    "generated_decimals",
+    "id",
+    columns,
+    captureGeneratedDecimal,
+    generatedColumns: [new GeneratedValueColumn(
+        new ResultColumn("amount", ResultColumnKind.Text()),
+        GeneratedValueTiming.OnAdd(),
+        true
+      )],
+    applyGenerated: applyGeneratedDecimal
+  )
+  let item = new GeneratedDecimalRecord()
+
+  changes.register(tracker.changeSet())
+
+  test::assertTrue(tracker.add(item) == null)
+  for malformed in ["invalid", "1.00"]
+    provider.returned = malformed
+    match changes.saveChanges()
+      case WriteResult.Failure(error)
+        test::assertTrue(writeFailureMessage(error) != "")
+      case WriteResult.Saved(count)
+        test::assertTrue(false)
+      case WriteResult.SavedWithValues(count, outputs)
+        test::assertTrue(false)
+    end
+
+    test::assertEqual(item.applied, 0)
+    test::assertEqual(item.amount.text(), "0")
+  end
+
+  test::assertEqual(provider.rollbacks, 2)
+  provider.returned = "1.25"
+  saved(changes.saveChanges(), 1)
+
+  test::assertEqual(item.applied, 1)
+  test::assertEqual(item.amount.text(), "1.25")
+end
+
 def accountHandle(db: ExpandedDatabase, value: Account): TrackedHandle<Account>?
   match db.accounts.addWithHandle(value)
     case TrackHandleResult.Tracked(handle)
@@ -177,7 +306,12 @@ def verifyLazy(provider: SQLiteProvider): Void
             test::assertEqual(rows.count(), 1)
             test::assertTrue(child != null)
             if child != null
-              test::assertTrue(reference::same(child.value.account, account))
+              let inverse = child.value.account
+
+              test::assertTrue(inverse != null)
+              if inverse != null
+                test::assertTrue(reference::same(inverse, account))
+              end
               match db.lazyReference_itemsFor_Account_by_tenant_accountExternalId(child.value)
                 case QueryResult.Failure(error)
                   test::assertTrue(false)
@@ -228,7 +362,13 @@ def verify(provider: SQLiteProvider): Void
         if account.value.approvedItems.Length == 1
           let child = account.value.approvedItems[0]
 
-          test::assertTrue(reference::same(child.approver, account.value))
+          let inverse = child.approver
+
+          test::assertTrue(inverse != null)
+          if inverse != null
+            test::assertTrue(reference::same(inverse, account.value))
+          end
+
           test::assertEqual(child.approverExternalId, account.value.externalId)
         end
         account = account.next
@@ -351,6 +491,7 @@ end
 def main(): Void
   exactValues()
   optionalTupleValidation()
+  generatedDecimalValidation()
   let completed = verifyFile()
 
   test::assertEqual(completed.closeFailures.count(), 0)
