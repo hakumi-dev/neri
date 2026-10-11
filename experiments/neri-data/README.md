@@ -121,16 +121,23 @@ query.orderByString(byName)
 query.orderByBool(byActive)
 ```
 
-The overloads are named because method-level generic parameters are outside the
-current Neri surface. A selector must resolve to a mapped field of the query's
-entity; arbitrary callbacks, dynamic field names and string filters are not
-translation APIs.
+The named overloads retain their scalar type contracts. The generic
+`orderByValue(codec, selector)` and `thenByValue(codec, selector)` methods accept
+typed scalar expression quotations. The codec and quotation result types must
+agree. Arbitrary callbacks are not SQL translation APIs.
 
 Projection is a shared generic module function:
 
 ```neri
 select<T, R>(query: Query<T>, codec: ScalarCodec<R>, selector: quote fn(T): R): Projection<T, R>
 ```
+
+`query.select(codec, selector)` supports a computed scalar expression;
+`query.selectShape(shape)` materializes a composed typed row shape. String
+quotations support `contains`, `startsWith`, `endsWith` and `byteLength` with
+case-sensitive UTF-8 semantics. SQLite text predicates preserve embedded NUL
+bytes. PostgreSQL text parameters reject NUL because its text storage does not
+represent that value.
 
 `T` is inferred from the query and `R` from the scalar codec. `intScalar()`,
 `boolScalar()`, `textScalar()` and their nullable variants provide strict
