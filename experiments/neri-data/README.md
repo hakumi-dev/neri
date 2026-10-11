@@ -296,9 +296,15 @@ transaction and conflict semantics, limitations, and research basis, and
 `Provider` supplies a dialect, advertises `BoundedTypedReads`, binds every
 parameter, and returns raw rows. The runtime checks the plan's limit, selected
 columns, scalar kinds and nullability, then materializes typed rows through the
-generated decoder. The repository includes an in-memory contract provider and
-a separately linked SQLite provider. PostgreSQL-style placeholders are
-supported by the planner; a PostgreSQL connection adapter is not included.
+generated decoder. The repository includes an in-memory contract provider,
+a separately linked SQLite provider, and a [libpq PostgreSQL provider](POSTGRESQL.md).
+PostgreSQL validates mapped identifiers against its 63-byte limit before
+compilation. Generated constraint names must fit the same limit.
+
+[Exact scalars and ordered keys](SCALARS-KEYS.md) describes binary buffers,
+canonical decimals, composite primary keys and alternate principal identities.
+[Asynchronous operations and lazy loading](ASYNC-AND-LAZY.md) describes owned
+polling operations, context relationship fixup and loaded-state caching.
 
 Opt-in [generated integer keys](GENERATED-VALUES.md) use SQLite RETURNING and
 restore temporary keys on rollback. [Model differences](MODEL-MIGRATIONS.md)
