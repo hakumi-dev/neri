@@ -42,9 +42,18 @@ Include the entity and generated source directories in the application's
 example `["app", "data/entities", "data/generated"]`. Keep the mapping's Neri
 project focused on its entity declarations so generation can run before those
 generated files exist. Ito supplies both exported libraries to the application;
-it does not run the Data generator. Regenerate first when mapping inputs change.
+it runs the Data generator before preparing application sources when the
+application declares `neri.dataMappings`, for example `["data/mapping.json"]`.
+`ito prepare`, `build`, `run` and `test` use `neri-data-generate --ensure` under
+the application lock. `NERI_DATA_GENERATE` selects that generator executable.
+Without this declaration, regenerate explicitly when mapping inputs change.
 Installed Data metadata and copied source files use the packaged Neri manifests
 as their source inventory, including the owning `SQLiteSession` resource.
+
+`neri-data-generate --check <mapping.json>` validates inputs, output ownership,
+the generation manifest and every generated artifact without writing files.
+It exits unsuccessfully when output is missing, stale or invalid. `--ensure`
+publishes changed output and reuses a current revision without rewriting it.
 
 The packaged `examples/data-consumer` project exercises installed generation and
 SQLite persistence. Its mapping and entity declarations provide a minimal

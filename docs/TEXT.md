@@ -21,6 +21,13 @@ not allocate an intermediate array. `fromBytes(value)` returns a new `String`
 only for valid UTF-8 and otherwise returns `null`. `concat` and `equal` use the
 built-in `String` operations.
 
+`String.contains`, `startsWith` and `endsWith` compare exact UTF-8 bytes,
+including embedded NUL. They are case-sensitive and do not normalize Unicode
+or use a locale. An empty search string succeeds for all three methods.
+`contains` searches every possible byte position and has worst-case work
+proportional to the source length times the search length. Prefix and suffix
+checks are linear in the search length.
+
 `invalidUtf8Offset(bytes): Int?` returns `null` for valid UTF-8. For invalid
 input it returns the zero-based byte position that violates the encoding rules;
 for an incomplete final sequence, it returns that sequence's first byte. It

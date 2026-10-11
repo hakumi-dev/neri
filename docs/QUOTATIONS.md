@@ -76,7 +76,11 @@ the scalar value or `CaptureValue.Null` without a conversion. Field packs use
 the same validated capture ABI. A different optional type is rejected.
 
 Standard `String` equality, inequality and concatenation operator syntax is
-represented by dedicated nodes. Direct method calls and custom overloaded
+represented by dedicated nodes. The standard `String.contains`, `startsWith`,
+`endsWith` and `byteLength` methods also have dedicated nodes. These methods
+preserve ordinal UTF-8 byte semantics; an empty search string matches every
+string. Only the standard library declarations qualify for these nodes.
+Other direct method calls and custom overloaded
 operators produce `NR276`, as do unsupported operations such as indexing and
 casts. Ordinary type and member errors retain their standard diagnostics.
 Operation diagnostics point to the bound operation's source span.
