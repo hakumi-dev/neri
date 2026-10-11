@@ -87,6 +87,11 @@ Scalar aggregates ignore null inputs. `sumInt` preserves SQL sum semantics;
 SQLite's floating-point `total()` or convert an overflow into zero. Text
 extrema and grouping follow the database's collation rules.
 
+PostgreSQL integer sums cast the complete aggregate expression to `BIGINT`,
+after `FILTER` and any zero default. This rejects results outside Neri's Int
+range. PostgreSQL averages cast their complete expression to `DOUBLE PRECISION`
+so the provider decodes the advertised Float result instead of a NUMERIC value.
+
 Float aggregates use approximate binary64 arithmetic. `average` translates to
 `AVG`; `sumFloatOrZero` uses `COALESCE(SUM(...), 0.0)`. Non-finite Float results
 fail strict decoding. These factories support the same distinct and per-leaf
