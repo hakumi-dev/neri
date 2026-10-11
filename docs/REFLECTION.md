@@ -68,3 +68,23 @@ Neri defines a narrower field-only interface with public-field visibility and it
 own `compile for` syntax. Its control-flow restrictions and expansion limits are
 Neri contracts. The referenced proposals do not establish the correctness of
 Neri's implementation; compiler contract tests validate its supported behavior.
+
+## Checked managed reference casts
+
+`reference.cast<To, From>(value)` returns `To?`. It returns the same object when
+its runtime class is `To` or a subclass of `To`, and returns null otherwise.
+The cast preserves reference identity and checks the runtime class ancestry.
+Both type arguments are non-optional, mutable managed class types. Resource
+classes, represented values, and function types are excluded.
+
+```neri
+let derived = reference::cast<SpecialRecord, Record>(record)
+
+if derived != null
+  consume(derived.extra)
+end
+```
+
+Runtime type descriptors carry their declared base type as a size-guarded tail
+extension. Existing descriptor fields keep their offsets. Descriptors created
+without the ancestry extension support exact-class matches.

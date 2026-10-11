@@ -936,6 +936,20 @@ void require_binary(const function_context &context, const instruction &value,
     }
     return 0U;
   }
+  case NERI_IR_OPCODE_CLASS_CHECKED_CAST_V1: {
+    verify_instruction_shape(value, 1U, 1U, 1U, false, false, false);
+    const auto &source = definition_type(context, value.operands.front());
+    const auto &result = value.results.front().value_type;
+    const auto &target = value.type_arguments.front();
+    if (!is_class(source) || !is_class(target) ||
+        result.tag != NERI_IR_TYPE_OPTIONAL_V1 ||
+        result.arguments.size() != 1U ||
+        !same_type(result.arguments.front(), target)) {
+      fail(reader_error_kind::invalid_type,
+           "class.cast.checked requires a managed class and an optional target class result.");
+    }
+    return 0U;
+  }
   case NERI_IR_OPCODE_OPTIONAL_NONE_V1: {
     verify_instruction_shape(value, 1U, 0U, 1U, false, false, false);
     const auto &result = value.results.front().value_type;

@@ -1608,6 +1608,13 @@ private:
       case NERI_IR_OPCODE_CLASS_UPCAST_V1:
         result = value(instruction.operands[0]);
         break;
+      case NERI_IR_OPCODE_CLASS_CHECKED_CAST_V1:
+        result = builder_.CreateCall(
+            module_.checked_class_cast_function(),
+            {value(instruction.operands[0]),
+             module_.class_descriptor(*instruction.type_arguments.front().symbol)},
+            "class.cast.checked");
+        break;
       case NERI_IR_OPCODE_OPTIONAL_NONE_V1:
         if (uses_null_representation(instruction.results.front().value_type)) {
           result = llvm::ConstantPointerNull::get(
@@ -2589,7 +2596,7 @@ private:
            llvm::Type::getInt64Ty(context_), pointer, pointer, pointer,
            llvm::Type::getInt64Ty(context_), pointer, pointer,
            llvm::Type::getInt32Ty(context_),
-           llvm::Type::getInt32Ty(context_)});
+           llvm::Type::getInt32Ty(context_), pointer});
     }
     return type_descriptor_type_;
   }
@@ -2654,7 +2661,7 @@ private:
          llvm::ConstantInt::get(llvm::Type::getInt64Ty(context_), 0U),
          null_pointer, null_pointer,
          llvm::ConstantInt::get(llvm::Type::getInt32Ty(context_), scalar_kind),
-         llvm::ConstantInt::get(llvm::Type::getInt32Ty(context_), 0U)}));
+         llvm::ConstantInt::get(llvm::Type::getInt32Ty(context_), 0U), null_pointer}));
     descriptor->setAlignment(llvm::Align(8));
     return descriptor;
   }
@@ -2773,7 +2780,7 @@ private:
          element_descriptor(element), null_pointer,
          llvm::ConstantInt::get(llvm::Type::getInt32Ty(context_),
                                 NERI_SCALAR_KIND_NONE_V1),
-         llvm::ConstantInt::get(llvm::Type::getInt32Ty(context_), 0U)}));
+         llvm::ConstantInt::get(llvm::Type::getInt32Ty(context_), 0U), null_pointer}));
     descriptor->setAlignment(llvm::Align(8));
     return descriptor;
   }
@@ -2823,6 +2830,61 @@ private:
   [[nodiscard]] llvm::GlobalVariable *class_descriptor(
       const symbol_id &id) const {
     return class_descriptors_.at(symbol_key(id));
+  }
+
+  [[nodiscard]] llvm::Function *checked_class_cast_function() {
+    if (auto *existing = output_->getFunction(".hk.class.cast.checked"))
+      return existing;
+    auto *pointer = llvm::PointerType::getUnqual(context_);
+    auto *signature = llvm::FunctionType::get(pointer, {pointer, pointer}, false);
+    auto *function = llvm::Function::Create(
+        signature, llvm::GlobalValue::PrivateLinkage,
+        ".hk.class.cast.checked", output_.get());
+    function->addFnAttr(llvm::Attribute::NoUnwind);
+    auto *entry = llvm::BasicBlock::Create(context_, "entry", function);
+    auto *initial = llvm::BasicBlock::Create(context_, "initial", function);
+    auto *loop = llvm::BasicBlock::Create(context_, "ancestry", function);
+    auto *compare = llvm::BasicBlock::Create(context_, "compare", function);
+    auto *extension = llvm::BasicBlock::Create(context_, "extension", function);
+    auto *parent = llvm::BasicBlock::Create(context_, "parent", function);
+    auto *success = llvm::BasicBlock::Create(context_, "success", function);
+    auto *failure = llvm::BasicBlock::Create(context_, "failure", function);
+    auto *object = function->getArg(0);
+    auto *target = function->getArg(1);
+    auto *none = llvm::ConstantPointerNull::get(pointer);
+    llvm::IRBuilder<> builder(entry);
+    builder.CreateCondBr(builder.CreateICmpEQ(object, none), failure, initial);
+    builder.SetInsertPoint(initial);
+    auto *dynamic = builder.CreateAlignedLoad(pointer, object, llvm::Align(8));
+    builder.CreateBr(loop);
+    builder.SetInsertPoint(loop);
+    auto *descriptor = builder.CreatePHI(pointer, 2);
+    auto *depth = builder.CreatePHI(builder.getInt32Ty(), 2);
+    descriptor->addIncoming(dynamic, initial);
+    depth->addIncoming(builder.getInt32(0), initial);
+    auto *valid = builder.CreateAnd(builder.CreateICmpNE(descriptor, none),
+                                   builder.CreateICmpULT(depth, builder.getInt32(256)));
+    builder.CreateCondBr(valid, compare, failure);
+    builder.SetInsertPoint(compare);
+    builder.CreateCondBr(builder.CreateICmpEQ(descriptor, target), success, extension);
+    builder.SetInsertPoint(extension);
+    auto *size = builder.CreateAlignedLoad(builder.getInt32Ty(), descriptor,
+                                          llvm::Align(4));
+    builder.CreateCondBr(builder.CreateICmpUGE(
+                             size, builder.getInt32(NERI_TYPE_DESCRIPTOR_V1_CLASS_BASE_SIZE)),
+                         parent, failure);
+    builder.SetInsertPoint(parent);
+    auto *slot = builder.CreateStructGEP(type_descriptor_type(), descriptor, 17U);
+    auto *base = builder.CreateAlignedLoad(pointer, slot, llvm::Align(8));
+    auto *next_depth = builder.CreateAdd(depth, builder.getInt32(1));
+    builder.CreateBr(loop);
+    descriptor->addIncoming(base, parent);
+    depth->addIncoming(next_depth, parent);
+    builder.SetInsertPoint(success);
+    builder.CreateRet(object);
+    builder.SetInsertPoint(failure);
+    builder.CreateRet(none);
+    return function;
   }
 
   void apply_aot_symbol_visibility(llvm::GlobalValue &value) const {
@@ -2904,7 +2966,8 @@ private:
            null_pointer, null_pointer,
            llvm::ConstantInt::get(llvm::Type::getInt32Ty(context_),
                                   NERI_SCALAR_KIND_NONE_V1),
-           llvm::ConstantInt::get(llvm::Type::getInt32Ty(context_), 0U)}));
+           llvm::ConstantInt::get(llvm::Type::getInt32Ty(context_), 0U),
+           declaration.base ? static_cast<llvm::Constant *>(class_descriptor(*declaration.base)) : null_pointer}));
     }
   }
 

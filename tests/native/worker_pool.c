@@ -45,7 +45,7 @@ static void nested_probe(void) {
 static const neri_type_descriptor_v1 value_type = {
   sizeof(neri_type_descriptor_v1), NERI_RUNTIME_ABI_MAJOR, NERI_RUNTIME_ABI_MINOR,
   NERI_TYPE_KIND_CLASS_V1, 0, sizeof(uint64_t), _Alignof(uint64_t),
-  0, 0, NULL, NULL, "pool-value", 0, NULL, NULL, NERI_SCALAR_KIND_NONE_V1, 0
+  0, 0, NULL, NULL, "pool-value", 0, NULL, NULL, NERI_SCALAR_KIND_NONE_V1, 0, NULL
 };
 static void initialize(void) {
   const neri_runtime_abi_requirements_v1 requirements = {

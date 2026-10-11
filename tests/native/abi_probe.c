@@ -42,10 +42,12 @@ NERI_ABI_STATIC_ASSERT(sizeof(neri_string_prefix_v1) == 24);
 NERI_ABI_STATIC_ASSERT(alignof(neri_string_prefix_v1) == 8);
 NERI_ABI_STATIC_ASSERT(sizeof(neri_array_prefix_v1) == 24);
 NERI_ABI_STATIC_ASSERT(alignof(neri_array_prefix_v1) == 8);
-NERI_ABI_STATIC_ASSERT(sizeof(neri_type_descriptor_v1) == 104);
+NERI_ABI_STATIC_ASSERT(sizeof(neri_type_descriptor_v1) == 112);
 NERI_ABI_STATIC_ASSERT(alignof(neri_type_descriptor_v1) == 8);
 NERI_ABI_STATIC_ASSERT(NERI_TYPE_DESCRIPTOR_V1_BASE_SIZE == 80);
 NERI_ABI_STATIC_ASSERT(NERI_TYPE_DESCRIPTOR_V1_4_SIZE == 104);
+NERI_ABI_STATIC_ASSERT(NERI_TYPE_DESCRIPTOR_V1_CLASS_BASE_SIZE == 112);
+NERI_ABI_STATIC_ASSERT(offsetof(neri_type_descriptor_v1, base_type) == 104);
 NERI_ABI_STATIC_ASSERT(NERI_TYPE_KIND_INLINE_AGGREGATE_V1 == 4);
 NERI_ABI_STATIC_ASSERT(NERI_TYPE_KIND_SCALAR_V1 == 5);
 NERI_ABI_STATIC_ASSERT(NERI_SCALAR_KIND_NONE_V1 == 0);
@@ -115,6 +117,7 @@ static const neri_type_descriptor_v1 node_type = {
     NULL,
     NERI_SCALAR_KIND_NONE_V1,
     0,
+    NULL,
 };
 
 static neri_gc_stats_v1 read_stats(void) {
