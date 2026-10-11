@@ -44,7 +44,11 @@ only when every component is NULL; partial NULL tuples fail tracking, loading,
 and saving validation. Set writes select and match every primary key component.
 
 Generated schema columns retain composite primary key positions and foreign key
-column tuples. Includes, references, relationship setters, batched predicates,
+column tuples. Each reference is anchored once on a distinct dependent tuple
+member. Composite relationship names include every foreign key member and their
+tracked slots retain complete tuple identity, so relations may share tenant
+columns. Each identical foreign key tuple has one mapped principal relation.
+Includes, references, relationship setters, batched predicates,
 and filtered include partitions use complete tuples. Navigation ordering appends
 all dependent primary key columns for a stable tie-break order.
 
