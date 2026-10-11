@@ -1,0 +1,294 @@
+use host
+use text
+use workers
+use result
+use neri_data
+namespace neri_data_sqlite
+
+def sqliteAsyncInterrupted(): ProviderFailure
+  return ProviderFailure.Driver(new DriverError(
+      "sqlite",
+      "async.read",
+      DriverErrorKind.Interrupted(),
+      9,
+      9,
+      null,
+      "SQLite asynchronous operation cancelled or deadline reached"
+    ))
+end
+
+def sqliteWireFailure(wire: SQLiteWireWriter, error: ProviderFailure): Void
+  match error
+    case ProviderFailure.State(message)
+      wire.integer(0)
+      wire.string(message)
+    case ProviderFailure.Driver(driver)
+      wire.integer(1)
+      wire.string(driver.provider())
+      wire.string(driver.operation())
+      var kind = 8
+
+      match driver.kind()
+        case DriverErrorKind.Contention()
+          kind = 0
+        case DriverErrorKind.Constraint()
+          kind = 1
+        case DriverErrorKind.Interrupted()
+          kind = 2
+        case DriverErrorKind.ReadOnly()
+          kind = 3
+        case DriverErrorKind.StorageFull()
+          kind = 4
+        case DriverErrorKind.Io()
+          kind = 5
+        case DriverErrorKind.Corrupt()
+          kind = 6
+        case DriverErrorKind.Other()
+      end
+      wire.integer(kind)
+      let primary = driver.primaryCode()
+      let extended = driver.extendedCode()
+      let state = driver.sqlState()
+
+      wire.integer(primary == null ? -1 : primary)
+      wire.integer(extended == null ? -1 : extended)
+      wire.string(state == null ? "" : state)
+      wire.string(driver.message())
+    case ProviderFailure.Cleanup(failure)
+      wire.integer(2)
+      sqliteWireFailure(wire, failure.primary())
+      sqliteWireFailure(wire, failure.cleanup())
+  end
+end
+
+def sqliteWireReadFailure(reader: SQLiteWireReader, depth: Int = 0): ProviderFailure
+  if depth > 8
+    return ProviderFailure.State("SQLite async error nesting exceeds wire bound")
+  end
+  let tag = reader.integer()
+
+  if tag == 0
+    return ProviderFailure.State(reader.string())
+  end
+  if tag == 2
+    let primary = sqliteWireReadFailure(reader, depth + 1)
+    let cleanup = sqliteWireReadFailure(reader, depth + 1)
+
+    return ProviderFailure.Cleanup(new ProviderCleanupFailure(primary, cleanup))
+  end
+  if tag != 1
+    return ProviderFailure.State("SQLite async failure wire tag is invalid")
+  end
+  let provider = reader.string()
+  let operation = reader.string()
+  let code = reader.integer()
+  let primary = reader.integer()
+  let extended = reader.integer()
+  let state = reader.string()
+  let message = reader.string()
+  var kind = DriverErrorKind.Other()
+
+  if code == 0
+    kind = DriverErrorKind.Contention()
+  else if code == 1
+    kind = DriverErrorKind.Constraint()
+  else if code == 2
+    kind = DriverErrorKind.Interrupted()
+  else if code == 3
+    kind = DriverErrorKind.ReadOnly()
+  else if code == 4
+    kind = DriverErrorKind.StorageFull()
+  else if code == 5
+    kind = DriverErrorKind.Io()
+  else if code == 6
+    kind = DriverErrorKind.Corrupt()
+  end
+  return ProviderFailure.Driver(new DriverError(
+      provider,
+      operation,
+      kind,
+      primary < 0 ? null : primary, extended < 0 ? null : extended, state == "" ? null : state, message
+    ))
+end
+
+def sqliteAsyncWorkerResponse(path: String, input: Byte[]): Byte[]
+  let reader = new SQLiteWireReader(input)
+  let version = reader.string()
+  let sql = reader.string()
+  let timeout = reader.integer()
+  let maximum = reader.integer()
+  let count = reader.integer()
+  var failure: ProviderFailure? = null
+
+  if version != "neri-sqlite-read-v1" || count < 1 || count > 1000 || maximum < -1 || maximum > 1000
+    failure = ProviderFailure.State("SQLite async request metadata is invalid")
+  end
+  let columns = arrays::generate<ResultColumn>(count < 1 || count > 1000 ? 0 : count) do |index|
+    let name = reader.string()
+    let kind = reader.integer()
+    let nullable = reader.integer()
+
+    if kind < 1 || kind > 5 || (nullable != 0 && nullable != 1)
+      failure = ProviderFailure.State("SQLite async request column kind is invalid")
+    end
+    return new ResultColumn(name, sqliteWireReadKind(kind), nullable == 1)
+  end
+  let parameterCount = reader.integer()
+  let parameters = new CompileState()
+  var index = 0
+
+  if parameterCount < 0 || parameterCount > 65535
+    failure = ProviderFailure.State("SQLite async parameter count is invalid")
+  end
+  while index < parameterCount && failure == null
+    match reader.cell()
+      case Cell.Null()
+        failure = ProviderFailure.State("SQLite async predicate parameter cannot be NULL")
+      case Cell.Bool(value)
+        parameters.bind(Parameter.Bool(value))
+      case Cell.Int(value)
+        parameters.bind(Parameter.Int(value))
+      case Cell.Float(value)
+        parameters.bind(Parameter.Float(value))
+      case Cell.Text(value)
+        parameters.bind(Parameter.Text(value))
+      case Cell.Binary(value)
+        parameters.bind(Parameter.Binary(value))
+    end
+    index = index + 1
+  end
+  if !reader.finished()
+    failure = ProviderFailure.State("SQLite async request is malformed")
+  end
+  let rows = new TypedRows<RawRow>()
+
+  if failure == null
+    match SQLiteProvider.open(path)
+      case SQLiteOpenResult.Failure(error)
+        failure = error
+      case SQLiteOpenResult.Opened(provider)
+        provider.observeWorkerCancellation(true)
+        let resultColumns = new ResultColumns(columns)
+        let visit: fn(RawRow): Bool = fn(row: RawRow): Bool do
+          if workers::cancelled() || rows.count() >= 100000
+            return false
+          end
+          rows.add(row)
+          return true
+        end
+        let stream = new StreamPlan(
+          sql,
+          new ParameterValues(parameters.head, parameters.count),
+          resultColumns,
+          maximum < 0 ? null : maximum, timeout < 0 ? null : timeout, null
+        )
+
+        match provider.stream(stream, visit)
+          case StreamResult.Completed(delivered)
+          case StreamResult.Cancelled(delivered)
+            failure = sqliteAsyncInterrupted()
+          case StreamResult.Stopped(delivered)
+            failure = workers::cancelled() ? sqliteAsyncInterrupted() : ProviderFailure.State("SQLite async response exceeds 100000 rows")
+          case StreamResult.Failure(error, delivered)
+            match error
+              case QueryFailure.Provider(nativeError)
+                failure = nativeError
+              case QueryFailure.Cleanup(cleanup)
+                failure = ProviderFailure.State("SQLite async read failed during cleanup")
+              case QueryFailure.InvalidIdentifier(name)
+              case QueryFailure.InvalidLimit(value, maximum)
+              case QueryFailure.MissingLimit(maximum)
+              case QueryFailure.SourceMismatch(expected, actual)
+              case QueryFailure.UnsupportedCapability(name)
+              case QueryFailure.MissingColumn(name)
+              case QueryFailure.TypeMismatch(column, expected, actual)
+              case QueryFailure.Cardinality(expected, actual)
+                failure = ProviderFailure.State("SQLite async query metadata is invalid")
+            end
+        end
+        let cleanup = provider.closeFailure()
+
+        if cleanup != null
+          failure = failure == null ? cleanup : ProviderFailure.Cleanup(new ProviderCleanupFailure(failure, cleanup))
+        end
+    end
+  end
+  let wire = new SQLiteWireWriter()
+
+  if failure == null
+    wire.integer(0)
+    wire.integer(rows.count())
+    var row = rows.first()
+
+    while row != null
+      for column in columns
+        match row.value.value(column.name())
+          case CellLookup.Found(value)
+            wire.cell(value)
+          case CellLookup.Missing()
+            failure = ProviderFailure.State("SQLite async response column is missing")
+        end
+      end
+      row = row.next
+    end
+  else
+    wire.integer(1)
+    sqliteWireFailure(wire, failure)
+  end
+  let output = wire.bytes()
+
+  if output != null && failure == null
+    return output
+  end
+  if output != null && failure != null
+    return output
+  end
+  let rejected = new SQLiteWireWriter()
+
+  rejected.integer(1)
+  sqliteWireFailure(rejected, ProviderFailure.State("SQLite async response exceeds 32 MiB"))
+  let rejectedBytes = rejected.bytes()
+
+  return rejectedBytes == null ? [] : rejectedBytes
+end
+
+## Native worker entry runs in the isolated heap established by the runtime.
+@cabiExport("app_neri_sqlite_async_worker")
+unsafe def sqliteAsyncWorkerEntry(config: Byte*, length: UInt64): Void
+  if length > (1048576 as UInt64)
+    workers::fail(text::bytes("SQLite async configuration exceeds bound"))
+    return
+  end
+  let copied = arrays::generate<Byte>(length as Int) do |index|
+    return config[index]
+  end
+  let path = host::stringFromBytes(copied)
+
+  if path == null
+    workers::fail(text::bytes("SQLite async path is invalid UTF-8"))
+    return
+  end
+  match workers::ready()
+    case result::Result.Error(error)
+      return
+    case result::Result.Ok(ready)
+  end
+  while true
+    match workers::receive()
+      case result::Result.Error(error)
+        return
+      case result::Result.Ok(input)
+        if input == null
+          return
+        end
+        let output = sqliteAsyncWorkerResponse(path, input)
+
+        match workers::reply(output)
+          case result::Result.Error(error)
+            workers::fail(text::bytes(error.detail))
+            return
+          case result::Result.Ok(replied)
+        end
+    end
+  end
+end

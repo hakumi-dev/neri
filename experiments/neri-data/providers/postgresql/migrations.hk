@@ -1,0 +1,239 @@
+use host
+use neri_data
+namespace neri_data_postgresql
+
+def pgMigrationHistory(provider: PostgreSQLProvider, catalog: readonly MigrationSet): MigrationHistoryResult
+  let invalid = catalog.validate()
+
+  if invalid != null || catalog.count() > 1000
+    return MigrationHistoryResult.Failure(MigrationFailure.Validation(invalid == null ? "PostgreSQL migration catalog exceeds 1000 entries" : invalid))
+  end
+  let existsColumns = new ResultColumns([new ResultColumn("present", ResultColumnKind.Bool())])
+
+  match provider.execute(new SqlPlan(
+      "SELECT to_regclass('__neri_migrations') IS NOT NULL AS present",
+      new ParameterValues(),
+      1,
+      existsColumns
+    ))
+    case ProviderResult.Failure(error)
+      return MigrationHistoryResult.Failure(MigrationFailure.Provider(error))
+    case ProviderResult.Rows(rows)
+      if rows.Length != 1
+        return MigrationHistoryResult.Failure(MigrationFailure.Drift("PostgreSQL migration history presence is invalid"))
+      end
+      match rows[0].value("present")
+        case CellLookup.Missing()
+          return MigrationHistoryResult.Failure(MigrationFailure.Drift("PostgreSQL migration history presence is missing"))
+        case CellLookup.Found(value)
+          match value
+            case Cell.Bool(present)
+              if !present
+                return MigrationHistoryResult.Loaded([])
+              end
+            case Cell.Null()
+            case Cell.Int(number)
+            case Cell.Float(number)
+            case Cell.Text(text)
+            case Cell.Binary(bytes)
+              return MigrationHistoryResult.Failure(MigrationFailure.Drift("PostgreSQL migration history presence is not boolean"))
+          end
+      end
+  end
+  let columns = new ResultColumns([
+      new ResultColumn("ordinal", ResultColumnKind.Int()),
+      new ResultColumn("id", ResultColumnKind.Text()),
+      new ResultColumn("signature", ResultColumnKind.Text())
+    ])
+
+  match provider.execute(new SqlPlan(
+      "SELECT ordinal, id, signature FROM __neri_migrations ORDER BY ordinal LIMIT 1001",
+      new ParameterValues(),
+      1001,
+      columns
+    ))
+    case ProviderResult.Failure(error)
+      return MigrationHistoryResult.Failure(MigrationFailure.Provider(error))
+    case ProviderResult.Rows(rows)
+      var failure: String? = null
+      let stamps = arrays::generate<MigrationStamp>(rows.Length) do |index|
+        var ordinal = -1
+        var id = ""
+        var signature = ""
+
+        match rows[index].value("ordinal")
+          case CellLookup.Found(value)
+            match value
+              case Cell.Int(number)
+                ordinal = number
+              case Cell.Null()
+              case Cell.Bool(boolean)
+              case Cell.Float(number)
+              case Cell.Text(text)
+              case Cell.Binary(bytes)
+            end
+          case CellLookup.Missing()
+        end
+        match rows[index].value("id")
+          case CellLookup.Found(value)
+            match value
+              case Cell.Text(text)
+                id = text
+              case Cell.Null()
+              case Cell.Bool(boolean)
+              case Cell.Float(number)
+              case Cell.Int(number)
+              case Cell.Binary(bytes)
+            end
+          case CellLookup.Missing()
+        end
+        match rows[index].value("signature")
+          case CellLookup.Found(value)
+            match value
+              case Cell.Text(text)
+                signature = text
+              case Cell.Null()
+              case Cell.Bool(boolean)
+              case Cell.Float(number)
+              case Cell.Int(number)
+              case Cell.Binary(bytes)
+            end
+          case CellLookup.Missing()
+        end
+        if ordinal != index + 1
+          failure = "PostgreSQL migration history ordinal is not contiguous"
+        end
+        return new MigrationStamp(id, signature)
+      end
+
+      if failure != null
+        return MigrationHistoryResult.Failure(MigrationFailure.Drift(failure))
+      end
+      let drift = catalog.historyPrefix(stamps)
+
+      return drift == null ? MigrationHistoryResult.Loaded(stamps) : MigrationHistoryResult.Failure(MigrationFailure.Drift(drift))
+  end
+end
+
+def pgMigrationFailure(provider: PostgreSQLProvider, lease: Int, primary: MigrationFailure): MigrationResult
+  match provider.rollbackTransaction(lease)
+    case WriteResult.Failure(error)
+      return MigrationResult.Failure(MigrationFailure.Cleanup(new MigrationCleanupFailure(
+            primary,
+            ProviderFailure.State(writeFailureMessage(error))
+          )))
+    case WriteResult.Saved(count)
+    case WriteResult.SavedWithValues(count, outputs)
+      return MigrationResult.Failure(primary)
+  end
+end
+
+def pgMigrate(provider: PostgreSQLProvider, catalog: readonly MigrationSet, target: String?): MigrationResult
+  let invalid = catalog.validate()
+
+  if invalid != null || catalog.count() > 1000
+    return MigrationResult.Failure(MigrationFailure.Validation(invalid == null ? "PostgreSQL migration catalog exceeds 1000 entries" : invalid))
+  end
+  var targetCount = catalog.count()
+
+  if target != null
+    targetCount = 0
+    if target != ""
+      var found = false
+      var index = 0
+
+      while index < catalog.count()
+        let migration = catalog.at(index)
+
+        if migration != null && migration.id() == target
+          targetCount = index + 1
+          found = true
+        end
+        index = index + 1
+      end
+      if !found
+        return MigrationResult.Failure(MigrationFailure.Validation("migration target is not in catalog"))
+      end
+    end
+  end
+  match provider.beginTransaction()
+    case TransactionOpenResult.Failure(error)
+      return MigrationResult.Failure(MigrationFailure.Provider(ProviderFailure.State(writeFailureMessage(error))))
+    case TransactionOpenResult.Begun(lease)
+      match provider.command(
+        "DO $$BEGIN PERFORM pg_advisory_xact_lock(1852142185); END$$; CREATE TABLE IF NOT EXISTS __neri_migrations (ordinal BIGINT PRIMARY KEY, id TEXT NOT NULL, signature TEXT NOT NULL)",
+        new WriteValues(),
+        script: true
+      )
+        case PostgreSQLCommandResult.Failure(error)
+          return pgMigrationFailure(provider, lease, MigrationFailure.Provider(error))
+        case PostgreSQLCommandResult.Completed(count, row)
+      end
+      match pgMigrationHistory(provider, catalog)
+        case MigrationHistoryResult.Failure(error)
+          return pgMigrationFailure(provider, lease, error)
+        case MigrationHistoryResult.Loaded(stamps)
+          var applied = stamps.Length
+          var changed = 0
+
+          while applied != targetCount
+            let forward = applied < targetCount
+            let index = forward ? applied : applied - 1
+            let migration = catalog.at(index)
+
+            if migration == null
+              return pgMigrationFailure(
+                provider,
+                lease,
+                MigrationFailure.Validation("migration catalog has a missing entry")
+              )
+            end
+            match compilePostgresMigration(migration, forward)
+              case SchemaCompileResult.Failure(message)
+                return pgMigrationFailure(provider, lease, MigrationFailure.Unsupported(message))
+              case SchemaCompileResult.Statement(sql)
+                match provider.command(sql, new WriteValues(), script: true)
+                  case PostgreSQLCommandResult.Failure(error)
+                    return pgMigrationFailure(provider, lease, MigrationFailure.Provider(error))
+                  case PostgreSQLCommandResult.Completed(count, row)
+                end
+            end
+            let values = new CompileState()
+
+            values.bind(Parameter.Int(index + 1))
+            var sql = "DELETE FROM __neri_migrations WHERE ordinal=$1"
+
+            if forward
+              sql = "INSERT INTO __neri_migrations(ordinal,id,signature) VALUES($1,$2,$3)"
+              values.bind(Parameter.Text(migration.id()))
+              values.bind(Parameter.Text(migration.signature()))
+            end
+            match provider.command(sql, readWriteParameters(new ParameterValues(values.head, values.count)))
+              case PostgreSQLCommandResult.Failure(error)
+                return pgMigrationFailure(provider, lease, MigrationFailure.Provider(error))
+              case PostgreSQLCommandResult.Completed(count, row)
+                if count != 1
+                  return pgMigrationFailure(
+                    provider,
+                    lease,
+                    MigrationFailure.Drift("PostgreSQL migration stamp write count mismatch")
+                  )
+                end
+            end
+            applied = forward ? applied + 1 : applied - 1
+            changed = changed + 1
+          end
+          match provider.commitTransaction(lease)
+            case WriteResult.Failure(error)
+              return pgMigrationFailure(
+                provider,
+                lease,
+                MigrationFailure.Provider(ProviderFailure.State(writeFailureMessage(error)))
+              )
+            case WriteResult.Saved(count)
+            case WriteResult.SavedWithValues(count, outputs)
+              return MigrationResult.Applied(changed)
+          end
+      end
+  end
+end

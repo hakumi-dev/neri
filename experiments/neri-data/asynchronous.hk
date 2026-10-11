@@ -1,0 +1,181 @@
+use result
+namespace neri_data
+
+enum AsyncInterest
+  case Read()
+  case Write()
+end
+
+enum AsyncReadPoll
+  case Pending(socket: Int, interest: AsyncInterest)
+  case Row(value: RawRow)
+  case Completed()
+  case Failure(error: ProviderFailure)
+end
+
+## A sequential nonblocking cursor. The operation owns its driver until close.
+abstract class AsyncReadDriver
+  public abstract def poll(): AsyncReadPoll
+  public abstract def cancel(): Void
+  public abstract def close(): ProviderFailure?
+end
+
+enum AsyncReadStart
+  case Started(driver: AsyncReadDriver)
+  case Failure(error: ProviderFailure)
+end
+
+enum AsyncQueryPoll<T>
+  case Pending(socket: Int, interest: AsyncInterest)
+  case Completed(result: QueryResult<T>)
+end
+
+## Every poll performs bounded local work and returns without waiting for I/O.
+## A caller may register Pending.socket with its event loop before polling again.
+resource class AsyncQuery<T>
+  private driver: AsyncReadDriver
+  private compiled: TypedPlan<T>
+  private tracker: EntityTracker<T>?
+  private rows: TypedRows<T> = new TypedRows<T>()
+  private terminal: QueryResult<T>?
+
+  def init(driver: AsyncReadDriver, compiled: TypedPlan<T>, tracker: EntityTracker<T>? = null): Void
+    this.driver = driver
+    this.compiled = compiled
+    this.tracker = tracker
+  end
+
+  public def cancel(): Void
+    this.driver.cancel()
+  end
+
+  public def poll(): AsyncQueryPoll<T>
+    let terminal = this.terminal
+
+    if terminal != null
+      return AsyncQueryPoll<T>.Completed(terminal)
+    end
+    match this.driver.poll()
+      case AsyncReadPoll.Pending(socket, interest)
+        return AsyncQueryPoll<T>.Pending(socket, interest)
+      case AsyncReadPoll.Row(raw)
+        match this.compiled.decode(raw)
+          case DecodeResult.Value(value)
+            this.rows.add(value)
+          case DecodeResult.Failure(error)
+            this.terminal = QueryResult<T>.Failure(error)
+            let cleanup = this.driver.close()
+
+            if cleanup != null
+              this.terminal = QueryResult<T>.Failure(QueryFailure.Cleanup(new QueryCleanupFailure(error, cleanup)))
+            end
+        end
+      case AsyncReadPoll.Failure(error)
+        this.terminal = QueryResult<T>.Failure(QueryFailure.Provider(error))
+        let cleanup = this.driver.close()
+
+        if cleanup != null
+          this.terminal = QueryResult<T>.Failure(QueryFailure.Cleanup(new QueryCleanupFailure(
+                QueryFailure.Provider(error),
+                cleanup
+              )))
+        end
+      case AsyncReadPoll.Completed()
+        let tracker = this.tracker
+
+        this.terminal = tracker == null ? QueryResult<T>.Rows(this.rows) : tracker.resolveRows(this.rows)
+        let cleanup = this.driver.close()
+
+        if cleanup != null
+          let primary = this.terminal
+
+          if primary != null
+            match primary
+              case QueryResult.Failure(error)
+                this.terminal = QueryResult<T>.Failure(QueryFailure.Cleanup(new QueryCleanupFailure(error, cleanup)))
+              case QueryResult.Rows(rows)
+                this.terminal = QueryResult<T>.Failure(QueryFailure.Provider(cleanup))
+            end
+          end
+        end
+    end
+    let completed = this.terminal
+
+    if completed != null
+      return AsyncQueryPoll<T>.Completed(completed)
+    end
+    # A row was consumed. Return immediately; -1 requests local rescheduling.
+    return AsyncQueryPoll<T>.Pending(-1, AsyncInterest.Read())
+  end
+
+  public def close(): result::Failure?
+    let error = this.driver.close()
+
+    return error == null ? null : providerResourceFailure(error, "data.async.close")
+  end
+end
+
+## Converts the public immutable predicate list for parameterized native drivers.
+def readWriteParameters(parameters: readonly ParameterValues): WriteValues
+  let output = new WriteValues()
+  var current = parameters.first()
+
+  while current != null
+    match current.value()
+      case Parameter.Bool(value)
+        output.add(Cell.Bool(value))
+      case Parameter.Int(value)
+        output.add(Cell.Int(value))
+      case Parameter.Float(value)
+        output.add(Cell.Float(value))
+      case Parameter.Text(value)
+        output.add(Cell.Text(value))
+      case Parameter.Binary(value)
+        output.add(Cell.Binary(value))
+    end
+    current = current.next()
+  end
+  return output
+end
+
+def startAsyncQuery<T>(
+  provider: Provider?,
+  compiled: TypedPlan<T>,
+  options: StreamOptions? = null,
+  tracker: EntityTracker<T>? = null,
+  maximumRows: Int? = null
+): result::Result<AsyncQuery<T>, QueryFailure>
+  if provider == null
+    return result::Result<AsyncQuery<T>, QueryFailure>.Error(QueryFailure.UnsupportedCapability("asynchronous reads require a provider"))
+  end
+  if compiled.sql().requiresCheckedScalars() && !provider.supports(ProviderCapability.CheckedScalarExpressions())
+    return result::Result<AsyncQuery<T>, QueryFailure>.Error(QueryFailure.UnsupportedCapability("checked-scalar-expressions"))
+  end
+  match provider.beginReadAsync(compiled.sql(), options, maximumRows)
+    case AsyncReadStart.Failure(error)
+      return result::Result<AsyncQuery<T>, QueryFailure>.Error(QueryFailure.Provider(error))
+    case AsyncReadStart.Started(driver)
+      let operation = new AsyncQuery<T>(driver, compiled, tracker)
+
+      return result::Result<AsyncQuery<T>, QueryFailure>.Ok(transfer operation)
+  end
+end
+
+def queryAsync<T>(query: Query<T>, options: StreamOptions? = null): result::Result<AsyncQuery<T>, QueryFailure>
+  let invalid = query.queryFailure()
+
+  if invalid != null
+    return result::Result<AsyncQuery<T>, QueryFailure>.Error(invalid)
+  end
+  let provider = query.provider()
+
+  if provider == null
+    return result::Result<AsyncQuery<T>, QueryFailure>.Error(QueryFailure.UnsupportedCapability("asynchronous reads require a provider"))
+  end
+  match compilePipeline<T, T>(query, query.rowDecoder(), null, query.rowLimit(), provider.dialect(), unbounded: true)
+    case CompileResult.Failure(error)
+      return result::Result<AsyncQuery<T>, QueryFailure>.Error(error)
+    case CompileResult.Plan(compiled)
+      return startAsyncQuery<T>(provider, compiled, options, query.rowTracker(), streamMaximum<T>(query))
+  end
+end

@@ -1,0 +1,375 @@
+use host
+use result
+use neri_data
+namespace neri_data_postgresql
+
+enum PostgreSQLOpenPoll
+  case Pending(socket: Int, interest: AsyncInterest)
+  case Opened(provider: PostgreSQLProvider)
+  case Failure(error: ProviderFailure)
+end
+
+## Owns the connecting handle. Supply hostaddr to avoid libpq DNS resolution.
+## No database I/O wait occurs in poll; finish transfers ownership to the provider.
+class PostgreSQLConnectDriver
+  private connection: Void*?
+  private deadline: Int?
+  private token: CancellationToken?
+  private opened: PostgreSQLProvider?
+  private error: ProviderFailure?
+
+  def init(connection: Void*, deadline: Int?, token: CancellationToken?): Void
+    this.connection = connection
+    this.deadline = deadline
+    this.token = token
+  end
+
+  public static def start(conninfo: String, options: StreamOptions? = null): PostgreSQLConnectStart
+    if pgHasNul(conninfo)
+      return PostgreSQLConnectStart.Failure(ProviderFailure.State("PostgreSQL conninfo contains NUL"))
+    end
+    let deadline = pgDeadline(options)
+
+    if options != null && options.timeoutMilliseconds() != null && deadline == null
+      return PostgreSQLConnectStart.Failure(ProviderFailure.State("invalid PostgreSQL timeout or unavailable monotonic clock"))
+    end
+    var token: CancellationToken? = null
+
+    if options != null
+      token = options.token()
+    end
+    unsafe
+      let bytes = pgCString(conninfo)
+      let parsed = pgConninfoParse(bytes, null)
+
+      if parsed == null
+        native::free(bytes)
+        return PostgreSQLConnectStart.Failure(ProviderFailure.State("invalid PostgreSQL conninfo"))
+      end
+      var address: String? = null
+      var index = 0
+
+      while parsed[index].keyword != null
+        if pgText(parsed[index].keyword) == "hostaddr"
+          address = pgText(parsed[index].value)
+        end
+        index = index + 1
+      end
+      pgConninfoFree(parsed)
+      if address == null || address == "" || !pgHostAddressesPresent(address)
+        native::free(bytes)
+        return PostgreSQLConnectStart.Failure(ProviderFailure.State("nonblocking PostgreSQL connection requires hostaddr in conninfo"))
+      end
+      let keywords = stackalloc PostgreSQLPointer[3]
+      let values = stackalloc PostgreSQLPointer[3]
+      let databaseKey = pgCString("dbname")
+      let encodingKey = pgCString("client_encoding")
+      let encoding = pgCString("UTF8")
+
+      keywords[0].value = databaseKey
+      keywords[1].value = encodingKey
+      keywords[2].value = null
+      values[0].value = bytes
+      values[1].value = encoding
+      values[2].value = null
+      let connection = pgConnectStartParams(keywords as Byte**, values as Byte**, 1 as Int32)
+
+      native::free(bytes)
+      native::free(databaseKey)
+      native::free(encodingKey)
+      native::free(encoding)
+      if connection == null
+        return PostgreSQLConnectStart.Failure(ProviderFailure.State("PostgreSQL could not allocate connection"))
+      end
+      let operation = new PostgreSQLConnectDriver(connection, deadline, token)
+
+      return PostgreSQLConnectStart.Started(operation)
+    end
+  end
+
+  public def poll(): PostgreSQLOpenPoll
+    let opened = this.opened
+    let priorError = this.error
+
+    if opened != null
+      return PostgreSQLOpenPoll.Opened(opened)
+    end
+    if priorError != null
+      return PostgreSQLOpenPoll.Failure(priorError)
+    end
+    let token = this.token
+
+    if (token != null && token.cancelled()) || streamTimedOut(this.deadline)
+      this.error = pgInterrupted("connect")
+      this.close()
+      return PostgreSQLOpenPoll.Failure(pgInterrupted("connect"))
+    end
+    unsafe
+      let connection = this.connection
+
+      if connection == null
+        return PostgreSQLOpenPoll.Failure(ProviderFailure.State("PostgreSQL connect operation is closed"))
+      end
+      let status = pgConnectPoll(connection) as Int
+
+      if status == 1 || status == 2 || status == 4
+        return PostgreSQLOpenPoll.Pending(
+          status == 4 ? -1 : pgSocket(connection) as Int,
+          status == 2 ? AsyncInterest.Write() : AsyncInterest.Read()
+        )
+      end
+      if status != 3 || pgSetNonblocking(connection, 1 as Int32) != (0 as Int32)
+        let error = pgFailure(connection, "connect")
+
+        this.error = error
+        this.close()
+        return PostgreSQLOpenPoll.Failure(error)
+      end
+      let parameter = pgCString("client_encoding")
+      let encoding = pgText(pgParameterStatus(connection, parameter))
+
+      native::free(parameter)
+      if encoding != "UTF8"
+        let error = ProviderFailure.State("PostgreSQL connection requires client_encoding UTF8")
+
+        this.error = error
+        this.close()
+        return PostgreSQLOpenPoll.Failure(error)
+      end
+      let provider = new PostgreSQLProvider(connection)
+
+      this.connection = null
+      this.opened = provider
+      return PostgreSQLOpenPoll.Opened(provider)
+    end
+  end
+
+  public def cancel(): Void
+    this.error = pgInterrupted("connect")
+    this.close()
+  end
+
+  public def close(): result::Failure?
+    unsafe
+      let connection = this.connection
+
+      if connection != null
+        pgFinish(connection)
+        this.connection = null
+      end
+    end
+    return null
+  end
+end
+
+def pgHostAddressesPresent(address: String): Bool
+  var index = 0
+  var previousComma = true
+
+  while index < host::stringByteLength(address)
+    let comma = host::stringByteAt(address, index) == (44 as Byte)
+
+    if comma && previousComma
+      return false
+    end
+    previousComma = comma
+    index = index + 1
+  end
+  return !previousComma
+end
+
+enum PostgreSQLConnectStart
+  case Started(driver: PostgreSQLConnectDriver)
+  case Failure(error: ProviderFailure)
+end
+
+resource class PostgreSQLConnect
+  private driver: PostgreSQLConnectDriver
+
+  def init(driver: PostgreSQLConnectDriver): Void
+    this.driver = driver
+  end
+
+  public static def start(
+    conninfo: String,
+    options: StreamOptions? = null
+  ): result::Result<PostgreSQLConnect, ProviderFailure>
+    match PostgreSQLConnectDriver.start(conninfo, options)
+      case PostgreSQLConnectStart.Failure(error)
+        return result::Result<PostgreSQLConnect, ProviderFailure>.Error(error)
+      case PostgreSQLConnectStart.Started(driver)
+        let owned = new PostgreSQLConnect(driver)
+
+        return result::Result<PostgreSQLConnect, ProviderFailure>.Ok(transfer owned)
+    end
+  end
+
+  public def poll(): PostgreSQLOpenPoll
+    return this.driver.poll()
+  end
+
+  public def cancel(): Void
+    this.driver.cancel()
+  end
+
+  public def close(): result::Failure?
+    return this.driver.close()
+  end
+end
+
+def pgDeadline(options: StreamOptions?): Int?
+  if options == null
+    return null
+  end
+  let timeout = options.timeoutMilliseconds()
+
+  if timeout == null || timeout < 1 || timeout > 86400000
+    return null
+  end
+  let now = clock::milliseconds()
+
+  return now == null || now > 9223372036854775807 - timeout ? null : now + timeout
+end
+
+def pgInterrupted(operation: String): ProviderFailure
+  return ProviderFailure.Driver(new DriverError(
+      "postgresql",
+      operation,
+      DriverErrorKind.Interrupted(),
+      null,
+      null,
+      "57014",
+      "PostgreSQL operation cancelled or deadline reached"
+    ))
+end
+
+## The provider remains strongly referenced for this operation's full lifetime.
+class PostgreSQLRead: AsyncReadDriver
+  private owner: PostgreSQLProvider
+  private columns: readonly ResultColumns
+  private maximum: Int?
+  private deadline: Int?
+  private token: readonly CancellationToken?
+  private delivered: Int = 0
+  private stopped: Bool = false
+  private done: Bool = false
+  private failure: ProviderFailure?
+  private resultFailure: ProviderFailure?
+
+  def init(
+    owner: PostgreSQLProvider,
+    columns: readonly ResultColumns,
+    maximum: Int?,
+    deadline: Int?,
+    token: readonly CancellationToken?
+  ): Void
+    this.owner = owner
+    this.columns = columns
+    this.maximum = maximum
+    this.deadline = deadline
+    this.token = token
+  end
+
+  public override def cancel(): Void
+    if !this.done
+      this.stopped = true
+    end
+  end
+
+  public override def close(): ProviderFailure?
+    if !this.done
+      this.done = true
+      return this.owner.abortOperation()
+    end
+    return null
+  end
+
+  private def fail(error: ProviderFailure, abort: Bool): AsyncReadPoll
+    this.failure = error
+    if abort
+      let cleanup = this.close()
+
+      if cleanup != null
+        this.failure = ProviderFailure.Cleanup(new ProviderCleanupFailure(error, cleanup))
+      end
+    end
+    return AsyncReadPoll.Failure(error)
+  end
+
+  public override def poll(): AsyncReadPoll
+    let failure = this.failure
+
+    if failure != null
+      return AsyncReadPoll.Failure(failure)
+    end
+    if this.done
+      return AsyncReadPoll.Completed()
+    end
+    let token = this.token
+
+    if this.stopped || (token != null && token.cancelled()) || streamTimedOut(this.deadline)
+      return this.fail(pgInterrupted("read"), true)
+    end
+    unsafe
+      let connection = this.owner.nativeHandle()
+
+      if connection == null
+        return this.fail(ProviderFailure.State("PostgreSQL read connection is closed"), true)
+      end
+      let flushed = pgFlush(connection) as Int
+
+      if flushed < 0 || pgConsumeInput(connection) != (1 as Int32)
+        return this.fail(pgFailure(connection, "read.io"), true)
+      end
+      if flushed == 1
+        return AsyncReadPoll.Pending(pgSocket(connection) as Int, AsyncInterest.Write())
+      end
+      if pgIsBusy(connection) != (0 as Int32)
+        return AsyncReadPoll.Pending(pgSocket(connection) as Int, AsyncInterest.Read())
+      end
+      let result = pgGetResult(connection)
+
+      if result == null
+        this.done = true
+        this.owner.finishOperation()
+        let resultFailure = this.resultFailure
+
+        if resultFailure != null
+          this.failure = resultFailure
+          return AsyncReadPoll.Failure(resultFailure)
+        end
+        return AsyncReadPoll.Completed()
+      end
+      let status = pgResultStatus(result) as Int
+
+      if status == 9
+        let maximum = this.maximum
+
+        if maximum != null && this.delivered >= maximum
+          pgClear(result)
+          return this.fail(ProviderFailure.State("PostgreSQL exceeded query row bound"), true)
+        end
+        let decoded = pgDecodeRow(result, 0, this.columns)
+
+        pgClear(result)
+        match decoded
+          case PostgreSQLRowResult.Failure(error)
+            return this.fail(error, true)
+          case PostgreSQLRowResult.Row(value)
+            this.delivered = this.delivered + 1
+            return AsyncReadPoll.Row(value)
+        end
+      end
+      if status == 2 && pgNtuples(result) == (0 as Int32)
+        pgClear(result)
+        return AsyncReadPoll.Pending(-1, AsyncInterest.Read())
+      end
+      let error = pgFailure(connection, "read.result", result)
+
+      pgClear(result)
+      # Drain an ordinary SQL error to permit transaction rollback/reuse.
+      this.resultFailure = error
+      return AsyncReadPoll.Pending(-1, AsyncInterest.Read())
+    end
+  end
+end

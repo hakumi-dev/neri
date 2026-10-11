@@ -1,0 +1,117 @@
+use neri_data
+use neri_data_sqlite
+use neri_data_sqlite_fixture
+use resources
+use result
+use test
+
+def asyncMaterialization(path: String): resources::Outcome<Int, QueryFailure>
+  match SQLiteAsyncProvider.open(path)
+    case result::Result.Error(error)
+      return QueryFailure.Provider(error)
+    case result::Result.Ok(provider)
+      let columns = new ResultColumns([new ResultColumn("id", ResultColumnKind.Int())])
+      let read: fn(RawRow): DecodeResult<Int> = fn(row: RawRow): DecodeResult<Int> do
+        return decodeInt(row, "id")
+      end
+      let typed = new TypedPlan<Int>(
+        new SqlPlan("SELECT id FROM records ORDER BY id", new ParameterValues(), 1000, columns),
+        new Decoder<Int>(read, columns)
+      )
+
+      using operation <- startAsyncQuery<Int>(provider, typed, new StreamOptions(timeoutMilliseconds: 10000))
+        var done = false
+
+        while !done
+          match operation.poll()
+            case AsyncQueryPoll.Pending(socket, interest)
+              continue
+            case AsyncQueryPoll.Completed(result)
+              done = true
+              match result
+                case QueryResult.Failure(error)
+                  provider.closeFailure()
+                  return error
+                case QueryResult.Rows(rows)
+                  test::assertEqual(rows.count(), 1201)
+              end
+          end
+        end
+        let cancellation = new CancellationToken()
+
+        match provider.beginReadAsync(
+          new SqlPlan(
+            "WITH RECURSIVE n(v) AS (SELECT 1 UNION ALL SELECT v+1 FROM n WHERE v<100000000) SELECT SUM(v) AS id FROM n",
+            new ParameterValues(),
+            1,
+            columns
+          ),
+          new StreamOptions(token: cancellation, timeoutMilliseconds: 10000)
+        )
+          case AsyncReadStart.Failure(error)
+            provider.closeFailure()
+            return QueryFailure.Provider(error)
+          case AsyncReadStart.Started(driver)
+            cancellation.cancel()
+            var waiting = true
+
+            while waiting
+              match driver.poll()
+                case AsyncReadPoll.Pending(socket, interest)
+                  continue
+                case AsyncReadPoll.Failure(error)
+                  waiting = false
+                  match error
+                    case ProviderFailure.Driver(details)
+                      test::assertEqual(details.primaryCode(), 9)
+                    case ProviderFailure.State(message)
+                    case ProviderFailure.Cleanup(cleanup)
+                      test::assertTrue(false)
+                  end
+                case AsyncReadPoll.Completed()
+                case AsyncReadPoll.Row(row)
+                  test::assertTrue(false)
+                  waiting = false
+              end
+            end
+            driver.close()
+        end
+
+        test::assertTrue(provider.closeFailure() == null)
+        return 0
+      end
+  end
+end
+
+def isolatedContract(): resources::Outcome<Int, result::Failure>
+  using directory <- files::TemporaryDirectory.create("neri-async-sqlite-")
+    let path = directory.path() + "/records.sqlite"
+
+    test::assertTrue(createSQLiteFixture(
+        path,
+        "CREATE TABLE records(id INTEGER NOT NULL); WITH RECURSIVE n(v) AS (SELECT 1 UNION ALL SELECT v+1 FROM n WHERE v<1201) INSERT INTO records SELECT v FROM n;"
+      ))
+    let outcome = asyncMaterialization(path)
+
+    test::assertEqual(outcome.closeFailures.count(), 0)
+    match outcome.completion
+      case resources::Completion.Value(code)
+        test::assertEqual(code, 0)
+      case resources::Completion.Failure(error)
+        test::assertTrue(false)
+    end
+    return 0
+  end
+end
+
+def main(): Void
+  let outcome = isolatedContract()
+
+  test::assertEqual(outcome.closeFailures.count(), 0)
+  match outcome.completion
+    case resources::Completion.Value(code)
+      test::assertEqual(code, 0)
+    case resources::Completion.Failure(error)
+      test::assertTrue(false)
+  end
+end
