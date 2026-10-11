@@ -30,6 +30,11 @@ enum AsyncQueryPoll<T>
   case Completed(result: QueryResult<T>)
 end
 
+enum AsyncQueryPreparation<T>
+  case Ready(driver: AsyncReadDriver, compiled: TypedPlan<T>, tracker: EntityTracker<T>?)
+  case Failure(error: QueryFailure)
+end
+
 ## Every poll performs bounded local work and returns without waiting for I/O.
 ## A caller may register Pending.socket with its event loop before polling again.
 resource class AsyncQuery<T>
@@ -138,6 +143,27 @@ def readWriteParameters(parameters: readonly ParameterValues): WriteValues
   return output
 end
 
+def prepareAsyncQuery<T>(
+  provider: Provider?,
+  compiled: TypedPlan<T>,
+  options: StreamOptions? = null,
+  tracker: EntityTracker<T>? = null,
+  maximumRows: Int? = null
+): AsyncQueryPreparation<T>
+  if provider == null
+    return AsyncQueryPreparation<T>.Failure(QueryFailure.UnsupportedCapability("asynchronous reads require a provider"))
+  end
+  if compiled.sql().requiresCheckedScalars() && !provider.supports(ProviderCapability.CheckedScalarExpressions())
+    return AsyncQueryPreparation<T>.Failure(QueryFailure.UnsupportedCapability("checked-scalar-expressions"))
+  end
+  match provider.beginReadAsync(compiled.sql(), options, maximumRows)
+    case AsyncReadStart.Failure(error)
+      return AsyncQueryPreparation<T>.Failure(QueryFailure.Provider(error))
+    case AsyncReadStart.Started(driver)
+      return AsyncQueryPreparation<T>.Ready(driver, compiled, tracker)
+  end
+end
+
 def startAsyncQuery<T>(
   provider: Provider?,
   compiled: TypedPlan<T>,
@@ -145,37 +171,42 @@ def startAsyncQuery<T>(
   tracker: EntityTracker<T>? = null,
   maximumRows: Int? = null
 ): result::Result<AsyncQuery<T>, QueryFailure>
-  if provider == null
-    return result::Result<AsyncQuery<T>, QueryFailure>.Error(QueryFailure.UnsupportedCapability("asynchronous reads require a provider"))
-  end
-  if compiled.sql().requiresCheckedScalars() && !provider.supports(ProviderCapability.CheckedScalarExpressions())
-    return result::Result<AsyncQuery<T>, QueryFailure>.Error(QueryFailure.UnsupportedCapability("checked-scalar-expressions"))
-  end
-  match provider.beginReadAsync(compiled.sql(), options, maximumRows)
-    case AsyncReadStart.Failure(error)
-      return result::Result<AsyncQuery<T>, QueryFailure>.Error(QueryFailure.Provider(error))
-    case AsyncReadStart.Started(driver)
-      let operation = new AsyncQuery<T>(driver, compiled, tracker)
+  match prepareAsyncQuery(provider, compiled, options, tracker, maximumRows)
+    case AsyncQueryPreparation.Failure(error)
+      return result::Result<AsyncQuery<T>, QueryFailure>.Error(error)
+    case AsyncQueryPreparation.Ready(driver, plan, owner)
+      let owned = new AsyncQuery<T>(driver, plan, owner)
 
-      return result::Result<AsyncQuery<T>, QueryFailure>.Ok(transfer operation)
+      return result::Result<AsyncQuery<T>, QueryFailure>.Ok(transfer owned)
   end
 end
 
-def queryAsync<T>(query: Query<T>, options: StreamOptions? = null): result::Result<AsyncQuery<T>, QueryFailure>
+def prepareQueryAsync<T>(query: Query<T>, options: StreamOptions? = null): AsyncQueryPreparation<T>
   let invalid = query.queryFailure()
 
   if invalid != null
-    return result::Result<AsyncQuery<T>, QueryFailure>.Error(invalid)
+    return AsyncQueryPreparation<T>.Failure(invalid)
   end
   let provider = query.provider()
 
   if provider == null
-    return result::Result<AsyncQuery<T>, QueryFailure>.Error(QueryFailure.UnsupportedCapability("asynchronous reads require a provider"))
+    return AsyncQueryPreparation<T>.Failure(QueryFailure.UnsupportedCapability("asynchronous reads require a provider"))
   end
   match compilePipeline<T, T>(query, query.rowDecoder(), null, query.rowLimit(), provider.dialect(), unbounded: true)
     case CompileResult.Failure(error)
-      return result::Result<AsyncQuery<T>, QueryFailure>.Error(error)
+      return AsyncQueryPreparation<T>.Failure(error)
     case CompileResult.Plan(compiled)
-      return startAsyncQuery<T>(provider, compiled, options, query.rowTracker(), streamMaximum<T>(query))
+      return prepareAsyncQuery<T>(provider, compiled, options, query.rowTracker(), streamMaximum<T>(query))
+  end
+end
+
+def queryAsync<T>(query: Query<T>, options: StreamOptions? = null): result::Result<AsyncQuery<T>, QueryFailure>
+  match prepareQueryAsync(query, options)
+    case AsyncQueryPreparation.Failure(error)
+      return result::Result<AsyncQuery<T>, QueryFailure>.Error(error)
+    case AsyncQueryPreparation.Ready(driver, plan, owner)
+      let owned = new AsyncQuery<T>(driver, plan, owner)
+
+      return result::Result<AsyncQuery<T>, QueryFailure>.Ok(transfer owned)
   end
 end
