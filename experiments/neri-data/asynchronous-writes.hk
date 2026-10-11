@@ -10,6 +10,11 @@ abstract class AsyncWriteDriver
   public abstract def poll(): AsyncWritePoll
   public abstract def cancel(): Void
   public abstract def close(): WriteFailure?
+
+  ## An abandoned worker operation may finish rollback on its provider owner.
+  public def deferFinalize(finalize: fn(WriteResult): WriteResult): Bool
+    return false
+  end
 end
 
 enum AsyncWriteStart
@@ -90,7 +95,16 @@ resource class AsyncWrite
     let error = this.driver.close()
 
     if this.terminal == null
-      this.finish(WriteResult.Failure(error == null ? WriteFailure.Transaction("asynchronous write disposed before completion") : error))
+      match this.driver.poll()
+        case AsyncWritePoll.Completed(result)
+          this.finish(result)
+        case AsyncWritePoll.Pending(socket, interest)
+          let finalize = this.finalize
+
+          if finalize != null && this.driver.deferFinalize(finalize)
+            this.finalize = null
+          end
+      end
     end
     return error == null ? null : writeResourceFailure(error, "data.async.write.close")
   end
@@ -169,4 +183,49 @@ def writeResourceFailure(error: WriteFailure, operation: String): result::Failur
     case WriteFailure.Transaction(message)
       return new result::Failure("write", operation, writeFailureMessage(error))
   end
+end
+
+## Freezes parameters and result metadata before asynchronous execution begins.
+def freezeWriteBatch(source: readonly WriteBatch): WriteBatch
+  let frozen = new WriteBatch()
+  var current = source.first()
+
+  while current != null
+    let command = current.command()
+    let values = new WriteValues()
+    var value = command.parameters().first()
+
+    while value != null
+      match value.value()
+        case Cell.Null()
+          values.add(Cell.Null())
+        case Cell.Bool(item)
+          values.add(Cell.Bool(item))
+        case Cell.Int(item)
+          values.add(Cell.Int(item))
+        case Cell.Float(item)
+          values.add(Cell.Float(item))
+        case Cell.Text(item)
+          values.add(Cell.Text(item))
+        case Cell.Binary(item)
+          values.add(Cell.Binary(copyBinary(item)))
+      end
+      value = value.next()
+    end
+    let returning = command.returningColumns()
+    var copied: ResultColumns? = null
+
+    if returning != null
+      let columns = arrays::generate<ResultColumn>(returning.count()) do |index|
+        let column = returning.at(index)
+
+        return new ResultColumn(column.name(), copyResultColumnKind(column.kind()), column.nullable())
+      end
+
+      copied = new ResultColumns(columns)
+    end
+    frozen.add(command.sql(), values, command.expectedRows(), copied)
+    current = current.next()
+  end
+  return frozen
 end

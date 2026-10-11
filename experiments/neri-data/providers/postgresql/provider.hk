@@ -152,6 +152,161 @@ class PostgreSQLProvider: Provider
     return null
   end
 
+  internal def reconcileAsyncFailure(): Void
+    unsafe
+      let connection = this.connection
+
+      if connection != null && this.activeLease != 0 && pgTransactionStatus(connection) == (0 as Int32)
+        this.lastLease = this.activeLease
+        this.activeLease = 0
+        this.savepoints = null
+        this.lastState = TransactionState.RolledBack()
+      end
+    end
+  end
+
+  internal def asyncControlSql(action: AsyncTransactionAction): PostgreSQLControlSql
+    match action
+      case AsyncTransactionAction.Begin()
+        if this.activeLease != 0 || this.nextLease <= 0 || this.nextLease == 9223372036854775807
+          return PostgreSQLControlSql.Failure(WriteFailure.Transaction("PostgreSQL transaction already active or lease ids exhausted"))
+        end
+        return PostgreSQLControlSql.Statement("BEGIN")
+      case AsyncTransactionAction.Commit(lease)
+        if lease != this.activeLease || lease == 0 || this.savepoints != null
+          return PostgreSQLControlSql.Failure(WriteFailure.Transaction("PostgreSQL commit requires an active lease with released savepoints"))
+        end
+        match this.transactionState(lease)
+          case TransactionState.Active()
+            return PostgreSQLControlSql.Statement("COMMIT")
+          case TransactionState.Failed()
+          case TransactionState.Invalid()
+          case TransactionState.Committed()
+          case TransactionState.RolledBack()
+            return PostgreSQLControlSql.Failure(WriteFailure.Transaction("PostgreSQL failed transaction requires rollback"))
+        end
+      case AsyncTransactionAction.Rollback(lease)
+        if lease != this.activeLease || lease == 0
+          return PostgreSQLControlSql.Failure(WriteFailure.Transaction("PostgreSQL rollback lease is invalid"))
+        end
+        return PostgreSQLControlSql.Statement("ROLLBACK")
+      case AsyncTransactionAction.Savepoint(lease)
+        if lease != this.activeLease || lease == 0 || this.nextSavepoint <= 0 || this.nextSavepoint == 9223372036854775807
+          return PostgreSQLControlSql.Failure(WriteFailure.Transaction("PostgreSQL savepoint lease is invalid or ids exhausted"))
+        end
+        return PostgreSQLControlSql.Statement("SAVEPOINT neri_sp_" + (this.nextSavepoint as String))
+      case AsyncTransactionAction.RollbackTo(lease, id)
+        let top = this.savepoints
+
+        if lease != this.activeLease || lease == 0 || top == null || top.id != id
+          return PostgreSQLControlSql.Failure(WriteFailure.Transaction("PostgreSQL savepoints require the latest active id and lease"))
+        end
+        return PostgreSQLControlSql.Statement("ROLLBACK TO SAVEPOINT neri_sp_" + (id as String))
+      case AsyncTransactionAction.Release(lease, id)
+        let top = this.savepoints
+
+        if lease != this.activeLease || lease == 0 || top == null || top.id != id
+          return PostgreSQLControlSql.Failure(WriteFailure.Transaction("PostgreSQL savepoints require the latest active id and lease"))
+        end
+        return PostgreSQLControlSql.Statement("RELEASE SAVEPOINT neri_sp_" + (id as String))
+    end
+  end
+
+  internal def acceptAsyncControl(action: AsyncTransactionAction): AsyncControlResult
+    match action
+      case AsyncTransactionAction.Begin()
+        let lease = this.nextLease
+
+        this.nextLease = lease + 1
+        this.activeLease = lease
+        this.lastLease = lease
+        this.lastState = TransactionState.Active()
+        return AsyncControlResult.Begun(lease)
+      case AsyncTransactionAction.Savepoint(lease)
+        let id = this.nextSavepoint
+
+        this.nextSavepoint = id + 1
+        this.savepoints = new PostgreSQLSavepoint(id, this.savepoints)
+        return AsyncControlResult.Created(id)
+      case AsyncTransactionAction.Commit(lease)
+        this.activeLease = 0
+        this.savepoints = null
+        this.lastState = TransactionState.Committed()
+      case AsyncTransactionAction.Rollback(lease)
+        this.activeLease = 0
+        this.savepoints = null
+        this.lastState = TransactionState.RolledBack()
+      case AsyncTransactionAction.RollbackTo(lease, id)
+        return AsyncControlResult.Saved()
+      case AsyncTransactionAction.Release(lease, id)
+        let top = this.savepoints
+
+        this.savepoints = top == null ? null : top.previous
+    end
+    return AsyncControlResult.Saved()
+  end
+
+  public override def beginControlAsync(
+    action: AsyncTransactionAction,
+    options: StreamOptions? = null
+  ): AsyncControlStart
+    let unavailable = this.available()
+
+    if unavailable != null
+      return AsyncControlStart.Failure(WriteFailure.Provider(unavailable))
+    end
+    let deadline = pgDeadline(options)
+    let token = options == null ? null : options.token()
+
+    if options != null && options.timeoutMilliseconds() != null && deadline == null
+      return AsyncControlStart.Failure(WriteFailure.Validation("invalid PostgreSQL asynchronous timeout"))
+    end
+    if token != null && token.cancelled()
+      return AsyncControlStart.Failure(WriteFailure.Provider(pgInterrupted("async.transaction")))
+    end
+    match this.asyncControlSql(action)
+      case PostgreSQLControlSql.Failure(error)
+        return AsyncControlStart.Failure(error)
+      case PostgreSQLControlSql.Statement(sql)
+        this.busy = true
+        return AsyncControlStart.Started(new PostgreSQLAsyncControl(this, action, sql, deadline, token))
+    end
+  end
+
+  public override def beginWriteAsync(
+    batch: readonly WriteBatch,
+    options: StreamOptions? = null,
+    lease: Int? = null,
+    validate: (fn(readonly WriteReturnedRows): WriteFailure?)? = null
+  ): AsyncWriteStart
+    let unavailable = this.available()
+
+    if unavailable != null
+      return AsyncWriteStart.Failure(WriteFailure.Provider(unavailable))
+    end
+    if batch.count() > 1000 || (lease == null && this.activeLease != 0) || (lease != null && (lease == 0 || lease != this.activeLease))
+      return AsyncWriteStart.Failure(WriteFailure.Transaction("PostgreSQL asynchronous batch requires a valid lease or an idle connection and at most 1000 commands"))
+    end
+    let deadline = pgDeadline(options)
+    let token = options == null ? null : options.token()
+
+    if options != null && options.timeoutMilliseconds() != null && deadline == null
+      return AsyncWriteStart.Failure(WriteFailure.Validation("invalid PostgreSQL asynchronous timeout"))
+    end
+    if token != null && token.cancelled()
+      return AsyncWriteStart.Failure(WriteFailure.Provider(pgInterrupted("async.write")))
+    end
+    this.busy = true
+    return AsyncWriteStart.Started(new PostgreSQLAsyncWrite(
+        this,
+        freezeWriteBatch(batch),
+        lease,
+        deadline,
+        token,
+        validate
+      ))
+  end
+
   private def startRead(
     sql: String,
     parameters: readonly ParameterValues,
@@ -359,6 +514,9 @@ class PostgreSQLProvider: Provider
 
         if result == null
           this.finishOperation()
+          if failure != null
+            this.reconcileAsyncFailure()
+          end
           return failure == null ? PostgreSQLCommandResult.Completed(
             count,
             returned
@@ -391,6 +549,10 @@ class PostgreSQLProvider: Provider
           failure = pgFailure(connection, "command.result", result)
         end
         pgClear(result)
+        if status == 3 || status == 4 || status == 5
+          this.abortOperation()
+          return PostgreSQLCommandResult.Failure(failure == null ? ProviderFailure.State("PostgreSQL COPY is unsupported") : failure)
+        end
       end
     end
   end
@@ -456,6 +618,7 @@ class PostgreSQLProvider: Provider
 
     match result
       case WriteResult.Failure(error)
+        this.reconcileAsyncFailure()
         return result
       case WriteResult.Saved(count)
       case WriteResult.SavedWithValues(count, outputs)

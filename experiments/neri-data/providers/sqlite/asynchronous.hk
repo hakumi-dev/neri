@@ -11,12 +11,23 @@ enum SQLiteWorkerPoll
   case Failure(error: ProviderFailure)
 end
 
-## One worker owns a read-only database session for each queued operation.
+enum SQLiteJobStart
+  case Started(ticket: UInt64)
+  case Failure(error: ProviderFailure)
+end
+
+## One isolated worker owns the writable connection for its complete lifetime.
 ## The main heap exchanges bounded byte copies with the isolated worker heap.
 class SQLiteAsyncProvider: Provider
   private handle: Int
   private closed: Bool = false
   private outstanding: UInt64 = 0 as UInt64
+  private busy: Bool = false
+  private activeLease: Int = 0
+  private lastLease: Int = 0
+  private state: TransactionState = TransactionState.Invalid()
+  private cleanup: SQLiteAsyncWrite?
+  private controlCleanup: SQLiteAsyncControl?
 
   unsafe def init(handle: Int): Void
     this.handle = handle
@@ -77,12 +88,12 @@ class SQLiteAsyncProvider: Provider
       case ProviderCapability.CheckedScalarExpressions()
       case ProviderCapability.WindowFunctions()
       case ProviderCapability.BoundedTypedReads()
-        return !this.closed
-      case ProviderCapability.StreamingReads()
       case ProviderCapability.TrackedWrites()
-      case ProviderCapability.SetWrites()
       case ProviderCapability.ExplicitTransactions()
       case ProviderCapability.Savepoints()
+        return !this.closed
+      case ProviderCapability.StreamingReads()
+      case ProviderCapability.SetWrites()
         return false
     end
   end
@@ -96,16 +107,10 @@ class SQLiteAsyncProvider: Provider
     options: StreamOptions? = null,
     maximumRows: Int? = null
   ): AsyncReadStart
-    if this.closed
-      return AsyncReadStart.Failure(ProviderFailure.State("SQLite asynchronous session is closed"))
-    end
-    if this.outstanding != (0 as UInt64)
-      match this.pollJob(this.outstanding)
-        case SQLiteWorkerPoll.Pending()
-          return AsyncReadStart.Failure(ProviderFailure.State("SQLite asynchronous session already has an active operation"))
-        case SQLiteWorkerPoll.Completed(bytes)
-        case SQLiteWorkerPoll.Failure(error)
-      end
+    let unavailable = this.admit()
+
+    if unavailable != null
+      return AsyncReadStart.Failure(unavailable)
     end
     var timeout = 30000
     var token: CancellationToken? = null
@@ -135,19 +140,176 @@ class SQLiteAsyncProvider: Provider
     if input == null
       return AsyncReadStart.Failure(ProviderFailure.State("SQLite asynchronous request exceeds 32 MiB"))
     end
+    match this.submitJob(input)
+      case SQLiteJobStart.Failure(error)
+        return AsyncReadStart.Failure(error)
+      case SQLiteJobStart.Started(ticket)
+        this.busy = true
+        return AsyncReadStart.Started(new SQLiteAsyncRead(this, ticket, plan.columns(), deadline, token))
+    end
+  end
+
+  internal def finishOperation(): Void
+    this.busy = false
+  end
+
+  internal def acceptState(lease: Int, state: TransactionState): Void
+    if lease <= 0
+      return
+    end
+    this.lastLease = lease
+    this.state = state
+    match state
+      case TransactionState.Active()
+      case TransactionState.Failed()
+        this.activeLease = lease
+      case TransactionState.Committed()
+      case TransactionState.RolledBack()
+      case TransactionState.Invalid()
+        this.activeLease = 0
+    end
+  end
+
+  public override def transactionState(lease: Int): TransactionState
+    return lease > 0 && lease == this.lastLease ? this.state : TransactionState.Invalid()
+  end
+
+  internal def retainCleanup(driver: SQLiteAsyncWrite): Void
+    this.cleanup = driver
+  end
+
+  ## Advances abandoned-write rollback without waiting or admitting other work.
+  public def pollCleanup(): AsyncWritePoll
+    let cleanup = this.cleanup
+
+    if cleanup == null
+      return AsyncWritePoll.Completed(WriteResult.Saved(0))
+    end
+    let poll = cleanup.poll()
+
+    match poll
+      case AsyncWritePoll.Completed(result)
+        this.cleanup = null
+      case AsyncWritePoll.Pending(socket, interest)
+    end
+    return poll
+  end
+
+  internal def retainControlCleanup(driver: SQLiteAsyncControl): Void
+    this.controlCleanup = driver
+  end
+
+  public def pollControlCleanup(): AsyncControlPoll
+    let cleanup = this.controlCleanup
+
+    if cleanup == null
+      return AsyncControlPoll.Completed(AsyncControlResult.Saved())
+    end
+    let poll = cleanup.poll()
+
+    match poll
+      case AsyncControlPoll.Completed(result)
+        this.controlCleanup = null
+      case AsyncControlPoll.Pending(socket, interest)
+    end
+    return poll
+  end
+
+  private def admit(): ProviderFailure?
+    if this.closed
+      return ProviderFailure.State("SQLite asynchronous session is closed")
+    end
+    if this.cleanup != null
+      this.pollCleanup()
+    end
+    if this.controlCleanup != null
+      this.pollControlCleanup()
+    end
+    if this.busy
+      return ProviderFailure.State("SQLite asynchronous session already has an active operation or pending rollback")
+    end
+    if this.outstanding != (0 as UInt64)
+      match this.pollJob(this.outstanding)
+        case SQLiteWorkerPoll.Pending()
+          return ProviderFailure.State("SQLite asynchronous cancelled job has not completed cleanup")
+        case SQLiteWorkerPoll.Completed(bytes)
+        case SQLiteWorkerPoll.Failure(error)
+      end
+    end
+    return null
+  end
+
+  internal def submitJob(input: Byte[]): SQLiteJobStart
+    if this.closed || this.outstanding != (0 as UInt64)
+      return SQLiteJobStart.Failure(ProviderFailure.State("SQLite asynchronous worker is unavailable"))
+    end
     unsafe
       let ticket = stackalloc UInt64[1]
 
       borrow input as bytes
-        let status = workers::nativeSubmit(this.handle, bytes, input.Length as UInt64, ticket)
-
-        if status != (0 as Int32)
-          return AsyncReadStart.Failure(ProviderFailure.State("SQLite asynchronous worker admission failed"))
+        if workers::nativeSubmit(this.handle, bytes, input.Length as UInt64, ticket) != (0 as Int32)
+          return SQLiteJobStart.Failure(ProviderFailure.State("SQLite asynchronous worker admission failed"))
         end
       end
       this.outstanding = ticket[0]
-      return AsyncReadStart.Started(new SQLiteAsyncRead(this, ticket[0], plan.columns(), deadline, token))
+      return SQLiteJobStart.Started(ticket[0])
     end
+  end
+
+  public override def beginControlAsync(
+    action: AsyncTransactionAction,
+    options: StreamOptions? = null
+  ): AsyncControlStart
+    let unavailable = this.admit()
+
+    if unavailable != null
+      return AsyncControlStart.Failure(WriteFailure.Provider(unavailable))
+    end
+    let deadline = sqliteAsyncDeadline(options, false)
+    let token = options == null ? null : options.token()
+
+    if options != null && options.timeoutMilliseconds() != null && deadline == null
+      return AsyncControlStart.Failure(WriteFailure.Validation("invalid SQLite asynchronous timeout"))
+    end
+    if token != null && token.cancelled()
+      return AsyncControlStart.Failure(WriteFailure.Provider(sqliteAsyncInterrupted()))
+    end
+    this.busy = true
+    return AsyncControlStart.Started(new SQLiteAsyncControl(this, action, deadline, token))
+  end
+
+  public override def beginWriteAsync(
+    batch: readonly WriteBatch,
+    options: StreamOptions? = null,
+    lease: Int? = null,
+    validate: (fn(readonly WriteReturnedRows): WriteFailure?)? = null
+  ): AsyncWriteStart
+    let unavailable = this.admit()
+
+    if unavailable != null
+      return AsyncWriteStart.Failure(WriteFailure.Provider(unavailable))
+    end
+    if batch.count() > 1000 || (lease == null && this.activeLease != 0) || (lease != null && (lease == 0 || lease != this.activeLease))
+      return AsyncWriteStart.Failure(WriteFailure.Transaction("SQLite asynchronous batch requires a valid lease or idle connection and at most 1000 commands"))
+    end
+    let deadline = sqliteAsyncDeadline(options, true)
+    let token = options == null ? null : options.token()
+
+    if deadline == null
+      return AsyncWriteStart.Failure(WriteFailure.Validation("invalid SQLite asynchronous timeout"))
+    end
+    if token != null && token.cancelled()
+      return AsyncWriteStart.Failure(WriteFailure.Provider(sqliteAsyncInterrupted()))
+    end
+    this.busy = true
+    return AsyncWriteStart.Started(new SQLiteAsyncWrite(
+        this,
+        freezeWriteBatch(batch),
+        lease,
+        deadline,
+        token,
+        validate
+      ))
   end
 
   internal def cancelJob(ticket: UInt64): ProviderFailure?
@@ -267,6 +429,7 @@ class SQLiteAsyncRead: AsyncReadDriver
       this.cancel()
     end
     this.closed = true
+    this.owner.finishOperation()
     return this.failure
   end
 
@@ -291,9 +454,11 @@ class SQLiteAsyncRead: AsyncReadDriver
         case SQLiteWorkerPoll.Pending()
           return AsyncReadPoll.Pending(this.owner.readiness(), AsyncInterest.Read())
         case SQLiteWorkerPoll.Failure(error)
+          this.owner.finishOperation()
           this.failure = error
           return AsyncReadPoll.Failure(error)
         case SQLiteWorkerPoll.Completed(bytes)
+          this.owner.finishOperation()
           reader = new SQLiteWireReader(bytes)
           if this.cancelled
             this.closed = true

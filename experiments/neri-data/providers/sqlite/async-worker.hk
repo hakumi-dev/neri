@@ -111,7 +111,7 @@ def sqliteWireReadFailure(reader: SQLiteWireReader, depth: Int = 0): ProviderFai
     ))
 end
 
-def sqliteAsyncWorkerResponse(path: String, input: Byte[]): Byte[]
+def sqliteAsyncWorkerResponse(provider: SQLiteProvider, input: Byte[]): Byte[]
   let reader = new SQLiteWireReader(input)
   let version = reader.string()
   let sql = reader.string()
@@ -120,7 +120,7 @@ def sqliteAsyncWorkerResponse(path: String, input: Byte[]): Byte[]
   let count = reader.integer()
   var failure: ProviderFailure? = null
 
-  if version != "neri-sqlite-read-v1" || count < 1 || count > 1000 || maximum < -1 || maximum > 1000
+  if version != "neri-sqlite-read-v1" || count < 1 || count > 1000 || maximum < -1 || maximum > 100000
     failure = ProviderFailure.State("SQLite async request metadata is invalid")
   end
   let columns = arrays::generate<ResultColumn>(count < 1 || count > 1000 ? 0 : count) do |index|
@@ -163,53 +163,43 @@ def sqliteAsyncWorkerResponse(path: String, input: Byte[]): Byte[]
   let rows = new TypedRows<RawRow>()
 
   if failure == null
-    match SQLiteProvider.open(path)
-      case SQLiteOpenResult.Failure(error)
-        failure = error
-      case SQLiteOpenResult.Opened(provider)
-        provider.observeWorkerCancellation(true)
-        let resultColumns = new ResultColumns(columns)
-        let visit: fn(RawRow): Bool = fn(row: RawRow): Bool do
-          if workers::cancelled() || rows.count() >= 100000
-            return false
-          end
-          rows.add(row)
-          return true
-        end
-        let stream = new StreamPlan(
-          sql,
-          new ParameterValues(parameters.head, parameters.count),
-          resultColumns,
-          maximum < 0 ? null : maximum, timeout < 0 ? null : timeout, null
-        )
+    provider.observeWorkerCancellation(true)
+    let resultColumns = new ResultColumns(columns)
+    let visit: fn(RawRow): Bool = fn(row: RawRow): Bool do
+      if workers::cancelled() || rows.count() >= 100000
+        return false
+      end
+      rows.add(row)
+      return true
+    end
+    let stream = new StreamPlan(
+      sql,
+      new ParameterValues(parameters.head, parameters.count),
+      resultColumns,
+      maximum < 0 ? null : maximum, timeout < 0 ? null : timeout, null
+    )
 
-        match provider.stream(stream, visit)
-          case StreamResult.Completed(delivered)
-          case StreamResult.Cancelled(delivered)
-            failure = sqliteAsyncInterrupted()
-          case StreamResult.Stopped(delivered)
-            failure = workers::cancelled() ? sqliteAsyncInterrupted() : ProviderFailure.State("SQLite async response exceeds 100000 rows")
-          case StreamResult.Failure(error, delivered)
-            match error
-              case QueryFailure.Provider(nativeError)
-                failure = nativeError
-              case QueryFailure.Cleanup(cleanup)
-                failure = ProviderFailure.State("SQLite async read failed during cleanup")
-              case QueryFailure.InvalidIdentifier(name)
-              case QueryFailure.InvalidLimit(value, maximum)
-              case QueryFailure.MissingLimit(maximum)
-              case QueryFailure.SourceMismatch(expected, actual)
-              case QueryFailure.UnsupportedCapability(name)
-              case QueryFailure.MissingColumn(name)
-              case QueryFailure.TypeMismatch(column, expected, actual)
-              case QueryFailure.Cardinality(expected, actual)
-                failure = ProviderFailure.State("SQLite async query metadata is invalid")
-            end
-        end
-        let cleanup = provider.closeFailure()
-
-        if cleanup != null
-          failure = failure == null ? cleanup : ProviderFailure.Cleanup(new ProviderCleanupFailure(failure, cleanup))
+    match provider.stream(stream, visit)
+      case StreamResult.Completed(delivered)
+      case StreamResult.Cancelled(delivered)
+        failure = sqliteAsyncInterrupted()
+      case StreamResult.Stopped(delivered)
+        failure = workers::cancelled() ? sqliteAsyncInterrupted() : ProviderFailure.State("SQLite async response exceeds 100000 rows")
+      case StreamResult.Failure(error, delivered)
+        match error
+          case QueryFailure.Provider(nativeError)
+            failure = nativeError
+          case QueryFailure.Cleanup(cleanup)
+            failure = ProviderFailure.State("SQLite async read failed during cleanup")
+          case QueryFailure.InvalidIdentifier(name)
+          case QueryFailure.InvalidLimit(value, maximum)
+          case QueryFailure.MissingLimit(maximum)
+          case QueryFailure.SourceMismatch(expected, actual)
+          case QueryFailure.UnsupportedCapability(name)
+          case QueryFailure.MissingColumn(name)
+          case QueryFailure.TypeMismatch(column, expected, actual)
+          case QueryFailure.Cardinality(expected, actual)
+            failure = ProviderFailure.State("SQLite async query metadata is invalid")
         end
     end
   end
@@ -240,13 +230,10 @@ def sqliteAsyncWorkerResponse(path: String, input: Byte[]): Byte[]
   if output != null && failure == null
     return output
   end
-  if output != null && failure != null
-    return output
-  end
   let rejected = new SQLiteWireWriter()
 
   rejected.integer(1)
-  sqliteWireFailure(rejected, ProviderFailure.State("SQLite async response exceeds 32 MiB"))
+  sqliteWireFailure(rejected, failure == null ? ProviderFailure.State("SQLite async response exceeds 32 MiB") : failure)
   let rejectedBytes = rejected.bytes()
 
   return rejectedBytes == null ? [] : rejectedBytes
@@ -273,19 +260,50 @@ unsafe def sqliteAsyncWorkerEntry(config: Byte*, length: UInt64): Void
       return
     case result::Result.Ok(ready)
   end
+  var provider: SQLiteProvider? = null
+
   while true
     match workers::receive()
       case result::Result.Error(error)
+        sqliteAsyncCloseWorker(provider)
         return
       case result::Result.Ok(input)
         if input == null
+          sqliteAsyncCloseWorker(provider)
           return
         end
-        let output = sqliteAsyncWorkerResponse(path, input)
+        if provider == null
+          match SQLiteProvider.openWritable(path)
+            case SQLiteOpenResult.Opened(opened)
+              provider = opened
+              opened.observeWorkerCancellation(true)
+            case SQLiteOpenResult.Failure(error)
+              let failed = sqliteAsyncOpenFailure(input, error)
+
+              workers::reply(failed)
+              continue
+          end
+        end
+        let active = provider
+
+        if active == null
+          sqliteAsyncCloseWorker(provider)
+          return
+        end
+        let header = new SQLiteWireReader(input)
+        let version = header.string()
+        let output = version == "neri-sqlite-read-v1" ? sqliteAsyncWorkerResponse(
+          active,
+          input
+        ) : sqliteAsyncWriteWorkerResponse(
+          active,
+          input
+        )
 
         match workers::reply(output)
           case result::Result.Error(error)
             workers::fail(text::bytes(error.detail))
+            sqliteAsyncCloseWorker(provider)
             return
           case result::Result.Ok(replied)
         end

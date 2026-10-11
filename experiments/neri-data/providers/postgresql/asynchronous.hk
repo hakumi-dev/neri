@@ -1,0 +1,436 @@
+use host
+use neri_data
+namespace neri_data_postgresql
+
+enum PostgreSQLCommandPoll
+  case Pending(socket: Int, interest: AsyncInterest)
+  case Completed(count: Int, row: RawRow?)
+  case Failure(error: ProviderFailure)
+end
+
+enum PostgreSQLControlSql
+  case Statement(sql: String)
+  case Failure(error: WriteFailure)
+end
+
+## A single nonblocking command on the caller's already-reserved connection.
+class PostgreSQLCommandCursor
+  private owner: PostgreSQLProvider
+  private columns: readonly ResultColumns?
+  private terminal: Bool = false
+  private count: Int = 0
+  private row: RawRow?
+  private error: ProviderFailure?
+
+  def init(owner: PostgreSQLProvider, columns: readonly ResultColumns?): Void
+    this.owner = owner
+    this.columns = columns
+  end
+
+  public static def start(
+    owner: PostgreSQLProvider,
+    sql: String,
+    parameters: readonly WriteValues,
+    columns: readonly ResultColumns? = null
+  ): PostgreSQLCommandCursor
+    let cursor = new PostgreSQLCommandCursor(owner, columns)
+
+    unsafe
+      let connection = owner.nativeHandle()
+
+      cursor.error = connection == null ? ProviderFailure.State("PostgreSQL asynchronous connection is closed") : pgSend(
+        connection,
+        sql,
+        parameters
+      )
+      cursor.terminal = cursor.error != null
+    end
+    return cursor
+  end
+
+  public def poll(): PostgreSQLCommandPoll
+    let error = this.error
+
+    if this.terminal
+      return error == null ? PostgreSQLCommandPoll.Completed(
+        this.count,
+        this.row
+      ) : PostgreSQLCommandPoll.Failure(error)
+    end
+    unsafe
+      let connection = this.owner.nativeHandle()
+
+      if connection == null
+        this.terminal = true
+        this.error = ProviderFailure.State("PostgreSQL asynchronous connection is closed")
+        return PostgreSQLCommandPoll.Failure(ProviderFailure.State("PostgreSQL asynchronous connection is closed"))
+      end
+      let flushed = pgFlush(connection) as Int
+
+      if flushed < 0 || pgConsumeInput(connection) != (1 as Int32)
+        let ioError = pgFailure(connection, "async.command.io")
+
+        this.owner.abortOperation()
+        this.error = error == null ? ioError : ProviderFailure.Cleanup(new ProviderCleanupFailure(error, ioError))
+        this.terminal = true
+        return PostgreSQLCommandPoll.Failure(error == null ? ioError : ProviderFailure.Cleanup(new ProviderCleanupFailure(
+              error,
+              ioError
+            )))
+      end
+      if flushed == 1 || pgIsBusy(connection) != (0 as Int32)
+        return PostgreSQLCommandPoll.Pending(
+          pgSocket(connection) as Int,
+          flushed == 1 ? AsyncInterest.Write() : AsyncInterest.Read()
+        )
+      end
+      let result = pgGetResult(connection)
+
+      if result == null
+        this.terminal = true
+        return error == null ? PostgreSQLCommandPoll.Completed(
+          this.count,
+          this.row
+        ) : PostgreSQLCommandPoll.Failure(error)
+      end
+      let status = pgResultStatus(result) as Int
+
+      if status == 1 || status == 2
+        let text = pgText(pgCmdTuples(result))
+        let count = text == null ? null : host::parseInt(text)
+
+        if count != null
+          this.count = this.count + count
+        end
+        let columns = this.columns
+
+        if columns != null
+          if status != 2 || pgNtuples(result) != (1 as Int32) || this.row != null
+            this.error = ProviderFailure.State("PostgreSQL RETURNING requires exactly one row per write")
+          else
+            match pgDecodeRow(result, 0, columns)
+              case PostgreSQLRowResult.Row(row)
+                this.row = row
+              case PostgreSQLRowResult.Failure(failure)
+                this.error = failure
+            end
+          end
+        else if pgNtuples(result) != (0 as Int32)
+          this.error = ProviderFailure.State("PostgreSQL asynchronous command returned unexpected rows")
+        end
+      else
+        this.error = pgFailure(connection, "async.command.result", result)
+      end
+      pgClear(result)
+      if status == 3 || status == 4 || status == 5
+        this.owner.abortOperation()
+        this.terminal = true
+      end
+      return PostgreSQLCommandPoll.Pending(-1, AsyncInterest.Read())
+    end
+  end
+end
+
+class PostgreSQLAsyncControl: AsyncControlDriver
+  private owner: PostgreSQLProvider
+  private action: AsyncTransactionAction
+  private cursor: PostgreSQLCommandCursor
+  private deadline: Int?
+  private token: CancellationToken?
+  private terminal: AsyncControlResult?
+  private cancelled: Bool = false
+
+  def init(
+    owner: PostgreSQLProvider,
+    action: AsyncTransactionAction,
+    sql: String,
+    deadline: Int?,
+    token: CancellationToken?
+  ): Void
+    this.owner = owner
+    this.action = action
+    this.deadline = deadline
+    this.token = token
+    this.cursor = PostgreSQLCommandCursor.start(owner, sql, new WriteValues())
+  end
+
+  public override def cancel(): Void
+    this.cancelled = true
+  end
+
+  public override def close(): WriteFailure?
+    if this.terminal == null
+      this.owner.abortOperation()
+      this.terminal = AsyncControlResult.Failure(WriteFailure.Provider(pgInterrupted("async.transaction")))
+    end
+    return null
+  end
+
+  public override def poll(): AsyncControlPoll
+    let terminal = this.terminal
+
+    if terminal != null
+      return AsyncControlPoll.Completed(terminal)
+    end
+    let token = this.token
+
+    if this.cancelled || (token != null && token.cancelled()) || streamTimedOut(this.deadline)
+      this.close()
+      return AsyncControlPoll.Completed(AsyncControlResult.Failure(WriteFailure.Provider(pgInterrupted("async.transaction"))))
+    end
+    match this.cursor.poll()
+      case PostgreSQLCommandPoll.Pending(socket, interest)
+        return AsyncControlPoll.Pending(socket, interest)
+      case PostgreSQLCommandPoll.Failure(error)
+        this.owner.finishOperation()
+        this.owner.reconcileAsyncFailure()
+        this.terminal = AsyncControlResult.Failure(WriteFailure.Provider(error))
+        return AsyncControlPoll.Completed(AsyncControlResult.Failure(WriteFailure.Provider(error)))
+      case PostgreSQLCommandPoll.Completed(count, row)
+        let result = this.owner.acceptAsyncControl(this.action)
+
+        this.owner.finishOperation()
+        this.terminal = result
+        return AsyncControlPoll.Completed(result)
+    end
+  end
+end
+
+## BEGIN/SAVEPOINT, commands, returned-value validation, then COMMIT/RELEASE.
+class PostgreSQLAsyncWrite: AsyncWriteDriver
+  private owner: PostgreSQLProvider
+  private batch: WriteBatch
+  private current: readonly WriteCommandNode?
+  private lease: Int?
+  private savepoint: Int = 0
+  private deadline: Int?
+  private token: CancellationToken?
+  private validate: (fn(readonly WriteReturnedRows): WriteFailure?)?
+  private cursor: PostgreSQLCommandCursor?
+  private action: AsyncTransactionAction?
+  private phase: Int = 0
+  private outputs: WriteReturnedRows = new WriteReturnedRows()
+  private count: Int = 0
+  private returning: Bool = false
+  private failure: WriteFailure?
+  private terminal: WriteResult?
+  private cancelled: Bool = false
+
+  def init(
+    owner: PostgreSQLProvider,
+    batch: WriteBatch,
+    lease: Int?,
+    deadline: Int?,
+    token: CancellationToken?,
+    validate: (fn(readonly WriteReturnedRows): WriteFailure?)?
+  ): Void
+    this.owner = owner
+    this.batch = batch
+    this.current = batch.first()
+    this.lease = lease
+    this.deadline = deadline
+    this.token = token
+    this.validate = validate
+  end
+
+  public override def cancel(): Void
+    this.cancelled = true
+  end
+
+  public override def close(): WriteFailure?
+    if this.terminal == null
+      this.owner.abortOperation()
+      this.terminal = WriteResult.Failure(this.failure == null ? WriteFailure.Provider(pgInterrupted("async.write")) : this.failure)
+    end
+    return null
+  end
+
+  private def complete(result: WriteResult): AsyncWritePoll
+    this.owner.finishOperation()
+    this.terminal = result
+    return AsyncWritePoll.Completed(result)
+  end
+
+  private def startControl(action: AsyncTransactionAction, nextPhase: Int): AsyncWritePoll
+    match this.owner.asyncControlSql(action)
+      case PostgreSQLControlSql.Failure(error)
+        let primary = this.failure
+
+        return this.complete(WriteResult.Failure(primary == null ? error : WriteFailure.Cleanup(new WriteCleanupFailure(
+                primary,
+                error
+              ))))
+      case PostgreSQLControlSql.Statement(sql)
+        this.action = action
+        this.cursor = PostgreSQLCommandCursor.start(this.owner, sql, new WriteValues())
+        this.phase = nextPhase
+        return AsyncWritePoll.Pending(-1, AsyncInterest.Write())
+    end
+  end
+
+  private def recover(error: WriteFailure): AsyncWritePoll
+    this.failure = error
+    this.cursor = null
+    let lease = this.lease
+
+    if lease == null
+      return this.complete(WriteResult.Failure(error))
+    end
+    match this.owner.transactionState(lease)
+      case TransactionState.RolledBack()
+        return this.complete(WriteResult.Failure(error))
+      case TransactionState.Active()
+      case TransactionState.Failed()
+      case TransactionState.Invalid()
+      case TransactionState.Committed()
+    end
+    return this.startControl(
+      this.savepoint == 0 ? AsyncTransactionAction.Rollback(lease) : AsyncTransactionAction.RollbackTo(
+        lease,
+        this.savepoint
+      ),
+      5
+    )
+  end
+
+  public override def poll(): AsyncWritePoll
+    let terminal = this.terminal
+
+    if terminal != null
+      return AsyncWritePoll.Completed(terminal)
+    end
+    let token = this.token
+
+    if this.phase < 4 && (this.cancelled || (token != null && token.cancelled()) || streamTimedOut(this.deadline))
+      # Closing the socket safely aborts any in-flight command and transaction.
+      this.close()
+      let cancelled = this.terminal
+
+      return AsyncWritePoll.Completed(cancelled == null ? WriteResult.Failure(WriteFailure.Provider(pgInterrupted("async.write"))) : cancelled)
+    end
+    if this.phase == 0
+      let lease = this.lease
+
+      return this.startControl(
+        lease == null ? AsyncTransactionAction.Begin() : AsyncTransactionAction.Savepoint(lease),
+        1
+      )
+    end
+    let cursor = this.cursor
+
+    if cursor != null
+      match cursor.poll()
+        case PostgreSQLCommandPoll.Pending(socket, interest)
+          return AsyncWritePoll.Pending(socket, interest)
+        case PostgreSQLCommandPoll.Failure(error)
+          this.cursor = null
+          this.owner.reconcileAsyncFailure()
+          if this.phase >= 4
+            let primary = this.failure
+
+            if this.phase == 4 && primary == null
+              return this.recover(WriteFailure.Provider(error))
+            end
+            return this.complete(WriteResult.Failure(primary == null ? WriteFailure.Provider(error) : WriteFailure.Cleanup(new WriteCleanupFailure(
+                    primary,
+                    WriteFailure.Provider(error)
+                  ))))
+          end
+          if this.phase == 1
+            return this.complete(WriteResult.Failure(WriteFailure.Provider(error)))
+          end
+          return this.recover(WriteFailure.Provider(error))
+        case PostgreSQLCommandPoll.Completed(changed, row)
+          this.cursor = null
+          let action = this.action
+
+          if action != null
+            let accepted = this.owner.acceptAsyncControl(action)
+
+            this.action = null
+            match accepted
+              case AsyncControlResult.Begun(lease)
+                this.lease = lease
+              case AsyncControlResult.Created(id)
+                this.savepoint = id
+              case AsyncControlResult.Saved()
+              case AsyncControlResult.Failure(error)
+                return this.recover(error)
+            end
+            if this.phase == 1
+              this.phase = 2
+            else if this.phase == 4
+              return this.complete(this.returning ? WriteResult.SavedWithValues(
+                  this.count,
+                  this.outputs
+                ) : WriteResult.Saved(this.count))
+            else if this.phase == 5
+              let lease = this.lease
+
+              if this.savepoint != 0 && lease != null
+                return this.startControl(AsyncTransactionAction.Release(lease, this.savepoint), 6)
+              end
+              let failure = this.failure
+
+              return this.complete(WriteResult.Failure(failure == null ? WriteFailure.Transaction("PostgreSQL asynchronous write rolled back") : failure))
+            else if this.phase == 6
+              let failure = this.failure
+
+              return this.complete(WriteResult.Failure(failure == null ? WriteFailure.Transaction("PostgreSQL asynchronous write rolled back") : failure))
+            end
+          else
+            let current = this.current
+
+            if current == null
+              return this.recover(WriteFailure.Validation("PostgreSQL asynchronous write command is missing"))
+            end
+            if changed != current.command().expectedRows()
+              return this.recover(WriteFailure.Concurrency("PostgreSQL asynchronous write affected " + (changed as String) + " rows; expected " + (current.command().expectedRows() as String)))
+            end
+            this.count = this.count + changed
+            this.outputs.add(row)
+            this.returning = this.returning || row != null
+            this.current = current.next()
+          end
+      end
+    end
+    if this.phase == 2
+      let current = this.current
+
+      if current != null
+        let command = current.command()
+
+        this.cursor = PostgreSQLCommandCursor.start(
+          this.owner,
+          command.sql(),
+          command.parameters(),
+          command.returningColumns()
+        )
+        return AsyncWritePoll.Pending(-1, AsyncInterest.Write())
+      end
+      let validate = this.validate
+
+      if validate != null
+        let rejected = validate(this.outputs)
+
+        this.validate = null
+        if rejected != null
+          return this.recover(rejected)
+        end
+      end
+      let lease = this.lease
+
+      if lease == null
+        return this.recover(WriteFailure.Transaction("PostgreSQL asynchronous write transaction is missing"))
+      end
+      return this.startControl(
+        this.savepoint == 0 ? AsyncTransactionAction.Commit(lease) : AsyncTransactionAction.Release(
+          lease,
+          this.savepoint
+        ),
+        4
+      )
+    end
+    return AsyncWritePoll.Pending(-1, AsyncInterest.Read())
+  end
+end

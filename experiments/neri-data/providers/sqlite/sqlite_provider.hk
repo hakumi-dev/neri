@@ -919,6 +919,67 @@ class SQLiteProvider: neri_data::Provider
     this.workerCancellation = enabled
   end
 
+  ## Only invoked on the isolated worker heap; native handles stay there.
+  internal def workerGuard(deadlineMilliseconds: Int?, operation: fn(): WriteResult): WriteResult
+    unsafe
+      let database = this.database
+
+      if database == null
+        return WriteResult.Failure(WriteFailure.Transaction("SQLite worker connection is closed"))
+      end
+      let control = stackalloc SQLiteStreamDeadline[1]
+      let configuration = this.effectiveConfiguration
+
+      control.workerCancellation = deadlineMilliseconds == null ? 0 as Int32 : 1 as Int32
+      control.deadline = deadlineMilliseconds == null ? 9223372036854775807 : deadlineMilliseconds
+      control.expired = 0 as Int32
+      control.interruptedStatus = 0 as Int32
+      control.busyBudget = configuration == null ? 0 : configuration.busyTimeoutMilliseconds()
+      control.busySlept = 0
+      let installed = sqliteBusyHandler(database, sqliteStreamBusy, control as Void*)
+
+      if installed != (0 as Int32)
+        return WriteResult.Failure(sqliteWriteFailure(database, installed, "async.busy_handler"))
+      end
+      sqliteProgressHandler(database, 1000 as Int32, sqliteStreamProgress, control as Void*)
+      var result = operation()
+
+      sqliteProgressHandler(database, 0 as Int32, null, null)
+      let restored = sqliteBusyTimeout(database, control.busyBudget as Int32)
+
+      if restored != (0 as Int32)
+        let cleanup = sqliteWriteFailure(database, restored, "async.busy_timeout.restore")
+
+        match result
+          case WriteResult.Failure(primary)
+            result = WriteResult.Failure(WriteFailure.Cleanup(new WriteCleanupFailure(primary, cleanup)))
+          case WriteResult.Saved(count)
+          case WriteResult.SavedWithValues(count, rows)
+            result = WriteResult.Failure(cleanup)
+        end
+        this.poisoned = true
+      end
+      return result
+    end
+  end
+
+  private def removeWorkerProgressForCleanup(): Void
+    if this.workerCancellation
+      unsafe
+        let database = this.database
+        let configuration = this.effectiveConfiguration
+
+        if database != null
+          sqliteProgressHandler(database, 0 as Int32, null, null)
+          sqliteBusyTimeout(
+            database,
+            configuration == null ? 0 as Int32 : configuration.busyTimeoutMilliseconds() as Int32
+          )
+        end
+      end
+    end
+  end
+
   public override def writeBatch(batch: readonly WriteBatch): WriteResult
     if this.streaming
       return WriteResult.Failure(WriteFailure.Transaction("SQLite provider is busy streaming"))
@@ -1394,6 +1455,7 @@ class SQLiteProvider: neri_data::Provider
   end
 
   private def failLeasedBatch(error: WriteFailure): WriteResult
+    this.removeWorkerProgressForCleanup()
     unsafe
       let database = this.database
 
@@ -1428,6 +1490,7 @@ class SQLiteProvider: neri_data::Provider
   end
 
   private def failOuterTransaction(error: WriteFailure): WriteResult
+    this.removeWorkerProgressForCleanup()
     unsafe
       let database = this.database
 

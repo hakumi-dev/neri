@@ -1,0 +1,390 @@
+use host
+use text
+use workers
+use neri_data
+namespace neri_data_sqlite
+
+## Worker messages contain only bounded copies; callbacks run on the owning heap.
+def sqliteWireWriteFailure(wire: SQLiteWireWriter, error: WriteFailure): Void
+  match error
+    case WriteFailure.Provider(error)
+      wire.integer(0)
+      sqliteWireFailure(wire, error)
+    case WriteFailure.Cleanup(error)
+      wire.integer(1)
+      sqliteWireWriteFailure(wire, error.primary())
+      sqliteWireWriteFailure(wire, error.cleanup())
+    case WriteFailure.Validation(message)
+      wire.integer(2)
+      wire.string(message)
+    case WriteFailure.Concurrency(message)
+      wire.integer(3)
+      wire.string(message)
+    case WriteFailure.Constraint(message)
+      wire.integer(4)
+      wire.string(message)
+    case WriteFailure.Unsupported(message)
+      wire.integer(5)
+      wire.string(message)
+    case WriteFailure.Transaction(message)
+      wire.integer(6)
+      wire.string(message)
+  end
+end
+
+def sqliteWireReadWriteFailure(reader: SQLiteWireReader, depth: Int = 0): WriteFailure
+  if depth > 8
+    return WriteFailure.Validation("SQLite async write failure nesting exceeds bound")
+  end
+  let tag = reader.integer()
+
+  if tag == 0
+    return WriteFailure.Provider(sqliteWireReadFailure(reader))
+  end
+  if tag == 1
+    let primary = sqliteWireReadWriteFailure(reader, depth + 1)
+    let cleanup = sqliteWireReadWriteFailure(reader, depth + 1)
+
+    return WriteFailure.Cleanup(new WriteCleanupFailure(primary, cleanup))
+  end
+  let message = reader.string()
+
+  if tag == 2
+    return WriteFailure.Validation(message)
+  end
+  if tag == 3
+    return WriteFailure.Concurrency(message)
+  end
+  if tag == 4
+    return WriteFailure.Constraint(message)
+  end
+  if tag == 5
+    return WriteFailure.Unsupported(message)
+  end
+  return WriteFailure.Transaction(message)
+end
+
+def sqliteWireState(state: TransactionState): Int
+  match state
+    case TransactionState.Active()
+      return 1
+    case TransactionState.Failed()
+      return 2
+    case TransactionState.Committed()
+      return 3
+    case TransactionState.RolledBack()
+      return 4
+    case TransactionState.Invalid()
+      return 0
+  end
+end
+
+def sqliteWireReadState(value: Int): TransactionState
+  if value == 1
+    return TransactionState.Active()
+  end
+  if value == 2
+    return TransactionState.Failed()
+  end
+  if value == 3
+    return TransactionState.Committed()
+  end
+  if value == 4
+    return TransactionState.RolledBack()
+  end
+  return TransactionState.Invalid()
+end
+
+def sqliteWireControlRequest(action: AsyncTransactionAction, deadline: Int?): Byte[]?
+  let wire = new SQLiteWireWriter()
+
+  wire.string("neri-sqlite-control-v1")
+  wire.integer(deadline == null ? -1 : deadline)
+  match action
+    case AsyncTransactionAction.Begin()
+      wire.integer(0)
+      wire.integer(0)
+      wire.integer(0)
+    case AsyncTransactionAction.Commit(lease)
+      wire.integer(1)
+      wire.integer(lease)
+      wire.integer(0)
+    case AsyncTransactionAction.Rollback(lease)
+      wire.integer(2)
+      wire.integer(lease)
+      wire.integer(0)
+    case AsyncTransactionAction.Savepoint(lease)
+      wire.integer(3)
+      wire.integer(lease)
+      wire.integer(0)
+    case AsyncTransactionAction.RollbackTo(lease, id)
+      wire.integer(4)
+      wire.integer(lease)
+      wire.integer(id)
+    case AsyncTransactionAction.Release(lease, id)
+      wire.integer(5)
+      wire.integer(lease)
+      wire.integer(id)
+  end
+  return wire.bytes()
+end
+
+def sqliteWireBatchRequest(batch: readonly WriteBatch, lease: Int, deadline: Int?): Byte[]?
+  let wire = new SQLiteWireWriter()
+
+  wire.string("neri-sqlite-write-v1")
+  wire.integer(deadline == null ? -1 : deadline)
+  wire.integer(lease)
+  wire.integer(batch.count())
+  var current = batch.first()
+
+  while current != null
+    let command = current.command()
+    let columns = command.returningColumns()
+
+    wire.string(command.sql())
+    wire.integer(command.expectedRows())
+    wire.integer(columns == null ? -1 : columns.count())
+    if columns != null
+      var index = 0
+
+      while index < columns.count()
+        let column = columns.at(index)
+
+        wire.string(column.name())
+        wire.integer(sqliteWireKind(column.kind()))
+        wire.integer(column.nullable() ? 1 : 0)
+        index = index + 1
+      end
+    end
+    wire.integer(command.parameters().count())
+    var value = command.parameters().first()
+
+    while value != null
+      wire.cell(value.value())
+      value = value.next()
+    end
+    current = current.next()
+  end
+  return wire.bytes()
+end
+
+def sqliteWireStateRequest(lease: Int): Byte[]?
+  let wire = new SQLiteWireWriter()
+
+  wire.string("neri-sqlite-control-v1")
+  wire.integer(-1)
+  wire.integer(6)
+  wire.integer(lease)
+  wire.integer(0)
+  return wire.bytes()
+end
+
+def sqliteWorkerControl(provider: SQLiteProvider, action: Int, lease: Int, id: Int): WriteResult
+  if action == 0
+    match provider.beginTransaction()
+      case TransactionOpenResult.Begun(opened)
+        return WriteResult.Saved(opened)
+      case TransactionOpenResult.Failure(error)
+        return WriteResult.Failure(error)
+    end
+  end
+  if action == 1
+    return provider.commitTransaction(lease)
+  end
+  if action == 2
+    return provider.rollbackTransaction(lease)
+  end
+  if action == 3
+    match provider.createSavepoint(lease)
+      case SavepointOpenResult.Created(created)
+        return WriteResult.Saved(created)
+      case SavepointOpenResult.Failure(error)
+        return WriteResult.Failure(error)
+    end
+  end
+  if action == 4
+    return provider.rollbackToSavepoint(lease, id)
+  end
+  if action == 5
+    return provider.releaseSavepoint(lease, id)
+  end
+  if action == 6
+    return WriteResult.Saved(0)
+  end
+  return WriteResult.Failure(WriteFailure.Validation("SQLite async control action is invalid"))
+end
+
+def sqliteWireWriteResponse(result: WriteResult, state: TransactionState): Byte[]
+  let wire = new SQLiteWireWriter()
+
+  wire.integer(sqliteWireState(state))
+  match result
+    case WriteResult.Failure(error)
+      wire.integer(1)
+      sqliteWireWriteFailure(wire, error)
+    case WriteResult.Saved(count)
+      wire.integer(0)
+      wire.integer(count)
+      wire.integer(0)
+    case WriteResult.SavedWithValues(count, rows)
+      wire.integer(0)
+      wire.integer(count)
+      wire.integer(rows.count())
+      var current = rows.first()
+
+      while current != null
+        let row = current.row()
+
+        wire.integer(row == null ? -1 : row.count())
+        if row != null
+          var index = 0
+
+          while index < row.count()
+            let column = row.at(index)
+
+            if column != null
+              wire.string(column.name)
+              wire.cell(column.value)
+            end
+            index = index + 1
+          end
+        end
+        current = current.next()
+      end
+  end
+  let bytes = wire.bytes()
+
+  if bytes != null
+    return bytes
+  end
+  let rejected = new SQLiteWireWriter()
+
+  rejected.integer(sqliteWireState(state))
+  rejected.integer(1)
+  sqliteWireWriteFailure(rejected, WriteFailure.Validation("SQLite async write response exceeds 32 MiB"))
+  let output = rejected.bytes()
+
+  return output == null ? [] : output
+end
+
+def sqliteAsyncWriteWorkerResponse(provider: SQLiteProvider, input: Byte[]): Byte[]
+  let reader = new SQLiteWireReader(input)
+  let version = reader.string()
+  let deadline = reader.integer()
+
+  if version == "neri-sqlite-control-v1"
+    let action = reader.integer()
+    let lease = reader.integer()
+    let id = reader.integer()
+
+    if !reader.finished()
+      return sqliteWireWriteResponse(
+        WriteResult.Failure(WriteFailure.Validation("SQLite async control request is malformed")),
+        TransactionState.Invalid()
+      )
+    end
+    let operation: fn(): WriteResult = fn(): WriteResult do
+      return sqliteWorkerControl(provider, action, lease, id)
+    end
+    let result = provider.workerGuard(deadline < 0 ? null : deadline, operation)
+    var stateLease = lease
+
+    match result
+      case WriteResult.Saved(count)
+        if action == 0
+          stateLease = count
+        end
+      case WriteResult.Failure(error)
+      case WriteResult.SavedWithValues(count, rows)
+    end
+    if workers::cancelled() && action != 1 && action != 6 && stateLease > 0
+      # A cancelled BEGIN must never leave an unreported transaction open.
+      let cleanup: fn(): WriteResult = fn(): WriteResult do
+        return provider.rollbackTransaction(stateLease)
+      end
+
+      provider.workerGuard(null, cleanup)
+    end
+    return sqliteWireWriteResponse(result, provider.transactionState(stateLease))
+  end
+  let lease = reader.integer()
+  let count = reader.integer()
+  let batch = new WriteBatch()
+  var failure: WriteFailure? = null
+  var command = 0
+
+  if version != "neri-sqlite-write-v1" || count < 0 || count > 1000
+    failure = WriteFailure.Validation("SQLite async batch metadata is invalid")
+  end
+  while command < count && failure == null
+    let sql = reader.string()
+    let expected = reader.integer()
+    let columnCount = reader.integer()
+
+    if columnCount < -1 || columnCount > 1000
+      failure = WriteFailure.Validation("SQLite async RETURNING metadata is invalid")
+      break
+    end
+    let columns = arrays::generate<ResultColumn>(columnCount < 0 ? 0 : columnCount) do |index|
+      let name = reader.string()
+      let kind = reader.integer()
+      let nullable = reader.integer()
+
+      if kind < 1 || kind > 5 || (nullable != 0 && nullable != 1)
+        failure = WriteFailure.Validation("SQLite async RETURNING kind is invalid")
+      end
+      return new ResultColumn(name, sqliteWireReadKind(kind), nullable == 1)
+    end
+    let parameterCount = reader.integer()
+    let values = new WriteValues()
+    var index = 0
+
+    if parameterCount < 0 || parameterCount > 65535
+      failure = WriteFailure.Validation("SQLite async write parameter count is invalid")
+    end
+    while index < parameterCount && failure == null
+      values.add(reader.cell())
+      index = index + 1
+    end
+    batch.add(sql, values, expected, columnCount < 0 ? null : new ResultColumns(columns))
+    command = command + 1
+  end
+  if !reader.finished()
+    failure = WriteFailure.Validation("SQLite async batch request is malformed")
+  end
+  if failure != null
+    return sqliteWireWriteResponse(WriteResult.Failure(failure), provider.transactionState(lease))
+  end
+  let operation: fn(): WriteResult = fn(): WriteResult do
+    return provider.writeBatchInTransaction(batch, lease)
+  end
+  let result = provider.workerGuard(deadline < 0 ? null : deadline, operation)
+
+  return sqliteWireWriteResponse(result, provider.transactionState(lease))
+end
+
+def sqliteAsyncOpenFailure(input: Byte[], error: ProviderFailure): Byte[]
+  let reader = new SQLiteWireReader(input)
+
+  if reader.string() != "neri-sqlite-read-v1"
+    return sqliteWireWriteResponse(WriteResult.Failure(WriteFailure.Provider(error)), TransactionState.Invalid())
+  end
+  let wire = new SQLiteWireWriter()
+
+  wire.integer(1)
+  sqliteWireFailure(wire, error)
+  let bytes = wire.bytes()
+
+  return bytes == null ? [] : bytes
+end
+
+def sqliteAsyncCloseWorker(provider: SQLiteProvider?): Void
+  if provider != null
+    let error = provider.closeFailure()
+
+    if error != null
+      workers::fail(text::bytes(providerFailureMessage(error)))
+    end
+  end
+end
