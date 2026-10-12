@@ -1,0 +1,378 @@
+use host
+use neri_data
+
+def dataMigrationSourceId(source: String): String
+  let prefix = "\ndef migration_"
+  var index = 0
+
+  while index + host::stringByteLength(prefix) <= host::stringByteLength(source)
+    if host::stringSlice(source, index, host::stringByteLength(prefix)) == prefix
+      var endIndex = index + host::stringByteLength(prefix)
+
+      while endIndex < host::stringByteLength(source) && host::stringByteAt(source, endIndex) as Int != 40
+        endIndex = endIndex + 1
+      end
+      let name = host::stringSlice(
+        source,
+        index + host::stringByteLength(prefix),
+        endIndex - index - host::stringByteLength(prefix)
+      )
+
+      return dataIdentifier(name) ? name : ""
+    end
+    index = index + 1
+  end
+  return ""
+end
+
+## Discovery follows the verified signature chain, never filesystem or filename order.
+def dataMigrationDiscover(mapping: DataMapping, requested: String): DataMigrationCatalog
+  let catalog = new DataMigrationCatalog()
+  let path = bootstrapStartsWith(requested, "/") ? requested : mapping.mappingRoot + "/" + requested
+  let canonical = neriCanonicalPath(path)
+
+  if canonical == null
+    catalog.fail("migration catalog must be an existing directory")
+    return catalog
+  end
+  catalog.path = canonical
+  let status = files::status(path).status
+
+  if status == null || status.symlink || !status.kind.isDirectory()
+    catalog.fail("migration catalog must be a directory without symlinks")
+    return catalog
+  end
+  let opened = files::Root.open(canonical)
+  let directory = opened.root
+
+  if opened.failure != null || directory == null
+    catalog.fail("cannot open migration catalog")
+    return catalog
+  end
+  let listed = directory.list("", 1003)
+
+  directory.close()
+  if listed.failure != null || listed.closeFailure != null
+    catalog.fail("cannot list migration catalog")
+    return catalog
+  end
+  var count = 0
+
+  for item in listed.entries
+    if item.name != "catalog.hk" && item.name != "manifest.json" && item.name != ".neri-migrations.lock"
+      if !item.kind.isDirectory() || !dataMigrationOutputName(item.name)
+        catalog.fail("migration catalog contains an unmanaged entry: " + item.name)
+        return catalog
+      end
+      count = count + 1
+    end
+  end
+  if count > 1000
+    catalog.fail("migration catalog exceeds 1000 bundles")
+    return catalog
+  end
+  let unordered: DataMigrationEntry[] = arrays::generate(count) do |index|
+    return new DataMigrationEntry()
+  end
+  var position = 0
+
+  for item in listed.entries
+    if item.name != "catalog.hk" && item.name != "manifest.json" && item.name != ".neri-migrations.lock"
+      let entry = unordered[position]
+
+      entry.directory = item.name
+      let directoryStatus = files::status(canonical + "/" + item.name).status
+      let sourceStatus = files::status(canonical + "/" + item.name + "/migration.hk").status
+
+      if directoryStatus == null || directoryStatus.symlink || sourceStatus == null || sourceStatus.symlink || !sourceStatus.kind.isFile()
+        catalog.fail("migration bundle and source must be regular entries without symlinks")
+        return catalog
+      end
+      entry.snapshot = dataMigrationHistorical(mapping, canonical + "/" + item.name + "/snapshot.json")
+      if entry.snapshot.error != "" || entry.snapshot.model == null
+        catalog.fail(entry.snapshot.error)
+        return catalog
+      end
+      let bundle = files::Root.open(canonical + "/" + item.name)
+      let bundleRoot = bundle.root
+
+      if bundle.failure != null || bundleRoot == null
+        catalog.fail("cannot inspect migration bundle")
+        return catalog
+      end
+      let contents = bundleRoot.list("", 4)
+
+      bundleRoot.close()
+      if contents.failure != null || contents.closeFailure != null || contents.entries.Length != 3
+        catalog.fail("migration bundle must contain exactly three owned files")
+        return catalog
+      end
+      for file in contents.entries
+        if !file.kind.isFile() || (file.name != "migration.hk" && file.name != "snapshot.json" && file.name != "scaffold.json")
+          catalog.fail("migration bundle contains an unmanaged entry")
+          return catalog
+        end
+      end
+      let source = dataMigrationReadLimited(canonical + "/" + item.name + "/migration.hk", 16777216)
+
+      if source == null
+        catalog.fail("cannot read migration source")
+        return catalog
+      end
+      let parser = new LspJsonParser(entry.snapshot.markerText)
+      let marker = parser.parse()
+
+      if sha256Text(source) != marker.get("sourceSha256").scalarText()
+        catalog.fail("migration source digest differs; reconcile the authored bundle before discovery")
+        return catalog
+      end
+      entry.id = dataMigrationSourceId(source)
+      entry.source = source
+      entry.beforeSignature = marker.get("beforeSignature").scalarText()
+      if entry.id == ""
+        catalog.fail("migration source has no generated factory")
+        return catalog
+      end
+      position = position + 1
+    end
+  end
+  catalog.entries = arrays::generate(count) do |index|
+    return new DataMigrationEntry()
+  end
+  var before = new SchemaModel([])
+
+  position = 0
+  while position < count
+    var next: DataMigrationEntry? = null
+
+    for candidate in unordered
+      if candidate.beforeSignature == before.signature()
+        if next != null
+          catalog.fail("migration history branches at a schema signature")
+          return catalog
+        end
+        next = candidate
+      end
+    end
+    if next == null
+      catalog.fail("migration catalog has a gap, cycle, or missing initial bundle")
+      return catalog
+    end
+    let after = next.snapshot.model
+
+    if after == null
+      catalog.fail("migration snapshot has no model")
+      return catalog
+    end
+    match diffSchema(next.id, before, after)
+      case SchemaDiffResult.Failure(error)
+        catalog.fail(dataMigrationFailure(error))
+        return catalog
+      case SchemaDiffResult.Unchanged()
+        catalog.fail("migration catalog contains an unchanged snapshot")
+        return catalog
+      case SchemaDiffResult.Plan(plan)
+        next.migration = plan.migration()
+        if dataMigrationLegacySource(dataMigrationSource(
+            next.id,
+            mapping.namespaceName + ".migrations",
+            plan,
+            after
+          )) != dataMigrationLegacySource(next.source)
+          catalog.fail("migration source differs from its declared snapshot plan")
+          return catalog
+        end
+    end
+    catalog.entries[position] = next
+    before = after
+    position = position + 1
+  end
+  let invalid = catalog.migrations().validate()
+
+  catalog.fail(invalid) if invalid != null
+  return catalog
+end
+
+def dataMigrationPending(mapping: DataMapping, catalog: DataMigrationCatalog): Bool
+  let before = catalog.model()
+  let current = dataMigrationModel(mapping)
+  let after = current.model
+
+  if catalog.error != "" || before == null || current.error != "" || after == null
+    catalog.fail(current.error != "" ? current.error : "cannot compare catalog and current model")
+    return true
+  end
+  return before.signature() != after.signature()
+end
+
+def dataMigrationCatalogSource(mapping: DataMapping, catalog: DataMigrationCatalog): String
+  var source = "namespace " + semanticNamespaceDisplay(mapping.namespaceName + ".migrations") + "\n\ndef migrations(): neri_data::MigrationSet\n  return new neri_data::MigrationSet(["
+  var index = 0
+
+  for entry in catalog.entries
+    source = source + (index == 0 ? "" : ", ") + "migration_" + entry.id + "()"
+    index = index + 1
+  end
+  return source + "])\nend\n"
+end
+
+
+def dataMigrationCatalogManifest(catalog: DataMigrationCatalog, runtimeProject: String): String
+  var manifest = "{\"version\":2,\"defaultUnit\":\"migrations\",\"units\":{\"migrations\":{\"kind\":\"library\",\"sources\":[\"catalog.hk\""
+
+  for entry in catalog.entries
+    manifest = manifest + "," + lspQuote(entry.directory + "/migration.hk")
+  end
+  return manifest + "],\"references\":[{\"project\":" + lspQuote(dataRelativePath(
+      catalog.path,
+      runtimeProject
+    )) + ",\"unit\":\"runtime\"}]}}}\n"
+end
+
+def dataMigrationWriteCatalog(
+  mapping: DataMapping,
+  catalog: DataMigrationCatalog,
+  runtimeProject: String,
+  previous: DataMigrationCatalog? = null
+): Bool
+  if catalog.error != ""
+    return mapping.fail(catalog.error)
+  end
+  let source = dataMigrationCatalogSource(mapping, catalog)
+  let manifest = dataMigrationCatalogManifest(catalog, runtimeProject)
+  let expected = previous == null ? catalog : previous
+  let sourcePath = catalog.path + "/catalog.hk"
+  let manifestPath = catalog.path + "/manifest.json"
+  let oldSource = host::readText(sourcePath)
+  let oldManifest = host::readText(manifestPath)
+
+  if (oldSource != null && oldSource != dataMigrationCatalogSource(
+      mapping,
+      expected
+    )) || (oldManifest != null && oldManifest != dataMigrationCatalogManifest(
+      expected,
+      runtimeProject
+    ))
+    return mapping.fail("catalog artifacts contain unowned edits")
+  end
+  if host::writeText(
+    sourcePath,
+    source
+  ) && host::writeText(
+    manifestPath,
+    manifest
+  ) && host::readText(sourcePath) == source && host::readText(manifestPath) == manifest
+    return true
+  end
+  if oldSource == null
+    dataMigrationRemoveOwn(sourcePath, source)
+  else
+    host::writeText(sourcePath, oldSource)
+  end
+  if oldManifest == null
+    dataMigrationRemoveOwn(manifestPath, manifest)
+  else
+    host::writeText(manifestPath, oldManifest)
+  end
+  return mapping.fail("catalog publication failed; prior catalog files were restored where possible")
+end
+
+def dataMigrationCatalogUnchanged(catalog: DataMigrationCatalog): Bool
+  for entry in catalog.entries
+    let snapshot = entry.snapshot
+
+    if dataMigrationReadLimited(
+      snapshot.sourcePath,
+      4194304
+    ) != snapshot.sourceText || dataMigrationReadLimited(
+      bootstrapDirectory(snapshot.sourcePath) + "/scaffold.json",
+      16777216
+    ) != snapshot.markerText || dataMigrationReadLimited(
+      bootstrapDirectory(snapshot.sourcePath) + "/migration.hk",
+      16777216
+    ) != entry.source
+      return false
+    end
+  end
+  return true
+end
+
+## Called while the provider holds its migration lock and the catalog lock is reserved.
+def dataMigrationRemoveLast(
+  mapping: DataMapping,
+  catalog: DataMigrationCatalog,
+  expectedId: String,
+  applied: MigrationStamp[],
+  runtimeProject: String
+): Bool
+  let mismatch = catalog.migrations().historyPrefix(applied)
+
+  if catalog.error != "" || mismatch != null || catalog.entries.Length == 0
+    return mapping.fail(mismatch != null ? mismatch : "catalog has no removable migration")
+  end
+  let last = catalog.entries[catalog.entries.Length - 1]
+
+  if last.id != expectedId || applied.Length >= catalog.entries.Length
+    return mapping.fail("last migration differs from expected id or is already applied")
+  end
+  if !dataMigrationCatalogUnchanged(catalog)
+    return mapping.fail("migration catalog changed before removal")
+  end
+  let staged = catalog.path + "/.neri-migrations.lock/removed"
+  let original = catalog.path + "/" + last.directory
+
+  if files::move(original, staged).failure != null
+    return mapping.fail("cannot stage the last migration for removal")
+  end
+  let remaining = new DataMigrationCatalog()
+
+  remaining.path = catalog.path
+  remaining.entries = arrays::generate(catalog.entries.Length - 1) do |index|
+    return catalog.entries[index]
+  end
+  if !dataMigrationWriteCatalog(mapping, remaining, runtimeProject, catalog)
+    if files::move(staged, original).failure != null
+      return mapping.fail("catalog publication and restoring the staged migration failed")
+    end
+    return false
+  end
+  if dataMigrationReadLimited(
+    staged + "/migration.hk",
+    16777216
+  ) != last.source || dataMigrationReadLimited(
+    staged + "/snapshot.json",
+    4194304
+  ) != last.snapshot.sourceText || dataMigrationReadLimited(
+    staged + "/scaffold.json",
+    16777216
+  ) != last.snapshot.markerText
+    return mapping.fail("staged migration changed; it remains under the catalog lock for recovery")
+  end
+  let sourceRemoved = files::removeFile(staged + "/migration.hk").failure == null
+  let snapshotRemoved = files::removeFile(staged + "/snapshot.json").failure == null
+  let markerRemoved = files::removeFile(staged + "/scaffold.json").failure == null
+
+  if !sourceRemoved || !snapshotRemoved || !markerRemoved || files::removeDirectory(staged).failure != null
+    return mapping.fail("last migration was removed from the catalog; cleanup remains in .neri-migrations.lock/removed")
+  end
+  return true
+end
+
+## Existing scalar-only scaffold sources predate the optional reference argument.
+def dataMigrationLegacySource(source: String): String
+  let omitted = ", reference: null"
+  var output = ""
+  var start = 0
+  var index = 0
+
+  while index + host::stringByteLength(omitted) <= host::stringByteLength(source)
+    if host::stringSlice(source, index, host::stringByteLength(omitted)) == omitted
+      output = output + host::stringSlice(source, start, index - start)
+      index = index + host::stringByteLength(omitted)
+      start = index
+    else
+      index = index + 1
+    end
+  end
+  return output + host::stringSlice(source, start, host::stringByteLength(source) - start)
+end

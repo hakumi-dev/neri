@@ -1,0 +1,314 @@
+use result
+namespace neri_data
+
+enum AsyncMigrationPoll
+  case Pending(socket: Int, interest: AsyncInterest)
+  case Completed(result: MigrationResult)
+end
+
+abstract class AsyncMigrationDriver
+  public abstract def poll(): AsyncMigrationPoll
+  public abstract def cancel(): Void
+  public abstract def close(): MigrationFailure?
+end
+
+enum AsyncMigrationStart
+  case Started(driver: AsyncMigrationDriver)
+  case Failure(error: MigrationFailure)
+end
+
+resource class AsyncMigration
+  private driver: AsyncMigrationDriver
+
+  def init(driver: AsyncMigrationDriver): Void
+    this.driver = driver
+  end
+
+  public def poll(): AsyncMigrationPoll
+    return this.driver.poll()
+  end
+
+  public def cancel(): Void
+    this.driver.cancel()
+  end
+
+  public def close(): result::Failure?
+    let error = this.driver.close()
+
+    return error == null ? null : migrationResourceFailure(error, "data.async.migration.close")
+  end
+end
+
+def migrationResourceFailure(error: MigrationFailure, operation: String): result::Failure
+  match error
+    case MigrationFailure.Provider(nativeError)
+      return providerResourceFailure(nativeError, operation)
+    case MigrationFailure.Cleanup(cleanup)
+      return new result::Failure("cleanup_failed", operation,
+        cause: migrationResourceFailure(cleanup.primary(), operation),
+        closeFailure: providerResourceFailure(cleanup.cleanup(), operation))
+    case MigrationFailure.Validation(message)
+      return new result::Failure("migration", operation, message)
+    case MigrationFailure.Drift(message)
+      return new result::Failure("migration", operation, message)
+    case MigrationFailure.Unsupported(message)
+      return new result::Failure("migration", operation, message)
+  end
+end
+
+enum AsyncWritePoll
+  case Pending(socket: Int, interest: AsyncInterest)
+  case Completed(result: WriteResult)
+end
+
+abstract class AsyncWriteDriver
+  public abstract def poll(): AsyncWritePoll
+  public abstract def cancel(): Void
+  public abstract def close(): WriteFailure?
+
+  ## An abandoned worker operation may finish rollback on its provider owner.
+  public def deferFinalize(finalize: fn(WriteResult): WriteResult): Bool
+    return false
+  end
+end
+
+enum AsyncWriteStart
+  case Started(driver: AsyncWriteDriver)
+  case Failure(error: WriteFailure)
+end
+
+enum AsyncTransactionAction
+  case Begin()
+  case Commit(lease: Int)
+  case Rollback(lease: Int)
+  case Savepoint(lease: Int)
+  case RollbackTo(lease: Int, id: Int)
+  case Release(lease: Int, id: Int)
+end
+
+enum AsyncControlResult
+  case Begun(lease: Int)
+  case Created(id: Int)
+  case Saved()
+  case Failure(error: WriteFailure)
+end
+
+enum AsyncControlPoll
+  case Pending(socket: Int, interest: AsyncInterest)
+  case Completed(result: AsyncControlResult)
+end
+
+abstract class AsyncControlDriver
+  public abstract def poll(): AsyncControlPoll
+  public abstract def cancel(): Void
+  public abstract def close(): WriteFailure?
+end
+
+enum AsyncControlStart
+  case Started(driver: AsyncControlDriver)
+  case Failure(error: WriteFailure)
+end
+
+resource class AsyncWrite
+  private driver: AsyncWriteDriver
+  private finalize: (fn(WriteResult): WriteResult)?
+  private terminal: WriteResult?
+
+  def init(driver: AsyncWriteDriver, finalize: (fn(WriteResult): WriteResult)? = null): Void
+    this.driver = driver
+    this.finalize = finalize
+  end
+
+  private def finish(result: WriteResult): WriteResult
+    let finalize = this.finalize
+    let terminal = finalize == null ? result : finalize(result)
+
+    this.finalize = null
+    this.terminal = terminal
+    return terminal
+  end
+
+  public def poll(): AsyncWritePoll
+    let terminal = this.terminal
+
+    if terminal != null
+      return AsyncWritePoll.Completed(terminal)
+    end
+    match this.driver.poll()
+      case AsyncWritePoll.Pending(socket, interest)
+        return AsyncWritePoll.Pending(socket, interest)
+      case AsyncWritePoll.Completed(result)
+        return AsyncWritePoll.Completed(this.finish(result))
+    end
+  end
+
+  public def cancel(): Void
+    this.driver.cancel()
+  end
+
+  public def close(): result::Failure?
+    let error = this.driver.close()
+
+    if this.terminal == null
+      match this.driver.poll()
+        case AsyncWritePoll.Completed(result)
+          this.finish(result)
+        case AsyncWritePoll.Pending(socket, interest)
+          let finalize = this.finalize
+
+          if finalize != null && this.driver.deferFinalize(finalize)
+            this.finalize = null
+          end
+      end
+    end
+    return error == null ? null : writeResourceFailure(error, "data.async.write.close")
+  end
+end
+
+def startWriteAsync(
+  provider: Provider,
+  batch: readonly WriteBatch,
+  options: StreamOptions? = null,
+  lease: Int? = null,
+  validate: (fn(readonly WriteReturnedRows): WriteFailure?)? = null,
+  finalize: (fn(WriteResult): WriteResult)? = null
+): result::Result<AsyncWrite, WriteFailure>
+  match provider.beginWriteAsync(batch, options, lease, validate)
+    case AsyncWriteStart.Failure(error)
+      return result::Result<AsyncWrite, WriteFailure>.Error(error)
+    case AsyncWriteStart.Started(driver)
+      let owned = new AsyncWrite(driver, finalize)
+
+      return result::Result<AsyncWrite, WriteFailure>.Ok(transfer owned)
+  end
+end
+
+resource class AsyncControl
+  private driver: AsyncControlDriver
+
+  def init(driver: AsyncControlDriver): Void
+    this.driver = driver
+  end
+
+  public def poll(): AsyncControlPoll
+    return this.driver.poll()
+  end
+
+  public def cancel(): Void
+    this.driver.cancel()
+  end
+
+  public def close(): result::Failure?
+    let error = this.driver.close()
+
+    return error == null ? null : writeResourceFailure(error, "data.async.transaction.close")
+  end
+end
+
+def startControlAsync(
+  provider: Provider,
+  action: AsyncTransactionAction,
+  options: StreamOptions? = null
+): result::Result<AsyncControl, WriteFailure>
+  match provider.beginControlAsync(action, options)
+    case AsyncControlStart.Failure(error)
+      return result::Result<AsyncControl, WriteFailure>.Error(error)
+    case AsyncControlStart.Started(driver)
+      let owned = new AsyncControl(driver)
+
+      return result::Result<AsyncControl, WriteFailure>.Ok(transfer owned)
+  end
+end
+
+def writeResourceFailure(error: WriteFailure, operation: String): result::Failure
+  match error
+    case WriteFailure.Provider(nativeError)
+      return providerResourceFailure(nativeError, operation)
+    case WriteFailure.Cleanup(cleanup)
+      return new result::Failure(
+        "cleanup_failed",
+        operation,
+        cause: writeResourceFailure(cleanup.primary(), operation),
+        closeFailure: writeResourceFailure(cleanup.cleanup(), operation)
+      )
+    case WriteFailure.Validation(message)
+      return new result::Failure("write", operation, writeFailureMessage(error))
+    case WriteFailure.Concurrency(message)
+      return new result::Failure("write", operation, writeFailureMessage(error))
+    case WriteFailure.Constraint(message)
+      return new result::Failure("write", operation, writeFailureMessage(error))
+    case WriteFailure.Unsupported(message)
+      return new result::Failure("write", operation, writeFailureMessage(error))
+    case WriteFailure.Transaction(message)
+      return new result::Failure("write", operation, writeFailureMessage(error))
+  end
+end
+
+## Freezes parameters and result metadata before asynchronous execution begins.
+def copyWriteValues(source: readonly WriteValues): WriteValues
+  let values = new WriteValues()
+  var current = source.first()
+
+  while current != null
+    match current.value()
+      case Cell.Binary(item)
+        values.add(Cell.Binary(copyBinary(item)))
+      case Cell.Null()
+        values.add(Cell.Null())
+      case Cell.Bool(item)
+        values.add(Cell.Bool(item))
+      case Cell.Int(item)
+        values.add(Cell.Int(item))
+      case Cell.Float(item)
+        values.add(Cell.Float(item))
+      case Cell.Text(item)
+        values.add(Cell.Text(item))
+    end
+    current = current.next()
+  end
+  return values
+end
+
+def freezeWriteBatch(source: readonly WriteBatch): WriteBatch
+  let frozen = new WriteBatch()
+  var current = source.first()
+
+  while current != null
+    let command = current.command()
+    let values = new WriteValues()
+    var value = command.parameters().first()
+
+    while value != null
+      match value.value()
+        case Cell.Null()
+          values.add(Cell.Null())
+        case Cell.Bool(item)
+          values.add(Cell.Bool(item))
+        case Cell.Int(item)
+          values.add(Cell.Int(item))
+        case Cell.Float(item)
+          values.add(Cell.Float(item))
+        case Cell.Text(item)
+          values.add(Cell.Text(item))
+        case Cell.Binary(item)
+          values.add(Cell.Binary(copyBinary(item)))
+      end
+      value = value.next()
+    end
+    let returning = command.returningColumns()
+    var copied: ResultColumns? = null
+
+    if returning != null
+      let columns = arrays::generate<ResultColumn>(returning.count()) do |index|
+        let column = returning.at(index)
+
+        return new ResultColumn(column.name(), copyResultColumnKind(column.kind()), column.nullable())
+      end
+
+      copied = new ResultColumns(columns)
+    end
+    frozen.add(command.sql(), values, command.expectedRows(), copied)
+    current = current.next()
+  end
+  return frozen
+end

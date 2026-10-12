@@ -1,0 +1,138 @@
+def dataEmitJsonClass(output: DataArtifact, mapping: DataMapping, symbol: SemanticClass, prefix: String): Void
+  let typeName = semanticNamespaceDisplay(symbol.fullName)
+  var member = symbol.firstField
+  let model = mapping.semantic
+
+  while member != null
+    if dataJsonScalar(member.typeName) == null && model != null
+      let nested = dataFindClass(
+        model,
+        semanticIsOptional(member.typeName) ? semanticInnerType(member.typeName) : member.typeName
+      )
+
+      dataEmitJsonClass(output, mapping, nested, prefix + "_" + member.name) if nested != null
+    end
+    member = member.nextField
+  end
+  output.write("def value_" + prefix + "(entity: " + typeName + "?): json::Value\n  if entity == null\n    return json::Value.nullValue()\n  end\n  let value = json::Value.object()\n")
+  member = symbol.firstField
+  while member != null
+    let scalar = dataJsonScalar(member.typeName)
+
+    if scalar != null
+      scalar.memberName = member.name
+      let family = dataTextScalarFamily(semanticIsOptional(member.typeName) ? semanticInnerType(member.typeName) : member.typeName)
+      let array = family == "Strings" || family == "Ints" || family == "Bools"
+
+      output.write("  value.put(" + lspQuote(member.name) + ", neri_data::jsonModelValue(" + dataCaptureCell(scalar) + (array ? ", array: true" : "") + "))\n")
+    else
+      output.write("  value.put(" + lspQuote(member.name) + ", value_" + prefix + "_" + member.name + "(entity." + member.name + "))\n")
+    end
+    member = member.nextField
+  end
+  output.write("  return value\nend\n\ndef read_" + prefix + "(value: json::Value?, column: String): neri_data::DecodeResult<" + typeName + ">\n  if value == null || value.kind() != \"object\"\n    return neri_data::DecodeResult<" + typeName + ">.Failure(neri_data::QueryFailure.TypeMismatch(column, \"JSON object\", value == null ? \"missing\" : value.kind()))\n  end\n  let entity = new " + typeName + "()\n")
+  member = symbol.firstField
+  while member != null
+    let scalar = dataJsonScalar(member.typeName)
+
+    if scalar != null
+      let family = dataTextScalarFamily(semanticIsOptional(member.typeName) ? semanticInnerType(member.typeName) : member.typeName)
+      let kind = family == "Strings" || family == "Ints" || family == "Bools" ? "Array" : dataScalarName(scalar.domain)
+      let decode = dataComplexFieldDecoder(scalar)
+
+      output.write("  let row_" + member.name + " = new neri_data::RawRow([new neri_data::RawColumn(column, neri_data::jsonModelCell(value.get(" + lspQuote(member.name) + "), " + lspQuote(kind) + "))])\n  match " + decode + "(row_" + member.name + ", column)\n    case neri_data::DecodeResult.Failure(error)\n      return neri_data::DecodeResult<" + typeName + ">.Failure(error)\n    case neri_data::DecodeResult.Value(decoded)\n      entity." + member.name + " = decoded\n  end\n")
+    else
+      let optional = semanticIsOptional(member.typeName)
+
+      output.write("  let nested_" + member.name + " = value.get(" + lspQuote(member.name) + ")\n")
+      if optional
+        output.write("  if nested_" + member.name + " == null || nested_" + member.name + ".kind() == \"null\"\n    entity." + member.name + " = null\n  else\n")
+      end
+      output.write("  match read_" + prefix + "_" + member.name + "(nested_" + member.name + ", column)\n    case neri_data::DecodeResult.Failure(error)\n      return neri_data::DecodeResult<" + typeName + ">.Failure(error)\n    case neri_data::DecodeResult.Value(decoded)\n      entity." + member.name + " = decoded\n  end\n")
+      output.write("  end\n") if optional
+    end
+    member = member.nextField
+  end
+  output.write("  return neri_data::DecodeResult<" + typeName + ">.Value(entity)\nend\n\n")
+end
+
+def dataEmitJsonModels(output: DataArtifact, mapping: DataMapping, entity: DataEntity): Void
+  var field = entity.firstField
+
+  while field != null
+    let symbol = field.jsonSymbol
+
+    if symbol != null
+      dataEmitJsonClass(output, mapping, symbol, field.jsonPrefix)
+      let typeName = semanticNamespaceDisplay(field.typeName)
+      let result = "neri_data::DecodeResult<" + typeName + ">"
+
+      output.write("def initial_" + field.jsonPrefix + "(): " + semanticNamespaceDisplay(symbol.fullName) + "\n  return new " + semanticNamespaceDisplay(symbol.fullName) + "()\nend\n\ndef encode_" + field.jsonPrefix + "(entity: " + typeName + "): neri_data::Cell\n")
+      output.write("  return neri_data::Cell.Null() if entity == null\n") if field.optional
+      output.write("  match json::stringify(value_" + field.jsonPrefix + "(entity))\n    case result::Result.Ok(text)\n      return neri_data::Cell.Text(text)\n    case result::Result.Error(error)\n      return neri_data::Cell.Bool(false)\n  end\nend\n\ndef decode_" + field.jsonPrefix + "(row: neri_data::RawRow, column: String): " + result + "\n  match neri_data::decode" + (field.optional ? "Nullable" : "") + "String(row, column)\n    case neri_data::DecodeResult.Failure(error)\n      return " + result + ".Failure(error)\n    case neri_data::DecodeResult.Value(text)\n")
+      output.write("      return " + result + ".Value(null) if text == null\n") if field.optional
+      output.write("      match json::parse(text)\n        case result::Result.Error(error)\n          return " + result + ".Failure(neri_data::QueryFailure.TypeMismatch(column, \"complex JSON\", \"invalid JSON\"))\n        case result::Result.Ok(value)\n          match read_" + field.jsonPrefix + "(value, column)\n            case neri_data::DecodeResult.Failure(error)\n              return " + result + ".Failure(error)\n            case neri_data::DecodeResult.Value(decoded)\n              return " + result + ".Value(decoded)\n          end\n      end\n  end\nend\n\n")
+    end
+    field = field.nextField
+  end
+end
+
+def dataJsonClassPublicNames(
+  mapping: DataMapping,
+  emission: DataEmission,
+  names: StringBuffer,
+  symbol: SemanticClass,
+  prefix: String
+): Bool
+  if !dataEmissionAddName(
+    emission,
+    names,
+    "value_" + prefix,
+    "JSON encoder"
+  ) || !dataEmissionAddName(
+    emission,
+    names,
+    "read_" + prefix,
+    "JSON decoder"
+  )
+    return false
+  end
+  var member = symbol.firstField
+  let model = mapping.semantic
+
+  while member != null
+    if model != null && dataJsonScalar(member.typeName) == null
+      let nested = dataFindClass(
+        model,
+        semanticIsOptional(member.typeName) ? semanticInnerType(member.typeName) : member.typeName
+      )
+
+      if nested != null && !dataJsonClassPublicNames(mapping, emission, names, nested, prefix + "_" + member.name)
+        return false
+      end
+    end
+    member = member.nextField
+  end
+  return true
+end
+
+def dataJsonPublicNames(mapping: DataMapping, emission: DataEmission, names: StringBuffer, entity: DataEntity): Bool
+  var field = entity.firstField
+
+  while field != null
+    let symbol = field.jsonSymbol
+
+    if symbol != null
+      if !dataJsonClassPublicNames(mapping, emission, names, symbol, field.jsonPrefix)
+        return false
+      end
+      for prefix in ["initial_", "encode_", "decode_"]
+        if !dataEmissionAddName(emission, names, prefix + field.jsonPrefix, "JSON storage codec")
+          return false
+        end
+      end
+    end
+    field = field.nextField
+  end
+  return true
+end

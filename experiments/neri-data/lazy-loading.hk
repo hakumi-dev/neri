@@ -1,0 +1,430 @@
+namespace neri_data
+
+enum NavigationLoadState
+  case Unknown()
+  case Loading()
+  case Partial()
+  case Loaded()
+end
+
+class MaterializationObserver
+  public action: fn(): QueryFailure?
+  public next: MaterializationObserver?
+
+  def init(action: fn(): QueryFailure?, next: MaterializationObserver?): Void
+    this.action = action
+    this.next = next
+  end
+end
+
+class NavigationStateEntry<T>
+  public entity: T
+  public key: Cell
+  public state: NavigationLoadState
+  public next: NavigationStateEntry<T>?
+
+  def init(entity: T, key: Cell, state: NavigationLoadState, next: NavigationStateEntry<T>?): Void
+    this.entity = entity
+    this.key = key
+    this.state = state
+    this.next = next
+  end
+end
+
+class NavigationStates<T>
+  private first: NavigationStateEntry<T>?
+
+  public def clear(): Void
+    this.first = null
+  end
+
+  public def get(entity: T, key: Cell): NavigationLoadState
+    var current = this.first
+
+    while current != null
+      if reference::same(current.entity, entity)
+        if !navigationCellSameOrNull(current.key, key)
+          current.state = NavigationLoadState.Unknown()
+          current.key = key
+        end
+        return current.state
+      end
+      current = current.next
+    end
+    return NavigationLoadState.Unknown()
+  end
+
+  public def set(entity: T, key: Cell, state: NavigationLoadState): Void
+    var current = this.first
+
+    while current != null
+      if reference::same(current.entity, entity)
+        current.key = key
+        current.state = state
+        return
+      end
+      current = current.next
+    end
+    this.first = new NavigationStateEntry<T>(entity, key, state, this.first)
+  end
+end
+
+## Fixes every materialized relationship using identity-resolved tracked objects.
+## Foreign-key edits and contradictory local reference edits remain application-owned.
+class NavigationFixup<P, D>
+  private principals: EntityTracker<P>
+  private dependents: EntityTracker<D>
+  private relation: CollectionNavigation<P, D>
+  private running: Bool = false
+
+  def init(principals: EntityTracker<P>, dependents: EntityTracker<D>, relation: CollectionNavigation<P, D>): Void
+    this.principals = principals
+    this.dependents = dependents
+    this.relation = relation
+  end
+
+  public def apply(): QueryFailure?
+    if this.running
+      return null
+    end
+    this.running = true
+    let principals = new TypedRows<P>()
+    let dependents = new TypedRows<D>()
+    let collectPrincipal: fn(P): Bool = fn(value: P): Bool do
+      if this.principals.ownsPersistedForNavigation(value)
+        principals.add(value)
+      end
+      return true
+    end
+    let collectDependent: fn(D): Bool = fn(value: D): Bool do
+      if this.dependents.ownsPersistedForNavigation(value)
+        dependents.add(value)
+      end
+      return true
+    end
+
+    this.principals.visitTracked(collectPrincipal)
+    this.dependents.visitTracked(collectDependent)
+    var dependent = dependents.first()
+
+    while dependent != null
+      let value = dependent.value
+      let foreignKey = this.relation.foreignKey(value)
+      let original = this.dependents.original(value)
+
+      if original != null && navigationTupleRowMatches(original, this.relation.columns(), foreignKey)
+        var principal = principals.first()
+        var target: P? = null
+
+        while principal != null
+          if navigationCellEqual(this.relation.principalKey(principal.value), foreignKey)
+            target = principal.value
+            break
+          end
+          principal = principal.next
+        end
+        let currentReference = this.relation.reference(value)
+
+        if target != null && (currentReference == null || reference::same(currentReference, target))
+          let existing = this.relation.collection(target)
+          var present = false
+
+          for child in existing
+            if reference::same(child, value)
+              present = true
+            end
+          end
+          if !present
+            let exact = arrays::generate<D>(existing.Length + 1) do |index|
+              return index < existing.Length ? existing[index] : value
+            end
+
+            this.relation.setCollection(target, exact)
+          end
+          this.relation.setReference(value, target)
+        end
+      end
+      dependent = dependent.next
+    end
+    this.running = false
+    return null
+  end
+end
+
+## Register once for each context-owned, stable navigation object.
+def registerNavigation<P, D>(
+  principals: Query<P>,
+  dependents: Query<D>,
+  relation: CollectionNavigation<P, D>
+): QueryFailure?
+  let principalTracker = principals.rowTracker()
+  let dependentTracker = dependents.rowTracker()
+  let principalOwner = principals.changeOwner()
+  let dependentOwner = dependents.changeOwner()
+
+  if principalTracker == null || dependentTracker == null || principalOwner == null || dependentOwner == null || !reference::same(
+    principalOwner,
+    dependentOwner
+  )
+    return QueryFailure.Provider(ProviderFailure.State("navigation fixup requires tracked roots from the same context"))
+  end
+  let fixup = new NavigationFixup<P, D>(principalTracker, dependentTracker, relation)
+  let action: fn(): QueryFailure? = fn(): QueryFailure? do
+    return fixup.apply()
+  end
+
+  principalTracker.observeMaterialization(action)
+  dependentTracker.observeMaterialization(action)
+  return fixup.apply()
+end
+
+## Loads on access once; Partial selections trigger a complete relationship load.
+def lazyCollection<P, D>(
+  principals: Query<P>,
+  dependents: Query<D>,
+  relation: CollectionNavigation<P, D>,
+  entity: P
+): QueryResult<D>
+  let tracker = principals.rowTracker()
+
+  if tracker == null || !tracker.ownsPersistedForNavigation(entity)
+    return QueryResult<D>.Failure(QueryFailure.Provider(ProviderFailure.State("lazy collection requires a live persisted instance in this context")))
+  end
+  let previous = relation.collectionState(entity)
+
+  match previous
+    case NavigationLoadState.Loaded()
+      let rows = new TypedRows<D>()
+      let dependentTracker = dependents.rowTracker()
+
+      if dependentTracker == null
+        return QueryResult<D>.Failure(QueryFailure.Provider(ProviderFailure.State("lazy collection requires a tracked dependent root")))
+      end
+
+      for value in relation.collection(entity)
+        if !dependentTracker.ownsPersistedForNavigation(value)
+          relation.markCollection(entity, NavigationLoadState.Unknown())
+          return QueryResult<D>.Failure(QueryFailure.Provider(ProviderFailure.State("loaded collection contains a removed or detached instance; reload after saving changes")))
+        end
+        rows.add(value)
+      end
+      return QueryResult<D>.Rows(rows)
+    case NavigationLoadState.Loading()
+      return QueryResult<D>.Failure(QueryFailure.Provider(ProviderFailure.State("lazy collection loading is reentrant")))
+    case NavigationLoadState.Unknown()
+    case NavigationLoadState.Partial()
+  end
+  relation.markCollection(entity, NavigationLoadState.Loading())
+  let selected = new TypedRows<P>()
+
+  selected.add(entity)
+  match include(principals, dependents, relation).load(selected)
+    case QueryResult.Failure(error)
+      relation.markCollection(entity, previous)
+      return QueryResult<D>.Failure(error)
+    case QueryResult.Rows(loaded)
+      let children = new TypedRows<D>()
+
+      for value in relation.collection(entity)
+        children.add(value)
+      end
+      return QueryResult<D>.Rows(children)
+  end
+end
+
+def lazyReference<P, D>(
+  dependents: Query<D>,
+  principals: Query<P>,
+  relation: CollectionNavigation<P, D>,
+  entity: D
+): QueryResult<P>
+  let tracker = dependents.rowTracker()
+
+  if tracker == null || !tracker.ownsPersistedForNavigation(entity)
+    return QueryResult<P>.Failure(QueryFailure.Provider(ProviderFailure.State("lazy reference requires a live persisted instance in this context")))
+  end
+  let previous = relation.referenceState(entity)
+
+  match previous
+    case NavigationLoadState.Loaded()
+      let rows = new TypedRows<P>()
+      let value = relation.reference(entity)
+
+      if value != null
+        let principalTracker = principals.rowTracker()
+
+        if principalTracker == null || !principalTracker.ownsPersistedForNavigation(value)
+          relation.markReference(entity, NavigationLoadState.Unknown())
+          return QueryResult<P>.Failure(QueryFailure.Provider(ProviderFailure.State("loaded reference points to a removed or detached instance; reload after saving changes")))
+        end
+        rows.add(value)
+      end
+      return QueryResult<P>.Rows(rows)
+    case NavigationLoadState.Loading()
+      return QueryResult<P>.Failure(QueryFailure.Provider(ProviderFailure.State("lazy reference loading is reentrant")))
+    case NavigationLoadState.Unknown()
+    case NavigationLoadState.Partial()
+  end
+  relation.markReference(entity, NavigationLoadState.Loading())
+  let selected = new TypedRows<D>()
+
+  selected.add(entity)
+  match includeReference(dependents, principals, relation).load(selected)
+    case QueryResult.Failure(error)
+      relation.markReference(entity, previous)
+      return QueryResult<P>.Failure(error)
+    case QueryResult.Rows(loaded)
+      let rows = new TypedRows<P>()
+      let value = relation.reference(entity)
+
+      if value != null
+        rows.add(value)
+      end
+      return QueryResult<P>.Rows(rows)
+  end
+end
+
+enum AsyncLoadStart<T>
+  case Started(driver: AsyncLoadDriver<T>)
+  case Failure(error: QueryFailure)
+end
+
+## Loaded navigations complete locally; unknown and partial states use asynchronous reads.
+def lazyCollectionAsync<P, D>(
+  principals: Query<P>,
+  dependents: Query<D>,
+  relation: CollectionNavigation<P, D>,
+  entity: P,
+  options: StreamOptions? = null
+): result::Result<AsyncLoad<D>, QueryFailure>
+  match prepareLazyCollection(principals, dependents, relation, entity, options)
+    case AsyncLoadStart.Failure(error)
+      return result::Result<AsyncLoad<D>, QueryFailure>.Error(error)
+    case AsyncLoadStart.Started(driver)
+      let owned = new AsyncLoad<D>(driver)
+
+      return result::Result<AsyncLoad<D>, QueryFailure>.Ok(transfer owned)
+  end
+end
+
+def prepareLazyCollection<P, D>(
+  principals: Query<P>,
+  dependents: Query<D>,
+  relation: CollectionNavigation<P, D>,
+  entity: P,
+  options: StreamOptions? = null
+): AsyncLoadStart<D>
+  let tracker = principals.rowTracker()
+
+  if tracker == null || !tracker.ownsPersistedForNavigation(entity)
+    return AsyncLoadStart<D>.Failure(QueryFailure.Provider(ProviderFailure.State("lazy collection requires a live persisted instance in this context")))
+  end
+  let previous = relation.collectionState(entity)
+  let loader = include(principals, dependents, relation)
+  let invalid = loader.validateQueries(true)
+
+  if invalid != null
+    return AsyncLoadStart<D>.Failure(invalid)
+  end
+  let map: fn(QueryResult<P>): QueryResult<D> = fn(result: QueryResult<P>): QueryResult<D> do
+    match result
+      case QueryResult.Failure(error)
+        relation.markCollection(entity, previous)
+        return QueryResult<D>.Failure(error)
+      case QueryResult.Rows(rows)
+        let values = new TypedRows<D>()
+
+        for child in relation.collection(entity)
+          values.add(child)
+        end
+        return QueryResult<D>.Rows(values)
+    end
+  end
+
+  match previous
+    case NavigationLoadState.Loading()
+      return AsyncLoadStart<D>.Failure(QueryFailure.Provider(ProviderFailure.State("lazy collection loading is reentrant")))
+    case NavigationLoadState.Loaded()
+      # The loaded branch of lazyCollection inspects tracked memory only.
+      let completed = lazyCollection(principals, dependents, relation, entity)
+
+      return AsyncLoadStart<D>.Started(new AsyncMappedNavigation<P, D, D>(null, map, completed))
+    case NavigationLoadState.Unknown()
+    case NavigationLoadState.Partial()
+  end
+  let rows = new TypedRows<P>()
+
+  rows.add(entity)
+  relation.markCollection(entity, NavigationLoadState.Loading())
+  let source = new AsyncNavigationDriver<P, D>(loader, options, rows: rows)
+
+  return AsyncLoadStart<D>.Started(new AsyncMappedNavigation<P, D, D>(source, map))
+end
+
+def lazyReferenceAsync<P, D>(
+  dependents: Query<D>, principals: Query<P>, relation: CollectionNavigation<P, D>, entity: D, options: StreamOptions? = null
+): result::Result<AsyncLoad<P>, QueryFailure>
+  match prepareLazyReference(dependents, principals, relation, entity, options)
+    case AsyncLoadStart.Failure(error)
+      return result::Result<AsyncLoad<P>, QueryFailure>.Error(error)
+    case AsyncLoadStart.Started(driver)
+      let owned = new AsyncLoad<P>(driver)
+
+      return result::Result<AsyncLoad<P>, QueryFailure>.Ok(transfer owned)
+  end
+end
+
+def prepareLazyReference<P, D>(
+  dependents: Query<D>,
+  principals: Query<P>,
+  relation: CollectionNavigation<P, D>,
+  entity: D,
+  options: StreamOptions? = null
+): AsyncLoadStart<P>
+  let tracker = dependents.rowTracker()
+
+  if tracker == null || !tracker.ownsPersistedForNavigation(entity)
+    return AsyncLoadStart<P>.Failure(QueryFailure.Provider(ProviderFailure.State("lazy reference requires a live persisted instance in this context")))
+  end
+  let previous = relation.referenceState(entity)
+  let loader = includeReference(dependents, principals, relation)
+  let invalid = loader.validateQueries()
+
+  if invalid != null
+    return AsyncLoadStart<P>.Failure(invalid)
+  end
+  let map: fn(QueryResult<D>): QueryResult<P> = fn(result: QueryResult<D>): QueryResult<P> do
+    match result
+      case QueryResult.Failure(error)
+        relation.markReference(entity, previous)
+        return QueryResult<P>.Failure(error)
+      case QueryResult.Rows(rows)
+        let values = new TypedRows<P>()
+        let principal = relation.reference(entity)
+
+        if principal != null
+          values.add(principal)
+        end
+        return QueryResult<P>.Rows(values)
+    end
+  end
+
+  match previous
+    case NavigationLoadState.Loading()
+      return AsyncLoadStart<P>.Failure(QueryFailure.Provider(ProviderFailure.State("lazy reference loading is reentrant")))
+    case NavigationLoadState.Loaded()
+      # The loaded branch of lazyReference inspects tracked memory only.
+      let completed = lazyReference(dependents, principals, relation, entity)
+
+      return AsyncLoadStart<P>.Started(new AsyncMappedNavigation<D, P, P>(null, map, completed))
+    case NavigationLoadState.Unknown()
+    case NavigationLoadState.Partial()
+  end
+  let rows = new TypedRows<D>()
+
+  rows.add(entity)
+  relation.markReference(entity, NavigationLoadState.Loading())
+  let source = new AsyncNavigationDriver<D, P>(loader, options, rows: rows)
+
+  return AsyncLoadStart<P>.Started(new AsyncMappedNavigation<D, P, P>(source, map))
+end

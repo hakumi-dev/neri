@@ -121,16 +121,23 @@ query.orderByString(byName)
 query.orderByBool(byActive)
 ```
 
-The overloads are named because method-level generic parameters are outside the
-current Neri surface. A selector must resolve to a mapped field of the query's
-entity; arbitrary callbacks, dynamic field names and string filters are not
-translation APIs.
+The named overloads retain their scalar type contracts. The generic
+`orderByValue(codec, selector)` and `thenByValue(codec, selector)` methods accept
+typed scalar expression quotations. The codec and quotation result types must
+agree. Arbitrary callbacks are not SQL translation APIs.
 
 Projection is a shared generic module function:
 
 ```neri
 select<T, R>(query: Query<T>, codec: ScalarCodec<R>, selector: quote fn(T): R): Projection<T, R>
 ```
+
+`query.select(codec, selector)` supports a computed scalar expression;
+`query.selectShape(shape)` materializes a composed typed row shape. String
+quotations support `contains`, `startsWith`, `endsWith` and `byteLength` with
+case-sensitive UTF-8 semantics. SQLite text predicates preserve embedded NUL
+bytes. PostgreSQL text parameters reject NUL because its text storage does not
+represent that value.
 
 `T` is inferred from the query and `R` from the scalar codec. `intScalar()`,
 `boolScalar()`, `textScalar()` and their nullable variants provide strict
@@ -289,9 +296,15 @@ transaction and conflict semantics, limitations, and research basis, and
 `Provider` supplies a dialect, advertises `BoundedTypedReads`, binds every
 parameter, and returns raw rows. The runtime checks the plan's limit, selected
 columns, scalar kinds and nullability, then materializes typed rows through the
-generated decoder. The repository includes an in-memory contract provider and
-a separately linked SQLite provider. PostgreSQL-style placeholders are
-supported by the planner; a PostgreSQL connection adapter is not included.
+generated decoder. The repository includes an in-memory contract provider,
+a separately linked SQLite provider, and a [libpq PostgreSQL provider](POSTGRESQL.md).
+PostgreSQL validates mapped identifiers against its 63-byte limit before
+compilation. Generated constraint names must fit the same limit.
+
+[Exact scalars and ordered keys](SCALARS-KEYS.md) describes binary buffers,
+canonical decimals, composite primary keys and alternate principal identities.
+[Asynchronous operations and lazy loading](ASYNC-AND-LAZY.md) describes owned
+polling operations, context relationship fixup and loaded-state caching.
 
 Opt-in [generated integer keys](GENERATED-VALUES.md) use SQLite RETURNING and
 restore temporary keys on rollback. [Model differences](MODEL-MIGRATIONS.md)

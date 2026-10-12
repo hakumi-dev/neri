@@ -1,0 +1,126 @@
+use result
+namespace neri_data
+
+class PooledContextEntry<T>
+  public value: T
+  public next: PooledContextEntry<T>?
+
+  def init(value: T, next: PooledContextEntry<T>?): Void
+    this.value = value
+    this.next = next
+  end
+end
+
+## Sequential context reuse with an explicit complete reset boundary.
+## The application owns provider sessions for the lifetime of every lease.
+class ContextPool<T>
+  private factory: fn(): T
+  private reset: fn(T): WriteFailure?
+  private capacity: Int
+  private idle: PooledContextEntry<T>?
+  private active: PooledContextEntry<T>?
+  private idleCount: Int = 0
+  private leased: Int = 0
+  private opened: Bool = true
+
+  def init(factory: fn(): T, reset: fn(T): WriteFailure?, capacity: Int = 32): Void
+    this.factory = factory
+    this.reset = reset
+    this.capacity = capacity
+  end
+
+  public def acquire(): result::Result<ContextLease<T>, WriteFailure>
+    if !this.opened
+      return result::Result<ContextLease<T>, WriteFailure>.Error(WriteFailure.Validation("context pool is closed"))
+    end
+    if this.capacity < 1 || this.capacity > 4096
+      return result::Result<ContextLease<T>, WriteFailure>.Error(WriteFailure.Validation("context pool capacity must be between 1 and 4096"))
+    end
+    if this.leased >= this.capacity
+      return result::Result<ContextLease<T>, WriteFailure>.Error(WriteFailure.Validation("context pool lease limit reached"))
+    end
+    let entry = this.idle
+    let value = entry == null ? this.factory() : entry.value
+
+    if entry != null
+      this.idle = entry.next
+      this.idleCount = this.idleCount - 1
+    end
+    this.leased = this.leased + 1
+    let ticket = new PooledContextEntry<T>(value, this.active)
+
+    this.active = ticket
+    let owned = new ContextLease<T>(this, ticket)
+
+    return result::Result<ContextLease<T>, WriteFailure>.Ok(transfer owned)
+  end
+
+  internal def release(ticket: PooledContextEntry<T>): WriteFailure?
+    var previous: PooledContextEntry<T>? = null
+    var current = this.active
+
+    while current != null && !reference::same(current, ticket)
+      previous = current
+      current = current.next
+    end
+    if current == null
+      return WriteFailure.Validation("context lease does not belong to this pool")
+    end
+    if previous == null
+      this.active = current.next
+    else
+      previous.next = current.next
+    end
+    let value = current.value
+    let failure = this.reset(value)
+
+    this.leased = this.leased - 1
+    if failure != null
+      return failure
+    end
+    if this.opened && this.idleCount < this.capacity
+      this.idle = new PooledContextEntry<T>(value, this.idle)
+      this.idleCount = this.idleCount + 1
+    end
+    return null
+  end
+
+  public readonly def activeLeases(): Int
+    return this.leased
+  end
+
+  public def close(): WriteFailure?
+    if this.leased != 0
+      return WriteFailure.Transaction("context pool still has active leases")
+    end
+    this.opened = false
+    this.idle = null
+    this.idleCount = 0
+    return null
+  end
+end
+
+resource class ContextLease<T>
+  private pool: ContextPool<T>
+  private ticket: PooledContextEntry<T>
+  private closed: Bool = false
+
+  def init(pool: ContextPool<T>, ticket: PooledContextEntry<T>): Void
+    this.pool = pool
+    this.ticket = ticket
+  end
+
+  public def context(): T?
+    return this.closed ? null : this.ticket.value
+  end
+
+  public def close(): result::Failure?
+    if this.closed
+      return null
+    end
+    this.closed = true
+    let failure = this.pool.release(this.ticket)
+
+    return failure == null ? null : writeResourceFailure(failure, "data.context.pool.return")
+  end
+end

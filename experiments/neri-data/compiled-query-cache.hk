@@ -1,0 +1,132 @@
+namespace neri_data
+
+class CompiledContextEntry<C, T>
+  public context: C
+  public query: CompiledQuery<T>
+  public next: CompiledContextEntry<C, T>?
+
+  def init(context: C, query: CompiledQuery<T>, next: CompiledContextEntry<C, T>?): Void
+    this.context = context
+    this.query = query
+    this.next = next
+  end
+end
+
+## Bounded reusable query factory. Each context's shape is checked once and cached.
+## All changing application inputs must be supplied through the delegate binder.
+class CompiledQueryCache<C, T>
+  private factory: fn(C): Query<T>
+  private capacity: Int
+  private first: CompiledContextEntry<C, T>?
+  private count: Int = 0
+  private template: CompiledQuery<T>?
+
+  def init(factory: fn(C): Query<T>, capacity: Int = 16): Void
+    this.factory = factory
+    this.capacity = capacity
+  end
+
+  public def clear(): Void
+    this.first = null
+    this.count = 0
+    this.template = null
+  end
+
+  public def getOrCompile(context: C): CompiledQueryResult<T>
+    if this.capacity < 1 || this.capacity > 64
+      return CompiledQueryResult<T>.Failure(QueryFailure.UnsupportedCapability("compiled query cache capacity must be between 1 and 64"))
+    end
+    var current = this.first
+    var previous: CompiledContextEntry<C, T>? = null
+
+    while current != null
+      if reference::same(current.context, context)
+        if previous != null
+          previous.next = current.next
+          current.next = this.first
+          this.first = current
+        end
+        return CompiledQueryResult<T>.Prepared(current.query)
+      end
+      previous = current
+      current = current.next
+    end
+    let source = this.factory(context)
+    let template = this.template
+    let result = template == null ? source.compileQuery() : template.bindTo(source)
+
+    match result
+      case CompiledQueryResult.Failure(error)
+        return CompiledQueryResult<T>.Failure(error)
+      case CompiledQueryResult.Prepared(compiled)
+        if template == null
+          this.template = compiled
+        end
+        this.first = new CompiledContextEntry<C, T>(context, compiled, this.first)
+        this.count = this.count + 1
+        if this.count > this.capacity
+          var tail = this.first
+          var kept = 1
+
+          while tail != null && kept < this.capacity
+            tail = tail.next
+            kept = kept + 1
+          end
+          if tail != null
+            tail.next = null
+          end
+          this.count = this.capacity
+          # Retain a template owned by an entry still inside the bounded cache.
+          this.template = compiled
+        end
+        return CompiledQueryResult<T>.Prepared(compiled)
+    end
+  end
+
+  public def delegate<A>(parameters: fn(A): ParameterValues): fn(C, A): QueryResult<T>
+    let cache = this
+    let invoke: fn(C, A): QueryResult<T> = fn(context: C, argument: A): QueryResult<T> do
+      match cache.getOrCompile(context)
+        case CompiledQueryResult.Failure(error)
+          return QueryResult<T>.Failure(error)
+        case CompiledQueryResult.Prepared(query)
+          return query.all(parameters: parameters(argument))
+      end
+    end
+
+    return invoke
+  end
+
+  public def asyncDelegate<A>(parameters: fn(A): ParameterValues): fn(
+    C,
+    A,
+    StreamOptions?
+  ): result::Result<AsyncQuery<T>, QueryFailure>
+    let cache = this
+    let invoke: fn(
+      C,
+      A,
+      StreamOptions?
+    ): result::Result<AsyncQuery<T>, QueryFailure> = fn(
+      context: C,
+      argument: A,
+      options: StreamOptions?
+    ): result::Result<AsyncQuery<T>, QueryFailure> do
+      match cache.getOrCompile(context)
+        case CompiledQueryResult.Failure(error)
+          return result::Result<AsyncQuery<T>, QueryFailure>.Error(error)
+        case CompiledQueryResult.Prepared(query)
+          match query.prepareAllAsync(options, parameters(argument))
+            case AsyncQueryPreparation.Failure(error)
+              return result::Result<AsyncQuery<T>, QueryFailure>.Error(error)
+            case AsyncQueryPreparation.Ready(driver, plan, tracker)
+              let owned = new AsyncQuery<T>(driver, plan, tracker)
+
+              return result::Result<AsyncQuery<T>, QueryFailure>.Ok(transfer owned)
+          end
+      end
+    end
+
+    return invoke
+  end
+end

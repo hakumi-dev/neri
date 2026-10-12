@@ -1,0 +1,341 @@
+use host
+use buffers
+use neri_data
+namespace neri_data_postgresql
+
+unsafe def pgCString(value: String): Byte*
+  let count = host::stringByteLength(value)
+  let output = native::alloc<Byte>(count + 1)
+  var index = 0
+
+  while index < count
+    output[index] = host::stringByteAt(value, index)
+    index = index + 1
+  end
+  output[count] = 0 as Byte
+  return output
+end
+
+def pgHasNul(value: String): Bool
+  var index = 0
+
+  while index < host::stringByteLength(value)
+    if host::stringByteAt(value, index) == (0 as Byte)
+      return true
+    end
+    index = index + 1
+  end
+  return false
+end
+
+unsafe def pgText(pointer: Byte*?, length: Int = -1): String?
+  if pointer == null
+    return null
+  end
+  var count = length
+
+  if count < 0
+    count = 0
+    while count < 1048576 && pointer[count] != (0 as Byte)
+      count = count + 1
+    end
+    if count == 1048576
+      return null
+    end
+  end
+  if count > 134217728
+    return null
+  end
+  let bytes = arrays::generate<Byte>(count) do |index|
+    return 0 as Byte
+  end
+  var index = 0
+
+  while index < count
+    bytes[index] = pointer[index]
+    index = index + 1
+  end
+
+  return host::stringFromBytes(bytes)
+end
+
+unsafe def pgFailure(connection: Void*, operation: String, result: Void*? = null): ProviderFailure
+  var message = pgText(pgErrorMessage(connection))
+  var state: String? = null
+  var kind = DriverErrorKind.Other()
+
+  if result != null
+    message = pgText(pgResultErrorMessage(result))
+    state = pgText(pgResultErrorField(result, 67 as Int32))
+  end
+  if state != null
+    let category = host::stringSlice(state, 0, 2)
+
+    if category == "23"
+      kind = DriverErrorKind.Constraint()
+    end
+    if category == "40" || state == "55P03"
+      kind = DriverErrorKind.Contention()
+    end
+    if state == "57014"
+      kind = DriverErrorKind.Interrupted()
+    end
+    if state == "25006"
+      kind = DriverErrorKind.ReadOnly()
+    end
+    if category == "08" || category == "58"
+      kind = DriverErrorKind.Io()
+    end
+  end
+  return ProviderFailure.Driver(new DriverError(
+      "postgresql",
+      operation,
+      kind,
+      null,
+      null,
+      state,
+      message == null ? "PostgreSQL operation failed" : message
+    ))
+end
+
+enum PostgreSQLRowResult
+  case Row(value: RawRow)
+  case Failure(error: ProviderFailure)
+end
+
+def pgHexDigit(value: Byte): Int
+  let number = value as Int
+
+  if number >= 48 && number <= 57
+    return number - 48
+  end
+  if number >= 97 && number <= 102
+    return number - 87
+  end
+  return -1
+end
+
+unsafe def pgDecodeRow(result: Void*, row: Int, columns: readonly ResultColumns): PostgreSQLRowResult
+  if (pgNfields(result) as Int) != columns.count()
+    return PostgreSQLRowResult.Failure(ProviderFailure.State("PostgreSQL result column count mismatch"))
+  end
+  let values = arrays::generate<RawColumn>(columns.count()) do |index|
+    return new RawColumn("", Cell.Null())
+  end
+  var index = 0
+
+  while index < columns.count()
+    let expected = columns.at(index)
+    let name = pgText(pgFname(result, index as Int32))
+
+    if name == null || name != expected.name()
+      return PostgreSQLRowResult.Failure(ProviderFailure.State("PostgreSQL result column name mismatch"))
+    end
+    var cell = Cell.Null()
+
+    if pgGetisnull(result, row as Int32, index as Int32) != (0 as Int32)
+      if !expected.nullable()
+        return PostgreSQLRowResult.Failure(ProviderFailure.State("PostgreSQL required column is NULL"))
+      end
+    else
+      let oid = pgFtype(result, index as Int32) as Int
+      let pointer = pgGetvalue(result, row as Int32, index as Int32)
+      let length = pgGetlength(result, row as Int32, index as Int32) as Int
+      let value = pgText(pointer, length)
+
+      if value == null
+        return PostgreSQLRowResult.Failure(ProviderFailure.State("PostgreSQL result is invalid UTF-8 or exceeds the value bound"))
+      end
+      match expected.kind()
+        case ResultColumnKind.Bool()
+          if oid != 16 || (value != "t" && value != "f")
+            return PostgreSQLRowResult.Failure(ProviderFailure.State("PostgreSQL boolean requires bool OID and t/f"))
+          end
+          cell = Cell.Bool(value == "t")
+        case ResultColumnKind.Int()
+          let parsed = host::parseInt(value)
+
+          if (oid != 20 && oid != 21 && oid != 23) || parsed == null
+            return PostgreSQLRowResult.Failure(ProviderFailure.State("PostgreSQL integer requires an integer OID and in-range Int"))
+          end
+          cell = Cell.Int(parsed)
+        case ResultColumnKind.Float()
+          let floatValue = host::parseFloat(value)
+
+          if (oid != 700 && oid != 701) || floatValue == null || !dataFloatFinite(floatValue)
+            return PostgreSQLRowResult.Failure(ProviderFailure.State("PostgreSQL Float requires a finite float4/float8"))
+          end
+          cell = Cell.Float(floatValue)
+        case ResultColumnKind.Text()
+          if oid != 25 && oid != 1042 && oid != 1043
+            return PostgreSQLRowResult.Failure(ProviderFailure.State("PostgreSQL String requires text, varchar or char"))
+          end
+          cell = Cell.Text(value)
+        case ResultColumnKind.Binary()
+          if oid != 17
+            return PostgreSQLRowResult.Failure(ProviderFailure.State("PostgreSQL Binary requires bytea"))
+          end
+          let hexadecimal = length >= 2 && pointer[0] == (92 as Byte) && pointer[1] == (120 as Byte)
+          let buffer = ByteBuffer.create(hexadecimal ? (length - 2) / 2 : length)
+
+          if buffer == null
+            return PostgreSQLRowResult.Failure(ProviderFailure.State("PostgreSQL binary value exceeds the buffer bound"))
+          end
+          var offset = hexadecimal ? 2 : 0
+
+          while offset < length
+            if hexadecimal
+              if offset + 1 >= length
+                return PostgreSQLRowResult.Failure(ProviderFailure.State("PostgreSQL bytea contains incomplete hexadecimal"))
+              end
+              let high = pgHexDigit(pointer[offset])
+              let low = pgHexDigit(pointer[offset + 1])
+
+              if high < 0 || low < 0 || !buffer.append((high * 16 + low) as Byte)
+                return PostgreSQLRowResult.Failure(ProviderFailure.State("PostgreSQL bytea contains invalid hexadecimal"))
+              end
+              offset = offset + 2
+            else if pointer[offset] != (92 as Byte)
+              buffer.append(pointer[offset])
+              offset = offset + 1
+            else if offset + 1 < length && pointer[offset + 1] == (92 as Byte)
+              buffer.append(92 as Byte)
+              offset = offset + 2
+            else
+              if offset + 3 >= length
+                return PostgreSQLRowResult.Failure(ProviderFailure.State("PostgreSQL bytea contains invalid octal escape"))
+              end
+              let first = pointer[offset + 1] as Int
+              let second = pointer[offset + 2] as Int
+              let third = pointer[offset + 3] as Int
+
+              if first < 48 || first > 51 || second < 48 || second > 55 || third < 48 || third > 55
+                return PostgreSQLRowResult.Failure(ProviderFailure.State("PostgreSQL bytea contains invalid octal escape"))
+              end
+              buffer.append(((first - 48) * 64 + (second - 48) * 8 + third - 48) as Byte)
+              offset = offset + 4
+            end
+          end
+          cell = Cell.Binary(buffer)
+      end
+    end
+    values[index] = new RawColumn(name, cell)
+    index = index + 1
+  end
+  return PostgreSQLRowResult.Row(new RawRow(values))
+end
+
+## Parameters are copied into libpq's output buffer before this function returns.
+unsafe def pgSend(connection: Void*, sql: String, values: readonly WriteValues): ProviderFailure?
+  if pgHasNul(sql) || values.count() > 65535
+    return ProviderFailure.State("PostgreSQL statement contains NUL or too many parameters")
+  end
+  let statement = pgCString(sql)
+  let pointers = native::alloc<PostgreSQLPointer>(values.count() + 1)
+  let lengths = native::alloc<Int32>(values.count() + 1)
+  let formats = native::alloc<Int32>(values.count() + 1)
+  let types = native::alloc<UInt32>(values.count() + 1)
+  var current = values.first()
+  var index = 0
+  var failure: ProviderFailure? = null
+
+  while current != null
+    pointers[index].value = null
+    lengths[index] = 0 as Int32
+    formats[index] = 0 as Int32
+    types[index] = 0 as UInt32
+    var text: String? = null
+
+    match current.value()
+      case Cell.Null()
+      case Cell.Bool(value)
+        text = value ? "true" : "false"
+        types[index] = 16 as UInt32
+      case Cell.Int(value)
+        text = value as String
+        types[index] = 20 as UInt32
+      case Cell.Float(value)
+        if !dataFloatFinite(value)
+          failure = ProviderFailure.State("PostgreSQL Float parameter must be finite")
+        end
+        text = value as String
+        types[index] = 701 as UInt32
+      case Cell.Text(value)
+        text = value
+        types[index] = 25 as UInt32
+      case Cell.Binary(value)
+        let bytes = value.snapshot()
+        let pointer = native::alloc<Byte>(bytes.Length + 1)
+        var offset = 0
+
+        while offset < bytes.Length
+          pointer[offset] = bytes[offset]
+          offset = offset + 1
+        end
+        pointer[bytes.Length] = 0 as Byte
+        pointers[index].value = pointer
+        lengths[index] = bytes.Length as Int32
+        formats[index] = 1 as Int32
+        types[index] = 17 as UInt32
+    end
+    if text != null
+      if pgHasNul(text)
+        failure = ProviderFailure.State("PostgreSQL text parameter contains NUL")
+      end
+      pointers[index].value = pgCString(text)
+    end
+    index = index + 1
+    current = current.next()
+  end
+  if failure == null && pgSendQueryParams(
+    connection,
+    statement,
+    values.count() as Int32,
+    types,
+    pointers as Byte**,
+    lengths,
+    formats,
+    0 as Int32
+  ) != (1 as Int32)
+    failure = pgFailure(connection, "send")
+  end
+  var released = 0
+
+  while released < index
+    let pointer = pointers[released].value
+
+    if pointer != null
+      native::free(pointer)
+    end
+    released = released + 1
+  end
+  native::free(statement)
+  native::free(pointers)
+  native::free(lengths)
+  native::free(formats)
+  native::free(types)
+  return failure
+end
+
+## Preserve provider diagnostics when a write/migration cleanup needs that channel.
+def pgWriteProviderFailure(failure: WriteFailure): ProviderFailure
+  match failure
+    case WriteFailure.Provider(error)
+      return error
+    case WriteFailure.Cleanup(error)
+      return ProviderFailure.Cleanup(new ProviderCleanupFailure(
+          pgWriteProviderFailure(error.primary()),
+          pgWriteProviderFailure(error.cleanup())
+        ))
+    case WriteFailure.Validation(message)
+      return ProviderFailure.State(message)
+    case WriteFailure.Concurrency(message)
+      return ProviderFailure.State(message)
+    case WriteFailure.Constraint(message)
+      return ProviderFailure.State(message)
+    case WriteFailure.Unsupported(message)
+      return ProviderFailure.State(message)
+    case WriteFailure.Transaction(message)
+      return ProviderFailure.State(message)
+  end
+end

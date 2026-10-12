@@ -1,0 +1,198 @@
+use host
+use test
+use result
+use resources
+use neri_data
+use neri_data_postgresql
+use neri_data_async_contract
+use neri_data_query_contract
+
+def saved(result: WriteResult): Void
+  match result
+    case WriteResult.Failure(error)
+      console::println(writeFailureMessage(error))
+
+      test::assertTrue(false)
+    case WriteResult.Saved(count)
+    case WriteResult.SavedWithValues(count, rows)
+  end
+end
+
+def asyncContract(provider: PostgreSQLProvider): resources::Outcome<Int, QueryFailure>
+  let columns = new ResultColumns([new ResultColumn("n", ResultColumnKind.Int())])
+  let read: fn(RawRow): DecodeResult<Int> = fn(row: RawRow): DecodeResult<Int> do
+    return decodeInt(row, "n")
+  end
+  let typed = new TypedPlan<Int>(
+    new SqlPlan("SELECT n FROM generate_series(1,1201) AS series(n)", new ParameterValues(), 1000, columns),
+    new Decoder<Int>(read, columns)
+  )
+
+  using operation <- startAsyncQuery<Int>(provider, typed, new StreamOptions(timeoutMilliseconds: 10000))
+    var completed = false
+
+    while !completed
+      match operation.poll()
+        case AsyncQueryPoll.Pending(socket, interest)
+          # The contract deliberately continues other application work while pending.
+          let unrelated = 2 + 2
+
+          test::assertEqual(unrelated, 4)
+        case AsyncQueryPoll.Completed(result)
+          completed = true
+          match result
+            case QueryResult.Failure(error)
+              return error
+            case QueryResult.Rows(rows)
+              test::assertEqual(rows.count(), 1201)
+          end
+      end
+    end
+    return 0
+  end
+  return 1
+end
+
+def runContract(): resources::Outcome<Int, ProviderFailure>
+  let conninfo = host::environment("NERI_POSTGRES_CONNINFO")
+
+  if conninfo == null
+    return ProviderFailure.State("NERI_POSTGRES_CONNINFO is required for the PostgreSQL provider contract")
+  end
+  using session <- PostgreSQLSession.open(conninfo)
+    let provider = session.provider()
+
+    saved(provider.executeSet(new SetWritePlan(
+          "CREATE TEMP TABLE neri_async_write_values(id BIGINT PRIMARY KEY,label TEXT NOT NULL)",
+          new WriteValues()
+        )))
+    verifyAsyncProviderWrites(provider)
+    verifyAsyncProviderTrackedSave(provider)
+    verifyAsyncProviderSetWrites(provider)
+    verifyPostgreSQLCommitCancellation(provider)
+    verifyAsyncProviderMigrations(provider)
+    verifyPostgreSQLScalars(provider)
+    verifyPostgreSQLDecimalQueries(provider)
+    verifyQueryParity(provider)
+    let queryParity = verifyAsyncQueryParity(provider)
+
+    test::assertEqual(queryParity.closeFailures.count(), 0)
+    match queryParity.completion
+      case resources::Completion.Value(value)
+        test::assertEqual(value, 0)
+      case resources::Completion.Failure(error)
+        test::assertTrue(false)
+    end
+    verifyPostgreSQLSchemaInspection(provider)
+    verifyPostgreSQLTrackedWrites(provider)
+    verifyPostgreSQLNativeEnrollment(provider)
+    verifyPostgreSQLComputedUpdates(provider)
+    verifyPostgreSQLMigrations(provider)
+    verifyPostgreSQLSchemaFeatures(provider)
+    verifyPostgreSQLTuples(provider)
+
+    saved(provider.executeSet(new SetWritePlan(
+          "CREATE TEMP TABLE neri_contract_values(id BIGINT PRIMARY KEY, label TEXT, active BOOLEAN)",
+          new WriteValues()
+        )))
+    let bound = new CompileState()
+
+    bound.bind(Parameter.Int(7))
+    bound.bind(Parameter.Text("' quoted $2"))
+    bound.bind(Parameter.Bool(true))
+    saved(provider.executeSet(new SetWritePlan(
+          "INSERT INTO neri_contract_values VALUES($1,$2,$3)",
+          readWriteParameters(new ParameterValues(bound.head, bound.count))
+        )))
+    let columns = new ResultColumns([
+        new ResultColumn("id", ResultColumnKind.Int()),
+        new ResultColumn("label", ResultColumnKind.Text()),
+        new ResultColumn("active", ResultColumnKind.Bool())
+      ])
+
+    match provider.execute(new SqlPlan(
+        "SELECT id,label,active FROM neri_contract_values",
+        new ParameterValues(),
+        1,
+        columns
+      ))
+      case ProviderResult.Failure(error)
+        return error
+      case ProviderResult.Rows(rows)
+        test::assertEqual(rows.Length, 1)
+        match decodeString(rows[0], "label")
+          case DecodeResult.Value(value)
+            test::assertEqual(value, "' quoted $2")
+          case DecodeResult.Failure(error)
+            test::assertTrue(false)
+        end
+    end
+    match provider.beginTransaction()
+      case TransactionOpenResult.Failure(error)
+        return ProviderFailure.State(writeFailureMessage(error))
+      case TransactionOpenResult.Begun(lease)
+        match provider.createSavepoint(lease)
+          case SavepointOpenResult.Failure(error)
+            return ProviderFailure.State(writeFailureMessage(error))
+          case SavepointOpenResult.Created(id)
+            saved(provider.executeSetInTransaction(
+                new SetWritePlan("UPDATE neri_contract_values SET label='changed'", new WriteValues()),
+                lease
+              ))
+            saved(provider.rollbackToSavepoint(lease, id))
+            saved(provider.releaseSavepoint(lease, id))
+        end
+        saved(provider.commitTransaction(lease))
+    end
+    let asynchronous = asyncContract(provider)
+
+    test::assertEqual(asynchronous.closeFailures.count(), 0)
+    match asynchronous.completion
+      case resources::Completion.Value(code)
+        test::assertEqual(code, 0)
+      case resources::Completion.Failure(error)
+        test::assertTrue(false)
+    end
+    let cancellation = new CancellationToken()
+    let sleepColumns = new ResultColumns([new ResultColumn("n", ResultColumnKind.Int())])
+
+    match provider.beginReadAsync(
+      new SqlPlan("SELECT 1::bigint AS n FROM pg_sleep(10)", new ParameterValues(), 1, sleepColumns),
+      new StreamOptions(token: cancellation)
+    )
+      case AsyncReadStart.Failure(error)
+        return error
+      case AsyncReadStart.Started(driver)
+        cancellation.cancel()
+        match driver.poll()
+          case AsyncReadPoll.Failure(error)
+            test::assertTrue(provider.closeFailure() == null)
+          case AsyncReadPoll.Completed()
+            test::assertTrue(false)
+          case AsyncReadPoll.Pending(socket, interest)
+            test::assertTrue(false)
+          case AsyncReadPoll.Row(row)
+            test::assertTrue(false)
+        end
+        driver.close()
+    end
+    return 0
+  end
+  return 1
+end
+
+def main(): Void
+  let outcome = runContract()
+
+  test::assertEqual(outcome.closeFailures.count(), 0)
+  match outcome.completion
+    case resources::Completion.Value(code)
+      test::assertEqual(code, 0)
+    case resources::Completion.Failure(error)
+      if error != null
+        console::println(providerFailureMessage(error))
+      end
+
+      test::assertTrue(false)
+  end
+end

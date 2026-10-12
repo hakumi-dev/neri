@@ -1,0 +1,461 @@
+use host
+namespace neri_data
+
+## A binary-sortable exact decimal key. Its order matches Decimal.compare.
+def decimalSortKey(value: readonly Decimal): String
+  let text = value.text()
+
+  if text == "0"
+    return "1"
+  end
+  let negative = decimalNegative(text)
+  let start = negative ? 1 : 0
+  var point = host::stringByteLength(text)
+  var first = -1
+  var index = start
+
+  while index < host::stringByteLength(text)
+    let byte = host::stringByteAt(text, index) as Int
+
+    if byte == 46
+      point = index
+    else if byte != 48 && first < 0
+      first = index
+    end
+    index = index + 1
+  end
+  let exponent = first < point ? point - first : point - first + 1
+  var encoded = ((negative ? 4096 - exponent : 4096 + exponent) as String)
+
+  while host::stringByteLength(encoded) < 4
+    encoded = "0" + encoded
+  end
+  var digits = ""
+
+  index = first
+  while index < host::stringByteLength(text)
+    let byte = host::stringByteAt(text, index) as Int
+
+    if byte != 46
+      digits = digits + host::stringSlice("0123456789", negative ? 57 - byte : byte - 48, 1)
+    end
+    index = index + 1
+  end
+  return (negative ? "0" : "2") + encoded + digits + (negative ? ":" : "/")
+end
+
+def decimalCheckedSql(sql: String, dialect: SqlDialect, optional: Bool = false): String
+  match dialect
+    case SqlDialect.QuestionMark()
+      return "__neri_decimal_value(" + sql + (optional ? ", 1)" : ", 0)")
+    case SqlDialect.PostgreSql()
+      let value = "\"__neri_decimal_value\".\"number\""
+      let numeric = "CAST(" + value + " AS NUMERIC)"
+      let valid = "(" + value + " ~ '^-?(0|[1-9][0-9]*)(\\.[0-9]*[1-9])?$' AND " + value + " <> '-0' AND length(replace(replace(" + value + ", '.', ''), '-', '')) <= 4096)"
+
+      return "(SELECT CAST(trim_scale(CASE WHEN " + (optional ? value + " IS NULL THEN NULL WHEN " : "") + valid + " THEN " + numeric + " ELSE CAST((coalesce(" + value + ", 'NULL') || ' invalid Decimal') AS NUMERIC) END) AS TEXT) FROM (SELECT " + sql + " AS \"number\") AS \"__neri_decimal_value\")"
+  end
+end
+
+def decimalSortSql(sql: String, dialect: SqlDialect): String
+  match dialect
+    case SqlDialect.QuestionMark()
+      return "__neri_decimal_sort(" + sql + ")"
+    case SqlDialect.PostgreSql()
+      let value = "\"__neri_decimal_sort\".\"number\""
+      let magnitude = "ltrim(" + value + ", '-')"
+      let integer = "split_part(" + magnitude + ", '.', 1)"
+      let digits = "ltrim(replace(" + magnitude + ", '.', ''), '0')"
+      let exponent = "(CASE WHEN " + integer + " <> '0' THEN length(" + integer + ") ELSE 1 - (length(split_part(" + magnitude + ", '.', 2)) - length(ltrim(split_part(" + magnitude + ", '.', 2), '0')) + 1) END)"
+
+      return "(SELECT (CASE WHEN " + value + " = '0' THEN '1' WHEN left(" + value + ", 1) = '-' THEN '0' || lpad(CAST((4096 - " + exponent + ") AS TEXT), 4, '0') || translate(" + digits + ", '0123456789', '9876543210') || ':' ELSE '2' || lpad(CAST((4096 + " + exponent + ") AS TEXT), 4, '0') || " + digits + " || '/' END) COLLATE \"C\" FROM (SELECT " + sql + " AS \"number\") AS \"__neri_decimal_sort\")"
+  end
+end
+
+## An exact SQL decimal expression with bounded arithmetic.
+class DecimalExpression<T>
+  private builder: fn(EntityMapping, CompileState, SqlDialect): ScalarSqlResult
+  private size: Int
+
+  def init(builder: fn(EntityMapping, CompileState, SqlDialect): ScalarSqlResult, size: Int = 1): Void
+    this.builder = builder
+    this.size = size
+  end
+
+  internal readonly def expressionSize(): Int
+    return this.size
+  end
+
+  internal def buildSql(mapping: EntityMapping, state: CompileState, dialect: SqlDialect): ScalarSqlResult
+    if this.size > 128
+      return scalarSqlFailure("decimal expression exceeds 128 nodes")
+    end
+    return this.builder(mapping, state, dialect)
+  end
+
+  public def add(other: DecimalExpression<T>): DecimalExpression<T>
+    return decimalBinary(this, other, "+")
+  end
+
+  public def subtract(other: DecimalExpression<T>): DecimalExpression<T>
+    return decimalBinary(this, other, "-")
+  end
+
+  public def multiply(other: DecimalExpression<T>): DecimalExpression<T>
+    return decimalBinary(this, other, "*")
+  end
+
+  ## Scale is explicit; SQL and local Decimal arithmetic truncate toward zero.
+  public def divideTruncated(other: DecimalExpression<T>, scale: Int): DecimalExpression<T>
+    return decimalBinary(this, other, "/", scale)
+  end
+
+  public def asOptional(): OptionalDecimalExpression<T>
+    return new OptionalDecimalExpression<T>(this)
+  end
+
+  public def equalTo(other: DecimalExpression<T>): DecimalPredicate<T>
+    return decimalCompare(this, other, "=")
+  end
+
+  public def lessThan(other: DecimalExpression<T>): DecimalPredicate<T>
+    return decimalCompare(this, other, "<")
+  end
+
+  public def greaterThan(other: DecimalExpression<T>): DecimalPredicate<T>
+    return decimalCompare(this, other, ">")
+  end
+
+  public def lessThanOrEqual(other: DecimalExpression<T>): DecimalPredicate<T>
+    return decimalCompare(this, other, "<=")
+  end
+
+  public def greaterThanOrEqual(other: DecimalExpression<T>): DecimalPredicate<T>
+    return decimalCompare(this, other, ">=")
+  end
+end
+
+class DecimalPredicate<T>
+  private builder: fn(EntityMapping, CompileState, SqlDialect): ScalarSqlResult
+
+  def init(builder: fn(EntityMapping, CompileState, SqlDialect): ScalarSqlResult): Void
+    this.builder = builder
+  end
+
+  internal def expression(mapping: EntityMapping): Predicate<T>
+    return new Predicate<T>(new Expression(
+        ExpressionKind.Decimal(),
+        scalarMapping: mapping,
+        decimalBuilder: this.builder
+      ))
+  end
+end
+
+def decimalField<T>(field: quote fn(T): Decimal): DecimalExpression<T>
+  let build: fn(
+    EntityMapping,
+    CompileState,
+    SqlDialect
+  ): ScalarSqlResult = fn(
+    mapping: EntityMapping,
+    state: CompileState,
+    dialect: SqlDialect
+  ): ScalarSqlResult do
+    match translateSelection(mapping, field.tree())
+      case SelectionResult.Failure(error)
+        return ScalarSqlResult.Failure(error)
+      case SelectionResult.Column(column)
+        if column.typeName() != "neri_data.Decimal" && column.typeName() != "Decimal"
+          return scalarSqlFailure("decimal field requires a required Decimal mapping")
+        end
+        return ScalarSqlResult.Value(new ScalarSql(
+            decimalCheckedSql(quoted(mapping.table(), column.column()), dialect),
+            true
+          ))
+    end
+  end
+
+  return new DecimalExpression<T>(build)
+end
+
+def decimalValue<T>(value: readonly Decimal): DecimalExpression<T>
+  let text = value.text()
+  let build: fn(
+    EntityMapping,
+    CompileState,
+    SqlDialect
+  ): ScalarSqlResult = fn(
+    mapping: EntityMapping,
+    state: CompileState,
+    dialect: SqlDialect
+  ): ScalarSqlResult do
+    state.bind(Parameter.Text(text))
+    return ScalarSqlResult.Value(new ScalarSql(
+        decimalCheckedSql(dialectPlaceholder(dialect, state.count), dialect),
+        true
+      ))
+  end
+
+  return new DecimalExpression<T>(build)
+end
+
+def decimalBinary<T>(
+  left: DecimalExpression<T>,
+  right: DecimalExpression<T>,
+  operation: String,
+  scale: Int = 0,
+  optional: Bool = false
+): DecimalExpression<T>
+  let build: fn(
+    EntityMapping,
+    CompileState,
+    SqlDialect
+  ): ScalarSqlResult = fn(
+    mapping: EntityMapping,
+    state: CompileState,
+    dialect: SqlDialect
+  ): ScalarSqlResult do
+    if operation == "/" && (scale < 0 || scale > 4096)
+      return scalarSqlFailure("decimal division scale must be between 0 and 4096")
+    end
+    match left.buildSql(mapping, state, dialect)
+      case ScalarSqlResult.Failure(error)
+        return ScalarSqlResult.Failure(error)
+      case ScalarSqlResult.Value(first)
+        match right.buildSql(mapping, state, dialect)
+          case ScalarSqlResult.Failure(error)
+            return ScalarSqlResult.Failure(error)
+          case ScalarSqlResult.Value(second)
+            var sql = ""
+
+            match dialect
+              case SqlDialect.QuestionMark()
+                let name = operation == "+" ? "add" : (operation == "-" ? "subtract" : (operation == "*" ? "multiply" : "divide"))
+
+                sql = "__neri_decimal_" + name + "(" + first.sql + ", " + second.sql + (operation == "/" ? ", " + (scale as String) : "") + ")"
+              case SqlDialect.PostgreSql()
+                if operation == "/"
+                  let power = "power(10::NUMERIC, " + (scale as String) + ")"
+
+                  let quotient = "CAST(div(CAST(" + first.sql + " AS NUMERIC) * " + power + ", CAST(" + second.sql + " AS NUMERIC)) AS TEXT)"
+                  let value = "\"__neri_decimal_divide\".\"quotient\""
+                  let digits = "lpad(ltrim(" + value + ", '-'), greatest(length(ltrim(" + value + ", '-')), " + ((scale + 1) as String) + "), '0')"
+                  let magnitude = scale == 0 ? digits : "left(" + digits + ", length(" + digits + ") - " + (scale as String) + ") || '.' || right(" + digits + ", " + (scale as String) + ")"
+
+                  sql = "(SELECT CAST(trim_scale(CAST((CASE WHEN left(" + value + ", 1) = '-' THEN '-' ELSE '' END) || " + magnitude + " AS NUMERIC)) AS TEXT) FROM (SELECT " + quotient + " AS \"quotient\") AS \"__neri_decimal_divide\")"
+                else
+                  sql = "CAST(trim_scale(CAST(" + first.sql + " AS NUMERIC) " + operation + " CAST(" + second.sql + " AS NUMERIC)) AS TEXT)"
+                end
+            end
+            return ScalarSqlResult.Value(new ScalarSql(decimalCheckedSql(sql, dialect, optional), true))
+        end
+    end
+  end
+
+  let size = left.expressionSize() > 128 || right.expressionSize() > 128 ? 129 : left.expressionSize() + right.expressionSize() + 1
+
+  return new DecimalExpression<T>(build, size)
+end
+
+def decimalCompare<T>(left: DecimalExpression<T>, right: DecimalExpression<T>, operation: String): DecimalPredicate<T>
+  let build: fn(
+    EntityMapping,
+    CompileState,
+    SqlDialect
+  ): ScalarSqlResult = fn(
+    mapping: EntityMapping,
+    state: CompileState,
+    dialect: SqlDialect
+  ): ScalarSqlResult do
+    match left.buildSql(mapping, state, dialect)
+      case ScalarSqlResult.Failure(error)
+        return ScalarSqlResult.Failure(error)
+      case ScalarSqlResult.Value(first)
+        match right.buildSql(mapping, state, dialect)
+          case ScalarSqlResult.Failure(error)
+            return ScalarSqlResult.Failure(error)
+          case ScalarSqlResult.Value(second)
+            match dialect
+              case SqlDialect.QuestionMark()
+                return ScalarSqlResult.Value(new ScalarSql(
+                    "(__neri_decimal_compare(" + first.sql + ", " + second.sql + ") " + operation + " 0)",
+                    true
+                  ))
+              case SqlDialect.PostgreSql()
+                return ScalarSqlResult.Value(new ScalarSql(
+                    "(CAST(" + first.sql + " AS NUMERIC) " + operation + " CAST(" + second.sql + " AS NUMERIC))",
+                    true
+                  ))
+            end
+        end
+    end
+  end
+
+  return new DecimalPredicate<T>(build)
+end
+
+def decimalShape<T>(expression: DecimalExpression<T>): RowShape<T, Decimal>
+  let build: fn(
+    EntityMapping,
+    Int,
+    CompileState,
+    SqlDialect,
+    String?
+  ): ShapeCompileResult<Decimal> = fn(
+    mapping: EntityMapping,
+    offset: Int,
+    state: CompileState,
+    dialect: SqlDialect,
+    presence: String?
+  ): ShapeCompileResult<Decimal> do
+    match expression.buildSql(mapping, state, dialect)
+      case ScalarSqlResult.Failure(error)
+        return ShapeCompileResult<Decimal>.Failure(error)
+      case ScalarSqlResult.Value(value)
+        let alias = "__neri_shape_" + (offset as String)
+        let columns = new ResultColumns([new ResultColumn(alias, ResultColumnKind.Text())])
+        let prepare: fn(RawRow): ShapePrepareResult<Decimal> = fn(row: RawRow): ShapePrepareResult<Decimal> do
+          match decodeDecimal(row, alias)
+            case DecodeResult.Failure(error)
+              return ShapePrepareResult<Decimal>.Failure(error)
+            case DecodeResult.Value(decimal)
+              let make: fn(): Decimal = fn(): Decimal do
+                return decimal
+              end
+
+              return ShapePrepareResult<Decimal>.Ready(new ShapePrepared<Decimal>(make))
+          end
+        end
+
+        return ShapeCompileResult<Decimal>.Plan(new ShapePlan<Decimal>(
+            value.sql + " AS \"" + alias + "\"",
+            columns,
+            1,
+            prepare,
+            true,
+            scalar: alias,
+            scalarType: "neri_data.Decimal"
+          ))
+    end
+  end
+
+  return new RowShape<T, Decimal>(build)
+end
+
+def decimalRemappedMapping(original: EntityMapping, source: String): EntityMapping
+  let fields: MappingColumn[] = tasks::generate(original.count(), 1) do |index|
+    let column = original.columnAt(index)
+
+    if column == null
+      return new MappingColumn("invalid", "Invalid", "invalid")
+    end
+    return new MappingColumn(
+      column.identity(),
+      column.typeName(),
+      column.column(),
+      column.path(),
+      column.boolToInt(),
+      column.storageTypeName(),
+      column.conversionId()
+    )
+  end
+
+  return new EntityMapping(original.entityType(), source, fields, readOnly: original.readOnly())
+end
+
+def decimalFiltered<T>(source: Relation<T>, predicate: DecimalPredicate<T>): Relation<T>
+  let build: fn(SqlDialect): RelationBuildResult<T> = fn(dialect: SqlDialect): RelationBuildResult<T> do
+    match source.build(dialect)
+      case RelationBuildResult.Failure(error)
+        return RelationBuildResult<T>.Failure(error)
+      case RelationBuildResult.Plan(plan)
+        let mapping = decimalRemappedMapping(plan.mapping, "__neri_decimal_input")
+        let state = new CompileState()
+
+        joinParameterCopy(plan.parameters, state)
+        match compileExpression(predicate.expression(mapping).expression, state, mapping.table(), dialect)
+          case ExpressionCompileResult.Failure(error)
+            return RelationBuildResult<T>.Failure(error)
+          case ExpressionCompileResult.Sql(filter)
+            let sql = "SELECT * FROM (" + plan.sql + ") AS \"__neri_decimal_input\" WHERE " + filter + joinOrderSql(
+              plan.order,
+              mapping.table()
+            )
+
+            return RelationBuildResult<T>.Plan(new RelationPlan<T>(
+                sql,
+                new ParameterValues(state.head, state.count),
+                plan.columns,
+                plan.decoder,
+                plan.mapping,
+                true,
+                plan.order
+              ))
+        end
+    end
+  end
+
+  return new Relation<T>(
+    build,
+    source.provider(),
+    resolver: source.resolutionFactory(),
+    owner: source.contextOwner(),
+    physicalSource: source.physicalEntitySource(),
+    trackingActive: source.tracksEntities()
+  )
+end
+
+def decimalOrdered<T>(source: Relation<T>, expression: DecimalExpression<T>, descending: Bool): Relation<T>
+  let build: fn(SqlDialect): RelationBuildResult<T> = fn(dialect: SqlDialect): RelationBuildResult<T> do
+    match source.build(dialect)
+      case RelationBuildResult.Failure(error)
+        return RelationBuildResult<T>.Failure(error)
+      case RelationBuildResult.Plan(plan)
+        let mapping = decimalRemappedMapping(plan.mapping, "__neri_decimal_input")
+        let state = new CompileState()
+
+        match expression.buildSql(mapping, state, dialect)
+          case ScalarSqlResult.Failure(error)
+            return RelationBuildResult<T>.Failure(error)
+          case ScalarSqlResult.Value(value)
+            let shifted = joinShiftSql(plan.sql, state.count, dialect)
+
+            if shifted == null
+              return RelationBuildResult<T>.Failure(QueryFailure.UnsupportedCapability("decimal ordering parameters cannot be rebased"))
+            end
+            joinParameterCopy(plan.parameters, state)
+            var key = "__neri_decimal_key"
+            var keyIndex = 0
+
+            while relationColumnIndex(plan.columns, key) >= 0
+              keyIndex = keyIndex + 1
+              key = "__neri_decimal_key" + (keyIndex as String)
+            end
+            let sql = "SELECT \"__neri_decimal_input\".*, " + decimalSortSql(
+              value.sql,
+              dialect
+            ) + " AS \"" + key + "\" FROM (" + shifted + ") AS \"__neri_decimal_input\" ORDER BY \"" + key + "\"" + (descending ? " DESC" : " ASC")
+            let columns = joinOrderColumns(plan.columns, key, "String", false)
+
+            return RelationBuildResult<T>.Plan(new RelationPlan<T>(
+                sql,
+                new ParameterValues(state.head, state.count),
+                columns,
+                plan.decoder,
+                plan.mapping,
+                true,
+                new OrderTerm(key, descending)
+              ))
+        end
+    end
+  end
+
+  return new Relation<T>(
+    build,
+    source.provider(),
+    resolver: source.resolutionFactory(),
+    owner: source.contextOwner(),
+    physicalSource: source.physicalEntitySource(),
+    trackingActive: source.tracksEntities()
+  )
+end

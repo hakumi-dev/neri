@@ -1,0 +1,384 @@
+namespace neri_data
+
+## A detached reference from keyless read rows to a keyed entity set.
+class KeylessReferencedQuery<D, P>: AsyncNavigationPlan<D, P>
+  private roots: Query<D>
+  private principals: Query<P>
+  private foreignKey: fn(D): Cell
+  private principalKey: fn(P): Cell
+  private setReference: fn(D, P?): Void
+  private scoped: Bool = false
+
+  def init(
+    roots: Query<D>,
+    principals: Query<P>,
+    foreignKey: fn(D): Cell,
+    principalKey: fn(P): Cell,
+    setReference: fn(D, P?): Void
+  ): Void
+    this.roots = roots.asNoTracking()
+    this.principals = principals
+    this.foreignKey = foreignKey
+    this.principalKey = principalKey
+    this.setReference = setReference
+  end
+
+  internal def invalid(): QueryFailure?
+    let roots = this.roots.entityMapping()
+    let principals = this.principals.entityMapping()
+    let provider = this.roots.provider()
+    let principalProvider = this.principals.provider()
+
+    if roots == null || principals == null || roots.primaryKeys().Length != 0 || principals.primaryKeys().Length == 0
+      return QueryFailure.UnsupportedCapability("keyless reference requires keyless root and keyed principal mappings")
+    end
+    if provider == null || principalProvider == null || !reference::same(provider, principalProvider)
+      return QueryFailure.UnsupportedCapability("keyless reference queries require the same provider")
+    end
+    return this.roots.queryFailure() == null ? this.principals.queryFailure() : this.roots.queryFailure()
+  end
+
+  internal override def checkpointRoots(journal: NavigationJournal): Void
+  end
+
+  public override def prepareRoot(options: StreamOptions?): AsyncQueryPreparation<D>
+    let invalid = this.invalid()
+
+    return invalid == null ? prepareQueryAsync(this.roots, options) : AsyncQueryPreparation<D>.Failure(invalid)
+  end
+
+  public override def navigationKeys(rows: TypedRows<D>): TypedRows<Cell>
+    let keys = new TypedRows<Cell>()
+    var row = rows.first()
+
+    while row != null
+      let key = this.foreignKey(row.value)
+      var existing = keys.first()
+      var found = false
+
+      while existing != null
+        found = found || navigationCellEqual(existing.value, key)
+        existing = existing.next
+      end
+      if !found && navigationKeyValid(key)
+        keys.add(key)
+      end
+      row = row.next
+    end
+    return keys
+  end
+
+  public override def navigationMaximum(): Int
+    return 10000
+  end
+
+  public override def prepareNavigation(
+    keys: TypedRows<Cell>,
+    maximum: Int,
+    options: StreamOptions?
+  ): AsyncQueryPreparation<P>
+    let mapping = this.principals.entityMapping()
+    let provider = this.principals.provider()
+
+    if mapping == null || provider == null
+      return AsyncQueryPreparation<P>.Failure(QueryFailure.UnsupportedCapability("keyless principal mapping or provider is missing"))
+    end
+    let query = this.principals.matchingTupleCells(mapping.primaryKeys(), keys)
+
+    match compilePipeline<P, P>(query, query.rowDecoder(), null, null, provider.dialect(), unbounded: true)
+      case CompileResult.Failure(error)
+        return AsyncQueryPreparation<P>.Failure(error)
+      case CompileResult.Plan(plan)
+        let tracker = this.principals.rowTracker()
+        var resolver: AsyncRowResolver<P>? = null
+
+        if tracker != null
+          resolver = tracker
+        end
+        return prepareAsyncQuery<P>(provider, plan, options, resolver, maximumRows: maximum)
+    end
+  end
+
+  public override def publishNavigation(rows: TypedRows<D>, related: TypedRows<P>): QueryResult<D>
+    var root = rows.first()
+
+    while root != null
+      let key = this.foreignKey(root.value)
+
+      if !referenceForeignKeyAllowed(key)
+        return QueryResult<D>.Failure(QueryFailure.UnsupportedCapability("keyless foreign key must use an Int or TEXT scalar or tuple key"))
+      end
+      root = root.next
+    end
+    root = rows.first()
+    while root != null
+      let key = this.foreignKey(root.value)
+      var target: P? = null
+      var principal = related.first()
+
+      while principal != null
+        if navigationKeyValid(key) && navigationCellEqual(key, this.principalKey(principal.value))
+          if target != null && !reference::same(target, principal.value)
+            return QueryResult<D>.Failure(QueryFailure.UnsupportedCapability("keyless reference principal key is not unique"))
+          end
+          target = principal.value
+        end
+        principal = principal.next
+      end
+      root = root.next
+    end
+    # All keys and target uniqueness are checked before publication.
+    root = rows.first()
+    while root != null
+      let key = this.foreignKey(root.value)
+      var target: P? = null
+      var principal = related.first()
+
+      while principal != null
+        if navigationKeyValid(key) && navigationCellEqual(key, this.principalKey(principal.value))
+          target = principal.value
+        end
+        principal = principal.next
+      end
+      this.setReference(root.value, target)
+      root = root.next
+    end
+    return QueryResult<D>.Rows(rows)
+  end
+
+  public def all(): QueryResult<D>
+    if !this.scoped
+      let plan = new KeylessReferencedQuery<D, P>(
+        this.roots,
+        this.principals.detachedGraph(),
+        this.foreignKey,
+        this.principalKey,
+        this.setReference
+      )
+
+      plan.scoped = true
+      return plan.all()
+    end
+    let invalid = this.invalid()
+
+    if invalid != null
+      return QueryResult<D>.Failure(invalid)
+    end
+    match this.roots.all()
+      case QueryResult.Failure(error)
+        return QueryResult<D>.Failure(error)
+      case QueryResult.Rows(rows)
+        let mapping = this.principals.entityMapping()
+
+        if mapping == null
+          return QueryResult<D>.Failure(QueryFailure.UnsupportedCapability("keyless principal mapping is missing"))
+        end
+        let keys = this.navigationKeys(rows)
+        let related = new TypedRows<P>()
+        var current = keys.first()
+
+        while current != null
+          let batch = new TypedRows<Cell>()
+
+          while batch.count() < 1000
+            batch.add(current.value)
+            current = current.next
+            if current == null
+              break
+            end
+          end
+          match this.principals.matchingTupleCells(mapping.primaryKeys(), batch).take(queryRowLimit()).all()
+            case QueryResult.Failure(error)
+              return QueryResult<D>.Failure(error)
+            case QueryResult.Rows(principals)
+              var principal = principals.first()
+
+              while principal != null
+                if related.count() >= 10000
+                  return QueryResult<D>.Failure(QueryFailure.UnsupportedCapability("keyless reference exceeds principal row limit"))
+                end
+                related.add(principal.value)
+                principal = principal.next
+              end
+          end
+        end
+        return this.publishNavigation(rows, related)
+    end
+  end
+
+  public def allAsync(options: StreamOptions? = null): result::Result<AsyncNavigation<D, P>, QueryFailure>
+    let plan = this.scoped ? this : new KeylessReferencedQuery<D, P>(
+      this.roots,
+      this.principals.detachedGraph(),
+      this.foreignKey,
+      this.principalKey,
+      this.setReference
+    )
+    let invalid = plan.invalid()
+
+    if invalid != null
+      return result::Result<AsyncNavigation<D, P>, QueryFailure>.Error(invalid)
+    end
+    match prepareAsyncNavigation<D, P>(plan, options)
+      case AsyncNavigationStart.Failure(error)
+        return result::Result<AsyncNavigation<D, P>, QueryFailure>.Error(error)
+      case AsyncNavigationStart.Started(driver)
+        let owned = new AsyncNavigation<D, P>(driver)
+
+        return result::Result<AsyncNavigation<D, P>, QueryFailure>.Ok(transfer owned)
+    end
+  end
+end
+
+def includeKeylessReference<D, P>(
+  roots: Query<D>,
+  principals: Query<P>,
+  foreignKey: fn(D): Cell,
+  principalKey: fn(P): Cell,
+  setReference: fn(D, P?): Void
+): KeylessReferencedQuery<D, P>
+  return new KeylessReferencedQuery<D, P>(roots, principals, foreignKey, principalKey, setReference)
+end
+
+def keylessReferenceStep<D, P>(
+  roots: Query<D>,
+  principals: Query<P>,
+  foreignKey: fn(D): Cell,
+  principalKey: fn(P): Cell,
+  getReference: fn(D): P?,
+  setReference: fn(D, P?): Void,
+  foreignKeyColumns: String[] = []
+): NavigationStep<D, P>
+  let checkpoint: fn(
+    TypedRows<D>,
+    NavigationJournal
+  ): Void = fn(
+    rows: TypedRows<D>,
+    journal: NavigationJournal
+  ): Void do
+    var root = rows.first()
+
+    while root != null
+      let entity = root.value
+      let previous = getReference(entity)
+      let undo: fn(): Void = fn(): Void do
+        setReference(entity, previous)
+      end
+
+      journal.record(undo)
+      root = root.next
+    end
+  end
+  let project: fn(QueryResult<D>): QueryResult<P> = fn(result: QueryResult<D>): QueryResult<P> do
+    match result
+      case QueryResult.Failure(error)
+        return QueryResult<P>.Failure(error)
+      case QueryResult.Rows(rows)
+        let targets = new TypedRows<P>()
+        var root = rows.first()
+
+        while root != null
+          let target = getReference(root.value)
+
+          if target != null
+            navigationDistinct(targets, target)
+          end
+          root = root.next
+        end
+        return QueryResult<P>.Rows(targets)
+    end
+  end
+  let check: fn(Bool): QueryFailure? = fn(asynchronous: Bool): QueryFailure? do
+    return includeKeylessReference(roots, principals, foreignKey, principalKey, setReference).invalid()
+  end
+  let run: fn(
+    TypedRows<D>,
+    NavigationJournal
+  ): QueryResult<P> = fn(
+    rows: TypedRows<D>,
+    journal: NavigationJournal
+  ): QueryResult<P> do
+    checkpoint(rows, journal)
+    let plan = includeKeylessReference(roots, principals, foreignKey, principalKey, setReference)
+    let mapping = principals.entityMapping()
+
+    if mapping == null
+      return QueryResult<P>.Failure(QueryFailure.UnsupportedCapability("keyless principal mapping is missing"))
+    end
+    let related = new TypedRows<P>()
+    var current = plan.navigationKeys(rows).first()
+
+    while current != null
+      let batch = new TypedRows<Cell>()
+
+      while batch.count() < 1000
+        batch.add(current.value)
+        current = current.next
+        if current == null
+          break
+        end
+      end
+      match principals.matchingTupleCells(mapping.primaryKeys(), batch).take(queryRowLimit()).all()
+        case QueryResult.Failure(error)
+          return QueryResult<P>.Failure(error)
+        case QueryResult.Rows(found)
+          var principal = found.first()
+
+          while principal != null
+            if related.count() >= 10000
+              return QueryResult<P>.Failure(QueryFailure.UnsupportedCapability("keyless reference exceeds principal row limit"))
+            end
+            navigationDistinct(related, principal.value)
+            principal = principal.next
+          end
+      end
+    end
+    return project(plan.publishNavigation(rows, related))
+  end
+  let runAsync: fn(
+    TypedRows<D>,
+    NavigationJournal,
+    StreamOptions?
+  ): AsyncLoadDriver<P> = fn(
+    rows: TypedRows<D>,
+    journal: NavigationJournal,
+    options: StreamOptions?
+  ): AsyncLoadDriver<P> do
+    checkpoint(rows, journal)
+    let plan = includeKeylessReference(roots, principals, foreignKey, principalKey, setReference)
+
+    return new AsyncMappedNavigation<D, P, P>(new AsyncNavigationDriver<D, P>(plan, options, rows: rows), project)
+  end
+
+  let single: fn(
+    SingleNavigationScope,
+    SingleNavigationRows<D>
+  ): SingleNavigationRows<P> = fn(
+    scope: SingleNavigationScope,
+    input: SingleNavigationRows<D>
+  ): SingleNavigationRows<P> do
+    return singleKeylessReferenceRole(
+      scope,
+      input,
+      roots,
+      principals,
+      foreignKey,
+      principalKey,
+      getReference,
+      setReference,
+      foreignKeyColumns
+    )
+  end
+
+  return new NavigationStep<D, P>(
+    run,
+    check,
+    roots.provider(),
+    roots.changeOwner(),
+    null,
+    navigationTrackerIdentity(principals.rowTracker()),
+    executeAsync: runAsync,
+    requiresSourceTracker: false,
+    singleContributor: single
+  )
+end

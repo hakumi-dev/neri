@@ -15,6 +15,8 @@ def navigationCellEqual(left: Cell, right: Cell): Bool
           return false
         case Cell.Text(other)
           return false
+        case Cell.Binary(other)
+          return false
       end
     case Cell.Text(value)
       match right
@@ -28,12 +30,16 @@ def navigationCellEqual(left: Cell, right: Cell): Bool
           return false
         case Cell.Int(other)
           return false
+        case Cell.Binary(other)
+          return false
       end
     case Cell.Null()
       return false
     case Cell.Bool(value)
       return false
     case Cell.Float(value)
+      return false
+    case Cell.Binary(value)
       return false
   end
 end
@@ -52,6 +58,8 @@ def navigationCellSameOrNull(left: Cell, right: Cell): Bool
           return false
         case Cell.Float(value)
           return false
+        case Cell.Binary(value)
+          return false
       end
     case Cell.Int(value)
       return navigationCellEqual(left, right)
@@ -61,6 +69,8 @@ def navigationCellSameOrNull(left: Cell, right: Cell): Bool
       return false
     case Cell.Float(value)
       return false
+    case Cell.Binary(value)
+      return navigationCellEqual(left, right)
   end
 end
 
@@ -76,10 +86,12 @@ def navigationKeyValid(value: Cell): Bool
       return false
     case Cell.Float(number)
       return false
+    case Cell.Binary(boolean)
+      return false
   end
 end
 
-def navigationColumnType(mapping: EntityMapping, column: String): String
+def navigationColumnType(mapping: readonly EntityMapping, column: String): String
   var index = 0
 
   while index < mapping.count()
@@ -87,6 +99,20 @@ def navigationColumnType(mapping: EntityMapping, column: String): String
 
     if field != null && field.column() == column
       return field.typeName()
+    end
+    index = index + 1
+  end
+  return ""
+end
+
+def navigationColumnStorageType(mapping: readonly EntityMapping, column: String): String
+  var index = 0
+
+  while index < mapping.count()
+    let field = mapping.columnAt(index)
+
+    if field != null && field.column() == column
+      return field.storageTypeName()
     end
     index = index + 1
   end
@@ -162,10 +188,16 @@ def navigationRowMatchesOptional(row: RawRow, column: String, expected: Cell): B
 end
 
 class CollectionNavigation<P, D>
+  private collectionStates: NavigationStates<P> = new NavigationStates<P>()
+  private referenceStates: NavigationStates<D> = new NavigationStates<D>()
+  private stateOwner: CollectionNavigation<P, D>?
+  private stateJournal: NavigationJournal?
   private principalKeyGetter: fn(P): Cell
   private dependentKeyGetter: fn(D): Cell
   private foreignKeyGetter: fn(D): Cell
   private foreignKeyName: String
+  private foreignKeyNames: String[]
+  private principalKeyNames: String[]?
   private collectionGetter: fn(P): D[]
   private collectionSetter: fn(P, D[]): Void
   private referenceGetter: fn(D): P?
@@ -179,16 +211,97 @@ class CollectionNavigation<P, D>
     getCollection: fn(P): D[],
     setCollection: fn(P, D[]): Void,
     getReference: fn(D): P?,
-    setReference: fn(D, P?): Void
+    setReference: fn(D, P?): Void,
+    foreignKeyColumns: String[]? = null,
+    principalKeyColumns: String[]? = null,
+    stateOwner: CollectionNavigation<P, D>? = null,
+    stateJournal: NavigationJournal? = null
   ): Void
     this.principalKeyGetter = principalKey
     this.dependentKeyGetter = dependentKey
     this.foreignKeyGetter = foreignKey
     this.foreignKeyName = foreignKeyColumn
+    this.foreignKeyNames = [foreignKeyColumn]
+    if foreignKeyColumns != null
+      this.foreignKeyNames = tasks::generate(foreignKeyColumns.Length, 1) do |index|
+        return foreignKeyColumns[index]
+      end
+    end
+    this.principalKeyNames = null
+    if principalKeyColumns != null
+      this.principalKeyNames = tasks::generate<String>(principalKeyColumns.Length, 1) do |index|
+        return principalKeyColumns[index]
+      end
+    end
     this.collectionGetter = getCollection
     this.collectionSetter = setCollection
     this.referenceGetter = getReference
     this.referenceSetter = setReference
+    this.stateOwner = stateOwner
+    this.stateJournal = stateJournal
+  end
+
+  public def clearLoadedStates(): Void
+    let owner = this.stateOwner
+
+    if owner != null
+      owner.clearLoadedStates()
+      return
+    end
+    this.collectionStates.clear()
+    this.referenceStates.clear()
+  end
+
+  public def collectionState(entity: P): NavigationLoadState
+    let owner = this.stateOwner
+
+    return owner == null ? this.collectionStates.get(entity, this.principalKey(entity)) : owner.collectionState(entity)
+  end
+
+  public def referenceState(entity: D): NavigationLoadState
+    let owner = this.stateOwner
+
+    return owner == null ? this.referenceStates.get(entity, this.foreignKey(entity)) : owner.referenceState(entity)
+  end
+
+  public def markCollection(entity: P, state: NavigationLoadState): Void
+    let owner = this.stateOwner
+    let journal = this.stateJournal
+
+    if owner != null
+      let previous = owner.collectionState(entity)
+
+      if journal != null
+        let undo: fn(): Void = fn(): Void do
+          owner.markCollection(entity, previous)
+        end
+
+        journal.record(undo)
+      end
+      owner.markCollection(entity, state)
+      return
+    end
+    this.collectionStates.set(entity, this.principalKey(entity), state)
+  end
+
+  public def markReference(entity: D, state: NavigationLoadState): Void
+    let owner = this.stateOwner
+    let journal = this.stateJournal
+
+    if owner != null
+      let previous = owner.referenceState(entity)
+
+      if journal != null
+        let undo: fn(): Void = fn(): Void do
+          owner.markReference(entity, previous)
+        end
+
+        journal.record(undo)
+      end
+      owner.markReference(entity, state)
+      return
+    end
+    this.referenceStates.set(entity, this.foreignKey(entity), state)
   end
 
   internal def principalKey(entity: P): Cell
@@ -205,6 +318,20 @@ class CollectionNavigation<P, D>
 
   internal readonly def column(): String
     return this.foreignKeyName
+  end
+
+  internal def columns(): String[]
+    return this.foreignKeyNames
+  end
+
+  internal def principalColumns(defaultColumns: String[]): String[]
+    let selected = this.principalKeyNames
+
+    return selected == null ? defaultColumns : selected
+  end
+
+  internal def principalColumnMetadata(): String[]?
+    return this.principalKeyNames
   end
 
   internal def collection(entity: P): D[]
@@ -319,7 +446,7 @@ def navigationOrderTerm(
   dialect: SqlDialect
 ): NavigationOrderResult
   if tree != null
-    match compileScalarQuotation(mapping, tree, tree.resultType(), state, dialect)
+    match compileOrderQuotation(mapping, tree, state, dialect)
       case ScalarSqlResult.Failure(error)
         return NavigationOrderResult.Failure(error)
       case ScalarSqlResult.Value(value)
@@ -327,10 +454,10 @@ def navigationOrderTerm(
         return NavigationOrderResult.Sql(value.sql + (descending ? " DESC" : " ASC"))
     end
   end
-  if !identifierValid(column) || navigationColumnType(mapping, column) == ""
+  if !identifierValid(column) || navigationColumnStorageType(mapping, column) == ""
     return NavigationOrderResult.Failure(QueryFailure.MissingColumn(column))
   end
-  return NavigationOrderResult.Sql(quoted(mapping.table(), column) + (descending ? " DESC" : " ASC"))
+  return NavigationOrderResult.Sql(mappedOrderSql(mapping, mapping.table(), column) + (descending ? " DESC" : " ASC"))
 end
 
 def navigationWindowOrder<T>(
@@ -366,15 +493,20 @@ def navigationWindowOrder<T>(
   if !identifierValid(dependentKey)
     return NavigationOrderResult.Failure(QueryFailure.InvalidIdentifier(dependentKey))
   end
-  return NavigationOrderResult.Sql(order + (order == "" ? "" : ", ") + quoted(mapping.table(), dependentKey) + " ASC")
+  for key in mapping.primaryKeys()
+    order = order + (order == "" ? "" : ", ") + quoted(mapping.table(), key) + " ASC"
+  end
+  return NavigationOrderResult.Sql(order)
 end
 
-class IncludedQuery<P, D>
+class IncludedQuery<P, D>: AsyncNavigationPlan<P, D>
+  private publicationObserver: (fn(TypedRows<P>, TypedRows<D>): Void)?
   private principals: Query<P>
   private dependents: Query<D>
   private selectedChildren: Query<D>?
   private relation: CollectionNavigation<P, D>
   private childMaximum: Int = 10000
+  private detached: Bool = false
 
   def init(
     principals: Query<P>,
@@ -388,10 +520,61 @@ class IncludedQuery<P, D>
     this.selectedChildren = selectedChildren
   end
 
+  ## Executes this graph with one left-join statement.
+  public def asSingleQuery(): SingleIncludedQuery<P, D>
+    return new SingleIncludedQuery<P, D>(this)
+  end
+
+  internal def effectiveSinglePlan(): IncludedQuery<P, D>
+    return this.detached ? this.detachedPlan() : this
+  end
+
+  public def asSplitQuery(): IncludedQuery<P, D>
+    return this
+  end
+
+  internal def rootQuery(): Query<P>
+    return this.principals
+  end
+
+  internal def relatedQuery(): Query<D>
+    return this.dependents
+  end
+
+  internal def childSelection(): Query<D>
+    let selected = this.selectedChildren
+
+    return selected == null ? this.dependents : selected
+  end
+
+  internal def navigation(): CollectionNavigation<P, D>
+    return this.relation
+  end
+
+  internal def singleChildren(dialect: SqlDialect): CompileResult<D>
+    let selected = this.selectedChildren
+
+    if selected == null
+      return compilePipeline<D, D>(this.dependents, this.dependents.rowDecoder(), null, null, dialect, unbounded: true)
+    end
+    return this.compileSelectedChildren(selected, null, 9223372036854775807, dialect)
+  end
+
+  public def beforePublication(observer: fn(TypedRows<P>, TypedRows<D>): Void): IncludedQuery<P, D>
+    let clone = new IncludedQuery<P, D>(this.principals, this.dependents, this.relation, this.selectedChildren)
+
+    clone.childMaximum = this.childMaximum
+    clone.detached = this.detached
+    clone.publicationObserver = observer
+    return clone
+  end
+
   public def maxChildren(maximum: Int): IncludedQuery<P, D>
     let copy = new IncludedQuery<P, D>(this.principals, this.dependents, this.relation, this.selectedChildren)
 
     copy.childMaximum = maximum
+    copy.detached = this.detached
+    copy.publicationObserver = this.publicationObserver
     return copy
   end
 
@@ -400,24 +583,184 @@ class IncludedQuery<P, D>
     let copy = new IncludedQuery<P, D>(this.principals, this.dependents, this.relation, query)
 
     copy.childMaximum = this.childMaximum
+    copy.detached = this.detached
+    copy.publicationObserver = this.publicationObserver
     return copy
   end
 
+  ## Each materialization uses fresh graph identities outside the context tracker.
+  public def asNoTracking(): IncludedQuery<P, D>
+    let copy = this.maxChildren(this.childMaximum)
+
+    copy.detached = true
+    return copy
+  end
+
+  private def detachedPlan(): IncludedQuery<P, D>
+    let principals = this.principals.detachedGraph()
+    let dependents = this.dependents.detachedGraph()
+    var children: Query<D>? = null
+    let selected = this.selectedChildren
+    let tracker = dependents.rowTracker()
+
+    if selected != null && tracker != null
+      children = selected.withNavigationTracker(tracker)
+    end
+    let copy = new IncludedQuery<P, D>(principals, dependents, this.relation, children)
+
+    copy.childMaximum = this.childMaximum
+    copy.publicationObserver = this.publicationObserver
+    return copy
+  end
+
+  public def allAsync(options: StreamOptions? = null): result::Result<AsyncNavigation<P, D>, QueryFailure>
+    let plan = this.detached ? this.detachedPlan() : this
+    let invalid = plan.validateQueries(true)
+
+    if invalid != null
+      return result::Result<AsyncNavigation<P, D>, QueryFailure>.Error(invalid)
+    end
+    match prepareAsyncNavigation<P, D>(plan, options)
+      case AsyncNavigationStart.Failure(error)
+        return result::Result<AsyncNavigation<P, D>, QueryFailure>.Error(error)
+      case AsyncNavigationStart.Started(driver)
+        let owned = new AsyncNavigation<P, D>(driver)
+
+        return result::Result<AsyncNavigation<P, D>, QueryFailure>.Ok(transfer owned)
+    end
+  end
+
+  public def loadAsync(
+    rows: TypedRows<P>,
+    options: StreamOptions? = null
+  ): result::Result<AsyncNavigation<P, D>, QueryFailure>
+    let plan = this.detached ? this.detachedPlan() : this
+    var selected = rows
+
+    if this.detached
+      let tracker = plan.principals.rowTracker()
+
+      if tracker == null
+        return result::Result<AsyncNavigation<P, D>, QueryFailure>.Error(QueryFailure.UnsupportedCapability("detached graph requires identity metadata"))
+      end
+      match tracker.resolveRows(rows)
+        case QueryResult.Failure(error)
+          return result::Result<AsyncNavigation<P, D>, QueryFailure>.Error(error)
+        case QueryResult.Rows(resolved)
+          selected = resolved
+      end
+    end
+    let invalid = plan.validateQueries(true)
+
+    if invalid != null
+      return result::Result<AsyncNavigation<P, D>, QueryFailure>.Error(invalid)
+    end
+    let owned = new AsyncNavigation<P, D>(new AsyncNavigationDriver<P, D>(plan, options, rows: selected))
+
+    return result::Result<AsyncNavigation<P, D>, QueryFailure>.Ok(transfer owned)
+  end
+
+  public override def prepareRoot(options: StreamOptions?): AsyncQueryPreparation<P>
+    let invalid = this.validateQueries(true)
+
+    return invalid == null ? prepareQueryAsync<P>(this.principals, options) : AsyncQueryPreparation<P>.Failure(invalid)
+  end
+
+  internal override def checkpointRoots(journal: NavigationJournal): Void
+    let parents = this.principals.rowTracker()
+    let children = this.dependents.rowTracker()
+
+    if parents != null && children != null
+      checkpointNavigation(this.relation, parents, children, new TypedRows<P>(), new TypedRows<D>(), journal)
+    end
+  end
+
+  public override def navigationKeys(rows: TypedRows<P>): TypedRows<Cell>
+    let keys = new TypedRows<Cell>()
+    var row = rows.first()
+
+    while row != null
+      let key = this.relation.principalKey(row.value)
+      var existing = keys.first()
+      var found = false
+
+      while existing != null
+        found = found || navigationCellEqual(existing.value, key)
+        existing = existing.next
+      end
+      if !found
+        keys.add(key)
+      end
+      row = row.next
+    end
+    return keys
+  end
+
+  public override def navigationMaximum(): Int
+    return this.childMaximum
+  end
+
+  public override def prepareNavigation(
+    keys: TypedRows<Cell>,
+    maximum: Int,
+    options: StreamOptions?
+  ): AsyncQueryPreparation<D>
+    let selected = this.selectedChildren
+    let query = selected == null ? this.dependents.matchingTupleCells(this.relation.columns(), keys) : selected
+    let provider = query.provider()
+
+    if provider == null
+      return AsyncQueryPreparation<D>.Failure(QueryFailure.UnsupportedCapability("asynchronous navigation loading requires a provider"))
+    end
+    var compiled = CompileResult<D>.Failure(QueryFailure.UnsupportedCapability("navigation query is unavailable"))
+
+    if selected == null
+      compiled = compilePipeline<D, D>(query, query.rowDecoder(), null, null, provider.dialect(), unbounded: true)
+    else
+      compiled = this.compileSelectedChildren(selected, keys, maximum, provider.dialect())
+    end
+    match compiled
+      case CompileResult.Failure(error)
+        return AsyncQueryPreparation<D>.Failure(error)
+      case CompileResult.Plan(plan)
+        return prepareAsyncQuery<D>(provider, plan, options, maximumRows: maximum)
+    end
+  end
+
+  public override def publishNavigation(rows: TypedRows<P>, related: TypedRows<D>): QueryResult<P>
+    return this.load(rows, related)
+  end
+
   public def all(): QueryResult<P>
+    if this.detached
+      return this.detachedPlan().all()
+    end
     let invalid = this.validateQueries()
 
     if invalid != null
       return QueryResult<P>.Failure(invalid)
     end
+    let journal = new NavigationJournal()
+
+    this.checkpointRoots(journal)
     match this.principals.all()
       case QueryResult.Failure(error)
+        journal.rollback()
         return QueryResult<P>.Failure(error)
       case QueryResult.Rows(rows)
-        return this.load(rows)
+        let result = this.load(rows)
+
+        match result
+          case QueryResult.Failure(error)
+            journal.rollback()
+          case QueryResult.Rows(loaded)
+            journal.discard()
+        end
+        return result
     end
   end
 
-  internal def validateQueries(): QueryFailure?
+  internal def validateQueries(asynchronous: Bool = false): QueryFailure?
     if this.childMaximum < 1 || this.childMaximum > 10000
       return QueryFailure.Provider(ProviderFailure.State("navigation child limit must be between 1 and 10000"))
     end
@@ -519,27 +862,36 @@ class IncludedQuery<P, D>
     if principalKey == null || dependentKey == null
       return QueryFailure.UnsupportedCapability("navigation loading requires mapped primary keys")
     end
-    let principalType = navigationColumnType(principalMapping, principalKey)
-    let dependentType = navigationColumnType(dependentMapping, dependentKey)
-    let foreignType = navigationColumnType(dependentMapping, this.relation.column())
+    let principalColumns = this.relation.principalColumns(principalMapping.primaryKeys())
+    let principalType = principalColumns.Length == 0 ? "" : navigationColumnStorageType(
+      principalMapping,
+      principalColumns[0]
+    )
+    let dependentType = navigationColumnStorageType(dependentMapping, dependentKey)
+    let foreignType = navigationColumnStorageType(dependentMapping, this.relation.column())
 
     if (principalType != "Int" && principalType != "String") || (dependentType != "Int" && dependentType != "String") || (foreignType != "Int" && foreignType != "String" && foreignType != "Int?" && foreignType != "String?") || principalType != navigationUnderlyingType(foreignType)
       return QueryFailure.UnsupportedCapability("navigation keys and foreign key require matching Int or String mappings")
     end
+    if !navigationTupleColumnsValid(principalMapping, dependentMapping, principalColumns, this.relation.columns())
+      return QueryFailure.UnsupportedCapability("navigation key tuple mappings do not match")
+    end
     if selected != null
-      if !leftProvider.supports(ProviderCapability.StreamingReads())
+      if !asynchronous && !leftProvider.supports(ProviderCapability.StreamingReads())
         return QueryFailure.UnsupportedCapability("streaming-reads")
       end
       if (selected.rowOffset() > 0 || selected.rowLimit() != null) && !leftProvider.supports(ProviderCapability.WindowFunctions())
         return QueryFailure.UnsupportedCapability("window-functions")
       end
       let sample = new TypedRows<Cell>()
+      let sampleColumns: RawColumn[] = tasks::generate(principalColumns.Length, 1) do |index|
+        let column = principalColumns[index]
+        let typeName = navigationColumnStorageType(principalMapping, column)
 
-      if principalType == "Int"
-        sample.add(Cell.Int(0))
-      else
-        sample.add(Cell.Text(""))
+        return new RawColumn(column, typeName == "Int" ? Cell.Int(0) : Cell.Text(""))
       end
+
+      sample.add(compositeKeyCell(new RawRow(sampleColumns), principalColumns))
       match this.compileSelectedChildren(selected, sample, 1, leftProvider.dialect())
         case CompileResult.Failure(error)
           return error
@@ -552,7 +904,7 @@ class IncludedQuery<P, D>
     return null
   end
 
-  private def compileBaseChildren(query: Query<D>, keys: TypedRows<Cell>, dialect: SqlDialect): CompileResult<D>
+  private def compileBaseChildren(query: Query<D>, keys: TypedRows<Cell>?, dialect: SqlDialect): CompileResult<D>
     let mapping = this.dependents.entityMapping()
 
     if mapping == null
@@ -563,35 +915,15 @@ class IncludedQuery<P, D>
     if dependentKey == null
       return CompileResult<D>.Failure(QueryFailure.UnsupportedCapability("navigation children require a mapped primary key"))
     end
-    let predicate = query.filterExpression()
-    var source = new Query<D>(
-      query.sourceName(),
-      query.rowDecoder(),
-      mapping: mapping,
-      provider: query.provider(),
-      tracker: query.rowTracker(),
-      changes: query.changeOwner()
-    )
-
-    if predicate != null
-      source = new Query<D>(
-        query.sourceName(),
-        query.rowDecoder(),
-        new Predicate<D>(predicate),
-        mapping: mapping,
-        provider: query.provider(),
-        tracker: query.rowTracker(),
-        changes: query.changeOwner()
-      )
-    end
-    let matched = source.matchingCells(this.relation.column(), keys)
+    let source = query.navigationBase()
+    let matched = keys == null ? source : source.matchingTupleCells(this.relation.columns(), keys)
 
     return compilePipeline<D, D>(matched, matched.rowDecoder(), null, null, dialect, ordered: false, unbounded: true)
   end
 
   private def compileSelectedChildren(
     query: Query<D>,
-    keys: TypedRows<Cell>,
+    keys: TypedRows<Cell>?,
     maximum: Int,
     dialect: SqlDialect
   ): CompileResult<D>
@@ -603,7 +935,7 @@ class IncludedQuery<P, D>
 
   private def compileUnpagedChildren(
     query: Query<D>,
-    keys: TypedRows<Cell>,
+    keys: TypedRows<Cell>?,
     maximum: Int,
     dialect: SqlDialect
   ): CompileResult<D>
@@ -636,9 +968,9 @@ class IncludedQuery<P, D>
               projection = projection + (index == 0 ? "" : ", ") + quoted(mapping.table(), columns.at(index).name())
               index = index + 1
             end
-            let sql = "SELECT " + projection + " FROM (" + basePlan.sql().sql() + ") AS \"" + mapping.table() + "\" ORDER BY " + quoted(
+            let sql = "SELECT " + projection + " FROM (" + basePlan.sql().sql() + ") AS \"" + mapping.table() + "\" ORDER BY " + navigationQuotedColumns(
               mapping.table(),
-              this.relation.column()
+              this.relation.columns()
             ) + ", " + orderSql + " LIMIT " + (maximum as String)
             let params = new ParameterValues(state.head, state.count)
             let checked = basePlan.sql().requiresCheckedScalars() || state.requiresCheckedScalars
@@ -653,7 +985,7 @@ class IncludedQuery<P, D>
 
   private def compileWindowedChildren(
     query: Query<D>,
-    keys: TypedRows<Cell>,
+    keys: TypedRows<Cell>?,
     maximum: Int,
     dialect: SqlDialect
   ): CompileResult<D>
@@ -703,18 +1035,18 @@ class IncludedQuery<P, D>
               index = index + 1
             end
             let rank = quoted("__neri_navigation", rankName)
-            var sql = "SELECT " + outerColumns + " FROM (SELECT " + innerColumns + ", ROW_NUMBER() OVER (PARTITION BY " + quoted(
+            var sql = "SELECT " + outerColumns + " FROM (SELECT " + innerColumns + ", ROW_NUMBER() OVER (PARTITION BY " + navigationQuotedColumns(
               mapping.table(),
-              this.relation.column()
+              this.relation.columns()
             ) + " ORDER BY " + orderSql + ") AS \"" + rankName + "\" FROM (" + shiftedBase + ") AS \"" + mapping.table() + "\") AS \"__neri_navigation\" WHERE " + rank + " > " + (query.rowOffset() as String)
             let take = query.rowLimit()
 
             if take != null
               sql = sql + " AND " + rank + " <= " + ((query.rowOffset() + take) as String)
             end
-            sql = sql + " ORDER BY " + quoted(
+            sql = sql + " ORDER BY " + navigationQuotedColumns(
               "__neri_navigation",
-              this.relation.column()
+              this.relation.columns()
             ) + ", " + rank + " LIMIT " + (maximum as String)
             let params = new ParameterValues(orderState.head, orderState.count)
             let checked = basePlan.sql().requiresCheckedScalars() || orderState.requiresCheckedScalars
@@ -725,8 +1057,35 @@ class IncludedQuery<P, D>
     end
   end
 
-  public def load(rows: TypedRows<P>): QueryResult<P>
-    let invalid = this.validateQueries()
+  public def load(rows: TypedRows<P>, prefetched: TypedRows<D>? = null): QueryResult<P>
+    if this.detached
+      let plan = this.detachedPlan()
+      let tracker = plan.principals.rowTracker()
+
+      if tracker == null
+        return QueryResult<P>.Failure(QueryFailure.UnsupportedCapability("detached graph requires identity metadata"))
+      end
+      match tracker.resolveRows(rows)
+        case QueryResult.Failure(error)
+          return QueryResult<P>.Failure(error)
+        case QueryResult.Rows(resolved)
+          return plan.load(resolved, prefetched)
+      end
+    end
+    let journal = new NavigationJournal()
+    let result = this.loadCore(rows, prefetched, journal)
+
+    match result
+      case QueryResult.Failure(error)
+        journal.rollback()
+      case QueryResult.Rows(loaded)
+        journal.discard()
+    end
+    return result
+  end
+
+  private def loadCore(rows: TypedRows<P>, prefetched: TypedRows<D>?, journal: NavigationJournal): QueryResult<P>
+    let invalid = this.validateQueries(prefetched != null)
 
     if invalid != null
       return QueryResult<P>.Failure(invalid)
@@ -763,7 +1122,11 @@ class IncludedQuery<P, D>
       end
       let originalParent = parentTracker.original(parent.value)
 
-      if originalParent == null || !navigationRowMatches(originalParent, principalKeyColumn, key)
+      if originalParent == null || !navigationTupleRowMatches(
+        originalParent,
+        this.relation.principalColumns(principalMapping.primaryKeys()),
+        key
+      )
         return QueryResult<P>.Failure(QueryFailure.Provider(ProviderFailure.State("navigation principal key callback differs from mapped key")))
       end
       var other = first
@@ -793,7 +1156,17 @@ class IncludedQuery<P, D>
     let staged = new NavigationStage<D>(this.childMaximum)
     var batch: NavigationBucket<P, D>? = first
 
-    while batch != null
+    if prefetched != null
+      var current = prefetched.first()
+
+      while current != null
+        if !staged.accept(current.value)
+          return QueryResult<P>.Failure(QueryFailure.Provider(ProviderFailure.State("navigation child limit exceeded")))
+        end
+        current = current.next
+      end
+    end
+    while batch != null && prefetched == null
       let keys = new TypedRows<Cell>()
       var taken = 0
       var cursor: NavigationBucket<P, D>? = batch
@@ -807,7 +1180,7 @@ class IncludedQuery<P, D>
       let selected = this.selectedChildren
 
       if selected == null
-        let childQuery = this.dependents.matchingCells(this.relation.column(), keys)
+        let childQuery = this.dependents.matchingTupleCells(this.relation.columns(), keys)
         let visit: fn(D): Bool = fn(value: D): Bool do
           return staged.accept(value)
         end
@@ -890,6 +1263,12 @@ class IncludedQuery<P, D>
       end
       stagedChild = stagedChild.next
     end
+    let publicationObserver = this.publicationObserver
+
+    if publicationObserver != null
+      publicationObserver(rows, staged.rows)
+    end
+    checkpointNavigation(this.relation, parentTracker, childTracker, rows, staged.rows, journal)
     match childTracker.resolveRows(staged.rows)
       case QueryResult.Failure(error)
         return QueryResult<P>.Failure(error)
@@ -910,17 +1289,17 @@ class IncludedQuery<P, D>
           let currentChild = childTracker.current(child.value)
           let originalChild = childTracker.original(child.value)
 
-          if currentChild == null || originalChild == null || !navigationRowMatches(
+          if currentChild == null || originalChild == null || !navigationTupleRowMatches(
             currentChild,
-            dependentKeyColumn,
+            dependentMapping.primaryKeys(),
             this.relation.dependentKey(child.value)
-          ) || !navigationRowMatches(
+          ) || !navigationTupleRowMatches(
             currentChild,
-            this.relation.column(),
+            this.relation.columns(),
             this.relation.foreignKey(child.value)
-          ) || !navigationRowMatchesOptional(
+          ) || !navigationTupleRowMatches(
             originalChild,
-            this.relation.column(),
+            this.relation.columns(),
             this.relation.foreignKey(child.value)
           )
             return QueryResult<P>.Failure(QueryFailure.Provider(ProviderFailure.State("navigation callbacks differ from mapped child fields")))
@@ -957,20 +1336,39 @@ class IncludedQuery<P, D>
       for oldChild in this.relation.collection(bucket.principal)
         let oldReference = this.relation.reference(oldChild)
         let originalChild = childTracker.original(oldChild)
+        let currentChild = childTracker.current(oldChild)
+        var added = false
+        let state = childTracker.stateOf(oldChild)
+
+        if state != null
+          match state
+            case TrackingState.Added()
+              added = true
+            case TrackingState.Unchanged()
+            case TrackingState.Modified()
+            case TrackingState.Deleted()
+            case TrackingState.Detached()
+          end
+        end
 
         if oldReference == null || !reference::same(oldReference, bucket.principal)
           return QueryResult<P>.Failure(QueryFailure.Provider(ProviderFailure.State("tracked navigation collection and inverse reference disagree")))
         end
-        if !childTracker.ownsPersistedForNavigation(oldChild) || !navigationCellEqual(
+        if (!added && !childTracker.ownsPersistedForNavigation(oldChild)) || !navigationCellEqual(
           this.relation.foreignKey(oldChild),
           bucket.key
-        ) || originalChild == null || !navigationRowMatchesOptional(
-          originalChild,
-          this.relation.column(),
+        ) || currentChild == null || !navigationTupleRowMatches(
+          currentChild,
+          this.relation.columns(),
           bucket.key
-        )
+        ) || (!added && (originalChild == null || !navigationTupleRowMatches(
+              originalChild,
+              this.relation.columns(),
+              bucket.key
+            )))
           return QueryResult<P>.Failure(QueryFailure.Provider(ProviderFailure.State("tracked navigation collection conflicts with pending local relationship changes")))
         end
+        navigationDistinct(bucket.children, oldChild)
       end
       bucket = bucket.next
     end
@@ -998,7 +1396,12 @@ class IncludedQuery<P, D>
       this.relation.setCollection(bucket.principal, exact)
       for child in exact
         this.relation.setReference(child, bucket.principal)
+        this.relation.markReference(child, NavigationLoadState.Loaded())
       end
+      this.relation.markCollection(
+        bucket.principal,
+        this.selectedChildren == null ? NavigationLoadState.Loaded() : NavigationLoadState.Partial()
+      )
       bucket = bucket.next
     end
     return QueryResult<P>.Rows(rows)
@@ -1007,4 +1410,40 @@ end
 
 def include<P, D>(principals: Query<P>, dependents: Query<D>, relation: CollectionNavigation<P, D>): IncludedQuery<P, D>
   return new IncludedQuery<P, D>(principals, dependents, relation)
+end
+
+def navigationTupleRowMatches(row: RawRow, columns: String[], expected: Cell): Bool
+  return sameCell(compositeKeyCell(row, columns), expected)
+end
+
+def navigationTupleColumnsValid(
+  principal: EntityMapping,
+  dependent: EntityMapping,
+  keys: String[],
+  foreignKeys: String[]
+): Bool
+  if keys.Length == 0 || keys.Length != foreignKeys.Length
+    return false
+  end
+  var index = 0
+
+  while index < keys.Length
+    let keyType = navigationColumnStorageType(principal, keys[index])
+    let foreignType = navigationColumnStorageType(dependent, foreignKeys[index])
+
+    if (keyType != "Int" && keyType != "String") || keyType != navigationUnderlyingType(foreignType)
+      return false
+    end
+    index = index + 1
+  end
+  return true
+end
+
+def navigationQuotedColumns(table: String, columns: String[]): String
+  var result = ""
+
+  for column in columns
+    result = result + (result == "" ? "" : ", ") + quoted(table, column)
+  end
+  return result
 end

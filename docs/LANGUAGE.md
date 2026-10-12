@@ -414,7 +414,8 @@ use this boundary; their validated factories remain safe entry points.
 
 Public, safe instance methods on ordinary classes can expose operators using
 `@operator("+")`. The annotation belongs to the class that implements the
-operation. Binary operators take one parameter of exactly that class type;
+operation. Binary operators take one parameter of that class type or its readonly view;
+an operand can acquire the readonly view while binding the operator call.
 unary operators take none. Arithmetic operators return that class type;
 comparison operators and unary `!` return `Bool`.
 
@@ -679,7 +680,10 @@ require an explicitly written callback wrapper with its own unsafe block.
 
 `quote fn(Parameters): Result` describes an inspectable expression. An explicit
 `quote do |parameter: Type|: Result ... end` expression constructs one. A
-quotation parameter also supplies the expected types for a trailing `do` block.
+quotation parameter also supplies the expected types for a trailing `do` block
+or an expression lambda written as `parameter => expression`. Expression
+lambdas use the contextual parameter type; generic result types can be inferred
+from the body expression.
 The compiler preserves resolved field identities, parameter types and scalar
 captures in a readonly tree exposed through `tree()`.
 
@@ -687,6 +691,15 @@ Quotations use `use quotation` and a body containing one supported return
 expression. Their signatures participate in ordinary generic inference. See
 [typed quotations](QUOTATIONS.md) for supported operations, capture rules and
 diagnostics.
+
+### Element types
+
+`element of T` removes one array or nullable layer from `T`; a type without
+either layer is preserved. For example, `element of Customer[]` and
+`element of Customer?` are both `Customer`. Nested shapes retain their inner
+layer: `element of Customer?[]` is `Customer?`. The projection participates in
+generic type substitution, allowing a selector's result to determine the entity
+type used by the next navigation selector.
 
 ### Typed field arguments
 

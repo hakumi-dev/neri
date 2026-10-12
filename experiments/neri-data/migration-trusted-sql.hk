@@ -1,0 +1,212 @@
+use host
+namespace neri_data
+
+## Authored migration SQL stays inside the catalog's transaction and order.
+def schemaTrustedSqlFailure(sql: String, dialect: SqlDialect = SqlDialect.PostgreSql()): String?
+  let length = host::stringByteLength(sql)
+
+  if length < 1 || length > 65536
+    return "trusted migration SQL must contain 1..65536 UTF-8 bytes"
+  end
+  var index = 0
+  var quote = 0
+  var dollar = ""
+  var blockComment = 0
+  var lineComment = false
+  var terminated = false
+  var first = ""
+  var trigger = false
+  var triggerBody = 0
+  var wordCount = 0
+
+  while index < length
+    let byte = host::stringByteAt(sql, index) as Int
+    let next = index + 1 < length ? host::stringByteAt(sql, index + 1) as Int : -1
+
+    if byte == 0
+      return "trusted migration SQL contains NUL"
+    end
+    if lineComment
+      lineComment = false if byte == 10 || byte == 13
+      index = index + 1
+    else if blockComment > 0
+      if byte == 47 && next == 42
+        return "trusted migration SQL cannot contain nested block comments"
+      else if byte == 42 && next == 47
+        blockComment = blockComment - 1
+        index = index + 2
+      else
+        index = index + 1
+      end
+    else if dollar != ""
+      let size = host::stringByteLength(dollar)
+
+      if index + size <= length && host::stringSlice(sql, index, size) == dollar
+        dollar = ""
+        index = index + size
+      else
+        index = index + 1
+      end
+    else if quote != 0
+      if quote == 39 && byte == 92
+        return "trusted migration SQL quoted literals cannot contain backslash escapes; use a dollar-quoted PostgreSQL body"
+      end
+      if byte == quote
+        if next == quote
+          index = index + 2
+        else
+          quote = 0
+          index = index + 1
+        end
+      else
+        index = index + 1
+      end
+    else if byte <= 32
+      index = index + 1
+    else if byte == 45 && next == 45
+      lineComment = true
+      index = index + 2
+    else if byte == 47 && next == 42
+      blockComment = 1
+      index = index + 2
+    else if terminated
+      return "trusted migration SQL requires exactly one statement"
+    else if byte == 39 || byte == 34 || byte == 96 || byte == 91
+      quote = byte == 91 ? 93 : byte
+      index = index + 1
+    else if byte == 36
+      match dialect
+        case SqlDialect.QuestionMark()
+          return "SQLite trusted migration SQL cannot contain unbound dollar parameters"
+        case SqlDialect.PostgreSql()
+      end
+      if index > 0
+        let previous = host::stringByteAt(sql, index - 1) as Int
+
+        if (previous >= 65 && previous <= 90) || (previous >= 97 && previous <= 122) || (previous >= 48 && previous <= 57) || previous == 95 || previous == 36
+          return "PostgreSQL dollar-quoted blocks require a token boundary"
+        end
+      end
+      var finish = index + 1
+
+      while finish < length && finish - index <= 64
+        let current = host::stringByteAt(sql, finish) as Int
+
+        if !((current >= 65 && current <= 90) || (current >= 97 && current <= 122) || (current >= 48 && current <= 57) || current == 95)
+          break
+        end
+        finish = finish + 1
+      end
+      if finish < length && host::stringByteAt(sql, finish) as Int == 36
+        dollar = host::stringSlice(sql, index, finish - index + 1)
+        index = finish + 1
+      else
+        return "trusted migration SQL does not accept unbound parameters"
+      end
+    else if byte == 59
+      terminated = true if triggerBody == 0
+      index = index + 1
+    else if (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) || byte == 95
+      let start = index
+
+      while index < length
+        let current = host::stringByteAt(sql, index) as Int
+
+        if !((current >= 65 && current <= 90) || (current >= 97 && current <= 122) || (current >= 48 && current <= 57) || current == 95)
+          break
+        end
+        index = index + 1
+      end
+      let word = host::stringSlice(sql, start, index - start)
+
+      wordCount = wordCount + 1
+      if first == ""
+        first = word
+        if !schemaSameIdentifier(
+          word,
+          "CREATE"
+        ) && !schemaSameIdentifier(
+          word,
+          "ALTER"
+        ) && !schemaSameIdentifier(
+          word,
+          "DROP"
+        ) && !schemaSameIdentifier(
+          word,
+          "INSERT"
+        ) && !schemaSameIdentifier(
+          word,
+          "UPDATE"
+        ) && !schemaSameIdentifier(
+          word,
+          "DELETE"
+        ) && !schemaSameIdentifier(
+          word,
+          "WITH"
+        ) && !schemaSameIdentifier(
+          word,
+          "COMMENT"
+        ) && !schemaSameIdentifier(
+          word,
+          "GRANT"
+        ) && !schemaSameIdentifier(
+          word,
+          "REVOKE"
+        ) && !schemaSameIdentifier(
+          word,
+          "DO"
+        )
+          return "trusted migration SQL requires transactional DDL or DML"
+        end
+      end
+      if schemaSameIdentifier(first, "CREATE") && wordCount <= 4 && schemaSameIdentifier(word, "TRIGGER")
+        trigger = true
+      end
+      if schemaSameIdentifier(word, "BEGIN") && trigger && triggerBody == 0
+        triggerBody = 1
+      else if triggerBody > 0
+        if schemaSameIdentifier(word, "CASE")
+          triggerBody = triggerBody + 1
+        else if schemaSameIdentifier(word, "END")
+          triggerBody = triggerBody - 1
+        end
+      else if schemaSameIdentifier(word, "BEGIN") || schemaSameIdentifier(word, "COMMIT") || schemaSameIdentifier(word, "ROLLBACK") || schemaSameIdentifier(word, "END") || schemaSameIdentifier(word, "ABORT") || schemaSameIdentifier(word, "SAVEPOINT") || schemaSameIdentifier(word, "RELEASE") || schemaSameIdentifier(word, "START") || schemaSameIdentifier(word, "TRANSACTION")
+        return "trusted migration SQL cannot control the catalog transaction"
+      end
+    else if byte == 63
+      return "trusted migration SQL does not accept unbound parameters"
+    else if (byte == 58 || byte == 64) && ((next >= 65 && next <= 90) || (next >= 97 && next <= 122) || next == 95)
+      if byte != 58 || index == 0 || host::stringByteAt(sql, index - 1) as Int != 58
+        return "trusted migration SQL does not accept unbound named parameters"
+      end
+      index = index + 1
+    else
+      index = index + 1
+    end
+  end
+  if first == "" || quote != 0 || dollar != "" || blockComment != 0 || triggerBody != 0
+    return "trusted migration SQL has an incomplete statement or quoted block"
+  end
+  return null
+end
+
+def schemaSqlOperation(op: readonly SchemaOp): Bool
+  match op
+    case SchemaOp.Sql(statement)
+      return true
+    case SchemaOp.CreateTable(table, columns)
+    case SchemaOp.DropTable(table)
+    case SchemaOp.AddColumn(table, column)
+    case SchemaOp.DropColumn(table, column)
+    case SchemaOp.RenameTable(from, to)
+    case SchemaOp.RenameColumn(table, from, to)
+    case SchemaOp.CreateIndex(name, table, columns, unique, facets)
+    case SchemaOp.DropIndex(name)
+    case SchemaOp.RebuildTable(before, after)
+    case SchemaOp.InsertData(table, columns, values)
+    case SchemaOp.UpdateData(table, keys, keyValues, columns, values)
+    case SchemaOp.DeleteData(table, keys, keyValues)
+      return false
+  end
+  return false
+end

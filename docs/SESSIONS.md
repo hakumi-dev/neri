@@ -214,7 +214,8 @@ bound candidate directly to IR and invokes native code generation. Mutating the
 caller's snapshot or `NERI_STDLIB` after preparation therefore cannot change
 compiled code. Project, generated and
 library sources retain separate parser boundaries, including the boundary before
-the first captured library. Their aggregate snapshot is limited to 1 MiB.
+the first captured library. Their aggregate project and library snapshot is limited
+to 4 MiB. Submitted session source remains limited to 1 MiB independently.
 
 `SessionToolchain(compiler, linker, target, workRoot, release = false,
 cacheEnabled = true)` takes a `TargetPlatform` and selects Debug or Release

@@ -2,6 +2,7 @@ use host
 namespace neri_data
 
 enum SchemaType
+  case Binary()
   case Bool()
   case Int()
   case Float()
@@ -22,19 +23,40 @@ class SchemaColumn
   private storedNullable: Bool
   private storedPrimaryKey: Bool
   private storedDefault: SchemaDefault?
+  private storedReference: SchemaReference?
+  private storedKeyPosition: Int
+  private storedDefaultSql: String?
+  private storedComputedSql: String?
+  private storedComputedStored: Bool
+  private storedCheckSql: String?
+  private storedCollation: String?
 
   def init(
     name: String,
     type: SchemaType,
     nullable: Bool = false,
     primaryKey: Bool = false,
-    defaultValue: SchemaDefault? = null
+    defaultValue: SchemaDefault? = null,
+    reference: SchemaReference? = null,
+    keyPosition: Int = 0,
+    defaultSql: String? = null,
+    computedSql: String? = null,
+    computedStored: Bool = true,
+    checkSql: String? = null,
+    collation: String? = null
   ): Void
     this.storedName = name
     this.storedType = type
     this.storedNullable = nullable
     this.storedPrimaryKey = primaryKey
-    this.storedDefault = defaultValue
+    this.storedDefault = schemaCloneDefault(defaultValue)
+    this.storedReference = schemaCloneReference(reference)
+    this.storedKeyPosition = keyPosition
+    this.storedDefaultSql = defaultSql
+    this.storedComputedSql = computedSql
+    this.storedComputedStored = computedStored
+    this.storedCheckSql = checkSql
+    this.storedCollation = collation
   end
 
   public readonly def name(): String
@@ -53,21 +75,53 @@ class SchemaColumn
     return this.storedPrimaryKey
   end
 
+  public readonly def keyPosition(): Int
+    return this.storedKeyPosition
+  end
+
+  public readonly def reference(): readonly SchemaReference?
+    return this.storedReference
+  end
+
   public readonly def defaultValue(): readonly SchemaDefault?
     return this.storedDefault
+  end
+
+  public readonly def defaultSql(): String?
+    return this.storedDefaultSql
+  end
+
+  public readonly def computedSql(): String?
+    return this.storedComputedSql
+  end
+
+  public readonly def computedStored(): Bool
+    return this.storedComputedStored
+  end
+
+  public readonly def checkSql(): String?
+    return this.storedCheckSql
+  end
+
+  public readonly def collation(): String?
+    return this.storedCollation
   end
 end
 
 enum SchemaOp
+  case Sql(statement: String)
   case CreateTable(table: String, columns: SchemaColumn[])
   case DropTable(table: String)
   case AddColumn(table: String, column: SchemaColumn)
   case DropColumn(table: String, column: String)
   case RenameTable(from: String, to: String)
   case RenameColumn(table: String, from: String, to: String)
-  case CreateIndex(name: String, table: String, columns: String[], unique: Bool)
+  case CreateIndex(name: String, table: String, columns: String[], unique: Bool, facets: SchemaIndex?)
   case DropIndex(name: String)
   case RebuildTable(before: SchemaTable, after: SchemaTable)
+  case InsertData(table: String, columns: String[], values: Cell[])
+  case UpdateData(table: String, keyColumns: String[], keyValues: Cell[], columns: String[], values: Cell[])
+  case DeleteData(table: String, keyColumns: String[], keyValues: Cell[])
 end
 
 enum SchemaCompileResult
@@ -81,6 +135,11 @@ enum MigrationFailure
   case Unsupported(message: String)
   case Provider(error: ProviderFailure)
   case Cleanup(error: MigrationCleanupFailure)
+end
+
+enum MigrationHistoryResult
+  case Loaded(stamps: MigrationStamp[])
+  case Failure(error: MigrationFailure)
 end
 
 enum MigrationResult
@@ -153,6 +212,8 @@ def schemaTypeCode(type: readonly SchemaType): String
       return "F"
     case SchemaType.Text()
       return "T"
+    case SchemaType.Binary()
+      return "Y"
   end
 end
 
@@ -175,7 +236,115 @@ def schemaDefaultCode(value: readonly SchemaDefault?): String
 end
 
 def schemaColumnCode(column: readonly SchemaColumn): String
-  return schemaPiece(column.name()) + schemaTypeCode(column.type()) + (column.nullable() ? "1" : "0") + (column.primaryKey() ? "1" : "0") + schemaDefaultCode(column.defaultValue())
+  return schemaPiece(column.name()) + schemaTypeCode(column.type()) + (column.nullable() ? "1" : "0") + (column.primaryKey() ? "1" : "0") + schemaDefaultCode(column.defaultValue()) + schemaReferenceCode(column.reference()) + (column.keyPosition() == 0 ? "" : "K" + schemaPiece(column.keyPosition() as String)) + schemaColumnFacetsCode(column)
+end
+
+def schemaColumnFacetsCode(column: readonly SchemaColumn): String
+  let defaultSql = column.defaultSql()
+  let computedSql = column.computedSql()
+  let checkSql = column.checkSql()
+  let collation = column.collation()
+
+  if defaultSql == null && computedSql == null && checkSql == null && collation == null
+    return ""
+  end
+  return "E1" + schemaPiece(defaultSql == null ? "" : defaultSql) + schemaPiece(computedSql == null ? "" : computedSql) + (column.computedStored() ? "1" : "0") + schemaPiece(checkSql == null ? "" : checkSql) + schemaPiece(collation == null ? "" : collation)
+end
+
+## Authored DDL accepts one bounded expression with balanced delimiters and literals.
+def schemaExpressionValid(value: String): Bool
+  let length = host::stringByteLength(value)
+
+  if length == 0 || length > 65536
+    return false
+  end
+  var quote = 0
+  var depth = 0
+  var index = 0
+  var content = false
+
+  while index < length
+    let byte = host::stringByteAt(value, index) as Int
+    let next = index + 1 < length ? host::stringByteAt(value, index + 1) as Int : 0
+
+    if byte == 0
+      return false
+    end
+    if quote != 0
+      if byte == quote
+        if next == quote
+          index = index + 1
+        else
+          quote = 0
+        end
+      end
+    else if byte == 39 || byte == 34
+      quote = byte
+      content = true
+    else if byte == 59 || (byte == 45 && next == 45) || (byte == 47 && next == 42)
+      return false
+    else if byte == 40
+      depth = depth + 1
+    else if byte == 41
+      depth = depth - 1
+      return false if depth < 0
+    else if byte > 32
+      content = true
+    end
+    index = index + 1
+  end
+  return content && quote == 0 && depth == 0
+end
+
+def schemaNormalizedSql(sql: String): String
+  var output = ""
+  var quote = 0
+  var index = 0
+  let length = host::stringByteLength(sql)
+
+  while index < length
+    let byte = host::stringByteAt(sql, index) as Int
+
+    if quote != 0
+      output = output + host::stringSlice(sql, index, 1)
+      if byte == quote
+        if index + 1 < length && host::stringByteAt(sql, index + 1) as Int == quote
+          output = output + host::stringSlice(sql, index + 1, 1)
+          index = index + 1
+        else
+          quote = 0
+        end
+      end
+    else if byte == 39 || byte == 34
+      quote = byte
+      output = output + host::stringSlice(sql, index, 1)
+    else if byte > 32 && byte != 59
+      if byte >= 97 && byte <= 122
+        output = output + host::stringSlice("ABCDEFGHIJKLMNOPQRSTUVWXYZ", byte - 97, 1)
+      else
+        output = output + host::stringSlice(sql, index, 1)
+      end
+    end
+    index = index + 1
+  end
+  return output
+end
+
+def schemaCloneColumn(column: readonly SchemaColumn): SchemaColumn
+  return new SchemaColumn(
+    column.name(),
+    schemaCloneType(column.type()),
+    column.nullable(),
+    column.primaryKey(),
+    schemaCloneDefault(column.defaultValue()),
+    schemaCloneReference(column.reference()),
+    column.keyPosition(),
+    column.defaultSql(),
+    column.computedSql(),
+    column.computedStored(),
+    column.checkSql(),
+    column.collation()
+  )
 end
 
 def schemaCloneType(type: readonly SchemaType): SchemaType
@@ -188,6 +357,8 @@ def schemaCloneType(type: readonly SchemaType): SchemaType
       return SchemaType.Float()
     case SchemaType.Text()
       return SchemaType.Text()
+    case SchemaType.Binary()
+      return SchemaType.Binary()
   end
 end
 
@@ -211,6 +382,14 @@ end
 
 def schemaOpCode(op: readonly SchemaOp): String
   match op
+    case SchemaOp.Sql(statement)
+      return "SQL1" + schemaPiece(statement)
+    case SchemaOp.InsertData(table, columns, values)
+      return "SI" + schemaPiece(table) + schemaSeedTupleCode(columns, values)
+    case SchemaOp.UpdateData(table, keys, keyValues, columns, values)
+      return "SU" + schemaPiece(table) + schemaSeedTupleCode(keys, keyValues) + schemaSeedTupleCode(columns, values)
+    case SchemaOp.DeleteData(table, keys, keyValues)
+      return "SD" + schemaPiece(table) + schemaSeedTupleCode(keys, keyValues)
     case SchemaOp.CreateTable(table, columns)
       var code = "CT" + schemaPiece(table) + schemaPiece(columns.Length as String)
 
@@ -228,13 +407,13 @@ def schemaOpCode(op: readonly SchemaOp): String
       return "RT" + schemaPiece(from) + schemaPiece(to)
     case SchemaOp.RenameColumn(table, from, to)
       return "RC" + schemaPiece(table) + schemaPiece(from) + schemaPiece(to)
-    case SchemaOp.CreateIndex(name, table, columns, unique)
+    case SchemaOp.CreateIndex(name, table, columns, unique, indexFacets)
       var code = "CI" + schemaPiece(name) + schemaPiece(table) + (unique ? "1" : "0") + schemaPiece(columns.Length as String)
 
       for column in columns
         code = code + schemaPiece(column)
       end
-      return code
+      return code + (indexFacets == null ? "" : schemaPiece(indexFacets.signature()))
     case SchemaOp.DropIndex(name)
       return "DI" + schemaPiece(name)
     case SchemaOp.RebuildTable(before, after)
@@ -244,17 +423,25 @@ end
 
 def schemaCloneOp(op: readonly SchemaOp): SchemaOp
   match op
+    case SchemaOp.Sql(statement)
+      return SchemaOp.Sql(statement)
+    case SchemaOp.InsertData(table, columns, values)
+      return SchemaOp.InsertData(table, schemaSeedColumnsCopy(columns), schemaSeedValuesCopy(values))
+    case SchemaOp.UpdateData(table, keys, keyValues, columns, values)
+      return SchemaOp.UpdateData(
+        table,
+        schemaSeedColumnsCopy(keys),
+        schemaSeedValuesCopy(keyValues),
+        schemaSeedColumnsCopy(columns),
+        schemaSeedValuesCopy(values)
+      )
+    case SchemaOp.DeleteData(table, keys, keyValues)
+      return SchemaOp.DeleteData(table, schemaSeedColumnsCopy(keys), schemaSeedValuesCopy(keyValues))
     case SchemaOp.CreateTable(table, columns)
       let copied: SchemaColumn[] = tasks::generate(columns.Length, 1) do |index|
         let column = columns[index]
 
-        return new SchemaColumn(
-          column.name(),
-          schemaCloneType(column.type()),
-          column.nullable(),
-          column.primaryKey(),
-          schemaCloneDefault(column.defaultValue())
-        )
+        return schemaCloneColumn(column)
       end
 
       return SchemaOp.CreateTable(table, copied)
@@ -268,12 +455,12 @@ def schemaCloneOp(op: readonly SchemaOp): SchemaOp
       return SchemaOp.RenameTable(from, to)
     case SchemaOp.RenameColumn(table, from, to)
       return SchemaOp.RenameColumn(table, from, to)
-    case SchemaOp.CreateIndex(name, table, columns, unique)
+    case SchemaOp.CreateIndex(name, table, columns, unique, indexFacets)
       let copied: String[] = tasks::generate(columns.Length, 1) do |index|
         return columns[index]
       end
 
-      return SchemaOp.CreateIndex(name, table, copied, unique)
+      return SchemaOp.CreateIndex(name, table, copied, unique, indexFacets == null ? null : indexFacets.copy())
     case SchemaOp.DropIndex(name)
       return SchemaOp.DropIndex(name)
     case SchemaOp.RebuildTable(before, after)
@@ -282,7 +469,12 @@ def schemaCloneOp(op: readonly SchemaOp): SchemaOp
 end
 
 def schemaDuplicateOperation(left: readonly SchemaOp, right: readonly SchemaOp): Bool
+  if schemaSqlOperation(left) || schemaSqlOperation(right)
+    return false
+  end
   match left
+    case SchemaOp.Sql(statement)
+      return false
     case SchemaOp.CreateTable(table, columns)
       match right
         case SchemaOp.CreateTable(other, otherColumns)
@@ -292,9 +484,13 @@ def schemaDuplicateOperation(left: readonly SchemaOp, right: readonly SchemaOp):
         case SchemaOp.DropColumn(other, column)
         case SchemaOp.RenameTable(from, to)
         case SchemaOp.RenameColumn(other, from, to)
-        case SchemaOp.CreateIndex(name, other, otherColumns, unique)
+        case SchemaOp.CreateIndex(name, other, otherColumns, unique, indexFacets)
         case SchemaOp.DropIndex(name)
+        case SchemaOp.Sql(statement)
         case SchemaOp.RebuildTable(before, after)
+        case SchemaOp.InsertData(seedTable, seedColumns, seedValues)
+        case SchemaOp.UpdateData(seedTable, seedKeys, seedKeyValues, seedColumns, seedValues)
+        case SchemaOp.DeleteData(seedTable, seedKeys, seedKeyValues)
           return false
       end
     case SchemaOp.DropTable(table)
@@ -306,9 +502,13 @@ def schemaDuplicateOperation(left: readonly SchemaOp, right: readonly SchemaOp):
         case SchemaOp.DropColumn(other, column)
         case SchemaOp.RenameTable(from, to)
         case SchemaOp.RenameColumn(other, from, to)
-        case SchemaOp.CreateIndex(name, other, columns, unique)
+        case SchemaOp.CreateIndex(name, other, columns, unique, indexFacets)
         case SchemaOp.DropIndex(name)
+        case SchemaOp.Sql(statement)
         case SchemaOp.RebuildTable(before, after)
+        case SchemaOp.InsertData(seedTable, seedColumns, seedValues)
+        case SchemaOp.UpdateData(seedTable, seedKeys, seedKeyValues, seedColumns, seedValues)
+        case SchemaOp.DeleteData(seedTable, seedKeys, seedKeyValues)
           return false
       end
     case SchemaOp.AddColumn(table, column)
@@ -320,9 +520,13 @@ def schemaDuplicateOperation(left: readonly SchemaOp, right: readonly SchemaOp):
         case SchemaOp.DropColumn(other, otherColumn)
         case SchemaOp.RenameTable(from, to)
         case SchemaOp.RenameColumn(other, from, to)
-        case SchemaOp.CreateIndex(name, other, columns, unique)
+        case SchemaOp.CreateIndex(name, other, columns, unique, indexFacets)
         case SchemaOp.DropIndex(name)
+        case SchemaOp.Sql(statement)
         case SchemaOp.RebuildTable(before, after)
+        case SchemaOp.InsertData(seedTable, seedColumns, seedValues)
+        case SchemaOp.UpdateData(seedTable, seedKeys, seedKeyValues, seedColumns, seedValues)
+        case SchemaOp.DeleteData(seedTable, seedKeys, seedKeyValues)
           return false
       end
     case SchemaOp.DropColumn(table, column)
@@ -334,9 +538,13 @@ def schemaDuplicateOperation(left: readonly SchemaOp, right: readonly SchemaOp):
         case SchemaOp.AddColumn(other, otherColumn)
         case SchemaOp.RenameTable(from, to)
         case SchemaOp.RenameColumn(other, from, to)
-        case SchemaOp.CreateIndex(name, other, columns, unique)
+        case SchemaOp.CreateIndex(name, other, columns, unique, indexFacets)
         case SchemaOp.DropIndex(name)
+        case SchemaOp.Sql(statement)
         case SchemaOp.RebuildTable(before, after)
+        case SchemaOp.InsertData(seedTable, seedColumns, seedValues)
+        case SchemaOp.UpdateData(seedTable, seedKeys, seedKeyValues, seedColumns, seedValues)
+        case SchemaOp.DeleteData(seedTable, seedKeys, seedKeyValues)
           return false
       end
     case SchemaOp.RenameTable(from, to)
@@ -348,9 +556,13 @@ def schemaDuplicateOperation(left: readonly SchemaOp, right: readonly SchemaOp):
         case SchemaOp.AddColumn(other, column)
         case SchemaOp.DropColumn(other, column)
         case SchemaOp.RenameColumn(other, otherFrom, otherTo)
-        case SchemaOp.CreateIndex(name, other, columns, unique)
+        case SchemaOp.CreateIndex(name, other, columns, unique, indexFacets)
         case SchemaOp.DropIndex(name)
+        case SchemaOp.Sql(statement)
         case SchemaOp.RebuildTable(before, after)
+        case SchemaOp.InsertData(seedTable, seedColumns, seedValues)
+        case SchemaOp.UpdateData(seedTable, seedKeys, seedKeyValues, seedColumns, seedValues)
+        case SchemaOp.DeleteData(seedTable, seedKeys, seedKeyValues)
           return false
       end
     case SchemaOp.RenameColumn(table, from, to)
@@ -362,14 +574,18 @@ def schemaDuplicateOperation(left: readonly SchemaOp, right: readonly SchemaOp):
         case SchemaOp.AddColumn(other, column)
         case SchemaOp.DropColumn(other, column)
         case SchemaOp.RenameTable(otherFrom, otherTo)
-        case SchemaOp.CreateIndex(name, other, columns, unique)
+        case SchemaOp.CreateIndex(name, other, columns, unique, indexFacets)
         case SchemaOp.DropIndex(name)
+        case SchemaOp.Sql(statement)
         case SchemaOp.RebuildTable(before, after)
+        case SchemaOp.InsertData(seedTable, seedColumns, seedValues)
+        case SchemaOp.UpdateData(seedTable, seedKeys, seedKeyValues, seedColumns, seedValues)
+        case SchemaOp.DeleteData(seedTable, seedKeys, seedKeyValues)
           return false
       end
-    case SchemaOp.CreateIndex(name, table, columns, unique)
+    case SchemaOp.CreateIndex(name, table, columns, unique, indexFacets)
       match right
-        case SchemaOp.CreateIndex(otherName, otherTable, otherColumns, otherUnique)
+        case SchemaOp.CreateIndex(otherName, otherTable, otherColumns, otherUnique, indexFacets)
           return schemaSameIdentifier(name, otherName)
         case SchemaOp.CreateTable(other, otherColumns)
         case SchemaOp.DropTable(other)
@@ -378,7 +594,11 @@ def schemaDuplicateOperation(left: readonly SchemaOp, right: readonly SchemaOp):
         case SchemaOp.RenameTable(from, to)
         case SchemaOp.RenameColumn(other, from, to)
         case SchemaOp.DropIndex(otherName)
+        case SchemaOp.Sql(statement)
         case SchemaOp.RebuildTable(before, after)
+        case SchemaOp.InsertData(seedTable, seedColumns, seedValues)
+        case SchemaOp.UpdateData(seedTable, seedKeys, seedKeyValues, seedColumns, seedValues)
+        case SchemaOp.DeleteData(seedTable, seedKeys, seedKeyValues)
           return false
       end
     case SchemaOp.DropIndex(name)
@@ -391,24 +611,36 @@ def schemaDuplicateOperation(left: readonly SchemaOp, right: readonly SchemaOp):
         case SchemaOp.DropColumn(other, column)
         case SchemaOp.RenameTable(from, to)
         case SchemaOp.RenameColumn(other, from, to)
-        case SchemaOp.CreateIndex(otherName, other, columns, unique)
+        case SchemaOp.CreateIndex(otherName, other, columns, unique, indexFacets)
+        case SchemaOp.Sql(statement)
         case SchemaOp.RebuildTable(before, after)
+        case SchemaOp.InsertData(seedTable, seedColumns, seedValues)
+        case SchemaOp.UpdateData(seedTable, seedKeys, seedKeyValues, seedColumns, seedValues)
+        case SchemaOp.DeleteData(seedTable, seedKeys, seedKeyValues)
           return false
       end
     case SchemaOp.RebuildTable(before, after)
       match right
         case SchemaOp.RebuildTable(otherBefore, otherAfter)
           return schemaSameIdentifier(before.name(), otherBefore.name())
+        case SchemaOp.Sql(statement)
         case SchemaOp.CreateTable(other, columns)
         case SchemaOp.DropTable(other)
         case SchemaOp.AddColumn(other, column)
         case SchemaOp.DropColumn(other, column)
         case SchemaOp.RenameTable(from, to)
         case SchemaOp.RenameColumn(other, from, to)
-        case SchemaOp.CreateIndex(name, other, columns, unique)
+        case SchemaOp.CreateIndex(name, other, columns, unique, indexFacets)
         case SchemaOp.DropIndex(name)
+        case SchemaOp.InsertData(seedTable, seedColumns, seedValues)
+        case SchemaOp.UpdateData(seedTable, seedKeys, seedKeyValues, seedColumns, seedValues)
+        case SchemaOp.DeleteData(seedTable, seedKeys, seedKeyValues)
           return false
       end
+    case SchemaOp.InsertData(seedTable, seedColumns, seedValues)
+    case SchemaOp.UpdateData(seedTable, seedKeys, seedKeyValues, seedColumns, seedValues)
+    case SchemaOp.DeleteData(seedTable, seedKeys, seedKeyValues)
+      return false
   end
   return false
 end
@@ -418,13 +650,13 @@ def schemaRebuildValidation(before: readonly SchemaTable, after: readonly Schema
     return "table rebuild exceeds 1000 objects"
   end
   let oldModel = new SchemaModel([before.copy()])
-  let oldError = oldModel.validate()
+  let oldError = oldModel.validate(false)
 
   if oldError != null
     return oldError
   end
   let newModel = new SchemaModel([after.copy()])
-  let newError = newModel.validate()
+  let newError = newModel.validate(false)
 
   if newError != null
     return newError
@@ -459,34 +691,52 @@ def schemaRebuildValidation(before: readonly SchemaTable, after: readonly Schema
       )
         return "column case-only rename is unsupported"
       end
-      if previous == null && (target.column().primaryKey() || (!target.column().nullable() && target.column().defaultValue() == null))
+      if previous == null && (target.column().primaryKey() || (!target.column().nullable() && target.column().defaultValue() == null && target.column().defaultSql() == null && target.column().computedSql() == null))
         return "added column requires nullable or defaulted non-primary-key definition"
       end
     end
     targetIndex = targetIndex + 1
   end
-  var keyIdentity = ""
+  var oldKeys = 0
+  var newKeys = 0
   var index = 0
 
   while index < before.count()
     let field = before.at(index)
 
     if field != null && field.column().primaryKey()
-      keyIdentity = field.identity()
+      oldKeys = oldKeys + 1
+      let other = after.find(field.identity())
+
+      if other == null || !other.column().primaryKey() || schemaTypeCode(field.column().type()) != schemaTypeCode(other.column().type()) || field.column().nullable() != other.column().nullable() || schemaDefaultCode(field.column().defaultValue()) != schemaDefaultCode(other.column().defaultValue()) || field.column().keyPosition() != other.column().keyPosition()
+        return "primary key change is unsupported"
+      end
     end
     index = index + 1
   end
-  let oldKey = before.find(keyIdentity)
-  let newKey = after.find(keyIdentity)
+  index = 0
+  while index < after.count()
+    let field = after.at(index)
 
-  if oldKey == null || newKey == null || !newKey.column().primaryKey() || schemaTypeCode(oldKey.column().type()) != schemaTypeCode(newKey.column().type()) || oldKey.column().nullable() != newKey.column().nullable() || schemaDefaultCode(oldKey.column().defaultValue()) != schemaDefaultCode(newKey.column().defaultValue())
+    newKeys = newKeys + 1 if field != null && field.column().primaryKey()
+    index = index + 1
+  end
+  if oldKeys != newKeys
     return "primary key change is unsupported"
   end
   return null
 end
 
 def schemaOperationValidation(op: readonly SchemaOp): String?
+  var dialect = SqlDialect.QuestionMark()
+
   match op
+    case SchemaOp.Sql(statement)
+      return schemaTrustedSqlFailure(statement)
+    case SchemaOp.InsertData(table, columns, values)
+    case SchemaOp.UpdateData(table, keys, keyValues, columns, values)
+    case SchemaOp.DeleteData(table, keys, keyValues)
+      return schemaSeedValidation(op)
     case SchemaOp.RebuildTable(before, after)
       return schemaRebuildValidation(before, after)
     case SchemaOp.CreateTable(table, columns)
@@ -495,10 +745,13 @@ def schemaOperationValidation(op: readonly SchemaOp): String?
     case SchemaOp.DropColumn(table, column)
     case SchemaOp.RenameTable(from, to)
     case SchemaOp.RenameColumn(table, from, to)
-    case SchemaOp.CreateIndex(name, table, columns, unique)
+    case SchemaOp.CreateIndex(name, table, columns, unique, indexFacets)
+      if indexFacets != null && indexFacets.include().Length > 0
+        dialect = SqlDialect.PostgreSql()
+      end
     case SchemaOp.DropIndex(name)
   end
-  match compileSchema(op, SqlDialect.QuestionMark())
+  match compileSchema(op, dialect)
     case SchemaCompileResult.Failure(message)
       return message
     case SchemaCompileResult.Statement(sql)
@@ -514,10 +767,10 @@ class Migration
 
   def init(id: String, up: SchemaOp[], down: SchemaOp[]): Void
     this.storedId = id
-    this.forward = tasks::generate(up.Length, 1) do |index|
+    this.forward = arrays::generate(up.Length) do |index|
       return schemaCloneOp(up[index])
     end
-    this.reverse = tasks::generate(down.Length, 1) do |index|
+    this.reverse = arrays::generate(down.Length) do |index|
       return schemaCloneOp(down[index])
     end
     var content = "v1" + schemaPiece(id) + schemaPiece(this.forward.Length as String)
@@ -564,10 +817,10 @@ class Migration
   end
 
   internal readonly def copy(): Migration
-    let up: SchemaOp[] = tasks::generate(this.forward.Length, 1) do |index|
+    let up: SchemaOp[] = arrays::generate(this.forward.Length) do |index|
       return schemaCloneOp(this.forward[index])
     end
-    let down: SchemaOp[] = tasks::generate(this.reverse.Length, 1) do |index|
+    let down: SchemaOp[] = arrays::generate(this.reverse.Length) do |index|
       return schemaCloneOp(this.reverse[index])
     end
 
@@ -579,7 +832,7 @@ class MigrationSet
   private ordered: Migration[]
 
   def init(migrations: Migration[]): Void
-    this.ordered = tasks::generate(migrations.Length, 1) do |index|
+    this.ordered = arrays::generate(migrations.Length) do |index|
       return migrations[index].copy()
     end
   end
@@ -710,12 +963,38 @@ def schemaTextLiteral(value: String): String
   return output + host::stringSlice(value, start, host::stringByteLength(value) - start) + "'"
 end
 
-def schemaColumnSql(column: readonly SchemaColumn, adding: Bool = false): SchemaCompileResult
+def schemaColumnSql(
+  column: readonly SchemaColumn,
+  adding: Bool = false,
+  dialect: SqlDialect = SqlDialect.QuestionMark(),
+  compositeKey: Bool = false
+): SchemaCompileResult
   if !identifierValid(column.name())
     return SchemaCompileResult.Failure("invalid column identifier")
   end
+  let defaultSql = column.defaultSql()
+  let computedSql = column.computedSql()
+  let checkSql = column.checkSql()
+  let collation = column.collation()
+
+  if (defaultSql != null && !schemaExpressionValid(defaultSql)) || (computedSql != null && !schemaExpressionValid(computedSql)) || (checkSql != null && !schemaExpressionValid(checkSql)) || (collation != null && !identifierValid(collation))
+    return SchemaCompileResult.Failure("invalid authored column expression or collation")
+  end
+  if (defaultSql != null && column.defaultValue() != null) || (computedSql != null && (defaultSql != null || column.defaultValue() != null || column.primaryKey()))
+    return SchemaCompileResult.Failure("computed columns and SQL defaults require exclusive generation definitions")
+  end
+  if column.primaryKey() && defaultSql != null
+    return SchemaCompileResult.Failure("primary key cannot have a SQL default")
+  end
   if column.primaryKey() && (column.nullable() || column.defaultValue() != null || adding)
     return SchemaCompileResult.Failure("primary key must be required Int or Text without default and created with table")
+  end
+  var postgres = false
+
+  match dialect
+    case SqlDialect.PostgreSql()
+      postgres = true
+    case SqlDialect.QuestionMark()
   end
   var kind = ""
 
@@ -724,27 +1003,42 @@ def schemaColumnSql(column: readonly SchemaColumn, adding: Bool = false): Schema
       if column.primaryKey()
         return SchemaCompileResult.Failure("primary key must be Int or Text")
       end
-      kind = "INTEGER"
+      kind = postgres ? "BOOLEAN" : "INTEGER"
     case SchemaType.Int()
-      kind = "INTEGER"
+      kind = postgres ? "BIGINT" : "INTEGER"
     case SchemaType.Float()
       if column.primaryKey()
         return SchemaCompileResult.Failure("primary key must be Int or Text")
       end
-      kind = "REAL"
+      kind = postgres ? "DOUBLE PRECISION" : "REAL"
     case SchemaType.Text()
       kind = "TEXT"
+    case SchemaType.Binary()
+      if column.primaryKey()
+        return SchemaCompileResult.Failure("primary key must be Int or Text")
+      end
+      kind = postgres ? "BYTEA" : "BLOB"
   end
   var sql = schemaQuote(column.name()) + " " + kind
 
+  if collation != null
+    if kind != "TEXT"
+      return SchemaCompileResult.Failure("collation requires a text column")
+    end
+    sql = sql + " COLLATE " + schemaQuote(collation)
+  end
+  if computedSql != null
+    sql = sql + " GENERATED ALWAYS AS (" + computedSql + ") " + (column.computedStored() ? "STORED" : "VIRTUAL")
+  end
+
   if column.primaryKey()
-    sql = sql + (kind == "TEXT" ? " NOT NULL PRIMARY KEY" : " PRIMARY KEY")
+    sql = sql + (compositeKey ? " NOT NULL" : (kind == "INTEGER" ? " PRIMARY KEY" : " NOT NULL PRIMARY KEY"))
   else if !column.nullable()
     sql = sql + " NOT NULL"
   end
   let defaultValue = column.defaultValue()
 
-  if adding && !column.nullable() && defaultValue == null
+  if adding && !column.nullable() && defaultValue == null && defaultSql == null && computedSql == null
     return SchemaCompileResult.Failure("required added column requires a typed default")
   end
   if defaultValue != null
@@ -757,12 +1051,14 @@ def schemaColumnSql(column: readonly SchemaColumn, adding: Bool = false): Schema
       case SchemaDefault.Bool(value)
         match column.type()
           case SchemaType.Bool()
-            sql = sql + (value ? " DEFAULT 1" : " DEFAULT 0")
+            sql = sql + (postgres ? (value ? " DEFAULT TRUE" : " DEFAULT FALSE") : (value ? " DEFAULT 1" : " DEFAULT 0"))
           case SchemaType.Int()
             return SchemaCompileResult.Failure("column default type mismatch")
           case SchemaType.Float()
             return SchemaCompileResult.Failure("column default type mismatch")
           case SchemaType.Text()
+            return SchemaCompileResult.Failure("column default type mismatch")
+          case SchemaType.Binary()
             return SchemaCompileResult.Failure("column default type mismatch")
         end
       case SchemaDefault.Int(value)
@@ -774,6 +1070,8 @@ def schemaColumnSql(column: readonly SchemaColumn, adding: Bool = false): Schema
           case SchemaType.Float()
             return SchemaCompileResult.Failure("column default type mismatch")
           case SchemaType.Text()
+            return SchemaCompileResult.Failure("column default type mismatch")
+          case SchemaType.Binary()
             return SchemaCompileResult.Failure("column default type mismatch")
         end
       case SchemaDefault.Float(value)
@@ -788,6 +1086,8 @@ def schemaColumnSql(column: readonly SchemaColumn, adding: Bool = false): Schema
           case SchemaType.Int()
             return SchemaCompileResult.Failure("column default type mismatch")
           case SchemaType.Text()
+            return SchemaCompileResult.Failure("column default type mismatch")
+          case SchemaType.Binary()
             return SchemaCompileResult.Failure("column default type mismatch")
         end
       case SchemaDefault.Text(value)
@@ -808,9 +1108,13 @@ def schemaColumnSql(column: readonly SchemaColumn, adding: Bool = false): Schema
             return SchemaCompileResult.Failure("column default type mismatch")
           case SchemaType.Float()
             return SchemaCompileResult.Failure("column default type mismatch")
+          case SchemaType.Binary()
+            return SchemaCompileResult.Failure("column default type mismatch")
         end
     end
   end
+  sql = sql + " DEFAULT (" + defaultSql + ")" if defaultSql != null
+  sql = sql + " CONSTRAINT " + schemaQuote("neri_ck_" + column.name()) + " CHECK (" + checkSql + ")" if checkSql != null
   return SchemaCompileResult.Statement(sql)
 end
 
@@ -819,26 +1123,62 @@ def schemaTableValid(table: String): Bool
 end
 
 def compileSchema(op: readonly SchemaOp, dialect: SqlDialect): SchemaCompileResult
+  match op
+    case SchemaOp.Sql(statement)
+      let failure = schemaTrustedSqlFailure(statement, dialect)
+
+      return failure == null ? SchemaCompileResult.Statement(statement) : SchemaCompileResult.Failure(failure)
+    case SchemaOp.CreateTable(table, columns)
+    case SchemaOp.DropTable(table)
+    case SchemaOp.AddColumn(table, column)
+    case SchemaOp.DropColumn(table, column)
+    case SchemaOp.RenameTable(from, to)
+    case SchemaOp.RenameColumn(table, from, to)
+    case SchemaOp.CreateIndex(name, table, columns, unique, facets)
+    case SchemaOp.DropIndex(name)
+    case SchemaOp.RebuildTable(before, after)
+    case SchemaOp.InsertData(table, columns, values)
+    case SchemaOp.UpdateData(table, keys, keyValues, columns, values)
+    case SchemaOp.DeleteData(table, keys, keyValues)
+  end
   match dialect
     case SqlDialect.PostgreSql()
-      return SchemaCompileResult.Failure("schema compiler supports SQLite dialect only")
+      if !schemaPostgresOpNamesValid(op)
+        return SchemaCompileResult.Failure("PostgreSQL identifiers, including generated constraint names, must fit 63 UTF-8 bytes")
+      end
     case SqlDialect.QuestionMark()
   end
+  if schemaSeedOperation(op)
+    match compileSeed(op, dialect, true)
+      case SetPlanResult.Plan(plan)
+        return SchemaCompileResult.Statement(plan.sql())
+      case SetPlanResult.Failure(error)
+        return SchemaCompileResult.Failure(writeFailureMessage(error))
+    end
+  end
   match op
+    case SchemaOp.Sql(statement)
+      return SchemaCompileResult.Failure("invalid trusted SQL operation")
+    case SchemaOp.InsertData(table, columns, values)
+      return SchemaCompileResult.Failure("invalid seed operation")
+    case SchemaOp.UpdateData(table, keys, keyValues, columns, values)
+      return SchemaCompileResult.Failure("invalid seed operation")
+    case SchemaOp.DeleteData(table, keys, keyValues)
+      return SchemaCompileResult.Failure("invalid seed operation")
     case SchemaOp.CreateTable(table, columns)
       if !schemaTableValid(table) || columns.Length == 0
         return SchemaCompileResult.Failure("create table requires valid name and columns")
       end
       var columnsSql = ""
       var primaryKeys = 0
+
+      for column in columns
+        primaryKeys = primaryKeys + 1 if column.primaryKey()
+      end
       var index = 0
 
       while index < columns.Length
         let column = columns[index]
-
-        if column.primaryKey()
-          primaryKeys = primaryKeys + 1
-        end
         var prior = 0
 
         while prior < index
@@ -847,7 +1187,7 @@ def compileSchema(op: readonly SchemaOp, dialect: SqlDialect): SchemaCompileResu
           end
           prior = prior + 1
         end
-        match schemaColumnSql(column)
+        match schemaColumnSql(column, dialect: dialect, compositeKey: primaryKeys > 1)
           case SchemaCompileResult.Failure(message)
             return SchemaCompileResult.Failure(message)
           case SchemaCompileResult.Statement(sql)
@@ -855,8 +1195,14 @@ def compileSchema(op: readonly SchemaOp, dialect: SqlDialect): SchemaCompileResu
         end
         index = index + 1
       end
-      if primaryKeys != 1
-        return SchemaCompileResult.Failure("table requires exactly one Int or Text primary key")
+      if primaryKeys == 0
+        return SchemaCompileResult.Failure("table requires an Int or Text primary key")
+      end
+      match schemaTableConstraints(columns)
+        case SchemaCompileResult.Failure(message)
+          return SchemaCompileResult.Failure(message)
+        case SchemaCompileResult.Statement(sql)
+          columnsSql = columnsSql + sql
       end
       return SchemaCompileResult.Statement("CREATE TABLE " + schemaQuote(table) + " (" + columnsSql + ")")
     case SchemaOp.DropTable(table)
@@ -868,7 +1214,10 @@ def compileSchema(op: readonly SchemaOp, dialect: SqlDialect): SchemaCompileResu
       if !schemaTableValid(table)
         return SchemaCompileResult.Failure("invalid or reserved table name")
       end
-      match schemaColumnSql(column, true)
+      if column.reference() != null
+        return SchemaCompileResult.Failure("foreign-key additions require a table rebuild")
+      end
+      match schemaColumnSql(column, true, dialect)
         case SchemaCompileResult.Failure(message)
           return SchemaCompileResult.Failure(message)
         case SchemaCompileResult.Statement(sql)
@@ -889,8 +1238,19 @@ def compileSchema(op: readonly SchemaOp, dialect: SqlDialect): SchemaCompileResu
         return SchemaCompileResult.Failure("invalid column rename")
       end
       return SchemaCompileResult.Statement("ALTER TABLE " + schemaQuote(table) + " RENAME COLUMN " + schemaQuote(from) + " TO " + schemaQuote(to))
-    case SchemaOp.CreateIndex(name, table, columns, unique)
-      if !identifierValid(name) || schemaReserved(name) || !schemaTableValid(table) || columns.Length == 0
+    case SchemaOp.CreateIndex(name, table, columns, unique, indexFacets)
+      var expressions: String[] = []
+      var descending: Bool[] = []
+      var included: String[] = []
+
+      if indexFacets != null
+        expressions = indexFacets.expressions()
+        descending = indexFacets.descending()
+        included = indexFacets.include()
+      end
+      let predicate = indexFacets == null ? null : indexFacets.predicate()
+
+      if !identifierValid(name) || schemaReserved(name) || !schemaTableValid(table) || columns.Length + expressions.Length == 0 || columns.Length + expressions.Length > 1000 || (descending.Length != 0 && descending.Length != columns.Length + expressions.Length) || (predicate != null && !schemaExpressionValid(predicate))
         return SchemaCompileResult.Failure("invalid index definition")
       end
       var names = ""
@@ -908,16 +1268,59 @@ def compileSchema(op: readonly SchemaOp, dialect: SqlDialect): SchemaCompileResu
           end
           prior = prior + 1
         end
-        names = names + (index == 0 ? "" : ", ") + schemaQuote(columns[index])
+        names = names + (index == 0 ? "" : ", ") + schemaQuote(columns[index]) + (descending.Length != 0 && descending[index] ? " DESC" : "")
         index = index + 1
       end
-      return SchemaCompileResult.Statement("CREATE " + (unique ? "UNIQUE " : "") + "INDEX " + schemaQuote(name) + " ON " + schemaQuote(table) + " (" + names + ")")
+      for expression in expressions
+        if !schemaExpressionValid(expression)
+          return SchemaCompileResult.Failure("invalid index key expression")
+        end
+        names = names + (names == "" ? "" : ", ") + "(" + expression + ")" + (descending.Length != 0 && descending[index] ? " DESC" : "")
+        index = index + 1
+      end
+      var includeSql = ""
+
+      var includeIndex = 0
+
+      for column in included
+        if !identifierValid(column)
+          return SchemaCompileResult.Failure("invalid included index column")
+        end
+        for key in columns
+          if schemaSameIdentifier(column, key)
+            return SchemaCompileResult.Failure("included index column duplicates a key column")
+          end
+        end
+        var prior = 0
+
+        while prior < includeIndex
+          if schemaSameIdentifier(column, included[prior])
+            return SchemaCompileResult.Failure("duplicate included index column")
+          end
+          prior = prior + 1
+        end
+        includeSql = includeSql + (includeSql == "" ? "" : ", ") + schemaQuote(column)
+        includeIndex = includeIndex + 1
+      end
+      if includeSql != ""
+        match dialect
+          case SqlDialect.QuestionMark()
+            return SchemaCompileResult.Failure("included index columns require PostgreSQL")
+          case SqlDialect.PostgreSql()
+        end
+      end
+      return SchemaCompileResult.Statement("CREATE " + (unique ? "UNIQUE " : "") + "INDEX " + schemaQuote(name) + " ON " + schemaQuote(table) + " (" + names + ")" + (includeSql == "" ? "" : " INCLUDE (" + includeSql + ")") + (predicate == null ? "" : " WHERE " + predicate))
     case SchemaOp.DropIndex(name)
       if !identifierValid(name) || schemaReserved(name)
         return SchemaCompileResult.Failure("invalid or reserved index name")
       end
       return SchemaCompileResult.Statement("DROP INDEX " + schemaQuote(name))
     case SchemaOp.RebuildTable(before, after)
-      return SchemaCompileResult.Failure("table rebuild requires SQLite provider execution")
+      match dialect
+        case SqlDialect.PostgreSql()
+          return schemaPostgresRebuild(before, after)
+        case SqlDialect.QuestionMark()
+          return SchemaCompileResult.Failure("table rebuild requires SQLite provider execution")
+      end
   end
 end

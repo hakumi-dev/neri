@@ -1,0 +1,258 @@
+use neri_data
+use neri_data_sqlite
+use neri_data_sqlite_fixture
+use neri_data_async_contract
+use neri_data_schema_contract
+use resources
+use result
+use test
+
+def asyncMaterialization(path: String): resources::Outcome<Int, QueryFailure>
+  match SQLiteAsyncProvider.open(path)
+    case result::Result.Error(error)
+      return QueryFailure.Provider(error)
+    case result::Result.Ok(provider)
+      verifyAsyncProviderWrites(provider)
+      verifyAsyncProviderTrackedSave(provider)
+      verifyAsyncProviderSetWrites(provider)
+      verifyAsyncProviderMigrations(provider)
+      verifySQLiteAsyncSchemaRebuild(provider)
+      verifySQLiteAsyncTrustedSql(provider, path)
+      let columns = new ResultColumns([new ResultColumn("id", ResultColumnKind.Int())])
+      let read: fn(RawRow): DecodeResult<Int> = fn(row: RawRow): DecodeResult<Int> do
+        return decodeInt(row, "id")
+      end
+      let typed = new TypedPlan<Int>(
+        new SqlPlan("SELECT id FROM records ORDER BY id", new ParameterValues(), 1000, columns),
+        new Decoder<Int>(read, columns)
+      )
+
+      using operation <- startAsyncQuery<Int>(provider, typed, new StreamOptions(timeoutMilliseconds: 10000))
+        var done = false
+
+        while !done
+          match operation.poll()
+            case AsyncQueryPoll.Pending(socket, interest)
+              continue
+            case AsyncQueryPoll.Completed(result)
+              done = true
+              match result
+                case QueryResult.Failure(error)
+                  provider.closeFailure()
+                  return error
+                case QueryResult.Rows(rows)
+                  test::assertEqual(rows.count(), 1201)
+              end
+          end
+        end
+        let cancellation = new CancellationToken()
+
+        match provider.beginReadAsync(
+          new SqlPlan(
+            "WITH RECURSIVE n(v) AS (SELECT 1 UNION ALL SELECT v+1 FROM n WHERE v<100000000) SELECT SUM(v) AS id FROM n",
+            new ParameterValues(),
+            1,
+            columns
+          ),
+          new StreamOptions(token: cancellation, timeoutMilliseconds: 10000)
+        )
+          case AsyncReadStart.Failure(error)
+            provider.closeFailure()
+            return QueryFailure.Provider(error)
+          case AsyncReadStart.Started(driver)
+            cancellation.cancel()
+            var waiting = true
+
+            while waiting
+              match driver.poll()
+                case AsyncReadPoll.Pending(socket, interest)
+                  continue
+                case AsyncReadPoll.Failure(error)
+                  waiting = false
+                  match error
+                    case ProviderFailure.Driver(details)
+                      test::assertTrue(details.primaryCode() == 9)
+                    case ProviderFailure.State(message)
+                      test::assertTrue(false)
+                    case ProviderFailure.Cleanup(cleanup)
+                      test::assertTrue(false)
+                  end
+                case AsyncReadPoll.Completed()
+                  test::assertTrue(false)
+                  waiting = false
+                case AsyncReadPoll.Row(row)
+                  test::assertTrue(false)
+                  waiting = false
+              end
+            end
+            driver.close()
+        end
+
+        test::assertTrue(provider.closeFailure() == null)
+        return 0
+      end
+  end
+  return 1
+end
+
+def isolatedContract(): resources::Outcome<Int, result::Failure>
+  using directory <- files::TemporaryDirectory.create("neri-async-sqlite-")
+    let path = directory.path() + "/records.sqlite"
+
+    test::assertTrue(createSQLiteFixture(
+        path,
+        "CREATE TABLE neri_async_write_values(id INTEGER PRIMARY KEY,label TEXT NOT NULL); CREATE TABLE records(id INTEGER NOT NULL); WITH RECURSIVE n(v) AS (SELECT 1 UNION ALL SELECT v+1 FROM n WHERE v<1201) INSERT INTO records SELECT v FROM n;"
+      ))
+    let outcome = asyncMaterialization(path)
+
+    test::assertEqual(outcome.closeFailures.count(), 0)
+    match outcome.completion
+      case resources::Completion.Value(code)
+        test::assertEqual(code, 0)
+      case resources::Completion.Failure(error)
+        test::assertTrue(false)
+    end
+    return 0
+  end
+  return 1
+end
+
+def main(): Void
+  let outcome = isolatedContract()
+
+  test::assertEqual(outcome.closeFailures.count(), 0)
+  match outcome.completion
+    case resources::Completion.Value(code)
+      test::assertEqual(code, 0)
+    case resources::Completion.Failure(error)
+      test::assertTrue(false)
+  end
+end
+
+## Full worker catalog copies preserve rebuild definitions and foreign-key tuples.
+def verifySQLiteAsyncTrustedSql(provider: SQLiteAsyncProvider, path: String): Void
+  match SQLiteProvider.open(path)
+    case SQLiteOpenResult.Failure(error)
+      test::assertTrue(false)
+    case SQLiteOpenResult.Opened(reader)
+      let migrate: fn(
+        MigrationSet,
+        String?
+      ): MigrationResult = fn(
+        catalog: MigrationSet,
+        target: String?
+      ): MigrationResult do
+        return awaitAsyncMigration(provider.beginMigrationAsync(catalog, target))
+      end
+
+      verifyTrustedMigrationSql(reader, migrate, false)
+
+      test::assertTrue(reader.close())
+  end
+end
+
+def verifySQLiteAsyncSchemaRebuild(provider: SQLiteAsyncProvider): Void
+  let principal = new SchemaColumn("id", SchemaType.Int(), primaryKey: true)
+  let dependent = new SchemaColumn(
+    "parent_id",
+    SchemaType.Int(),
+    reference: new SchemaReference("neri_async_parent", ["id"], ["parent_id"], "CASCADE")
+  )
+  let fields = [
+    new SchemaField("id", new SchemaColumn("id", SchemaType.Int(), primaryKey: true)),
+    new SchemaField("parent", dependent)
+  ]
+  let before = new SchemaTable("async_child", "neri_async_child", fields)
+  let after = new SchemaTable("async_child", "neri_async_child", [
+      fields[0], fields[1], new SchemaField("label", new SchemaColumn("label", SchemaType.Text(), nullable: true))
+    ])
+  let catalog = new MigrationSet([
+      new Migration("async_rebuild_001", [
+          SchemaOp.CreateTable("neri_async_parent", [principal]),
+          SchemaOp.CreateTable(
+            "neri_async_child",
+            [new SchemaColumn("id", SchemaType.Int(), primaryKey: true), dependent]
+          )
+        ], [SchemaOp.DropTable("neri_async_child"), SchemaOp.DropTable("neri_async_parent")]),
+      new Migration("async_rebuild_002", [SchemaOp.RebuildTable(before, after)], [SchemaOp.RebuildTable(after, before)])
+    ])
+
+  asyncMigrationApplied(awaitAsyncMigration(provider.beginMigrationAsync(catalog, "async_rebuild_001")), 1)
+  match awaitAsyncWrite(provider.beginSetAsync(new SetWritePlan(
+        "INSERT INTO neri_async_parent VALUES(7)",
+        new WriteValues()
+      )))
+    case WriteResult.Saved(count)
+      test::assertEqual(count, 1)
+    case WriteResult.SavedWithValues(count, rows)
+      test::assertTrue(false)
+    case WriteResult.Failure(error)
+      test::assertTrue(false)
+  end
+  match awaitAsyncWrite(provider.beginSetAsync(new SetWritePlan(
+        "INSERT INTO neri_async_child VALUES(9,7)",
+        new WriteValues()
+      )))
+    case WriteResult.Saved(count)
+      test::assertEqual(count, 1)
+    case WriteResult.SavedWithValues(count, rows)
+      test::assertTrue(false)
+    case WriteResult.Failure(error)
+      test::assertTrue(false)
+  end
+  asyncMigrationApplied(awaitAsyncMigration(provider.beginMigrationAsync(catalog)), 1)
+  let columns = new ResultColumns([
+      new ResultColumn("id", ResultColumnKind.Int()),
+      new ResultColumn("label", ResultColumnKind.Text(), true)
+    ])
+
+  match provider.beginReadAsync(new SqlPlan("SELECT id,label FROM neri_async_child", new ParameterValues(), 1, columns))
+    case AsyncReadStart.Failure(error)
+      test::assertTrue(false)
+    case AsyncReadStart.Started(driver)
+      var done = false
+      var count = 0
+
+      while !done
+        match driver.poll()
+          case AsyncReadPoll.Pending(socket, interest)
+            continue
+          case AsyncReadPoll.Row(row)
+            count = count + 1
+            match decodeInt(row, "id")
+              case DecodeResult.Value(value)
+                test::assertEqual(value, 9)
+              case DecodeResult.Failure(error)
+                test::assertTrue(false)
+            end
+            match row.value("label")
+              case CellLookup.Found(value)
+                match value
+                  case Cell.Null()
+                  case Cell.Text(item)
+                    test::assertTrue(false)
+                  case Cell.Bool(item)
+                    test::assertTrue(false)
+                  case Cell.Int(item)
+                    test::assertTrue(false)
+                  case Cell.Float(item)
+                    test::assertTrue(false)
+                  case Cell.Binary(item)
+                    test::assertTrue(false)
+                end
+              case CellLookup.Missing()
+                test::assertTrue(false)
+            end
+          case AsyncReadPoll.Failure(error)
+            test::assertTrue(false)
+            done = true
+          case AsyncReadPoll.Completed()
+            done = true
+        end
+      end
+
+      test::assertEqual(count, 1)
+      test::assertTrue(driver.close() == null)
+  end
+  asyncMigrationApplied(awaitAsyncMigration(provider.beginMigrationAsync(catalog, "")), 2)
+end

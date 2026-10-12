@@ -1,3 +1,4 @@
+use buffers
 use host
 use neri_data
 namespace neri_data_sqlite
@@ -94,6 +95,22 @@ unsafe def sqliteBindNull(statement: Void*, index: Int32): Int32
 end
 
 @library("sqlite3")
+@cabiImport("sqlite3_bind_blob")
+unsafe def sqliteBindBlob(
+  statement: Void*,
+  index: Int32,
+  value: Byte*,
+  length: Int32,
+  destructor: (cabi fn(Void*): Void)?
+): Int32
+end
+
+@library("sqlite3")
+@cabiImport("sqlite3_column_blob")
+unsafe def sqliteColumnBlob(statement: Void*, index: Int32): Byte*?
+end
+
+@library("sqlite3")
 @cabiImport("sqlite3_bind_text")
 unsafe def sqliteBindText(
   statement: Void*,
@@ -165,7 +182,9 @@ class SQLiteProvider: neri_data::Provider
   private closed: Bool = false
   private writable: Bool = false
   private poisoned: Bool = false
+  private migrationLegacyAlter: Bool = false
   private streaming: Bool = false
+  private workerCancellation: Bool = false
   private windowFunctions: Bool = false
   private nextLease: Int = 1
   private activeLease: Int = 0
@@ -173,8 +192,83 @@ class SQLiteProvider: neri_data::Provider
   private lastTransactionState: TransactionState = TransactionState.Invalid()
   private nextSavepoint: Int = 1
   private savepoints: SQLiteSavepointNode?
+  private ownsHandle: Bool = true
+  private reconnectPath: String?
+  private reconnectOptions: SQLiteOptions?
 
   def init(): Void
+  end
+
+  ## The caller retains the native handle and exclusively owns its lifetime.
+  public static unsafe def borrowNativeTransaction(database: Void*): SQLiteOpenResult
+    if sqliteAutoCommit(database) != (0 as Int32)
+      return SQLiteOpenResult.Failure(ProviderFailure.State("native SQLite transaction must already be active"))
+    end
+    let failure = sqliteForeignKeysFailure(database)
+
+    if failure != null
+      return SQLiteOpenResult.Failure(failure)
+    end
+    if !sqliteRegisterCheckedScalars(database)
+      return SQLiteOpenResult.Failure(sqliteFailure(database, "borrow.checked_scalars"))
+    end
+    let provider = new SQLiteProvider()
+
+    provider.database = database
+    provider.writable = true
+    provider.ownsHandle = false
+    provider.activeLease = 1
+    provider.lastLease = 1
+    provider.nextLease = 2
+    provider.lastTransactionState = TransactionState.Active()
+    provider.windowFunctions = sqliteVersionNumber() >= (3025000 as Int32)
+    return SQLiteOpenResult.Opened(provider)
+  end
+
+  ## Reuses a borrowed wrapper after the native owner starts its next transaction.
+  public def enlistNativeTransaction(): TransactionOpenResult
+    if this.ownsHandle || this.streaming || this.activeLease != 0 || this.nextLease <= 0 || this.nextLease == 9223372036854775807
+      return TransactionOpenResult.Failure(WriteFailure.Transaction("borrowed SQLite transaction enrollment requires an idle wrapper"))
+    end
+    unsafe
+      let handle = this.database
+
+      if handle == null || !(sqliteAutoCommit(handle) == (0 as Int32))
+        return TransactionOpenResult.Failure(WriteFailure.Transaction("native SQLite transaction must be idle and active"))
+      end
+    end
+    let lease = this.nextLease
+
+    this.nextLease = lease + 1
+    this.activeLease = lease
+    this.lastLease = lease
+    this.lastTransactionState = TransactionState.Active()
+    this.savepoints = null
+    return TransactionOpenResult.Begun(lease)
+  end
+
+  public readonly def nativeTransactionLease(): Int?
+    return this.activeLease == 0 ? null : this.activeLease
+  end
+
+  ## Acknowledges an externally completed outcome only after native transaction exit.
+  public def acknowledgeNativeTransaction(committed: Bool): WriteResult
+    if this.ownsHandle || this.streaming || this.activeLease == 0
+      return WriteResult.Failure(WriteFailure.Transaction("no idle borrowed SQLite transaction to acknowledge"))
+    end
+    unsafe
+      let database = this.database
+
+      if database == null || sqliteAutoCommit(database) == (0 as Int32)
+        return WriteResult.Failure(WriteFailure.Transaction("native SQLite transaction is still active"))
+      end
+    end
+    this.lastLease = this.activeLease
+    this.activeLease = 0
+    this.savepoints = null
+    this.lastTransactionState = committed ? TransactionState.Committed() : TransactionState.RolledBack()
+    this.poisoned = false
+    return WriteResult.Saved(0)
   end
 
   static def open(path: String, options: SQLiteOptions? = null): SQLiteOpenResult
@@ -257,6 +351,8 @@ class SQLiteProvider: neri_data::Provider
       let provider = new SQLiteProvider()
 
       provider.database = result[0]
+      provider.reconnectPath = path
+      provider.reconnectOptions = policy
       match sqliteConfigure(result[0], policy, writable)
         case SQLiteConfigurationResult.Failure(error)
           return SQLiteOpenResult.Failure(sqliteCloseFailure(result[0], error))
@@ -303,6 +399,40 @@ class SQLiteProvider: neri_data::Provider
     return this.effectiveConfiguration
   end
 
+  ## Reopens the same file and retains this provider object for mapped query roots.
+  public def reconnectAfterRollback(): WriteFailure?
+    let path = this.reconnectPath
+
+    if !this.ownsHandle || this.streaming || this.activeLease != 0 || this.poisoned || path == null || path == ":memory:"
+      return WriteFailure.Transaction("SQLite reconnect requires an idle owned file connection")
+    end
+    let opened = SQLiteProvider.openMode(path, this.writable, false, this.reconnectOptions)
+
+    match opened
+      case SQLiteOpenResult.Failure(error)
+        return WriteFailure.Provider(error)
+      case SQLiteOpenResult.Opened(replacement)
+        let failure = this.closeFailure()
+
+        if failure != null
+          let cleanup = replacement.closeFailure()
+
+          return cleanup == null ? WriteFailure.Provider(failure) : WriteFailure.Cleanup(new WriteCleanupFailure(
+              WriteFailure.Provider(failure),
+              WriteFailure.Provider(cleanup)
+            ))
+        end
+        this.database = replacement.database
+        replacement.database = null
+        replacement.closed = true
+        this.closed = false
+        this.effectiveConfiguration = replacement.effectiveConfiguration
+        this.windowFunctions = replacement.windowFunctions
+        return null
+    end
+    return WriteFailure.Transaction("SQLite reconnect did not finish")
+  end
+
   public def close(): Bool
     return this.closeFailure() == null
   end
@@ -310,6 +440,14 @@ class SQLiteProvider: neri_data::Provider
   public def closeFailure(): ProviderFailure?
     if this.streaming
       return ProviderFailure.State("SQLite close could not finish")
+    end
+    if !this.ownsHandle
+      if this.activeLease != 0
+        return ProviderFailure.State("borrowed SQLite transaction requires acknowledged completion before close")
+      end
+      this.database = null
+      this.closed = true
+      return null
     end
     unsafe
       let database = this.database
@@ -388,6 +526,76 @@ class SQLiteProvider: neri_data::Provider
     end
   end
 
+  public def scaffoldSchema(options: SchemaScaffoldOptions? = null): SchemaScaffoldResult
+    match this.inspectSchema()
+      case SQLiteSchemaResult.Snapshot(snapshot)
+        return sqliteScaffoldSchema(snapshot, options)
+      case SQLiteSchemaResult.Failure(error)
+        return SchemaScaffoldResult.Failure(error)
+    end
+  end
+
+  public override def migrationHistory(catalog: readonly MigrationSet): MigrationHistoryResult
+    if this.closed || this.streaming || this.poisoned
+      return MigrationHistoryResult.Failure(MigrationFailure.Unsupported("SQLite provider is unavailable for migration history"))
+    end
+    let invalid = catalog.validate()
+
+    if invalid != null
+      return MigrationHistoryResult.Failure(MigrationFailure.Validation(invalid))
+    end
+    unsafe
+      let database = this.database
+
+      if database == null
+        return MigrationHistoryResult.Failure(MigrationFailure.Provider(ProviderFailure.State("SQLite handle is unavailable")))
+      end
+      let present = sqliteRebuildCheck(
+        database,
+        "SELECT 1 FROM main.sqlite_schema WHERE lower(name) = '__neri_migrations'",
+        MigrationFailure.Validation("history exists")
+      )
+
+      if present == null
+        return MigrationHistoryResult.Loaded([])
+      end
+      match present
+        case MigrationFailure.Validation(message)
+          if message != "history exists"
+            return MigrationHistoryResult.Failure(present)
+          end
+        case MigrationFailure.Drift(message)
+          return MigrationHistoryResult.Failure(present)
+        case MigrationFailure.Unsupported(message)
+          return MigrationHistoryResult.Failure(present)
+        case MigrationFailure.Provider(error)
+          return MigrationHistoryResult.Failure(present)
+        case MigrationFailure.Cleanup(error)
+          return MigrationHistoryResult.Failure(present)
+      end
+      let wrongKind = sqliteRebuildCheck(
+        database,
+        "SELECT 1 FROM main.sqlite_schema WHERE lower(name) = '__neri_migrations' AND type != 'table'",
+        MigrationFailure.Drift("migration history object is not a table")
+      )
+
+      if wrongKind != null
+        return MigrationHistoryResult.Failure(wrongKind)
+      end
+      match sqliteMigrationHistory(database, catalog.count())
+        case SQLiteMigrationHistory.Failure(error)
+          return MigrationHistoryResult.Failure(error)
+        case SQLiteMigrationHistory.Loaded(stamps)
+          let mismatch = catalog.historyPrefix(stamps)
+
+          if mismatch != null
+            return MigrationHistoryResult.Failure(MigrationFailure.Drift(mismatch))
+          end
+          return MigrationHistoryResult.Loaded(stamps)
+      end
+    end
+  end
+
   public def migrate(catalog: readonly MigrationSet, target: String? = null): MigrationResult
     if this.streaming
       return MigrationResult.Failure(MigrationFailure.Unsupported("SQLite provider is busy streaming"))
@@ -449,13 +657,40 @@ class SQLiteProvider: neri_data::Provider
         this.poisoned = true
         return MigrationResult.Failure(MigrationFailure.Provider(ProviderFailure.State("SQLite connection already has an unowned transaction")))
       end
+      match sqliteConfigurationScalar(database, "PRAGMA legacy_alter_table")
+        case result::Result.Error(error)
+          return MigrationResult.Failure(MigrationFailure.Provider(error))
+        case result::Result.Ok(value)
+          if value != "0" && value != "1"
+            return MigrationResult.Failure(MigrationFailure.Provider(ProviderFailure.State("SQLite legacy_alter_table state is invalid")))
+          end
+          this.migrationLegacyAlter = value == "1"
+      end
+      let modern = sqliteExecuteLiteral(database, "PRAGMA legacy_alter_table = OFF")
+
+      if modern != (0 as Int32)
+        return this.failMigration(MigrationFailure.Provider(sqliteFailure(
+              database,
+              "migration.legacy_alter_table",
+              modern
+            )))
+      end
+      let disabled = sqliteExecuteLiteral(database, "PRAGMA foreign_keys = OFF")
+
+      if disabled != (0 as Int32)
+        return this.failMigration(MigrationFailure.Provider(sqliteFailure(
+              database,
+              "migration.foreign_keys",
+              disabled
+            )))
+      end
       let begun = sqliteExecuteLiteral(database, "BEGIN IMMEDIATE")
 
       if begun != (0 as Int32)
         if sqliteAutoCommit(database) == (0 as Int32)
           this.poisoned = true
         end
-        return MigrationResult.Failure(MigrationFailure.Provider(sqliteFailure(database, "migration.begin", begun)))
+        return this.failMigration(MigrationFailure.Provider(sqliteFailure(database, "migration.begin", begun)))
       end
       let historyCreated = sqliteExecuteLiteral(
         database,
@@ -529,6 +764,15 @@ class SQLiteProvider: neri_data::Provider
               index = index - 1
             end
           end
+          let foreignKeyCheck = sqliteRebuildCheck(
+            database,
+            "PRAGMA main.foreign_key_check",
+            MigrationFailure.Validation("migration violates a database foreign key")
+          )
+
+          if foreignKeyCheck != null
+            return this.failMigration(foreignKeyCheck)
+          end
           let committed = sqliteExecuteLiteral(database, "COMMIT")
 
           if committed != (0 as Int32)
@@ -536,6 +780,12 @@ class SQLiteProvider: neri_data::Provider
           end
           if sqliteAutoCommit(database) == (0 as Int32)
             return this.failMigration(MigrationFailure.Provider(ProviderFailure.State("SQLite migration commit did not end the transaction")))
+          end
+          let restored = this.restoreMigrationPragmas()
+
+          if restored != null
+            this.poisoned = true
+            return MigrationResult.Failure(MigrationFailure.Provider(restored))
           end
           return MigrationResult.Applied(count)
       end
@@ -568,7 +818,33 @@ class SQLiteProvider: neri_data::Provider
               )))
         end
       end
+      let restored = this.restoreMigrationPragmas()
+
+      if restored != null
+        this.poisoned = true
+        return MigrationResult.Failure(MigrationFailure.Cleanup(new MigrationCleanupFailure(error, restored)))
+      end
       return MigrationResult.Failure(error)
+    end
+  end
+
+  private def restoreMigrationPragmas(): ProviderFailure?
+    unsafe
+      let database = this.database
+
+      if database == null
+        return ProviderFailure.State("migration pragma restoration cannot access database")
+      end
+      let legacySql = this.migrationLegacyAlter ? "PRAGMA legacy_alter_table = ON" : "PRAGMA legacy_alter_table = OFF"
+      let legacyStatus = sqliteExecuteLiteral(database, legacySql)
+
+      if legacyStatus != (0 as Int32)
+        return sqliteFailure(database, "migration.restore_legacy_alter_table", legacyStatus)
+      end
+      if sqliteExecuteLiteral(database, "PRAGMA foreign_keys = ON") != (0 as Int32)
+        return sqliteFailure(database, "migration.restore_foreign_keys")
+      end
+      return sqliteForeignKeysFailure(database)
     end
   end
 
@@ -712,6 +988,7 @@ class SQLiteProvider: neri_data::Provider
       let deadline = stackalloc SQLiteStreamDeadline[1]
 
       deadline.deadline = 9223372036854775807
+      deadline.workerCancellation = this.workerCancellation ? 1 as Int32 : 0 as Int32
       deadline.expired = 0 as Int32
       deadline.interruptedStatus = 0 as Int32
       deadline.busyBudget = 0
@@ -779,6 +1056,71 @@ class SQLiteProvider: neri_data::Provider
       end
       this.streaming = false
       return result
+    end
+  end
+
+  internal def observeWorkerCancellation(enabled: Bool): Void
+    this.workerCancellation = enabled
+  end
+
+  ## Only invoked on the isolated worker heap; native handles stay there.
+  internal def workerGuard(deadlineMilliseconds: Int?, operation: fn(): WriteResult): WriteResult
+    unsafe
+      let database = this.database
+
+      if database == null
+        return WriteResult.Failure(WriteFailure.Transaction("SQLite worker connection is closed"))
+      end
+      let control = stackalloc SQLiteStreamDeadline[1]
+      let configuration = this.effectiveConfiguration
+
+      control.workerCancellation = deadlineMilliseconds == null ? 0 as Int32 : 1 as Int32
+      control.deadline = deadlineMilliseconds == null ? 9223372036854775807 : deadlineMilliseconds
+      control.expired = 0 as Int32
+      control.interruptedStatus = 0 as Int32
+      control.busyBudget = configuration == null ? 0 : configuration.busyTimeoutMilliseconds()
+      control.busySlept = 0
+      let installed = sqliteBusyHandler(database, sqliteStreamBusy, control as Void*)
+
+      if installed != (0 as Int32)
+        return WriteResult.Failure(sqliteWriteFailure(database, installed, "async.busy_handler"))
+      end
+      sqliteProgressHandler(database, 1000 as Int32, sqliteStreamProgress, control as Void*)
+      var result = operation()
+
+      sqliteProgressHandler(database, 0 as Int32, null, null)
+      let restored = sqliteBusyTimeout(database, control.busyBudget as Int32)
+
+      if restored != (0 as Int32)
+        let cleanup = sqliteWriteFailure(database, restored, "async.busy_timeout.restore")
+
+        match result
+          case WriteResult.Failure(primary)
+            result = WriteResult.Failure(WriteFailure.Cleanup(new WriteCleanupFailure(primary, cleanup)))
+          case WriteResult.Saved(count)
+          case WriteResult.SavedWithValues(count, rows)
+            result = WriteResult.Failure(cleanup)
+        end
+        this.poisoned = true
+      end
+      return result
+    end
+  end
+
+  private def removeWorkerProgressForCleanup(): Void
+    if this.workerCancellation
+      unsafe
+        let database = this.database
+        let configuration = this.effectiveConfiguration
+
+        if database != null
+          sqliteProgressHandler(database, 0 as Int32, null, null)
+          sqliteBusyTimeout(
+            database,
+            configuration == null ? 0 as Int32 : configuration.busyTimeoutMilliseconds() as Int32
+          )
+        end
+      end
     end
   end
 
@@ -893,6 +1235,9 @@ class SQLiteProvider: neri_data::Provider
   end
 
   public override def beginTransaction(): TransactionOpenResult
+    if !this.ownsHandle
+      return TransactionOpenResult.Failure(WriteFailure.Transaction("external SQLite owner controls transaction completion"))
+    end
     if this.streaming
       return TransactionOpenResult.Failure(WriteFailure.Transaction("SQLite provider is busy streaming"))
     end
@@ -949,6 +1294,9 @@ class SQLiteProvider: neri_data::Provider
           return TransactionState.Failed()
         end
         if sqliteAutoCommit(database) != (0 as Int32)
+          if !this.ownsHandle
+            return TransactionState.Failed()
+          end
           this.activeLease = 0
           this.savepoints = null
           this.lastTransactionState = TransactionState.RolledBack()
@@ -987,6 +1335,9 @@ class SQLiteProvider: neri_data::Provider
         return SavepointOpenResult.Failure(WriteFailure.Transaction("SQLite database handle unavailable"))
       end
       if sqliteAutoCommit(database) != (0 as Int32)
+        if !this.ownsHandle
+          return SavepointOpenResult.Failure(WriteFailure.Transaction("external transaction completion is not acknowledged"))
+        end
         this.activeLease = 0
         this.savepoints = null
         this.lastTransactionState = TransactionState.RolledBack()
@@ -999,9 +1350,11 @@ class SQLiteProvider: neri_data::Provider
         let failure = sqliteWriteFailure(database, status, "savepoint")
 
         if sqliteAutoCommit(database) != (0 as Int32)
-          this.activeLease = 0
-          this.savepoints = null
-          this.lastTransactionState = TransactionState.RolledBack()
+          if this.ownsHandle
+            this.activeLease = 0
+            this.savepoints = null
+            this.lastTransactionState = TransactionState.RolledBack()
+          end
         end
         return SavepointOpenResult.Failure(failure)
       end
@@ -1180,6 +1533,9 @@ class SQLiteProvider: neri_data::Provider
   end
 
   public override def commitTransaction(lease: Int): WriteResult
+    if !this.ownsHandle
+      return WriteResult.Failure(WriteFailure.Transaction("external SQLite owner controls transaction completion"))
+    end
     if this.streaming
       return WriteResult.Failure(WriteFailure.Transaction("SQLite provider is busy streaming"))
     end
@@ -1211,6 +1567,9 @@ class SQLiteProvider: neri_data::Provider
   end
 
   public override def rollbackTransaction(lease: Int): WriteResult
+    if !this.ownsHandle
+      return WriteResult.Failure(WriteFailure.Transaction("external SQLite owner controls transaction completion"))
+    end
     if this.streaming
       return WriteResult.Failure(WriteFailure.Transaction("SQLite provider is busy streaming"))
     end
@@ -1248,6 +1607,7 @@ class SQLiteProvider: neri_data::Provider
   end
 
   private def failLeasedBatch(error: WriteFailure): WriteResult
+    this.removeWorkerProgressForCleanup()
     unsafe
       let database = this.database
 
@@ -1260,6 +1620,10 @@ class SQLiteProvider: neri_data::Provider
             )))
       end
       if sqliteAutoCommit(database) != (0 as Int32)
+        if !this.ownsHandle
+          this.lastTransactionState = TransactionState.Failed()
+          return WriteResult.Failure(error)
+        end
         this.activeLease = 0
         this.savepoints = null
         this.lastTransactionState = TransactionState.RolledBack()
@@ -1282,6 +1646,15 @@ class SQLiteProvider: neri_data::Provider
   end
 
   private def failOuterTransaction(error: WriteFailure): WriteResult
+    this.removeWorkerProgressForCleanup()
+    if !this.ownsHandle
+      this.poisoned = true
+      this.lastTransactionState = TransactionState.Failed()
+      return WriteResult.Failure(WriteFailure.Cleanup(new WriteCleanupFailure(
+            error,
+            WriteFailure.Transaction("external transaction owner must recover uncertain native state")
+          )))
+    end
     unsafe
       let database = this.database
 
@@ -1784,6 +2157,28 @@ unsafe def bindWriteValues(database: Void*, statement: Void*, values: readonly W
         node.next = buffers
         buffers = node
         status = sqliteBindText(statement, index as Int32, bytes, length as Int32, null)
+      case Cell.Binary(value)
+        if value.length() > 134217728
+          return SQLiteWriteBindResult.Failure(
+            WriteFailure.Validation("SQLite binary parameter exceeds the buffer limit"),
+            buffers
+          )
+        end
+        let snapshot = value.snapshot()
+        let length = snapshot.Length
+        let bytes = native::alloc<Byte>(length + 1)
+        var offset = 0
+
+        while offset < length
+          bytes[offset] = snapshot[offset]
+          offset = offset + 1
+        end
+        let node = new SQLiteTextBufferNode()
+
+        node.pointer = bytes
+        node.next = buffers
+        buffers = node
+        status = sqliteBindBlob(statement, index as Int32, bytes, length as Int32, null)
     end
     if status != (0 as Int32)
       return SQLiteWriteBindResult.Failure(sqliteWriteFailure(database, status, "bind"), buffers)
@@ -1838,6 +2233,8 @@ class SQLiteCollectedRows
           return new RawColumn(column.name, Cell.Float(value))
         case Cell.Text(value)
           return new RawColumn(column.name, Cell.Text(value))
+        case Cell.Binary(value)
+          return new RawColumn(column.name, Cell.Binary(copyBinary(value)))
       end
     end
 
@@ -1894,6 +2291,28 @@ unsafe def bindParameters(database: Void*, statement: Void*, parameters: readonl
         node.next = buffers
         buffers = node
         status = sqliteBindText(statement, index as Int32, bytes, length as Int32, null)
+      case Parameter.Binary(value)
+        if value.length() > 134217728
+          return SQLiteBindResult.Failure(
+            ProviderFailure.State("SQLite binary parameter exceeds the buffer limit"),
+            buffers
+          )
+        end
+        let snapshot = value.snapshot()
+        let length = snapshot.Length
+        let bytes = native::alloc<Byte>(length + 1)
+        var offset = 0
+
+        while offset < length
+          bytes[offset] = snapshot[offset]
+          offset = offset + 1
+        end
+        let node = new SQLiteTextBufferNode()
+
+        node.pointer = bytes
+        node.next = buffers
+        buffers = node
+        status = sqliteBindBlob(statement, index as Int32, bytes, length as Int32, null)
     end
     if status != (0 as Int32)
       let message = sqliteFailure(database, "read.bind", status)
@@ -2023,6 +2442,26 @@ unsafe def decodeSQLiteColumns(statement: Void*, columns: readonly ResultColumns
             return SQLiteColumnsResult.Failure("SQLite text column is invalid UTF-8")
           end
           cell = Cell.Text(text)
+        case ResultColumnKind.Binary()
+          if kind != (4 as Int32)
+            return SQLiteColumnsResult.Failure("SQLite binary column has wrong type")
+          end
+          let length = sqliteColumnBytes(statement, index as Int32) as Int
+          let blobPointer = sqliteColumnBlob(statement, index as Int32)
+
+          if length < 0 || length > 134217728 || (blobPointer == null && length > 0)
+            return SQLiteColumnsResult.Failure("SQLite binary column exceeds the buffer limit or is unavailable")
+          end
+          let buffer = new ByteBuffer(134217728, length)
+          var offset = 0
+
+          while offset < length
+            if blobPointer != null
+              buffer.append(blobPointer[offset])
+            end
+            offset = offset + 1
+          end
+          cell = Cell.Binary(buffer)
       end
     end
     values[index] = new RawColumn(name, cell)

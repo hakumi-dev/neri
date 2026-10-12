@@ -1,0 +1,507 @@
+use clock
+namespace neri_data
+
+## Returning null preserves the incoming command and its normal execution.
+abstract class CommandInterceptor
+  public def readPlan(plan: readonly SqlPlan): SqlPlan?
+    return null
+  end
+
+  public def readResult(plan: readonly SqlPlan): ProviderResult?
+    return null
+  end
+
+  public def writePlan(batch: readonly WriteBatch, lease: Int?): WriteBatch?
+    return null
+  end
+
+  public def writeResult(batch: readonly WriteBatch, lease: Int?): WriteResult?
+    return null
+  end
+
+  public def setPlan(plan: readonly SetWritePlan, lease: Int?): SetWritePlan?
+    return null
+  end
+
+  public def setResult(plan: readonly SetWritePlan, lease: Int?): WriteResult?
+    return null
+  end
+
+  public def streamingPlan(plan: readonly StreamPlan): StreamPlan?
+    return null
+  end
+end
+
+## Wrap providers in registration order to compose command replacement pipelines.
+class InterceptedProvider: Provider
+  private inner: Provider
+  private interceptor: CommandInterceptor
+  private intercepting: Bool = false
+
+  def init(provider: Provider, interceptor: CommandInterceptor): Void
+    this.inner = provider
+    this.interceptor = interceptor
+  end
+
+  public override readonly def dialect(): SqlDialect
+    return this.inner.dialect()
+  end
+
+  public override readonly def supports(capability: ProviderCapability): Bool
+    return this.inner.supports(capability)
+  end
+
+  public override def execute(plan: readonly SqlPlan): ProviderResult
+    if this.intercepting
+      return ProviderResult.Failure(ProviderFailure.State("command interceptor cannot reenter its provider"))
+    end
+    this.intercepting = true
+    let replacement = this.interceptor.readPlan(plan)
+    var effective: readonly SqlPlan = plan
+
+    if replacement != null
+      effective = replacement
+    end
+    let result = this.interceptor.readResult(effective)
+
+    this.intercepting = false
+    return result == null ? this.inner.execute(effective) : interceptedReadCopy(result, effective.limit())
+  end
+
+  public override def beginReadAsync(
+    plan: readonly SqlPlan,
+    options: StreamOptions? = null,
+    maximumRows: Int? = null
+  ): AsyncReadStart
+    if interceptedDeadline(options) == null
+      return AsyncReadStart.Failure(ProviderFailure.State("invalid intercepted asynchronous timeout"))
+    end
+    if this.intercepting
+      return AsyncReadStart.Failure(ProviderFailure.State("command interceptor cannot reenter its provider"))
+    end
+    this.intercepting = true
+    let replacement = this.interceptor.readPlan(plan)
+    var effective: readonly SqlPlan = plan
+
+    if replacement != null
+      effective = replacement
+    end
+    let result = this.interceptor.readResult(effective)
+
+    this.intercepting = false
+    if result == null
+      return this.inner.beginReadAsync(effective, options, maximumRows)
+    end
+    let maximum = maximumRows == null ? effective.limit() : maximumRows
+
+    return AsyncReadStart.Started(new InterceptedReadDriver(result, maximum, options))
+  end
+
+  public override def stream(plan: readonly StreamPlan, visit: fn(RawRow): Bool): StreamResult
+    if this.intercepting
+      return StreamResult.Failure(
+        QueryFailure.Provider(ProviderFailure.State("command interceptor cannot reenter its provider")),
+        0
+      )
+    end
+    this.intercepting = true
+    let replacement = this.interceptor.streamingPlan(plan)
+
+    this.intercepting = false
+    if replacement != null
+      return this.inner.stream(replacement, visit)
+    end
+    return this.inner.stream(plan, visit)
+  end
+
+  public override def writeBatch(batch: readonly WriteBatch): WriteResult
+    return this.write(batch, null)
+  end
+
+  public override def writeBatchInTransaction(batch: readonly WriteBatch, lease: Int): WriteResult
+    return this.write(batch, lease)
+  end
+
+  private def write(batch: readonly WriteBatch, lease: Int?): WriteResult
+    let inactive = this.inactiveLease(lease)
+
+    if inactive != null
+      return WriteResult.Failure(inactive)
+    end
+    if this.intercepting
+      return WriteResult.Failure(WriteFailure.Transaction("command interceptor cannot reenter its provider"))
+    end
+    this.intercepting = true
+    let replacement = this.interceptor.writePlan(batch, lease)
+    var effective: readonly WriteBatch = batch
+
+    if replacement != null
+      effective = replacement
+    end
+    let result = this.interceptor.writeResult(effective, lease)
+
+    this.intercepting = false
+    if result != null
+      return interceptedWriteCopy(result)
+    end
+    return lease == null ? this.inner.writeBatch(effective) : this.inner.writeBatchInTransaction(effective, lease)
+  end
+
+  public override def beginWriteAsync(
+    batch: readonly WriteBatch,
+    options: StreamOptions? = null,
+    lease: Int? = null,
+    validate: (fn(readonly WriteReturnedRows): WriteFailure?)? = null
+  ): AsyncWriteStart
+    let inactive = this.inactiveLease(lease)
+
+    if inactive != null
+      return AsyncWriteStart.Failure(inactive)
+    end
+    if interceptedDeadline(options) == null
+      return AsyncWriteStart.Failure(WriteFailure.Validation("invalid intercepted asynchronous timeout"))
+    end
+    if this.intercepting
+      return AsyncWriteStart.Failure(WriteFailure.Transaction("command interceptor cannot reenter its provider"))
+    end
+    this.intercepting = true
+    let replacement = this.interceptor.writePlan(batch, lease)
+    var effective: readonly WriteBatch = batch
+
+    if replacement != null
+      effective = replacement
+    end
+    var result = this.interceptor.writeResult(effective, lease)
+
+    this.intercepting = false
+    if result == null
+      return this.inner.beginWriteAsync(effective, options, lease, validate)
+    end
+    if validate != null
+      match result
+        case WriteResult.SavedWithValues(count, rows)
+          let failure = validate(rows)
+
+          result = WriteResult.Failure(failure) if failure != null
+        case WriteResult.Saved(count)
+          let failure = validate(new WriteReturnedRows())
+
+          result = WriteResult.Failure(failure) if failure != null
+        case WriteResult.Failure(error)
+      end
+    end
+    if result == null
+      return AsyncWriteStart.Failure(WriteFailure.Validation("intercepted write result is missing"))
+    end
+    return AsyncWriteStart.Started(new InterceptedWriteDriver(result, options))
+  end
+
+  public override def executeSet(plan: readonly SetWritePlan): WriteResult
+    return this.set(plan, null)
+  end
+
+  public override def executeSetInTransaction(plan: readonly SetWritePlan, lease: Int): WriteResult
+    return this.set(plan, lease)
+  end
+
+  private def set(plan: readonly SetWritePlan, lease: Int?): WriteResult
+    let inactive = this.inactiveLease(lease)
+
+    if inactive != null
+      return WriteResult.Failure(inactive)
+    end
+    if this.intercepting
+      return WriteResult.Failure(WriteFailure.Transaction("command interceptor cannot reenter its provider"))
+    end
+    this.intercepting = true
+    let replacement = this.interceptor.setPlan(plan, lease)
+    var effective: readonly SetWritePlan = plan
+
+    if replacement != null
+      effective = replacement
+    end
+    let result = this.interceptor.setResult(effective, lease)
+
+    this.intercepting = false
+    if result != null
+      return interceptedWriteCopy(result)
+    end
+    return lease == null ? this.inner.executeSet(effective) : this.inner.executeSetInTransaction(effective, lease)
+  end
+
+  public override def beginSetAsync(
+    plan: readonly SetWritePlan,
+    options: StreamOptions? = null,
+    lease: Int? = null
+  ): AsyncWriteStart
+    let inactive = this.inactiveLease(lease)
+
+    if inactive != null
+      return AsyncWriteStart.Failure(inactive)
+    end
+    if interceptedDeadline(options) == null
+      return AsyncWriteStart.Failure(WriteFailure.Validation("invalid intercepted asynchronous timeout"))
+    end
+    if this.intercepting
+      return AsyncWriteStart.Failure(WriteFailure.Transaction("command interceptor cannot reenter its provider"))
+    end
+    this.intercepting = true
+    let replacement = this.interceptor.setPlan(plan, lease)
+    var effective: readonly SetWritePlan = plan
+
+    if replacement != null
+      effective = replacement
+    end
+    let result = this.interceptor.setResult(effective, lease)
+
+    this.intercepting = false
+    return result == null ? this.inner.beginSetAsync(
+      effective,
+      options,
+      lease
+    ) : AsyncWriteStart.Started(new InterceptedWriteDriver(
+        result,
+        options
+      ))
+  end
+
+  private def inactiveLease(lease: Int?): WriteFailure?
+    if lease == null
+      return null
+    end
+    match this.inner.transactionState(lease)
+      case TransactionState.Active()
+        return null
+      case TransactionState.RolledBack()
+      case TransactionState.Committed()
+      case TransactionState.Invalid()
+      case TransactionState.Failed()
+        return WriteFailure.Transaction("intercepted write requires an active transaction lease")
+    end
+    return WriteFailure.Transaction("intercepted transaction state is unavailable")
+  end
+
+  public override def beginTransaction(): TransactionOpenResult
+    return this.intercepting ? TransactionOpenResult.Failure(WriteFailure.Transaction("command interceptor cannot reenter its provider")) : this.inner.beginTransaction()
+  end
+
+  public override def commitTransaction(lease: Int): WriteResult
+    return this.intercepting ? WriteResult.Failure(WriteFailure.Transaction("command interceptor cannot reenter its provider")) : this.inner.commitTransaction(lease)
+  end
+
+  public override def rollbackTransaction(lease: Int): WriteResult
+    return this.intercepting ? WriteResult.Failure(WriteFailure.Transaction("command interceptor cannot reenter its provider")) : this.inner.rollbackTransaction(lease)
+  end
+
+  public override def transactionState(lease: Int): TransactionState
+    return this.inner.transactionState(lease)
+  end
+
+  public override def createSavepoint(lease: Int): SavepointOpenResult
+    return this.intercepting ? SavepointOpenResult.Failure(WriteFailure.Transaction("command interceptor cannot reenter its provider")) : this.inner.createSavepoint(lease)
+  end
+
+  public override def rollbackToSavepoint(lease: Int, id: Int): WriteResult
+    return this.intercepting ? WriteResult.Failure(WriteFailure.Transaction("command interceptor cannot reenter its provider")) : this.inner.rollbackToSavepoint(
+      lease,
+      id
+    )
+  end
+
+  public override def releaseSavepoint(lease: Int, id: Int): WriteResult
+    return this.intercepting ? WriteResult.Failure(WriteFailure.Transaction("command interceptor cannot reenter its provider")) : this.inner.releaseSavepoint(
+      lease,
+      id
+    )
+  end
+
+  public override def beginControlAsync(
+    action: AsyncTransactionAction,
+    options: StreamOptions? = null
+  ): AsyncControlStart
+    return this.intercepting ? AsyncControlStart.Failure(WriteFailure.Transaction("command interceptor cannot reenter its provider")) : this.inner.beginControlAsync(
+      action,
+      options
+    )
+  end
+
+  public override def migrationHistory(catalog: readonly MigrationSet): MigrationHistoryResult
+    if this.intercepting
+      return MigrationHistoryResult.Failure(MigrationFailure.Validation("command interceptor cannot reenter its provider"))
+    end
+    return this.inner.migrationHistory(catalog)
+  end
+
+  public override def beginMigrationAsync(
+    catalog: readonly MigrationSet,
+    target: String? = null,
+    options: StreamOptions? = null
+  ): AsyncMigrationStart
+    return this.intercepting ? AsyncMigrationStart.Failure(MigrationFailure.Validation("command interceptor cannot reenter its provider")) : this.inner.beginMigrationAsync(
+      catalog,
+      target,
+      options
+    )
+  end
+end
+
+class InterceptedReadDriver: AsyncReadDriver
+  private result: ProviderResult
+  private index: Int = 0
+  private maximum: Int
+  private options: StreamOptions?
+  private cancelled: Bool = false
+  private closed: Bool = false
+  private deadline: Int?
+
+  def init(result: ProviderResult, maximum: Int, options: StreamOptions?): Void
+    this.result = interceptedReadCopy(result, maximum)
+    this.deadline = interceptedDeadline(options)
+    this.maximum = maximum
+    this.options = options
+  end
+
+  public override def poll(): AsyncReadPoll
+    let options = this.options
+    let token = options == null ? null : options.token()
+
+    if this.closed || this.cancelled || (token != null && token.cancelled()) || streamTimedOut(this.deadline)
+      return AsyncReadPoll.Failure(ProviderFailure.State("intercepted read cancelled, timed out or closed"))
+    end
+    match this.result
+      case ProviderResult.Failure(error)
+        return AsyncReadPoll.Failure(error)
+      case ProviderResult.Rows(rows)
+        if rows.Length > this.maximum || this.maximum < 0 || this.maximum > 100000
+          return AsyncReadPoll.Failure(ProviderFailure.State("intercepted read exceeds its validated row bound"))
+        end
+        if this.index < rows.Length
+          let row = rows[this.index]
+
+          this.index = this.index + 1
+          return AsyncReadPoll.Row(row)
+        end
+        return AsyncReadPoll.Completed()
+    end
+    return AsyncReadPoll.Completed()
+  end
+
+  public override def cancel(): Void
+    this.cancelled = true
+  end
+
+  public override def close(): ProviderFailure?
+    this.closed = true
+    return null
+  end
+end
+
+class InterceptedWriteDriver: AsyncWriteDriver
+  private result: WriteResult
+  private options: StreamOptions?
+  private cancelled: Bool = false
+  private terminal: Bool = false
+  private deadline: Int?
+
+  def init(result: WriteResult, options: StreamOptions?): Void
+    this.result = interceptedWriteCopy(result)
+    this.deadline = interceptedDeadline(options)
+    this.options = options
+  end
+
+  public override def poll(): AsyncWritePoll
+    if this.terminal
+      return AsyncWritePoll.Completed(this.result)
+    end
+    let options = this.options
+    let token = options == null ? null : options.token()
+
+    if this.cancelled || (token != null && token.cancelled()) || streamTimedOut(this.deadline)
+      this.result = WriteResult.Failure(WriteFailure.Transaction("intercepted write cancelled or timed out"))
+    end
+    this.terminal = true
+    return AsyncWritePoll.Completed(this.result)
+  end
+
+  public override def cancel(): Void
+    this.cancelled = true if !this.terminal
+  end
+
+  public override def close(): WriteFailure?
+    this.cancelled = true if !this.terminal
+    return null
+  end
+end
+
+
+def interceptedDeadline(options: StreamOptions?): Int?
+  let selected = options == null ? null : options.timeoutMilliseconds()
+  let timeout = selected == null ? 30000 : selected
+  let now = clock::milliseconds()
+
+  return timeout < 1 || timeout > 86400000 || now == null || now > 9223372036854775807 - timeout ? null : now + timeout
+end
+
+def interceptedRowCopy(row: readonly RawRow): RawRow
+  let columns = arrays::generate<RawColumn>(row.count()) do |index|
+    let column = row.at(index)
+
+    if column == null
+      return new RawColumn("", Cell.Null())
+    end
+    let value = cellFromRow(row, column.name)
+
+    return new RawColumn(column.name, value == null ? Cell.Null() : value)
+  end
+
+  return new RawRow(columns)
+end
+
+def interceptedReadCopy(result: ProviderResult, maximum: Int): ProviderResult
+  match result
+    case ProviderResult.Failure(error)
+      return ProviderResult.Failure(error)
+    case ProviderResult.Rows(rows)
+      if maximum < 0 || maximum > 100000 || rows.Length > maximum
+        return ProviderResult.Failure(ProviderFailure.State("intercepted read exceeds its validated row bound"))
+      end
+      for row in rows
+        if row.count() > 1000
+          return ProviderResult.Failure(ProviderFailure.State("intercepted row exceeds 1000 columns"))
+        end
+      end
+      let owned = arrays::generate<RawRow>(rows.Length) do |index|
+        return interceptedRowCopy(rows[index])
+      end
+
+      return ProviderResult.Rows(owned)
+  end
+  return ProviderResult.Failure(ProviderFailure.State("intercepted result is invalid"))
+end
+
+def interceptedWriteCopy(result: WriteResult): WriteResult
+  match result
+    case WriteResult.Saved(count)
+      return count < 0 ? WriteResult.Failure(WriteFailure.Validation("intercepted affected row count is negative")) : WriteResult.Saved(count)
+    case WriteResult.Failure(error)
+      return WriteResult.Failure(error)
+    case WriteResult.SavedWithValues(count, rows)
+      if count < 0 || rows.count() > 10000
+        return WriteResult.Failure(WriteFailure.Validation("intercepted write result exceeds its bounds"))
+      end
+      let owned = new WriteReturnedRows()
+      var index = 0
+
+      while index < rows.count()
+        let row = rows.at(index)
+
+        if row != null && row.count() > 1000
+          return WriteResult.Failure(WriteFailure.Validation("intercepted write row exceeds 1000 columns"))
+        end
+        owned.add(row == null ? null : interceptedRowCopy(row))
+        index = index + 1
+      end
+      return WriteResult.SavedWithValues(count, owned)
+  end
+  return WriteResult.Failure(WriteFailure.Validation("intercepted write result is invalid"))
+end

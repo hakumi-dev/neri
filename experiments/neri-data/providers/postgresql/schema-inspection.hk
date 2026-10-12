@@ -1,0 +1,540 @@
+use host
+use neri_data
+namespace neri_data_postgresql
+
+## One visible column of a PostgreSQL table, partitioned table, or view.
+class PostgreSQLSchemaColumn
+  private storedSchema: String
+  private storedTable: String
+  private storedName: String
+  private storedType: String
+  private storedDefault: String?
+  private storedRequired: Bool
+  private storedKeyPosition: Int
+  private storedGenerated: String
+  private storedIdentity: String
+  private storedView: Bool
+  private storedCollation: String?
+  private storedCheck: String?
+
+  def init(
+    schema: String,
+    table: String,
+    name: String,
+    declaredType: String,
+    defaultSql: String?,
+    required: Bool,
+    keyPosition: Int,
+    generated: String,
+    identity: String,
+    view: Bool,
+    collation: String? = null,
+    checkSql: String? = null
+  ): Void
+    this.storedSchema = schema
+    this.storedTable = table
+    this.storedName = name
+    this.storedType = declaredType
+    this.storedDefault = defaultSql
+    this.storedRequired = required
+    this.storedKeyPosition = keyPosition
+    this.storedGenerated = generated
+    this.storedIdentity = identity
+    this.storedView = view
+    this.storedCollation = collation
+    this.storedCheck = checkSql
+  end
+
+  public readonly def collation(): String?
+    return this.storedCollation
+  end
+
+  public readonly def checkSql(): String?
+    return this.storedCheck
+  end
+
+  public readonly def schema(): String
+    return this.storedSchema
+  end
+
+  public readonly def table(): String
+    return this.storedTable
+  end
+
+  public readonly def name(): String
+    return this.storedName
+  end
+
+  public readonly def declaredType(): String
+    return this.storedType
+  end
+
+  public readonly def defaultSql(): String?
+    return this.storedDefault
+  end
+
+  public readonly def required(): Bool
+    return this.storedRequired
+  end
+
+  public readonly def keyPosition(): Int
+    return this.storedKeyPosition
+  end
+
+  ## PostgreSQL attgenerated code: empty for ordinary, s stored, v virtual.
+  public readonly def generated(): String
+    return this.storedGenerated
+  end
+
+  ## PostgreSQL attidentity code: empty for ordinary, a always, d by default.
+  public readonly def identity(): String
+    return this.storedIdentity
+  end
+
+  public readonly def view(): Bool
+    return this.storedView
+  end
+end
+
+class PostgreSQLSchemaSnapshot
+  private columns: PostgreSQLSchemaColumn?[]
+  private size: Int = 0
+  private references: SchemaScaffoldReference?[] = arrays::generate<SchemaScaffoldReference?>(1000) do |index|
+    return null
+  end
+  private indexes: SchemaScaffoldIndex?[] = arrays::generate<SchemaScaffoldIndex?>(1000) do |index|
+    return null
+  end
+  private referenceSize: Int = 0
+  private indexSize: Int = 0
+
+  def init(): Void
+    this.columns = arrays::generate<PostgreSQLSchemaColumn?>(1000) do |index|
+      return null
+    end
+  end
+
+  internal def add(column: PostgreSQLSchemaColumn): Void
+    this.columns[this.size] = column
+    this.size = this.size + 1
+  end
+
+  internal def addReference(reference: SchemaScaffoldReference): Void
+    this.references[this.referenceSize] = reference
+    this.referenceSize = this.referenceSize + 1
+  end
+
+  internal def addIndex(index: SchemaScaffoldIndex): Void
+    this.indexes[this.indexSize] = index
+    this.indexSize = this.indexSize + 1
+  end
+
+  public readonly def referenceCount(): Int
+    return this.referenceSize
+  end
+
+  public readonly def indexCount(): Int
+    return this.indexSize
+  end
+
+  public readonly def referenceAt(index: Int): readonly SchemaScaffoldReference?
+    return index < 0 || index >= this.referenceSize ? null : this.references[index]
+  end
+
+  public readonly def indexAt(index: Int): readonly SchemaScaffoldIndex?
+    return index < 0 || index >= this.indexSize ? null : this.indexes[index]
+  end
+
+  public readonly def count(): Int
+    return this.size
+  end
+
+  public readonly def at(index: Int): readonly PostgreSQLSchemaColumn?
+    return index < 0 || index >= this.size ? null : this.columns[index]
+  end
+end
+
+enum PostgreSQLSchemaResult
+  case Snapshot(value: PostgreSQLSchemaSnapshot)
+  case Failure(error: ProviderFailure)
+end
+
+def pgInspectSchema(provider: PostgreSQLProvider, schema: String?): PostgreSQLSchemaResult
+  var ownedLease: Int? = null
+
+  if provider.nativeTransactionLease() == null
+    match provider.beginTransaction()
+      case TransactionOpenResult.Failure(error)
+        return PostgreSQLSchemaResult.Failure(ProviderFailure.State(writeFailureMessage(error)))
+      case TransactionOpenResult.Begun(lease)
+        ownedLease = lease
+    end
+    match provider.command("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY", new WriteValues())
+      case PostgreSQLCommandResult.Failure(error)
+        let lease = ownedLease
+
+        if lease != null
+          provider.rollbackTransaction(lease)
+        end
+        return PostgreSQLSchemaResult.Failure(error)
+      case PostgreSQLCommandResult.Completed(count, row)
+    end
+  end
+  let result = pgInspectSchemaCurrent(provider, schema)
+  let lease = ownedLease
+
+  if lease != null
+    match provider.rollbackTransaction(lease)
+      case WriteResult.Failure(error)
+        let cleanup = ProviderFailure.State(writeFailureMessage(error))
+
+        match result
+          case PostgreSQLSchemaResult.Failure(primary)
+            return PostgreSQLSchemaResult.Failure(ProviderFailure.Cleanup(new ProviderCleanupFailure(primary, cleanup)))
+          case PostgreSQLSchemaResult.Snapshot(snapshot)
+            return PostgreSQLSchemaResult.Failure(cleanup)
+        end
+      case WriteResult.Saved(count)
+      case WriteResult.SavedWithValues(count, rows)
+    end
+  end
+  return result
+end
+
+def pgInspectSchemaCurrent(provider: PostgreSQLProvider, schema: String?): PostgreSQLSchemaResult
+  if schema != null && (!identifierValid(schema) || pgHasNul(schema))
+    return PostgreSQLSchemaResult.Failure(ProviderFailure.State("PostgreSQL schema inspection requires a valid schema identifier"))
+  end
+  let parameters = new CompileState()
+  var filter = "left(n.nspname,3) <> 'pg_' AND n.nspname <> 'information_schema'"
+
+  if schema != null
+    parameters.bind(Parameter.Text(schema))
+    filter = "n.nspname = $1"
+  end
+  let sql = "SELECT n.nspname::text AS schema_name,c.relname::text AS table_name,a.attname::text AS column_name,pg_catalog.format_type(a.atttypid,a.atttypmod)::text AS declared_type,pg_catalog.pg_get_expr(d.adbin,d.adrelid)::text AS default_sql,a.attnotnull AS required,COALESCE((SELECT k.ordinality FROM pg_catalog.pg_index i CROSS JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS k(attnum,ordinality) WHERE i.indrelid=c.oid AND i.indisprimary AND k.attnum=a.attnum LIMIT 1),0)::bigint AS key_position,a.attgenerated::text AS generated,a.attidentity::text AS identity,(c.relkind IN ('v','m')) AS is_view,(SELECT coll.collname::text FROM pg_catalog.pg_collation coll JOIN pg_catalog.pg_type typ ON typ.oid=a.atttypid WHERE coll.oid=a.attcollation AND a.attcollation<>typ.typcollation) AS collation_name,(SELECT string_agg('(' || pg_catalog.pg_get_expr(ch.conbin,ch.conrelid) || ')',' AND ' ORDER BY ch.conname) FROM pg_catalog.pg_constraint ch WHERE ch.conrelid=c.oid AND ch.contype='c' AND ((array_length(ch.conkey,1)=1 AND ch.conkey[1]=a.attnum) OR (COALESCE(array_length(ch.conkey,1),0)<>1 AND a.attnum=(SELECT min(f.attnum) FROM pg_catalog.pg_attribute f WHERE f.attrelid=c.oid AND f.attnum>0 AND NOT f.attisdropped)))) AS check_sql FROM pg_catalog.pg_namespace n JOIN pg_catalog.pg_class c ON c.relnamespace=n.oid JOIN pg_catalog.pg_attribute a ON a.attrelid=c.oid LEFT JOIN pg_catalog.pg_attrdef d ON d.adrelid=c.oid AND d.adnum=a.attnum WHERE " + filter + " AND c.relkind IN ('r','p','v','m') AND a.attnum > 0 AND NOT a.attisdropped AND left(lower(c.relname),7) <> '__neri_' ORDER BY n.nspname COLLATE \"C\",c.relname COLLATE \"C\",a.attnum LIMIT 1001"
+  let columns = new ResultColumns([
+      new ResultColumn("schema_name", ResultColumnKind.Text()),
+      new ResultColumn("table_name", ResultColumnKind.Text()),
+      new ResultColumn("column_name", ResultColumnKind.Text()),
+      new ResultColumn("declared_type", ResultColumnKind.Text()),
+      new ResultColumn("default_sql", ResultColumnKind.Text(), true),
+      new ResultColumn("required", ResultColumnKind.Bool()),
+      new ResultColumn("key_position", ResultColumnKind.Int()),
+      new ResultColumn("generated", ResultColumnKind.Text()),
+      new ResultColumn("identity", ResultColumnKind.Text()),
+      new ResultColumn("is_view", ResultColumnKind.Bool()),
+      new ResultColumn("collation_name", ResultColumnKind.Text(), true),
+      new ResultColumn("check_sql", ResultColumnKind.Text(), true)
+    ])
+
+  match provider.execute(new SqlPlan(sql, new ParameterValues(parameters.head, parameters.count), 1001, columns))
+    case ProviderResult.Failure(error)
+      return PostgreSQLSchemaResult.Failure(error)
+    case ProviderResult.Rows(rows)
+      if rows.Length > 1000
+        return PostgreSQLSchemaResult.Failure(ProviderFailure.State("PostgreSQL schema inspection exceeds 1000 visible columns"))
+      end
+      let snapshot = new PostgreSQLSchemaSnapshot()
+
+      for row in rows
+        match pgDecodeSchemaColumn(row)
+          case PostgreSQLSchemaColumnResult.Column(column)
+            snapshot.add(column)
+          case PostgreSQLSchemaColumnResult.Failure(error)
+            return PostgreSQLSchemaResult.Failure(error)
+        end
+      end
+      let failure = pgInspectSchemaMetadata(provider, snapshot, filter, parameters)
+
+      return failure == null ? PostgreSQLSchemaResult.Snapshot(snapshot) : PostgreSQLSchemaResult.Failure(failure)
+  end
+end
+
+enum PostgreSQLSchemaColumnResult
+  case Column(value: PostgreSQLSchemaColumn)
+  case Failure(error: ProviderFailure)
+end
+
+def pgSchemaText(row: RawRow, name: String): String
+  match decodeString(row, name)
+    case DecodeResult.Value(value)
+      return value
+    case DecodeResult.Failure(error)
+      return ""
+  end
+end
+
+def pgDecodeSchemaColumn(row: RawRow): PostgreSQLSchemaColumnResult
+  let schema = pgSchemaText(row, "schema_name")
+  let table = pgSchemaText(row, "table_name")
+  let name = pgSchemaText(row, "column_name")
+  let type = pgSchemaText(row, "declared_type")
+  let generated = pgSchemaText(row, "generated")
+  let identity = pgSchemaText(row, "identity")
+  var defaultSql: String? = null
+  var collation: String? = null
+  var checkSql: String? = null
+  var required = false
+  var key = -1
+  var view = false
+
+  match decodeNullableString(row, "default_sql")
+    case DecodeResult.Value(value)
+      defaultSql = value
+    case DecodeResult.Failure(error)
+      return PostgreSQLSchemaColumnResult.Failure(ProviderFailure.State("PostgreSQL schema default metadata is invalid"))
+  end
+  match decodeNullableString(row, "collation_name")
+    case DecodeResult.Value(value)
+      collation = value
+    case DecodeResult.Failure(error)
+      return PostgreSQLSchemaColumnResult.Failure(ProviderFailure.State("PostgreSQL collation metadata is invalid"))
+  end
+  match decodeNullableString(row, "check_sql")
+    case DecodeResult.Value(value)
+      checkSql = value
+    case DecodeResult.Failure(error)
+      return PostgreSQLSchemaColumnResult.Failure(ProviderFailure.State("PostgreSQL check metadata is invalid"))
+  end
+  match decodeBool(row, "required")
+    case DecodeResult.Value(value)
+      required = value
+    case DecodeResult.Failure(error)
+      return PostgreSQLSchemaColumnResult.Failure(ProviderFailure.State("PostgreSQL schema nullability metadata is invalid"))
+  end
+  match decodeInt(row, "key_position")
+    case DecodeResult.Value(value)
+      key = value
+    case DecodeResult.Failure(error)
+      return PostgreSQLSchemaColumnResult.Failure(ProviderFailure.State("PostgreSQL schema key metadata is invalid"))
+  end
+  match decodeBool(row, "is_view")
+    case DecodeResult.Value(value)
+      view = value
+    case DecodeResult.Failure(error)
+      return PostgreSQLSchemaColumnResult.Failure(ProviderFailure.State("PostgreSQL schema relation metadata is invalid"))
+  end
+  if schema == "" || table == "" || name == "" || type == "" || key < 0 || (identity != "" && identity != "a" && identity != "d") || (generated != "" && generated != "s" && generated != "v")
+    return PostgreSQLSchemaColumnResult.Failure(ProviderFailure.State("PostgreSQL schema column metadata is invalid"))
+  end
+  return PostgreSQLSchemaColumnResult.Column(new PostgreSQLSchemaColumn(
+      schema,
+      table,
+      name,
+      type,
+      defaultSql,
+      required,
+      key,
+      generated,
+      identity,
+      view, collation, checkSql
+    ))
+end
+
+def pgScaffoldSchema(snapshot: readonly PostgreSQLSchemaSnapshot, options: SchemaScaffoldOptions?): SchemaScaffoldResult
+  let columns = arrays::generate<SchemaScaffoldColumn>(snapshot.count()) do |index|
+    let column = snapshot.at(index)
+
+    if column == null
+      return new SchemaScaffoldColumn("", "", "", true)
+    end
+    var type = ""
+
+    if column.declaredType() == "bigint"
+      type = "Int"
+    else if column.declaredType() == "double precision"
+      type = "Float"
+    else if column.declaredType() == "boolean"
+      type = "Bool"
+    else if column.declaredType() == "text"
+      type = "String"
+    else if column.declaredType() == "bytea"
+      type = "ByteBuffer"
+    end
+    if column.schema() != "public"
+      type = ""
+    end
+    let generated = column.generated() != ""
+
+    return new SchemaScaffoldColumn(
+      column.table(), column.name(), type, !column.required(),
+      column.keyPosition(), generated || column.identity() != "" || column.defaultSql() != null,
+      generated, column.view(), generated ? null : column.defaultSql(), generated ? column.defaultSql() : null, column.generated() != "v", column.checkSql(), column.collation()
+    )
+  end
+
+  let references = arrays::generate<SchemaScaffoldReference>(snapshot.referenceCount()) do |index|
+    let reference = snapshot.referenceAt(index)
+
+    return reference == null ? new SchemaScaffoldReference(
+      "",
+      "",
+      [],
+      []
+    ) : new SchemaScaffoldReference(
+      reference.table,
+      reference.parent,
+      schemaSeedColumnsCopy(reference.fields),
+      schemaSeedColumnsCopy(reference.keys),
+      reference.deleteBehavior,
+      reference.deferred
+    )
+  end
+  let indexes = arrays::generate<SchemaScaffoldIndex>(snapshot.indexCount()) do |index|
+    let definition = snapshot.indexAt(index)
+
+    return definition == null ? new SchemaScaffoldIndex(
+      "",
+      "",
+      [],
+      false
+    ) : new SchemaScaffoldIndex(
+      definition.table,
+      definition.name,
+      schemaSeedColumnsCopy(definition.fields),
+      definition.unique,
+      definition.descending,
+      definition.expressions,
+      definition.included,
+      definition.predicate
+    )
+  end
+
+  return neri_data::scaffoldSchema(columns, options, references, indexes)
+end
+
+
+def pgInspectSchemaMetadata(
+  provider: PostgreSQLProvider,
+  snapshot: PostgreSQLSchemaSnapshot,
+  filter: String,
+  parameters: CompileState
+): ProviderFailure?
+  let foreignSql = "SELECT c.relname::text AS table_name,p.relname::text AS parent_name,con.conname::text AS constraint_name,k.ordinality::bigint AS ordinal,a.attname::text AS field_name,b.attname::text AS key_name,con.confdeltype::text AS delete_code,(con.condeferrable AND con.condeferred) AS deferred FROM pg_catalog.pg_namespace n JOIN pg_catalog.pg_class c ON c.relnamespace=n.oid JOIN pg_catalog.pg_constraint con ON con.conrelid=c.oid AND con.contype='f' JOIN pg_catalog.pg_class p ON p.oid=con.confrelid CROSS JOIN LATERAL unnest(con.conkey,con.confkey) WITH ORDINALITY AS k(field,key,ordinality) JOIN pg_catalog.pg_attribute a ON a.attrelid=c.oid AND a.attnum=k.field JOIN pg_catalog.pg_attribute b ON b.attrelid=p.oid AND b.attnum=k.key WHERE " + filter + " AND left(lower(c.relname),7)<>'__neri_' ORDER BY n.nspname COLLATE \"C\",c.relname COLLATE \"C\",con.conname COLLATE \"C\",k.ordinality LIMIT 1001"
+  let foreignColumns = new ResultColumns([
+      new ResultColumn("table_name", ResultColumnKind.Text()), new ResultColumn("parent_name", ResultColumnKind.Text()),
+      new ResultColumn("constraint_name", ResultColumnKind.Text()), new ResultColumn("ordinal", ResultColumnKind.Int()),
+      new ResultColumn("field_name", ResultColumnKind.Text()), new ResultColumn("key_name", ResultColumnKind.Text()),
+      new ResultColumn("delete_code", ResultColumnKind.Text()), new ResultColumn("deferred", ResultColumnKind.Bool())
+    ])
+
+  match provider.execute(new SqlPlan(
+      foreignSql,
+      new ParameterValues(parameters.head, parameters.count),
+      1001,
+      foreignColumns
+    ))
+    case ProviderResult.Failure(error)
+      return error
+    case ProviderResult.Rows(rows)
+      if rows.Length > 1000
+        return ProviderFailure.State("PostgreSQL foreign-key metadata exceeds 1000 components")
+      end
+      var table = ""
+      var parent = ""
+      var constraint = ""
+      var action = "NO ACTION"
+      var deferred = false
+      var fields = new TypedRows<String>()
+      var keys = new TypedRows<String>()
+
+      for row in rows
+        let nextTable = pgSchemaText(row, "table_name")
+        let nextParent = pgSchemaText(row, "parent_name")
+        let nextConstraint = pgSchemaText(row, "constraint_name")
+        let field = pgSchemaText(row, "field_name")
+        let key = pgSchemaText(row, "key_name")
+        let deleteCode = pgSchemaText(row, "delete_code")
+
+        if nextTable == "" || nextParent == "" || nextConstraint == "" || field == "" || key == "" || deleteCode == "d"
+          return ProviderFailure.State("PostgreSQL foreign-key metadata cannot be represented")
+        end
+        if table != nextTable || constraint != nextConstraint
+          if constraint != ""
+            snapshot.addReference(new SchemaScaffoldReference(
+                table,
+                parent,
+                navigationArray(fields),
+                navigationArray(keys),
+                action,
+                deferred
+              ))
+          end
+          table = nextTable
+          parent = nextParent
+          constraint = nextConstraint
+          action = deleteCode == "c" ? "CASCADE" : (deleteCode == "n" ? "SET NULL" : (deleteCode == "r" ? "RESTRICT" : "NO ACTION"))
+          fields = new TypedRows<String>()
+          keys = new TypedRows<String>()
+          match decodeBool(row, "deferred")
+            case DecodeResult.Value(value)
+              deferred = value
+            case DecodeResult.Failure(error)
+              return ProviderFailure.State("PostgreSQL foreign-key deferral metadata is invalid")
+          end
+        end
+        match decodeInt(row, "ordinal")
+          case DecodeResult.Value(value)
+            if value != fields.count() + 1
+              return ProviderFailure.State("PostgreSQL foreign-key tuple order is invalid")
+            end
+          case DecodeResult.Failure(error)
+            return ProviderFailure.State("PostgreSQL foreign-key tuple ordinal is invalid")
+        end
+        fields.add(field)
+        keys.add(key)
+      end
+      if constraint != ""
+        snapshot.addReference(new SchemaScaffoldReference(
+            table,
+            parent,
+            navigationArray(fields),
+            navigationArray(keys),
+            action,
+            deferred
+          ))
+      end
+  end
+  let indexSql = "SELECT c.relname::text AS table_name,ic.relname::text AS index_name,i.indisunique AS is_unique,pg_catalog.pg_get_indexdef(i.indexrelid)::text AS index_sql FROM pg_catalog.pg_namespace n JOIN pg_catalog.pg_class c ON c.relnamespace=n.oid JOIN pg_catalog.pg_index i ON i.indrelid=c.oid JOIN pg_catalog.pg_class ic ON ic.oid=i.indexrelid WHERE " + filter + " AND NOT i.indisprimary AND left(lower(c.relname),7)<>'__neri_' ORDER BY n.nspname COLLATE \"C\",c.relname COLLATE \"C\",ic.relname COLLATE \"C\" LIMIT 1001"
+  let indexColumns = new ResultColumns([
+      new ResultColumn("table_name", ResultColumnKind.Text()),
+      new ResultColumn("index_name", ResultColumnKind.Text()),
+      new ResultColumn("is_unique", ResultColumnKind.Bool()),
+      new ResultColumn("index_sql", ResultColumnKind.Text())
+    ])
+
+  match provider.execute(new SqlPlan(
+      indexSql,
+      new ParameterValues(parameters.head, parameters.count),
+      1001,
+      indexColumns
+    ))
+    case ProviderResult.Failure(error)
+      return error
+    case ProviderResult.Rows(rows)
+      if rows.Length > 1000
+        return ProviderFailure.State("PostgreSQL index metadata exceeds 1000 indexes")
+      end
+      for row in rows
+        let table = pgSchemaText(row, "table_name")
+        let name = pgSchemaText(row, "index_name")
+        let ddl = pgSchemaText(row, "index_sql")
+        var unique = false
+
+        match decodeBool(row, "is_unique")
+          case DecodeResult.Value(value)
+            unique = value
+          case DecodeResult.Failure(error)
+            return ProviderFailure.State("PostgreSQL index uniqueness metadata is invalid")
+        end
+        let definition = schemaDdlIndex(ddl, table, name, unique)
+
+        if definition == null
+          return ProviderFailure.State("PostgreSQL index definition cannot be represented")
+        end
+        snapshot.addIndex(definition)
+      end
+  end
+  return null
+end

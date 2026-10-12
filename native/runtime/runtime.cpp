@@ -334,6 +334,7 @@ const neri_type_descriptor_v1 dynamic_string_type = {
     nullptr,
     NERI_SCALAR_KIND_NONE_V1,
     0,
+    nullptr,
 };
 
 const neri_runtime_abi_info_v1 runtime_abi = {
@@ -1336,6 +1337,7 @@ NERI_RT_API extern const neri_type_descriptor_v1
         nullptr,
         NERI_SCALAR_KIND_NONE_V1,
         0,
+        nullptr,
 };
 
 NERI_RT_API const neri_runtime_abi_info_v1 *neri_rt_v1_get_abi(void) {

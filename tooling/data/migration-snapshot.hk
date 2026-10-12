@@ -1,5 +1,59 @@
 use host
 use neri_data
+use crypto
+
+def dataMigrationJsonCell(value: readonly Cell): String
+  match value
+    case Cell.Null()
+      return "{\"kind\":\"Null\"}"
+    case Cell.Bool(item)
+      return "{\"kind\":\"Bool\",\"value\":" + (item ? "true" : "false") + "}"
+    case Cell.Int(item)
+      return "{\"kind\":\"Int\",\"value\":" + lspQuote(item as String) + "}"
+    case Cell.Float(item)
+      return "{\"kind\":\"Float\",\"value\":" + lspQuote(item as String) + "}"
+    case Cell.Text(item)
+      return "{\"kind\":\"Text\",\"value\":" + lspQuote(item) + "}"
+    case Cell.Binary(item)
+      let encoded = crypto::encodeHex(item.snapshot())
+
+      return encoded == null ? "" : "{\"kind\":\"Binary\",\"value\":" + lspQuote(encoded) + "}"
+  end
+end
+
+def dataMigrationJsonSeed(seed: readonly SchemaSeed): String
+  var keys = "["
+  var keyValues = "["
+  var fields = "["
+  var values = "["
+  var index = 0
+
+  while index < seed.keyCount() + seed.count()
+    let key = index < seed.keyCount()
+    let position = key ? index : index - seed.keyCount()
+    let identity = key ? seed.keyAt(position) : seed.at(position)
+    let value = key ? seed.keyValueAt(position) : seed.valueAt(position)
+
+    if identity == null || value == null
+      return ""
+    end
+    let separator = position == 0 ? "" : ","
+    let code = dataMigrationJsonCell(value)
+
+    if code == ""
+      return ""
+    end
+    if key
+      keys = keys + separator + lspQuote(identity)
+      keyValues = keyValues + separator + code
+    else
+      fields = fields + separator + lspQuote(identity)
+      values = values + separator + code
+    end
+    index = index + 1
+  end
+  return "{\"keys\":" + keys + "],\"keyValues\":" + keyValues + "],\"fields\":" + fields + "],\"values\":" + values + "]}"
+end
 
 def dataMigrationJsonDefault(value: readonly SchemaDefault?): String
   if value == null
@@ -29,11 +83,45 @@ def dataMigrationTypeName(value: readonly SchemaType): String
       return "Float"
     case SchemaType.Text()
       return "Text"
+    case SchemaType.Binary()
+      return "Binary"
   end
 end
 
 def dataMigrationJsonColumn(column: readonly SchemaColumn): String
-  return "{\"name\":" + lspQuote(column.name()) + ",\"type\":" + lspQuote(dataMigrationTypeName(column.type())) + ",\"nullable\":" + (column.nullable() ? "true" : "false") + ",\"primaryKey\":" + (column.primaryKey() ? "true" : "false") + ",\"default\":" + dataMigrationJsonDefault(column.defaultValue()) + "}"
+  var facets = dataMigrationJsonFacet(
+    "defaultSql",
+    column.defaultSql()
+  ) + dataMigrationJsonFacet(
+    "computedSql",
+    column.computedSql()
+  ) + dataMigrationJsonFacet(
+    "checkSql",
+    column.checkSql()
+  ) + dataMigrationJsonFacet(
+    "collation",
+    column.collation()
+  )
+
+  facets = facets + ",\"computedStored\":false" if column.computedSql() != null && !column.computedStored()
+  return "{\"name\":" + lspQuote(column.name()) + ",\"type\":" + lspQuote(dataMigrationTypeName(column.type())) + ",\"nullable\":" + (column.nullable() ? "true" : "false") + ",\"primaryKey\":" + (column.primaryKey() ? "true" : "false") + ",\"default\":" + dataMigrationJsonDefault(column.defaultValue()) + (column.reference() == null ? "" : ",\"reference\":" + dataMigrationJsonReference(column.reference())) + (column.keyPosition() == 0 ? "" : ",\"keyPosition\":" + (column.keyPosition() as String)) + facets + "}"
+end
+
+def dataMigrationJsonFacet(name: String, value: String?): String
+  return value == null ? "" : "," + lspQuote(name) + ":" + lspQuote(value)
+end
+
+def dataMigrationReadFacet(result: DataMigrationSnapshot, node: LspJson, name: String): String?
+  let value = node.get(name)
+
+  if value.isMissing()
+    return null
+  end
+  if !value.isString()
+    result.fail("snapshot column facet requires a string: " + name)
+    return null
+  end
+  return value.scalarText()
 end
 
 def dataMigrationJsonTable(table: readonly SchemaTable): String
@@ -65,11 +153,73 @@ def dataMigrationJsonTable(table: readonly SchemaTable): String
         end
         fieldIndex = fieldIndex + 1
       end
-      output = output + "],\"unique\":" + (definition.unique() ? "true" : "false") + "}"
+      output = output + "],\"unique\":" + (definition.unique() ? "true" : "false") + dataMigrationJsonIndexFacets(definition) + "}"
+    end
+    index = index + 1
+  end
+  output = output + "],\"seeds\":["
+  index = 0
+  while index < table.seedCount()
+    let seed = table.seedAt(index)
+
+    if seed != null
+      let code = dataMigrationJsonSeed(seed)
+
+      if code == ""
+        return ""
+      end
+      output = output + (index == 0 ? "" : ",") + code
     end
     index = index + 1
   end
   return output + "]}"
+end
+
+def dataMigrationJsonIndexFacets(definition: readonly SchemaIndex): String
+  if !definition.hasFacets()
+    return ""
+  end
+  var output = ",\"descending\":["
+  let descending = definition.descending()
+  var index = 0
+
+  for value in descending
+    output = output + (index == 0 ? "" : ",") + (value ? "true" : "false")
+    index = index + 1
+  end
+  output = output + "]" + dataMigrationJsonFacet("predicate", definition.predicate())
+  output = output + ",\"expressions\":" + dataMigrationJsonStrings(definition.expressions()) + ",\"include\":" + dataMigrationJsonStrings(definition.include())
+  return output
+end
+
+def dataMigrationJsonStrings(values: String[]): String
+  var output = "["
+  var index = 0
+
+  for value in values
+    output = output + (index == 0 ? "" : ",") + lspQuote(value)
+    index = index + 1
+  end
+  return output + "]"
+end
+
+def dataMigrationReadIndexStrings(result: DataMigrationSnapshot, node: LspJson): String[]
+  if node.isMissing()
+    return []
+  end
+  if !node.isArray()
+    result.fail("snapshot index facet requires an array")
+    return []
+  end
+  return arrays::generate<String>(dataMigrationJsonArrayLength(result, node)) do |index|
+    let value = dataMigrationNodeAt(node, index)
+
+    if value == null || !value.isString()
+      result.fail("snapshot index facet requires string entries")
+      return ""
+    end
+    return value.scalarText()
+  end
 end
 
 ## A versioned, self-checking copy of the complete logical schema.
@@ -203,7 +353,25 @@ def dataMigrationReadDefault(result: DataMigrationSnapshot, node: LspJson): Sche
 end
 
 def dataMigrationReadColumn(result: DataMigrationSnapshot, node: LspJson): SchemaColumn?
-  if !dataMigrationJsonObject(result, node, "column", ["name", "type", "nullable", "primaryKey", "default"])
+  if !dataMigrationJsonObject(
+    result,
+    node,
+    "column",
+    [
+      "name",
+      "type",
+      "nullable",
+      "primaryKey",
+      "default",
+      "reference",
+      "keyPosition",
+      "defaultSql",
+      "computedSql",
+      "computedStored",
+      "checkSql",
+      "collation"
+    ]
+  )
     return null
   end
   let name = dataMigrationJsonRequired(result, node, "name", LspJsonType.String())
@@ -226,6 +394,8 @@ def dataMigrationReadColumn(result: DataMigrationSnapshot, node: LspJson): Schem
     kind = SchemaType.Float()
   else if type.scalarText() == "Text"
     kind = SchemaType.Text()
+  else if type.scalarText() == "Binary"
+    kind = SchemaType.Binary()
   else if type.scalarText() != "Int"
     result.fail("unknown snapshot column type")
     return null
@@ -235,7 +405,43 @@ def dataMigrationReadColumn(result: DataMigrationSnapshot, node: LspJson): Schem
   if result.error != ""
     return null
   end
-  return new SchemaColumn(name.scalarText(), kind, nullable.isTrue(), primaryKey.isTrue(), defaultValue)
+  let reference = dataMigrationReadReference(result, node.get("reference"))
+
+  let positionNode = node.get("keyPosition")
+  var keyPosition = 0
+
+  if !positionNode.isMissing()
+    let value = positionNode.isNumber() ? host::parseInt(positionNode.scalarText()) : null
+
+    if value == null || value < 1 || value > 1000
+      result.fail("invalid primary-key position")
+      return null
+    end
+    keyPosition = value
+  end
+  let defaultSql = dataMigrationReadFacet(result, node, "defaultSql")
+  let computedSql = dataMigrationReadFacet(result, node, "computedSql")
+  let checkSql = dataMigrationReadFacet(result, node, "checkSql")
+  let collation = dataMigrationReadFacet(result, node, "collation")
+  let computedStored = node.get("computedStored")
+
+  if !computedStored.isMissing() && !computedStored.isBoolean()
+    result.fail("snapshot computedStored requires a boolean")
+  end
+  return new SchemaColumn(
+    name.scalarText(),
+    kind,
+    nullable.isTrue(),
+    primaryKey.isTrue(),
+    defaultValue,
+    reference,
+    keyPosition,
+    defaultSql,
+    computedSql,
+    computedStored.isMissing() || computedStored.isTrue(),
+    checkSql,
+    collation
+  )
 end
 
 def dataMigrationReadField(result: DataMigrationSnapshot, node: LspJson): SchemaField?
@@ -254,7 +460,12 @@ def dataMigrationReadField(result: DataMigrationSnapshot, node: LspJson): Schema
 end
 
 def dataMigrationReadIndex(result: DataMigrationSnapshot, node: LspJson): SchemaIndex?
-  if !dataMigrationJsonObject(result, node, "index", ["name", "fields", "unique"])
+  if !dataMigrationJsonObject(
+    result,
+    node,
+    "index",
+    ["name", "fields", "unique", "descending", "predicate", "expressions", "include"]
+  )
     return null
   end
   let name = dataMigrationJsonRequired(result, node, "name", LspJsonType.String())
@@ -275,11 +486,41 @@ def dataMigrationReadIndex(result: DataMigrationSnapshot, node: LspJson): Schema
     return current.scalarText()
   end
 
-  return result.error == "" ? new SchemaIndex(name.scalarText(), fields, unique.isTrue()) : null
+  let descendingNode = node.get("descending")
+
+  if !descendingNode.isMissing() && !descendingNode.isArray()
+    result.fail("snapshot index descending requires an array")
+    return null
+  end
+  let descending = arrays::generate<Bool>(descendingNode.isMissing() ? 0 : dataMigrationJsonArrayLength(
+      result,
+      descendingNode
+    )) do |index|
+    let value = dataMigrationNodeAt(descendingNode, index)
+
+    if value == null || !value.isBoolean()
+      result.fail("snapshot index descending requires boolean entries")
+      return false
+    end
+    return value.isTrue()
+  end
+  let predicate = dataMigrationReadFacet(result, node, "predicate")
+  let expressions = dataMigrationReadIndexStrings(result, node.get("expressions"))
+  let included = dataMigrationReadIndexStrings(result, node.get("include"))
+
+  return result.error == "" ? new SchemaIndex(
+    name.scalarText(),
+    fields,
+    unique.isTrue(),
+    descending,
+    predicate,
+    expressions,
+    included
+  ) : null
 end
 
 def dataMigrationReadTable(result: DataMigrationSnapshot, node: LspJson): SchemaTable?
-  if !dataMigrationJsonObject(result, node, "table", ["identity", "name", "fields", "indexes"])
+  if !dataMigrationJsonObject(result, node, "table", ["identity", "name", "fields", "indexes", "seeds"])
     return null
   end
   let identity = dataMigrationJsonRequired(result, node, "identity", LspJsonType.String())
@@ -315,7 +556,89 @@ def dataMigrationReadTable(result: DataMigrationSnapshot, node: LspJson): Schema
     return definition == null ? new SchemaIndex("", []) : definition
   end
 
-  return result.error == "" ? new SchemaTable(identity.scalarText(), name.scalarText(), fields, indexes) : null
+  let seedsNode = node.get("seeds")
+  let seedCount = seedsNode.isMissing() ? 0 : dataMigrationJsonArrayLength(result, seedsNode)
+  let seeds = arrays::generate<SchemaSeed>(seedCount) do |position|
+    let current = dataMigrationNodeAt(seedsNode, position)
+
+    if current == null
+      result.fail("snapshot seed is missing")
+      return new SchemaSeed([], [], [], [])
+    end
+    return dataMigrationReadSeed(result, current)
+  end
+
+  return result.error == "" ? new SchemaTable(identity.scalarText(), name.scalarText(), fields, indexes, seeds) : null
+end
+
+def dataMigrationReadCell(result: DataMigrationSnapshot, node: LspJson): Cell
+  if node.get("kind").scalarText() == "Binary"
+    if !dataMigrationJsonObject(result, node, "binary seed value", ["kind", "value"]) || !node.get("value").isString()
+      result.fail("invalid binary seed value")
+      return Cell.Null()
+    end
+    let bytes = crypto::decodeHex(node.get("value").scalarText(), 2097152).bytes()
+
+    if bytes == null
+      result.fail("invalid binary seed value")
+      return Cell.Null()
+    end
+    return cellBinaryBytes(bytes)
+  end
+  let value = dataMigrationReadDefault(result, node)
+
+  if value == null
+    result.fail("invalid typed seed value")
+    return Cell.Null()
+  end
+  match value
+    case SchemaDefault.Null()
+      return Cell.Null()
+    case SchemaDefault.Bool(item)
+      return Cell.Bool(item)
+    case SchemaDefault.Int(item)
+      return Cell.Int(item)
+    case SchemaDefault.Float(item)
+      return Cell.Float(item)
+    case SchemaDefault.Text(item)
+      return Cell.Text(item)
+  end
+end
+
+def dataMigrationReadSeed(result: DataMigrationSnapshot, node: LspJson): SchemaSeed
+  if !dataMigrationJsonObject(result, node, "seed", ["keys", "keyValues", "fields", "values"])
+    return new SchemaSeed([], [], [], [])
+  end
+  return new SchemaSeed(
+    dataMigrationReadStrings(result, node.get("keys")),
+    dataMigrationReadCells(result, node.get("keyValues")),
+    dataMigrationReadStrings(result, node.get("fields")),
+    dataMigrationReadCells(result, node.get("values"))
+  )
+end
+
+def dataMigrationReadStrings(result: DataMigrationSnapshot, node: LspJson): String[]
+  return arrays::generate<String>(dataMigrationJsonArrayLength(result, node)) do |position|
+    let value = dataMigrationNodeAt(node, position)
+
+    if value == null || !value.isString()
+      result.fail("seed field must be a string")
+      return ""
+    end
+    return value.scalarText()
+  end
+end
+
+def dataMigrationReadCells(result: DataMigrationSnapshot, node: LspJson): Cell[]
+  return arrays::generate<Cell>(dataMigrationJsonArrayLength(result, node)) do |position|
+    let value = dataMigrationNodeAt(node, position)
+
+    if value == null
+      result.fail("seed value is missing")
+      return Cell.Null()
+    end
+    return dataMigrationReadCell(result, value)
+  end
 end
 
 def dataMigrationReadSnapshot(text: String): DataMigrationSnapshot
@@ -374,4 +697,68 @@ def dataMigrationReadSnapshot(text: String): DataMigrationSnapshot
     result.model = model
   end
   return result
+end
+
+def dataMigrationJsonReference(reference: readonly SchemaReference?): String
+  if reference == null
+    return "null"
+  end
+  var output = "{\"table\":" + lspQuote(reference.table()) + ",\"onDelete\":" + lspQuote(reference.onDelete()) + ",\"columns\":["
+  var fields = ",\"fields\":["
+  var index = 0
+
+  while index < reference.count()
+    output = output + (index == 0 ? "" : ",") + lspQuote(schemaReferenceName(reference.columnAt(index)))
+    fields = fields + (index == 0 ? "" : ",") + lspQuote(schemaReferenceName(reference.fieldAt(index)))
+    index = index + 1
+  end
+  return output + "]" + fields + "]" + (reference.deferred() ? ",\"deferred\":true" : "") + "}"
+end
+
+def dataMigrationReadReference(result: DataMigrationSnapshot, node: LspJson): SchemaReference?
+  if node.isMissing() || node.isNull()
+    return null
+  end
+  if !dataMigrationJsonObject(result, node, "foreign key", ["table", "columns", "fields", "onDelete", "deferred"])
+    return null
+  end
+  let table = dataMigrationJsonRequired(result, node, "table", LspJsonType.String())
+  let columnsNode = dataMigrationJsonRequired(result, node, "columns", LspJsonType.Array())
+  let fieldsNode = dataMigrationJsonRequired(result, node, "fields", LspJsonType.Array())
+  let action = dataMigrationJsonRequired(result, node, "onDelete", LspJsonType.String())
+
+  if table == null || columnsNode == null || fieldsNode == null || action == null
+    return null
+  end
+  let columns: String[] = arrays::generate(dataMigrationJsonArrayLength(result, columnsNode)) do |index|
+    let item = dataMigrationNodeAt(columnsNode, index)
+
+    if item == null || !item.isString()
+      result.fail("foreign-key column must be a string")
+      return ""
+    end
+    return item.scalarText()
+  end
+  let fields: String[] = arrays::generate(dataMigrationJsonArrayLength(result, fieldsNode)) do |index|
+    let item = dataMigrationNodeAt(fieldsNode, index)
+
+    if item == null || !item.isString()
+      result.fail("foreign-key field must be a string")
+      return ""
+    end
+    return item.scalarText()
+  end
+
+  let deferred = node.get("deferred")
+
+  if !deferred.isMissing() && !deferred.isBoolean()
+    result.fail("snapshot foreign-key deferred requires a boolean")
+  end
+  return result.error == "" ? new SchemaReference(
+    table.scalarText(),
+    columns,
+    fields,
+    action.scalarText(),
+    deferred.isTrue()
+  ) : null
 end

@@ -78,8 +78,10 @@ SQLite acquires `BEGIN IMMEDIATE` before reading history. The complete requested
 upgrade or downgrade and its history changes commit together; failures roll
 back that transaction. Other writers cannot race the history check while the
 lock is held. Lock acquisition can fail and the caller may retry. Migration
-execution leaves foreign-key enforcement enabled, so schema operations retain
-SQLite's constraint and cascade behavior.
+execution temporarily disables foreign-key enforcement during table rebuilds
+and checks all references before committing. This prevents dropping a principal
+rebuild table from cascading into dependent rows. The runner restores enforcement
+and the connection's original `legacy_alter_table` setting after success or rollback.
 
 Down operations are authored explicitly. Dropping a table or column can lose
 data; applying an inverse schema operation does not reconstruct its contents.

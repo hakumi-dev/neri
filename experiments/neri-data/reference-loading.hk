@@ -72,10 +72,14 @@ def referenceForeignKeyAllowed(value: Cell): Bool
       return false
     case Cell.Float(number)
       return false
+    case Cell.Binary(boolean)
+      return false
   end
 end
 
-class ReferencedQuery<P, D>
+class ReferencedQuery<P, D>: AsyncNavigationPlan<D, P>
+  private detached: Bool = false
+  private publicationObserver: (fn(TypedRows<D>, TypedRows<P>): Void)?
   private dependents: Query<D>
   private principals: Query<P>
   private relation: CollectionNavigation<P, D>
@@ -84,6 +88,33 @@ class ReferencedQuery<P, D>
     this.dependents = dependents
     this.principals = principals
     this.relation = relation
+  end
+
+  public def beforePublication(observer: fn(TypedRows<D>, TypedRows<P>): Void): ReferencedQuery<P, D>
+    let clone = new ReferencedQuery<P, D>(this.dependents, this.principals, this.relation)
+
+    clone.publicationObserver = observer
+    clone.detached = this.detached
+    return clone
+  end
+
+  public def asNoTracking(): ReferencedQuery<P, D>
+    let copy = new ReferencedQuery<P, D>(this.dependents, this.principals, this.relation)
+
+    copy.publicationObserver = this.publicationObserver
+    copy.detached = true
+    return copy
+  end
+
+  private def detachedPlan(): ReferencedQuery<P, D>
+    let copy = new ReferencedQuery<P, D>(
+      this.dependents.detachedGraph(),
+      this.principals.detachedGraph(),
+      this.relation
+    )
+
+    copy.publicationObserver = this.publicationObserver
+    return copy
   end
 
   internal def validateQueries(): QueryFailure?
@@ -129,31 +160,192 @@ class ReferencedQuery<P, D>
     if dependentKey == null || principalKey == null
       return QueryFailure.UnsupportedCapability("reference loading requires mapped primary keys")
     end
-    let dependentType = navigationColumnType(dependentMapping, dependentKey)
-    let principalType = navigationColumnType(principalMapping, principalKey)
-    let foreignType = navigationColumnType(dependentMapping, this.relation.column())
+    let dependentType = navigationColumnStorageType(dependentMapping, dependentKey)
+    let principalColumns = this.relation.principalColumns(principalMapping.primaryKeys())
+    let principalType = principalColumns.Length == 0 ? "" : navigationColumnStorageType(
+      principalMapping,
+      principalColumns[0]
+    )
+    let foreignType = navigationColumnStorageType(dependentMapping, this.relation.column())
 
     if (dependentType != "Int" && dependentType != "String") || (principalType != "Int" && principalType != "String") || (foreignType != "Int" && foreignType != "String" && foreignType != "Int?" && foreignType != "String?") || principalType != navigationUnderlyingType(foreignType)
       return QueryFailure.UnsupportedCapability("reference keys and foreign key require matching Int or String mappings")
     end
+    if !navigationTupleColumnsValid(principalMapping, dependentMapping, principalColumns, this.relation.columns())
+      return QueryFailure.UnsupportedCapability("reference key tuple mappings do not match")
+    end
     return null
   end
 
+  public def allAsync(options: StreamOptions? = null): result::Result<AsyncNavigation<D, P>, QueryFailure>
+    let plan = this.detached ? this.detachedPlan() : this
+    let invalid = plan.validateQueries()
+
+    if invalid != null
+      return result::Result<AsyncNavigation<D, P>, QueryFailure>.Error(invalid)
+    end
+    match prepareAsyncNavigation<D, P>(plan, options)
+      case AsyncNavigationStart.Failure(error)
+        return result::Result<AsyncNavigation<D, P>, QueryFailure>.Error(error)
+      case AsyncNavigationStart.Started(driver)
+        let owned = new AsyncNavigation<D, P>(driver)
+
+        return result::Result<AsyncNavigation<D, P>, QueryFailure>.Ok(transfer owned)
+    end
+  end
+
+  public def loadAsync(
+    rows: TypedRows<D>,
+    options: StreamOptions? = null
+  ): result::Result<AsyncNavigation<D, P>, QueryFailure>
+    let plan = this.detached ? this.detachedPlan() : this
+    var selected = rows
+
+    if this.detached
+      let tracker = plan.dependents.rowTracker()
+
+      if tracker == null
+        return result::Result<AsyncNavigation<D, P>, QueryFailure>.Error(QueryFailure.UnsupportedCapability("detached graph requires identity metadata"))
+      end
+      match tracker.resolveRows(rows)
+        case QueryResult.Failure(error)
+          return result::Result<AsyncNavigation<D, P>, QueryFailure>.Error(error)
+        case QueryResult.Rows(resolved)
+          selected = resolved
+      end
+    end
+    let invalid = plan.validateQueries()
+
+    if invalid != null
+      return result::Result<AsyncNavigation<D, P>, QueryFailure>.Error(invalid)
+    end
+    let owned = new AsyncNavigation<D, P>(new AsyncNavigationDriver<D, P>(plan, options, rows: selected))
+
+    return result::Result<AsyncNavigation<D, P>, QueryFailure>.Ok(transfer owned)
+  end
+
+  public override def prepareRoot(options: StreamOptions?): AsyncQueryPreparation<D>
+    let invalid = this.validateQueries()
+
+    return invalid == null ? prepareQueryAsync<D>(this.dependents, options) : AsyncQueryPreparation<D>.Failure(invalid)
+  end
+
+  internal override def checkpointRoots(journal: NavigationJournal): Void
+    let parents = this.principals.rowTracker()
+    let children = this.dependents.rowTracker()
+
+    if parents != null && children != null
+      checkpointNavigation(this.relation, parents, children, new TypedRows<P>(), new TypedRows<D>(), journal)
+    end
+  end
+
+  public override def navigationKeys(rows: TypedRows<D>): TypedRows<Cell>
+    let keys = new TypedRows<Cell>()
+    var row = rows.first()
+
+    while row != null
+      let key = this.relation.foreignKey(row.value)
+      var existing = keys.first()
+      var found = false
+
+      while existing != null
+        found = found || navigationCellEqual(existing.value, key)
+        existing = existing.next
+      end
+      if !found && navigationKeyValid(key)
+        keys.add(key)
+      end
+      row = row.next
+    end
+    return keys
+  end
+
+  public override def navigationMaximum(): Int
+    return 10000
+  end
+
+  public override def prepareNavigation(
+    keys: TypedRows<Cell>,
+    maximum: Int,
+    options: StreamOptions?
+  ): AsyncQueryPreparation<P>
+    let mapping = this.principals.entityMapping()
+    let provider = this.principals.provider()
+
+    if mapping == null || provider == null
+      return AsyncQueryPreparation<P>.Failure(QueryFailure.UnsupportedCapability("asynchronous reference loading requires mapped provider roots"))
+    end
+    let query = this.principals.matchingTupleCells(this.relation.principalColumns(mapping.primaryKeys()), keys)
+
+    match compilePipeline<P, P>(query, query.rowDecoder(), null, null, provider.dialect(), unbounded: true)
+      case CompileResult.Failure(error)
+        return AsyncQueryPreparation<P>.Failure(error)
+      case CompileResult.Plan(plan)
+        return prepareAsyncQuery<P>(provider, plan, options, maximumRows: maximum)
+    end
+  end
+
+  public override def publishNavigation(rows: TypedRows<D>, related: TypedRows<P>): QueryResult<D>
+    return this.load(rows, related)
+  end
+
   public def all(): QueryResult<D>
+    if this.detached
+      return this.detachedPlan().all()
+    end
     let invalid = this.validateQueries()
 
     if invalid != null
       return QueryResult<D>.Failure(invalid)
     end
+    let journal = new NavigationJournal()
+
+    this.checkpointRoots(journal)
     match this.dependents.all()
       case QueryResult.Failure(error)
+        journal.rollback()
         return QueryResult<D>.Failure(error)
       case QueryResult.Rows(rows)
-        return this.load(rows)
+        let result = this.load(rows)
+
+        match result
+          case QueryResult.Failure(error)
+            journal.rollback()
+          case QueryResult.Rows(loaded)
+            journal.discard()
+        end
+        return result
     end
   end
 
-  public def load(rows: TypedRows<D>): QueryResult<D>
+  public def load(rows: TypedRows<D>, prefetched: TypedRows<P>? = null): QueryResult<D>
+    if this.detached
+      let plan = this.detachedPlan()
+      let tracker = plan.dependents.rowTracker()
+
+      if tracker == null
+        return QueryResult<D>.Failure(QueryFailure.UnsupportedCapability("detached graph requires identity metadata"))
+      end
+      match tracker.resolveRows(rows)
+        case QueryResult.Failure(error)
+          return QueryResult<D>.Failure(error)
+        case QueryResult.Rows(resolved)
+          return plan.load(resolved, prefetched)
+      end
+    end
+    let journal = new NavigationJournal()
+    let result = this.loadCore(rows, prefetched, journal)
+
+    match result
+      case QueryResult.Failure(error)
+        journal.rollback()
+      case QueryResult.Rows(loaded)
+        journal.discard()
+    end
+    return result
+  end
+
+  private def loadCore(rows: TypedRows<D>, prefetched: TypedRows<P>?, journal: NavigationJournal): QueryResult<D>
     let invalid = this.validateQueries()
 
     if invalid != null
@@ -195,17 +387,17 @@ class ReferencedQuery<P, D>
       let current = dependentTracker.current(dependent)
       let baseline = dependentTracker.original(dependent)
 
-      if current == null || baseline == null || !navigationRowMatches(
+      if current == null || baseline == null || !navigationTupleRowMatches(
         current,
-        dependentKeyColumn,
+        dependentMapping.primaryKeys(),
         key
-      ) || !navigationRowMatchesOptional(
+      ) || !navigationTupleRowMatches(
         current,
-        this.relation.column(),
+        this.relation.columns(),
         foreignKey
-      ) || !navigationRowMatchesOptional(
+      ) || !navigationTupleRowMatches(
         baseline,
-        this.relation.column(),
+        this.relation.columns(),
         foreignKey
       )
         return QueryResult<D>.Failure(QueryFailure.Provider(ProviderFailure.State("reference dependent key or foreign key differs from mapped baseline")))
@@ -252,7 +444,17 @@ class ReferencedQuery<P, D>
     let staged = new NavigationStage<P>(requested.count())
     var batch = requested.first()
 
-    while batch != null
+    if prefetched != null
+      var current = prefetched.first()
+
+      while current != null
+        if !staged.accept(current.value)
+          return QueryResult<D>.Failure(QueryFailure.Provider(ProviderFailure.State("reference principal query returned too many rows")))
+        end
+        current = current.next
+      end
+    end
+    while batch != null && prefetched == null
       let keys = new TypedRows<Cell>()
       var taken = 0
       var cursor: TypedRowNode<Cell>? = batch
@@ -263,7 +465,10 @@ class ReferencedQuery<P, D>
         taken = taken + 1
       end
       batch = cursor
-      let principalQuery = this.principals.matchingCells(principalKeyColumn, keys)
+      let principalQuery = this.principals.matchingTupleCells(
+        this.relation.principalColumns(principalMapping.primaryKeys()),
+        keys
+      )
       let visit: fn(P): Bool = fn(value: P): Bool do
         return staged.accept(value)
       end
@@ -315,6 +520,12 @@ class ReferencedQuery<P, D>
     var firstTarget: NavigationBucket<P, D>? = null
     var lastTarget: NavigationBucket<P, D>? = null
 
+    let publicationObserver = this.publicationObserver
+
+    if publicationObserver != null
+      publicationObserver(rows, staged.rows)
+    end
+    checkpointNavigation(this.relation, principalTracker, dependentTracker, staged.rows, rows, journal)
     match principalTracker.resolveRows(staged.rows)
       case QueryResult.Failure(error)
         return QueryResult<D>.Failure(error)
@@ -329,9 +540,9 @@ class ReferencedQuery<P, D>
           if !principalTracker.ownsPersistedForNavigation(principal.value) || !navigationCellEqual(
             key,
             this.relation.principalKey(raw.value)
-          ) || original == null || !navigationRowMatches(
+          ) || original == null || !navigationTupleRowMatches(
             original,
-            principalKeyColumn,
+            this.relation.principalColumns(principalMapping.primaryKeys()),
             key
           )
             return QueryResult<D>.Failure(QueryFailure.Provider(ProviderFailure.State("tracked reference principal key differs from database row")))
@@ -427,17 +638,17 @@ class ReferencedQuery<P, D>
         ) || !dependentTracker.ownsPersistedForNavigation(member) || !navigationCellEqual(
           this.relation.foreignKey(member),
           target.key
-        ) || currentMember == null || originalMember == null || !navigationRowMatches(
+        ) || currentMember == null || originalMember == null || !navigationTupleRowMatches(
           currentMember,
-          dependentKeyColumn,
+          dependentMapping.primaryKeys(),
           this.relation.dependentKey(member)
-        ) || !navigationRowMatchesOptional(
+        ) || !navigationTupleRowMatches(
           currentMember,
-          this.relation.column(),
+          this.relation.columns(),
           target.key
-        ) || !navigationRowMatchesOptional(
+        ) || !navigationTupleRowMatches(
           originalMember,
-          this.relation.column(),
+          this.relation.columns(),
           target.key
         )
           return QueryResult<D>.Failure(QueryFailure.Provider(ProviderFailure.State("principal collection contains contradictory member")))
@@ -476,6 +687,7 @@ class ReferencedQuery<P, D>
 
     while selected != null
       this.relation.setReference(selected.dependent, selected.target)
+      this.relation.markReference(selected.dependent, NavigationLoadState.Loaded())
       selected = selected.next
     end
     return QueryResult<D>.Rows(rows)

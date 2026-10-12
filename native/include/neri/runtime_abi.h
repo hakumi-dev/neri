@@ -193,10 +193,13 @@ struct neri_type_descriptor_v1 {
   neri_gc_trace_inline_fn_v1 trace_inline;
   uint32_t scalar_kind;
   uint32_t reserved_v1_4;
+  /* Optional class ancestry extension, present when struct_size covers it. */
+  const neri_type_descriptor_v1 *base_type;
 };
 
 #define NERI_TYPE_DESCRIPTOR_V1_BASE_SIZE UINT32_C(80)
 #define NERI_TYPE_DESCRIPTOR_V1_4_SIZE UINT32_C(104)
+#define NERI_TYPE_DESCRIPTOR_V1_CLASS_BASE_SIZE UINT32_C(112)
 
 typedef struct neri_runtime_abi_requirements_v1 {
   uint32_t struct_size;

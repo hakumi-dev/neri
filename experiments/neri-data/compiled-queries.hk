@@ -1,0 +1,363 @@
+use result
+use host
+namespace neri_data
+
+enum CompiledQueryResult<T>
+  case Prepared(value: CompiledQuery<T>)
+  case Failure(error: QueryFailure)
+end
+
+def compiledParameterKind(value: readonly Parameter): String
+  match value
+    case Parameter.Bool(value)
+      return "Bool"
+    case Parameter.Int(value)
+      return "Int"
+    case Parameter.Float(value)
+      return "Float"
+    case Parameter.Text(value)
+      return "String"
+    case Parameter.Binary(value)
+      return "ByteBuffer"
+  end
+end
+
+def compiledDialectName(dialect: SqlDialect): String
+  match dialect
+    case SqlDialect.QuestionMark()
+      return "question-mark"
+    case SqlDialect.PostgreSql()
+      return "postgresql"
+  end
+end
+
+## A reusable translated query with strict, independently copied parameter binding.
+class CompiledQuery<T>
+  private source: Query<T>
+  private plan: TypedPlan<T>
+  private dialectName: String
+  private storedDialect: SqlDialect
+
+  def init(source: Query<T>, plan: TypedPlan<T>, dialect: SqlDialect): Void
+    this.source = source
+    this.plan = plan
+    this.dialectName = compiledDialectName(dialect)
+    this.storedDialect = dialect
+  end
+
+  public readonly def sql(): readonly SqlPlan
+    return this.plan.sql()
+  end
+
+  ## Creates a reusable functional delegate; every invocation supplies fresh values.
+  public def delegate<A>(parameters: fn(A): ParameterValues): fn(A): QueryResult<T>
+    let compiled = this
+    let invoke: fn(A): QueryResult<T> = fn(argument: A): QueryResult<T> do
+      return compiled.all(parameters: parameters(argument))
+    end
+
+    return invoke
+  end
+
+  public def asyncDelegate<A>(parameters: fn(A): ParameterValues): fn(
+    A,
+    StreamOptions?
+  ): result::Result<AsyncQuery<T>, QueryFailure>
+    let compiled = this
+    let invoke: fn(
+      A,
+      StreamOptions?
+    ): result::Result<AsyncQuery<T>, QueryFailure> = fn(
+      argument: A,
+      options: StreamOptions?
+    ): result::Result<AsyncQuery<T>, QueryFailure> do
+      match compiled.prepareAllAsync(options, parameters(argument))
+        case AsyncQueryPreparation.Failure(error)
+          return result::Result<AsyncQuery<T>, QueryFailure>.Error(error)
+        case AsyncQueryPreparation.Ready(driver, plan, tracker)
+          let owned = new AsyncQuery<T>(driver, plan, tracker)
+
+          return result::Result<AsyncQuery<T>, QueryFailure>.Ok(transfer owned)
+      end
+    end
+
+    return invoke
+  end
+
+  ## Associates the compiled shape with a compatible query and its context policy.
+  ## Compatibility is checked once; subsequent reads reuse the translated plan.
+  public def bindTo(query: Query<T>): CompiledQueryResult<T>
+    let provider = query.provider()
+
+    if provider != null && compiledDialectName(provider.dialect()) != this.dialectName
+      return CompiledQueryResult<T>.Failure(QueryFailure.UnsupportedCapability("compiled query provider dialect does not match"))
+    end
+    match compilePipeline<T, T>(
+      query,
+      query.rowDecoder(),
+      null,
+      query.rowLimit(),
+      this.storedDialect,
+      unbounded: !query.hasBound()
+    )
+      case CompileResult.Failure(error)
+        return CompiledQueryResult<T>.Failure(error)
+      case CompileResult.Plan(plan)
+        let original = this.plan.sql()
+        let candidate = plan.sql()
+
+        if original.sql() != candidate.sql() || original.columns().count() != candidate.columns().count() || original.parameters().count() != candidate.parameters().count()
+          return CompiledQueryResult<T>.Failure(QueryFailure.UnsupportedCapability("compiled query target shape does not match"))
+        end
+        var index = 0
+
+        while index < original.columns().count()
+          let first = original.columns().at(index)
+          let second = candidate.columns().at(index)
+
+          if first.name() != second.name() || relationSetKind(first.kind()) != relationSetKind(second.kind()) || first.nullable() != second.nullable()
+            return CompiledQueryResult<T>.Failure(QueryFailure.UnsupportedCapability("compiled query target result columns do not match"))
+          end
+          index = index + 1
+        end
+        var first = original.parameters().first()
+        var second = candidate.parameters().first()
+
+        while first != null && second != null
+          if compiledParameterKind(first.value()) != compiledParameterKind(second.value())
+            return CompiledQueryResult<T>.Failure(QueryFailure.UnsupportedCapability("compiled query target parameter types do not match"))
+          end
+          first = first.next()
+          second = second.next()
+        end
+        if first != null || second != null
+          return CompiledQueryResult<T>.Failure(QueryFailure.UnsupportedCapability("compiled query target parameter list does not match"))
+        end
+        return CompiledQueryResult<T>.Prepared(new CompiledQuery<T>(query, plan, this.storedDialect))
+    end
+  end
+
+  ## Reuses SQL and decoding while replacing captured values with matching scalar types.
+  public def bind(parameters: readonly ParameterValues? = null): CompileResult<T>
+    let invalid = this.source.queryFailure()
+
+    if invalid != null
+      return CompileResult<T>.Failure(invalid)
+    end
+    if parameters == null
+      return CompileResult<T>.Plan(this.plan)
+    end
+    let expected = this.plan.sql().parameters()
+
+    if parameters.count() != expected.count()
+      return CompileResult<T>.Failure(QueryFailure.UnsupportedCapability("compiled query parameter count does not match"))
+    end
+    var supplied = parameters.first()
+    var declared = expected.first()
+    let state = new CompileState()
+
+    while supplied != null && declared != null && state.count < expected.count()
+      let actualKind = compiledParameterKind(supplied.value())
+      let expectedKind = compiledParameterKind(declared.value())
+
+      if actualKind != expectedKind
+        return CompileResult<T>.Failure(QueryFailure.TypeMismatch(
+            "compiled query parameter " + (state.count as String),
+            expectedKind,
+            actualKind
+          ))
+      end
+      match supplied.value()
+        case Parameter.Bool(value)
+          state.bind(Parameter.Bool(value))
+        case Parameter.Int(value)
+          state.bind(Parameter.Int(value))
+        case Parameter.Float(value)
+          if !dataFloatFinite(value)
+            return CompileResult<T>.Failure(QueryFailure.UnsupportedCapability("Float parameter must be finite"))
+          end
+          state.bind(Parameter.Float(value))
+        case Parameter.Text(value)
+          state.bind(Parameter.Text(value))
+        case Parameter.Binary(value)
+          state.bind(Parameter.Binary(copyBinary(value)))
+      end
+      supplied = supplied.next()
+      declared = declared.next()
+    end
+    if supplied != null || declared != null || state.count != expected.count()
+      return CompileResult<T>.Failure(QueryFailure.UnsupportedCapability("compiled query parameter list does not match its count"))
+    end
+    let original = this.plan
+    let read: fn(RawRow): DecodeResult<T> = fn(row: RawRow): DecodeResult<T> do
+      return original.decode(row)
+    end
+    let sql = original.sql()
+    let decoder = new Decoder<T>(read, relationColumnsCopy(sql.columns()))
+
+    return CompileResult<T>.Plan(new TypedPlan<T>(
+        new SqlPlan(
+          sql.sql(),
+          new ParameterValues(state.head, state.count),
+          sql.limit(),
+          sql.columns(),
+          sql.requiresCheckedScalars()
+        ),
+        decoder
+      ))
+  end
+
+  public def all(provider: Provider? = null, parameters: readonly ParameterValues? = null): QueryResult<T>
+    let selected = provider == null ? this.source.provider() : provider
+
+    if selected == null
+      return QueryResult<T>.Failure(QueryFailure.UnsupportedCapability("compiled query requires a provider"))
+    end
+    if compiledDialectName(selected.dialect()) != this.dialectName
+      return QueryResult<T>.Failure(QueryFailure.UnsupportedCapability("compiled query provider dialect does not match"))
+    end
+    let compiled = this.bind(parameters)
+    var result: QueryResult<T> = QueryResult<T>.Failure(QueryFailure.UnsupportedCapability("compiled query did not execute"))
+
+    if this.source.hasBound()
+      if !selected.supports(ProviderCapability.BoundedTypedReads())
+        return QueryResult<T>.Failure(QueryFailure.UnsupportedCapability("bounded-typed-reads"))
+      end
+      result = execute<T>(compiled, selected)
+    else
+      let buildPlan: fn(SqlDialect): CompileResult<T> = fn(dialect: SqlDialect): CompileResult<T> do
+        return compiled
+      end
+
+      result = materializeStream<T>(selected, buildPlan)
+    end
+    match result
+      case QueryResult.Failure(error)
+        return QueryResult<T>.Failure(error)
+      case QueryResult.Rows(rows)
+        if provider == null || this.source.identityResolutionOnly()
+          let tracker = this.source.rowTracker()
+
+          if tracker != null
+            return tracker.resolveRows(rows)
+          end
+        end
+        return QueryResult<T>.Rows(rows)
+    end
+  end
+
+  public def allAsync(
+    options: StreamOptions? = null,
+    parameters: readonly ParameterValues? = null
+  ): result::Result<AsyncQuery<T>, QueryFailure>
+    match this.prepareAllAsync(options, parameters)
+      case AsyncQueryPreparation.Failure(error)
+        return result::Result<AsyncQuery<T>, QueryFailure>.Error(error)
+      case AsyncQueryPreparation.Ready(driver, plan, tracker)
+        let owned = new AsyncQuery<T>(driver, plan, tracker)
+
+        return result::Result<AsyncQuery<T>, QueryFailure>.Ok(transfer owned)
+    end
+  end
+
+  internal def prepareAllAsync(options: StreamOptions?, parameters: readonly ParameterValues?): AsyncQueryPreparation<T>
+    let provider = this.source.provider()
+
+    if provider == null
+      return AsyncQueryPreparation<T>.Failure(QueryFailure.UnsupportedCapability("compiled asynchronous query requires a provider"))
+    end
+    if compiledDialectName(provider.dialect()) != this.dialectName
+      return AsyncQueryPreparation<T>.Failure(QueryFailure.UnsupportedCapability("compiled query provider dialect does not match"))
+    end
+    match this.bind(parameters)
+      case CompileResult.Failure(error)
+        return AsyncQueryPreparation<T>.Failure(error)
+      case CompileResult.Plan(plan)
+        let tracker = this.source.rowTracker()
+        var resolver: AsyncRowResolver<T>? = null
+
+        if tracker != null
+          resolver = tracker
+        end
+        return prepareAsyncQuery<T>(provider, plan, options, resolver, streamMaximum<T>(this.source))
+    end
+  end
+end
+
+def compileTypedQuery<T>(query: Query<T>, dialect: SqlDialect? = null): CompiledQueryResult<T>
+  let provider = query.provider()
+  let selected = dialect == null ? (provider == null ? SqlDialect.QuestionMark() : provider.dialect()) : dialect
+
+  match compilePipeline<T, T>(query, query.rowDecoder(), null, query.rowLimit(), selected, unbounded: !query.hasBound())
+    case CompileResult.Failure(error)
+      return CompiledQueryResult<T>.Failure(error)
+    case CompileResult.Plan(plan)
+      return CompiledQueryResult<T>.Prepared(new CompiledQuery<T>(query, plan, selected))
+  end
+end
+
+## Reads trusted composable SQL through an explicit decoder and independent values.
+## Optional mapping enables the same field-based composition as generated queries.
+def sqlQuery<T>(
+  sql: String,
+  parameters: readonly ParameterValues,
+  decoder: Decoder<T>,
+  provider: Provider? = null,
+  mapping: EntityMapping? = null
+): Query<T>
+  let source = mapping == null ? "__neri_sql" : mapping.table()
+
+  return new Query<T>(source, decoder, mapping: mapping, provider: provider).fromSql(sql, parameters)
+end
+
+## A scalar SQL source exposes its single result column as Value for composition.
+def sqlScalar<T>(
+  codec: ScalarCodec<T>,
+  sql: String,
+  parameters: readonly ParameterValues,
+  provider: Provider? = null
+): Relation<T>
+  let mapping = new EntityMapping(
+    codec.typeName(),
+    "__neri_sql",
+    [new MappingColumn(codec.typeName() + ".value", codec.typeName(), "Value")],
+    readOnly: true
+  )
+  var failure = codec.preservesSqlValue() ? null : QueryFailure.UnsupportedCapability("composable scalar SQL requires a certified scalar codec")
+
+  if host::stringByteLength(sql) == 0 || host::stringByteLength(sql) > 65536
+    failure = QueryFailure.UnsupportedCapability("SQL source length must be between 1 and 65536 bytes")
+  end
+  var index = 0
+
+  while index < host::stringByteLength(sql)
+    if host::stringByteAt(sql, index) == (0 as Byte)
+      failure = QueryFailure.UnsupportedCapability("SQL source contains NUL")
+    end
+    index = index + 1
+  end
+  let copied = new CompileState()
+
+  joinParameterCopy(parameters, copied)
+  let values = new ParameterValues(copied.head, copied.count)
+  let decoder = codec.decoder("Value")
+  let build: fn(SqlDialect): RelationBuildResult<T> = fn(dialect: SqlDialect): RelationBuildResult<T> do
+    match compileQuery<T>(
+      "__neri_sql", decoder, null, null, null, false, null, dialect,
+      selected: mappedSelection(mapping),
+      fromSql: new SqlSource("(" + sql + "\n) AS \"__neri_sql\""),
+      prefix: values,
+      allowUnbounded: true
+    )
+      case CompileResult.Failure(error)
+        return RelationBuildResult<T>.Failure(error)
+      case CompileResult.Plan(plan)
+        return RelationBuildResult<T>.Plan(new RelationPlan<T>(
+            plan.sql().sql(), values, relationColumnsCopy(plan.sql().columns()), decoder, mapping,
+            plan.sql().requiresCheckedScalars()
+          ))
+    end
+  end
+
+  return new Relation<T>(build, provider, failure: failure)
+end

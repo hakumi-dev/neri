@@ -120,6 +120,7 @@ class PersistenceProvider: Provider
                 case Cell.Float(value)
                 case Cell.Bool(value)
                 case Cell.Text(value)
+                case Cell.Binary(value)
               end
             end
           end
@@ -297,13 +298,175 @@ def expectName(row: RawRow?, name: String): Void
           test::assertTrue(false)
         case Cell.Int(value)
           test::assertTrue(false)
+        case Cell.Binary(value)
+          test::assertTrue(false)
       end
     case CellLookup.Missing()
       test::assertTrue(false)
   end
 end
 
+def verifyIdentifyingGraphRollback(): Void
+  let columns = new ResultColumns([
+      new ResultColumn("id", ResultColumnKind.Int()),
+      new ResultColumn("parent_id", ResultColumnKind.Int())
+    ])
+  let principals = new EntityTracker<GraphItem>("identifying_principals", "id", columns, captureGraphItem)
+  let dependents = new EntityTracker<GraphItem>(
+    "identifying_dependents", "id", columns, captureGraphItem,
+    keyColumns: ["id", "parent_id"]
+  )
+  let context = new ChangeContext(new PersistenceProvider())
+  let principal = new GraphItem(7, 0)
+  let dependent = new GraphItem(5, 0)
+
+  context.register(principals.changeSet())
+  context.register(dependents.changeSet())
+
+  test::assertTrue(principals.add(principal) == null)
+  test::assertTrue(dependents.add(dependent) == null)
+  let graph = new GraphRegistration(context)
+  let principalVisits = new GraphVisitList<GraphItem>(graph)
+  let dependentVisits = new GraphVisitList<GraphItem>(graph)
+  var principalSlot: GraphSlot<GraphItem>? = null
+  var dependentSlot: GraphSlot<GraphItem>? = null
+
+  match principalVisits.visit(principal)
+    case GraphVisitResult.New(slot)
+      principalSlot = slot
+    case GraphVisitResult.Existing(slot)
+      test::assertTrue(false)
+    case GraphVisitResult.Failure(error)
+      test::assertTrue(false)
+  end
+  match dependentVisits.visit(dependent)
+    case GraphVisitResult.New(slot)
+      dependentSlot = slot
+    case GraphVisitResult.Existing(slot)
+      test::assertTrue(false)
+    case GraphVisitResult.Failure(error)
+      test::assertTrue(false)
+  end
+  if principalSlot == null || dependentSlot == null
+    return
+  end
+  let valid: fn(
+    TrackedHandle<GraphItem>,
+    TrackedHandle<GraphItem>
+  ): RelationshipEdge = fn(
+    parent: TrackedHandle<GraphItem>,
+    child: TrackedHandle<GraphItem>
+  ): RelationshipEdge do
+    return new RelationshipLink<GraphItem, GraphItem>(
+      parent,
+      child,
+      readGraphKey,
+      readGraphParent,
+      setGraphParent,
+      slot: "parent_id"
+    ).edge()
+  end
+  let invalid: fn(
+    TrackedHandle<GraphItem>,
+    TrackedHandle<GraphItem>
+  ): RelationshipEdge = fn(
+    parent: TrackedHandle<GraphItem>,
+    child: TrackedHandle<GraphItem>
+  ): RelationshipEdge do
+    return new RelationshipLink<GraphItem, GraphItem>(
+      parent,
+      child,
+      readGraphKey,
+      readGraphParent,
+      setGraphParent,
+      slot: "missing",
+      deletePolicy: RelationshipDeletePolicy.ClientSetNull()
+    ).edge()
+  end
+  let restore: fn(): Void = fn(): Void do
+    dependent.parentId = 0
+  end
+
+  test::assertTrue(graph.stageNode(principalSlot, principals) == null)
+  test::assertTrue(graph.stageNode(dependentSlot, dependents) == null)
+  test::assertTrue(graph.stageLink(principalSlot, dependentSlot, valid, restore) == null)
+  test::assertTrue(graph.stageLink(principalSlot, dependentSlot, invalid, restore) == null)
+  match graph.enroll(principalSlot)
+    case TrackHandleResult.Tracked(handle)
+      test::assertTrue(false)
+    case TrackHandleResult.Failure(error)
+  end
+
+  test::assertEqual(dependent.parentId, 0)
+  test::assertTrue(dependents.original(dependent) != null)
+
+  let duplicate = new GraphItem(5, 7)
+
+  test::assertTrue(dependents.add(duplicate) == null)
+  let principalHandle = principalSlot.handle()
+  let dependentHandle = dependentSlot.handle()
+
+  if principalHandle == null || dependentHandle == null
+    return
+  end
+
+  test::assertTrue(context.registerRelation(valid(principalHandle, dependentHandle)) != null)
+  test::assertEqual(dependent.parentId, 0)
+  test::assertTrue(dependents.original(dependent) != null)
+  test::assertTrue(dependents.remove(duplicate) == null)
+  test::assertTrue(context.registerRelation(valid(principalHandle, dependentHandle)) == null)
+  test::assertEqual(dependent.parentId, 7)
+  dependent.id = 6
+  expectedValidation(context.saveChanges())
+  dependent.id = 5
+  expectedSaved(context.saveChanges(), 2)
+end
+
+def captureSegmentGraphItem(item: GraphItem): RawRow
+  return new RawRow([
+      new RawColumn("id", Cell.Int(item.id)),
+      new RawColumn("local_value", Cell.Int(10)),
+      new RawColumn("remote_value", Cell.Int(item.parentId))
+    ])
+end
+
+def verifyTableSegmentComparer(): Void
+  let columns = new ResultColumns([
+      new ResultColumn("id", ResultColumnKind.Int()),
+      new ResultColumn("local_value", ResultColumnKind.Int()),
+      new ResultColumn("remote_value", ResultColumnKind.Int())
+    ])
+  let roots = new EntityTracker<GraphItem>("segment_roots", "id", columns, captureSegmentGraphItem)
+  let entity = new GraphItem(1, 5)
+
+  test::assertTrue(roots.attach(entity) == null)
+  entity.parentId = 99
+  let equal: fn(RawRow, RawRow): Bool = fn(left: RawRow, right: RawRow): Bool do
+    let leftRemote = cellFromRow(left, "remote_value")
+    let rightRemote = cellFromRow(right, "remote_value")
+
+    test::assertTrue(leftRemote != null && rightRemote != null)
+    if leftRemote != null && rightRemote != null
+      test::assertTrue(sameCell(leftRemote, Cell.Int(5)))
+      test::assertTrue(sameCell(rightRemote, Cell.Int(5)))
+    end
+    return sameRows(left, right, columns)
+  end
+  let comparer = tableSegmentComparer<GraphItem>(roots, ["id"], equal)
+  let original = new RawRow([
+      new RawColumn("id", Cell.Int(1)), new RawColumn("local_value", Cell.Int(10))
+    ])
+  let changed = new RawRow([
+      new RawColumn("id", Cell.Int(1)), new RawColumn("local_value", Cell.Int(11))
+    ])
+
+  test::assertTrue(comparer(original, original))
+  test::assertFalse(comparer(original, changed))
+end
+
 def main(): Void
+  verifyTableSegmentComparer()
+  verifyIdentifyingGraphRollback()
   let driver = new DriverError("test", "commit", DriverErrorKind.StorageFull(), 13, 1293, "53100", "storage exhausted")
   let cleanup = WriteFailure.Provider(ProviderFailure.Driver(driver))
   let failure = WriteFailure.Cleanup(new WriteCleanupFailure(WriteFailure.Concurrency("stale revision"), cleanup))
@@ -324,7 +487,7 @@ def main(): Void
 
   malformedContext.register(malformed.changeSet())
 
-  test::assertTrue(malformed.attach(new PersistenceItem(1, "kept")) == null)
+  test::assertTrue(malformed.attach(new PersistenceItem(1, "kept")) != null)
   expectedValidation(malformedContext.saveChanges())
   let columns = new ResultColumns([
       new ResultColumn("id", ResultColumnKind.Int()),
@@ -419,6 +582,8 @@ def main(): Void
             test::assertTrue(false)
           case Cell.Int(value)
             test::assertTrue(false)
+          case Cell.Binary(value)
+            test::assertTrue(false)
         end
       case CellLookup.Missing()
         test::assertTrue(false)
@@ -435,6 +600,8 @@ def main(): Void
           case Cell.Bool(value)
             test::assertTrue(false)
           case Cell.Int(value)
+            test::assertTrue(false)
+          case Cell.Binary(value)
             test::assertTrue(false)
         end
       case CellLookup.Missing()

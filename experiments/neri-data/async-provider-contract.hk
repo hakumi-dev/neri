@@ -1,0 +1,587 @@
+use neri_data
+use test
+use resources
+namespace neri_data_async_contract
+
+class AsyncProviderEntity
+  public id: Int = 42
+  public label: String = "tracked async insertion"
+end
+
+def captureAsyncProviderEntity(entity: AsyncProviderEntity): RawRow
+  return new RawRow([
+      new RawColumn("id", Cell.Int(entity.id)),
+      new RawColumn("label", Cell.Text(entity.label))
+    ])
+end
+
+def awaitAsyncContextSave(context: ChangeContext, expected: Int): resources::Outcome<Int, WriteFailure>
+  using operation <- context.saveChangesAsync()
+    while true
+      match operation.poll()
+        case AsyncWritePoll.Pending(socket, interest)
+          continue
+        case AsyncWritePoll.Completed(result)
+          match result
+            case WriteResult.Saved(count)
+              test::assertEqual(count, expected)
+            case WriteResult.SavedWithValues(count, rows)
+              test::assertEqual(count, expected)
+            case WriteResult.Failure(error)
+              return error
+          end
+          return 0
+      end
+    end
+  end
+  return 1
+end
+
+def asyncContextSaved(outcome: resources::Outcome<Int, WriteFailure>): Void
+  test::assertEqual(outcome.closeFailures.count(), 0)
+  match outcome.completion
+    case resources::Completion.Value(value)
+      test::assertEqual(value, 0)
+    case resources::Completion.Failure(error)
+      if error != null
+        console::println(writeFailureMessage(error))
+      end
+
+      test::assertTrue(false)
+  end
+end
+
+def verifyAsyncProviderTrackedSave(provider: Provider): Void
+  let columns = new ResultColumns([
+      new ResultColumn("id", ResultColumnKind.Int()),
+      new ResultColumn("label", ResultColumnKind.Text())
+    ])
+  let tracker = new EntityTracker<AsyncProviderEntity>(
+    "neri_async_write_values",
+    "id",
+    columns,
+    captureAsyncProviderEntity
+  )
+  let context = new ChangeContext(provider)
+  let entity = new AsyncProviderEntity()
+
+  context.register(tracker.changeSet())
+
+  test::assertTrue(tracker.add(entity) == null)
+  asyncContextSaved(awaitAsyncContextSave(context, 1))
+
+  test::assertTrue(tracker.original(entity) != null)
+  test::assertEqual(asyncProviderCount(provider), 2)
+  entity.label = "tracked async update"
+  asyncContextSaved(awaitAsyncContextSave(context, 1))
+
+  test::assertTrue(tracker.remove(entity) == null)
+  asyncContextSaved(awaitAsyncContextSave(context, 1))
+
+  test::assertTrue(tracker.original(entity) == null)
+  test::assertEqual(asyncProviderCount(provider), 1)
+end
+
+class AsyncProviderValidation
+  public calls: Int = 0
+  public reject: Bool = false
+
+  public def validate(rows: readonly WriteReturnedRows): WriteFailure?
+    this.calls = this.calls + 1
+    if rows.count() != 1 || rows.at(0) == null
+      return WriteFailure.Validation("RETURNING row was absent")
+    end
+    let row = rows.at(0)
+
+    if row == null
+      return WriteFailure.Validation("RETURNING row was absent")
+    end
+    match row.value("id")
+      case CellLookup.Found(cell)
+        match cell
+          case Cell.Int(id)
+            test::assertTrue(id > 0)
+          case Cell.Null()
+            return WriteFailure.Validation("RETURNING id was malformed")
+          case Cell.Bool(value)
+            return WriteFailure.Validation("RETURNING id was malformed")
+          case Cell.Float(value)
+            return WriteFailure.Validation("RETURNING id was malformed")
+          case Cell.Text(value)
+            return WriteFailure.Validation("RETURNING id was malformed")
+          case Cell.Binary(value)
+            return WriteFailure.Validation("RETURNING id was malformed")
+        end
+      case CellLookup.Missing()
+        return WriteFailure.Validation("RETURNING id was malformed")
+    end
+    return this.reject ? WriteFailure.Validation("deliberate before-commit rejection") : null
+  end
+end
+
+def awaitAsyncWrite(start: AsyncWriteStart): WriteResult
+  match start
+    case AsyncWriteStart.Failure(error)
+      return WriteResult.Failure(error)
+    case AsyncWriteStart.Started(driver)
+      while true
+        match driver.poll()
+          case AsyncWritePoll.Pending(socket, interest)
+            continue
+          case AsyncWritePoll.Completed(result)
+            test::assertTrue(driver.close() == null)
+
+            return result
+        end
+      end
+  end
+  return WriteResult.Failure(WriteFailure.Transaction("async write did not terminate"))
+end
+
+def awaitAsyncControl(start: AsyncControlStart): AsyncControlResult
+  match start
+    case AsyncControlStart.Failure(error)
+      return AsyncControlResult.Failure(error)
+    case AsyncControlStart.Started(driver)
+      while true
+        match driver.poll()
+          case AsyncControlPoll.Pending(socket, interest)
+            continue
+          case AsyncControlPoll.Completed(result)
+            test::assertTrue(driver.close() == null)
+
+            return result
+        end
+      end
+  end
+  return AsyncControlResult.Failure(WriteFailure.Transaction("async control did not terminate"))
+end
+
+def asyncControlSaved(result: AsyncControlResult): Void
+  match result
+    case AsyncControlResult.Saved()
+      return
+    case AsyncControlResult.Failure(error)
+      console::println(writeFailureMessage(error))
+
+      test::assertTrue(false)
+    case AsyncControlResult.Begun(lease)
+      test::assertTrue(false)
+    case AsyncControlResult.Created(id)
+      test::assertTrue(false)
+  end
+end
+
+def asyncRowsSaved(result: WriteResult, expected: Int): Void
+  match result
+    case WriteResult.SavedWithValues(count, rows)
+      test::assertEqual(count, expected)
+      test::assertEqual(rows.count(), expected)
+    case WriteResult.Failure(error)
+      console::println(writeFailureMessage(error))
+
+      test::assertTrue(false)
+    case WriteResult.Saved(count)
+      test::assertTrue(false)
+  end
+end
+
+def asyncProviderCount(provider: Provider): Int
+  let columns = new ResultColumns([new ResultColumn("n", ResultColumnKind.Int())])
+  let plan = new SqlPlan("SELECT COUNT(*) AS n FROM neri_async_write_values", new ParameterValues(), 1, columns)
+  var count = -1
+
+  match provider.beginReadAsync(plan, new StreamOptions(timeoutMilliseconds: 10000), 1)
+    case AsyncReadStart.Failure(error)
+      console::println(providerFailureMessage(error))
+
+      test::assertTrue(false)
+    case AsyncReadStart.Started(driver)
+      var done = false
+
+      while !done
+        match driver.poll()
+          case AsyncReadPoll.Pending(socket, interest)
+            continue
+          case AsyncReadPoll.Row(row)
+            match decodeInt(row, "n")
+              case DecodeResult.Value(value)
+                count = value
+              case DecodeResult.Failure(error)
+                test::assertTrue(false)
+            end
+          case AsyncReadPoll.Failure(error)
+            console::println(providerFailureMessage(error))
+
+            test::assertTrue(false)
+
+            done = true
+          case AsyncReadPoll.Completed()
+            done = true
+        end
+      end
+
+      test::assertTrue(driver.close() == null)
+  end
+  return count
+end
+
+def asyncInsert(provider: Provider, id: Int): WriteBatch
+  let values = new WriteValues()
+  let batch = new WriteBatch()
+  var parameters = "?,?"
+
+  values.add(Cell.Int(id))
+  values.add(Cell.Text("' bound value " + (id as String)))
+  match provider.dialect()
+    case SqlDialect.QuestionMark()
+    case SqlDialect.PostgreSql()
+      parameters = "$1,$2"
+  end
+  batch.add(
+    "INSERT INTO neri_async_write_values(id,label) VALUES(" + parameters + ") RETURNING id,label",
+    values,
+    1,
+    new ResultColumns([
+        new ResultColumn("id", ResultColumnKind.Int()),
+        new ResultColumn("label", ResultColumnKind.Text())
+      ])
+  )
+  return batch
+end
+
+## Runs identically against a libpq connection and an isolated SQLite worker.
+def verifyAsyncProviderWrites(provider: Provider): Void
+  let validation = new AsyncProviderValidation()
+  let validate: fn(readonly WriteReturnedRows): WriteFailure? = fn(rows: readonly WriteReturnedRows): WriteFailure? do
+    return validation.validate(rows)
+  end
+
+  validation.reject = true
+  match awaitAsyncWrite(provider.beginWriteAsync(
+      asyncInsert(provider, 1),
+      new StreamOptions(timeoutMilliseconds: 10000),
+      validate: validate
+    ))
+    case WriteResult.Failure(error)
+      match error
+        case WriteFailure.Validation(message)
+          test::assertEqual(message, "deliberate before-commit rejection")
+        case WriteFailure.Provider(error)
+          test::assertTrue(false)
+        case WriteFailure.Cleanup(error)
+          test::assertTrue(false)
+        case WriteFailure.Concurrency(message)
+          test::assertTrue(false)
+        case WriteFailure.Constraint(message)
+          test::assertTrue(false)
+        case WriteFailure.Unsupported(message)
+          test::assertTrue(false)
+        case WriteFailure.Transaction(message)
+          test::assertTrue(false)
+      end
+    case WriteResult.Saved(count)
+      test::assertTrue(false)
+    case WriteResult.SavedWithValues(count, rows)
+      test::assertTrue(false)
+  end
+
+  test::assertEqual(validation.calls, 1)
+  test::assertEqual(asyncProviderCount(provider), 0)
+
+  validation.reject = false
+  asyncRowsSaved(awaitAsyncWrite(provider.beginWriteAsync(asyncInsert(provider, 1), validate: validate)), 1)
+
+  test::assertEqual(validation.calls, 2)
+  test::assertEqual(asyncProviderCount(provider), 1)
+
+  match awaitAsyncControl(provider.beginControlAsync(AsyncTransactionAction.Begin()))
+    case AsyncControlResult.Failure(error)
+      console::println(writeFailureMessage(error))
+
+      test::assertTrue(false)
+    case AsyncControlResult.Created(id)
+      test::assertTrue(false)
+    case AsyncControlResult.Saved()
+      test::assertTrue(false)
+    case AsyncControlResult.Begun(lease)
+      asyncRowsSaved(
+        awaitAsyncWrite(provider.beginWriteAsync(asyncInsert(provider, 2), lease: lease, validate: validate)),
+        1
+      )
+
+      test::assertEqual(asyncProviderCount(provider), 2)
+
+      asyncControlSaved(awaitAsyncControl(provider.beginControlAsync(AsyncTransactionAction.Rollback(lease))))
+      match provider.transactionState(lease)
+        case TransactionState.RolledBack()
+        case TransactionState.Invalid()
+          test::assertTrue(false)
+        case TransactionState.Active()
+          test::assertTrue(false)
+        case TransactionState.Failed()
+          test::assertTrue(false)
+        case TransactionState.Committed()
+          test::assertTrue(false)
+      end
+  end
+
+  test::assertEqual(asyncProviderCount(provider), 1)
+
+  match awaitAsyncControl(provider.beginControlAsync(AsyncTransactionAction.Begin()))
+    case AsyncControlResult.Begun(lease)
+      match awaitAsyncControl(provider.beginControlAsync(AsyncTransactionAction.Savepoint(lease)))
+        case AsyncControlResult.Created(id)
+          asyncRowsSaved(awaitAsyncWrite(provider.beginWriteAsync(asyncInsert(provider, 3), lease: lease)), 1)
+          asyncControlSaved(awaitAsyncControl(provider.beginControlAsync(AsyncTransactionAction.RollbackTo(lease, id))))
+          asyncControlSaved(awaitAsyncControl(provider.beginControlAsync(AsyncTransactionAction.Release(lease, id))))
+          asyncControlSaved(awaitAsyncControl(provider.beginControlAsync(AsyncTransactionAction.Commit(lease))))
+        case AsyncControlResult.Begun(id)
+          test::assertTrue(false)
+        case AsyncControlResult.Saved()
+          test::assertTrue(false)
+        case AsyncControlResult.Failure(error)
+          test::assertTrue(false)
+      end
+    case AsyncControlResult.Created(id)
+      test::assertTrue(false)
+    case AsyncControlResult.Saved()
+      test::assertTrue(false)
+    case AsyncControlResult.Failure(error)
+      test::assertTrue(false)
+  end
+
+  test::assertEqual(asyncProviderCount(provider), 1)
+
+  let stale = new WriteBatch()
+
+  stale.add("UPDATE neri_async_write_values SET label='stale' WHERE id=999", new WriteValues(), 1)
+  match awaitAsyncWrite(provider.beginWriteAsync(stale))
+    case WriteResult.Failure(error)
+      match error
+        case WriteFailure.Concurrency(message)
+          test::assertTrue(message != "")
+        case WriteFailure.Provider(error)
+          test::assertTrue(false)
+        case WriteFailure.Cleanup(error)
+          test::assertTrue(false)
+        case WriteFailure.Validation(message)
+          test::assertTrue(false)
+        case WriteFailure.Constraint(message)
+          test::assertTrue(false)
+        case WriteFailure.Unsupported(message)
+          test::assertTrue(false)
+        case WriteFailure.Transaction(message)
+          test::assertTrue(false)
+      end
+    case WriteResult.Saved(count)
+      test::assertTrue(false)
+    case WriteResult.SavedWithValues(count, rows)
+      test::assertTrue(false)
+  end
+
+  test::assertEqual(asyncProviderCount(provider), 1)
+end
+
+## Set writes preserve free affected-row counts and transaction rollback semantics.
+def verifyAsyncProviderSetWrites(provider: Provider): Void
+  let context = new ChangeContext(provider)
+  let update = new SetWritePlan("UPDATE neri_async_write_values SET label='bulk async'", new WriteValues())
+
+  match awaitAsyncWrite(context.prepareSetAsync(update, provider))
+    case WriteResult.Saved(count)
+      test::assertEqual(count, 1)
+    case WriteResult.SavedWithValues(count, rows)
+      test::assertTrue(false)
+    case WriteResult.Failure(error)
+      console::println(writeFailureMessage(error))
+
+      test::assertTrue(false)
+  end
+  match awaitAsyncControl(provider.beginControlAsync(AsyncTransactionAction.Begin()))
+    case AsyncControlResult.Begun(lease)
+      let delete = new SetWritePlan("DELETE FROM neri_async_write_values", new WriteValues())
+
+      match awaitAsyncWrite(provider.beginSetAsync(delete, lease: lease))
+        case WriteResult.Saved(count)
+          test::assertEqual(count, 1)
+        case WriteResult.SavedWithValues(count, rows)
+          test::assertTrue(false)
+        case WriteResult.Failure(error)
+          test::assertTrue(false)
+      end
+      asyncControlSaved(awaitAsyncControl(provider.beginControlAsync(AsyncTransactionAction.Rollback(lease))))
+    case AsyncControlResult.Created(id)
+      test::assertTrue(false)
+    case AsyncControlResult.Saved()
+      test::assertTrue(false)
+    case AsyncControlResult.Failure(error)
+      test::assertTrue(false)
+  end
+
+  test::assertEqual(asyncProviderCount(provider), 1)
+  let token = new CancellationToken()
+
+  token.cancel()
+  match provider.beginSetAsync(update, new StreamOptions(token: token))
+    case AsyncWriteStart.Failure(error)
+    case AsyncWriteStart.Started(driver)
+      driver.close()
+
+      test::assertTrue(false)
+  end
+end
+
+def awaitAsyncMigration(start: AsyncMigrationStart): MigrationResult
+  match start
+    case AsyncMigrationStart.Failure(error)
+      return MigrationResult.Failure(error)
+    case AsyncMigrationStart.Started(driver)
+      while true
+        match driver.poll()
+          case AsyncMigrationPoll.Pending(socket, interest)
+            continue
+          case AsyncMigrationPoll.Completed(result)
+            test::assertTrue(driver.close() == null)
+
+            return result
+        end
+      end
+  end
+  return MigrationResult.Failure(MigrationFailure.Validation("async migration did not terminate"))
+end
+
+def asyncMigrationApplied(result: MigrationResult, expected: Int): Void
+  match result
+    case MigrationResult.Applied(count)
+      test::assertEqual(count, expected)
+    case MigrationResult.Failure(error)
+      test::assertTrue(false)
+  end
+end
+
+def verifyAsyncProviderMigrations(provider: Provider): Void
+  let migration = new Migration("async_provider_001", [
+      SchemaOp.CreateTable("neri_async_migrated", [new SchemaColumn("id", SchemaType.Int(), primaryKey: true)])
+    ], [SchemaOp.DropTable("neri_async_migrated")])
+  let catalog = new MigrationSet([migration])
+
+  asyncMigrationApplied(awaitAsyncMigration(provider.beginMigrationAsync(catalog)), 1)
+  asyncMigrationApplied(awaitAsyncMigration(provider.beginMigrationAsync(catalog)), 0)
+  let drift = new MigrationSet([new Migration("async_provider_001", [
+          SchemaOp.CreateTable(
+            "neri_async_migrated",
+            [new SchemaColumn("id", SchemaType.Int(), primaryKey: true), new SchemaColumn("label", SchemaType.Text())]
+          )
+        ], [SchemaOp.DropTable("neri_async_migrated")])])
+
+  match awaitAsyncMigration(provider.beginMigrationAsync(drift))
+    case MigrationResult.Applied(count)
+      test::assertTrue(false)
+    case MigrationResult.Failure(error)
+      match error
+        case MigrationFailure.Drift(message)
+          test::assertTrue(message != "")
+        case MigrationFailure.Validation(message)
+          test::assertTrue(false)
+        case MigrationFailure.Unsupported(message)
+          test::assertTrue(false)
+        case MigrationFailure.Provider(error)
+          test::assertTrue(false)
+        case MigrationFailure.Cleanup(error)
+          test::assertTrue(false)
+      end
+  end
+  asyncMigrationApplied(awaitAsyncMigration(provider.beginMigrationAsync(catalog, "")), 1)
+  let broken = new MigrationSet([new Migration("async_provider_broken", [
+          SchemaOp.CreateTable("neri_async_rolled_back", [new SchemaColumn("id", SchemaType.Int(), primaryKey: true)]),
+          SchemaOp.AddColumn("neri_async_missing_table", new SchemaColumn("label", SchemaType.Text()))
+        ], [SchemaOp.DropTable("neri_async_rolled_back")])])
+
+  match awaitAsyncMigration(provider.beginMigrationAsync(broken))
+    case MigrationResult.Failure(error)
+    case MigrationResult.Applied(count)
+      test::assertTrue(false)
+  end
+  # A clean catalog succeeds after a failed migration has rolled back.
+  asyncMigrationApplied(awaitAsyncMigration(provider.beginMigrationAsync(catalog)), 1)
+  asyncMigrationApplied(awaitAsyncMigration(provider.beginMigrationAsync(catalog, "")), 1)
+  verifyAsyncProviderSeeds(provider)
+end
+
+def verifyAsyncSeedLabel(provider: Provider, expected: String): Void
+  let columns = new ResultColumns([new ResultColumn("name", ResultColumnKind.Text())])
+  var count = 0
+
+  match provider.beginReadAsync(new SqlPlan(
+      "SELECT name FROM neri_async_seed WHERE id=1",
+      new ParameterValues(),
+      1,
+      columns
+    ))
+    case AsyncReadStart.Failure(error)
+      test::assertTrue(false)
+    case AsyncReadStart.Started(driver)
+      var done = false
+
+      while !done
+        match driver.poll()
+          case AsyncReadPoll.Pending(socket, interest)
+            continue
+          case AsyncReadPoll.Row(row)
+            count = count + 1
+            match decodeString(row, "name")
+              case DecodeResult.Value(value)
+                test::assertEqual(value, expected)
+              case DecodeResult.Failure(error)
+                test::assertTrue(false)
+            end
+          case AsyncReadPoll.Completed()
+            done = true
+          case AsyncReadPoll.Failure(error)
+            test::assertTrue(false)
+
+            done = true
+        end
+      end
+
+      test::assertTrue(driver.close() == null)
+  end
+
+  test::assertEqual(count, 1)
+end
+
+def verifyAsyncProviderSeeds(provider: Provider): Void
+  let label = "'; DROP TABLE neri_async_seed; -- bound seed"
+  let initial = new Migration("async_seed_001", [
+      SchemaOp.CreateTable("neri_async_seed", [
+          new SchemaColumn("id", SchemaType.Int(), primaryKey: true),
+          new SchemaColumn("label", SchemaType.Text())
+        ]),
+      SchemaOp.InsertData("neri_async_seed", ["id", "label"], [Cell.Int(1), Cell.Text("initial")]),
+      SchemaOp.UpdateData("neri_async_seed", ["id"], [Cell.Int(1)], ["label"], [Cell.Text("before rename")]),
+      SchemaOp.RenameColumn("neri_async_seed", "label", "name"),
+      SchemaOp.UpdateData("neri_async_seed", ["id"], [Cell.Int(1)], ["name"], [Cell.Text(label)])
+    ], [
+      SchemaOp.DeleteData("neri_async_seed", ["id"], [Cell.Int(1)]),
+      SchemaOp.DropTable("neri_async_seed")
+    ])
+  let catalog = new MigrationSet([initial])
+
+  asyncMigrationApplied(awaitAsyncMigration(provider.beginMigrationAsync(catalog)), 1)
+  asyncMigrationApplied(awaitAsyncMigration(provider.beginMigrationAsync(catalog)), 0)
+  verifyAsyncSeedLabel(provider, label)
+  let failed = new Migration("async_seed_002", [
+      SchemaOp.UpdateData("neri_async_seed", ["id"], [Cell.Int(1)], ["name"], [Cell.Text("must roll back")]),
+      SchemaOp.UpdateData("neri_async_seed", ["id"], [Cell.Int(999)], ["name"], [Cell.Text("missing row")])
+    ], [SchemaOp.UpdateData("neri_async_seed", ["id"], [Cell.Int(1)], ["name"], [Cell.Text(label)])])
+
+  match awaitAsyncMigration(provider.beginMigrationAsync(new MigrationSet([initial, failed])))
+    case MigrationResult.Failure(error)
+    case MigrationResult.Applied(count)
+      test::assertTrue(false)
+  end
+  verifyAsyncSeedLabel(provider, label)
+  asyncMigrationApplied(awaitAsyncMigration(provider.beginMigrationAsync(catalog)), 0)
+  asyncMigrationApplied(awaitAsyncMigration(provider.beginMigrationAsync(catalog, "")), 1)
+end

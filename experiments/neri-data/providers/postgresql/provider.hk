@@ -1,0 +1,1161 @@
+use host
+use result
+use neri_data
+namespace neri_data_postgresql
+
+@cabiImport("neri_rt_v1_net_poll")
+unsafe def pgWaitSocket(socket: Int, writing: Int, milliseconds: Int): Int
+end
+
+enum PostgreSQLCommandResult
+  case Completed(count: Int, row: RawRow?)
+  case Failure(error: ProviderFailure)
+end
+
+class PostgreSQLSavepoint
+  public id: Int
+  public previous: PostgreSQLSavepoint?
+
+  def init(id: Int, previous: PostgreSQLSavepoint?): Void
+    this.id = id
+    this.previous = previous
+  end
+end
+
+## Sequential connection owner; every operation reserves the handle until drained.
+class PostgreSQLProvider: Provider
+  private connection: Void*?
+  private opened: Bool = true
+  private busy: Bool = false
+  private nextLease: Int = 1
+  private activeLease: Int = 0
+  private lastLease: Int = 0
+  private lastState: TransactionState = TransactionState.Invalid()
+  private nextSavepoint: Int = 1
+  private savepoints: PostgreSQLSavepoint?
+  private ownsHandle: Bool = true
+  private reconnectInfo: String?
+
+  unsafe def init(connection: Void*): Void
+    this.connection = connection
+  end
+
+  ## The caller retains the native connection and exclusively owns its lifetime.
+  public static unsafe def borrowNativeTransaction(connection: Void*): result::Result<PostgreSQLProvider, ProviderFailure>
+    if pgTransactionStatus(connection) != (2 as Int32)
+      return result::Result<PostgreSQLProvider, ProviderFailure>.Error(ProviderFailure.State("native PostgreSQL transaction must be idle and active"))
+    end
+    let provider = new PostgreSQLProvider(connection)
+
+    provider.ownsHandle = false
+    provider.activeLease = 1
+    provider.lastLease = 1
+    provider.nextLease = 2
+    provider.lastState = TransactionState.Active()
+    return result::Result<PostgreSQLProvider, ProviderFailure>.Ok(provider)
+  end
+
+  ## Reuses a borrowed wrapper after the native owner starts its next transaction.
+  public def enlistNativeTransaction(): TransactionOpenResult
+    if this.ownsHandle || this.busy || this.activeLease != 0 || this.nextLease <= 0 || this.nextLease == 9223372036854775807
+      return TransactionOpenResult.Failure(WriteFailure.Transaction("borrowed PostgreSQL transaction enrollment requires an idle wrapper"))
+    end
+    unsafe
+      let handle = this.connection
+
+      if handle == null || !(pgTransactionStatus(handle) == (2 as Int32))
+        return TransactionOpenResult.Failure(WriteFailure.Transaction("native PostgreSQL transaction must be idle and active"))
+      end
+    end
+    let lease = this.nextLease
+
+    this.nextLease = lease + 1
+    this.activeLease = lease
+    this.lastLease = lease
+    this.lastState = TransactionState.Active()
+    this.savepoints = null
+    return TransactionOpenResult.Begun(lease)
+  end
+
+  public readonly def nativeTransactionLease(): Int?
+    return this.activeLease == 0 ? null : this.activeLease
+  end
+
+  ## The external owner supplies its observed outcome after completing native control.
+  public def acknowledgeNativeTransaction(committed: Bool): WriteResult
+    if this.ownsHandle || this.busy || this.activeLease == 0
+      return WriteResult.Failure(WriteFailure.Transaction("no idle borrowed PostgreSQL transaction to acknowledge"))
+    end
+    unsafe
+      let connection = this.connection
+
+      if connection == null || pgTransactionStatus(connection) != (0 as Int32)
+        return WriteResult.Failure(WriteFailure.Transaction("native PostgreSQL transaction has not exited"))
+      end
+    end
+    this.lastLease = this.activeLease
+    this.activeLease = 0
+    this.savepoints = null
+    this.lastState = committed ? TransactionState.Committed() : TransactionState.RolledBack()
+    return WriteResult.Saved(0)
+  end
+
+  public static def open(
+    conninfo: String,
+    options: StreamOptions? = null
+  ): result::Result<PostgreSQLProvider, ProviderFailure>
+    let effective = options == null ? new StreamOptions(timeoutMilliseconds: 30000) : options
+
+    match PostgreSQLConnectDriver.start(conninfo, effective)
+      case PostgreSQLConnectStart.Failure(error)
+        return result::Result<PostgreSQLProvider, ProviderFailure>.Error(error)
+      case PostgreSQLConnectStart.Started(operation)
+        while true
+          match operation.poll()
+            case PostgreSQLOpenPoll.Failure(error)
+              operation.close()
+              return result::Result<PostgreSQLProvider, ProviderFailure>.Error(error)
+            case PostgreSQLOpenPoll.Opened(provider)
+              operation.close()
+              provider.reconnectInfo = conninfo
+              return result::Result<PostgreSQLProvider, ProviderFailure>.Ok(provider)
+            case PostgreSQLOpenPoll.Pending(socket, interest)
+              pgWait(socket, interest)
+          end
+        end
+    end
+    return result::Result<PostgreSQLProvider, ProviderFailure>.Error(ProviderFailure.State("PostgreSQL connect did not complete"))
+  end
+
+  ## Replaces the physical connection while preserving this provider's identity.
+  public def reconnectAfterRollback(): WriteFailure?
+    let info = this.reconnectInfo
+
+    if !this.ownsHandle || this.busy || this.activeLease != 0 || info == null
+      return WriteFailure.Transaction("PostgreSQL reconnect requires an idle owned connection with connection information")
+    end
+    match PostgreSQLProvider.open(info)
+      case result::Result.Error(error)
+        return WriteFailure.Provider(error)
+      case result::Result.Ok(replacement)
+        unsafe
+          let old = this.connection
+
+          if old != null
+            pgFinish(old)
+          end
+          this.connection = replacement.connection
+          replacement.connection = null
+          replacement.opened = false
+        end
+        this.opened = true
+        this.savepoints = null
+        return null
+    end
+    return WriteFailure.Transaction("PostgreSQL reconnect did not finish")
+  end
+
+  internal unsafe def nativeHandle(): Void*?
+    return this.connection
+  end
+
+  internal def finishOperation(): Void
+    this.busy = false
+  end
+
+  internal def abortOperation(): ProviderFailure?
+    this.opened = false
+    unsafe
+      let connection = this.connection
+
+      if connection != null
+        pgFinish(connection) if this.ownsHandle
+        this.connection = null
+      end
+    end
+    this.busy = false
+    if this.activeLease != 0
+      this.lastLease = this.activeLease
+      this.lastState = TransactionState.Failed()
+      this.activeLease = 0
+      this.savepoints = null
+    end
+    return null
+  end
+
+  public def closeFailure(): ProviderFailure?
+    if this.busy
+      return ProviderFailure.State("PostgreSQL close requires disposing the active operation first")
+    end
+    if !this.ownsHandle && this.activeLease != 0
+      return ProviderFailure.State("borrowed PostgreSQL transaction requires acknowledged completion before close")
+    end
+    if this.activeLease != 0
+      let lease = this.activeLease
+
+      match this.rollbackTransaction(lease)
+        case WriteResult.Failure(error)
+          this.abortOperation()
+          return pgWriteProviderFailure(error)
+        case WriteResult.Saved(count)
+        case WriteResult.SavedWithValues(count, outputs)
+      end
+    end
+    return this.abortOperation()
+  end
+
+  public override readonly def dialect(): SqlDialect
+    return SqlDialect.PostgreSql()
+  end
+
+  public override def migrationHistory(catalog: readonly MigrationSet): MigrationHistoryResult
+    if this.activeLease != 0
+      match this.command("DO $$BEGIN PERFORM pg_advisory_xact_lock(1852142185); END$$", new WriteValues(), script: true)
+        case PostgreSQLCommandResult.Failure(error)
+          return MigrationHistoryResult.Failure(MigrationFailure.Provider(error))
+        case PostgreSQLCommandResult.Completed(count, row)
+      end
+    end
+    return pgMigrationHistory(this, catalog)
+  end
+
+  public def migrate(catalog: readonly MigrationSet, target: String? = null): MigrationResult
+    return pgMigrate(this, catalog, target)
+  end
+
+  public def inspectSchema(schema: String? = null): PostgreSQLSchemaResult
+    return pgInspectSchema(this, schema)
+  end
+
+  public def scaffoldSchema(schema: String = "public", options: SchemaScaffoldOptions? = null): SchemaScaffoldResult
+    if schema != "public"
+      return SchemaScaffoldResult.Failure(ProviderFailure.State("PostgreSQL scaffolding requires the public schema until schema-qualified mapping is available"))
+    end
+    match this.inspectSchema(schema)
+      case PostgreSQLSchemaResult.Snapshot(snapshot)
+        return pgScaffoldSchema(snapshot, options)
+      case PostgreSQLSchemaResult.Failure(error)
+        return SchemaScaffoldResult.Failure(error)
+    end
+  end
+
+  public override readonly def supports(capability: ProviderCapability): Bool
+    match capability
+      case ProviderCapability.CheckedScalarExpressions()
+        return this.opened
+      case ProviderCapability.BoundedTypedReads()
+        return this.opened
+      case ProviderCapability.StreamingReads()
+        return this.opened
+      case ProviderCapability.SetWrites()
+        return this.opened
+      case ProviderCapability.TrackedWrites()
+        return this.opened
+      case ProviderCapability.ExplicitTransactions()
+        return this.opened
+      case ProviderCapability.Savepoints()
+        return this.opened
+      case ProviderCapability.WindowFunctions()
+        return this.opened
+    end
+  end
+
+  private def available(): ProviderFailure?
+    if !this.opened
+      return ProviderFailure.State("PostgreSQL connection is closed")
+    end
+    if this.busy
+      return ProviderFailure.State("PostgreSQL connection already has an active operation")
+    end
+    return null
+  end
+
+  internal def reconcileAsyncFailure(): Void
+    unsafe
+      let connection = this.connection
+
+      if connection != null && this.activeLease != 0 && pgTransactionStatus(connection) == (0 as Int32)
+        this.lastLease = this.activeLease
+        this.activeLease = 0
+        this.savepoints = null
+        this.lastState = TransactionState.RolledBack()
+      end
+    end
+  end
+
+  internal def asyncControlSql(action: AsyncTransactionAction): PostgreSQLControlSql
+    match action
+      case AsyncTransactionAction.Begin()
+        if this.activeLease != 0 || this.nextLease <= 0 || this.nextLease == 9223372036854775807
+          return PostgreSQLControlSql.Failure(WriteFailure.Transaction("PostgreSQL transaction already active or lease ids exhausted"))
+        end
+        return PostgreSQLControlSql.Statement("BEGIN")
+      case AsyncTransactionAction.Commit(lease)
+        if lease != this.activeLease || lease == 0 || this.savepoints != null
+          return PostgreSQLControlSql.Failure(WriteFailure.Transaction("PostgreSQL commit requires an active lease with released savepoints"))
+        end
+        match this.transactionState(lease)
+          case TransactionState.Active()
+            return PostgreSQLControlSql.Statement("COMMIT")
+          case TransactionState.Failed()
+            return PostgreSQLControlSql.Failure(WriteFailure.Transaction("PostgreSQL failed transaction requires rollback"))
+          case TransactionState.Invalid()
+            return PostgreSQLControlSql.Failure(WriteFailure.Transaction("PostgreSQL failed transaction requires rollback"))
+          case TransactionState.Committed()
+            return PostgreSQLControlSql.Failure(WriteFailure.Transaction("PostgreSQL failed transaction requires rollback"))
+          case TransactionState.RolledBack()
+            return PostgreSQLControlSql.Failure(WriteFailure.Transaction("PostgreSQL failed transaction requires rollback"))
+        end
+      case AsyncTransactionAction.Rollback(lease)
+        if lease != this.activeLease || lease == 0
+          return PostgreSQLControlSql.Failure(WriteFailure.Transaction("PostgreSQL rollback lease is invalid"))
+        end
+        return PostgreSQLControlSql.Statement("ROLLBACK")
+      case AsyncTransactionAction.Savepoint(lease)
+        if lease != this.activeLease || lease == 0 || this.nextSavepoint <= 0 || this.nextSavepoint == 9223372036854775807
+          return PostgreSQLControlSql.Failure(WriteFailure.Transaction("PostgreSQL savepoint lease is invalid or ids exhausted"))
+        end
+        return PostgreSQLControlSql.Statement("SAVEPOINT neri_sp_" + (this.nextSavepoint as String))
+      case AsyncTransactionAction.RollbackTo(lease, id)
+        let top = this.savepoints
+
+        if lease != this.activeLease || lease == 0 || top == null || top.id != id
+          return PostgreSQLControlSql.Failure(WriteFailure.Transaction("PostgreSQL savepoints require the latest active id and lease"))
+        end
+        return PostgreSQLControlSql.Statement("ROLLBACK TO SAVEPOINT neri_sp_" + (id as String))
+      case AsyncTransactionAction.Release(lease, id)
+        let releaseTop = this.savepoints
+
+        if lease != this.activeLease || lease == 0 || releaseTop == null || releaseTop.id != id
+          return PostgreSQLControlSql.Failure(WriteFailure.Transaction("PostgreSQL savepoints require the latest active id and lease"))
+        end
+        return PostgreSQLControlSql.Statement("RELEASE SAVEPOINT neri_sp_" + (id as String))
+    end
+  end
+
+  internal def acceptAsyncControl(action: AsyncTransactionAction): AsyncControlResult
+    match action
+      case AsyncTransactionAction.Begin()
+        let lease = this.nextLease
+
+        this.nextLease = lease + 1
+        this.activeLease = lease
+        this.lastLease = lease
+        this.lastState = TransactionState.Active()
+        return AsyncControlResult.Begun(lease)
+      case AsyncTransactionAction.Savepoint(lease)
+        let id = this.nextSavepoint
+
+        this.nextSavepoint = id + 1
+        this.savepoints = new PostgreSQLSavepoint(id, this.savepoints)
+        return AsyncControlResult.Created(id)
+      case AsyncTransactionAction.Commit(lease)
+        this.activeLease = 0
+        this.savepoints = null
+        this.lastState = TransactionState.Committed()
+      case AsyncTransactionAction.Rollback(lease)
+        this.activeLease = 0
+        this.savepoints = null
+        this.lastState = TransactionState.RolledBack()
+      case AsyncTransactionAction.RollbackTo(lease, id)
+        return AsyncControlResult.Saved()
+      case AsyncTransactionAction.Release(lease, id)
+        let top = this.savepoints
+
+        this.savepoints = top == null ? null : top.previous
+    end
+    return AsyncControlResult.Saved()
+  end
+
+  public override def beginControlAsync(
+    action: AsyncTransactionAction,
+    options: StreamOptions? = null
+  ): AsyncControlStart
+    if !this.ownsHandle
+      match action
+        case AsyncTransactionAction.Begin()
+        case AsyncTransactionAction.Commit(lease)
+        case AsyncTransactionAction.Rollback(lease)
+          return AsyncControlStart.Failure(WriteFailure.Transaction("external PostgreSQL owner controls transaction completion"))
+        case AsyncTransactionAction.Savepoint(lease)
+        case AsyncTransactionAction.RollbackTo(lease, id)
+        case AsyncTransactionAction.Release(lease, id)
+      end
+    end
+    let unavailable = this.available()
+
+    if unavailable != null
+      return AsyncControlStart.Failure(WriteFailure.Provider(unavailable))
+    end
+    let deadline = pgDeadline(options)
+    let token = options == null ? null : options.token()
+
+    if options != null && options.timeoutMilliseconds() != null && deadline == null
+      return AsyncControlStart.Failure(WriteFailure.Validation("invalid PostgreSQL asynchronous timeout"))
+    end
+    if token != null && token.cancelled()
+      return AsyncControlStart.Failure(WriteFailure.Provider(pgInterrupted("async.transaction")))
+    end
+    match this.asyncControlSql(action)
+      case PostgreSQLControlSql.Failure(error)
+        return AsyncControlStart.Failure(error)
+      case PostgreSQLControlSql.Statement(sql)
+        this.busy = true
+        return AsyncControlStart.Started(new PostgreSQLAsyncControl(this, action, sql, deadline, token))
+    end
+  end
+
+  public override def beginWriteAsync(
+    batch: readonly WriteBatch,
+    options: StreamOptions? = null,
+    lease: Int? = null,
+    validate: (fn(readonly WriteReturnedRows): WriteFailure?)? = null
+  ): AsyncWriteStart
+    let unavailable = this.available()
+
+    if unavailable != null
+      return AsyncWriteStart.Failure(WriteFailure.Provider(unavailable))
+    end
+    if batch.count() > 1000 || (lease == null && this.activeLease != 0) || (lease != null && (lease == 0 || lease != this.activeLease))
+      return AsyncWriteStart.Failure(WriteFailure.Transaction("PostgreSQL asynchronous batch requires a valid lease or an idle connection and at most 1000 commands"))
+    end
+    let deadline = pgDeadline(options)
+    let token = options == null ? null : options.token()
+
+    if options != null && options.timeoutMilliseconds() != null && deadline == null
+      return AsyncWriteStart.Failure(WriteFailure.Validation("invalid PostgreSQL asynchronous timeout"))
+    end
+    if token != null && token.cancelled()
+      return AsyncWriteStart.Failure(WriteFailure.Provider(pgInterrupted("async.write")))
+    end
+    this.busy = true
+    return AsyncWriteStart.Started(new PostgreSQLAsyncWrite(
+        this,
+        freezeWriteBatch(batch),
+        lease,
+        deadline,
+        token,
+        validate
+      ))
+  end
+
+  public override def beginSetAsync(
+    plan: readonly SetWritePlan,
+    options: StreamOptions? = null,
+    lease: Int? = null
+  ): AsyncWriteStart
+    let unavailable = this.available()
+
+    if unavailable != null
+      return AsyncWriteStart.Failure(WriteFailure.Provider(unavailable))
+    end
+    if plan.requiresCheckedScalars() && !this.supports(ProviderCapability.CheckedScalarExpressions())
+      return AsyncWriteStart.Failure(WriteFailure.Unsupported("checked-scalar-expressions"))
+    end
+    if (lease == null && this.activeLease != 0) || (lease != null && (lease <= 0 || lease != this.activeLease))
+      return AsyncWriteStart.Failure(WriteFailure.Transaction("PostgreSQL asynchronous set write requires a valid lease or idle connection"))
+    end
+    let deadline = pgDeadline(options)
+    let token = options == null ? null : options.token()
+
+    if options != null && options.timeoutMilliseconds() != null && deadline == null
+      return AsyncWriteStart.Failure(WriteFailure.Validation("invalid PostgreSQL asynchronous timeout"))
+    end
+    if token != null && token.cancelled()
+      return AsyncWriteStart.Failure(WriteFailure.Provider(pgInterrupted("async.set")))
+    end
+    let batch = new WriteBatch()
+
+    batch.add(plan.sql(), copyWriteValues(plan.parameters()), 0)
+    this.busy = true
+    return AsyncWriteStart.Started(new PostgreSQLAsyncWrite(this, batch, lease, deadline, token, null, true))
+  end
+
+  public override def beginMigrationAsync(
+    catalog: readonly MigrationSet,
+    target: String? = null,
+    options: StreamOptions? = null
+  ): AsyncMigrationStart
+    let unavailable = this.available()
+    let invalid = catalog.validate()
+
+    if unavailable != null
+      return AsyncMigrationStart.Failure(MigrationFailure.Provider(unavailable))
+    end
+    if this.activeLease != 0
+      return AsyncMigrationStart.Failure(MigrationFailure.Unsupported("PostgreSQL migrations require an idle connection"))
+    end
+    if invalid != null || catalog.count() > 1000
+      return AsyncMigrationStart.Failure(MigrationFailure.Validation(invalid == null ? "PostgreSQL migration catalog exceeds 1000 entries" : invalid))
+    end
+    var count = catalog.count()
+
+    if target != null
+      count = target == "" ? 0 : -1
+      var index = 0
+
+      while index < catalog.count()
+        let migration = catalog.at(index)
+
+        if migration != null && migration.id() == target
+          count = index + 1
+        end
+        index = index + 1
+      end
+      if count < 0
+        return AsyncMigrationStart.Failure(MigrationFailure.Validation("migration target is not in catalog"))
+      end
+    end
+    let deadline = pgDeadline(options)
+    let token = options == null ? null : options.token()
+
+    if options != null && options.timeoutMilliseconds() != null && deadline == null
+      return AsyncMigrationStart.Failure(MigrationFailure.Validation("invalid PostgreSQL asynchronous timeout"))
+    end
+    if token != null && token.cancelled()
+      return AsyncMigrationStart.Failure(MigrationFailure.Provider(pgInterrupted("async.migration")))
+    end
+    this.busy = true
+    return AsyncMigrationStart.Started(new PostgreSQLAsyncMigration(this, catalog, count, deadline, token))
+  end
+
+  public def migrateAsync(
+    catalog: readonly MigrationSet,
+    target: String? = null,
+    options: StreamOptions? = null
+  ): result::Result<AsyncMigration, MigrationFailure>
+    match this.beginMigrationAsync(catalog, target, options)
+      case AsyncMigrationStart.Failure(error)
+        return result::Result<AsyncMigration, MigrationFailure>.Error(error)
+      case AsyncMigrationStart.Started(driver)
+        let owned = new AsyncMigration(driver)
+
+        return result::Result<AsyncMigration, MigrationFailure>.Ok(transfer owned)
+    end
+  end
+
+  private def startRead(
+    sql: String,
+    parameters: readonly ParameterValues,
+    columns: readonly ResultColumns,
+    maximum: Int?,
+    deadline: Int?,
+    token: readonly CancellationToken?
+  ): AsyncReadStart
+    let unavailable = this.available()
+
+    if unavailable != null
+      return AsyncReadStart.Failure(unavailable)
+    end
+    unsafe
+      let connection = this.connection
+
+      if connection == null
+        return AsyncReadStart.Failure(ProviderFailure.State("PostgreSQL connection is closed"))
+      end
+      if token != null && token.cancelled()
+        return AsyncReadStart.Failure(pgInterrupted("read"))
+      end
+      let failed = pgSend(connection, sql, readWriteParameters(parameters))
+
+      if failed != null
+        return AsyncReadStart.Failure(failed)
+      end
+      this.busy = true
+      if pgSetSingleRowMode(connection) != (1 as Int32)
+        this.abortOperation()
+        return AsyncReadStart.Failure(ProviderFailure.State("PostgreSQL single-row mode unavailable"))
+      end
+      return AsyncReadStart.Started(new PostgreSQLRead(this, columns, maximum, deadline, token))
+    end
+  end
+
+  public override def beginReadAsync(
+    plan: readonly SqlPlan,
+    options: StreamOptions? = null,
+    maximumRows: Int? = null
+  ): AsyncReadStart
+    let deadline = pgDeadline(options)
+
+    if options != null && options.timeoutMilliseconds() != null && deadline == null
+      return AsyncReadStart.Failure(ProviderFailure.State("invalid PostgreSQL timeout or unavailable monotonic clock"))
+    end
+    var token: readonly CancellationToken? = null
+
+    if options != null
+      token = options.token()
+    end
+    return this.startRead(plan.sql(), plan.parameters(), plan.columns(), maximumRows, deadline, token)
+  end
+
+  public override def execute(plan: readonly SqlPlan): ProviderResult
+    let rows = new TypedRows<RawRow>()
+
+    match this.beginReadAsync(plan, new StreamOptions(timeoutMilliseconds: 30000), plan.limit())
+      case AsyncReadStart.Failure(error)
+        return ProviderResult.Failure(error)
+      case AsyncReadStart.Started(driver)
+        while true
+          match driver.poll()
+            case AsyncReadPoll.Pending(socket, interest)
+              pgWait(socket, interest)
+            case AsyncReadPoll.Row(row)
+              rows.add(row)
+            case AsyncReadPoll.Failure(error)
+              driver.close()
+              return ProviderResult.Failure(error)
+            case AsyncReadPoll.Completed()
+              let values = arrays::generate<RawRow>(rows.count()) do |index|
+                return new RawRow([])
+              end
+              var cursor = rows.first()
+              var index = 0
+
+              while cursor != null
+                values[index] = cursor.value
+                index = index + 1
+                cursor = cursor.next
+              end
+
+              return ProviderResult.Rows(values)
+          end
+        end
+    end
+    return ProviderResult.Failure(ProviderFailure.State("PostgreSQL read did not complete"))
+  end
+
+  public override def stream(plan: readonly StreamPlan, visit: fn(RawRow): Bool): StreamResult
+    var count = 0
+    var stopped = false
+
+    match this.startRead(
+      plan.sql(),
+      plan.parameters(),
+      plan.columns(),
+      plan.maximumRows(),
+      plan.deadlineMilliseconds(),
+      plan.token()
+    )
+      case AsyncReadStart.Failure(error)
+        return StreamResult.Failure(QueryFailure.Provider(error), 0)
+      case AsyncReadStart.Started(driver)
+        while true
+          match driver.poll()
+            case AsyncReadPoll.Pending(socket, interest)
+              pgWait(socket, interest)
+            case AsyncReadPoll.Row(row)
+              if !stopped
+                count = count + 1
+                stopped = !visit(row)
+              end
+            case AsyncReadPoll.Completed()
+              return stopped ? StreamResult.Stopped(count) : StreamResult.Completed(count)
+            case AsyncReadPoll.Failure(error)
+              driver.close()
+              match error
+                case ProviderFailure.Driver(details)
+                  if details.sqlState() == "57014"
+                    return StreamResult.Cancelled(count)
+                  end
+                case ProviderFailure.State(message)
+                case ProviderFailure.Cleanup(cleanup)
+              end
+              return StreamResult.Failure(QueryFailure.Provider(error), count)
+          end
+        end
+    end
+    return StreamResult.Failure(
+      QueryFailure.Provider(ProviderFailure.State("PostgreSQL stream did not complete")),
+      count
+    )
+  end
+
+  ## Synchronous facade waits only here; asynchronous operations never call it.
+  internal def command(
+    sql: String,
+    values: readonly WriteValues,
+    columns: readonly ResultColumns? = null,
+    script: Bool = false
+  ): PostgreSQLCommandResult
+    let unavailable = this.available()
+
+    if unavailable != null
+      return PostgreSQLCommandResult.Failure(unavailable)
+    end
+    unsafe
+      let connection = this.connection
+
+      if connection == null
+        return PostgreSQLCommandResult.Failure(ProviderFailure.State("PostgreSQL connection is closed"))
+      end
+      var sendFailure: ProviderFailure? = null
+
+      if script
+        if pgHasNul(sql) || values.count() != 0
+          return PostgreSQLCommandResult.Failure(ProviderFailure.State("PostgreSQL schema script cannot contain NUL or parameters"))
+        end
+        let text = pgCString(sql)
+        let sent = pgSendQuery(connection, text)
+
+        native::free(text)
+        if sent != (1 as Int32)
+          sendFailure = pgFailure(connection, "command.send")
+        end
+      else
+        sendFailure = pgSend(connection, sql, values)
+      end
+      if sendFailure != null
+        return PostgreSQLCommandResult.Failure(sendFailure)
+      end
+      this.busy = true
+      let now = clock::milliseconds()
+      let deadline = now == null ? 0 : now + 30000
+      var failure: ProviderFailure? = null
+      var count = 0
+      var returned: RawRow? = null
+
+      while true
+        if streamTimedOut(deadline)
+          this.abortOperation()
+          return PostgreSQLCommandResult.Failure(pgInterrupted("command"))
+        end
+        let flushed = pgFlush(connection) as Int
+
+        if flushed < 0 || pgConsumeInput(connection) != (1 as Int32)
+          let error = pgFailure(connection, "command.io")
+
+          this.abortOperation()
+          return PostgreSQLCommandResult.Failure(failure == null ? error : ProviderFailure.Cleanup(new ProviderCleanupFailure(
+                failure,
+                error
+              )))
+        end
+        if flushed == 1 || pgIsBusy(connection) != (0 as Int32)
+          pgWait(pgSocket(connection) as Int, flushed == 1 ? AsyncInterest.Write() : AsyncInterest.Read())
+          continue
+        end
+        let result = pgGetResult(connection)
+
+        if result == null
+          this.finishOperation()
+          if failure != null
+            this.reconcileAsyncFailure()
+          end
+          return failure == null ? PostgreSQLCommandResult.Completed(
+            count,
+            returned
+          ) : PostgreSQLCommandResult.Failure(failure)
+        end
+        let status = pgResultStatus(result) as Int
+
+        if status == 1 || status == 2
+          let countText = pgText(pgCmdTuples(result))
+          let changed = countText == null ? null : host::parseInt(countText)
+
+          if changed != null
+            count = count + changed
+          end
+          if columns != null
+            if status != 2 || pgNtuples(result) != (1 as Int32) || returned != null
+              failure = ProviderFailure.State("PostgreSQL RETURNING requires exactly one row per write")
+            else
+              match pgDecodeRow(result, 0, columns)
+                case PostgreSQLRowResult.Row(row)
+                  returned = row
+                case PostgreSQLRowResult.Failure(error)
+                  failure = error
+              end
+            end
+          else if pgNtuples(result) != (0 as Int32)
+            failure = ProviderFailure.State("PostgreSQL command returned unexpected rows")
+          end
+        else
+          failure = pgFailure(connection, "command.result", result)
+        end
+        pgClear(result)
+        if status == 3 || status == 4 || status == 5
+          this.abortOperation()
+          return PostgreSQLCommandResult.Failure(failure == null ? ProviderFailure.State("PostgreSQL COPY is unsupported") : failure)
+        end
+      end
+    end
+    return PostgreSQLCommandResult.Failure(ProviderFailure.State("PostgreSQL command did not complete"))
+  end
+
+  private def literal(sql: String): WriteResult
+    match this.command(sql, new WriteValues())
+      case PostgreSQLCommandResult.Failure(error)
+        return WriteResult.Failure(WriteFailure.Provider(error))
+      case PostgreSQLCommandResult.Completed(count, row)
+        return WriteResult.Saved(count)
+    end
+  end
+
+  public override def beginTransaction(): TransactionOpenResult
+    if !this.ownsHandle
+      return TransactionOpenResult.Failure(WriteFailure.Transaction("external PostgreSQL owner controls transaction completion"))
+    end
+    if this.activeLease != 0
+      return TransactionOpenResult.Failure(WriteFailure.Transaction("PostgreSQL transaction already active"))
+    end
+    if this.nextLease <= 0 || this.nextLease == 9223372036854775807
+      return TransactionOpenResult.Failure(WriteFailure.Transaction("PostgreSQL transaction lease ids exhausted"))
+    end
+    match this.literal("BEGIN")
+      case WriteResult.Failure(error)
+        return TransactionOpenResult.Failure(error)
+      case WriteResult.Saved(count)
+        let lease = this.nextLease
+
+        this.nextLease = this.nextLease + 1
+        this.activeLease = lease
+        this.lastLease = lease
+        this.lastState = TransactionState.Active()
+        return TransactionOpenResult.Begun(lease)
+      case WriteResult.SavedWithValues(count, outputs)
+        let lease = this.nextLease
+
+        this.nextLease = this.nextLease + 1
+        this.activeLease = lease
+        this.lastLease = lease
+        this.lastState = TransactionState.Active()
+        return TransactionOpenResult.Begun(lease)
+    end
+  end
+
+  public override def transactionState(lease: Int): TransactionState
+    if lease == this.activeLease && lease != 0
+      unsafe
+        let connection = this.connection
+
+        if connection == null || pgTransactionStatus(connection) == (4 as Int32)
+          return TransactionState.Failed()
+        end
+        let status = pgTransactionStatus(connection)
+
+        return status == (3 as Int32) || (!this.ownsHandle && status != (2 as Int32)) ? TransactionState.Failed() : TransactionState.Active()
+      end
+    end
+    return lease == this.lastLease ? this.lastState : TransactionState.Invalid()
+  end
+
+  public override def commitTransaction(lease: Int): WriteResult
+    if !this.ownsHandle
+      return WriteResult.Failure(WriteFailure.Transaction("external PostgreSQL owner controls transaction completion"))
+    end
+    if lease != this.activeLease || lease == 0
+      return WriteResult.Failure(WriteFailure.Transaction("PostgreSQL transaction lease is invalid"))
+    end
+    match this.transactionState(lease)
+      case TransactionState.Failed()
+        return WriteResult.Failure(WriteFailure.Transaction("PostgreSQL failed transaction requires rollback"))
+      case TransactionState.Active()
+      case TransactionState.Invalid()
+      case TransactionState.Committed()
+      case TransactionState.RolledBack()
+    end
+    let result = this.literal("COMMIT")
+
+    match result
+      case WriteResult.Failure(error)
+        this.reconcileAsyncFailure()
+        return result
+      case WriteResult.Saved(count)
+        this.activeLease = 0
+        this.savepoints = null
+        this.lastState = TransactionState.Committed()
+        return result
+      case WriteResult.SavedWithValues(count, outputs)
+        this.activeLease = 0
+        this.savepoints = null
+        this.lastState = TransactionState.Committed()
+        return result
+    end
+  end
+
+  public override def rollbackTransaction(lease: Int): WriteResult
+    if !this.ownsHandle
+      return WriteResult.Failure(WriteFailure.Transaction("external PostgreSQL owner controls transaction completion"))
+    end
+    if lease != this.activeLease || lease == 0
+      return WriteResult.Failure(WriteFailure.Transaction("PostgreSQL transaction lease is invalid"))
+    end
+    let result = this.literal("ROLLBACK")
+
+    match result
+      case WriteResult.Failure(error)
+        return result
+      case WriteResult.Saved(count)
+        this.activeLease = 0
+        this.savepoints = null
+        this.lastState = TransactionState.RolledBack()
+        return result
+      case WriteResult.SavedWithValues(count, outputs)
+        this.activeLease = 0
+        this.savepoints = null
+        this.lastState = TransactionState.RolledBack()
+        return result
+    end
+  end
+
+  public override def createSavepoint(lease: Int): SavepointOpenResult
+    if lease != this.activeLease || lease == 0
+      return SavepointOpenResult.Failure(WriteFailure.Transaction("PostgreSQL savepoint lease is invalid"))
+    end
+    if this.nextSavepoint <= 0 || this.nextSavepoint == 9223372036854775807
+      return SavepointOpenResult.Failure(WriteFailure.Transaction("PostgreSQL savepoint ids exhausted"))
+    end
+    let id = this.nextSavepoint
+
+    match this.literal("SAVEPOINT neri_sp_" + (id as String))
+      case WriteResult.Failure(error)
+        return SavepointOpenResult.Failure(error)
+      case WriteResult.Saved(count)
+        this.nextSavepoint = id + 1
+        this.savepoints = new PostgreSQLSavepoint(id, this.savepoints)
+        return SavepointOpenResult.Created(id)
+      case WriteResult.SavedWithValues(count, outputs)
+        this.nextSavepoint = id + 1
+        this.savepoints = new PostgreSQLSavepoint(id, this.savepoints)
+        return SavepointOpenResult.Created(id)
+    end
+  end
+
+  public override def rollbackToSavepoint(lease: Int, id: Int): WriteResult
+    let savepoint = this.savepoints
+
+    if lease == 0 || lease != this.activeLease || savepoint == null || savepoint.id != id
+      return WriteResult.Failure(WriteFailure.Transaction("PostgreSQL savepoints require the latest active id and lease"))
+    end
+    return this.literal("ROLLBACK TO SAVEPOINT neri_sp_" + (id as String))
+  end
+
+  public override def releaseSavepoint(lease: Int, id: Int): WriteResult
+    let savepoint = this.savepoints
+
+    if lease == 0 || lease != this.activeLease || savepoint == null || savepoint.id != id
+      return WriteResult.Failure(WriteFailure.Transaction("PostgreSQL savepoints require the latest active id and lease"))
+    end
+    let result = this.literal("RELEASE SAVEPOINT neri_sp_" + (id as String))
+
+    match result
+      case WriteResult.Failure(error)
+      case WriteResult.Saved(count)
+        this.savepoints = savepoint.previous
+      case WriteResult.SavedWithValues(count, outputs)
+        this.savepoints = savepoint.previous
+    end
+    return result
+  end
+
+  private def batch(batch: readonly WriteBatch): WriteResult
+    let outputs = new WriteReturnedRows()
+    var current = batch.first()
+    var count = 0
+    var hasReturning = false
+
+    while current != null
+      let command = current.command()
+
+      match this.command(command.sql(), command.parameters(), command.returningColumns())
+        case PostgreSQLCommandResult.Failure(error)
+          return WriteResult.Failure(WriteFailure.Provider(error))
+        case PostgreSQLCommandResult.Completed(changed, row)
+          if changed != command.expectedRows()
+            return WriteResult.Failure(WriteFailure.Concurrency("PostgreSQL write affected " + (changed as String) + " rows; expected " + (command.expectedRows() as String)))
+          end
+          count = count + changed
+          outputs.add(row)
+          hasReturning = hasReturning || row != null
+      end
+      current = current.next()
+    end
+    return hasReturning ? WriteResult.SavedWithValues(count, outputs) : WriteResult.Saved(count)
+  end
+
+  public override def writeBatchInTransaction(batch: readonly WriteBatch, lease: Int): WriteResult
+    match this.createSavepoint(lease)
+      case SavepointOpenResult.Failure(error)
+        return WriteResult.Failure(error)
+      case SavepointOpenResult.Created(id)
+        let result = this.batch(batch)
+
+        match result
+          case WriteResult.Failure(error)
+            match this.rollbackToSavepoint(lease, id)
+              case WriteResult.Failure(cleanup)
+                return WriteResult.Failure(WriteFailure.Cleanup(new WriteCleanupFailure(error, cleanup)))
+              case WriteResult.Saved(count)
+              case WriteResult.SavedWithValues(count, outputs)
+            end
+            match this.releaseSavepoint(lease, id)
+              case WriteResult.Failure(cleanup)
+                return WriteResult.Failure(WriteFailure.Cleanup(new WriteCleanupFailure(error, cleanup)))
+              case WriteResult.Saved(count)
+              case WriteResult.SavedWithValues(count, outputs)
+            end
+            return result
+          case WriteResult.Saved(count)
+            match this.releaseSavepoint(lease, id)
+              case WriteResult.Failure(error)
+                return WriteResult.Failure(error)
+              case WriteResult.Saved(released)
+              case WriteResult.SavedWithValues(released, returned)
+            end
+            return result
+          case WriteResult.SavedWithValues(count, outputs)
+            match this.releaseSavepoint(lease, id)
+              case WriteResult.Failure(error)
+                return WriteResult.Failure(error)
+              case WriteResult.Saved(released)
+              case WriteResult.SavedWithValues(released, returned)
+            end
+            return result
+        end
+    end
+  end
+
+  public override def writeBatch(batch: readonly WriteBatch): WriteResult
+    match this.beginTransaction()
+      case TransactionOpenResult.Failure(error)
+        return WriteResult.Failure(error)
+      case TransactionOpenResult.Begun(lease)
+        let result = this.batch(batch)
+
+        match result
+          case WriteResult.Failure(error)
+            match this.rollbackTransaction(lease)
+              case WriteResult.Failure(cleanup)
+                return WriteResult.Failure(WriteFailure.Cleanup(new WriteCleanupFailure(error, cleanup)))
+              case WriteResult.Saved(count)
+              case WriteResult.SavedWithValues(count, outputs)
+            end
+            return result
+          case WriteResult.Saved(count)
+            match this.commitTransaction(lease)
+              case WriteResult.Failure(error)
+                match this.rollbackTransaction(lease)
+                  case WriteResult.Failure(cleanup)
+                    return WriteResult.Failure(WriteFailure.Cleanup(new WriteCleanupFailure(error, cleanup)))
+                  case WriteResult.Saved(rolledBack)
+                  case WriteResult.SavedWithValues(rolledBack, ignored)
+                end
+                return WriteResult.Failure(error)
+              case WriteResult.Saved(committed)
+              case WriteResult.SavedWithValues(committed, ignored)
+            end
+            return result
+          case WriteResult.SavedWithValues(count, outputs)
+            match this.commitTransaction(lease)
+              case WriteResult.Failure(error)
+                match this.rollbackTransaction(lease)
+                  case WriteResult.Failure(cleanup)
+                    return WriteResult.Failure(WriteFailure.Cleanup(new WriteCleanupFailure(error, cleanup)))
+                  case WriteResult.Saved(rolledBack)
+                  case WriteResult.SavedWithValues(rolledBack, ignored)
+                end
+                return WriteResult.Failure(error)
+              case WriteResult.Saved(committed)
+              case WriteResult.SavedWithValues(committed, ignored)
+            end
+            return result
+        end
+    end
+  end
+
+  public override def executeSet(plan: readonly SetWritePlan): WriteResult
+    match this.beginTransaction()
+      case TransactionOpenResult.Failure(error)
+        return WriteResult.Failure(error)
+      case TransactionOpenResult.Begun(lease)
+        let result = this.executeSetInTransaction(plan, lease)
+
+        match result
+          case WriteResult.Failure(error)
+            match this.rollbackTransaction(lease)
+              case WriteResult.Failure(cleanup)
+                return WriteResult.Failure(WriteFailure.Cleanup(new WriteCleanupFailure(error, cleanup)))
+              case WriteResult.Saved(count)
+              case WriteResult.SavedWithValues(count, outputs)
+            end
+            return result
+          case WriteResult.Saved(count)
+            match this.commitTransaction(lease)
+              case WriteResult.Failure(error)
+                return WriteResult.Failure(error)
+              case WriteResult.Saved(committed)
+              case WriteResult.SavedWithValues(committed, outputs)
+            end
+            return result
+          case WriteResult.SavedWithValues(count, outputs)
+            match this.commitTransaction(lease)
+              case WriteResult.Failure(error)
+                return WriteResult.Failure(error)
+              case WriteResult.Saved(committed)
+              case WriteResult.SavedWithValues(committed, outputs)
+            end
+            return result
+        end
+    end
+  end
+
+  public override def executeSetInTransaction(plan: readonly SetWritePlan, lease: Int): WriteResult
+    if lease == 0 || lease != this.activeLease
+      return WriteResult.Failure(WriteFailure.Transaction("PostgreSQL set write lease is invalid"))
+    end
+    match this.command(plan.sql(), plan.parameters())
+      case PostgreSQLCommandResult.Failure(error)
+        return WriteResult.Failure(WriteFailure.Provider(error))
+      case PostgreSQLCommandResult.Completed(count, row)
+        return WriteResult.Saved(count)
+    end
+  end
+end
+
+def pgWait(socket: Int, interest: AsyncInterest): Void
+  if socket < 0
+    return
+  end
+  var writing = 0
+
+  match interest
+    case AsyncInterest.Read()
+    case AsyncInterest.Write()
+      writing = 1
+  end
+  unsafe
+    pgWaitSocket(socket, writing, 50)
+  end
+end
+
+resource class PostgreSQLSession
+  private owned: PostgreSQLProvider
+
+  def init(provider: PostgreSQLProvider): Void
+    this.owned = provider
+  end
+
+  public static def open(
+    conninfo: String,
+    options: StreamOptions? = null
+  ): result::Result<PostgreSQLSession, ProviderFailure>
+    match PostgreSQLProvider.open(conninfo, options)
+      case result::Result.Error(error)
+        return result::Result<PostgreSQLSession, ProviderFailure>.Error(error)
+      case result::Result.Ok(provider)
+        let owned = new PostgreSQLSession(provider)
+
+        return result::Result<PostgreSQLSession, ProviderFailure>.Ok(transfer owned)
+    end
+  end
+
+  public def provider(): PostgreSQLProvider
+    return this.owned
+  end
+
+  public def close(): result::Failure?
+    let error = this.owned.closeFailure()
+
+    return error == null ? null : providerResourceFailure(error, "postgresql.close")
+  end
+end

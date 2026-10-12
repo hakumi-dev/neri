@@ -30,7 +30,7 @@ static const neri_type_descriptor_v1 node_type = {
   sizeof(neri_type_descriptor_v1), NERI_RUNTIME_ABI_MAJOR, NERI_RUNTIME_ABI_MINOR,
   NERI_TYPE_KIND_CLASS_V1, NERI_TYPE_FLAG_CONTAINS_REFS_V1,
   sizeof(node_payload), _Alignof(node_payload), 0, 0, trace, NULL,
-  "worker-node", 0, NULL, NULL, NERI_SCALAR_KIND_NONE_V1, 0
+  "worker-node", 0, NULL, NULL, NERI_SCALAR_KIND_NONE_V1, 0, NULL
 };
 
 static void initialize(void) {
@@ -125,14 +125,14 @@ static void reject_foreign_reference(neri_ref_v1 reference, int store) {
 static const neri_type_descriptor_v1 int_type = {
   sizeof(neri_type_descriptor_v1), NERI_RUNTIME_ABI_MAJOR, NERI_RUNTIME_ABI_MINOR,
   NERI_TYPE_KIND_SCALAR_V1, 0, sizeof(int64_t), _Alignof(int64_t),
-  0, 0, NULL, NULL, "task-int", 0, NULL, NULL, NERI_SCALAR_KIND_INT_V1, 0
+  0, 0, NULL, NULL, "task-int", 0, NULL, NULL, NERI_SCALAR_KIND_INT_V1, 0, NULL
 };
 
 static const neri_type_descriptor_v1 array_type = {
   sizeof(neri_type_descriptor_v1), NERI_RUNTIME_ABI_MAJOR, NERI_RUNTIME_ABI_MINOR,
   NERI_TYPE_KIND_ARRAY_V1, 0, sizeof(uint64_t), _Alignof(uint64_t),
   sizeof(int64_t), _Alignof(int64_t), NULL, NULL, "task-array",
-  0, &int_type, NULL, NERI_SCALAR_KIND_NONE_V1, 0
+  0, &int_type, NULL, NERI_SCALAR_KIND_NONE_V1, 0, NULL
 };
 
 typedef struct task_case {

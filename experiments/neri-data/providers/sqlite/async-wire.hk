@@ -1,0 +1,239 @@
+use buffers
+use host
+use neri_data
+namespace neri_data_sqlite
+
+## Private bounded wire format; managed references never cross worker heaps.
+class SQLiteWireWriter
+  private output: ByteBuffer = new ByteBuffer(33554432, 1024)
+  private valid: Bool = true
+
+  public def integer(value: Int): Void
+    this.string(value as String)
+  end
+
+  public def string(value: String): Void
+    let count = host::stringByteLength(value)
+
+    this.size(count)
+    this.valid = this.output.appendText(value) && this.valid
+  end
+
+  private def size(value: Int): Void
+    var remainder = value
+    var index = 0
+
+    while index < 4
+      let byte = remainder - (remainder / 256) * 256
+
+      this.valid = this.output.append(byte as Byte) && this.valid
+      remainder = remainder / 256
+      index = index + 1
+    end
+  end
+
+  public def cell(value: readonly Cell): Void
+    match value
+      case Cell.Null()
+        this.integer(0)
+      case Cell.Bool(boolean)
+        this.integer(1)
+        this.integer(boolean ? 1 : 0)
+      case Cell.Int(number)
+        this.integer(2)
+        this.integer(number)
+      case Cell.Float(number)
+        this.integer(3)
+        this.string(number as String)
+      case Cell.Text(text)
+        this.integer(4)
+        this.string(text)
+      case Cell.Binary(buffer)
+        this.integer(5)
+        let bytes = buffer.snapshot()
+
+        this.size(bytes.Length)
+        this.valid = this.output.appendBytes(bytes) && this.valid
+    end
+  end
+
+  public def bytes(): Byte[]?
+    return this.valid ? this.output.snapshot() : null
+  end
+end
+
+class SQLiteWireReader
+  private input: Byte[]
+  private offset: Int = 0
+  private valid: Bool = true
+
+  def init(input: Byte[]): Void
+    this.input = input
+  end
+
+  public def healthy(): Bool
+    return this.valid
+  end
+
+  public def reject(): Void
+    this.valid = false
+  end
+
+  public def finished(): Bool
+    return this.valid && this.offset == this.input.Length
+  end
+
+  private def size(): Int
+    if this.input.Length - this.offset < 4
+      this.valid = false
+      return 0
+    end
+    var value = 0
+    var factor = 1
+    var index = 0
+
+    while index < 4
+      value = value + (this.input[this.offset] as Int) * factor
+      factor = factor * 256
+      index = index + 1
+      this.offset = this.offset + 1
+    end
+    if value > this.input.Length - this.offset
+      this.valid = false
+      return 0
+    end
+    return value
+  end
+
+  public def string(): String
+    let count = this.size()
+    let start = this.offset
+    let bytes = arrays::generate<Byte>(count) do |index|
+      return this.input[start + index]
+    end
+    let text = host::stringFromBytes(bytes)
+
+    this.offset = this.offset + count
+    if text == null
+      this.valid = false
+      return ""
+    end
+    return text
+  end
+
+  public def integer(): Int
+    let value = host::parseInt(this.string())
+
+    if value == null
+      this.valid = false
+      return 0
+    end
+    return value
+  end
+
+  public def cell(): Cell
+    let kind = this.integer()
+
+    if kind == 0
+      return Cell.Null()
+    end
+    if kind == 1
+      let value = this.integer()
+
+      this.valid = (value == 0 || value == 1) && this.valid
+      return Cell.Bool(value == 1)
+    end
+    if kind == 2
+      return Cell.Int(this.integer())
+    end
+    if kind == 3
+      let value = host::parseFloat(this.string())
+
+      if value == null || !dataFloatFinite(value)
+        this.valid = false
+        return Cell.Null()
+      end
+      return Cell.Float(value)
+    end
+    if kind == 4
+      return Cell.Text(this.string())
+    end
+    if kind == 5
+      let count = this.size()
+      let buffer = new ByteBuffer(count, count)
+      var index = 0
+
+      while index < count
+        buffer.append(this.input[this.offset])
+        this.offset = this.offset + 1
+        index = index + 1
+      end
+      return Cell.Binary(buffer)
+    end
+    this.valid = false
+    return Cell.Null()
+  end
+end
+
+def sqliteWireKind(kind: readonly ResultColumnKind): Int
+  match kind
+    case ResultColumnKind.Bool()
+      return 1
+    case ResultColumnKind.Int()
+      return 2
+    case ResultColumnKind.Float()
+      return 3
+    case ResultColumnKind.Text()
+      return 4
+    case ResultColumnKind.Binary()
+      return 5
+  end
+end
+
+def sqliteWireReadKind(value: Int): ResultColumnKind
+  if value == 1
+    return ResultColumnKind.Bool()
+  end
+  if value == 2
+    return ResultColumnKind.Int()
+  end
+  if value == 3
+    return ResultColumnKind.Float()
+  end
+  if value == 5
+    return ResultColumnKind.Binary()
+  end
+  return ResultColumnKind.Text()
+end
+
+def sqliteWireRequest(plan: readonly SqlPlan, deadline: Int?, maximum: Int?): Byte[]?
+  let wire = new SQLiteWireWriter()
+
+  wire.string("neri-sqlite-read-v1")
+  wire.string(plan.sql())
+  wire.integer(deadline == null ? -1 : deadline)
+  wire.integer(maximum == null ? -1 : maximum)
+  let columns = plan.columns()
+
+  wire.integer(columns.count())
+  var index = 0
+
+  while index < columns.count()
+    let column = columns.at(index)
+
+    wire.string(column.name())
+    wire.integer(sqliteWireKind(column.kind()))
+    wire.integer(column.nullable() ? 1 : 0)
+    index = index + 1
+  end
+  let parameters = readWriteParameters(plan.parameters())
+
+  wire.integer(parameters.count())
+  var parameter = parameters.first()
+
+  while parameter != null
+    wire.cell(parameter.value())
+    parameter = parameter.next()
+  end
+  return wire.bytes()
+end

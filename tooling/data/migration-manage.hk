@@ -1,0 +1,247 @@
+use console
+use host
+use neri_data
+use neri_data_sqlite
+use neri_data_postgresql
+use result
+
+def dataMigrationRuntimeProject(mapping: DataMapping): String?
+  let parser = new LspJsonParser(mapping.projectText)
+  let project = parser.parse()
+  var unit = project.get("units").first
+  var found: String? = null
+
+  while unit != null
+    var reference = unit.get("references").first
+
+    while reference != null
+      if reference.isObject() && reference.get("unit").scalarText() == "runtime" && reference.get("project").isString()
+        let requested = reference.get("project").scalarText()
+        let path = bootstrapStartsWith(requested, "/") ? requested : mapping.projectRoot + "/" + requested
+        let canonical = neriCanonicalPath(path)
+
+        if canonical != null
+          if found != null && found != canonical
+            return null
+          end
+          found = canonical
+        end
+      end
+      reference = reference.next
+    end
+    unit = unit.next
+  end
+  return found
+end
+
+def dataMigrationRemoveWithProvider(
+  mapping: DataMapping,
+  catalog: DataMigrationCatalog,
+  provider: Provider,
+  expected: String,
+  runtimeProject: String
+): Bool
+  var removed = false
+
+  match provider.beginTransaction()
+    case TransactionOpenResult.Failure(error)
+      return mapping.fail(writeFailureMessage(error))
+    case TransactionOpenResult.Begun(lease)
+      match provider.migrationHistory(catalog.migrations())
+        case MigrationHistoryResult.Failure(error)
+          mapping.fail(dataMigrationFailure(error))
+        case MigrationHistoryResult.Loaded(stamps)
+          removed = dataMigrationRemoveLast(mapping, catalog, expected, stamps, runtimeProject)
+      end
+      match provider.rollbackTransaction(lease)
+        case WriteResult.Failure(error)
+          return mapping.fail("migration-history transaction cleanup failed: " + writeFailureMessage(error))
+        case WriteResult.Saved(count)
+        case WriteResult.SavedWithValues(count, values)
+      end
+  end
+  return removed
+end
+
+def dataMigrationRemoveDatabase(
+  mapping: DataMapping,
+  catalog: DataMigrationCatalog,
+  expected: String,
+  providerName: String,
+  connection: String,
+  runtimeProject: String
+): Bool
+  if providerName == "sqlite"
+    match SQLiteProvider.openWritable(connection)
+      case SQLiteOpenResult.Failure(error)
+        return mapping.fail(providerFailureMessage(error))
+      case SQLiteOpenResult.Opened(provider)
+        let removed = dataMigrationRemoveWithProvider(mapping, catalog, provider, expected, runtimeProject)
+
+        if !provider.close()
+          return mapping.fail("SQLite migration-history provider cleanup failed")
+        end
+        return removed
+    end
+  end
+  if providerName == "postgres"
+    match PostgreSQLProvider.open(connection)
+      case result::Result.Error(error)
+        return mapping.fail(providerFailureMessage(error))
+      case result::Result.Ok(provider)
+        let removed = dataMigrationRemoveWithProvider(mapping, catalog, provider, expected, runtimeProject)
+        let closed = provider.closeFailure()
+
+        if closed != null
+          return mapping.fail(providerFailureMessage(closed))
+        end
+        return removed
+    end
+  end
+  return mapping.fail("migration provider must be sqlite or postgres")
+end
+
+def dataMigrationManagedUsage(): Int
+  console::println("usage: neri-data-migration discover|check <mapping.json> <catalog-directory>")
+  console::println("       neri-data-migration add <mapping.json> <catalog-directory> <id>")
+  console::println("       neri-data-migration remove-last <mapping.json> <catalog-directory> <expected-id> <sqlite|postgres> <connection>")
+  console::println("       neri-data-migration script <mapping.json> <catalog-directory> <from-id|empty> <to-id|empty> <sqlite|postgres> <output.sql>")
+  return 2
+end
+
+def dataMigrationManagedMain(action: String): Int
+  let mappingPath = host::argumentAt(1)
+  let requested = host::argumentAt(2)
+
+  if mappingPath == null || requested == null
+    return dataMigrationManagedUsage()
+  end
+  let expectedCount = action == "add" ? 4 : (action == "remove-last" ? 6 : (action == "script" ? 7 : 3))
+
+  if host::argumentCount() != expectedCount
+    return dataMigrationManagedUsage()
+  end
+  let mapping = dataLoadMapping(mappingPath)
+
+  if mapping.error != ""
+    console::println(mapping.error)
+    return 1
+  end
+  var catalog = dataMigrationDiscover(mapping, requested)
+
+  if catalog.error != ""
+    console::println(catalog.error)
+    return 1
+  end
+  if action == "check"
+    let pending = dataMigrationPending(mapping, catalog)
+
+    if catalog.error != ""
+      console::println(catalog.error)
+      return 1
+    end
+    console::println(pending ? "Model has pending changes" : "Model matches the latest migration snapshot")
+    return pending ? 3 : 0
+  end
+  if action == "script"
+    let from = host::argumentAt(3)
+    let to = host::argumentAt(4)
+    let providerName = host::argumentAt(5)
+    let output = host::argumentAt(6)
+
+    if from == null || to == null || providerName == null || output == null || (providerName != "sqlite" && providerName != "postgres")
+      return dataMigrationManagedUsage()
+    end
+    let dialect = providerName == "postgres" ? SqlDialect.PostgreSql() : SqlDialect.QuestionMark()
+
+    match dataMigrationScript(catalog, from, to, dialect)
+      case SchemaCompileResult.Failure(message)
+        console::println(message)
+        return 1
+      case SchemaCompileResult.Statement(sql)
+        let outputPath = bootstrapStartsWith(output, "/") ? output : mapping.mappingRoot + "/" + output
+        let status = files::status(outputPath).status
+
+        if status == null || status.exists || !dataMigrationCatalogUnchanged(catalog) || !host::writeText(
+          outputPath,
+          sql
+        )
+          console::println("cannot publish script to a new file from an unchanged catalog")
+          return 1
+        end
+        console::println("Migration SQL written at " + outputPath)
+        return 0
+    end
+  end
+  let runtimeProject = dataMigrationRuntimeProject(mapping)
+
+  if runtimeProject == null
+    console::println("mapped project must reference one unambiguous runtime project to publish a migration catalog")
+    return 1
+  end
+  let lock = catalog.path + "/.neri-migrations.lock"
+
+  if files::createDirectory(lock).failure != null
+    console::println("migration catalog is locked; inspect any interrupted staged removal before retrying")
+    return 1
+  end
+  var complete = false
+
+  if action == "discover"
+    complete = dataMigrationCatalogUnchanged(catalog) && dataMigrationWriteCatalog(mapping, catalog, runtimeProject)
+  else if action == "add"
+    let id = host::argumentAt(3)
+    let before = catalog.model()
+
+    if id != null && before != null
+      let draft = dataMigrationPrepare(mapping, before, id)
+
+      if draft.error != ""
+        mapping.fail(draft.error)
+      else if draft.unchanged
+        console::println("Schema is unchanged; no migration was written")
+        complete = true
+      else
+        if catalog.entries.Length > 0
+          let snapshot = catalog.entries[catalog.entries.Length - 1].snapshot
+
+          draft.historicalPath = snapshot.sourcePath
+          draft.historicalSnapshotText = snapshot.sourceText
+          draft.historicalMarkerText = snapshot.markerText
+        end
+        let previous = catalog
+
+        if dataMigrationCatalogUnchanged(previous) && dataMigrationPublish(mapping, draft, catalog.path + "/" + id)
+          catalog = dataMigrationDiscover(mapping, requested)
+          complete = dataMigrationWriteCatalog(mapping, catalog, runtimeProject, previous)
+          if !complete
+            let destination = previous.path + "/" + id
+
+            dataMigrationRemoveOwn(destination + "/scaffold.json", dataMigrationMarker(mapping, draft))
+            dataMigrationRemoveOwn(destination + "/snapshot.json", draft.snapshot)
+            dataMigrationRemoveOwn(destination + "/migration.hk", draft.source)
+            files::removeDirectory(destination)
+          end
+        end
+      end
+    end
+  else if action == "remove-last"
+    let expected = host::argumentAt(3)
+    let providerName = host::argumentAt(4)
+    let connection = host::argumentAt(5)
+
+    if expected != null && providerName != null && connection != null
+      complete = dataMigrationRemoveDatabase(mapping, catalog, expected, providerName, connection, runtimeProject)
+    end
+  end
+  if files::removeDirectory(lock).failure != null
+    mapping.fail("catalog lock cleanup failed; inspect staged artifacts before retrying")
+    complete = false
+  end
+  if !complete
+    console::println(mapping.error != "" ? mapping.error : "migration catalog operation failed")
+    return 1
+  end
+  console::println("Migration catalog " + action + " completed")
+  return 0
+end

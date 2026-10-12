@@ -1,16 +1,18 @@
 # Typed table rebuilds
 
 `diffSchema` plans `SchemaOp.RebuildTable(before, after)` when an existing
-non-key field changes type, nullability or default. Both arguments are copied
+non-key field changes type, nullability or default, or a foreign key changes.
+Both arguments are copied
 `SchemaTable` snapshots with stable logical identities. The operation includes
 physical table/column renames, added/removed fields and the target indexes.
 Primary-key identity and scalar definition must remain stable; its physical
 column name can change. New required columns
 need constant defaults. Both migration directions are validated independently.
 
-The operation is executed by the SQLite migration provider inside its existing
-whole-call transaction. `compileSchema` reports that a rebuild requires provider
-execution rather than returning a standalone SQL statement. Migration signatures
+The SQLite provider executes the operation inside its whole-call transaction.
+For SQLite, `compileSchema` requests provider execution; `compileMigration` can
+also emit a reviewable rebuild script. PostgreSQL compiles the same operation
+to ALTER statements that preserve the existing table. Migration signatures
 include both table definitions, while existing operation signatures retain their
 encoding. Altering an applied rebuild therefore fails history-prefix validation.
 
@@ -46,12 +48,20 @@ conversion.
 Before replacing a table, the provider compares its declared columns and indexes
 with the source snapshot. Unmodeled columns, generated columns, expression or
 partial indexes, custom collations and unsupported table constraints/options
-cause an explicit failure. Foreign keys or triggers/views depending on the
-table must be modeled by a future richer schema contract or handled separately;
-rebuild does not silently discard them. Foreign-key enforcement stays enabled.
+cause an explicit failure. Owned foreign keys must match the declared ordered
+column tuples, delete actions, NO ACTION update behavior and ordinary MATCH
+semantics. The replacement retains those references. Triggers and views
+depending on the table require separate handling and are rejected.
 
-The supported schema is the current scalar model with a single Int or required
-Text primary key and named ordinary indexes. Implicit SQLite rowids are not
+SQLite foreign keys are disabled before BEGIN IMMEDIATE to prevent DROP TABLE
+from cascading dependent deletion during a parent rebuild. The runner checks
+`foreign_key_check` before commit and restores enforcement after commit or
+rollback. Restoration failure poisons the provider. Migration execution requires
+`legacy_alter_table` OFF so physical renames update incoming references.
+
+The schema supports ordered composite Int/Text primary keys, named ordinary
+and unique indexes, and references to declared primary or unique tuples.
+Implicit SQLite rowids are not
 modeled application keys. The preflight is scoped to rebuild execution; it does
 not turn model comparison into general live database drift certification.
 It uses the existing bounded schema inspector. Dependency SQL matching is
@@ -67,7 +77,8 @@ Primary references verified on 2026-09-23:
 - SQLite, [Making other kinds of table schema changes](https://www.sqlite.org/lang_altertable.html#otheralter):
   specifies replacement creation, copying, dropping and final renaming within
   a transaction, with explicit handling of dependent schema objects. Neri
-  rejects dependencies its model cannot describe and keeps foreign keys enabled.
+  rejects dependencies its model cannot describe, checks foreign-key integrity
+  before commit, and restores enforcement after the transaction.
 - Microsoft, [SQLite provider limitations](https://learn.microsoft.com/en-us/ef/core/providers/sqlite/limitations#migrations-limitations):
   describes rebuild-based column changes and the boundary around artifacts
   represented in the model. Neri's supported constraint set remains smaller.

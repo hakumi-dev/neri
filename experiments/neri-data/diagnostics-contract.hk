@@ -166,7 +166,46 @@ class DiagnosticStreamVisitor
   end
 end
 
+def structuredWriteClassification(): Void
+  let driver = new DriverError(
+    "sqlite",
+    "write.step",
+    DriverErrorKind.Constraint(),
+    19,
+    2067,
+    null,
+    "unique constraint"
+  )
+  let constraint = ProviderFailure.Driver(driver)
+  let close = ProviderFailure.State("close failed")
+
+  test::assertEqual(diagnosticFailureKind(WriteFailure.Provider(constraint)), "constraint")
+  test::assertEqual(
+    diagnosticFailureKind(WriteFailure.Provider(ProviderFailure.Cleanup(new ProviderCleanupFailure(
+            constraint,
+            close
+          )))),
+    "constraint"
+  )
+  test::assertEqual(
+    diagnosticFailureKind(WriteFailure.Cleanup(new WriteCleanupFailure(
+          WriteFailure.Provider(constraint),
+          WriteFailure.Provider(close)
+        ))),
+    "constraint"
+  )
+  test::assertEqual(
+    diagnosticFailureKind(WriteFailure.Provider(ProviderFailure.Cleanup(new ProviderCleanupFailure(
+            close,
+            constraint
+          )))),
+    "provider"
+  )
+end
+
 def main(): Void
+  commandReplacementContracts()
+  structuredWriteClassification()
   let fake = new DiagnosticFakeProvider()
   let recorder = new DiagnosticRecorder()
   let observe: fn(readonly ProviderDiagnostic): Void = fn(value: readonly ProviderDiagnostic): Void do
@@ -428,4 +467,159 @@ def main(): Void
   test::assertEqual(recorder.affectedCount, 3)
   test::assertEqual(recorder.failureKind, "")
   test::assertTrue(recorder.duration >= 0)
+end
+
+
+class ContractCommandInterceptor: CommandInterceptor
+  public rows: RawRow[] = []
+  public replaceRead: Bool = false
+  public replaceWrite: Bool = false
+  public planCalls: Int = 0
+  public writeCalls: Int = 0
+
+  public override def readPlan(plan: readonly SqlPlan): SqlPlan?
+    this.planCalls = this.planCalls + 1
+    return new SqlPlan("SELECT 42 AS id", new ParameterValues(), plan.limit(), plan.columns())
+  end
+
+  public override def readResult(plan: readonly SqlPlan): ProviderResult?
+    test::assertEqual(plan.sql(), "SELECT 42 AS id")
+    return this.replaceRead ? ProviderResult.Rows(this.rows) : null
+  end
+
+  public override def writeResult(batch: readonly WriteBatch, lease: Int?): WriteResult?
+    this.writeCalls = this.writeCalls + 1
+    return this.replaceWrite ? WriteResult.Saved(1) : null
+  end
+end
+
+def commandReplacementContracts(): Void
+  let fake = new DiagnosticFakeProvider()
+  let interceptor = new ContractCommandInterceptor()
+  let provider = new InterceptedProvider(fake, interceptor)
+  let columns = new ResultColumns([new ResultColumn("id", ResultColumnKind.Int())])
+  let plan = new SqlPlan("SELECT 1 AS id", new ParameterValues(), 1000, columns)
+
+  interceptor.replaceRead = true
+  interceptor.rows = [new RawRow([new RawColumn("id", Cell.Int(42))])]
+  match provider.execute(plan)
+    case ProviderResult.Rows(rows)
+      test::assertEqual(rows.Length, 1)
+      match decodeInt(rows[0], "id")
+        case DecodeResult.Value(value)
+          test::assertEqual(value, 42)
+        case DecodeResult.Failure(error)
+          test::assertTrue(false)
+      end
+    case ProviderResult.Failure(error)
+      test::assertTrue(false)
+  end
+
+  test::assertEqual(fake.calls, 0)
+  interceptor.rows = arrays::generate<RawRow>(2001) do |index|
+    return new RawRow([new RawColumn("id", Cell.Int(index))])
+  end
+  match provider.beginReadAsync(plan, maximumRows: 2001)
+    case AsyncReadStart.Started(driver)
+      var count = 0
+      var completed = false
+
+      while !completed && count <= 2001
+        match driver.poll()
+          case AsyncReadPoll.Row(row)
+            count = count + 1
+          case AsyncReadPoll.Completed()
+            completed = true
+          case AsyncReadPoll.Pending(socket, interest)
+          case AsyncReadPoll.Failure(error)
+            test::assertTrue(false)
+            completed = true
+        end
+      end
+
+      test::assertEqual(count, 2001)
+      test::assertTrue(driver.close() == null)
+    case AsyncReadStart.Failure(error)
+      test::assertTrue(false)
+  end
+  interceptor.rows = []
+  let token = new CancellationToken()
+
+  match provider.beginReadAsync(plan, new StreamOptions(token))
+    case AsyncReadStart.Started(driver)
+      token.cancel()
+      match driver.poll()
+        case AsyncReadPoll.Failure(error)
+          test::assertTrue(true)
+        case AsyncReadPoll.Row(row)
+        case AsyncReadPoll.Completed()
+        case AsyncReadPoll.Pending(socket, interest)
+          test::assertTrue(false)
+      end
+
+      test::assertTrue(driver.close() == null)
+    case AsyncReadStart.Failure(error)
+      test::assertTrue(false)
+  end
+  match provider.beginReadAsync(plan, new StreamOptions(timeoutMilliseconds: 1))
+    case AsyncReadStart.Started(driver)
+      test::assertTrue(retryDelay(3) == null)
+      match driver.poll()
+        case AsyncReadPoll.Failure(error)
+          test::assertTrue(true)
+        case AsyncReadPoll.Row(row)
+        case AsyncReadPoll.Completed()
+        case AsyncReadPoll.Pending(socket, interest)
+          test::assertTrue(false)
+      end
+
+      test::assertTrue(driver.close() == null)
+    case AsyncReadStart.Failure(error)
+      test::assertTrue(false)
+  end
+  interceptor.replaceWrite = true
+  let batch = new WriteBatch()
+
+  batch.add("UPDATE records SET name='intercepted' WHERE id=1", new WriteValues(), 1)
+  match provider.beginWriteAsync(batch, new StreamOptions(timeoutMilliseconds: 1))
+    case AsyncWriteStart.Started(driver)
+      test::assertTrue(retryDelay(3) == null)
+      match driver.poll()
+        case AsyncWritePoll.Completed(result)
+          match result
+            case WriteResult.Failure(error)
+              test::assertTrue(true)
+            case WriteResult.Saved(count)
+            case WriteResult.SavedWithValues(count, rows)
+              test::assertTrue(false)
+          end
+        case AsyncWritePoll.Pending(socket, interest)
+          test::assertTrue(false)
+      end
+
+      test::assertTrue(driver.close() == null)
+    case AsyncWriteStart.Failure(error)
+      test::assertTrue(false)
+  end
+
+  test::assertEqual(fake.calls, 0)
+  let before = interceptor.writeCalls
+
+  match provider.writeBatchInTransaction(batch, 17)
+    case WriteResult.Failure(error)
+      test::assertTrue(true)
+    case WriteResult.Saved(count)
+    case WriteResult.SavedWithValues(count, rows)
+      test::assertTrue(false)
+  end
+  match provider.beginWriteAsync(batch, lease: 17)
+    case AsyncWriteStart.Failure(error)
+      test::assertTrue(true)
+    case AsyncWriteStart.Started(driver)
+      test::assertTrue(false)
+      driver.close()
+  end
+
+  test::assertEqual(interceptor.writeCalls, before)
+  test::assertEqual(fake.calls, 0)
 end

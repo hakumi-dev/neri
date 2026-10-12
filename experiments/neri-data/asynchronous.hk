@@ -1,0 +1,624 @@
+use result
+use clock
+namespace neri_data
+
+enum AsyncInterest
+  case Read()
+  case Write()
+end
+
+enum AsyncReadPoll
+  case Pending(socket: Int, interest: AsyncInterest)
+  case Row(value: RawRow)
+  case Completed()
+  case Failure(error: ProviderFailure)
+end
+
+## A sequential nonblocking cursor. The operation owns its driver until close.
+abstract class AsyncReadDriver
+  public abstract def poll(): AsyncReadPoll
+  public abstract def cancel(): Void
+  public abstract def close(): ProviderFailure?
+end
+
+enum AsyncReadStart
+  case Started(driver: AsyncReadDriver)
+  case Failure(error: ProviderFailure)
+end
+
+enum AsyncQueryPoll<T>
+  case Pending(socket: Int, interest: AsyncInterest)
+  case Completed(result: QueryResult<T>)
+end
+
+abstract class AsyncRowResolver<T>
+  public abstract def resolveRows(rows: TypedRows<T>): QueryResult<T>
+end
+
+enum AsyncQueryPreparation<T>
+  case Ready(driver: AsyncReadDriver, compiled: TypedPlan<T>, tracker: AsyncRowResolver<T>?)
+  case Failure(error: QueryFailure)
+end
+
+## Every poll performs bounded local work and returns without waiting for I/O.
+## A caller may register Pending.socket with its event loop before polling again.
+resource class AsyncQuery<T>
+  private driver: AsyncReadDriver
+  private compiled: TypedPlan<T>
+  private tracker: AsyncRowResolver<T>?
+  private rows: TypedRows<T> = new TypedRows<T>()
+  private terminal: QueryResult<T>?
+
+  def init(driver: AsyncReadDriver, compiled: TypedPlan<T>, tracker: AsyncRowResolver<T>? = null): Void
+    this.driver = driver
+    this.compiled = compiled
+    this.tracker = tracker
+  end
+
+  public def cancel(): Void
+    this.driver.cancel()
+  end
+
+  public def poll(): AsyncQueryPoll<T>
+    let terminal = this.terminal
+
+    if terminal != null
+      return AsyncQueryPoll<T>.Completed(terminal)
+    end
+    match this.driver.poll()
+      case AsyncReadPoll.Pending(socket, interest)
+        return AsyncQueryPoll<T>.Pending(socket, interest)
+      case AsyncReadPoll.Row(raw)
+        match this.compiled.decode(raw)
+          case DecodeResult.Value(value)
+            this.rows.add(value)
+          case DecodeResult.Failure(error)
+            this.terminal = QueryResult<T>.Failure(error)
+            let cleanup = this.driver.close()
+
+            if cleanup != null
+              this.terminal = QueryResult<T>.Failure(QueryFailure.Cleanup(new QueryCleanupFailure(error, cleanup)))
+            end
+        end
+      case AsyncReadPoll.Failure(error)
+        this.terminal = QueryResult<T>.Failure(QueryFailure.Provider(error))
+        let cleanup = this.driver.close()
+
+        if cleanup != null
+          this.terminal = QueryResult<T>.Failure(QueryFailure.Cleanup(new QueryCleanupFailure(
+                QueryFailure.Provider(error),
+                cleanup
+              )))
+        end
+      case AsyncReadPoll.Completed()
+        let tracker = this.tracker
+
+        this.terminal = tracker == null ? QueryResult<T>.Rows(this.rows) : tracker.resolveRows(this.rows)
+        let cleanup = this.driver.close()
+
+        if cleanup != null
+          let primary = this.terminal
+
+          if primary != null
+            match primary
+              case QueryResult.Failure(error)
+                this.terminal = QueryResult<T>.Failure(QueryFailure.Cleanup(new QueryCleanupFailure(error, cleanup)))
+              case QueryResult.Rows(rows)
+                this.terminal = QueryResult<T>.Failure(QueryFailure.Provider(cleanup))
+            end
+          end
+        end
+    end
+    let completed = this.terminal
+
+    if completed != null
+      return AsyncQueryPoll<T>.Completed(completed)
+    end
+    # A row was consumed. Return immediately; -1 requests local rescheduling.
+    return AsyncQueryPoll<T>.Pending(-1, AsyncInterest.Read())
+  end
+
+  public def close(): result::Failure?
+    let error = this.driver.close()
+
+    return error == null ? null : providerResourceFailure(error, "data.async.close")
+  end
+end
+
+## Converts the public immutable predicate list for parameterized native drivers.
+def readWriteParameters(parameters: readonly ParameterValues): WriteValues
+  let output = new WriteValues()
+  var current = parameters.first()
+
+  while current != null
+    match current.value()
+      case Parameter.Bool(value)
+        output.add(Cell.Bool(value))
+      case Parameter.Int(value)
+        output.add(Cell.Int(value))
+      case Parameter.Float(value)
+        output.add(Cell.Float(value))
+      case Parameter.Text(value)
+        output.add(Cell.Text(value))
+      case Parameter.Binary(value)
+        output.add(Cell.Binary(copyBinary(value)))
+    end
+    current = current.next()
+  end
+  return output
+end
+
+def prepareAsyncQuery<T>(
+  provider: Provider?,
+  compiled: TypedPlan<T>,
+  options: StreamOptions? = null,
+  tracker: AsyncRowResolver<T>? = null,
+  maximumRows: Int? = null
+): AsyncQueryPreparation<T>
+  if provider == null
+    return AsyncQueryPreparation<T>.Failure(QueryFailure.UnsupportedCapability("asynchronous reads require a provider"))
+  end
+  if compiled.sql().requiresCheckedScalars() && !provider.supports(ProviderCapability.CheckedScalarExpressions())
+    return AsyncQueryPreparation<T>.Failure(QueryFailure.UnsupportedCapability("checked-scalar-expressions"))
+  end
+  match provider.beginReadAsync(compiled.sql(), options, maximumRows)
+    case AsyncReadStart.Failure(error)
+      return AsyncQueryPreparation<T>.Failure(QueryFailure.Provider(error))
+    case AsyncReadStart.Started(driver)
+      return AsyncQueryPreparation<T>.Ready(driver, compiled, tracker)
+  end
+end
+
+def startAsyncQuery<T>(
+  provider: Provider?,
+  compiled: TypedPlan<T>,
+  options: StreamOptions? = null,
+  tracker: AsyncRowResolver<T>? = null,
+  maximumRows: Int? = null
+): result::Result<AsyncQuery<T>, QueryFailure>
+  match prepareAsyncQuery(provider, compiled, options, tracker, maximumRows)
+    case AsyncQueryPreparation.Failure(error)
+      return result::Result<AsyncQuery<T>, QueryFailure>.Error(error)
+    case AsyncQueryPreparation.Ready(driver, plan, owner)
+      let owned = new AsyncQuery<T>(driver, plan, owner)
+
+      return result::Result<AsyncQuery<T>, QueryFailure>.Ok(transfer owned)
+  end
+end
+
+def prepareQueryAsync<T>(query: Query<T>, options: StreamOptions? = null): AsyncQueryPreparation<T>
+  let invalid = query.queryFailure()
+
+  if invalid != null
+    return AsyncQueryPreparation<T>.Failure(invalid)
+  end
+  let provider = query.provider()
+
+  if provider == null
+    return AsyncQueryPreparation<T>.Failure(QueryFailure.UnsupportedCapability("asynchronous reads require a provider"))
+  end
+  match compilePipeline<T, T>(query, query.rowDecoder(), null, query.rowLimit(), provider.dialect(), unbounded: true)
+    case CompileResult.Failure(error)
+      return AsyncQueryPreparation<T>.Failure(error)
+    case CompileResult.Plan(compiled)
+      let tracker = query.rowTracker()
+      var resolver: AsyncRowResolver<T>? = null
+
+      if tracker != null
+        resolver = tracker
+      end
+      return prepareAsyncQuery<T>(provider, compiled, options, resolver, streamMaximum<T>(query))
+  end
+end
+
+def queryAsync<T>(query: Query<T>, options: StreamOptions? = null): result::Result<AsyncQuery<T>, QueryFailure>
+  match prepareQueryAsync(query, options)
+    case AsyncQueryPreparation.Failure(error)
+      return result::Result<AsyncQuery<T>, QueryFailure>.Error(error)
+    case AsyncQueryPreparation.Ready(driver, plan, owner)
+      let owned = new AsyncQuery<T>(driver, plan, owner)
+
+      return result::Result<AsyncQuery<T>, QueryFailure>.Ok(transfer owned)
+  end
+end
+
+## An ordinary driver buffer used by multi-command asynchronous coordinators.
+class AsyncBufferedRead<T>
+  private driver: AsyncReadDriver
+  private compiled: TypedPlan<T>
+  private resolver: AsyncRowResolver<T>?
+  private rows: TypedRows<T> = new TypedRows<T>()
+  private terminal: QueryResult<T>?
+
+  def init(driver: AsyncReadDriver, compiled: TypedPlan<T>, resolver: AsyncRowResolver<T>? = null): Void
+    this.driver = driver
+    this.compiled = compiled
+    this.resolver = resolver
+  end
+
+  private def complete(result: QueryResult<T>): AsyncQueryPoll<T>
+    let cleanup = this.driver.close()
+    var terminal = result
+
+    if cleanup != null
+      match result
+        case QueryResult.Failure(error)
+          terminal = QueryResult<T>.Failure(QueryFailure.Cleanup(new QueryCleanupFailure(error, cleanup)))
+        case QueryResult.Rows(rows)
+          terminal = QueryResult<T>.Failure(QueryFailure.Provider(cleanup))
+      end
+    end
+    this.terminal = terminal
+    return AsyncQueryPoll<T>.Completed(terminal)
+  end
+
+  public def poll(): AsyncQueryPoll<T>
+    let terminal = this.terminal
+
+    if terminal != null
+      return AsyncQueryPoll<T>.Completed(terminal)
+    end
+    match this.driver.poll()
+      case AsyncReadPoll.Pending(socket, interest)
+        return AsyncQueryPoll<T>.Pending(socket, interest)
+      case AsyncReadPoll.Failure(error)
+        return this.complete(QueryResult<T>.Failure(QueryFailure.Provider(error)))
+      case AsyncReadPoll.Row(raw)
+        match this.compiled.decode(raw)
+          case DecodeResult.Failure(error)
+            return this.complete(QueryResult<T>.Failure(error))
+          case DecodeResult.Value(value)
+            this.rows.add(value)
+        end
+        return AsyncQueryPoll<T>.Pending(-1, AsyncInterest.Read())
+      case AsyncReadPoll.Completed()
+        let cleanup = this.driver.close()
+        let resolver = this.resolver
+
+        if cleanup != null
+          this.terminal = QueryResult<T>.Failure(QueryFailure.Provider(cleanup))
+        else
+          this.terminal = resolver == null ? QueryResult<T>.Rows(this.rows) : resolver.resolveRows(this.rows)
+        end
+        let completed = this.terminal
+
+        return AsyncQueryPoll<T>.Completed(completed == null ? QueryResult<T>.Failure(QueryFailure.Provider(ProviderFailure.State("asynchronous buffered read has no completion"))) : completed)
+    end
+  end
+
+  public def close(): ProviderFailure?
+    this.driver.cancel()
+    return this.driver.close()
+  end
+end
+
+abstract class AsyncNavigationPlan<T, U>
+  internal abstract def checkpointRoots(journal: NavigationJournal): Void
+  public abstract def prepareRoot(options: StreamOptions?): AsyncQueryPreparation<T>
+  public abstract def navigationKeys(rows: TypedRows<T>): TypedRows<Cell>
+  public abstract def prepareNavigation(
+    keys: TypedRows<Cell>,
+    maximum: Int,
+    options: StreamOptions?
+  ): AsyncQueryPreparation<U>
+  public abstract def publishNavigation(rows: TypedRows<T>, related: TypedRows<U>): QueryResult<T>
+  public abstract def navigationMaximum(): Int
+end
+
+enum AsyncNavigationStart<T, U>
+  case Started(driver: AsyncNavigationDriver<T, U>)
+  case Failure(error: QueryFailure)
+end
+
+## Reads roots and bounded related batches before publishing any navigation state.
+class AsyncNavigationDriver<T, U>
+  private plan: AsyncNavigationPlan<T, U>
+  private options: StreamOptions?
+  private root: AsyncBufferedRead<T>?
+  private roots: TypedRows<T>?
+  private read: AsyncBufferedRead<U>?
+  private next: TypedRowNode<Cell>?
+  private related: TypedRows<U> = new TypedRows<U>()
+  private initialized: Bool = false
+  private cancelled: Bool = false
+  private terminal: QueryResult<T>?
+  private deadline: Int?
+  private rootJournal: NavigationJournal?
+
+  def init(
+    plan: AsyncNavigationPlan<T, U>,
+    options: StreamOptions?,
+    root: AsyncBufferedRead<T>? = null,
+    rows: TypedRows<T>? = null,
+    rootJournal: NavigationJournal? = null
+  ): Void
+    this.plan = plan
+    this.options = options
+    this.root = root
+    this.roots = rows
+    this.rootJournal = rootJournal
+    if options != null
+      let timeout = options.timeoutMilliseconds()
+
+      if timeout != null
+        let now = clock::milliseconds()
+
+        if timeout >= 1 && timeout <= 86400000 && now != null && now <= 9223372036854775807 - timeout
+          this.deadline = now + timeout
+        else
+          this.close()
+          this.terminal = QueryResult<T>.Failure(QueryFailure.Provider(ProviderFailure.State("asynchronous navigation deadline is invalid or unavailable")))
+        end
+      end
+    end
+  end
+
+  private def complete(result: QueryResult<T>): AsyncQueryPoll<T>
+    let journal = this.rootJournal
+
+    if journal != null
+      match result
+        case QueryResult.Failure(error)
+          journal.rollback()
+        case QueryResult.Rows(rows)
+          journal.discard()
+      end
+      this.rootJournal = null
+    end
+    this.terminal = result
+    return AsyncQueryPoll<T>.Completed(result)
+  end
+
+  public def cancel(): Void
+    this.cancelled = true
+    this.close()
+  end
+
+  public def close(): ProviderFailure?
+    let root = this.root
+    let read = this.read
+    var error: ProviderFailure? = null
+
+    if root != null
+      error = root.close()
+      this.root = null
+    end
+    if read != null
+      let cleanup = read.close()
+
+      error = error == null ? cleanup : (cleanup == null ? error : ProviderFailure.Cleanup(new ProviderCleanupFailure(
+            error,
+            cleanup
+          )))
+      this.read = null
+    end
+    if this.terminal == null
+      let journal = this.rootJournal
+
+      if journal != null
+        journal.rollback()
+        this.rootJournal = null
+      end
+      this.cancelled = true
+      this.terminal = QueryResult<T>.Failure(error == null ? QueryFailure.Provider(ProviderFailure.State("asynchronous navigation load cancelled")) : QueryFailure.Provider(error))
+    end
+    return error
+  end
+
+  public def poll(): AsyncQueryPoll<T>
+    let terminal = this.terminal
+
+    if terminal != null
+      return AsyncQueryPoll<T>.Completed(terminal)
+    end
+    let options = this.options
+    let token = options == null ? null : options.token()
+
+    if (token != null && token.cancelled()) || streamTimedOut(this.deadline)
+      this.cancel()
+      return this.poll()
+    end
+    let root = this.root
+
+    if root != null
+      match root.poll()
+        case AsyncQueryPoll.Pending(socket, interest)
+          return AsyncQueryPoll<T>.Pending(socket, interest)
+        case AsyncQueryPoll.Completed(result)
+          this.root = null
+          match result
+            case QueryResult.Failure(error)
+              return this.complete(QueryResult<T>.Failure(error))
+            case QueryResult.Rows(rows)
+              this.roots = rows
+          end
+      end
+      return AsyncQueryPoll<T>.Pending(-1, AsyncInterest.Read())
+    end
+    let roots = this.roots
+
+    if roots == null || roots.count() > 10000
+      return this.complete(QueryResult<T>.Failure(QueryFailure.Provider(ProviderFailure.State("asynchronous navigation roots are absent or exceed 10000 rows"))))
+    end
+    if !this.initialized
+      this.next = this.plan.navigationKeys(roots).first()
+      this.initialized = true
+      return AsyncQueryPoll<T>.Pending(-1, AsyncInterest.Read())
+    end
+    let read = this.read
+
+    if read != null
+      match read.poll()
+        case AsyncQueryPoll.Pending(socket, interest)
+          return AsyncQueryPoll<T>.Pending(socket, interest)
+        case AsyncQueryPoll.Completed(result)
+          this.read = null
+          match result
+            case QueryResult.Failure(error)
+              return this.complete(QueryResult<T>.Failure(error))
+            case QueryResult.Rows(rows)
+              var row = rows.first()
+
+              while row != null
+                if this.related.count() >= this.plan.navigationMaximum()
+                  return this.complete(QueryResult<T>.Failure(QueryFailure.Provider(ProviderFailure.State("asynchronous navigation related row limit exceeded"))))
+                end
+                this.related.add(row.value)
+                row = row.next
+              end
+          end
+      end
+      return AsyncQueryPoll<T>.Pending(-1, AsyncInterest.Read())
+    end
+    var next: TypedRowNode<Cell>? = this.next
+
+    if next == null
+      return this.complete(this.plan.publishNavigation(roots, this.related))
+    end
+    let keys = new TypedRows<Cell>()
+    var count = 0
+    var cursor: TypedRowNode<Cell>? = this.next
+
+    while cursor != null && count < 50
+      keys.add(cursor.value)
+      cursor = cursor.next
+      count = count + 1
+    end
+    this.next = cursor
+    match this.plan.prepareNavigation(keys, this.plan.navigationMaximum() - this.related.count() + 1, options)
+      case AsyncQueryPreparation.Failure(error)
+        return this.complete(QueryResult<T>.Failure(error))
+      case AsyncQueryPreparation.Ready(driver, compiled, tracker)
+        this.read = new AsyncBufferedRead<U>(driver, compiled)
+        return AsyncQueryPoll<T>.Pending(-1, AsyncInterest.Read())
+    end
+  end
+end
+
+resource class AsyncNavigation<T, U>
+  private driver: AsyncNavigationDriver<T, U>
+
+  def init(driver: AsyncNavigationDriver<T, U>): Void
+    this.driver = driver
+  end
+
+  public def poll(): AsyncQueryPoll<T>
+    return this.driver.poll()
+  end
+
+  public def cancel(): Void
+    this.driver.cancel()
+  end
+
+  public def close(): result::Failure?
+    let error = this.driver.close()
+
+    return error == null ? null : providerResourceFailure(error, "data.async.navigation.close")
+  end
+end
+
+def prepareAsyncNavigation<T, U>(plan: AsyncNavigationPlan<T, U>, options: StreamOptions?): AsyncNavigationStart<T, U>
+  let journal = new NavigationJournal()
+
+  plan.checkpointRoots(journal)
+  match plan.prepareRoot(options)
+    case AsyncQueryPreparation.Failure(error)
+      journal.rollback()
+      return AsyncNavigationStart<T, U>.Failure(error)
+    case AsyncQueryPreparation.Ready(driver, compiled, tracker)
+      return AsyncNavigationStart<T, U>.Started(new AsyncNavigationDriver<T, U>(
+          plan,
+          options,
+          new AsyncBufferedRead<T>(driver, compiled, tracker),
+          rootJournal: journal
+        ))
+  end
+end
+
+abstract class AsyncLoadDriver<T>
+  public abstract def poll(): AsyncQueryPoll<T>
+  public abstract def cancel(): Void
+  public abstract def close(): ProviderFailure?
+end
+
+## Maps a completed navigation publication to a lazy collection or reference result.
+class AsyncMappedNavigation<S, R, T>: AsyncLoadDriver<T>
+  private source: AsyncNavigationDriver<S, R>?
+  private map: fn(QueryResult<S>): QueryResult<T>
+  private terminal: QueryResult<T>?
+
+  def init(
+    source: AsyncNavigationDriver<S, R>?,
+    map: fn(QueryResult<S>): QueryResult<T>,
+    terminal: QueryResult<T>? = null
+  ): Void
+    this.source = source
+    this.map = map
+    this.terminal = terminal
+  end
+
+  public override def poll(): AsyncQueryPoll<T>
+    let terminal = this.terminal
+
+    if terminal != null
+      return AsyncQueryPoll<T>.Completed(terminal)
+    end
+    let source = this.source
+
+    if source == null
+      this.terminal = QueryResult<T>.Failure(QueryFailure.Provider(ProviderFailure.State("asynchronous lazy loader lost its source")))
+      return this.poll()
+    end
+    match source.poll()
+      case AsyncQueryPoll.Pending(socket, interest)
+        return AsyncQueryPoll<T>.Pending(socket, interest)
+      case AsyncQueryPoll.Completed(result)
+        let mapped = this.map(result)
+
+        this.terminal = mapped
+        return AsyncQueryPoll<T>.Completed(mapped)
+    end
+  end
+
+  public override def cancel(): Void
+    let source = this.source
+
+    if source != null
+      source.cancel()
+    end
+  end
+
+  public override def close(): ProviderFailure?
+    let source = this.source
+
+    if source == null || this.terminal != null
+      return null
+    end
+    let cleanup = source.close()
+
+    this.poll()
+    return cleanup
+  end
+end
+
+resource class AsyncLoad<T>
+  private driver: AsyncLoadDriver<T>
+
+  def init(driver: AsyncLoadDriver<T>): Void
+    this.driver = driver
+  end
+
+  public def poll(): AsyncQueryPoll<T>
+    return this.driver.poll()
+  end
+
+  public def cancel(): Void
+    this.driver.cancel()
+  end
+
+  public def close(): result::Failure?
+    let error = this.driver.close()
+
+    return error == null ? null : providerResourceFailure(error, "data.async.lazy.close")
+  end
+end

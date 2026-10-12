@@ -1,0 +1,242 @@
+namespace neri_data
+
+class NavigationChange<P, D>
+  public child: D
+  public baseline: P?
+  public desired: P?
+  public changed: Bool
+  public next: NavigationChange<P, D>?
+
+  def init(child: D, baseline: P?, desired: P?, changed: Bool, next: NavigationChange<P, D>?): Void
+    this.child = child
+    this.baseline = baseline
+    this.desired = desired
+    this.changed = changed
+    this.next = next
+  end
+end
+
+## Callbacks supply the generated write edge, orphan policy and FK snapshot restore.
+def registerCollectionChanges<P, D>(
+  principals: Query<P>, dependents: Query<D>, relation: CollectionNavigation<P, D>,
+  link: fn(P, D): QueryFailure?, unlink: fn(D): QueryFailure?,
+  snapshot: fn(D): fn(): Void
+): WriteFailure?
+  let owner = principals.changeOwner()
+  let dependentOwner = dependents.changeOwner()
+
+  if owner == null || dependentOwner == null || !reference::same(owner, dependentOwner)
+    return WriteFailure.Validation("collection change detection requires the same tracked context")
+  end
+  let detect: fn(GraphJournal): QueryFailure? = fn(journal: GraphJournal): QueryFailure? do
+    return detectCollectionChanges(principals, dependents, relation, link, unlink, snapshot, journal)
+  end
+
+  return owner.registerChangeDetector(detect)
+end
+
+def navigationSameReference<P>(first: P?, second: P?): Bool
+  return first == null ? second == null : (second != null && reference::same(first, second))
+end
+
+def detectCollectionChanges<P, D>(
+  principals: Query<P>, dependents: Query<D>, relation: CollectionNavigation<P, D>,
+  link: fn(P, D): QueryFailure?, unlink: fn(D): QueryFailure?,
+  snapshot: fn(D): fn(): Void, journal: GraphJournal
+): QueryFailure?
+  let parents = principals.rowTracker()
+  let children = dependents.rowTracker()
+
+  if parents == null || children == null
+    return QueryFailure.UnsupportedCapability("collection change detection requires entity tracker metadata")
+  end
+  let principalRows = new TypedRows<P>()
+  let childRows = new TypedRows<D>()
+  let collectParent: fn(P): Bool = fn(entity: P): Bool do
+    principalRows.add(entity)
+    for child in relation.collection(entity)
+      navigationDistinct(childRows, child)
+    end
+    return principalRows.count() <= 10000 && childRows.count() <= 10000
+  end
+  let collectChild: fn(D): Bool = fn(entity: D): Bool do
+    navigationDistinct(childRows, entity)
+    let reference = relation.reference(entity)
+
+    if reference != null
+      navigationDistinct(principalRows, reference)
+    end
+    return principalRows.count() <= 10000 && childRows.count() <= 10000
+  end
+
+  if !parents.visitTracked(collectParent) || !children.visitTracked(collectChild)
+    return QueryFailure.UnsupportedCapability("collection change detection exceeds 10000 entities")
+  end
+  let navigationJournal = new NavigationJournal()
+
+  checkpointNavigation(relation, parents, children, principalRows, childRows, navigationJournal)
+  let undoNavigations: fn(): Void = fn(): Void do
+    navigationJournal.rollback()
+  end
+
+  journal.record(undoNavigations)
+  var current = childRows.first()
+  var first: NavigationChange<P, D>? = null
+
+  while current != null
+    let node = current
+    let child = current.value
+    let state = dependents.stateOf(child)
+    var active = state == null
+    var added = state == null
+
+    if state != null
+      match state
+        case TrackingState.Added()
+          active = true
+          added = true
+        case TrackingState.Unchanged()
+          active = true
+        case TrackingState.Modified()
+          active = true
+        case TrackingState.Deleted()
+        case TrackingState.Detached()
+      end
+    end
+    if active
+      journal.record(snapshot(child))
+      let original = children.original(child)
+      var baseline: P? = null
+      var collectionTarget: P? = null
+      var baselineMember = false
+      var baselineLoaded = false
+      var parent = principalRows.first()
+
+      while parent != null
+        let principal = parent.value
+        let originalMatch = !added && original != null && navigationTupleRowMatches(
+          original,
+          relation.columns(),
+          relation.principalKey(principal)
+        )
+
+        if originalMatch
+          baseline = principal
+          match relation.collectionState(principal)
+            case NavigationLoadState.Loaded()
+              baselineLoaded = true
+            case NavigationLoadState.Unknown()
+            case NavigationLoadState.Partial()
+            case NavigationLoadState.Loading()
+          end
+        end
+        for candidate in relation.collection(principal)
+          if reference::same(candidate, child)
+            if originalMatch
+              baselineMember = true
+            else
+              if collectionTarget != null && !reference::same(collectionTarget, principal)
+                return QueryFailure.Provider(ProviderFailure.State("dependent was added to two different principal collections"))
+              end
+              collectionTarget = principal
+            end
+          end
+        end
+        parent = parent.next
+      end
+      let reference = relation.reference(child)
+      var referenceKnown = false
+
+      match relation.referenceState(child)
+        case NavigationLoadState.Loaded()
+          referenceKnown = true
+        case NavigationLoadState.Partial()
+          referenceKnown = true
+        case NavigationLoadState.Unknown()
+        case NavigationLoadState.Loading()
+      end
+      # Explicit FK links can leave both navigation fields unpopulated.
+      # An unknown empty navigation does not represent a requested unlink.
+      let unknownReference = reference == null && baseline != null && !baselineMember && !baselineLoaded && !referenceKnown
+      let referenceChanged = !unknownReference && !navigationSameReference(reference, baseline)
+      let scalarChanged = !added && original != null && !navigationTupleRowMatches(
+        original,
+        relation.columns(),
+        relation.foreignKey(child)
+      )
+      var desired = baseline
+      var changed = false
+
+      if collectionTarget != null
+        if referenceChanged && reference != null && !reference::same(reference, collectionTarget)
+          return QueryFailure.Provider(ProviderFailure.State("collection edit conflicts with a changed dependent reference"))
+        end
+        desired = collectionTarget
+        changed = true
+      else if referenceChanged
+        desired = reference
+        changed = true
+      else if baseline != null && baselineLoaded && !baselineMember
+        desired = null
+        changed = true
+      end
+      if scalarChanged && !changed
+        current = node.next
+        continue
+      end
+      if changed
+        first = new NavigationChange<P, D>(child, baseline, desired, true, first)
+      end
+    end
+    current = node.next
+  end
+  var change = first
+
+  while change != null
+    let child = change.child
+    let desired = change.desired
+    let baseline = change.baseline
+
+    if desired != null
+      relation.setReference(child, desired)
+      let error = link(desired, child)
+
+      if error != null
+        return error
+      end
+    else
+      if baseline != null
+        let linked = link(baseline, child)
+
+        if linked != null
+          return linked
+        end
+      end
+      let error = unlink(child)
+
+      if error != null
+        return error
+      end
+      relation.setReference(child, null)
+    end
+    var parent = principalRows.first()
+
+    while parent != null
+      let principal = parent.value
+      let retained = new TypedRows<D>()
+
+      for existing in relation.collection(principal)
+        if !reference::same(existing, child)
+          navigationDistinct(retained, existing)
+        end
+      end
+      if desired != null && reference::same(desired, principal)
+        retained.add(child)
+      end
+      relation.setCollection(principal, navigationArray(retained))
+      parent = parent.next
+    end
+    change = change.next
+  end
+  return null
+end

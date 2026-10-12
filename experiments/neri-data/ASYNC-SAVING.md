@@ -1,0 +1,17 @@
+# Asynchronous tracked saves and transactions
+
+A bound `ChangeContext` exposes `saveChangesAsync(options)`, which returns `result::Result<AsyncSave, WriteFailure>`. Keep the owned resource alive and call `poll()` until `AsyncWritePoll.Completed(result)`. A pending result carries the provider socket and read/write interest; socket -1 requests a later poll for a local transition or worker completion. Each poll advances at most one provider operation or one local transition. Provider drivers perform database I/O without blocking the calling thread.
+
+A save opens a native transaction when the context has no explicit lease. Within an explicit transaction, it creates an outer savepoint and requires provider savepoint support. Every dependency-ordered write uses that lease. The provider validates returned generated values before committing or releasing its write scope. The save commits its transaction or releases its outer savepoint after every operation succeeds. Failure rolls back the whole save scope, including provisional generated keys and relationship propagation. Earlier successful saves within an explicit transaction remain available.
+
+The proposed snapshot for each operation is captured after its principal dependencies have completed and their generated keys have been propagated, immediately before that operation is submitted. Application edits made before submission participate in that operation; edits made afterward remain changes against the accepted database snapshot. Binary values are copied. Generated values overlay the submitted snapshot instead of recapturing ordinary entity fields. Application code should leave database-generated properties under the provider's control while a save is pending.
+
+The context holds an operation guard until native completion and cleanup. Overlapping saves, transactions, graph mutations, tracked entry mutations, bulk writes, and tracked materialization return a state failure. Void clear and registration operations leave the context unchanged while the guard is held. Direct edits to entity properties remain available and follow the snapshot rule above.
+
+Explicit tracked transactions have corresponding `beginTransactionAsync`, `commitTransactionAsync`, and `rollbackTransactionAsync` methods. They return an owned `AsyncContextTransaction`; poll it until `AsyncControlPoll.Completed`. A successful begin establishes the context lease and tracker checkpoints, and successful commit or rollback reconciles those checkpoints. Use these methods when transaction control must also avoid blocking database I/O.
+
+Cancellation is cooperative. `cancel()` requests cancellation of the current provider operation and the save subsequently rolls back using cleanup operations without the cancelled options. A timeout applies to the entire save. If a native provider loses its connection or cannot prove rollback, the context retains its lease/checkpoints and reports uncertain transaction state. Further saves and commits fail until transaction recovery is resolved.
+
+Disposing a pending resource requests cancellation and performs one bounded poll. It can return a resource failure with code `cleanup_pending`. In that case the context retains the cleanup driver and its operation guard; call `pollSaveCleanup()` or `pollTransactionCleanup()` until completion. Cleanup errors retain the primary failure in `WriteFailure.Cleanup`. Resource disposal never hides a synchronous SQL wait.
+
+The synchronous save and transaction methods retain their existing contracts.

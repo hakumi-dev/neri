@@ -1,7 +1,8 @@
 # Neri Data
 
 Neri Data provides generated, typed relational access through the `neri_data`
-library and a SQLite adapter in `neri_data_sqlite`. Applications define ordinary
+library, a SQLite adapter in `neri_data_sqlite`, and a PostgreSQL adapter in
+`neri_data_postgresql`. Applications define ordinary
 Neri entities and a mapping file; generation produces a typed context, entity
 decoders, relationship helpers and schema metadata. Query quotations use the
 compiler's typed expression trees described in [Quotations](QUOTATIONS.md).
@@ -14,6 +15,12 @@ The toolchain includes the runtime source project at
 `neri-data-generate` and `neri-data-migration` use the standard library from their
 own installed toolchain. Keep those commands and the Data source projects from
 the same release.
+
+`neri-data-migration` also requires the platform's libpq 14 or later shared
+library, including when managing SQLite migrations. Install the PostgreSQL
+client library used by the package build and keep it available to the system
+loader. Release CI uses Homebrew `libpq` on macOS and Debian/Ubuntu `libpq-dev`
+on Linux; deployed Linux installations need its `libpq5` runtime package.
 
 The installed Data package is verified on Apple silicon with macOS 15 or newer
 and LLVM 22.1.8. This release gate does not establish installed Data support on
@@ -42,9 +49,18 @@ Include the entity and generated source directories in the application's
 example `["app", "data/entities", "data/generated"]`. Keep the mapping's Neri
 project focused on its entity declarations so generation can run before those
 generated files exist. Ito supplies both exported libraries to the application;
-it does not run the Data generator. Regenerate first when mapping inputs change.
+it runs the Data generator before preparing application sources when the
+application declares `neri.dataMappings`, for example `["data/mapping.json"]`.
+`ito prepare`, `build`, `run` and `test` use `neri-data-generate --ensure` under
+the application lock. `NERI_DATA_GENERATE` selects that generator executable.
+Without this declaration, regenerate explicitly when mapping inputs change.
 Installed Data metadata and copied source files use the packaged Neri manifests
 as their source inventory, including the owning `SQLiteSession` resource.
+
+`neri-data-generate --check <mapping.json>` validates inputs, output ownership,
+the generation manifest and every generated artifact without writing files.
+It exits unsuccessfully when output is missing, stale or invalid. `--ensure`
+publishes changed output and reuses a current revision without rewriting it.
 
 The packaged `examples/data-consumer` project exercises installed generation and
 SQLite persistence. Its mapping and entity declarations provide a minimal
@@ -84,12 +100,20 @@ provider when finished. Generated source is published at stable paths such as
   Filtered collection loading applies ordering and pagination independently for
   each parent. Reloaded membership follows database values while existing local
   scalar edits survive identity reuse.
+- Generated contexts retain relationship descriptors, record loaded state, and
+  fix references and inverse collections as tracked rows materialize. Generated
+  `lazy_<relationship>` and `lazyReference_<relationship>` methods load on access
+  and reuse complete results. Entity fields remain ordinary Neri field reads.
 - Graph registration discovers mapped navigations and orders related writes.
   Explicit relationship operations support reassignment, configured client
   cascades, orphan removal and nullable foreign-key updates.
 - Mapping snapshots and migration scaffolding produce reviewable up/down source.
   SQLite applies supported schema changes transactionally and rejects unsupported
   dependencies before rebuilding tables.
+- Managed migration catalogs discover immutable bundles, report pending model
+  changes, generate guarded SQL scripts, and check live database history before
+  removing the last unapplied migration. Physical foreign keys support ordered
+  tuples and configured database delete actions.
 - Synchronous streaming supports explicit stop, cooperative cancellation and
   deadlines. Provider diagnostics report completed operations without recording
   parameter values.
@@ -103,9 +127,11 @@ include apply to each parent's children. Collection loading stages publication
 until all batches succeed; chained loading restores earlier navigation changes
 after a later failure. Newly materialized tracker entries can remain.
 
-Loaded-state metadata, automatic context-wide relationship fixup and lazy loading
-are outside this release's loading contract. Callers explicitly reload the
-selection they need. Multiple queries share a consistent database snapshot only
+Complete loads mark navigations Loaded; filtered collections mark them Partial.
+Lazy access completes a Partial selection. Failed chained loads restore both
+navigation values and loaded metadata. Foreign-key changes invalidate reference
+state; cached access rejects removed or detached tracked instances.
+Multiple queries share a consistent database snapshot only
 when the caller selects suitable transaction isolation.
 
 The generated scalar mapping accepts the following types. Decoding checks the
@@ -118,22 +144,62 @@ numbers or integers into booleans other than `0` and `1`.
 | `Bool`, `Bool?` | INTEGER | Only `0` and `1`. |
 | `String`, `String?` | TEXT | Valid UTF-8, copied before advancing the statement. |
 | `Float`, `Float?` | REAL | Finite binary64 values; NaN and infinity are rejected. |
+| `buffers::ByteBuffer`, optional form | BLOB | Copied binary bytes, including NUL and empty buffers. |
+| `neri_data::Decimal`, optional form | TEXT | Canonical exact base-ten values, up to 4,096 digits. |
 
 Optional fields additionally accept SQL NULL. Required fields reject NULL.
 Declare Float columns with REAL affinity; see the
 [floating-point contract](../experiments/neri-data/FLOATS.md).
-Each entity has one required `Int` or `String` primary key. Foreign keys use the
-matching key type, with an optional form for nullable relationships. Other Neri
-field types, including narrower integer types and binary buffers, are not scalar
-mappings in this release. Composite/alternate keys, exact decimal,
-arbitrary application-constructor query translation, asynchronous I/O and
-additional real database adapters remain outside this release's scope.
-PostgreSQL placeholder rendering is a SQL compilation contract, not a PostgreSQL
-database adapter.
+Primary keys contain one or more required `Int` or `String` fields, in declared
+order. Alternate keys use unique tuples; relationships can target either key.
+Foreign keys use matching scalar types and optional forms for nullable
+relationships. Identity resolution and tracked UPDATE/DELETE operations use the
+complete primary-key tuple. Generated integer keys retain their single-key
+contract. See [scalars and keys](../experiments/neri-data/SCALARS-KEYS.md).
+
+Binary and decimal equality use `whereBinary(column, value)` and
+`whereDecimal(column, value)` with validated mapping metadata. Decimal parsing,
+comparison, addition, subtraction and negation preserve exact values without
+passing through binary floating point. The explicit Decimal expression DSL adds
+exact SQL comparison, ordering, addition and subtraction across both providers;
+see [query composition](DATA-QUERIES.md).
+Typed shape projections compose mapped scalar fields and supported expression
+quotations; arbitrary application constructors and narrower integer field types
+remain unsupported.
+
+The [PostgreSQL provider](../experiments/neri-data/POSTGRESQL.md) links libpq 14
+or later and implements parameterized typed reads, tracked writes, transaction
+leases, savepoints and migrations against a real database. Its text values use
+UTF-8 and reject embedded NUL. PostgreSQL implements checked scalar arithmetic
+with native numeric operations and finite-value validation; SQLite uses checked
+scalar functions.
+Provider differences remain explicit capabilities and structured failures.
+Both adapters reject embedded NUL in text parameters. Use binary values for
+parameterized byte payloads; SQLite byte string expressions can inspect existing
+text values containing NUL without relying on text length semantics.
+
+`Query<T>.allAsync()` and projection terminals return owned polling operations.
+PostgreSQL uses nonblocking libpq; `SQLiteAsyncSession` performs database I/O on
+an isolated worker and exposes an asynchronous provider. Socket interest and
+local rescheduling are explicit, so applications can integrate their event loop.
+See [asynchronous operations and lazy loading](../experiments/neri-data/ASYNC-AND-LAZY.md).
+
+Generated contexts expose `saveChangesAsync`, asynchronous transaction controls,
+and polling methods for cleanup after pending resource disposal. Tracked saves
+preserve dependency order, generated values and transaction checkpoints while
+allowing later application edits to remain dirty. See
+[asynchronous tracked saves and transactions](../experiments/neri-data/ASYNC-SAVING.md).
 
 Neri Data is an explicit relational API for this release. Its supported
-surface is defined here and does not imply feature parity with Entity Framework
-Core.
+surface is defined here and compared explicitly in the
+[relational capability matrix](DATA-PARITY.md). Model and lifecycle contracts include
+[keyless views, complex fields and inheritance](DATA-MODEL-MAPPING.md),
+[many-to-many navigation](DATA-MANY-TO-MANY.md),
+[versioned seed data](DATA-SEEDING.md),
+[async operations](DATA-ASYNC.md), and
+[pooling, save interception and retries](DATA-CONTEXT-LIFECYCLE.md).
+[Live schema scaffolding](DATA-SCHEMA-SCAFFOLDING.md) creates source and mapping
+for supported existing SQLite and PostgreSQL schemas.
 
 `Query<T>.all()` and its scalar and shape projections materialize the selected rows. Without an explicit query bound, execution
 collects the provider's typed streaming read; providers must support

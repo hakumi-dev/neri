@@ -1,0 +1,170 @@
+use reference
+namespace neri_data
+
+## Same-table owned references retain their owner identity until that owner is detached.
+class OwnedValues<B, O>
+  private roots: EntityTracker<B>
+  private select: fn(B): O?
+  private first: OwnedValueEntry<B, O>?
+  private checkpoint: OwnedValueEntry<B, O>?
+  private saveCheckpoint: OwnedValueEntry<B, O>?
+  private maximum: Int
+  private claims: OwnedClaimStore<O>
+  private count: Int = 0
+  private checkpointCount: Int = 0
+  private saveCheckpointCount: Int = 0
+
+  def init(roots: EntityTracker<B>, select: fn(B): O?, claims: OwnedClaimStore<O>, maximum: Int = 10000): Void
+    this.roots = roots
+    this.select = select
+    this.maximum = maximum
+    this.claims = claims
+  end
+
+  private def retained(target: OwnedValueEntry<B, O>): Bool
+    var entry = this.first
+
+    while entry != null
+      if reference::same(entry, target)
+        return this.active(entry.owner)
+      end
+      entry = entry.next
+    end
+    return false
+  end
+
+  private def active(owner: B): Bool
+    let state = this.roots.stateOf(owner)
+
+    if state == null
+      return false
+    end
+    match state
+      case TrackingState.Detached()
+        return false
+      case TrackingState.Added()
+      case TrackingState.Deleted()
+      case TrackingState.Unchanged()
+      case TrackingState.Modified()
+    end
+    return true
+  end
+
+  public def synchronize(): QueryFailure?
+    let original = this.first
+    let originalCount = this.count
+    let status = new ModelCallbackState()
+    let visit: fn(B): Bool = fn(owner: B): Bool do
+      let value = this.select(owner)
+
+      if value == null || !this.active(owner)
+        return true
+      end
+      var entry = this.first
+
+      while entry != null
+        if reference::same(entry.value, value) && this.active(entry.owner)
+          if !reference::same(entry.owner, owner)
+            status.failure = QueryFailure.Provider(ProviderFailure.State("an owned instance cannot be shared or moved between tracked owners"))
+            return false
+          end
+          return true
+        end
+        entry = entry.next
+      end
+      if this.maximum < 1 || this.count >= this.maximum
+        status.failure = QueryFailure.Provider(ProviderFailure.State("owned instance history exceeded its configured limit"))
+        return false
+      end
+      let created = new OwnedValueEntry<B, O>(owner, value, this.first)
+      let live: fn(): Bool = fn(): Bool do
+        return this.retained(created)
+      end
+
+      status.failure = this.claims.claim(value, created.token, live)
+      if status.failure != null
+        return false
+      end
+      this.first = created
+      this.count = this.count + 1
+      return true
+    end
+
+    this.roots.visitTracked(visit)
+    if status.failure != null
+      this.first = original
+      this.count = originalCount
+    end
+    return status.failure
+  end
+
+  public def register(changes: ChangeContext): WriteFailure?
+    let noWrite: fn(WriteBatch, SqlDialect): String? = fn(batch: WriteBatch, dialect: SqlDialect): String? do
+      return null
+    end
+    let nothing: fn(): Void = fn(): Void do
+    end
+    let clear: fn(): Void = fn(): Void do
+      this.first = null
+      this.count = 0
+    end
+    let checkpoint: fn(): Void = fn(): Void do
+      this.checkpoint = this.first
+      this.checkpointCount = this.count
+    end
+    let restore: fn(): Void = fn(): Void do
+      this.first = this.checkpoint
+      this.count = this.checkpointCount
+    end
+    let checkpointSave: fn(): Void = fn(): Void do
+      this.saveCheckpoint = this.first
+      this.saveCheckpointCount = this.count
+    end
+    let restoreSave: fn(): Void = fn(): Void do
+      this.first = this.saveCheckpoint
+      this.count = this.saveCheckpointCount
+    end
+    let returned: fn(readonly WriteReturnedRows): String? = fn(rows: readonly WriteReturnedRows): String? do
+      return null
+    end
+    let actions: fn(WriteActionList): String? = fn(list: WriteActionList): String? do
+      return null
+    end
+    let snapshot: fn(GraphJournal): Void = fn(journal: GraphJournal): Void do
+      let first = this.first
+      let count = this.count
+      let undo: fn(): Void = fn(): Void do
+        this.first = first
+        this.count = count
+      end
+
+      journal.record(undo)
+    end
+
+    changes.register(new ChangeSet(
+        noWrite,
+        nothing,
+        clear,
+        checkpoint,
+        restore,
+        nothing,
+        returned,
+        nothing,
+        actions,
+        checkpointSave,
+        restoreSave,
+        nothing,
+        snapshot
+      ))
+    let observe: fn(): QueryFailure? = fn(): QueryFailure? do
+      return this.synchronize()
+    end
+    let detect: fn(GraphJournal): QueryFailure? = fn(journal: GraphJournal): QueryFailure? do
+      return this.synchronize()
+    end
+
+    this.roots.observeMaterialization(observe)
+    this.roots.observeEnrollment(observe)
+    return changes.registerChangeDetector(detect)
+  end
+end

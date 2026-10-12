@@ -148,6 +148,61 @@ class QuotationBuilder
     return nodeKind
   end
 
+  def convertedComparison(boundNode: Int): String
+    let bound = this.body.model().bound
+
+    if bound.childCountAt(boundNode) != 2 || bound.typeAt(boundNode) != "Bool" || bound.valueAt(boundNode) != "operator"
+      return ""
+    end
+    let leftType = semanticMutableType(bound.typeAt(bound.childAt(boundNode, 0)))
+    let rightType = semanticMutableType(bound.typeAt(bound.childAt(boundNode, 1)))
+    let symbol = this.body.model().findClass(leftType)
+
+    if symbol == null || symbol.isResource || leftType != rightType
+      return ""
+    end
+    let hook = this.body.findMethod(symbol, "captureQuotation")
+
+    if hook == null || !quotationCaptureHookValid(hook, symbol.fullName, true)
+      return ""
+    end
+    var method = symbol.firstMethod
+
+    while method != null
+      if method.fullName == bound.dataAt(boundNode)
+        if !method.isReadonly || method.isStatic || method.isUnsafe || method.returnType != "Bool" || method.parameterCount != 1
+          return ""
+        end
+        let argument = method.firstParameter
+
+        if argument == null || semanticMutableType(argument.typeName) != leftType
+          return ""
+        end
+        if method.operatorName == "=="
+          return "Equal"
+        end
+        if method.operatorName == "!="
+          return "NotEqual"
+        end
+        if method.operatorName == "<"
+          return "Less"
+        end
+        if method.operatorName == "<="
+          return "LessEqual"
+        end
+        if method.operatorName == ">"
+          return "Greater"
+        end
+        if method.operatorName == ">="
+          return "GreaterEqual"
+        end
+        return ""
+      end
+      method = method.nextCallable
+    end
+    return ""
+  end
+
   def stringConcatenation(boundNode: Int): Bool
     let bound = this.body.model().bound
 
@@ -170,6 +225,60 @@ class QuotationBuilder
     let parameter = method.firstParameter
 
     return parameter != null && parameter.typeName == "String"
+  end
+
+  def stringMethod(boundNode: Int): String
+    let bound = this.body.model().bound
+    let identity = bound.dataAt(boundNode)
+    var methodName = ""
+    var nodeKind = ""
+    var resultType = "Bool"
+    var argumentCount = 2
+
+    if identity == "String.contains"
+      methodName = "contains"
+      nodeKind = "StringContains"
+    else if identity == "String.startsWith"
+      methodName = "startsWith"
+      nodeKind = "StringStartsWith"
+    else if identity == "String.endsWith"
+      methodName = "endsWith"
+      nodeKind = "StringEndsWith"
+    else if identity == "String.byteLength"
+      methodName = "byteLength"
+      nodeKind = "StringByteLength"
+      resultType = "Int"
+      argumentCount = 1
+    else
+      return ""
+    end
+    if bound.typeAt(boundNode) != resultType || bound.childCountAt(boundNode) != argumentCount || bound.typeAt(bound.childAt(
+        boundNode,
+        0
+      )) != "String"
+      return ""
+    end
+    if argumentCount == 2 && bound.typeAt(bound.childAt(boundNode, 1)) != "String"
+      return ""
+    end
+    let stringClass = this.body.model().findClass("String")
+
+    if stringClass == null || stringClass.representation != "utf8" || this.body.owner.sourceIdAt(this.body.syntax().startAt(stringClass.syntaxNode)) != "@stdlib/core.hk"
+      return ""
+    end
+    let method = this.body.owner.findDeclaredMethod(stringClass, methodName)
+
+    if method == null || method.fullName != identity || method.className != "String" || method.returnType != resultType || method.parameterCount != argumentCount - 1 || method.isStatic || method.isUnsafe || this.body.owner.sourceIdAt(this.body.syntax().startAt(method.syntaxNode)) != "@stdlib/core.hk"
+      return ""
+    end
+    if argumentCount == 2
+      let parameter = method.firstParameter
+
+      if parameter == null || parameter.typeName != "String"
+        return ""
+      end
+    end
+    return nodeKind
   end
 
   def translate(boundNode: Int, diagnosticNode: Int): Int
@@ -216,7 +325,22 @@ class QuotationBuilder
       return this.node("NullLiteral", typeName, diagnosticNode)
     end
     if kind.isInstanceCall()
-      let nodeKind = this.stringComparison(boundNode)
+      let methodKind = this.stringMethod(boundNode)
+
+      if methodKind != ""
+        let receiver = this.translate(bound.childAt(boundNode, 0), diagnosticNode)
+        var argument = -1
+
+        if bound.childCountAt(boundNode) == 2
+          argument = this.translate(bound.childAt(boundNode, 1), diagnosticNode)
+        end
+        if receiver >= 0 && (bound.childCountAt(boundNode) == 1 || argument >= 0)
+          return this.node(methodKind, typeName, diagnosticNode, receiver, argument)
+        end
+        return -1
+      end
+      let stringKind = this.stringComparison(boundNode)
+      let nodeKind = stringKind == "" ? this.convertedComparison(boundNode) : stringKind
 
       if nodeKind != ""
         let left = this.translate(bound.childAt(boundNode, 0), diagnosticNode)
@@ -499,6 +623,13 @@ def quotationBoxScalar(
   return body.addBound(body.boundKinds().getCall(), "quotation.CaptureValue", name, node, [value])
 end
 
+def quotationCaptureHookValid(hook: SemanticCallable, className: String, mutable: Bool): Bool
+  let parameter = hook.firstParameter
+  let parameterType = className + "?"
+
+  return hook.isStatic && hook.access.isPublic() && !hook.isUnsafe && !hook.isAbstract && hook.cAbiSymbol == "" && hook.intrinsicName == "" && hook.parameterCount == 1 && parameter != null && (parameter.typeName == semanticReadView(parameterType) || (mutable && parameter.typeName == parameterType)) && hook.returnType == "quotation.CaptureValue"
+end
+
 def quotationCapture(body: BootstrapBodyBinder, value: Int, node: Int): Int
   let bound = body.model().bound
   let typeName = bound.typeAt(value)
@@ -525,11 +656,32 @@ def quotationCapture(body: BootstrapBodyBinder, value: Int, node: Int): Int
   if typeName == "Null" || bound.kindAt(value).isNullLiteral()
     return quotationAlternative(body, "quotation.CaptureValue", "Null", [], node)
   end
+  let capturedType = semanticIsOptional(typeName) ? semanticInnerType(typeName) : typeName
+  let capturedClass = body.model().findClass(semanticMutableType(capturedType))
+
+  if capturedClass != null && !capturedClass.isResource
+    let hook = body.findMethod(capturedClass, "captureQuotation")
+
+    if hook != null
+      let valid = quotationCaptureHookValid(hook, capturedClass.fullName, !semanticIsReadonly(typeName))
+
+      if valid
+        body.owner.recordOccurrence(body.owner.callableSourceIdentity(hook), node)
+        return body.addBound(body.boundKinds().getCall(), "quotation.CaptureValue", hook.fullName, node, [value])
+      end
+      body.report(
+        "NR276",
+        node,
+        "Quotation capture hooks require a public safe static captureQuotation(Type?): quotation.CaptureValue method on a managed class."
+      )
+      return quotationAlternative(body, "quotation.CaptureValue", "Null", [], node)
+    end
+  end
   body.report("NR276", node, "Quoted expression captures must be Bool, Int, Float, String, or null.")
   return quotationAlternative(body, "quotation.CaptureValue", "Null", [], node)
 end
 
-def bindQuotation(body: BootstrapBodyBinder, node: Int, expectedType: String): BoundValue
+def bindQuotation(body: BootstrapBodyBinder, node: Int, expectedType: String, inferResult: Bool = false): BoundValue
   if !quotationAbiValid(body, node)
     return new BoundValue("Error", body.addBound(body.boundKinds().getErrorExpression(), "Error", "", node, []))
   end
@@ -549,7 +701,7 @@ def bindQuotation(body: BootstrapBodyBinder, node: Int, expectedType: String): B
   if body.syntax().kindAt(node).isQuoteExpression()
     closureNode = body.syntax().childAt(node, 0)
   end
-  let closure = bindClosure(body, closureNode, expectedFunction)
+  let closure = bindClosure(body, closureNode, expectedFunction, inferResult)
   let closureClass = body.model().findClass(body.model().bound.dataAt(closure.boundNode))
 
   if closureClass == null

@@ -1,0 +1,611 @@
+use host
+use neri_data
+namespace neri_data_sqlite
+
+def sqliteAsyncDeadline(options: StreamOptions?, defaultTimeout: Bool): Int?
+  let selected = options == null ? null : options.timeoutMilliseconds()
+
+  if selected == null && !defaultTimeout
+    return null
+  end
+  let timeout = selected == null ? 30000 : selected
+  let now = clock::milliseconds()
+
+  return timeout < 1 || timeout > 86400000 || now == null || now > 9223372036854775807 - timeout ? null : now + timeout
+end
+
+## One worker job. Polling uses a zero timeout; SQLite runs only on the worker.
+class SQLiteWriteCursor
+  private owner: SQLiteAsyncProvider
+  private ticket: UInt64 = 0 as UInt64
+  private lease: Int
+  private action: AsyncTransactionAction?
+  private deadline: Int?
+  private token: CancellationToken?
+  private cancelled: Bool = false
+
+  private terminal: WriteResult?
+  private primary: WriteFailure?
+  private recovering: Bool = false
+  private cancelFailure: ProviderFailure?
+
+  def init(
+    owner: SQLiteAsyncProvider,
+    input: Byte[]?,
+    lease: Int,
+    action: AsyncTransactionAction?,
+    deadline: Int?,
+    token: CancellationToken?
+  ): Void
+    this.owner = owner
+    this.lease = lease
+    this.action = action
+    this.deadline = deadline
+    this.token = token
+    if input == null
+      this.terminal = WriteResult.Failure(WriteFailure.Validation("SQLite async request exceeds 32 MiB"))
+      return
+    end
+    match owner.submitJob(input)
+      case SQLiteJobStart.Started(ticket)
+        this.ticket = ticket
+      case SQLiteJobStart.Failure(error)
+        this.terminal = WriteResult.Failure(WriteFailure.Provider(error))
+    end
+  end
+
+  public static def control(
+    owner: SQLiteAsyncProvider,
+    action: AsyncTransactionAction,
+    deadline: Int?,
+    token: CancellationToken?
+  ): SQLiteWriteCursor
+    var lease = 0
+
+    match action
+      case AsyncTransactionAction.Begin()
+      case AsyncTransactionAction.Commit(value)
+        lease = value
+      case AsyncTransactionAction.Rollback(value)
+        lease = value
+      case AsyncTransactionAction.Savepoint(value)
+        lease = value
+      case AsyncTransactionAction.RollbackTo(value, id)
+        lease = value
+      case AsyncTransactionAction.Release(value, id)
+        lease = value
+    end
+    return new SQLiteWriteCursor(owner, sqliteWireControlRequest(action, deadline), lease, action, deadline, token)
+  end
+
+  public static def batch(
+    owner: SQLiteAsyncProvider,
+    batch: readonly WriteBatch,
+    lease: Int,
+    deadline: Int?,
+    token: CancellationToken?,
+    setWrite: Bool = false
+  ): SQLiteWriteCursor
+    return new SQLiteWriteCursor(
+      owner,
+      sqliteWireBatchRequest(batch, lease, deadline, setWrite),
+      lease,
+      null,
+      deadline,
+      token
+    )
+  end
+
+  public def cancel(): Void
+    let action = this.action
+
+    # A queued commit/recovery is the completion boundary: preserve its outcome.
+    if action != null
+      match action
+        case AsyncTransactionAction.Commit(lease)
+          return
+        case AsyncTransactionAction.Rollback(lease)
+          return
+        case AsyncTransactionAction.RollbackTo(lease, id)
+          return
+        case AsyncTransactionAction.Release(lease, id)
+          return
+        case AsyncTransactionAction.Begin()
+        case AsyncTransactionAction.Savepoint(lease)
+      end
+    end
+    if !this.cancelled && this.terminal == null && this.ticket != (0 as UInt64)
+      this.cancelled = true
+      let error = this.owner.cancelJob(this.ticket)
+
+      if error != null
+        this.cancelFailure = error
+      end
+    end
+  end
+
+  public def poll(): AsyncWritePoll
+    let terminal = this.terminal
+
+    if terminal != null
+      return AsyncWritePoll.Completed(terminal)
+    end
+    let token = this.token
+
+    if !this.recovering && ((token != null && token.cancelled()) || streamTimedOut(this.deadline))
+      this.cancel()
+    end
+    match this.owner.pollJob(this.ticket)
+      case SQLiteWorkerPoll.Pending()
+        return AsyncWritePoll.Pending(this.owner.readiness(), AsyncInterest.Read())
+      case SQLiteWorkerPoll.Failure(error)
+        let primary = this.primary
+
+        if !this.recovering && this.lease > 0
+          let input = sqliteWireStateRequest(this.lease)
+
+          if input != null
+            match this.owner.submitJob(input)
+              case SQLiteJobStart.Started(ticket)
+                this.primary = WriteFailure.Provider(error)
+                this.ticket = ticket
+                this.recovering = true
+                return AsyncWritePoll.Pending(this.owner.readiness(), AsyncInterest.Read())
+              case SQLiteJobStart.Failure(cleanup)
+            end
+          end
+        end
+        if this.lease > 0
+          this.owner.acceptState(this.lease, TransactionState.Failed())
+        end
+        let failure = primary == null ? WriteFailure.Provider(error) : WriteFailure.Cleanup(new WriteCleanupFailure(
+            primary,
+            WriteFailure.Provider(error)
+          ))
+
+        this.terminal = WriteResult.Failure(failure)
+        return AsyncWritePoll.Completed(WriteResult.Failure(failure))
+      case SQLiteWorkerPoll.Completed(bytes)
+        let reader = new SQLiteWireReader(bytes)
+        let state = sqliteWireReadState(reader.integer())
+        let tag = reader.integer()
+        var result = WriteResult.Saved(0)
+
+        if tag == 1
+          result = WriteResult.Failure(sqliteWireReadWriteFailure(reader))
+        else if tag == 0
+          let count = reader.integer()
+          let rowCount = reader.integer()
+          let rows = new WriteReturnedRows()
+          var index = 0
+
+          if count < 0 || rowCount < 0 || rowCount > 1000
+            result = WriteResult.Failure(WriteFailure.Validation("SQLite async write response count is invalid"))
+          else
+            while index < rowCount && reader.healthy()
+              let columnCount = reader.integer()
+
+              if columnCount < -1 || columnCount > 1000
+                result = WriteResult.Failure(WriteFailure.Validation("SQLite async returned row metadata is invalid"))
+                break
+              end
+              let columns = arrays::generate<RawColumn>(columnCount < 0 ? 0 : columnCount) do |column|
+                let name = reader.string()
+
+                return new RawColumn(name, reader.cell())
+              end
+
+              rows.add(columnCount < 0 ? null : new RawRow(columns))
+              index = index + 1
+            end
+            if index == rowCount
+              result = rowCount == 0 ? WriteResult.Saved(count) : WriteResult.SavedWithValues(count, rows)
+            end
+          end
+        else
+          result = WriteResult.Failure(WriteFailure.Validation("SQLite async write response tag is invalid"))
+        end
+        if !reader.finished()
+          result = WriteResult.Failure(WriteFailure.Validation("SQLite async write response is malformed"))
+        end
+        let action = this.action
+        var stateLease = this.lease
+
+        if action != null
+          match action
+            case AsyncTransactionAction.Begin()
+              match result
+                case WriteResult.Saved(count)
+                  stateLease = count
+                case WriteResult.Failure(error)
+                case WriteResult.SavedWithValues(count, rows)
+              end
+            case AsyncTransactionAction.Commit(lease)
+            case AsyncTransactionAction.Rollback(lease)
+            case AsyncTransactionAction.Savepoint(lease)
+            case AsyncTransactionAction.RollbackTo(lease, id)
+            case AsyncTransactionAction.Release(lease, id)
+          end
+        end
+        this.owner.acceptState(stateLease, state)
+        let primary = this.primary
+
+        if this.recovering && primary != null
+          match result
+            case WriteResult.Failure(cleanup)
+              result = WriteResult.Failure(WriteFailure.Cleanup(new WriteCleanupFailure(primary, cleanup)))
+            case WriteResult.Saved(count)
+              result = WriteResult.Failure(primary)
+            case WriteResult.SavedWithValues(count, rows)
+              result = WriteResult.Failure(primary)
+          end
+        end
+        let cancelFailure = this.cancelFailure
+
+        if cancelFailure != null
+          match result
+            case WriteResult.Failure(primary)
+              result = WriteResult.Failure(WriteFailure.Cleanup(new WriteCleanupFailure(
+                    primary,
+                    WriteFailure.Provider(cancelFailure)
+                  )))
+            case WriteResult.Saved(count)
+              result = WriteResult.Failure(WriteFailure.Provider(cancelFailure))
+            case WriteResult.SavedWithValues(count, rows)
+              result = WriteResult.Failure(WriteFailure.Provider(cancelFailure))
+          end
+        end
+        this.terminal = result
+        return AsyncWritePoll.Completed(result)
+    end
+  end
+end
+
+class SQLiteAsyncControl: AsyncControlDriver
+  private owner: SQLiteAsyncProvider
+  private action: AsyncTransactionAction
+  private cursor: SQLiteWriteCursor
+  private terminal: AsyncControlResult?
+
+  def init(owner: SQLiteAsyncProvider, action: AsyncTransactionAction, deadline: Int?, token: CancellationToken?): Void
+    this.owner = owner
+    this.action = action
+    this.cursor = SQLiteWriteCursor.control(owner, action, deadline, token)
+  end
+
+  public override def cancel(): Void
+    this.cursor.cancel()
+  end
+
+  public override def poll(): AsyncControlPoll
+    let terminal = this.terminal
+
+    if terminal != null
+      return AsyncControlPoll.Completed(terminal)
+    end
+    match this.cursor.poll()
+      case AsyncWritePoll.Pending(socket, interest)
+        return AsyncControlPoll.Pending(socket, interest)
+      case AsyncWritePoll.Completed(result)
+        var completed = AsyncControlResult.Saved()
+
+        match result
+          case WriteResult.Failure(error)
+            completed = AsyncControlResult.Failure(error)
+          case WriteResult.Saved(count)
+            match this.action
+              case AsyncTransactionAction.Begin()
+                completed = AsyncControlResult.Begun(count)
+              case AsyncTransactionAction.Savepoint(lease)
+                completed = AsyncControlResult.Created(count)
+              case AsyncTransactionAction.Commit(lease)
+              case AsyncTransactionAction.Rollback(lease)
+              case AsyncTransactionAction.RollbackTo(lease, id)
+              case AsyncTransactionAction.Release(lease, id)
+            end
+          case WriteResult.SavedWithValues(count, rows)
+            completed = AsyncControlResult.Failure(WriteFailure.Validation("SQLite async control returned row data"))
+        end
+        this.owner.finishOperation()
+        this.terminal = completed
+        return AsyncControlPoll.Completed(completed)
+    end
+  end
+
+  public override def close(): WriteFailure?
+    if this.terminal == null
+      this.cancel()
+      match this.poll()
+        case AsyncControlPoll.Completed(result)
+        case AsyncControlPoll.Pending(socket, interest)
+          this.owner.retainControlCleanup(this)
+          return WriteFailure.Transaction("SQLite async transaction cleanup is pending; pollControlCleanup before reusing the session")
+      end
+    end
+    return null
+  end
+end
+
+## Atomic batch with caller-heap validation before the final worker commit.
+class SQLiteAsyncWrite: AsyncWriteDriver
+  private owner: SQLiteAsyncProvider
+  private batch: WriteBatch
+  private lease: Int?
+  private savepoint: Int = 0
+  private deadline: Int?
+  private token: CancellationToken?
+  private validate: (fn(readonly WriteReturnedRows): WriteFailure?)?
+  private cursor: SQLiteWriteCursor?
+  private phase: Int = 0
+  private result: WriteResult = WriteResult.Saved(0)
+  private failure: WriteFailure?
+  private terminal: WriteResult?
+  private cancelled: Bool = false
+  private finalize: (fn(WriteResult): WriteResult)?
+  private wrote: Bool = false
+  private setWrite: Bool
+
+  def init(
+    owner: SQLiteAsyncProvider,
+    batch: WriteBatch,
+    lease: Int?,
+    deadline: Int?,
+    token: CancellationToken?,
+    validate: (fn(readonly WriteReturnedRows): WriteFailure?)?,
+    setWrite: Bool = false
+  ): Void
+    this.owner = owner
+    this.batch = batch
+    this.lease = lease
+    this.deadline = deadline
+    this.token = token
+    this.validate = validate
+    this.setWrite = setWrite
+  end
+
+  public override def cancel(): Void
+    this.cancelled = true
+    let cursor = this.cursor
+
+    if cursor != null && this.phase < 4
+      cursor.cancel()
+    end
+  end
+
+  private def complete(result: WriteResult): AsyncWritePoll
+    this.owner.finishOperation()
+    let finalize = this.finalize
+    let completed = finalize == null ? result : finalize(result)
+
+    this.finalize = null
+    this.terminal = completed
+    return AsyncWritePoll.Completed(completed)
+  end
+
+  public override def deferFinalize(finalize: fn(WriteResult): WriteResult): Bool
+    if this.terminal != null
+      return false
+    end
+    this.finalize = finalize
+    return true
+  end
+
+  private def control(action: AsyncTransactionAction, phase: Int, cleanup: Bool = false): AsyncWritePoll
+    this.cursor = SQLiteWriteCursor.control(
+      this.owner,
+      action,
+      cleanup ? null : this.deadline,
+      cleanup ? null : this.token
+    )
+    this.phase = phase
+    return AsyncWritePoll.Pending(this.owner.readiness(), AsyncInterest.Read())
+  end
+
+  private def recover(error: WriteFailure): AsyncWritePoll
+    this.failure = error
+    this.cursor = null
+    let lease = this.lease
+
+    if lease == null
+      return this.complete(WriteResult.Failure(error))
+    end
+    match this.owner.transactionState(lease)
+      case TransactionState.RolledBack()
+        return this.complete(WriteResult.Failure(error))
+      case TransactionState.Active()
+      case TransactionState.Failed()
+      case TransactionState.Invalid()
+      case TransactionState.Committed()
+    end
+    return this.control(
+      this.savepoint == 0 ? AsyncTransactionAction.Rollback(lease) : AsyncTransactionAction.RollbackTo(
+        lease,
+        this.savepoint
+      ),
+      5,
+      true
+    )
+  end
+
+  public override def poll(): AsyncWritePoll
+    let terminal = this.terminal
+
+    if terminal != null
+      return AsyncWritePoll.Completed(terminal)
+    end
+    let token = this.token
+
+    if (token != null && token.cancelled()) || streamTimedOut(this.deadline)
+      this.cancel()
+    end
+    if this.phase == 0
+      if this.cancelled
+        return this.complete(WriteResult.Failure(WriteFailure.Provider(sqliteAsyncInterrupted())))
+      end
+      let lease = this.lease
+
+      return this.control(lease == null ? AsyncTransactionAction.Begin() : AsyncTransactionAction.Savepoint(lease), 1)
+    end
+    let cursor = this.cursor
+
+    if cursor != null
+      match cursor.poll()
+        case AsyncWritePoll.Pending(socket, interest)
+          return AsyncWritePoll.Pending(socket, interest)
+        case AsyncWritePoll.Completed(result)
+          this.cursor = null
+          match result
+            case WriteResult.Failure(error)
+              if this.phase >= 5
+                let primary = this.failure
+
+                return this.complete(WriteResult.Failure(primary == null ? error : WriteFailure.Cleanup(new WriteCleanupFailure(
+                        primary,
+                        error
+                      ))))
+              end
+              if this.phase == 1
+                return this.complete(WriteResult.Failure(error))
+              end
+              return this.recover(error)
+            case WriteResult.Saved(count)
+              if this.phase == 1
+                if this.lease == null
+                  this.lease = count
+                else
+                  this.savepoint = count
+                end
+                this.phase = 2
+              else if this.phase == 3
+                if count < 0 || (!this.setWrite && count != this.expectedCount()) || this.expectsReturning()
+                  return this.recover(WriteFailure.Validation("SQLite async batch affected-row count or returned-row presence is invalid"))
+                end
+                this.result = result
+                this.wrote = true
+                this.phase = 2
+              else if this.phase == 4
+                return this.complete(this.result)
+              else if this.phase == 5
+                let lease = this.lease
+
+                if this.savepoint != 0 && lease != null
+                  return this.control(AsyncTransactionAction.Release(lease, this.savepoint), 6, true)
+                end
+                let failure = this.failure
+
+                return this.complete(WriteResult.Failure(failure == null ? WriteFailure.Transaction("SQLite async batch rolled back") : failure))
+              else if this.phase == 6
+                let failure = this.failure
+
+                return this.complete(WriteResult.Failure(failure == null ? WriteFailure.Transaction("SQLite async batch rolled back") : failure))
+              end
+            case WriteResult.SavedWithValues(count, rows)
+              if this.phase != 3
+                return this.recover(WriteFailure.Validation("SQLite async control returned row data"))
+              end
+              if count != this.expectedCount() || !writeReturnedPresenceMatches(this.batch, rows)
+                return this.recover(WriteFailure.Validation("SQLite async batch affected-row count or returned-row presence is invalid"))
+              end
+              this.result = result
+              this.wrote = true
+              this.phase = 2
+          end
+          if this.phase == 2 && this.resultReady()
+            if this.cancelled
+              return this.recover(WriteFailure.Provider(sqliteAsyncInterrupted()))
+            end
+            let validate = this.validate
+
+            this.validate = null
+            if validate != null
+              var outputs = new WriteReturnedRows()
+
+              match this.result
+                case WriteResult.SavedWithValues(count, rows)
+                  outputs = rows
+                case WriteResult.Saved(count)
+                  var command = this.batch.first()
+
+                  while command != null
+                    outputs.add(null)
+                    command = command.next()
+                  end
+                case WriteResult.Failure(error)
+              end
+              let error = validate(outputs)
+
+              if error != null
+                return this.recover(error)
+              end
+            end
+            let lease = this.lease
+
+            if lease == null
+              return this.recover(WriteFailure.Transaction("SQLite async batch lost its transaction lease"))
+            end
+            return this.control(
+              this.savepoint == 0 ? AsyncTransactionAction.Commit(lease) : AsyncTransactionAction.Release(
+                lease,
+                this.savepoint
+              ),
+              4
+            )
+          end
+      end
+    end
+    if this.phase == 2
+      if this.cancelled
+        return this.recover(WriteFailure.Provider(sqliteAsyncInterrupted()))
+      end
+      let lease = this.lease
+
+      if lease == null
+        return this.recover(WriteFailure.Transaction("SQLite async batch lost its transaction lease"))
+      end
+      this.cursor = SQLiteWriteCursor.batch(this.owner, this.batch, lease, this.deadline, this.token, this.setWrite)
+      this.phase = 3
+      return AsyncWritePoll.Pending(this.owner.readiness(), AsyncInterest.Read())
+    end
+    return AsyncWritePoll.Pending(this.owner.readiness(), AsyncInterest.Read())
+  end
+
+  private def resultReady(): Bool
+    return this.wrote
+  end
+
+  private def expectedCount(): Int
+    var current = this.batch.first()
+    var count = 0
+
+    while current != null
+      count = count + current.command().expectedRows()
+      current = current.next()
+    end
+    return count
+  end
+
+  private def expectsReturning(): Bool
+    var current = this.batch.first()
+
+    while current != null
+      if current.command().returningColumns() != null
+        return true
+      end
+      current = current.next()
+    end
+    return false
+  end
+
+  public override def close(): WriteFailure?
+    if this.terminal == null
+      this.cancel()
+      match this.poll()
+        case AsyncWritePoll.Completed(result)
+        case AsyncWritePoll.Pending(socket, interest)
+          this.owner.retainCleanup(this)
+          return WriteFailure.Transaction("SQLite async write rollback is pending; pollCleanup before reusing the session")
+      end
+    end
+    return null
+  end
+end

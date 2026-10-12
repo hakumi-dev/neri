@@ -1,0 +1,199 @@
+use result
+namespace neri_data
+
+enum AsyncContextTransactionStart
+  case Started(driver: AsyncContextTransactionDriver)
+  case Failure(error: WriteFailure)
+end
+
+## A transaction control keeps tracker checkpoints aligned with the native lease.
+class AsyncContextTransactionDriver
+  private context: ChangeContext
+  private provider: Provider
+  private operationDriver: AsyncControlDriver
+  private mode: Int
+  private lease: Int?
+  private stopped: Bool = false
+  private cleaning: Bool = false
+  private cleanupPrimary: WriteFailure?
+  private terminal: AsyncControlResult?
+
+  def init(
+    context: ChangeContext,
+    provider: Provider,
+    operationDriver: AsyncControlDriver,
+    mode: Int,
+    lease: Int?
+  ): Void
+    this.context = context
+    this.provider = provider
+    this.operationDriver = operationDriver
+    this.mode = mode
+    this.lease = lease
+  end
+
+  private def finish(result: AsyncControlResult): AsyncControlPoll
+    this.terminal = result
+    this.context.asyncTransactionFinished(this.mode, result)
+    return AsyncControlPoll.Completed(result)
+  end
+
+  public def cancel(): Void
+    this.stopped = true
+    if !this.cleaning
+      this.operationDriver.cancel()
+    end
+  end
+
+  public def poll(): AsyncControlPoll
+    let terminal = this.terminal
+
+    if terminal != null
+      return AsyncControlPoll.Completed(terminal)
+    end
+    match this.operationDriver.poll()
+      case AsyncControlPoll.Pending(socket, interest)
+        return AsyncControlPoll.Pending(socket, interest)
+      case AsyncControlPoll.Completed(result)
+        let closeError = this.operationDriver.close()
+
+        if this.cleaning
+          let primary = this.cleanupPrimary
+          let error = primary == null ? WriteFailure.Transaction("asynchronous transaction cancelled") : primary
+
+          match result
+            case AsyncControlResult.Saved()
+              this.context.asyncTransactionFinished(2, result)
+              let terminal = AsyncControlResult.Failure(closeError == null ? error : WriteFailure.Cleanup(new WriteCleanupFailure(
+                    error,
+                    closeError
+                  )))
+
+              this.terminal = terminal
+              return AsyncControlPoll.Completed(terminal)
+            case AsyncControlResult.Failure(cleanup)
+              return this.finish(AsyncControlResult.Failure(WriteFailure.Cleanup(new WriteCleanupFailure(
+                      error,
+                      closeError == null ? cleanup : WriteFailure.Cleanup(new WriteCleanupFailure(cleanup, closeError))
+                    ))))
+            case AsyncControlResult.Begun(lease)
+              return this.finish(AsyncControlResult.Failure(WriteFailure.Cleanup(new WriteCleanupFailure(
+                      error,
+                      WriteFailure.Transaction("rollback returned a transaction lease")
+                    ))))
+            case AsyncControlResult.Created(id)
+              return this.finish(AsyncControlResult.Failure(WriteFailure.Cleanup(new WriteCleanupFailure(
+                      error,
+                      WriteFailure.Transaction("rollback returned a savepoint")
+                    ))))
+          end
+        end
+        match result
+          case AsyncControlResult.Begun(lease)
+            if this.mode != 0 || lease <= 0
+              return this.finish(AsyncControlResult.Failure(WriteFailure.Transaction("asynchronous begin returned an invalid lease")))
+            end
+            this.lease = lease
+            this.context.asyncTransactionOpened(lease)
+            if this.stopped || closeError != null
+              let primary = closeError == null ? WriteFailure.Transaction("asynchronous transaction cancelled") : closeError
+
+              match this.provider.transactionState(lease)
+                case TransactionState.RolledBack()
+                  return this.finish(AsyncControlResult.Failure(primary))
+                case TransactionState.Active()
+                case TransactionState.Committed()
+                case TransactionState.Invalid()
+                case TransactionState.Failed()
+              end
+              this.cleaning = true
+              this.cleanupPrimary = primary
+              match this.provider.beginControlAsync(AsyncTransactionAction.Rollback(lease), null)
+                case AsyncControlStart.Failure(cleanup)
+                  return this.finish(AsyncControlResult.Failure(WriteFailure.Cleanup(new WriteCleanupFailure(
+                          primary,
+                          cleanup
+                        ))))
+                case AsyncControlStart.Started(driver)
+                  this.operationDriver = driver
+                  return AsyncControlPoll.Pending(-1, AsyncInterest.Read())
+              end
+            end
+            return this.finish(result)
+          case AsyncControlResult.Saved()
+            if this.mode == 0
+              return this.finish(AsyncControlResult.Failure(WriteFailure.Transaction("asynchronous begin omitted its lease")))
+            end
+            if closeError != null
+              this.context.asyncTransactionFinished(this.mode, result)
+              this.terminal = AsyncControlResult.Failure(closeError)
+              return AsyncControlPoll.Completed(AsyncControlResult.Failure(closeError))
+            end
+            return this.finish(result)
+          case AsyncControlResult.Failure(error)
+            return this.finish(AsyncControlResult.Failure(closeError == null ? error : WriteFailure.Cleanup(new WriteCleanupFailure(
+                    error,
+                    closeError
+                  ))))
+          case AsyncControlResult.Created(id)
+            return this.finish(AsyncControlResult.Failure(WriteFailure.Transaction("asynchronous transaction returned a savepoint")))
+        end
+    end
+  end
+
+  public def close(): result::Failure?
+    if this.terminal != null
+      return null
+    end
+    this.cancel()
+    match this.poll()
+      case AsyncControlPoll.Pending(socket, interest)
+        return new result::Failure(
+          "cleanup_pending",
+          "data.async.transaction.close",
+          "pollTransactionCleanup must finish the pending transaction operation"
+        )
+      case AsyncControlPoll.Completed(result)
+        match result
+          case AsyncControlResult.Failure(error)
+            return writeResourceFailure(error, "data.async.transaction.close")
+          case AsyncControlResult.Begun(lease)
+            return null
+          case AsyncControlResult.Created(id)
+            return null
+          case AsyncControlResult.Saved()
+            return null
+        end
+    end
+  end
+end
+
+resource class AsyncContextTransaction
+  private closed: Bool = false
+  private driver: AsyncContextTransactionDriver
+
+  def init(driver: AsyncContextTransactionDriver): Void
+    this.driver = driver
+  end
+
+  public def poll(): AsyncControlPoll
+    if this.closed
+      return AsyncControlPoll.Completed(AsyncControlResult.Failure(WriteFailure.Transaction("asynchronous transaction resource is closed")))
+    end
+    return this.driver.poll()
+  end
+
+  public def cancel(): Void
+    if !this.closed
+      this.driver.cancel()
+    end
+  end
+
+  public def close(): result::Failure?
+    if this.closed
+      return null
+    end
+    this.closed = true
+    return this.driver.close()
+  end
+end

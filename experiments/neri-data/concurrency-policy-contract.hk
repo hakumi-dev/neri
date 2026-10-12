@@ -1,5 +1,6 @@
 use neri_data
 use test
+use reference
 
 class ConcurrencyPolicyItem
   public id: Int
@@ -42,6 +43,8 @@ def concurrencyValueText(value: readonly Cell): String
       return "bool|"
     case Cell.Float(value)
       return "float|"
+    case Cell.Binary(text)
+      return "binary:" + (text.length() as String) + "|"
   end
 end
 
@@ -178,7 +181,7 @@ def policyInvalid(tokens: String[]): Void
 
   context.register(tracker.changeSet())
 
-  test::assertTrue(tracker.attach(item) == null)
+  test::assertTrue(tracker.attach(item) != null)
   item.name = "new"
   expectPolicyValidation(context.saveChanges())
 
@@ -207,6 +210,233 @@ def policyDefensiveCopy(): Void
 
   test::assertEqual(provider.sql, "UPDATE \"items\" SET \"name\" = ? WHERE \"id\" = ? AND \"version\" = ?")
   test::assertEqual(provider.values, "text:new|int:7|int:4|")
+end
+
+def compositePolicyCase(tokens: String[], deleting: Bool): Void
+  let provider = new ConcurrencyPolicyProvider()
+  let tracker = new EntityTracker<ConcurrencyPolicyItem>(
+    "items",
+    "id",
+    concurrencyColumns(),
+    captureConcurrencyPolicy,
+    concurrencyColumns: tokens,
+    keyColumns: ["id", "version"]
+  )
+  let context = new ChangeContext(provider)
+  let item = new ConcurrencyPolicyItem(7, "old", "memo", 4)
+  let sibling = new ConcurrencyPolicyItem(7, "untouched", "memo", 5)
+
+  context.register(tracker.changeSet())
+
+  test::assertTrue(tracker.attach(item) == null)
+  test::assertTrue(tracker.attach(sibling) == null)
+  if deleting
+    test::assertTrue(tracker.remove(item) == null)
+  else
+    item.name = "new"
+  end
+  expectPolicySaved(context.saveChanges())
+  let predicate = " WHERE \"id\" = ?" + (tokens.Length == 0 ? "" : " AND \"note\" = ?") + " AND \"version\" = ?"
+
+  test::assertEqual(
+    provider.sql,
+    (deleting ? "DELETE FROM \"items\"" : "UPDATE \"items\" SET \"name\" = ?") + predicate
+  )
+  test::assertEqual(
+    provider.values,
+    (deleting ? "" : "text:new|") + "int:7|" + (tokens.Length == 0 ? "" : "text:memo|") + "int:4|"
+  )
+  let state = tracker.stateOf(sibling)
+
+  test::assertTrue(state != null)
+  if state != null
+    match state
+      case TrackingState.Unchanged()
+        test::assertTrue(true)
+      case TrackingState.Added()
+      case TrackingState.Modified()
+      case TrackingState.Deleted()
+      case TrackingState.Detached()
+        test::assertTrue(false)
+    end
+  end
+end
+
+def snapshotAttachmentCase(): Void
+  let provider = new ConcurrencyPolicyProvider()
+  let tracker = new EntityTracker<ConcurrencyPolicyItem>(
+    "items",
+    "id",
+    concurrencyColumns(),
+    captureConcurrencyPolicy,
+    concurrencyColumns: ["version"]
+  )
+  let context = new ChangeContext(provider)
+  let item = new ConcurrencyPolicyItem(7, "old", null, 4)
+  let persisted = captureConcurrencyPolicy(item)
+
+  item.name = "new"
+  context.register(tracker.changeSet())
+  match tracker.attachWithSnapshot(item, persisted)
+    case TrackHandleResult.Tracked(handle)
+      test::assertTrue(true)
+    case TrackHandleResult.Failure(error)
+      test::assertTrue(false)
+  end
+  match tracker.attachWithSnapshot(item, captureConcurrencyPolicy(item))
+    case TrackHandleResult.Tracked(handle)
+      test::assertTrue(true)
+    case TrackHandleResult.Failure(error)
+      test::assertTrue(false)
+  end
+  expectPolicySaved(context.saveChanges())
+
+  test::assertEqual(provider.sql, "UPDATE \"items\" SET \"name\" = ? WHERE \"id\" = ? AND \"version\" = ?")
+  test::assertEqual(provider.values, "text:new|int:7|int:4|")
+  let mismatched = new ConcurrencyPolicyItem(8, "new", null, 4)
+
+  match tracker.attachWithSnapshot(mismatched, persisted)
+    case TrackHandleResult.Tracked(handle)
+      test::assertTrue(false)
+    case TrackHandleResult.Failure(error)
+      test::assertTrue(tracker.stateOf(mismatched) == null)
+  end
+end
+
+def leafOnlyConcurrencyCase(): Void
+  let provider = new ConcurrencyPolicyProvider()
+  let physical = new ResultColumns([
+      new ResultColumn("id", ResultColumnKind.Int()),
+      new ResultColumn("version", ResultColumnKind.Int())
+    ])
+  let layout: fn(RawRow): TrackedWriteLayout = fn(row: RawRow): TrackedWriteLayout do
+    return new TrackedWriteLayout("roots", physical)
+  end
+  let tracker = new EntityTracker<ConcurrencyPolicyItem>(
+    "roots",
+    "id",
+    concurrencyColumns(),
+    captureConcurrencyPolicy,
+    concurrencyColumns: ["version"],
+    writeLayout: layout
+  )
+  let context = new ChangeContext(provider)
+  let item = new ConcurrencyPolicyItem(7, "old", null, 4)
+
+  context.register(tracker.changeSet())
+
+  test::assertTrue(tracker.attach(item) == null)
+  item.name = "new"
+  expectPolicySaved(context.saveChanges())
+
+  test::assertEqual(provider.sql, "UPDATE \"roots\" SET \"id\" = \"id\" WHERE \"id\" = ? AND \"version\" = ?")
+  test::assertEqual(provider.values, "int:7|int:4|")
+end
+
+class EnrollmentObserverState
+  public count: Int = 0
+  public released: Int = 0
+  public reject: Bool = true
+
+  public def changeSet(): ChangeSet
+    let nothing: fn(): Void = fn(): Void do
+    end
+    let prepare: fn(WriteBatch, SqlDialect): String? = fn(batch: WriteBatch, dialect: SqlDialect): String? do
+      return null
+    end
+    let returned: fn(readonly WriteReturnedRows): String? = fn(rows: readonly WriteReturnedRows): String? do
+      return null
+    end
+    let actions: fn(WriteActionList): String? = fn(list: WriteActionList): String? do
+      return null
+    end
+    let snapshot: fn(GraphJournal): Void = fn(journal: GraphJournal): Void do
+      let before = this.count
+      let undo: fn(): Void = fn(): Void do
+        this.count = before
+      end
+
+      journal.record(undo)
+    end
+
+    return new ChangeSet(
+      prepare,
+      nothing,
+      nothing,
+      nothing,
+      nothing,
+      nothing,
+      returned,
+      nothing,
+      actions,
+      nothing,
+      nothing,
+      nothing,
+      snapshot
+    )
+  end
+end
+
+def enrollmentObserverCase(): Void
+  let state = new EnrollmentObserverState()
+  let context = new ChangeContext(new ConcurrencyPolicyProvider())
+  let setter: fn(ConcurrencyPolicyItem, Int): Void = fn(item: ConcurrencyPolicyItem, key: Int): Void do
+    item.id = key
+  end
+  let tracker = new EntityTracker<ConcurrencyPolicyItem>(
+    "items",
+    "id",
+    concurrencyColumns(),
+    captureConcurrencyPolicy,
+    generatedKey: true,
+    setGeneratedKey: setter
+  )
+  let observe: fn(): QueryFailure? = fn(): QueryFailure? do
+    state.count = state.count + 1
+    return state.reject ? QueryFailure.Provider(ProviderFailure.State("enrollment veto")) : null
+  end
+  let clear: fn(): Void = fn(): Void do
+    state.released = state.released + 1
+  end
+  let item = new ConcurrencyPolicyItem(0, "new", null, 4)
+  let changes = tracker.changeSet()
+
+  context.register(changes)
+  context.register(state.changeSet())
+  tracker.observeEnrollment(observe)
+  tracker.observeClear(clear)
+
+  test::assertTrue(tracker.add(item) != null)
+  test::assertEqual(item.id, 0)
+  test::assertEqual(state.count, 0)
+  test::assertTrue(tracker.stateOf(item) == null)
+  state.reject = false
+
+  test::assertTrue(tracker.add(item) == null)
+  test::assertEqual(state.count, 1)
+  match tracker.handle(item)
+    case TrackHandleResult.Tracked(handle)
+      test::assertTrue(reference::same(handle.entity(), item))
+      test::assertEqual(state.count, 1)
+    case TrackHandleResult.Failure(error)
+      test::assertTrue(false)
+  end
+  changes.checkpoint()
+  tracker.clear()
+
+  test::assertEqual(state.released, 0)
+  changes.restore()
+  tracker.clear()
+
+  test::assertEqual(state.released, 1)
+  test::assertTrue(tracker.stateOf(item) == null)
+  let attached = new ConcurrencyPolicyItem(9, "persisted", null, 4)
+
+  state.reject = true
+
+  test::assertTrue(tracker.attach(attached) != null)
+  test::assertTrue(tracker.stateOf(attached) == null)
+  test::assertEqual(state.count, 1)
 end
 
 def main(): Void
@@ -252,4 +482,11 @@ def main(): Void
   policyInvalid(["version", "version"])
   policyInvalid(["bad-name"])
   policyDefensiveCopy()
+  compositePolicyCase([], false)
+  compositePolicyCase([], true)
+  compositePolicyCase(["note"], false)
+  compositePolicyCase(["note"], true)
+  snapshotAttachmentCase()
+  leafOnlyConcurrencyCase()
+  enrollmentObserverCase()
 end

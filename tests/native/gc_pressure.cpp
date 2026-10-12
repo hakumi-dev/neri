@@ -18,7 +18,7 @@ const neri_type_descriptor_v1 block_type = {
     sizeof(neri_type_descriptor_v1), NERI_RUNTIME_ABI_MAJOR,
     NERI_RUNTIME_ABI_MINOR, NERI_TYPE_KIND_CLASS_V1, 0,
     payload_bytes, 8, 0, 0, nullptr, nullptr, "gc-pressure-block", 0,
-    nullptr, nullptr, NERI_SCALAR_KIND_NONE_V1, 0};
+    nullptr, nullptr, NERI_SCALAR_KIND_NONE_V1, 0, nullptr};
 
 neri_ref_v1 allocate() {
   return neri_rt_v1_gc_alloc(&block_type, payload_bytes, 8);

@@ -1,0 +1,192 @@
+use test
+use resources
+use quotation
+use neri_data
+use neri_data_query_contract
+
+class SelectorProbeProvider: Provider
+  public calls: Int = 0
+
+  public override readonly def dialect(): SqlDialect
+    return SqlDialect.QuestionMark()
+  end
+
+  public override readonly def supports(capability: ProviderCapability): Bool
+    return true
+  end
+
+  public override def execute(plan: readonly SqlPlan): ProviderResult
+    this.calls = this.calls + 1
+    return ProviderResult.Failure(ProviderFailure.State("invalid selectors must fail before execution"))
+  end
+
+  public override def beginReadAsync(
+    plan: readonly SqlPlan,
+    options: StreamOptions? = null,
+    maximumRows: Int? = null
+  ): AsyncReadStart
+    this.calls = this.calls + 1
+    return AsyncReadStart.Failure(ProviderFailure.State("invalid selectors must fail before asynchronous execution"))
+  end
+end
+
+def selectorFailure(error: QueryFailure, expected: String): Void
+  match error
+    case QueryFailure.UnsupportedCapability(name)
+      test::assertEqual(name, expected)
+    case QueryFailure.InvalidIdentifier(name)
+    case QueryFailure.InvalidLimit(value, maximum)
+    case QueryFailure.MissingLimit(maximum)
+    case QueryFailure.SourceMismatch(expectedSource, actual)
+    case QueryFailure.Provider(failure)
+    case QueryFailure.Cleanup(failure)
+    case QueryFailure.MissingColumn(name)
+    case QueryFailure.TypeMismatch(column, expectedType, actual)
+    case QueryFailure.Cardinality(expectedCount, actual)
+      test::assertTrue(false)
+  end
+end
+
+def rejectedSelector<T>(result: QueryResult<T>, expected: String): Void
+  match result
+    case QueryResult.Failure(error)
+      selectorFailure(error, expected)
+    case QueryResult.Rows(rows)
+      test::assertTrue(false)
+  end
+end
+
+def startInvalidSelector<R, T>(path: NavigationQuery<R, T>): resources::Outcome<Int, QueryFailure>
+  using operation <- path.allAsync()
+    test::assertTrue(false)
+    return 1
+  end
+  return 0
+end
+
+def rejectedAsyncSelector<R, T>(path: NavigationQuery<R, T>, expected: String): Void
+  let outcome = startInvalidSelector(path)
+
+  test::assertEqual(outcome.closeFailures.count(), 0)
+  match outcome.completion
+    case resources::Completion.Failure(error)
+      test::assertTrue(error != null)
+      if error != null
+        selectorFailure(error, expected)
+      end
+    case resources::Completion.Value(value)
+      test::assertTrue(false)
+  end
+end
+
+def registerSelectorChildren(graph: QueryGapGraph): Void
+  graph.changes.registerNavigation<QueryGapRoot, QueryGapChild>(
+    "neri_data_query_contract.QueryGapRoot",
+    "neri_data_query_contract.QueryGapRoot.children",
+    "neri_data_query_contract.QueryGapChild[]",
+    collectionStep(graph.roots, graph.children, graph.relation)
+  )
+end
+
+def verifySelectorFailures(): Void
+  let provider = new SelectorProbeProvider()
+  let graph = new QueryGapGraph(provider)
+  let root = new QueryGapRoot(1)
+  let rows = new TypedRows<QueryGapRoot>()
+
+  rows.add(root)
+  registerSelectorChildren(graph)
+  let direct = "navigation selector must be a direct entity member"
+  let unregistered = "navigation selector member is not registered in this change context"
+
+  rejectedSelector(graph.roots.take(3).include(root => root.id).all(), unregistered)
+  rejectedSelector(graph.roots.take(3).include(root => root.id + 1).all(), direct)
+  rejectedSelector(graph.roots.take(3).include(root => root.skipChildren).all(), unregistered)
+  let capturedOffset = 2
+
+  rejectedSelector(graph.roots.take(3).include(root => root.id + capturedOffset).all(), direct)
+  let late = graph.roots.where(id: 1).take(3).tagWith("selector validation").ignoreQueryFilters().include(root => root.children).thenInclude(child => child.id)
+
+  rejectedSelector(late.all(), unregistered)
+  rejectedSelector(late.load(rows), unregistered)
+  rejectedSelector(late.asSingleQuery().all(), unregistered)
+  rejectedAsyncSelector(late, unregistered)
+  rejectedSelector(
+    graph.roots.take(3).include(root => root.children).thenInclude(child => child.root == null ? child.id : child.root.id).all(),
+    direct
+  )
+  rejectedSelector(graph.roots.take(3).include(root => root.children).include(root => root.id).all(), unregistered)
+  rejectedSelector(
+    graph.roots.take(3).asNoTracking().include(root => root.children).all(),
+    "navigation step requires the current tracked entity set"
+  )
+  let forged = new quotation::Tree(
+    [
+      new quotation::Node(quotation::NodeKind.Parameter(), "neri_data_query_contract.QueryGapRoot", index: 1),
+      new quotation::Node(
+        quotation::NodeKind.Member(),
+        "neri_data_query_contract.QueryGapChild[]",
+        first: 0,
+        identity: "neri_data_query_contract.QueryGapRoot.children"
+      )
+    ],
+    [],
+    1,
+    ["neri_data_query_contract.QueryGapRoot"],
+    "neri_data_query_contract.QueryGapChild[]"
+  )
+
+  rejectedSelector(
+    includePath(
+      graph.roots.take(3),
+      navigationSelectorStep<QueryGapRoot, QueryGapChild>(graph.changes, forged)
+    ).load(rows),
+    "navigation selector member identity or type is invalid"
+  )
+
+  test::assertEqual(provider.calls, 0)
+  test::assertEqual(root.children.Length, 0)
+end
+
+def verifyRegistrationFailures(): Void
+  let provider = new SelectorProbeProvider()
+  let mismatch = new QueryGapGraph(provider)
+
+  mismatch.changes.registerNavigation<QueryGapChild, QueryGapRoot>(
+    "neri_data_query_contract.QueryGapRoot",
+    "neri_data_query_contract.QueryGapRoot.children",
+    "neri_data_query_contract.QueryGapChild[]",
+    referenceStep(mismatch.children, mismatch.roots, mismatch.relation)
+  )
+  rejectedSelector(
+    mismatch.roots.take(3).include(root => root.children).all(),
+    "navigation selector member identity or type does not match registration"
+  )
+  let duplicate = new QueryGapGraph(provider)
+
+  registerSelectorChildren(duplicate)
+  registerSelectorChildren(duplicate)
+  rejectedSelector(
+    duplicate.roots.take(3).include(root => root.children).all(),
+    "navigation selector member has multiple registrations"
+  )
+  let wrongShape = new QueryGapGraph(provider)
+
+  wrongShape.changes.registerNavigation<QueryGapRoot, QueryGapChild>(
+    "neri_data_query_contract.QueryGapRoot",
+    "neri_data_query_contract.QueryGapRoot.children",
+    "neri_data_query_contract.QueryGapChild?",
+    collectionStep(wrongShape.roots, wrongShape.children, wrongShape.relation)
+  )
+  rejectedSelector(
+    wrongShape.roots.take(3).include(root => root.children).all(),
+    "navigation selector member identity or type does not match registration"
+  )
+
+  test::assertEqual(provider.calls, 0)
+end
+
+def main(): Void
+  verifySelectorFailures()
+  verifyRegistrationFailures()
+end

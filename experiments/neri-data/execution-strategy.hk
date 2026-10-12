@@ -1,0 +1,375 @@
+use result
+use clock
+namespace neri_data
+
+@cabiImport("neri_rt_v1_net_poll_many")
+unsafe def retryDelayNative(descriptors: Int*, interests: Int*, events: Int*, count: Int, milliseconds: Int): Int
+end
+
+def retryDelay(milliseconds: Int): WriteFailure?
+  unsafe
+    let unused = stackalloc Int[1]
+
+    if retryDelayNative(unused, unused, unused, 0, milliseconds) < 0
+      return WriteFailure.Transaction("save retry backoff wait failed")
+    end
+  end
+  return null
+end
+
+def retryBackoff(initial: Int, maximum: Int, retry: Int): Int
+  var delay = initial
+  var index = 1
+
+  while index < retry && delay < maximum
+    delay = delay > maximum / 2 ? maximum : delay * 2
+    index = index + 1
+  end
+  return delay
+end
+
+## Only native failures that establish transaction rollback are replayable.
+## Cleanup errors and ambiguous connection/commit failures are never retried.
+def retryableSaveFailure(error: WriteFailure): Bool
+  match error
+    case WriteFailure.Provider(failure)
+      match failure
+        case ProviderFailure.Driver(driver)
+          if driver.provider() == "postgresql"
+            let state = driver.sqlState()
+
+            return state == "40001" || state == "40P01"
+          end
+          if driver.provider() == "sqlite"
+            match driver.kind()
+              case DriverErrorKind.Contention()
+                return true
+              case DriverErrorKind.Constraint()
+              case DriverErrorKind.Interrupted()
+              case DriverErrorKind.ReadOnly()
+              case DriverErrorKind.StorageFull()
+              case DriverErrorKind.Io()
+              case DriverErrorKind.Corrupt()
+              case DriverErrorKind.Other()
+            end
+          end
+        case ProviderFailure.State(message)
+        case ProviderFailure.Cleanup(cleanup)
+      end
+    case WriteFailure.Validation(message)
+    case WriteFailure.Concurrency(message)
+    case WriteFailure.Constraint(message)
+    case WriteFailure.Unsupported(message)
+    case WriteFailure.Transaction(message)
+    case WriteFailure.Cleanup(cleanup)
+  end
+  return false
+end
+
+class SaveExecutionStrategy
+  private maximumRetries: Int
+  private initialBackoff: Int
+  private maximumBackoff: Int
+  private prepareRetry: (fn(ChangeContext, Int): WriteFailure?)?
+
+  def init(
+    maximumRetries: Int = 3,
+    initialBackoffMilliseconds: Int = 0,
+    maximumBackoffMilliseconds: Int = 60000,
+    prepareRetry: (fn(ChangeContext, Int): WriteFailure?)? = null
+  ): Void
+    this.maximumRetries = maximumRetries
+    this.initialBackoff = initialBackoffMilliseconds
+    this.maximumBackoff = maximumBackoffMilliseconds
+    this.prepareRetry = prepareRetry
+  end
+
+  private def validate(): WriteFailure?
+    if this.maximumRetries < 0 || this.maximumRetries > 32
+      return WriteFailure.Validation("save retry limit must be between 0 and 32")
+    end
+    if this.initialBackoff < 0 || this.maximumBackoff < this.initialBackoff || this.maximumBackoff > 60000
+      return WriteFailure.Validation("save retry backoff must be ordered milliseconds between 0 and 60000")
+    end
+    return null
+  end
+
+  public def saveChanges(context: ChangeContext): WriteResult
+    let invalid = this.validate()
+
+    if invalid != null
+      return WriteResult.Failure(invalid)
+    end
+    if !context.canRetrySave()
+      return WriteResult.Failure(WriteFailure.Transaction("save execution strategy requires an idle context without an explicit transaction"))
+    end
+    var retries = 0
+
+    while true
+      let result = context.saveChanges()
+
+      match result
+        case WriteResult.Saved(count)
+          return result
+        case WriteResult.SavedWithValues(count, values)
+          return result
+        case WriteResult.Failure(error)
+          if retries >= this.maximumRetries || !retryableSaveFailure(error) || !context.canRetrySave()
+            return result
+          end
+      end
+      retries = retries + 1
+      let delay = retryBackoff(this.initialBackoff, this.maximumBackoff, retries)
+      let waitFailure = delay == 0 ? null : retryDelay(delay)
+
+      if waitFailure != null
+        return WriteResult.Failure(waitFailure)
+      end
+      let prepare = this.prepareRetry
+      let failure = prepare == null ? null : prepare(context, retries)
+
+      if failure != null
+        return WriteResult.Failure(failure)
+      end
+      if !context.canRetrySave()
+        return WriteResult.Failure(WriteFailure.Transaction("save retry preparation did not leave the context idle"))
+      end
+    end
+    return WriteResult.Failure(WriteFailure.Transaction("save execution strategy did not terminate"))
+  end
+
+  public def saveChangesAsync(
+    context: ChangeContext,
+    options: StreamOptions? = null
+  ): result::Result<RetrySave, WriteFailure>
+    let invalid = this.validate()
+
+    if invalid != null
+      return result::Result<RetrySave, WriteFailure>.Error(invalid)
+    end
+    if !context.canRetrySave()
+      return result::Result<RetrySave, WriteFailure>.Error(WriteFailure.Transaction("save execution strategy requires an idle context without an explicit transaction"))
+    end
+    let driver = new RetrySaveDriver(
+      context,
+      this.maximumRetries,
+      options,
+      this.initialBackoff,
+      this.maximumBackoff,
+      this.prepareRetry
+    )
+
+    match driver.poll()
+      case AsyncWritePoll.Completed(outcome)
+        match outcome
+          case WriteResult.Failure(error)
+            return result::Result<RetrySave, WriteFailure>.Error(error)
+          case WriteResult.Saved(count)
+          case WriteResult.SavedWithValues(count, values)
+        end
+      case AsyncWritePoll.Pending(socket, interest)
+    end
+    let owned = new RetrySave(driver)
+
+    return result::Result<RetrySave, WriteFailure>.Ok(transfer owned)
+  end
+end
+
+class RetrySaveDriver
+  private context: ChangeContext
+  private maximumRetries: Int
+  private retries: Int = 0
+  private options: StreamOptions?
+  private deadline: Int?
+  private initialError: WriteFailure?
+  private active: AsyncSaveDriver?
+  private terminal: WriteResult?
+  private stopped: Bool = false
+  private initialBackoff: Int
+  private maximumBackoff: Int
+  private retryAt: Int?
+  private prepareRetry: (fn(ChangeContext, Int): WriteFailure?)?
+  private preparationPending: Bool = false
+
+  def init(
+    context: ChangeContext,
+    maximumRetries: Int,
+    options: StreamOptions?,
+    initialBackoff: Int = 0,
+    maximumBackoff: Int = 60000,
+    prepareRetry: (fn(ChangeContext, Int): WriteFailure?)? = null
+  ): Void
+    this.context = context
+    this.maximumRetries = maximumRetries
+    this.options = options
+    this.initialBackoff = initialBackoff
+    this.maximumBackoff = maximumBackoff
+    this.prepareRetry = prepareRetry
+    if options != null
+      let timeout = options.timeoutMilliseconds()
+
+      if timeout != null
+        let now = clock::milliseconds()
+
+        if timeout < 1 || timeout > 86400000 || now == null || now > 9223372036854775807 - timeout
+          this.initialError = WriteFailure.Validation("save execution strategy deadline is invalid or unavailable")
+        else
+          this.deadline = now + timeout
+        end
+      end
+    end
+  end
+
+  private def finish(result: WriteResult): AsyncWritePoll
+    this.terminal = result
+    return AsyncWritePoll.Completed(result)
+  end
+
+  public def poll(): AsyncWritePoll
+    let terminal = this.terminal
+
+    if terminal != null
+      return AsyncWritePoll.Completed(terminal)
+    end
+    let initialError = this.initialError
+
+    if initialError != null
+      return this.finish(WriteResult.Failure(initialError))
+    end
+    let active = this.active
+
+    if active == null
+      let options = this.options
+      let token = options == null ? null : options.token()
+
+      if this.stopped || (token != null && token.cancelled())
+        return this.finish(WriteResult.Failure(WriteFailure.Transaction("save execution strategy cancelled")))
+      end
+      let deadline = this.deadline
+      var remaining: Int? = null
+
+      if deadline != null
+        let now = clock::milliseconds()
+
+        if now == null || now >= deadline
+          return this.finish(WriteResult.Failure(WriteFailure.Transaction("save execution strategy deadline elapsed")))
+        end
+        remaining = deadline - now
+      end
+      let retryAt = this.retryAt
+
+      if retryAt != null
+        let now = clock::milliseconds()
+
+        if now == null
+          return this.finish(WriteResult.Failure(WriteFailure.Transaction("save retry backoff clock unavailable")))
+        end
+        if now < retryAt
+          return AsyncWritePoll.Pending(-1, AsyncInterest.Read())
+        end
+        this.retryAt = null
+      end
+      if this.preparationPending
+        this.preparationPending = false
+        let prepare = this.prepareRetry
+        let failure = prepare == null ? null : prepare(this.context, this.retries)
+
+        if failure != null
+          return this.finish(WriteResult.Failure(failure))
+        end
+        if !this.context.canRetrySave()
+          return this.finish(WriteResult.Failure(WriteFailure.Transaction("save retry preparation did not leave the context idle")))
+        end
+      end
+      let attemptOptions = options == null ? null : new StreamOptions(token, remaining)
+
+      match this.context.beginSaveAsync(attemptOptions)
+        case AsyncSaveStart.Failure(error)
+          return this.finish(WriteResult.Failure(error))
+        case AsyncSaveStart.Started(driver)
+          this.active = driver
+          return AsyncWritePoll.Pending(-1, AsyncInterest.Read())
+      end
+    end
+    match active.poll()
+      case AsyncWritePoll.Pending(socket, interest)
+        return AsyncWritePoll.Pending(socket, interest)
+      case AsyncWritePoll.Completed(result)
+        match result
+          case WriteResult.Failure(error)
+            if !this.stopped && this.retries < this.maximumRetries && retryableSaveFailure(error) && this.context.canRetrySave()
+              this.active = null
+              this.retries = this.retries + 1
+              this.preparationPending = true
+              let delay = retryBackoff(this.initialBackoff, this.maximumBackoff, this.retries)
+
+              if delay > 0
+                let now = clock::milliseconds()
+
+                if now == null || now > 9223372036854775807 - delay
+                  return this.finish(WriteResult.Failure(WriteFailure.Transaction("save retry backoff clock unavailable")))
+                end
+                this.retryAt = now + delay
+              end
+              return AsyncWritePoll.Pending(-1, AsyncInterest.Read())
+            end
+          case WriteResult.Saved(count)
+          case WriteResult.SavedWithValues(count, values)
+        end
+        return this.finish(result)
+    end
+  end
+
+  public def cancel(): Void
+    this.stopped = true
+    let active = this.active
+
+    if active != null
+      active.cancel()
+    end
+  end
+
+  public def close(): result::Failure?
+    if this.terminal != null
+      return null
+    end
+    this.stopped = true
+    let active = this.active
+
+    if active != null
+      return active.close()
+    end
+    this.terminal = WriteResult.Failure(WriteFailure.Transaction("save execution strategy cancelled"))
+    return null
+  end
+end
+
+resource class RetrySave
+  private driver: RetrySaveDriver
+  private closed: Bool = false
+
+  def init(driver: RetrySaveDriver): Void
+    this.driver = driver
+  end
+
+  public def poll(): AsyncWritePoll
+    if this.closed
+      return AsyncWritePoll.Completed(WriteResult.Failure(WriteFailure.Transaction("retry save resource is closed")))
+    end
+    return this.driver.poll()
+  end
+
+  public def cancel(): Void
+    if !this.closed
+      this.driver.cancel()
+    end
+  end
+
+  public def close(): result::Failure?
+    if this.closed
+      return null
+    end
+    this.closed = true
+    return this.driver.close()
+  end
+end

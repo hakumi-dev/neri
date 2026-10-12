@@ -35,9 +35,12 @@ the callable body. Calls supply its entries by field name.
 
 Duplicate labels, inaccessible or unknown fields, incompatible values and
 positional pack arguments produce compile-time diagnostics. Current entries
-support `Bool`, `Int`, `Float`, `String` and their optional types. Other fields can remain
-on the entity; supplying one as an entry requires additional representation
-support.
+support `Bool`, `Int`, `Float`, `String` and their optional types. Managed values
+can opt into scalar capture through the public safe static `captureQuotation`
+hook described in [quotations](QUOTATIONS.md). Their entries retain the declared
+model type and store the hook's scalar result. A readonly argument requires a
+hook accepting the readonly optional model type. Consumers validate that this
+scalar representation agrees with their mapped conversion.
 
 An omitted field contributes no entry. `false` contributes a Boolean entry, and
 `null` contributes a null entry for an optional field. An empty call contributes

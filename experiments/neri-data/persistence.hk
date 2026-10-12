@@ -1,3 +1,6 @@
+use host
+use buffers
+use result
 namespace neri_data
 
 ## A structured write failure that callers can inspect before choosing recovery.
@@ -81,7 +84,7 @@ class WriteValues
   private tail: WriteValueNode?
   private size: Int = 0
 
-  internal def add(value: Cell): Void
+  public def add(value: Cell): Void
     let node = new WriteValueNode(value)
     let current = this.tail
 
@@ -227,6 +230,8 @@ def copyResultColumnKind(kind: readonly ResultColumnKind): ResultColumnKind
       return ResultColumnKind.Float()
     case ResultColumnKind.Text()
       return ResultColumnKind.Text()
+    case ResultColumnKind.Binary()
+      return ResultColumnKind.Binary()
   end
 end
 
@@ -249,20 +254,28 @@ def generatedKindCode(kind: readonly ResultColumnKind): Int
       return 3
     case ResultColumnKind.Text()
       return 4
+    case ResultColumnKind.Binary()
+      return 5
   end
 end
 
 class GeneratedValueColumn
   private storedColumn: ResultColumn
   private storedTiming: GeneratedValueTiming
+  private storedCanonicalDecimal: Bool
 
-  def init(column: ResultColumn, timing: GeneratedValueTiming): Void
+  def init(column: ResultColumn, timing: GeneratedValueTiming, canonicalDecimal: Bool = false): Void
     this.storedColumn = new ResultColumn(column.name(), copyResultColumnKind(column.kind()), column.nullable())
     this.storedTiming = copyGeneratedValueTiming(timing)
+    this.storedCanonicalDecimal = canonicalDecimal
   end
 
   public readonly def column(): readonly ResultColumn
     return this.storedColumn
+  end
+
+  public readonly def canonicalDecimal(): Bool
+    return this.storedCanonicalDecimal
   end
 
   public readonly def timing(): readonly GeneratedValueTiming
@@ -298,7 +311,7 @@ class WriteBatch
   private tail: WriteCommandNode?
   private size: Int = 0
 
-  internal def add(sql: String, parameters: WriteValues, expectedRows: Int, returning: ResultColumns? = null): Void
+  public def add(sql: String, parameters: WriteValues, expectedRows: Int, returning: ResultColumns? = null): Void
     let node = new WriteCommandNode(new WriteCommand(sql, parameters, expectedRows, returning))
     let current = this.tail
 
@@ -325,6 +338,20 @@ enum EntityState
   case Unchanged()
   case Deleted()
   case Detached()
+end
+
+def trackingStateActive(state: EntityState): Bool
+  match state
+    case EntityState.Detached()
+      return false
+    case EntityState.Added()
+      return true
+    case EntityState.Unchanged()
+      return true
+    case EntityState.Deleted()
+      return true
+  end
+  return false
 end
 
 enum RelationshipDeletePolicy
@@ -366,9 +393,11 @@ class TrackedEntry<T>
   public transactionGeneratedLast: RawRow?
   public saveGeneratedBefore: RawRow?
   public transactionGeneratedApplied: Bool = false
+  public generatedIdentityPropagated: Bool = false
   public actionId: Int = -1
   public generation: Int = 0
   public graphIdentity: GraphIdentity = new GraphIdentity()
+  public graphProvisional: Bool = false
 
   def init(entity: T, original: RawRow, state: EntityState): Void
     this.entity = entity
@@ -448,9 +477,12 @@ class TrackedHandle<T>
   private identity: GraphIdentity
   private mappedColumns: readonly ResultColumns
   private mappedKeyName: String
+  private mappedKeyColumns: String[]
+  private alternateKeyColumns: String[][]
   private generatedColumns: GeneratedValueColumn[]
   private captureEntity: fn(T): RawRow
   private removeEntity: fn(T): QueryFailure?
+  private rebaseIdentity: (fn(TrackedEntry<T>, RawRow, String[]): QueryFailure?)?
 
   def init(
     entry: TrackedEntry<T>,
@@ -459,7 +491,10 @@ class TrackedHandle<T>
     keyName: String,
     capture: fn(T): RawRow,
     remove: fn(T): QueryFailure?,
-    generatedColumns: GeneratedValueColumn[]
+    generatedColumns: GeneratedValueColumn[],
+    keyColumns: String[]? = null,
+    alternateKeyColumns: String[][]? = null,
+    rebaseIdentity: (fn(TrackedEntry<T>, RawRow, String[]): QueryFailure?)? = null
   ): Void
     this.tracked = entry
     this.mintedEntity = entry.entity
@@ -468,9 +503,17 @@ class TrackedHandle<T>
     this.identity = entry.graphIdentity
     this.mappedColumns = columns
     this.mappedKeyName = keyName
+    this.mappedKeyColumns = [keyName]
+    if keyColumns != null
+      this.mappedKeyColumns = tasks::generate(keyColumns.Length, 1) do |index|
+        return keyColumns[index]
+      end
+    end
+    this.alternateKeyColumns = copyKeyTuples(alternateKeyColumns)
     this.generatedColumns = generatedColumns
     this.captureEntity = capture
     this.removeEntity = remove
+    this.rebaseIdentity = rebaseIdentity
   end
 
   public def entity(): T
@@ -493,24 +536,95 @@ class TrackedHandle<T>
     return this.identity
   end
 
+  internal def identifyingAdded(): Bool
+    if this.tracked.pendingWrite || this.tracked.transactionWritten
+      return false
+    end
+    match this.tracked.state
+      case EntityState.Added()
+        return true
+      case EntityState.Unchanged()
+      case EntityState.Deleted()
+      case EntityState.Detached()
+    end
+    return false
+  end
+
+  internal def scalarSnapshot(): RawRow
+    return this.captureEntity(this.tracked.entity)
+  end
+
+  internal def identifyingSlots(slots: String[]): Bool
+    for slot in slots
+      for column in this.mappedKeyColumns
+        return true if slot == column
+      end
+      for tuple in this.alternateKeyColumns
+        for column in tuple
+          return true if slot == column
+        end
+      end
+    end
+    return false
+  end
+
+  internal def rebaseIdentifying(before: RawRow, slots: String[], generatedIdentity: Bool = false): QueryFailure?
+    let after = this.captureEntity(this.tracked.entity)
+
+    if sameOptionalCell(
+      compositeKey(after, this.mappedKeyColumns),
+      compositeKey(before, this.mappedKeyColumns)
+    ) && immutableKeysFailure(
+      after,
+      before,
+      this.alternateKeyColumns
+    ) == null
+      return null
+    end
+    let rebase = this.rebaseIdentity
+
+    if rebase == null || !this.identifyingAdded()
+      return QueryFailure.Provider(ProviderFailure.State("persisted identifying foreign key cannot change"))
+    end
+    let failure = rebase(this.tracked, before, slots)
+
+    if failure == null && generatedIdentity
+      this.tracked.generatedIdentityPropagated = true
+    end
+    return failure
+  end
+
+  internal def journalIdentity(journal: GraphJournal): Void
+    let entry = this.tracked
+    let original = entry.original
+    let generatedIdentity = entry.generatedIdentityPropagated
+    let undo: fn(): Void = fn(): Void do
+      entry.original = original
+      entry.generatedIdentityPropagated = generatedIdentity
+    end
+
+    journal.record(undo)
+  end
+
   internal def validateCascade(): QueryFailure?
     if !this.valid()
       return QueryFailure.Provider(ProviderFailure.State("cascade handle is stale"))
     end
     let current = this.captureEntity(this.tracked.entity)
 
-    match current.value(this.mappedKeyName)
-      case CellLookup.Missing()
-        return QueryFailure.Provider(ProviderFailure.State("cascade entity key is missing"))
-      case CellLookup.Found(key)
-        match this.tracked.original.value(this.mappedKeyName)
-          case CellLookup.Missing()
-            return QueryFailure.Provider(ProviderFailure.State("cascade tracked key is missing"))
-          case CellLookup.Found(original)
-            if !sameCell(key, original)
-              return QueryFailure.Provider(ProviderFailure.State("cascade entity key changed"))
-            end
-        end
+    let key = compositeKey(current, this.mappedKeyColumns)
+    let original = compositeKey(this.tracked.original, this.mappedKeyColumns)
+
+    if key == null || original == null
+      return QueryFailure.Provider(ProviderFailure.State("cascade entity key is missing or invalid"))
+    end
+    if !sameCell(key, original)
+      return QueryFailure.Provider(ProviderFailure.State("cascade entity key changed"))
+    end
+    let alternateError = immutableKeysFailure(current, this.tracked.original, this.alternateKeyColumns)
+
+    if alternateError != null
+      return QueryFailure.Provider(ProviderFailure.State(alternateError))
     end
     match this.tracked.state
       case EntityState.Detached()
@@ -554,8 +668,17 @@ class TrackedHandle<T>
   end
 
   internal def hasScalarSlot(slot: String, kind: ResultColumnKind, optional: Bool, allowKey: Bool = false): Bool
-    if slot == this.mappedKeyName && !allowKey
-      return false
+    for key in this.mappedKeyColumns
+      if slot == key && !allowKey
+        return false
+      end
+    end
+    for tuple in this.alternateKeyColumns
+      for key in tuple
+        if slot == key && !allowKey
+          return false
+        end
+      end
     end
     for generated in this.generatedColumns
       if generated.column().name() == slot
@@ -582,6 +705,8 @@ class TrackedHandle<T>
                 return false
               case ResultColumnKind.Float()
                 return false
+              case ResultColumnKind.Binary()
+                return false
             end
           case ResultColumnKind.Text()
             match column.kind()
@@ -593,10 +718,14 @@ class TrackedHandle<T>
                 return false
               case ResultColumnKind.Float()
                 return false
+              case ResultColumnKind.Binary()
+                return false
             end
           case ResultColumnKind.Bool()
             return false
           case ResultColumnKind.Float()
+            return false
+          case ResultColumnKind.Binary()
             return false
         end
       end
@@ -618,6 +747,7 @@ class TrackerCheckpoint<T>
   public state: EntityState
   public generation: Int
   public graphIdentity: GraphIdentity
+  public generatedIdentityPropagated: Bool
   public next: TrackerCheckpoint<T>?
 
   def init(entry: TrackedEntry<T>): Void
@@ -627,6 +757,7 @@ class TrackerCheckpoint<T>
     this.state = entry.state
     this.generation = entry.generation
     this.graphIdentity = entry.graphIdentity
+    this.generatedIdentityPropagated = entry.generatedIdentityPropagated
   end
 end
 
@@ -644,6 +775,7 @@ class SaveCheckpoint<T>
   public pendingGeneratedValues: RawRow?
   public transactionWritten: Bool
   public transactionGeneratedApplied: Bool
+  public generatedIdentityPropagated: Bool
   public transactionGeneratedBefore: RawRow?
   public transactionGeneratedLast: RawRow?
   public saveGeneratedBefore: RawRow?
@@ -664,6 +796,7 @@ class SaveCheckpoint<T>
     this.pendingGeneratedValues = entry.pendingGeneratedValues
     this.transactionWritten = entry.transactionWritten
     this.transactionGeneratedApplied = entry.transactionGeneratedApplied
+    this.generatedIdentityPropagated = entry.generatedIdentityPropagated
     this.transactionGeneratedBefore = entry.transactionGeneratedBefore
     this.transactionGeneratedLast = entry.transactionGeneratedLast
     this.saveGeneratedBefore = entry.saveGeneratedBefore
@@ -685,7 +818,18 @@ class ChangeSet
   private checkpointSaveFn: fn(): Void
   private restoreSaveFn: fn(): Void
   private discardSaveFn: fn(): Void
+  private validateIdentityFn: (fn(): String?)?
   private registered: Bool = false
+  private registeredContext: ChangeContext?
+  private asyncBusy: Bool = false
+
+  internal def saving(): Bool
+    return this.asyncBusy
+  end
+
+  internal def setSaving(value: Bool): Void
+    this.asyncBusy = value
+  end
 
   def init(
     prepare: fn(WriteBatch, SqlDialect): String?,
@@ -700,7 +844,8 @@ class ChangeSet
     checkpointSave: fn(): Void,
     restoreSave: fn(): Void,
     discardSave: fn(): Void,
-    graphActionSnapshot: fn(GraphJournal): Void
+    graphActionSnapshot: fn(GraphJournal): Void,
+    validateIdentity: (fn(): String?)? = null
   ): Void
     this.prepareFn = prepare
     this.acceptFn = accept
@@ -715,18 +860,30 @@ class ChangeSet
     this.checkpointSaveFn = checkpointSave
     this.restoreSaveFn = restoreSave
     this.discardSaveFn = discardSave
+    this.validateIdentityFn = validateIdentity
   end
 
-  internal def registerOnce(): Bool
+  internal def registerOnce(context: ChangeContext): Bool
     if this.registered
       return false
     end
     this.registered = true
+    this.registeredContext = context
     return true
+  end
+
+  internal def context(): ChangeContext?
+    return this.registeredContext
   end
 
   internal def prepare(batch: WriteBatch, dialect: SqlDialect): String?
     return this.prepareFn(batch, dialect)
+  end
+
+  internal def validateIdentity(): String?
+    let validate = this.validateIdentityFn
+
+    return validate == null ? null : validate()
   end
 
   internal def accept(): Void
@@ -973,6 +1130,8 @@ class RelationshipEdge
             return false
           case ResultColumnKind.Float()
             return false
+          case ResultColumnKind.Binary()
+            return false
         end
       case ResultColumnKind.Text()
         match other.scalarKind
@@ -984,10 +1143,14 @@ class RelationshipEdge
             return false
           case ResultColumnKind.Float()
             return false
+          case ResultColumnKind.Binary()
+            return false
         end
       case ResultColumnKind.Bool()
         return false
       case ResultColumnKind.Float()
+        return false
+      case ResultColumnKind.Binary()
         return false
     end
   end
@@ -1049,6 +1212,20 @@ class RelationshipEdge
     this.active = false
   end
 
+  internal def journalState(journal: GraphJournal): Void
+    let edge = this
+    let active = this.active
+    let orphaned = this.orphaned
+    let registered = this.registered
+    let undo: fn(): Void = fn(): Void do
+      edge.active = active
+      edge.orphaned = orphaned
+      edge.registered = registered
+    end
+
+    journal.record(undo)
+  end
+
   internal def retireOrphan(): Void
     this.orphanCaptureFn()
     this.active = false
@@ -1085,6 +1262,7 @@ class ScalarRelationshipLink<P, D>
   private nullableForeignKey: Bool
   private deletePolicy: RelationshipDeletePolicy
   private slotName: String
+  private tupleColumns: ResultColumns?
   private cachedEdge: RelationshipEdge?
   private orphanForeignKey: Cell?
   private lastAssignedForeignKey: Cell?
@@ -1098,7 +1276,8 @@ class ScalarRelationshipLink<P, D>
     kind: ResultColumnKind,
     optional: Bool,
     slot: String = "",
-    deletePolicy: RelationshipDeletePolicy = RelationshipDeletePolicy.Restrict()
+    deletePolicy: RelationshipDeletePolicy = RelationshipDeletePolicy.Restrict(),
+    tupleColumns: ResultColumns? = null
   ): Void
     this.principal = principal
     this.dependent = dependent
@@ -1109,6 +1288,10 @@ class ScalarRelationshipLink<P, D>
     this.nullableForeignKey = optional
     this.deletePolicy = deletePolicy
     this.slotName = slot
+    this.tupleColumns = tupleColumns
+    if tupleColumns != null && tupleColumns.count() > 1
+      this.slotName = relationshipTupleSlot(tupleColumns)
+    end
   end
 
   public def edge(): RelationshipEdge
@@ -1161,10 +1344,10 @@ class ScalarRelationshipLink<P, D>
       return link.persistedForeignKey()
     end
     let mappedSlot: fn(): Bool = fn(): Bool do
-      return link.dependent.hasScalarSlot(link.slotName, link.keyKind, link.nullableForeignKey)
+      return link.hasMappedTuple(false)
     end
     let mappedOrphanSlot: fn(): Bool = fn(): Bool do
-      return link.dependent.hasScalarSlot(link.slotName, link.keyKind, link.nullableForeignKey, true)
+      return link.hasMappedTuple(true)
     end
     let dependentCascade: fn(): CascadeNode = fn(): CascadeNode do
       return link.dependent.cascadeNode()
@@ -1221,12 +1404,46 @@ class ScalarRelationshipLink<P, D>
     if !this.principal.valid() || !this.dependent.valid()
       return QueryFailure.Provider(ProviderFailure.State("relationship handle is stale"))
     end
+    let principalError = this.principal.validateCascade()
+
+    if principalError != null
+      return principalError
+    end
     let principalEntry = this.principal.entry()
     let dependentEntry = this.dependent.entry()
     let kindFailure = this.validateKind()
 
     if kindFailure != null
       return kindFailure
+    end
+
+    ## A generated root key may already be visible through a shared derived object.
+    let shared = reference::cast<P, D>(dependentEntry.entity)
+
+    if shared != null && reference::same(
+      principalEntry.entity,
+      shared
+    ) && (principalEntry.transactionGeneratedApplied || principalEntry.generatedIdentityPropagated) && this.dependent.identifyingAdded() && this.sameCell(
+      this.readForeignKey(dependentEntry.entity),
+      this.readPrincipal(principalEntry.entity)
+    )
+      let columns = this.tupleColumns
+      let slots: String[] = columns == null ? [this.slotName] : tasks::generate(columns.count(), 1) do |index|
+        return columns.at(index).name()
+      end
+
+      if this.dependent.identifyingSlots(slots)
+        let rebaseError = this.dependent.rebaseIdentifying(dependentEntry.original, slots, true)
+
+        if rebaseError != null
+          return rebaseError
+        end
+      end
+    end
+    let dependentError = this.dependent.validateCascade()
+
+    if dependentError != null
+      return dependentError
     end
 
     match principalEntry.state
@@ -1264,10 +1481,33 @@ class ScalarRelationshipLink<P, D>
       return QueryFailure.Provider(ProviderFailure.State("linked dependent foreign key has the wrong scalar kind or nullability"))
     end
     if !this.sameCell(current, key)
+      let columns = this.tupleColumns
+      let slots: String[] = columns == null ? [this.slotName] : tasks::generate(columns.count(), 1) do |index|
+        return columns.at(index).name()
+      end
+
+      if this.dependent.identifyingSlots(slots) && !this.dependent.identifyingAdded()
+        return QueryFailure.Provider(ProviderFailure.State("persisted identifying foreign key cannot change"))
+      end
+      let before = this.dependent.scalarSnapshot()
+
       this.writeForeignKey(dependentEntry.entity, key)
 
       if !this.sameCell(this.readForeignKey(dependentEntry.entity), key)
+        if !this.sameCell(this.readForeignKey(dependentEntry.entity), current)
+          this.writeForeignKey(dependentEntry.entity, current)
+        end
         return QueryFailure.Provider(ProviderFailure.State("relationship setter did not assign the principal key"))
+      end
+      let rebaseError = this.dependent.rebaseIdentifying(
+        before,
+        slots,
+        principalEntry.transactionGeneratedApplied || principalEntry.generatedIdentityPropagated
+      )
+
+      if rebaseError != null
+        this.writeForeignKey(dependentEntry.entity, current)
+        return rebaseError
       end
     end
     this.lastAssignedForeignKey = key
@@ -1344,12 +1584,53 @@ class ScalarRelationshipLink<P, D>
     if !this.matchesKind(this.readPrincipal(this.principal.entry().entity))
       return false
     end
+    let columns = this.tupleColumns
+
+    if columns != null
+      let names: String[] = tasks::generate(columns.count(), 1) do |index|
+        return columns.at(index).name()
+      end
+
+      return this.sameCell(
+        compositeKeyCell(dependentEntry.original, names),
+        this.readPrincipal(this.principal.entry().entity)
+      )
+    end
     match dependentEntry.original.value(this.slotName)
       case CellLookup.Found(value)
         return this.sameCell(value, this.readPrincipal(this.principal.entry().entity))
       case CellLookup.Missing()
         return false
     end
+  end
+
+  private def hasMappedTuple(allowKey: Bool): Bool
+    let columns = this.tupleColumns
+    let preservesIdentifyingKey = this.sameCell(
+      this.readForeignKey(this.dependent.entry().entity),
+      this.readPrincipal(this.principal.entry().entity)
+    )
+    let identifying = allowKey || this.dependent.identifyingAdded() || preservesIdentifyingKey
+
+    if columns == null
+      return this.dependent.hasScalarSlot(this.slotName, this.keyKind, this.nullableForeignKey, identifying)
+    end
+    var index = 0
+
+    while index < columns.count()
+      let column = columns.at(index)
+
+      if !this.dependent.hasScalarSlot(
+        column.name(),
+        copyResultColumnKind(column.kind()),
+        column.nullable(),
+        identifying
+      )
+        return false
+      end
+      index = index + 1
+    end
+    return columns.count() > 1
   end
 
   private def validateKind(): QueryFailure?
@@ -1361,6 +1642,8 @@ class ScalarRelationshipLink<P, D>
       case ResultColumnKind.Bool()
         return QueryFailure.UnsupportedCapability("relationship keys must be Int or String")
       case ResultColumnKind.Float()
+        return QueryFailure.UnsupportedCapability("relationship keys must be Int or String")
+      case ResultColumnKind.Binary()
         return QueryFailure.UnsupportedCapability("relationship keys must be Int or String")
     end
   end
@@ -1376,6 +1659,8 @@ class ScalarRelationshipLink<P, D>
       case Cell.Bool(boolean)
         return false
       case Cell.Float(number)
+        return false
+      case Cell.Binary(text)
         return false
     end
   end
@@ -1394,6 +1679,8 @@ class ScalarRelationshipLink<P, D>
             return false
           case Cell.Float(number)
             return false
+          case Cell.Binary(text)
+            return false
         end
       case ResultColumnKind.Text()
         match value
@@ -1407,10 +1694,14 @@ class ScalarRelationshipLink<P, D>
             return false
           case Cell.Float(number)
             return false
+          case Cell.Binary(boolean)
+            return false
         end
       case ResultColumnKind.Bool()
         return false
       case ResultColumnKind.Float()
+        return false
+      case ResultColumnKind.Binary()
         return false
     end
   end
@@ -1429,6 +1720,8 @@ class ScalarRelationshipLink<P, D>
             return false
           case Cell.Float(other)
             return false
+          case Cell.Binary(other)
+            return false
         end
       case Cell.Text(value)
         match right
@@ -1442,12 +1735,16 @@ class ScalarRelationshipLink<P, D>
             return false
           case Cell.Float(other)
             return false
+          case Cell.Binary(other)
+            return false
         end
       case Cell.Null()
         return this.isNull(right)
       case Cell.Bool(value)
         return false
       case Cell.Float(value)
+        return false
+      case Cell.Binary(value)
         return false
     end
   end
@@ -1569,6 +1866,8 @@ class RelationshipLink<P, D>
           return
         case Cell.Float(number)
           return
+        case Cell.Binary(text)
+          return
       end
     end
 
@@ -1680,9 +1979,17 @@ class WriteActionList
 end
 
 ## Tracks one mapped entity type by its assigned scalar key.
-class EntityTracker<T>
+class EntityTracker<T>: AsyncRowResolver<T>
+  private navigationIdentityToken: NavigationTrackerIdentity = new NavigationTrackerIdentity()
+  private materializationObservers: MaterializationObserver?
+  private enrollmentObservers: MaterializationObserver?
+  private clearObservers: MaterializationObserver?
+  private notifyingEnrollment: Bool = false
   private tableName: String
   private keyName: String
+  private keyColumns: String[]
+  private alternateKeyColumns: String[][]
+  private foreignKeyColumns: String[][]
   private columns: ResultColumns
   private captureRow: fn(T): RawRow
   private applyRow: (fn(T, T): Void)?
@@ -1699,6 +2006,15 @@ class EntityTracker<T>
   private checkpoints: TrackerCheckpoint<T>?
   private saveCheckpoints: SaveCheckpoint<T>?
   private graphEnrollmentActive: Bool = false
+  private hierarchyColumn: String?
+  private snapshotEqual: (fn(RawRow, RawRow): Bool)?
+  private writeLayout: (fn(RawRow): TrackedWriteLayout)?
+  private setWriteLayout: TrackedWriteLayout?
+  private tableSegments: Bool
+
+  internal def navigationIdentity(): NavigationTrackerIdentity
+    return this.navigationIdentityToken
+  end
 
   def init(
     table: String,
@@ -1710,10 +2026,31 @@ class EntityTracker<T>
     setGeneratedKey: (fn(T, Int): Void)? = null,
     generatedColumns: GeneratedValueColumn[] = [],
     applyGenerated: (fn(T, readonly RawRow): Void)? = null,
-    concurrencyColumns: String[]? = null
+    concurrencyColumns: String[]? = null,
+    keyColumns: String[]? = null,
+    alternateKeyColumns: String[][]? = null,
+    foreignKeyColumns: String[][]? = null,
+    hierarchyColumn: String? = null,
+    snapshotEqual: (fn(RawRow, RawRow): Bool)? = null,
+    writeLayout: (fn(RawRow): TrackedWriteLayout)? = null,
+    setWriteLayout: TrackedWriteLayout? = null,
+    tableSegments: Bool = false
   ): Void
     this.tableName = table
+    this.hierarchyColumn = hierarchyColumn
+    this.snapshotEqual = snapshotEqual
+    this.writeLayout = writeLayout
+    this.setWriteLayout = setWriteLayout
+    this.tableSegments = tableSegments
     this.keyName = keyColumn
+    this.keyColumns = [keyColumn]
+    if keyColumns != null
+      this.keyColumns = tasks::generate(keyColumns.Length, 1) do |index|
+        return keyColumns[index]
+      end
+    end
+    this.alternateKeyColumns = copyKeyTuples(alternateKeyColumns)
+    this.foreignKeyColumns = copyKeyTuples(foreignKeyColumns)
     this.columns = columns
     this.captureRow = capture
     this.applyRow = apply
@@ -1725,7 +2062,8 @@ class EntityTracker<T>
 
       return new GeneratedValueColumn(
         new ResultColumn(column.name(), copyResultColumnKind(column.kind()), column.nullable()),
-        copyGeneratedValueTiming(item.timing())
+        copyGeneratedValueTiming(item.timing()),
+        item.canonicalDecimal()
       )
     end
     this.applyGenerated = applyGenerated
@@ -1736,6 +2074,55 @@ class EntityTracker<T>
 
       this.concurrencyColumns = copied
     end
+  end
+
+  ## A query-local tracker resolves duplicates without enrolling in a context.
+  public def identityResolver(): EntityTracker<T>
+    return new EntityTracker<T>(
+      this.tableName,
+      this.keyName,
+      this.columns,
+      this.captureRow,
+      this.applyRow,
+      this.generatedKey,
+      this.setGeneratedKey,
+      this.generatedColumns,
+      this.applyGenerated,
+      this.concurrencyColumns,
+      this.keyColumns,
+      this.alternateKeyColumns,
+      this.foreignKeyColumns,
+      this.hierarchyColumn,
+      this.snapshotEqual,
+      this.writeLayout,
+      this.setWriteLayout,
+      this.tableSegments
+    )
+  end
+
+  internal readonly def hasPhysicalWriteLayout(): Bool
+    return this.writeLayout != null
+  end
+
+  internal readonly def hasTableSegments(): Bool
+    return this.tableSegments
+  end
+
+  internal def setWriteFailure(columns: String[]): String?
+    if this.writeLayout == null
+      return null
+    end
+    let layout = this.setWriteLayout
+
+    if layout == null || layout.table() != this.tableName
+      return "set writes require one fixed physical table; this hierarchy selects its table per tracked entity"
+    end
+    for column in columns
+      if !layout.has(column)
+        return "set update depends on a column outside its physical table: " + column
+      end
+    end
+    return null
   end
 
   public def changeSet(): ChangeSet
@@ -1784,6 +2171,9 @@ class EntityTracker<T>
     let graphActionSnapshot: fn(GraphJournal): Void = fn(journal: GraphJournal): Void do
       tracker.graphActionSnapshot(journal)
     end
+    let validateIdentity: fn(): String? = fn(): String? do
+      return tracker.validateTrackedIdentities()
+    end
     let created = new ChangeSet(
       prepare,
       accept,
@@ -1797,7 +2187,8 @@ class EntityTracker<T>
       checkpointSave,
       restoreSave,
       discardSave,
-      graphActionSnapshot
+      graphActionSnapshot,
+      validateIdentity
     )
 
     this.set = created
@@ -1805,12 +2196,147 @@ class EntityTracker<T>
   end
 
   private def key(row: RawRow): Cell?
-    match row.value(this.keyName)
-      case CellLookup.Found(value)
-        return value
-      case CellLookup.Missing()
-        return null
+    return compositeKey(row, this.keyColumns)
+  end
+
+  private def validateTrackedIdentities(): String?
+    var entry = this.entries
+
+    while entry != null
+      if trackingStateActive(entry.state)
+        let captured = this.captureRow(entry.entity)
+        let key = this.key(captured)
+
+        if key == null || !sameOptionalCell(key, this.key(entry.original))
+          return "tracked entity key changed"
+        end
+        let alternateError = immutableKeysFailure(captured, entry.original, this.alternateKeyColumns)
+
+        if alternateError != null
+          return alternateError
+        end
+      end
+      entry = entry.next
     end
+    return null
+  end
+
+  private def identityRebaser(): fn(TrackedEntry<T>, RawRow, String[]): QueryFailure?
+    let tracker = this
+
+    return fn(entry: TrackedEntry<T>, before: RawRow, slots: String[]): QueryFailure? do
+      return tracker.rebaseAddedIdentity(entry, before, slots)
+    end
+  end
+
+  private readonly def identityColumn(name: String): Bool
+    if this.isKeyColumn(name)
+      return true
+    end
+    for tuple in this.alternateKeyColumns
+      for column in tuple
+        return true if column == name
+      end
+    end
+    return false
+  end
+
+  private def rebaseAddedIdentity(entry: TrackedEntry<T>, before: RawRow, slots: String[]): QueryFailure?
+    match entry.state
+      case EntityState.Added()
+      case EntityState.Unchanged()
+        return QueryFailure.Provider(ProviderFailure.State("persisted identifying foreign key cannot change"))
+      case EntityState.Deleted()
+        return QueryFailure.Provider(ProviderFailure.State("persisted identifying foreign key cannot change"))
+      case EntityState.Detached()
+        return QueryFailure.Provider(ProviderFailure.State("detached identifying foreign key cannot change"))
+    end
+    if entry.pendingWrite || entry.transactionWritten || !sameOptionalCell(
+      this.key(before),
+      this.key(entry.original)
+    ) || immutableKeysFailure(
+      before,
+      entry.original,
+      this.alternateKeyColumns
+    ) != null
+      return QueryFailure.Provider(ProviderFailure.State("identifying propagation requires an unwritten Added baseline"))
+    end
+    let after = this.captureRow(entry.entity)
+    let invalid = this.validateKey(after)
+
+    if invalid != null
+      return invalid
+    end
+    var index = 0
+
+    while index < this.columns.count()
+      let name = this.columns.at(index).name()
+
+      if this.identityColumn(name) && !sameOptionalCell(cellFromRow(before, name), cellFromRow(after, name))
+        var allowed = false
+
+        for slot in slots
+          allowed = allowed || slot == name
+        end
+        if !allowed
+          return QueryFailure.Provider(ProviderFailure.State("relationship setter changed an unrelated key column"))
+        end
+      end
+      index = index + 1
+    end
+    var current = this.entries
+
+    while current != null
+      var active = true
+
+      match current.state
+        case EntityState.Detached()
+          active = false
+        case EntityState.Added()
+        case EntityState.Unchanged()
+        case EntityState.Deleted()
+      end
+      if active && !reference::same(current, entry)
+        if sameOptionalCell(
+          this.key(after),
+          this.key(current.original)
+        ) && !(this.graphEnrollmentActive && current.graphProvisional)
+          return QueryFailure.Provider(ProviderFailure.State("identifying foreign key matches another tracked identity"))
+        end
+        for tuple in this.alternateKeyColumns
+          let newKey = compositeKey(after, tuple)
+
+          if !sameOptionalCell(
+            newKey,
+            compositeKey(before, tuple)
+          ) && sameOptionalCell(
+            newKey,
+            compositeKey(current.original, tuple)
+          )
+            return QueryFailure.Provider(ProviderFailure.State("identifying foreign key matches another tracked alternate identity"))
+          end
+        end
+      end
+      current = current.next
+    end
+    let original = entry.original
+    let columns: RawColumn[] = tasks::generate(this.columns.count(), 1) do |position|
+      let name = this.columns.at(position).name()
+      let source = this.identityColumn(name) ? after : original
+      let cell = cellFromRow(source, name)
+
+      return new RawColumn(name, cell == null ? Cell.Null() : cell)
+    end
+
+    entry.original = new RawRow(columns)
+    return null
+  end
+
+  private readonly def isKeyColumn(name: String): Bool
+    for column in this.keyColumns
+      return true if column == name
+    end
+    return false
   end
 
   private def find(key: Cell): TrackedEntry<T>?
@@ -1819,7 +2345,7 @@ class EntityTracker<T>
     while current != null
       let trackedKey = this.key(current.original)
 
-      if trackedKey != null && sameCell(trackedKey, key)
+      if trackedKey != null && sameCell(trackedKey, key) && !(this.graphEnrollmentActive && current.graphProvisional)
         match current.state
           case EntityState.Detached()
             return current
@@ -1837,7 +2363,7 @@ class EntityTracker<T>
   end
 
   private def insert(entity: T, row: RawRow, state: EntityState): Void
-    let entry = new TrackedEntry<T>(entity, row, state)
+    let entry = new TrackedEntry<T>(entity, copyRow(row, this.columns), state)
 
     entry.transactionCreated = this.transactionActive
     if this.transactionActive
@@ -1864,6 +2390,16 @@ class EntityTracker<T>
   end
 
   private def validateKey(row: RawRow): QueryFailure?
+    let metadataError = this.validateMetadata()
+
+    if metadataError != null
+      return QueryFailure.Provider(ProviderFailure.State(metadataError))
+    end
+    let rowError = this.validateRow(row)
+
+    if rowError != null
+      return QueryFailure.Provider(ProviderFailure.State(rowError))
+    end
     let key = this.key(row)
 
     if key == null
@@ -1880,14 +2416,44 @@ class EntityTracker<T>
         return null
       case Cell.Text(value)
         return null
+      case Cell.Binary(value)
+        return QueryFailure.Provider(ProviderFailure.State("entity key must be an integer or string"))
     end
   end
 
+  private def asyncSaving(): Bool
+    let set = this.set
+
+    return set != null && set.saving()
+  end
+
   public def add(entity: T): QueryFailure?
+    if this.asyncSaving()
+      return QueryFailure.Provider(ProviderFailure.State("asynchronous save is active"))
+    end
     if this.graphEnrollmentActive
       return QueryFailure.Provider(ProviderFailure.State("cannot add directly during graph enrollment"))
     end
-    return this.addCore(entity)
+    if this.enrollmentObservers == null
+      return this.addCore(entity)
+    end
+    let journal = new GraphJournal()
+    let capture = this.enrollmentSnapshot(journal)
+
+    if capture != null
+      return capture
+    end
+    var failure = this.addCore(entity)
+
+    if failure == null
+      failure = this.notifyEnrollment()
+    end
+    if failure == null
+      journal.discard()
+    else
+      journal.rollback()
+    end
+    return failure
   end
 
   private def addCore(entity: T): QueryFailure?
@@ -1925,6 +2491,8 @@ class EntityTracker<T>
         case Cell.Text(value)
           return QueryFailure.Provider(ProviderFailure.State("generated key must be an integer"))
         case Cell.Float(value)
+          return QueryFailure.Provider(ProviderFailure.State("generated key must be an integer"))
+        case Cell.Binary(value)
           return QueryFailure.Provider(ProviderFailure.State("generated key must be an integer"))
       end
       if this.nextTemporaryKey == -9223372036854775808
@@ -1969,8 +2537,9 @@ class EntityTracker<T>
           end
           existing.generation = existing.generation + 1
           existing.graphIdentity = new GraphIdentity()
+          existing.generatedIdentityPropagated = false
           existing.entity = entity
-          existing.original = row
+          existing.original = copyRow(row, this.columns)
           existing.state = EntityState.Added()
           if this.transactionActive
             existing.transactionAdded = true
@@ -2021,8 +2590,58 @@ class EntityTracker<T>
         this.keyName,
         this.captureRow,
         remove,
-        this.generatedColumns
+        this.generatedColumns,
+        this.keyColumns,
+        this.alternateKeyColumns,
+        this.identityRebaser()
       ))
+  end
+
+  ## Returns an existing live handle by object identity without enrolling a new object.
+  public def handle(entity: T): TrackHandleResult<T>
+    return this.existingHandle(entity, false)
+  end
+
+  internal def cascadeHandle(entity: T): TrackHandleResult<T>
+    return this.existingHandle(entity, true)
+  end
+
+  private def existingHandle(entity: T, includeDeleted: Bool): TrackHandleResult<T>
+    if this.asyncSaving()
+      return TrackHandleResult<T>.Failure(QueryFailure.Provider(ProviderFailure.State("asynchronous save is active")))
+    end
+    var entry = this.entries
+
+    while entry != null
+      if reference::same(entry.entity, entity)
+        match entry.state
+          case EntityState.Added()
+            let key = this.key(this.captureRow(entity))
+
+            if key != null
+              return this.graphExistingHandle(entry, entity, key)
+            end
+          case EntityState.Unchanged()
+            let key = this.key(this.captureRow(entity))
+
+            if key != null
+              return this.graphExistingHandle(entry, entity, key)
+            end
+          case EntityState.Detached()
+          case EntityState.Deleted()
+            if includeDeleted
+              let key = this.key(this.captureRow(entity))
+
+              if key != null
+                return this.graphExistingHandle(entry, entity, key)
+              end
+            end
+        end
+        break
+      end
+      entry = entry.next
+    end
+    return TrackHandleResult<T>.Failure(QueryFailure.Provider(ProviderFailure.State("entity is not a live tracked instance")))
   end
 
   ## Enrolls one graph object and records every tracker-side mutation before add.
@@ -2032,6 +2651,12 @@ class EntityTracker<T>
       let tracker = this
       let finish: fn(): Void = fn(): Void do
         tracker.graphEnrollmentActive = false
+        var entry = tracker.entries
+
+        while entry != null
+          entry.graphProvisional = false
+          entry = entry.next
+        end
       end
 
       journal.finallyDo(finish)
@@ -2075,6 +2700,13 @@ class EntityTracker<T>
         case EntityState.Detached()
       end
     end
+    if this.enrollmentObservers != null
+      let capture = this.enrollmentSnapshot(journal)
+
+      if capture != null
+        return TrackHandleResult<T>.Failure(capture)
+      end
+    end
     let firstBefore = this.entries
     let lastBefore = this.lastEntry
     let temporaryBefore = this.nextTemporaryKey
@@ -2111,6 +2743,7 @@ class EntityTracker<T>
       let priorState = prior.state
       let priorGeneration = prior.generation
       let priorIdentity = prior.graphIdentity
+      let priorGeneratedIdentity = prior.generatedIdentityPropagated
       let priorDeleted = prior.transactionDeleted
       let priorDetached = prior.transactionDetached
       let priorAdded = prior.transactionAdded
@@ -2125,6 +2758,7 @@ class EntityTracker<T>
         prior.state = priorState
         prior.generation = priorGeneration
         prior.graphIdentity = priorIdentity
+        prior.generatedIdentityPropagated = priorGeneratedIdentity
         prior.transactionDeleted = priorDeleted
         prior.transactionDetached = priorDetached
         prior.transactionAdded = priorAdded
@@ -2147,10 +2781,20 @@ class EntityTracker<T>
     if assigned == null
       return TrackHandleResult<T>.Failure(QueryFailure.Provider(ProviderFailure.State("tracked graph entity key is missing")))
     end
-    let entry = this.find(assigned)
+    var entry = this.entries
+
+    while entry != null && !reference::same(entry.entity, entity)
+      entry = entry.next
+    end
 
     if entry == null
       return TrackHandleResult<T>.Failure(QueryFailure.Provider(ProviderFailure.State("tracked graph entity entry is missing")))
+    end
+    entry.graphProvisional = !this.generatedKey && this.keyColumns.Length > 1
+    let observed = this.notifyEnrollment()
+
+    if observed != null
+      return TrackHandleResult<T>.Failure(observed)
     end
     return this.graphExistingHandle(entry, entity, assigned)
   end
@@ -2174,18 +2818,69 @@ class EntityTracker<T>
         this.keyName,
         this.captureRow,
         remove,
-        this.generatedColumns
+        this.generatedColumns,
+        this.keyColumns,
+        this.alternateKeyColumns,
+        this.identityRebaser()
       ))
   end
 
   internal def graphActionSnapshot(journal: GraphJournal): Void
+    let firstBefore = this.entries
+    let lastBefore = this.lastEntry
+    let temporaryBefore = this.nextTemporaryKey
+    let tracker = this
+    let resetGenerated = this.setGeneratedKey
+    let restoreList: fn(): Void = fn(): Void do
+      var appended = lastBefore == null ? tracker.entries : lastBefore.next
+
+      while appended != null
+        appended.state = EntityState.Detached()
+        appended.generation = appended.generation + 1
+        appended.graphIdentity = new GraphIdentity()
+        resetGenerated(appended.entity, 0) if tracker.generatedKey && resetGenerated != null
+        appended = appended.next
+      end
+      tracker.entries = firstBefore
+      tracker.lastEntry = lastBefore
+      tracker.nextTemporaryKey = temporaryBefore
+      lastBefore.next = null if lastBefore != null
+    end
+
+    journal.record(restoreList)
     var current = this.entries
 
     while current != null
       let entry = current
       let previous = entry.actionId
+      let original = entry.original
+      let entity = entry.entity
+      let state = entry.state
+      let generation = entry.generation
+      let identity = entry.graphIdentity
+      let generatedIdentity = entry.generatedIdentityPropagated
+      let deleted = entry.transactionDeleted
+      let detached = entry.transactionDetached
+      let added = entry.transactionAdded
+      let birthOriginal = entry.transactionBirthOriginal
+      let birthEntity = entry.transactionBirthEntity
+      let birthGeneration = entry.transactionBirthGeneration
+      let birthIdentity = entry.transactionBirthIdentity
       let undo: fn(): Void = fn(): Void do
         entry.actionId = previous
+        entry.original = original
+        entry.entity = entity
+        entry.state = state
+        entry.generation = generation
+        entry.graphIdentity = identity
+        entry.generatedIdentityPropagated = generatedIdentity
+        entry.transactionDeleted = deleted
+        entry.transactionDetached = detached
+        entry.transactionAdded = added
+        entry.transactionBirthOriginal = birthOriginal
+        entry.transactionBirthEntity = birthEntity
+        entry.transactionBirthGeneration = birthGeneration
+        entry.transactionBirthIdentity = birthIdentity
       end
 
       journal.record(undo)
@@ -2194,9 +2889,35 @@ class EntityTracker<T>
   end
 
   public def attach(entity: T): QueryFailure?
+    if this.asyncSaving()
+      return QueryFailure.Provider(ProviderFailure.State("asynchronous save is active"))
+    end
     if this.graphEnrollmentActive
       return QueryFailure.Provider(ProviderFailure.State("cannot attach directly during graph enrollment"))
     end
+    if this.enrollmentObservers == null
+      return this.attachCore(entity)
+    end
+    let journal = new GraphJournal()
+    let capture = this.enrollmentSnapshot(journal)
+
+    if capture != null
+      return capture
+    end
+    var failure = this.attachCore(entity)
+
+    if failure == null
+      failure = this.notifyEnrollment()
+    end
+    if failure == null
+      journal.discard()
+    else
+      journal.rollback()
+    end
+    return failure
+  end
+
+  private def attachCore(entity: T): QueryFailure?
     let row = this.captureRow(entity)
     let invalid = this.validateKey(row)
 
@@ -2215,8 +2936,9 @@ class EntityTracker<T>
         case EntityState.Detached()
           existing.generation = existing.generation + 1
           existing.graphIdentity = new GraphIdentity()
+          existing.generatedIdentityPropagated = false
           existing.entity = entity
-          existing.original = row
+          existing.original = copyRow(row, this.columns)
           existing.state = EntityState.Unchanged()
           if this.transactionActive
             existing.transactionDeleted = false
@@ -2263,11 +2985,75 @@ class EntityTracker<T>
         this.keyName,
         this.captureRow,
         remove,
-        this.generatedColumns
+        this.generatedColumns,
+        this.keyColumns,
+        this.alternateKeyColumns,
+        this.identityRebaser()
       ))
   end
 
+  ## Attaches a persisted instance while retaining its previously captured values.
+  public def attachWithSnapshot(entity: T, snapshot: RawRow): TrackHandleResult<T>
+    if this.asyncSaving()
+      return TrackHandleResult<T>.Failure(QueryFailure.Provider(ProviderFailure.State("asynchronous save is active")))
+    end
+    if this.graphEnrollmentActive
+      return TrackHandleResult<T>.Failure(QueryFailure.Provider(ProviderFailure.State("cannot attach directly during graph enrollment")))
+    end
+    let row = this.captureRow(entity)
+    let invalid = this.validateKey(row)
+
+    if invalid != null
+      return TrackHandleResult<T>.Failure(invalid)
+    end
+    var existing = this.entries
+
+    while existing != null
+      if reference::same(existing.entity, entity)
+        match existing.state
+          case EntityState.Deleted()
+            return TrackHandleResult<T>.Failure(QueryFailure.Provider(ProviderFailure.State("entity is already deleted")))
+          case EntityState.Detached()
+          case EntityState.Added()
+          case EntityState.Unchanged()
+        end
+      end
+      if reference::same(existing.entity, entity) && trackingStateActive(existing.state)
+        let key = this.key(row)
+
+        if key != null
+          return this.graphExistingHandle(existing, entity, key)
+        end
+      end
+      existing = existing.next
+    end
+    let snapshotError = this.validateKey(snapshot)
+
+    if snapshotError != null
+      return TrackHandleResult<T>.Failure(snapshotError)
+    end
+    if !sameOptionalCell(this.key(row), this.key(snapshot))
+      return TrackHandleResult<T>.Failure(QueryFailure.Provider(ProviderFailure.State("snapshot entity key differs from the current entity key")))
+    end
+    for tuple in this.alternateKeyColumns
+      if !sameCell(compositeKeyCell(row, tuple), compositeKeyCell(snapshot, tuple))
+        return TrackHandleResult<T>.Failure(QueryFailure.Provider(ProviderFailure.State("snapshot alternate key differs from the current entity key")))
+      end
+    end
+    let attached = this.attachWithHandle(entity)
+
+    match attached
+      case TrackHandleResult.Tracked(handle)
+        handle.entry().original = copyRow(snapshot, this.columns)
+      case TrackHandleResult.Failure(error)
+    end
+    return attached
+  end
+
   public def remove(entity: T): QueryFailure?
+    if this.asyncSaving()
+      return QueryFailure.Provider(ProviderFailure.State("asynchronous save is active"))
+    end
     if this.graphEnrollmentActive
       return QueryFailure.Provider(ProviderFailure.State("cannot remove directly during graph enrollment"))
     end
@@ -2342,7 +3128,7 @@ class EntityTracker<T>
       case EntityState.Detached()
         return TrackingState.Detached()
       case EntityState.Unchanged()
-        if sameRows(entry.original, this.captureRow(entry.entity), this.columns)
+        if this.snapshotsEqual(entry.original, this.captureRow(entry.entity))
           return TrackingState.Unchanged()
         end
         return TrackingState.Modified()
@@ -2350,6 +3136,9 @@ class EntityTracker<T>
   end
 
   internal def ownsPersistedForNavigation(entity: T): Bool
+    if this.asyncSaving()
+      return false
+    end
     let current = this.captureRow(entity)
     let key = this.key(current)
 
@@ -2359,6 +3148,13 @@ class EntityTracker<T>
     let entry = this.find(key)
 
     if entry == null || !reference::same(entry.entity, entity) || !sameOptionalCell(key, this.key(entry.original))
+      return false
+    end
+    if immutableKeysFailure(
+      current,
+      entry.original,
+      this.alternateKeyColumns
+    ) != null || this.validateRow(current) != null
       return false
     end
     match entry.state
@@ -2447,6 +3243,9 @@ class EntityTracker<T>
 
   ## Stops tracking the key without writing to the provider.
   public def detach(entity: T): QueryFailure?
+    if this.asyncSaving()
+      return QueryFailure.Provider(ProviderFailure.State("asynchronous save is active"))
+    end
     let key = this.key(this.captureRow(entity))
 
     if key == null
@@ -2469,6 +3268,9 @@ class EntityTracker<T>
   ## Rebases one pending update or delete onto explicitly supplied database values.
   ## Local writable fields are preserved; store-owned fields take fresh values.
   public def rebase(entity: T, databaseEntity: T): QueryFailure?
+    if this.asyncSaving()
+      return QueryFailure.Provider(ProviderFailure.State("asynchronous save is active"))
+    end
     let local = this.captureRow(entity)
     let key = this.key(local)
 
@@ -2501,6 +3303,10 @@ class EntityTracker<T>
       return QueryFailure.UnsupportedCapability("cannot rebase an entity already saved in an active transaction")
     end
     let fresh = this.captureRow(databaseEntity)
+
+    if this.hierarchyMismatch(tracked, fresh)
+      return QueryFailure.UnsupportedCapability("hierarchy refresh cannot change a tracked discriminator")
+    end
     let metadataError = this.validateMetadata()
 
     if metadataError != null
@@ -2510,6 +3316,16 @@ class EntityTracker<T>
 
     if rowError != null
       return QueryFailure.Provider(ProviderFailure.State(rowError))
+    end
+    let alternateError = immutableKeysFailure(tracked, entry.original, this.alternateKeyColumns)
+
+    if alternateError != null
+      return QueryFailure.Provider(ProviderFailure.State(alternateError))
+    end
+    let freshAlternateError = immutableKeysFailure(fresh, entry.original, this.alternateKeyColumns)
+
+    if freshAlternateError != null
+      return QueryFailure.Provider(ProviderFailure.State(freshAlternateError))
     end
     if !sameOptionalCell(key, this.key(entry.original)) || !sameOptionalCell(key, this.key(fresh))
       return QueryFailure.Provider(ProviderFailure.State("rebase key mismatch"))
@@ -2542,6 +3358,9 @@ class EntityTracker<T>
   ## Explicit store-wins refresh from a separately fetched entity of the same key.
   ## Validation completes before any mapped field on the tracked instance changes.
   public def refreshFrom(entity: T, databaseEntity: T): QueryFailure?
+    if this.asyncSaving()
+      return QueryFailure.Provider(ProviderFailure.State("asynchronous save is active"))
+    end
     let apply = this.applyRow
 
     if apply == null
@@ -2589,10 +3408,24 @@ class EntityTracker<T>
       return QueryFailure.UnsupportedCapability("cannot refresh an entity already saved in an active transaction")
     end
     let fresh = this.captureRow(databaseEntity)
+
+    if this.hierarchyMismatch(tracked, fresh)
+      return QueryFailure.UnsupportedCapability("hierarchy refresh cannot change a tracked discriminator")
+    end
     let freshError = this.validateRow(fresh)
 
     if freshError != null
       return QueryFailure.Provider(ProviderFailure.State(freshError))
+    end
+    let alternateError = immutableKeysFailure(tracked, entry.original, this.alternateKeyColumns)
+
+    if alternateError != null
+      return QueryFailure.Provider(ProviderFailure.State(alternateError))
+    end
+    let freshAlternateError = immutableKeysFailure(fresh, entry.original, this.alternateKeyColumns)
+
+    if freshAlternateError != null
+      return QueryFailure.Provider(ProviderFailure.State(freshAlternateError))
     end
     if !sameOptionalCell(key, this.key(entry.original)) || !sameOptionalCell(key, this.key(fresh))
       return QueryFailure.Provider(ProviderFailure.State("refresh key mismatch"))
@@ -2610,6 +3443,9 @@ class EntityTracker<T>
 
   ## Discards every tracked state in this entity set without changing the database.
   public def clear(): Void
+    if this.asyncSaving()
+      return
+    end
     if this.transactionActive
       var current = this.entries
 
@@ -2629,6 +3465,12 @@ class EntityTracker<T>
       end
       this.entries = null
       this.lastEntry = null
+      var observer = this.clearObservers
+
+      while observer != null
+        observer.action()
+        observer = observer.next
+      end
     end
   end
 
@@ -2671,6 +3513,7 @@ class EntityTracker<T>
       entry.pendingGeneratedValues = checkpoint.pendingGeneratedValues
       entry.transactionWritten = checkpoint.transactionWritten
       entry.transactionGeneratedApplied = checkpoint.transactionGeneratedApplied
+      entry.generatedIdentityPropagated = checkpoint.generatedIdentityPropagated
       entry.transactionGeneratedBefore = checkpoint.transactionGeneratedBefore
       entry.transactionGeneratedLast = checkpoint.transactionGeneratedLast
       entry.saveGeneratedBefore = checkpoint.saveGeneratedBefore
@@ -2687,6 +3530,7 @@ class EntityTracker<T>
             case Cell.Bool(value)
             case Cell.Text(value)
             case Cell.Float(value)
+            case Cell.Binary(value)
           end
         end
       end
@@ -2759,6 +3603,7 @@ class EntityTracker<T>
       checkpoint.entry.state = checkpoint.state
       checkpoint.entry.generation = checkpoint.generation
       checkpoint.entry.graphIdentity = checkpoint.graphIdentity
+      checkpoint.entry.generatedIdentityPropagated = checkpoint.generatedIdentityPropagated
       checkpoint.entry.pending = null
       checkpoint = checkpoint.next
     end
@@ -2855,6 +3700,7 @@ class EntityTracker<T>
             case Cell.Bool(value)
             case Cell.Text(value)
             case Cell.Float(value)
+            case Cell.Binary(value)
           end
         end
       end
@@ -2888,6 +3734,7 @@ class EntityTracker<T>
       current.pendingWrite = false
       current.transactionWritten = false
       current.transactionGeneratedApplied = false
+      current.generatedIdentityPropagated = false
       current.transactionGeneratedBefore = null
       current.transactionGeneratedLast = null
       current = current.next
@@ -2895,13 +3742,90 @@ class EntityTracker<T>
   end
 
   ## Reuses tracked instances for rows with the same key.
-  public def resolveRows(rows: TypedRows<T>): QueryResult<T>
+  public def observeMaterialization(action: fn(): QueryFailure?): Void
+    this.materializationObservers = new MaterializationObserver(action, this.materializationObservers)
+  end
+
+  public def observeEnrollment(action: fn(): QueryFailure?): Void
+    this.enrollmentObservers = new MaterializationObserver(action, this.enrollmentObservers)
+  end
+
+  public def observeClear(action: fn(): Void): Void
+    let callback: fn(): QueryFailure? = fn(): QueryFailure? do
+      action()
+      return null
+    end
+
+    this.clearObservers = new MaterializationObserver(callback, this.clearObservers)
+  end
+
+  private def enrollmentSnapshot(journal: GraphJournal): QueryFailure?
+    if this.notifyingEnrollment
+      return QueryFailure.Provider(ProviderFailure.State("tracker enrollment observer cannot recursively enroll its tracker"))
+    end
+    let context = this.changeSet().context()
+
+    if context != null
+      return context.journalEnrollment(journal)
+    end
+    this.graphActionSnapshot(journal)
+    return null
+  end
+
+  private def notifyEnrollment(): QueryFailure?
+    if this.notifyingEnrollment
+      return QueryFailure.Provider(ProviderFailure.State("tracker enrollment observer cannot recursively enroll its tracker"))
+    end
+    if this.enrollmentObservers == null
+      return null
+    end
+    let context = this.changeSet().context()
+
+    if context != null
+      let admission = context.beginEnrollmentObserver()
+
+      if admission != null
+        return admission
+      end
+    end
+    this.notifyingEnrollment = true
+    var observer = this.enrollmentObservers
+
+    while observer != null
+      let failure = observer.action()
+
+      if failure != null
+        this.notifyingEnrollment = false
+        context.endEnrollmentObserver() if context != null
+        return failure
+      end
+      observer = observer.next
+    end
+    this.notifyingEnrollment = false
+    context.endEnrollmentObserver() if context != null
+    return null
+  end
+
+  public override def resolveRows(rows: TypedRows<T>): QueryResult<T>
+    if this.asyncSaving()
+      return QueryResult<T>.Failure(QueryFailure.Provider(ProviderFailure.State("asynchronous save is active")))
+    end
+    let hierarchyFailure = this.validateHierarchyRows(rows)
+
+    if hierarchyFailure != null
+      return QueryResult<T>.Failure(hierarchyFailure)
+    end
     let resolved = new TypedRows<T>()
     var current = rows.first()
 
     while current != null
       let entity = current.value
       let row = this.captureRow(entity)
+      let invalid = this.validateKey(row)
+
+      if invalid != null
+        return QueryResult<T>.Failure(invalid)
+      end
       let key = this.key(row)
 
       if key == null
@@ -2917,8 +3841,9 @@ class EntityTracker<T>
           case EntityState.Detached()
             existing.generation = existing.generation + 1
             existing.graphIdentity = new GraphIdentity()
+            existing.generatedIdentityPropagated = false
             existing.entity = entity
-            existing.original = row
+            existing.original = copyRow(row, this.columns)
             existing.state = EntityState.Unchanged()
             resolved.add(entity)
           case EntityState.Added()
@@ -2931,10 +3856,106 @@ class EntityTracker<T>
       end
       current = current.next
     end
+    var observer = this.materializationObservers
+
+    while observer != null
+      let failure = observer.action()
+
+      if failure != null
+        return QueryResult<T>.Failure(failure)
+      end
+      observer = observer.next
+    end
     return QueryResult<T>.Rows(resolved)
   end
 
+  ## Validates the canonical identity's materialization type without enrollment.
+  internal def validateMaterializationIdentity(entity: T, accepts: fn(T): Bool): QueryFailure?
+    if this.asyncSaving()
+      return QueryFailure.Provider(ProviderFailure.State("asynchronous save is active"))
+    end
+    let row = this.captureRow(entity)
+    let invalid = this.validateKey(row)
+
+    if invalid != null
+      return invalid
+    end
+    let key = this.key(row)
+
+    if key == null
+      return QueryFailure.Provider(ProviderFailure.State("decoded entity key is missing"))
+    end
+    let existing = this.find(key)
+    var canonical = entity
+
+    if existing != null
+      match existing.state
+        case EntityState.Detached()
+        case EntityState.Added()
+          canonical = existing.entity
+        case EntityState.Unchanged()
+          canonical = existing.entity
+        case EntityState.Deleted()
+          canonical = existing.entity
+      end
+    end
+    if this.hierarchyMismatch(this.captureRow(canonical), row)
+      return QueryFailure.UnsupportedCapability("tracked hierarchy identity has a different discriminator")
+    end
+    return accepts(canonical) ? null : QueryFailure.UnsupportedCapability("tracked hierarchy identity has a different subtype")
+  end
+
+  private def hierarchyMismatch(first: RawRow, second: RawRow): Bool
+    let column = this.hierarchyColumn
+
+    return column != null && !sameOptionalCell(cellFromRow(first, column), cellFromRow(second, column))
+  end
+
+  private def validateHierarchyRows(rows: TypedRows<T>): QueryFailure?
+    let column = this.hierarchyColumn
+
+    if column == null
+      return null
+    end
+    let accepts: fn(T): Bool = fn(entity: T): Bool do
+      return true
+    end
+    var identities: HierarchyMaterializationIdentity? = null
+    var current = rows.first()
+
+    while current != null
+      let invalid = this.validateMaterializationIdentity(current.value, accepts)
+
+      if invalid != null
+        return invalid
+      end
+      let row = this.captureRow(current.value)
+      let key = this.key(row)
+      let discriminator = cellFromRow(row, column)
+
+      if key == null || discriminator == null
+        return QueryFailure.MissingColumn(column)
+      end
+      var previous = identities
+
+      while previous != null
+        if sameCell(previous.key, key) && !sameCell(previous.discriminator, discriminator)
+          return QueryFailure.UnsupportedCapability("materialized hierarchy rows share a key with different discriminators")
+        end
+        previous = previous.next
+      end
+      identities = new HierarchyMaterializationIdentity(key, discriminator, identities)
+      current = current.next
+    end
+    return null
+  end
+
   internal def prepare(batch: WriteBatch, dialect: SqlDialect): String?
+    let identifierError = this.validateDialectIdentifiers(dialect)
+
+    if identifierError != null
+      return identifierError
+    end
     let metadataError = this.validateMetadata()
 
     if metadataError != null
@@ -2953,7 +3974,34 @@ class EntityTracker<T>
     return null
   end
 
+  private def validateDialectIdentifiers(dialect: SqlDialect): String?
+    match dialect
+      case SqlDialect.QuestionMark()
+        return null
+      case SqlDialect.PostgreSql()
+        if host::stringByteLength(this.tableName) > 63
+          return "PostgreSQL table identifier exceeds 63 bytes: " + this.tableName
+        end
+        var index = 0
+
+        while index < this.columns.count()
+          let name = this.columns.at(index).name()
+
+          if host::stringByteLength(name) > 63
+            return "PostgreSQL column identifier exceeds 63 bytes: " + name
+          end
+          index = index + 1
+        end
+        return null
+    end
+  end
+
   private def prepareEntry(current: TrackedEntry<T>, batch: WriteBatch, dialect: SqlDialect): String?
+    let identifierError = this.validateDialectIdentifiers(dialect)
+
+    if identifierError != null
+      return identifierError
+    end
     current.pending = null
     current.pendingWrite = false
     current.pendingCommandIndex = -1
@@ -2961,8 +4009,9 @@ class EntityTracker<T>
     current.pendingGeneratedValues = null
     match current.state
       case EntityState.Added()
-        let snapshot = this.captureRow(current.entity)
-        let rowError = this.validateRow(snapshot)
+        let captured = this.captureRow(current.entity)
+        let snapshot = copyRow(captured, this.columns)
+        let rowError = this.validateRow(captured)
 
         if rowError != null
           return rowError
@@ -2971,6 +4020,11 @@ class EntityTracker<T>
 
         if !sameOptionalCell(key, this.key(current.original))
           return "tracked entity key changed"
+        end
+        let alternateError = immutableKeysFailure(snapshot, current.original, this.alternateKeyColumns)
+
+        if alternateError != null
+          return alternateError
         end
         current.pending = snapshot
         let error = this.prepareInsert(batch, snapshot, dialect)
@@ -2981,8 +4035,9 @@ class EntityTracker<T>
         current.pendingWrite = true
         current.pendingCommandIndex = batch.count() - 1
       case EntityState.Unchanged()
-        let snapshot = this.captureRow(current.entity)
-        let rowError = this.validateRow(snapshot)
+        let captured = this.captureRow(current.entity)
+        let snapshot = copyRow(captured, this.columns)
+        let rowError = this.validateRow(captured)
 
         if rowError != null
           return rowError
@@ -2991,6 +4046,11 @@ class EntityTracker<T>
 
         if !sameOptionalCell(key, this.key(current.original))
           return "tracked entity key changed"
+        end
+        let alternateError = immutableKeysFailure(snapshot, current.original, this.alternateKeyColumns)
+
+        if alternateError != null
+          return alternateError
         end
         current.pending = snapshot
         let beforeCommands = batch.count()
@@ -3004,14 +4064,20 @@ class EntityTracker<T>
           current.pendingCommandIndex = batch.count() - 1
         end
       case EntityState.Deleted()
-        let snapshot = this.captureRow(current.entity)
-        let rowError = this.validateRow(snapshot)
+        let captured = this.captureRow(current.entity)
+        let snapshot = copyRow(captured, this.columns)
+        let rowError = this.validateRow(captured)
 
         if rowError != null
           return rowError
         end
         if !sameOptionalCell(this.key(snapshot), this.key(current.original))
           return "tracked entity key changed"
+        end
+        let alternateError = immutableKeysFailure(snapshot, current.original, this.alternateKeyColumns)
+
+        if alternateError != null
+          return alternateError
         end
         let error = this.prepareDelete(batch, current.original, dialect)
 
@@ -3034,6 +4100,17 @@ class EntityTracker<T>
 
     while current != null
       current.actionId = -1
+      var other = current.next
+
+      while other != null
+        if trackingStateActive(current.state) && trackingStateActive(other.state) && sameOptionalCell(
+          this.key(current.original),
+          this.key(other.original)
+        )
+          return "different graph entities resolved to the same tracked primary key"
+        end
+        other = other.next
+      end
       match current.state
         case EntityState.Detached()
         case EntityState.Added()
@@ -3070,6 +4147,11 @@ class EntityTracker<T>
     if !sameOptionalCell(this.key(snapshot), this.key(entry.original))
       return "tracked entity key changed"
     end
+    let alternateError = immutableKeysFailure(snapshot, entry.original, this.alternateKeyColumns)
+
+    if alternateError != null
+      return alternateError
+    end
     let tracker = this
     let prepare: fn(WriteBatch, SqlDialect): String? = fn(batch: WriteBatch, dialect: SqlDialect): String? do
       return tracker.prepareEntry(entry, batch, dialect)
@@ -3098,12 +4180,24 @@ class EntityTracker<T>
     if this.generatedColumns.Length > 0 && this.applyGenerated == null
       return "generated columns require an apply callback"
     end
-    var keyFound = false
+    if this.keyColumns.Length == 0 || (this.generatedKey && this.keyColumns.Length != 1)
+      return "tracked key requires one or more assigned columns; generated key requires one column"
+    end
+    var keyFound = 0
+    var hierarchyFound = false
+    let hierarchyColumn = this.hierarchyColumn
     var index = 0
 
     while index < this.columns.count()
       let column = this.columns.at(index)
       let name = column.name()
+
+      if hierarchyColumn != null && name == hierarchyColumn
+        if column.nullable() || generatedKindCode(column.kind()) != 4
+          return "hierarchy discriminator must be a required text column"
+        end
+        hierarchyFound = true
+      end
 
       if !identifierValid(name)
         return "invalid tracked column identifier"
@@ -3116,8 +4210,8 @@ class EntityTracker<T>
         end
         previous = previous + 1
       end
-      if name == this.keyName
-        keyFound = true
+      if this.isKeyColumn(name)
+        keyFound = keyFound + 1
 
         if column.nullable()
           return "tracked key must be required"
@@ -3132,19 +4226,42 @@ class EntityTracker<T>
             if this.generatedKey
               return "generated key must be an integer"
             end
+          case ResultColumnKind.Binary()
+            return "tracked key must be integer or string"
         end
       end
       index = index + 1
     end
-    if !keyFound
-      return "tracked key column is missing"
+    if keyFound != this.keyColumns.Length
+      return "tracked key columns are missing or duplicated"
+    end
+    if hierarchyColumn != null && !hierarchyFound
+      return "hierarchy discriminator column is missing"
+    end
+    for tuple in this.alternateKeyColumns
+      let invalid = keyTupleMetadataFailure(tuple, this.columns, false)
+
+      if invalid != null
+        return invalid
+      end
+    end
+    for tuple in this.foreignKeyColumns
+      let invalid = keyTupleMetadataFailure(tuple, this.columns, true)
+
+      if invalid != null
+        return invalid
+      end
     end
     var generated = 0
 
     while generated < this.generatedColumns.Length
       let definition = this.generatedColumns[generated].column()
 
-      if definition.name() == this.keyName
+      if this.generatedColumns[generated].canonicalDecimal() && generatedKindCode(definition.kind()) != 4
+        return "canonical decimal generated column requires text storage"
+      end
+
+      if this.isKeyColumn(definition.name())
         return "generated scalar column must not be the key"
       end
       var matching = false
@@ -3182,7 +4299,7 @@ class EntityTracker<T>
       while token < concurrency.Length
         let name = concurrency[token]
 
-        if !identifierValid(name) || name == this.keyName
+        if !identifierValid(name) || this.isKeyColumn(name)
           return "concurrency column must be a mapped non-key column: " + name
         end
         var found = false
@@ -3210,7 +4327,7 @@ class EntityTracker<T>
   end
 
   private def predicateIncludes(name: String): Bool
-    if name == this.keyName
+    if this.isKeyColumn(name)
       return true
     end
     let concurrency = this.concurrencyColumns
@@ -3376,6 +4493,19 @@ class EntityTracker<T>
       end
       index = index + 1
     end
+    for tuple in this.foreignKeyColumns
+      match compositeKeyCell(row, tuple)
+        case Cell.Bool(value)
+          return "captured foreign key tuple is partial-null or invalid"
+        case Cell.Null()
+        case Cell.Int(value)
+        case Cell.Text(value)
+        case Cell.Float(value)
+          return "captured foreign key tuple is invalid"
+        case Cell.Binary(value)
+          return "captured foreign key tuple is invalid"
+      end
+    end
     return null
   end
 
@@ -3390,14 +4520,34 @@ class EntityTracker<T>
     return result
   end
 
+  private def writeLayoutFor(row: RawRow): TrackedWriteLayout
+    let select = this.writeLayout
+
+    return select == null ? new TrackedWriteLayout(this.tableName, this.columns) : select(row)
+  end
+
+  private def writeLayoutFailure(row: RawRow, layout: TrackedWriteLayout, dialect: SqlDialect): String?
+    if this.writeLayout == null
+      return null
+    end
+    return layout.failure(row, this.columns, this.keyColumns, this.concurrencyColumns, this.generatedColumns, dialect)
+  end
+
   private def prepareInsert(batch: WriteBatch, row: RawRow, dialect: SqlDialect): String?
+    let layout = this.writeLayoutFor(row)
+    let invalid = this.writeLayoutFailure(row, layout, dialect)
+
+    if invalid != null
+      return invalid
+    end
+    let columns = layout.columns()
     var names = ""
     var markers = ""
     let values = new WriteValues()
     var index = 0
 
-    while index < this.columns.count()
-      let column = this.columns.at(index).name()
+    while index < columns.count()
+      let column = columns.at(index).name()
 
       if !identifierValid(column)
         return "invalid tracked column identifier"
@@ -3420,10 +4570,10 @@ class EntityTracker<T>
     let suffix = returning == null ? "" : this.returningSql(returning)
 
     if values.count() == 0
-      batch.add("INSERT INTO \"" + this.tableName + "\" DEFAULT VALUES" + suffix, values, 1, returning)
+      batch.add("INSERT INTO \"" + layout.table() + "\" DEFAULT VALUES" + suffix, values, 1, returning)
     else
       batch.add(
-        "INSERT INTO \"" + this.tableName + "\" (" + names + ") VALUES (" + markers + ")" + suffix,
+        "INSERT INTO \"" + layout.table() + "\" (" + names + ") VALUES (" + markers + ")" + suffix,
         values,
         1,
         returning
@@ -3433,18 +4583,28 @@ class EntityTracker<T>
   end
 
   private def prepareUpdate(batch: WriteBatch, original: RawRow, snapshot: RawRow, dialect: SqlDialect): String?
+    let layout = this.writeLayoutFor(snapshot)
+    let invalid = this.writeLayoutFailure(snapshot, layout, dialect)
+
+    if invalid != null
+      return invalid
+    end
+    if !layout.compatible(this.writeLayoutFor(original))
+      return "tracked entity physical write layout changed"
+    end
+    let columns = layout.columns()
     let values = new WriteValues()
     var assignments = ""
     var separator = ""
     var index = 0
 
-    while index < this.columns.count()
-      let column = this.columns.at(index).name()
+    while index < columns.count()
+      let column = columns.at(index).name()
 
       if !identifierValid(column)
         return "invalid tracked column identifier"
       end
-      if column != this.keyName
+      if !this.isKeyColumn(column)
         let before = cellFromRow(original, column)
         let after = cellFromRow(snapshot, column)
 
@@ -3462,10 +4622,29 @@ class EntityTracker<T>
       end
       index = index + 1
     end
+    if this.snapshotsEqual(original, snapshot)
+      return null
+    end
+    if assignments == "" && this.writeLayout != null
+      let concurrency = this.concurrencyColumns
+      var requiresUpdate = concurrency == null
+
+      if concurrency != null && concurrency.Length > 0
+        requiresUpdate = true
+      end
+      for definition in this.generatedColumns
+        if this.generatedOnUpdate(definition.column().name())
+          requiresUpdate = true
+        end
+      end
+      if requiresUpdate
+        assignments = "\"" + this.keyName + "\" = \"" + this.keyName + "\""
+      end
+    end
     if assignments == ""
       return null
     end
-    let predicate = this.originalPredicate(original, values, dialect)
+    let predicate = this.originalPredicate(original, values, dialect, columns)
 
     if predicate == null
       return "captured entity column is missing"
@@ -3474,7 +4653,7 @@ class EntityTracker<T>
     let suffix = returning == null ? "" : this.returningSql(returning)
 
     batch.add(
-      "UPDATE \"" + this.tableName + "\" SET " + assignments + " WHERE " + predicate + suffix,
+      "UPDATE \"" + layout.table() + "\" SET " + assignments + " WHERE " + predicate + suffix,
       values,
       1,
       returning
@@ -3482,23 +4661,40 @@ class EntityTracker<T>
     return null
   end
 
+  private def snapshotsEqual(left: RawRow, right: RawRow): Bool
+    let comparer = this.snapshotEqual
+
+    return comparer == null ? sameRows(left, right, this.columns) : comparer(left, right)
+  end
+
   private def prepareDelete(batch: WriteBatch, original: RawRow, dialect: SqlDialect): String?
+    let layout = this.writeLayoutFor(original)
+    let invalid = this.writeLayoutFailure(original, layout, dialect)
+
+    if invalid != null
+      return invalid
+    end
     let values = new WriteValues()
-    let predicate = this.originalPredicate(original, values, dialect)
+    let predicate = this.originalPredicate(original, values, dialect, layout.columns())
 
     if predicate == null
       return "captured entity column is missing"
     end
-    batch.add("DELETE FROM \"" + this.tableName + "\" WHERE " + predicate, values, 1)
+    batch.add("DELETE FROM \"" + layout.table() + "\" WHERE " + predicate, values, 1)
     return null
   end
 
-  private def originalPredicate(row: RawRow, values: WriteValues, dialect: SqlDialect): String?
+  private def originalPredicate(
+    row: RawRow,
+    values: WriteValues,
+    dialect: SqlDialect,
+    columns: readonly ResultColumns
+  ): String?
     var sql = ""
     var index = 0
 
-    while index < this.columns.count()
-      let column = this.columns.at(index).name()
+    while index < columns.count()
+      let column = columns.at(index).name()
 
       if this.predicateIncludes(column)
         let cell = cellFromRow(row, column)
@@ -3520,6 +4716,9 @@ class EntityTracker<T>
             values.add(cell)
             sql = sql + " = " + dialectPlaceholder(dialect, values.count())
           case Cell.Text(value)
+            values.add(cell)
+            sql = sql + " = " + dialectPlaceholder(dialect, values.count())
+          case Cell.Binary(value)
             values.add(cell)
             sql = sql + " = " + dialectPlaceholder(dialect, values.count())
         end
@@ -3567,6 +4766,11 @@ class EntityTracker<T>
           if value == null || !writeCellMatches(value, descriptor)
             return "generated write returned a type or nullability mismatch: " + descriptor.name()
           end
+          let definition = this.generatedColumn(descriptor.name())
+
+          if definition != null && definition.canonicalDecimal() && !generatedDecimalMatches(value)
+            return "generated write returned invalid or noncanonical decimal text: " + descriptor.name()
+          end
           index = index + 1
         end
         current.pendingGeneratedValues = copyRow(row, expected)
@@ -3583,7 +4787,7 @@ class EntityTracker<T>
               while other != null
                 let otherKey = other.pendingGeneratedKey
 
-                if otherKey != null && otherKey == value
+                if !reference::same(other, current) && otherKey != null && otherKey == value
                   return "generated key collides with another returned key"
                 end
                 match other.state
@@ -3636,6 +4840,8 @@ class EntityTracker<T>
               return "generated insert returned a non-integer key"
             case Cell.Float(value)
               return "generated insert returned a non-integer key"
+            case Cell.Binary(value)
+              return "generated insert returned a non-integer key"
           end
         end
       end
@@ -3683,7 +4889,11 @@ class EntityTracker<T>
       end
       if generated != null || returned != null
         current.transactionGeneratedApplied = true if this.transactionActive
-        current.pending = this.captureRow(current.entity)
+        let pending = current.pending
+
+        if pending != null && returned != null
+          current.pending = overlayReturnedRow(pending, returned)
+        end
         current.pendingGeneratedKey = null
         current.pendingGeneratedValues = null
       end
@@ -3754,39 +4964,60 @@ def writeCellMatches(cell: Cell, column: readonly ResultColumn): Bool
           return false
         case ResultColumnKind.Text()
           return false
+        case ResultColumnKind.Binary()
+          return false
       end
     case Cell.Int(value)
       match column.kind()
-        case ResultColumnKind.Int()
-          return true
         case ResultColumnKind.Bool()
           return false
+        case ResultColumnKind.Int()
+          return true
         case ResultColumnKind.Float()
           return false
         case ResultColumnKind.Text()
+          return false
+        case ResultColumnKind.Binary()
           return false
       end
     case Cell.Float(value)
       match column.kind()
-        case ResultColumnKind.Float()
-          return dataFloatFinite(value)
         case ResultColumnKind.Bool()
           return false
         case ResultColumnKind.Int()
           return false
+        case ResultColumnKind.Float()
+          return dataFloatFinite(value)
         case ResultColumnKind.Text()
+          return false
+        case ResultColumnKind.Binary()
           return false
       end
     case Cell.Text(value)
       match column.kind()
-        case ResultColumnKind.Text()
-          return true
         case ResultColumnKind.Bool()
           return false
         case ResultColumnKind.Int()
           return false
         case ResultColumnKind.Float()
           return false
+        case ResultColumnKind.Text()
+          return true
+        case ResultColumnKind.Binary()
+          return false
+      end
+    case Cell.Binary(value)
+      match column.kind()
+        case ResultColumnKind.Bool()
+          return false
+        case ResultColumnKind.Int()
+          return false
+        case ResultColumnKind.Float()
+          return false
+        case ResultColumnKind.Text()
+          return false
+        case ResultColumnKind.Binary()
+          return value.length() <= 134217728
       end
   end
 end
@@ -3820,8 +5051,80 @@ def relationshipQueryWriteFailure(error: QueryFailure): WriteFailure
 end
 
 ## One context coordinates all mapped entity trackers and one atomic provider write.
+## Keeps context admission closed until a set operation's recovery finishes.
+class AsyncContextSetDriver: AsyncWriteDriver
+  private context: ChangeContext
+  private provider: Provider
+  private underlying: AsyncWriteDriver
+  private lease: Int?
+  private terminal: WriteResult?
+  private disposed: Bool = false
+
+  def init(context: ChangeContext, provider: Provider, driver: AsyncWriteDriver, lease: Int?): Void
+    this.context = context
+    this.provider = provider
+    this.underlying = driver
+    this.lease = lease
+  end
+
+  private def finish(result: WriteResult): WriteResult
+    let existing = this.terminal
+
+    if existing != null
+      return existing
+    end
+    let terminal = this.context.asyncSetFinished(result, this.provider, this.lease)
+
+    this.terminal = terminal
+    return terminal
+  end
+
+  public override def poll(): AsyncWritePoll
+    let terminal = this.terminal
+
+    if terminal != null
+      return AsyncWritePoll.Completed(terminal)
+    end
+    match this.underlying.poll()
+      case AsyncWritePoll.Pending(socket, interest)
+        return AsyncWritePoll.Pending(socket, interest)
+      case AsyncWritePoll.Completed(result)
+        return AsyncWritePoll.Completed(this.finish(result))
+    end
+  end
+
+  public override def cancel(): Void
+    if this.terminal == null
+      this.underlying.cancel()
+    end
+  end
+
+  public override def close(): WriteFailure?
+    if this.disposed
+      return null
+    end
+    this.disposed = true
+    let error = this.underlying.close()
+
+    if this.terminal == null
+      match this.underlying.poll()
+        case AsyncWritePoll.Completed(result)
+          this.finish(result)
+        case AsyncWritePoll.Pending(socket, interest)
+          let finalize: fn(WriteResult): WriteResult = fn(result: WriteResult): WriteResult do
+            return this.finish(result)
+          end
+
+          this.underlying.deferFinalize(finalize)
+      end
+    end
+    return error
+  end
+end
+
 class ChangeContext
   private boundProvider: Provider?
+  private firstNavigation: NavigationRegistrationEntry?
   private firstSet: ChangeSetNode?
   private lastSet: ChangeSetNode?
   private firstEdge: RelationshipEdge?
@@ -3829,9 +5132,522 @@ class ChangeContext
   private lease: Int?
   private transactionFailed: Bool = false
   private graphRegistrationActive: Bool = false
+  private activeSave: AsyncSaveDriver?
+  private activeControl: AsyncContextTransactionDriver?
+  private activeSet: AsyncContextSetDriver?
+  private firstInterceptor: SaveInterceptorEntry?
+  private lastInterceptor: SaveInterceptorEntry?
+  private intercepting: Bool = false
+  private borrowedTransaction: Bool = false
+  private saveIntercepted: Bool = false
+  private detecting: Bool = false
+  private firstDetector: ChangeDetectorEntry?
+  private lastDetector: ChangeDetectorEntry?
+  private detectorCount: Int = 0
 
   def init(provider: Provider? = null): Void
     this.boundProvider = provider
+  end
+
+  ## Registers the declared member shape and its typed deferred traversal.
+  public def registerNavigation<A, B>(
+    sourceType: String,
+    member: String,
+    resultType: String,
+    step: NavigationStep<A, B>
+  ): Void
+    this.firstNavigation = new NavigationRegistration<A, B>(sourceType, member, resultType, step, this.firstNavigation)
+  end
+
+  internal def resolveNavigation<A, B>(tree: readonly quotation::Tree): NavigationStep<A, B>
+    if tree.parameterCount() != 1 || tree.captureCount() != 0 || tree.count() != 2
+      return failedNavigationStep<A, B>(QueryFailure.UnsupportedCapability("navigation selector must be a direct entity member"))
+    end
+    let member = tree.nodeAt(tree.root())
+
+    if member == null || translationNodeCode(member.kind()) != 2
+      return failedNavigationStep<A, B>(QueryFailure.UnsupportedCapability("navigation selector must be a direct entity member"))
+    end
+    let parameter = tree.nodeAt(member.first())
+    let sourceType = tree.parameterTypeAt(0)
+
+    if parameter == null || translationNodeCode(parameter.kind()) != 0 || parameter.index() != 0 || sourceType == null || parameter.typeName() != sourceType || member.typeName() != tree.resultType()
+      return failedNavigationStep<A, B>(QueryFailure.UnsupportedCapability("navigation selector member identity or type is invalid"))
+    end
+    var current = this.firstNavigation
+    var selected: NavigationStep<A, B>? = null
+
+    while current != null
+      if current.sourceType == sourceType && current.member == member.identity()
+        let typed = reference::cast<NavigationRegistration<A, B>, NavigationRegistrationEntry>(current)
+
+        if typed == null || current.resultType != member.typeName()
+          return failedNavigationStep<A, B>(QueryFailure.UnsupportedCapability("navigation selector member identity or type does not match registration"))
+        end
+        if selected != null
+          return failedNavigationStep<A, B>(QueryFailure.UnsupportedCapability("navigation selector member has multiple registrations"))
+        end
+        selected = typed.step
+      end
+      current = current.next
+    end
+    if selected == null
+      return failedNavigationStep<A, B>(QueryFailure.UnsupportedCapability("navigation selector member is not registered in this change context"))
+    end
+    return selected
+  end
+
+  public def addSaveInterceptor(interceptor: SaveInterceptor): WriteFailure?
+    if this.intercepting || this.activeSave != null || this.activeControl != null || this.activeSet != null || this.graphRegistrationActive
+      return WriteFailure.Transaction("context operation is already active")
+    end
+    let entry = new SaveInterceptorEntry(interceptor)
+    let last = this.lastInterceptor
+
+    if last == null
+      this.firstInterceptor = entry
+    else
+      last.next = entry
+    end
+    this.lastInterceptor = entry
+    return null
+  end
+
+  public def registerChangeDetector(detector: fn(GraphJournal): QueryFailure?): WriteFailure?
+    if this.detecting || !this.canRetrySave()
+      return WriteFailure.Transaction("change detector registration requires an idle context")
+    end
+    if this.detectorCount >= 1000
+      return WriteFailure.Validation("change detector registration exceeds 1000 entries")
+    end
+    let entry = new ChangeDetectorEntry(detector)
+    let last = this.lastDetector
+
+    if last == null
+      this.firstDetector = entry
+    else
+      last.next = entry
+    end
+    this.lastDetector = entry
+    this.detectorCount = this.detectorCount + 1
+    return null
+  end
+
+  public def journalChanges(journal: GraphJournal): QueryFailure?
+    if this.graphRegistrationActive
+      return QueryFailure.Provider(ProviderFailure.State("tracking journal requires an idle context"))
+    end
+    return this.journalEnrollment(journal)
+  end
+
+  internal def journalEnrollment(journal: GraphJournal): QueryFailure?
+    if this.intercepting || this.activeSave != null || this.activeControl != null || this.activeSet != null || this.transactionFailed
+      return QueryFailure.Provider(ProviderFailure.State("tracking journal requires an idle or enrolling context"))
+    end
+    var set = this.firstSet
+
+    while set != null
+      set.value.graphActionSnapshot(journal)
+      set = set.next
+    end
+    let firstBefore = this.firstEdge
+    let lastBefore = this.lastEdge
+    let context = this
+    let undo: fn(): Void = fn(): Void do
+      context.firstEdge = firstBefore
+      context.lastEdge = lastBefore
+      lastBefore.next = null if lastBefore != null
+    end
+
+    journal.record(undo)
+    var edge = this.firstEdge
+
+    while edge != null
+      edge.journalState(journal)
+      edge = edge.next
+    end
+    return null
+  end
+
+  internal def beginEnrollmentObserver(): QueryFailure?
+    if this.intercepting || this.activeSave != null || this.activeControl != null || this.activeSet != null || this.transactionFailed
+      return QueryFailure.Provider(ProviderFailure.State("enrollment observer requires an idle or enrolling context"))
+    end
+    this.intercepting = true
+    return null
+  end
+
+  internal def endEnrollmentObserver(): Void
+    this.intercepting = false
+  end
+
+  private def beforeSaving(): WriteFailure?
+    if this.detecting || this.intercepting || this.saveIntercepted || this.activeSave != null || this.activeControl != null || this.activeSet != null || this.graphRegistrationActive || this.transactionFailed
+      return WriteFailure.Transaction("context operation is already active or uncertain")
+    end
+    this.detecting = true
+    var set = this.firstSet
+
+    while set != null
+      let identityError = set.value.validateIdentity()
+
+      if identityError != null
+        this.detecting = false
+        return WriteFailure.Validation(identityError)
+      end
+      set = set.next
+    end
+    let journal = new GraphJournal()
+    let snapshotError = this.journalChanges(journal)
+
+    if snapshotError != null
+      this.detecting = false
+      return WriteFailure.Validation("change detection could not capture an idle tracking journal")
+    end
+    var detector = this.firstDetector
+
+    while detector != null
+      let error = detector.detect(journal)
+
+      if error != null
+        journal.rollback()
+        this.detecting = false
+        return detectorWriteFailure(error)
+      end
+      detector = detector.next
+    end
+    journal.discard()
+    this.detecting = false
+    this.intercepting = true
+    var current = this.firstInterceptor
+
+    while current != null
+      let error = current.interceptor.beforeSave(this)
+
+      if error != null
+        this.intercepting = false
+        return error
+      end
+      current = current.next
+    end
+    this.intercepting = false
+    this.saveIntercepted = true
+    return null
+  end
+
+  internal def saveOutcome(result: WriteResult): Void
+    if !this.saveIntercepted
+      return
+    end
+    this.saveIntercepted = false
+    this.intercepting = true
+    var current = this.firstInterceptor
+
+    while current != null
+      current.interceptor.afterSave(this, result)
+      current = current.next
+    end
+    this.intercepting = false
+  end
+
+
+
+  public def beginTransactionAsync(options: StreamOptions? = null): result::Result<AsyncContextTransaction, WriteFailure>
+    match this.beginTransactionDriverAsync(options)
+      case AsyncContextTransactionStart.Failure(error)
+        return result::Result<AsyncContextTransaction, WriteFailure>.Error(error)
+      case AsyncContextTransactionStart.Started(driver)
+        let owned = new AsyncContextTransaction(driver)
+
+        return result::Result<AsyncContextTransaction, WriteFailure>.Ok(transfer owned)
+    end
+  end
+
+  public def beginTransactionDriverAsync(options: StreamOptions? = null): AsyncContextTransactionStart
+    return this.startTransactionDriver(0, options)
+  end
+
+  public def commitTransactionAsync(options: StreamOptions? = null): result::Result<AsyncContextTransaction, WriteFailure>
+    match this.commitTransactionDriverAsync(options)
+      case AsyncContextTransactionStart.Failure(error)
+        return result::Result<AsyncContextTransaction, WriteFailure>.Error(error)
+      case AsyncContextTransactionStart.Started(driver)
+        let owned = new AsyncContextTransaction(driver)
+
+        return result::Result<AsyncContextTransaction, WriteFailure>.Ok(transfer owned)
+    end
+  end
+
+  public def commitTransactionDriverAsync(options: StreamOptions? = null): AsyncContextTransactionStart
+    return this.startTransactionDriver(1, options)
+  end
+
+  public def rollbackTransactionAsync(options: StreamOptions? = null): result::Result<AsyncContextTransaction, WriteFailure>
+    match this.rollbackTransactionDriverAsync(options)
+      case AsyncContextTransactionStart.Failure(error)
+        return result::Result<AsyncContextTransaction, WriteFailure>.Error(error)
+      case AsyncContextTransactionStart.Started(driver)
+        let owned = new AsyncContextTransaction(driver)
+
+        return result::Result<AsyncContextTransaction, WriteFailure>.Ok(transfer owned)
+    end
+  end
+
+  public def rollbackTransactionDriverAsync(options: StreamOptions? = null): AsyncContextTransactionStart
+    return this.startTransactionDriver(2, options)
+  end
+
+  private def startTransactionDriver(
+    mode: Int,
+    options: StreamOptions?
+  ): AsyncContextTransactionStart
+    if this.borrowedTransaction
+      return AsyncContextTransactionStart.Failure(WriteFailure.Transaction("external transaction owner must complete and synchronize enrolled contexts"))
+    end
+    if this.intercepting || this.activeSave != null || this.activeControl != null || this.activeSet != null || this.graphRegistrationActive
+      return AsyncContextTransactionStart.Failure(WriteFailure.Transaction("context operation is already active"))
+    end
+    if this.transactionFailed && mode != 2
+      return AsyncContextTransactionStart.Failure(WriteFailure.Transaction("transaction state is uncertain"))
+    end
+    let provider = this.boundProvider
+    let lease = this.lease
+
+    if provider == null
+      return AsyncContextTransactionStart.Failure(WriteFailure.Unsupported("asynchronous transaction requires a provider"))
+    end
+    if (mode == 0 && lease != null) || (mode != 0 && lease == null)
+      return AsyncContextTransactionStart.Failure(WriteFailure.Transaction("transaction scope does not match the requested operation"))
+    end
+    let action = mode == 0 ? AsyncTransactionAction.Begin() : (mode == 1 ? AsyncTransactionAction.Commit(lease == null ? 0 : lease) : AsyncTransactionAction.Rollback(lease == null ? 0 : lease))
+
+    if mode == 0
+      this.checkpointSets()
+    end
+    match provider.beginControlAsync(action, options)
+      case AsyncControlStart.Failure(error)
+        if mode == 0
+          this.discardCheckpoints()
+        else
+          this.asyncTransactionFinished(mode, AsyncControlResult.Failure(error))
+        end
+        return AsyncContextTransactionStart.Failure(error)
+      case AsyncControlStart.Started(operationDriver)
+        let driver = new AsyncContextTransactionDriver(this, provider, operationDriver, mode, lease)
+
+        this.activeControl = driver
+        this.setAsyncBusy(true)
+        return AsyncContextTransactionStart.Started(driver)
+    end
+  end
+
+  public def pollTransactionCleanup(): AsyncControlPoll
+    let driver = this.activeControl
+
+    if driver == null
+      return AsyncControlPoll.Completed(AsyncControlResult.Saved())
+    end
+    return driver.poll()
+  end
+
+  internal def asyncTransactionOpened(lease: Int): Void
+    this.lease = lease
+  end
+
+  internal def asyncTransactionFinished(mode: Int, result: AsyncControlResult): Void
+    match result
+      case AsyncControlResult.Begun(lease)
+        this.lease = lease
+        this.transactionFailed = false
+      case AsyncControlResult.Created(id)
+        this.transactionFailed = true
+      case AsyncControlResult.Saved()
+        if mode == 2
+          this.restoreCheckpoints()
+        else
+          this.discardCheckpoints()
+        end
+        this.lease = null
+        this.transactionFailed = false
+        this.pruneEdges()
+      case AsyncControlResult.Failure(error)
+        let provider = this.boundProvider
+        let lease = this.lease
+
+        if lease == null
+          this.discardCheckpoints() if mode == 0
+        else if provider == null
+          this.transactionFailed = true
+        else
+          match provider.transactionState(lease)
+            case TransactionState.Active()
+            case TransactionState.RolledBack()
+              this.restoreCheckpoints()
+              this.lease = null
+              this.transactionFailed = false
+            case TransactionState.Committed()
+              this.discardCheckpoints()
+              this.lease = null
+              this.transactionFailed = false
+              this.pruneEdges()
+            case TransactionState.Invalid()
+              this.transactionFailed = true
+            case TransactionState.Failed()
+              this.transactionFailed = true
+          end
+        end
+    end
+    this.activeControl = null
+    this.setAsyncBusy(false)
+  end
+
+  internal def asyncSaveTransactionEnded(committed: Bool): Void
+    if committed
+      this.discardCheckpoints()
+      this.pruneEdges()
+    else
+      this.restoreGraphSave()
+      this.restoreCheckpoints()
+    end
+    this.lease = null
+    this.transactionFailed = false
+    this.activeSave = null
+    this.setAsyncBusy(false)
+  end
+
+  public def saveChangesAsync(options: StreamOptions? = null): result::Result<AsyncSave, WriteFailure>
+    match this.beginSaveAsync(options)
+      case AsyncSaveStart.Failure(error)
+        return result::Result<AsyncSave, WriteFailure>.Error(error)
+      case AsyncSaveStart.Started(driver)
+        let owned = new AsyncSave(driver)
+
+        return result::Result<AsyncSave, WriteFailure>.Ok(transfer owned)
+    end
+  end
+
+  ## Saves each dependency-ordered operation through nonblocking provider drivers.
+  public def beginSaveAsync(options: StreamOptions? = null): AsyncSaveStart
+    let rejected = this.beforeSaving()
+
+    if rejected != null
+      return AsyncSaveStart.Failure(rejected)
+    end
+    let start = this.beginSaveCore(options)
+
+    match start
+      case AsyncSaveStart.Failure(error)
+        this.saveOutcome(WriteResult.Failure(error))
+      case AsyncSaveStart.Started(driver)
+    end
+    return start
+  end
+
+  private def beginSaveCore(options: StreamOptions?): AsyncSaveStart
+    if this.intercepting || this.activeSave != null || this.activeControl != null || this.activeSet != null
+      return AsyncSaveStart.Failure(WriteFailure.Transaction("asynchronous context operation is active"))
+    end
+    if this.graphRegistrationActive || this.transactionFailed
+      return AsyncSaveStart.Failure(WriteFailure.Transaction("context is unavailable for asynchronous saving"))
+    end
+    let provider = this.boundProvider
+
+    if provider == null
+      return AsyncSaveStart.Failure(WriteFailure.Unsupported("saveChangesAsync requires a provider"))
+    end
+    let activeLease = this.lease
+
+    let actions = new WriteActionList()
+
+    this.checkpointGraphSave()
+    var set = this.firstSet
+
+    while set != null
+      let error = set.value.collectActions(actions)
+
+      if error != null
+        this.restoreGraphSave()
+        return AsyncSaveStart.Failure(WriteFailure.Validation(error))
+      end
+      set = set.next
+    end
+    let invalid = this.graphPlan(actions)
+
+    if invalid != null
+      this.restoreGraphSave()
+      return AsyncSaveStart.Failure(WriteFailure.Validation(invalid))
+    end
+    if actions.count > 0 && activeLease != null && !provider.supports(ProviderCapability.Savepoints())
+      this.restoreGraphSave()
+      return AsyncSaveStart.Failure(WriteFailure.Unsupported("asynchronous saving in a transaction requires savepoints"))
+    end
+    if activeLease == null
+      this.checkpointSets()
+    end
+    let driver = new AsyncSaveDriver(this, provider, actions, activeLease, options)
+
+    this.activeSave = driver
+    this.setAsyncBusy(true)
+    return AsyncSaveStart.Started(driver)
+  end
+
+  ## Continues a cancelled save after its resource was disposed while cleanup was pending.
+  public def pollSaveCleanup(): AsyncWritePoll
+    let driver = this.activeSave
+
+    if driver == null
+      return AsyncWritePoll.Completed(WriteResult.Saved(0))
+    end
+    return driver.poll()
+  end
+
+  private def setAsyncBusy(value: Bool): Void
+    var set = this.firstSet
+
+    while set != null
+      set.value.setSaving(value)
+      set = set.next
+    end
+  end
+
+  internal def asyncSaveOpened(lease: Int): Void
+    this.lease = lease
+  end
+
+  internal def asyncSaveFinished(implicit: Bool, success: Bool, restored: Bool, opened: Bool): Void
+    if success
+      if implicit
+        this.discardCheckpoints()
+        this.lease = null
+      else
+        this.discardGraphSave()
+      end
+      this.pruneEdges()
+    else if restored
+      this.restoreGraphSave()
+      if implicit
+        if opened
+          this.restoreCheckpoints()
+        else
+          this.discardCheckpoints()
+        end
+        this.lease = null
+      end
+    else
+      this.transactionFailed = true
+    end
+    this.activeSave = null
+    this.setAsyncBusy(false)
+  end
+
+  internal def operationFailure(): QueryFailure?
+    if this.intercepting || this.activeSave != null || this.activeControl != null || this.activeSet != null
+      return QueryFailure.Provider(ProviderFailure.State("asynchronous context operation is active"))
+    end
+    if this.transactionFailed
+      return QueryFailure.Provider(ProviderFailure.State("transaction state is uncertain"))
+    end
+    return null
   end
 
   internal def matchesProvider(expected: Provider): Bool
@@ -3841,10 +5657,13 @@ class ChangeContext
   end
 
   public def register(set: ChangeSet): Void
+    if this.intercepting || this.activeSave != null || this.activeControl != null || this.activeSet != null
+      return
+    end
     if this.graphRegistrationActive
       return
     end
-    if !set.registerOnce()
+    if !set.registerOnce(this)
       return
     end
     let node = new ChangeSetNode(set)
@@ -3875,6 +5694,9 @@ class ChangeContext
   end
 
   internal def beginGraphRegistration(journal: GraphJournal): QueryFailure?
+    if this.intercepting || this.activeSave != null || this.activeControl != null || this.activeSet != null
+      return QueryFailure.Provider(ProviderFailure.State("asynchronous save is active"))
+    end
     if this.graphRegistrationActive
       return QueryFailure.Provider(ProviderFailure.State("graph enrollment is already active"))
     end
@@ -3952,6 +5774,9 @@ class ChangeContext
   end
 
   public def registerRelation(edge: RelationshipEdge): QueryFailure?
+    if this.intercepting || this.activeSave != null || this.activeControl != null || this.activeSet != null
+      return QueryFailure.Provider(ProviderFailure.State("asynchronous save is active"))
+    end
     if this.graphRegistrationActive
       return QueryFailure.Provider(ProviderFailure.State("cannot register a relationship during graph enrollment"))
     end
@@ -4028,6 +5853,9 @@ class ChangeContext
 
   ## Replaces an explicitly registered link for the same dependent and FK slot.
   public def reassignRelation(newEdge: RelationshipEdge): QueryFailure?
+    if this.intercepting || this.activeSave != null || this.activeControl != null || this.activeSet != null
+      return QueryFailure.Provider(ProviderFailure.State("asynchronous save is active"))
+    end
     if this.graphRegistrationActive
       return QueryFailure.Provider(ProviderFailure.State("cannot reassign a relationship during graph enrollment"))
     end
@@ -4106,6 +5934,9 @@ class ChangeContext
 
   ## Clears an optional FK, or retires a required cascade link after deleting its dependent closure.
   internal def unlinkByIdentity(identity: GraphIdentity, owner: ChangeSet, valid: Bool, slot: String): QueryFailure?
+    if this.intercepting || this.activeSave != null || this.activeControl != null || this.activeSet != null
+      return QueryFailure.Provider(ProviderFailure.State("asynchronous save is active"))
+    end
     if !this.ownsSet(owner)
       return QueryFailure.Provider(ProviderFailure.State("relationship handle belongs to another context"))
     end
@@ -4165,6 +5996,9 @@ class ChangeContext
   end
 
   internal def removeCascadeNode(root: CascadeNode, protectedIdentity: GraphIdentity? = null): QueryFailure?
+    if this.intercepting || this.activeSave != null || this.activeControl != null || this.activeSet != null
+      return QueryFailure.Provider(ProviderFailure.State("asynchronous save is active"))
+    end
     if !this.ownsSet(root.owner)
       return QueryFailure.Provider(ProviderFailure.State("cascade handle belongs to another context"))
     end
@@ -4346,7 +6180,23 @@ class ChangeContext
   end
 
   ## Discards all tracked entries while retaining the borrowed provider and mappings.
+  public def resetForPool(): WriteFailure?
+    if this.intercepting || this.activeSave != null || this.activeControl != null || this.activeSet != null || this.graphRegistrationActive || this.lease != null || this.transactionFailed
+      return WriteFailure.Transaction("context reset requires completed operations and no active transaction")
+    end
+    this.clear()
+    return null
+  end
+
+  internal def canRetrySave(): Bool
+    return !this.detecting && !this.intercepting && !this.saveIntercepted && this.activeSave == null && this.activeControl == null && this.activeSet == null && !this.graphRegistrationActive && this.lease == null && !this.transactionFailed
+  end
+
+  ## Discards all tracked entries while retaining the borrowed provider and mappings.
   public def clear(): Void
+    if this.intercepting || this.activeSave != null || this.activeControl != null || this.activeSet != null
+      return
+    end
     if this.graphRegistrationActive
       return
     end
@@ -4364,6 +6214,9 @@ class ChangeContext
 
   ## Opens one explicit transaction and captures every tracked baseline.
   public def beginTransaction(): WriteResult
+    if this.intercepting || this.activeSave != null || this.activeControl != null || this.activeSet != null
+      return WriteResult.Failure(WriteFailure.Transaction("asynchronous save is active"))
+    end
     if this.graphRegistrationActive
       return WriteResult.Failure(WriteFailure.Validation("cannot begin a transaction during graph enrollment"))
     end
@@ -4389,8 +6242,71 @@ class ChangeContext
     end
   end
 
+  ## Shares a provider-issued transaction without taking commit or rollback ownership.
+  public def enlistTransaction(lease: Int): WriteResult
+    if !this.canRetrySave()
+      return WriteResult.Failure(WriteFailure.Transaction("transaction enrollment requires an idle context"))
+    end
+    let provider = this.boundProvider
+
+    if provider == null
+      return WriteResult.Failure(WriteFailure.Unsupported("transaction enrollment requires a provider"))
+    end
+    match provider.transactionState(lease)
+      case TransactionState.Active()
+        this.checkpointSets()
+        this.lease = lease
+        this.borrowedTransaction = true
+        return WriteResult.Saved(0)
+      case TransactionState.Committed()
+      case TransactionState.RolledBack()
+      case TransactionState.Failed()
+      case TransactionState.Invalid()
+        return WriteResult.Failure(WriteFailure.Transaction("transaction enrollment requires an active provider lease"))
+    end
+    return WriteResult.Failure(WriteFailure.Transaction("transaction enrollment state is invalid"))
+  end
+
+  ## Publishes the external owner's acknowledged completion to this context's trackers.
+  public def synchronizeTransaction(): WriteResult
+    if this.intercepting || this.activeSave != null || this.activeControl != null || this.activeSet != null || this.graphRegistrationActive
+      return WriteResult.Failure(WriteFailure.Transaction("transaction synchronization requires completed operations"))
+    end
+    let provider = this.boundProvider
+    let lease = this.lease
+
+    if provider == null || lease == null || !this.borrowedTransaction
+      return WriteResult.Failure(WriteFailure.Transaction("context has no enrolled external transaction"))
+    end
+    match provider.transactionState(lease)
+      case TransactionState.Committed()
+        this.discardCheckpoints()
+      case TransactionState.RolledBack()
+        this.restoreCheckpoints()
+      case TransactionState.Active()
+        return WriteResult.Failure(WriteFailure.Transaction("external transaction owner has not completed its transaction"))
+      case TransactionState.Failed()
+        this.transactionFailed = true
+        return WriteResult.Failure(WriteFailure.Transaction("external transaction completion is not acknowledged"))
+      case TransactionState.Invalid()
+        this.transactionFailed = true
+        return WriteResult.Failure(WriteFailure.Transaction("external transaction completion is not acknowledged"))
+    end
+    this.lease = null
+    this.borrowedTransaction = false
+    this.transactionFailed = false
+    this.pruneEdges()
+    return WriteResult.Saved(0)
+  end
+
   ## Commits the provider before making provisional tracker baselines final.
   public def commitTransaction(): WriteResult
+    if this.borrowedTransaction
+      return WriteResult.Failure(WriteFailure.Transaction("external transaction owner must commit and synchronize enrolled contexts"))
+    end
+    if this.intercepting || this.activeSave != null || this.activeControl != null || this.activeSet != null
+      return WriteResult.Failure(WriteFailure.Transaction("asynchronous save is active"))
+    end
     if this.graphRegistrationActive
       return WriteResult.Failure(WriteFailure.Validation("cannot commit a transaction during graph enrollment"))
     end
@@ -4435,6 +6351,12 @@ class ChangeContext
 
   ## Rolls back provider writes, then restores the tracked pre-transaction baselines.
   public def rollbackTransaction(): WriteResult
+    if this.borrowedTransaction
+      return WriteResult.Failure(WriteFailure.Transaction("external transaction owner must roll back and synchronize enrolled contexts"))
+    end
+    if this.intercepting || this.activeSave != null || this.activeControl != null || this.activeSet != null
+      return WriteResult.Failure(WriteFailure.Transaction("asynchronous save is active"))
+    end
     if this.graphRegistrationActive
       return WriteResult.Failure(WriteFailure.Validation("cannot roll back a transaction during graph enrollment"))
     end
@@ -4616,8 +6538,97 @@ class ChangeContext
     end
   end
 
+  public def prepareSetAsync(
+    plan: readonly SetWritePlan,
+    expectedProvider: Provider? = null,
+    options: StreamOptions? = null
+  ): AsyncWriteStart
+    if this.intercepting || this.activeSave != null || this.activeControl != null || this.activeSet != null || this.graphRegistrationActive
+      return AsyncWriteStart.Failure(WriteFailure.Transaction("context operation is already active"))
+    end
+    if this.transactionFailed
+      return AsyncWriteStart.Failure(WriteFailure.Transaction("transaction state is uncertain"))
+    end
+    let provider = this.boundProvider
+
+    if provider == null
+      return AsyncWriteStart.Failure(WriteFailure.Unsupported("set write requires a provider"))
+    end
+    if expectedProvider != null && !reference::same(provider, expectedProvider)
+      return AsyncWriteStart.Failure(WriteFailure.Validation("set write provider does not belong to this context"))
+    end
+    if plan.requiresCheckedScalars() && !provider.supports(ProviderCapability.CheckedScalarExpressions())
+      return AsyncWriteStart.Failure(WriteFailure.Unsupported("provider does not support checked scalar expressions"))
+    end
+    let lease = this.lease
+
+    if lease != null
+      match provider.transactionState(lease)
+        case TransactionState.Active()
+        case TransactionState.RolledBack()
+          this.reconcile(WriteFailure.Transaction("transaction ended before set write"), provider, lease)
+          return AsyncWriteStart.Failure(WriteFailure.Transaction("transaction ended before set write"))
+        case TransactionState.Committed()
+          this.reconcile(WriteFailure.Transaction("transaction ended before set write"), provider, lease)
+          return AsyncWriteStart.Failure(WriteFailure.Transaction("transaction ended before set write"))
+        case TransactionState.Invalid()
+          this.transactionFailed = true
+          return AsyncWriteStart.Failure(WriteFailure.Transaction("transaction lease is invalid"))
+        case TransactionState.Failed()
+          this.transactionFailed = true
+          return AsyncWriteStart.Failure(WriteFailure.Transaction("transaction state is uncertain"))
+      end
+    end
+    match provider.beginSetAsync(plan, options, lease)
+      case AsyncWriteStart.Failure(error)
+        if lease != null
+          this.reconcile(error, provider, lease)
+        end
+        return AsyncWriteStart.Failure(error)
+      case AsyncWriteStart.Started(driver)
+        let operation = new AsyncContextSetDriver(this, provider, driver, lease)
+
+        this.activeSet = operation
+        this.setAsyncBusy(true)
+        return AsyncWriteStart.Started(operation)
+    end
+  end
+
+  public def pollSetCleanup(): AsyncWritePoll
+    let driver = this.activeSet
+
+    if driver == null
+      return AsyncWritePoll.Completed(WriteResult.Saved(0))
+    end
+    return driver.poll()
+  end
+
+  internal def asyncSetFinished(result: WriteResult, provider: Provider, lease: Int?): WriteResult
+    this.activeSet = null
+    this.setAsyncBusy(false)
+    match result
+      case WriteResult.Saved(count)
+        if count >= 0
+          return result
+        end
+        this.transactionFailed = lease != null
+        return WriteResult.Failure(WriteFailure.Provider(ProviderFailure.State("set write returned a negative row count")))
+      case WriteResult.SavedWithValues(count, values)
+        this.transactionFailed = lease != null
+        return WriteResult.Failure(WriteFailure.Provider(ProviderFailure.State("set write returned row values")))
+      case WriteResult.Failure(error)
+        if lease != null
+          return this.reconcile(error, provider, lease)
+        end
+        return result
+    end
+  end
+
   ## Executes a typed set write without changing any tracked snapshots.
   public def executeSet(plan: readonly SetWritePlan, expectedProvider: Provider? = null): WriteResult
+    if this.intercepting || this.activeSave != null || this.activeControl != null || this.activeSet != null
+      return WriteResult.Failure(WriteFailure.Transaction("asynchronous save is active"))
+    end
     if this.transactionFailed
       return WriteResult.Failure(WriteFailure.Transaction("transaction state is uncertain"))
     end
@@ -4710,6 +6721,21 @@ class ChangeContext
   end
 
   public def saveChanges(): WriteResult
+    let rejected = this.beforeSaving()
+
+    if rejected != null
+      return WriteResult.Failure(rejected)
+    end
+    let result = this.saveChangesCore()
+
+    this.saveOutcome(result)
+    return result
+  end
+
+  private def saveChangesCore(): WriteResult
+    if this.intercepting || this.activeSave != null || this.activeControl != null || this.activeSet != null
+      return WriteResult.Failure(WriteFailure.Transaction("asynchronous save is active"))
+    end
     if this.graphRegistrationActive
       return WriteResult.Failure(WriteFailure.Validation("cannot save during graph enrollment"))
     end
@@ -4843,7 +6869,7 @@ class ChangeContext
     end
   end
 
-  private def graphReady(action: WriteAction, actions: WriteActionList, planning: Bool): Bool
+  internal def graphReady(action: WriteAction, actions: WriteActionList, planning: Bool): Bool
     var edge = this.firstEdge
 
     while edge != null
@@ -4913,7 +6939,7 @@ class ChangeContext
     return true
   end
 
-  private def graphPlan(actions: WriteActionList): String?
+  internal def graphPlan(actions: WriteActionList): String?
     var edge = this.firstEdge
 
     while edge != null
@@ -4981,7 +7007,7 @@ class ChangeContext
     return null
   end
 
-  private def propagateFor(action: WriteAction): WriteFailure?
+  internal def propagateFor(action: WriteAction): WriteFailure?
     var edge = this.firstEdge
 
     while edge != null
@@ -5400,66 +7426,91 @@ def sameCell(left: Cell, right: Cell): Bool
       match right
         case Cell.Null()
           return true
-        case Cell.Bool(value)
+        case Cell.Bool(other)
           return false
-        case Cell.Int(value)
+        case Cell.Int(other)
           return false
-        case Cell.Float(value)
+        case Cell.Float(other)
           return false
-        case Cell.Text(value)
+        case Cell.Text(other)
+          return false
+        case Cell.Binary(other)
           return false
       end
     case Cell.Bool(value)
       match right
-        case Cell.Bool(other)
-          return value == other
         case Cell.Null()
           return false
+        case Cell.Bool(other)
+          return value == other
         case Cell.Int(other)
           return false
         case Cell.Float(other)
           return false
         case Cell.Text(other)
+          return false
+        case Cell.Binary(other)
           return false
       end
     case Cell.Int(value)
       match right
-        case Cell.Int(other)
-          return value == other
-        case Cell.Null()
-          return false
-        case Cell.Bool(other)
-          return false
-        case Cell.Float(other)
-          return false
-        case Cell.Text(other)
-          return false
-      end
-    case Cell.Text(value)
-      match right
-        case Cell.Text(other)
-          return value == other
         case Cell.Null()
           return false
         case Cell.Bool(other)
           return false
         case Cell.Int(other)
-          return false
+          return value == other
         case Cell.Float(other)
+          return false
+        case Cell.Text(other)
+          return false
+        case Cell.Binary(other)
           return false
       end
     case Cell.Float(value)
       match right
-        case Cell.Float(other)
-          return dataFloatFinite(value) && dataFloatFinite(other) && value == other
         case Cell.Null()
           return false
         case Cell.Bool(other)
           return false
         case Cell.Int(other)
           return false
+        case Cell.Float(other)
+          return dataFloatFinite(value) && dataFloatFinite(other) && value == other
         case Cell.Text(other)
           return false
+        case Cell.Binary(other)
+          return false
+      end
+    case Cell.Text(value)
+      match right
+        case Cell.Null()
+          return false
+        case Cell.Bool(other)
+          return false
+        case Cell.Int(other)
+          return false
+        case Cell.Float(other)
+          return false
+        case Cell.Text(other)
+          return value == other
+        case Cell.Binary(other)
+          return false
+      end
+    case Cell.Binary(value)
+      match right
+        case Cell.Null()
+          return false
+        case Cell.Bool(other)
+          return false
+        case Cell.Int(other)
+          return false
+        case Cell.Float(other)
+          return false
+        case Cell.Text(other)
+          return false
+        case Cell.Binary(other)
+          return sameBinary(value, other)
       end
   end
 end
@@ -5490,4 +7541,307 @@ def cellOptionalString(value: String?): Cell
     return Cell.Null()
   end
   return Cell.Text(value)
+end
+
+def cellByteBuffer(value: readonly ByteBuffer): Cell
+  return Cell.Binary(copyBinary(value))
+end
+
+def cellOptionalByteBuffer(value: ByteBuffer?): Cell
+  if value == null
+    return Cell.Null()
+  end
+  return cellByteBuffer(value)
+end
+
+def cellDecimal(value: readonly Decimal): Cell
+  return Cell.Text(value.text())
+end
+
+def cellOptionalDecimal(value: Decimal?): Cell
+  if value == null
+    return Cell.Null()
+  end
+  return cellDecimal(value)
+end
+
+## Returns a stable identity for one key or an ordered tuple of Int/String keys.
+## Tuple components carry scalar tags and byte lengths, so delimiters cannot collide.
+def compositeKey(row: RawRow, columns: String[]): Cell?
+  if columns.Length == 0
+    return null
+  end
+  var encoded = ""
+
+  for column in columns
+    let cell = cellFromRow(row, column)
+
+    if cell == null
+      return null
+    end
+    var text = ""
+    var tag = ""
+
+    match cell
+      case Cell.Int(value)
+        text = value as String
+        tag = "I"
+      case Cell.Text(value)
+        text = value
+        tag = "S"
+      case Cell.Null()
+        return null
+      case Cell.Bool(value)
+        return null
+      case Cell.Float(value)
+        return null
+      case Cell.Binary(value)
+        return null
+    end
+    if columns.Length == 1
+      return cell
+    end
+    encoded = encoded + tag + (host::stringByteLength(text) as String) + ":" + text
+  end
+  return Cell.Text(encoded)
+end
+
+## Expands an encoded identity into its original ordered scalar components.
+def compositeKeyRow(key: Cell, columns: String[]): RawRow?
+  if columns.Length == 1
+    return new RawRow([new RawColumn(columns[0], key)])
+  end
+  var encoded: String? = null
+
+  match key
+    case Cell.Text(value)
+      encoded = value
+    case Cell.Null()
+    case Cell.Bool(value)
+    case Cell.Int(value)
+    case Cell.Float(value)
+    case Cell.Binary(value)
+  end
+  if encoded == null || columns.Length == 0
+    return null
+  end
+  let values: RawColumn[] = tasks::generate(columns.Length, 1) do |index|
+    return new RawColumn(columns[index], Cell.Null())
+  end
+  var offset = 0
+  var component = 0
+  let length = host::stringByteLength(encoded)
+
+  while component < columns.Length
+    if offset >= length
+      return null
+    end
+    let tag = host::stringByteAt(encoded, offset) as Int
+
+    offset = offset + 1
+    let start = offset
+
+    while offset < length && host::stringByteAt(
+      encoded,
+      offset
+    ) as Int >= 48 && host::stringByteAt(
+      encoded,
+      offset
+    ) as Int <= 57
+      offset = offset + 1
+    end
+    if offset == start || offset >= length || host::stringByteAt(encoded, offset) as Int != 58
+      return null
+    end
+    let count = host::parseInt(host::stringSlice(encoded, start, offset - start))
+
+    offset = offset + 1
+    if count == null || count < 0 || count > length - offset
+      return null
+    end
+    let value = host::stringSlice(encoded, offset, count)
+    var cell = Cell.Null()
+
+    if tag == 73
+      let number = host::parseInt(value)
+
+      if number == null || (number as String) != value
+        return null
+      end
+      cell = Cell.Int(number)
+    else if tag == 83
+      cell = Cell.Text(value)
+    else
+      return null
+    end
+    values[component] = new RawColumn(columns[component], cell)
+    offset = offset + count
+    component = component + 1
+  end
+  if offset != length
+    return null
+  end
+  return new RawRow(values)
+end
+
+## Returns NULL for an absent optional foreign-key tuple.
+def compositeKeyCell(row: RawRow, columns: String[]): Cell
+  let key = compositeKey(row, columns)
+
+  if key != null
+    return key
+  end
+  for column in columns
+    let cell = cellFromRow(row, column)
+
+    if cell == null
+      return Cell.Bool(false)
+    end
+    match cell
+      case Cell.Null()
+      case Cell.Int(value)
+        return Cell.Bool(false)
+      case Cell.Text(value)
+        return Cell.Bool(false)
+      case Cell.Bool(value)
+        return Cell.Bool(false)
+      case Cell.Float(value)
+        return Cell.Bool(false)
+      case Cell.Binary(value)
+        return Cell.Bool(false)
+    end
+  end
+  return Cell.Null()
+end
+
+
+## Copies ordered tuple metadata so caller mutations cannot change identity rules.
+def copyKeyTuples(source: String[][]?): String[][]
+  if source == null
+    return []
+  end
+  return tasks::generate(source.Length, 1) do |index|
+    let tuple = source[index]
+
+    return tasks::generate(tuple.Length, 1) do |component|
+      return tuple[component]
+    end
+  end
+end
+
+def immutableKeysFailure(current: RawRow, original: RawRow, tuples: String[][]): String?
+  for columns in tuples
+    let before = compositeKey(original, columns)
+    let after = compositeKey(current, columns)
+
+    if before == null || after == null
+      return "tracked alternate key is missing or invalid"
+    end
+    if !sameCell(before, after)
+      return "tracked alternate key changed"
+    end
+  end
+  return null
+end
+
+def keyTupleMetadataFailure(tuple: String[], columns: readonly ResultColumns, optionalAllowed: Bool): String?
+  if tuple.Length == 0
+    return "tracked key tuple cannot be empty"
+  end
+  var position = 0
+  var nullable = false
+
+  while position < tuple.Length
+    let name = tuple[position]
+    var found = false
+    var index = 0
+
+    while index < columns.count()
+      let column = columns.at(index)
+
+      if column.name() == name
+        found = true
+        nullable = column.nullable() if position == 0
+        if column.nullable() != nullable || (!optionalAllowed && column.nullable())
+          return "tracked key tuple nullability is inconsistent"
+        end
+        match column.kind()
+          case ResultColumnKind.Int()
+          case ResultColumnKind.Text()
+          case ResultColumnKind.Bool()
+            return "tracked key tuple must use integer or string columns"
+          case ResultColumnKind.Float()
+            return "tracked key tuple must use integer or string columns"
+          case ResultColumnKind.Binary()
+            return "tracked key tuple must use integer or string columns"
+        end
+      end
+      index = index + 1
+    end
+    if !found
+      return "tracked key tuple column is missing"
+    end
+    var previous = 0
+
+    while previous < position
+      if tuple[previous] == name
+        return "tracked key tuple column is duplicated"
+      end
+      previous = previous + 1
+    end
+    position = position + 1
+  end
+  return null
+end
+
+
+def relationshipTupleSlot(columns: readonly ResultColumns): String
+  var result = "tuple:"
+  var index = 0
+
+  while index < columns.count()
+    let name = columns.at(index).name()
+
+    result = result + (host::stringByteLength(name) as String) + ":" + name
+    index = index + 1
+  end
+  return result
+end
+
+## Copies returned generated cells into the frozen write snapshot.
+def overlayReturnedRow(snapshot: readonly RawRow, returned: readonly RawRow): RawRow
+  let columns: RawColumn[] = tasks::generate(snapshot.count(), 1) do |index|
+    let column = snapshot.at(index)
+
+    if column == null
+      return new RawColumn("", Cell.Null())
+    end
+    let generated = cellFromRow(returned, column.name)
+    let persisted = cellFromRow(snapshot, column.name)
+    let value = generated == null ? persisted : generated
+
+    return new RawColumn(column.name, value == null ? Cell.Null() : value)
+  end
+
+  return new RawRow(columns)
+end
+
+
+def generatedDecimalMatches(value: readonly Cell): Bool
+  match value
+    case Cell.Null()
+      return true
+    case Cell.Text(text)
+      let parsed = Decimal.parse(text)
+
+      return parsed != null && parsed.text() == text
+    case Cell.Int(value)
+      return false
+    case Cell.Bool(value)
+      return false
+    case Cell.Float(value)
+      return false
+    case Cell.Binary(value)
+      return false
+  end
 end

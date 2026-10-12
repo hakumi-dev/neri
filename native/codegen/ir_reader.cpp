@@ -648,7 +648,7 @@ private:
     instruction result;
     const auto opcode_offset = input_.offset();
     result.opcode = decode_contiguous_tag(input_.u16(), NERI_IR_OPCODE_CONSTANT_V1,
-                                        NERI_IR_OPCODE_WORKER_ENTRY_V1,
+                                        NERI_IR_OPCODE_CLASS_CHECKED_CAST_V1,
                                         "opcode", opcode_offset);
     if (result.opcode >= NERI_IR_OPCODE_C_FUNCTION_ADDRESS_V1 &&
         result.opcode <= NERI_IR_OPCODE_CALL_C_INDIRECT_V1 && !c_interop_)

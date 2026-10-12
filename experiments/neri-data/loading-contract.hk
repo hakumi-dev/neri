@@ -1,9 +1,11 @@
 use neri_data
 use test
+use resources
 
 class LoadingParent
   public id: Int
   public children: LoadingChild[] = []
+  public peers: LoadingParent[] = []
 
   def init(id: Int): Void
     this.id = id
@@ -29,6 +31,8 @@ class LoadingProvider: Provider
   public duplicateParent: Bool = false
   public reads: Int = 0
   public streams: Int = 0
+  public failPublication: Bool = false
+  public failRoot: Bool = false
 
   public override readonly def supports(capability: ProviderCapability): Bool
     return true
@@ -45,6 +49,29 @@ class LoadingProvider: Provider
     end
 
     return ProviderResult.Rows(rows)
+  end
+
+  public override def beginReadAsync(
+    plan: readonly SqlPlan,
+    options: StreamOptions? = null,
+    maximumRows: Int? = null
+  ): AsyncReadStart
+    if plan.columns().count() == 1
+      match this.execute(plan)
+        case ProviderResult.Rows(rows)
+          return AsyncReadStart.Started(new LoadingAsyncRead(rows))
+        case ProviderResult.Failure(error)
+          return AsyncReadStart.Failure(error)
+      end
+    end
+    this.streams = this.streams + 1
+    let rows = arrays::generate<RawRow>(this.children) do |index|
+      return this.brokenChild ? new RawRow([]) : new RawRow([
+          new RawColumn("id", Cell.Int(10 + index)), new RawColumn("parent_id", Cell.Int(1))
+        ])
+    end
+
+    return AsyncReadStart.Started(new LoadingAsyncRead(rows))
   end
 
   public override def stream(plan: readonly StreamPlan, visit: fn(RawRow): Bool): StreamResult
@@ -67,6 +94,42 @@ class LoadingProvider: Provider
       end
     end
     return StreamResult.Completed(count)
+  end
+end
+
+class LoadingAsyncRead: AsyncReadDriver
+  private rows: RawRow[]
+  private index: Int = 0
+  private paused: Bool = false
+  private cancelled: Bool = false
+
+  def init(rows: RawRow[]): Void
+    this.rows = rows
+  end
+
+  public override def poll(): AsyncReadPoll
+    if this.cancelled
+      return AsyncReadPoll.Failure(ProviderFailure.State("cancelled navigation fixture"))
+    end
+    if !this.paused
+      this.paused = true
+      return AsyncReadPoll.Pending(-1, AsyncInterest.Read())
+    end
+    if this.index == this.rows.Length
+      return AsyncReadPoll.Completed()
+    end
+    let row = this.rows[this.index]
+
+    this.index = this.index + 1
+    return AsyncReadPoll.Row(row)
+  end
+
+  public override def cancel(): Void
+    this.cancelled = true
+  end
+
+  public override def close(): ProviderFailure?
+    return null
   end
 end
 
@@ -225,6 +288,146 @@ def main(): Void
     test::assertTrue(reference::same(inverse, parent))
   end
   let original = parent.children[0]
+  let asyncOutcome = verifyAsyncCollection(parents.take(10), children, relation, loaded)
+
+  test::assertEqual(asyncOutcome.closeFailures.count(), 0)
+  match asyncOutcome.completion
+    case resources::Completion.Value(value)
+      test::assertEqual(value, 0)
+    case resources::Completion.Failure(error)
+      test::assertTrue(false)
+  end
+
+  let conflicting = new LoadingParent(99)
+  let failedFixup: fn(): QueryFailure? = fn(): QueryFailure? do
+    if provider.failPublication
+      parent.children = []
+      original.parent = conflicting
+      relation.markCollection(parent, NavigationLoadState.Unknown())
+      relation.markReference(original, NavigationLoadState.Unknown())
+    end
+    return null
+  end
+
+  childTracker.observeMaterialization(failedFixup)
+  provider.failPublication = true
+  expectFailure(include(parents.take(10), children, relation).load(loaded))
+  provider.failPublication = false
+
+  test::assertEqual(parent.children.Length, 1)
+  test::assertTrue(reference::same(parent.children[0], original))
+  test::assertTrue(original.parent != null && reference::same(original.parent, parent))
+  match relation.collectionState(parent)
+    case NavigationLoadState.Loaded()
+    case NavigationLoadState.Unknown()
+      test::assertTrue(false)
+    case NavigationLoadState.Loading()
+      test::assertTrue(false)
+    case NavigationLoadState.Partial()
+      test::assertTrue(false)
+  end
+  let rootFixup: fn(): QueryFailure? = fn(): QueryFailure? do
+    if provider.failRoot
+      parent.children = []
+      original.parent = conflicting
+      relation.markCollection(parent, NavigationLoadState.Unknown())
+    end
+    return null
+  end
+
+  parentTracker.observeMaterialization(rootFixup)
+  provider.failRoot = true
+  expectFailure(include(parents.take(10), children, relation).all())
+  let failedAsyncRoot = verifyAsyncRootCollection(parents.take(10), children, relation)
+
+  test::assertEqual(failedAsyncRoot.closeFailures.count(), 0)
+  match failedAsyncRoot.completion
+    case resources::Completion.Failure(error)
+    case resources::Completion.Value(value)
+      test::assertTrue(false)
+  end
+
+  test::assertEqual(parent.children.Length, 1)
+  test::assertTrue(reference::same(parent.children[0], original))
+  test::assertTrue(original.parent != null && reference::same(original.parent, parent))
+  provider.failRoot = false
+
+  let removedRight = new LoadingParent(2)
+  let getPeers: fn(LoadingParent): LoadingParent[] = fn(value: LoadingParent): LoadingParent[] do
+    return value.peers
+  end
+  let setPeers: fn(LoadingParent, LoadingParent[]): Void = fn(value: LoadingParent, peers: LoadingParent[]): Void do
+    value.peers = peers
+  end
+  let createJoin: fn(LoadingParent, LoadingParent): LoadingChild = fn(
+    left: LoadingParent, right: LoadingParent
+  ): LoadingChild do
+    let join = new LoadingChild(100, left.id)
+
+    join.parent = right
+    return join
+  end
+  let skip = new ManyToManyNavigation<LoadingParent, LoadingChild, LoadingParent>(
+    relation, relation, getPeers, setPeers, getPeers, setPeers, createJoin
+  )
+
+  parent.peers = [removedRight]
+  removedRight.peers = [parent]
+  parent.children = []
+  original.parent = null
+  provider.children = 0
+  let refreshedSkip = expectRows(skip.load(parents, children, parents, loaded))
+
+  test::assertTrue(refreshedSkip != null)
+  test::assertEqual(parent.peers.Length, 0)
+  test::assertEqual(removedRight.peers.Length, 0)
+  parent.children = [original]
+  original.parent = parent
+  provider.children = 1
+  let impostor = new LoadingChild(original.id, parent.id)
+
+  impostor.parent = removedRight
+  parent.children = [impostor]
+  removedRight.children = [impostor]
+  let refusedUnlink = skip.unlink(children, parent, removedRight)
+  let retainedState = children.stateOf(original)
+
+  test::assertTrue(refusedUnlink != null)
+  test::assertTrue(retainedState != null)
+  if retainedState != null
+    match retainedState
+      case TrackingState.Unchanged()
+      case TrackingState.Detached()
+        test::assertTrue(false)
+      case TrackingState.Added()
+        test::assertTrue(false)
+      case TrackingState.Modified()
+        test::assertTrue(false)
+      case TrackingState.Deleted()
+        test::assertTrue(false)
+    end
+  end
+  parent.children = [original]
+  removedRight.children = []
+
+  let beforeCancelled = provider.streams
+  let token = new CancellationToken()
+
+  token.cancel()
+  let cancelled = verifyCancelledAsyncCollection(parents.take(10), children, relation, loaded, token)
+
+  test::assertEqual(cancelled.closeFailures.count(), 0)
+  test::assertEqual(provider.streams, beforeCancelled)
+  test::assertTrue(reference::same(parent.children[0], original))
+  let lazyCancelled = verifyAsyncLazyCollection(parents, children, relation, parent, token)
+
+  test::assertEqual(lazyCancelled.closeFailures.count(), 0)
+  match lazyCancelled.completion
+    case resources::Completion.Value(value)
+      test::assertEqual(value, 0)
+    case resources::Completion.Failure(error)
+      test::assertTrue(false)
+  end
 
   let beforeInvalidParent = provider.streams
 
@@ -277,9 +480,11 @@ def main(): Void
   let emptied = expectRows(include(parents.take(10), children, relation).load(loaded))
 
   test::assertTrue(emptied != null)
-  test::assertEqual(parent.children.Length, 0)
-  test::assertTrue(original.parent == null)
+  test::assertEqual(parent.children.Length, 1)
+  test::assertTrue(reference::same(parent.children[0], original))
+  test::assertTrue(original.parent != null)
   test::assertTrue(childTracker.detach(original) == null)
+  parent.children = []
   let detachedReload = expectRows(include(parents.take(10), children, relation).load(loaded))
 
   test::assertTrue(detachedReload != null)
@@ -434,4 +639,133 @@ def main(): Void
   end
 
   test::assertEqual(firstWide.value.children.Length, 1)
+end
+
+def verifyAsyncCollection(
+  parents: Query<LoadingParent>,
+  children: Query<LoadingChild>,
+  relation: CollectionNavigation<LoadingParent, LoadingChild>,
+  rows: TypedRows<LoadingParent>
+): resources::Outcome<Int, QueryFailure>
+  using operation <- include(parents, children, relation).loadAsync(rows)
+    while true
+      match operation.poll()
+        case AsyncQueryPoll.Pending(socket, interest)
+          continue
+        case AsyncQueryPoll.Completed(result)
+          match result
+            case QueryResult.Rows(loaded)
+              test::assertEqual(loaded.count(), rows.count())
+
+              return 0
+            case QueryResult.Failure(error)
+              match error
+                case QueryFailure.Provider(failure)
+                  console::println(providerFailureMessage(failure))
+                case QueryFailure.InvalidIdentifier(name)
+                case QueryFailure.InvalidLimit(value, maximum)
+                case QueryFailure.MissingLimit(maximum)
+                case QueryFailure.SourceMismatch(expected, actual)
+                case QueryFailure.UnsupportedCapability(name)
+                  console::println(name)
+                case QueryFailure.Cleanup(cleanup)
+                case QueryFailure.MissingColumn(name)
+                  console::println(name)
+                case QueryFailure.TypeMismatch(column, expected, actual)
+                  console::println(column + expected + actual)
+                case QueryFailure.Cardinality(expected, actual)
+              end
+              return error
+          end
+      end
+    end
+  end
+  return 1
+end
+
+def verifyAsyncRootCollection(
+  parents: Query<LoadingParent>, children: Query<LoadingChild>, relation: CollectionNavigation<LoadingParent, LoadingChild>
+): resources::Outcome<Int, QueryFailure>
+  using operation <- include(parents, children, relation).allAsync()
+    while true
+      match operation.poll()
+        case AsyncQueryPoll.Pending(socket, interest)
+          continue
+        case AsyncQueryPoll.Completed(result)
+          match result
+            case QueryResult.Failure(error)
+              return error
+            case QueryResult.Rows(rows)
+              return 0
+          end
+      end
+    end
+  end
+  return 1
+end
+
+def verifyCancelledAsyncCollection(
+  parents: Query<LoadingParent>,
+  children: Query<LoadingChild>,
+  relation: CollectionNavigation<LoadingParent, LoadingChild>,
+  rows: TypedRows<LoadingParent>,
+  token: CancellationToken
+): resources::Outcome<Int, QueryFailure>
+  using operation <- include(parents, children, relation).loadAsync(rows, new StreamOptions(token: token))
+    match operation.poll()
+      case AsyncQueryPoll.Pending(socket, interest)
+        test::assertTrue(false)
+      case AsyncQueryPoll.Completed(result)
+        match result
+          case QueryResult.Rows(rows)
+            test::assertTrue(false)
+          case QueryResult.Failure(error)
+            return 0
+        end
+    end
+    return 1
+  end
+  return 1
+end
+
+def verifyAsyncLazyCollection(
+  parents: Query<LoadingParent>,
+  children: Query<LoadingChild>,
+  relation: CollectionNavigation<LoadingParent, LoadingChild>,
+  entity: LoadingParent,
+  token: CancellationToken
+): resources::Outcome<Int, QueryFailure>
+  relation.markCollection(entity, NavigationLoadState.Unknown())
+  using operation <- lazyCollectionAsync(parents, children, relation, entity, new StreamOptions(token: token))
+    match relation.collectionState(entity)
+      case NavigationLoadState.Loading()
+      case NavigationLoadState.Loaded()
+        test::assertTrue(false)
+      case NavigationLoadState.Partial()
+        test::assertTrue(false)
+      case NavigationLoadState.Unknown()
+        test::assertTrue(false)
+    end
+    match operation.poll()
+      case AsyncQueryPoll.Pending(socket, interest)
+        test::assertTrue(false)
+      case AsyncQueryPoll.Completed(result)
+        match result
+          case QueryResult.Rows(rows)
+            test::assertTrue(false)
+          case QueryResult.Failure(error)
+        end
+    end
+    match relation.collectionState(entity)
+      case NavigationLoadState.Unknown()
+      case NavigationLoadState.Loading()
+        test::assertTrue(false)
+      case NavigationLoadState.Loaded()
+        test::assertTrue(false)
+      case NavigationLoadState.Partial()
+        test::assertTrue(false)
+    end
+    return 0
+  end
+  return 1
 end

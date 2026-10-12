@@ -1,0 +1,158 @@
+use reference
+namespace neri_data
+
+class HierarchyMaterializationIdentity
+  public key: Cell
+  public discriminator: Cell
+  public next: HierarchyMaterializationIdentity?
+
+  def init(key: Cell, discriminator: Cell, next: HierarchyMaterializationIdentity?): Void
+    this.key = key
+    this.discriminator = discriminator
+    this.next = next
+  end
+end
+
+## Resolves subtype materialization through the hierarchy's single root tracker.
+class HierarchyRowResolver<B, D>: AsyncRowResolver<D>
+  private root: AsyncRowResolver<B>
+  private upcast: fn(D): B
+  private downcast: fn(B): D?
+
+  def init(root: AsyncRowResolver<B>, upcast: fn(D): B, downcast: fn(B): D?): Void
+    this.root = root
+    this.upcast = upcast
+    this.downcast = downcast
+  end
+
+  public override def resolveRows(rows: TypedRows<D>): QueryResult<D>
+    let roots = new TypedRows<B>()
+    var current = rows.first()
+    let tracker = reference::cast<EntityTracker<B>, AsyncRowResolver<B>>(this.root)
+    let accepts: fn(B): Bool = fn(value: B): Bool do
+      return this.downcast(value) != null
+    end
+
+    while current != null
+      let root = this.upcast(current.value)
+
+      if tracker != null
+        let invalid = tracker.validateMaterializationIdentity(root, accepts)
+
+        if invalid != null
+          return QueryResult<D>.Failure(invalid)
+        end
+      end
+      roots.add(root)
+      current = current.next
+    end
+    match this.root.resolveRows(roots)
+      case QueryResult.Failure(error)
+        return QueryResult<D>.Failure(error)
+      case QueryResult.Rows(resolved)
+        let result = new TypedRows<D>()
+        var root = resolved.first()
+
+        while root != null
+          let child = this.downcast(root.value)
+
+          if child == null
+            return QueryResult<D>.Failure(QueryFailure.UnsupportedCapability("tracked hierarchy identity has a different subtype"))
+          end
+          result.add(child)
+          root = root.next
+        end
+        return QueryResult<D>.Rows(result)
+    end
+  end
+end
+
+## Narrows a mapped hierarchy source while retaining its root identity resolver.
+def hierarchyOfType<B, D>(
+  query: Query<B>, mapping: EntityMapping, discriminatorColumn: String,
+  discriminator: String, upcast: fn(D): B, downcast: fn(B): D?
+): Relation<D>
+  return hierarchyOfTypes<B, D>(query, mapping, discriminatorColumn, [discriminator], upcast, downcast)
+end
+
+def hierarchyOfTypes<B, D>(
+  query: Query<B>, mapping: EntityMapping, discriminatorColumn: String,
+  discriminators: String[], upcast: fn(D): B, downcast: fn(B): D?
+): Relation<D>
+  let source = query.asRelation()
+  let build: fn(SqlDialect): RelationBuildResult<D> = fn(dialect: SqlDialect): RelationBuildResult<D> do
+    match source.build(dialect)
+      case RelationBuildResult.Failure(error)
+        return RelationBuildResult<D>.Failure(error)
+      case RelationBuildResult.Plan(plan)
+        if !dialectIdentifierValid(discriminatorColumn, dialect)
+          return RelationBuildResult<D>.Failure(QueryFailure.InvalidIdentifier(discriminatorColumn))
+        end
+        let state = new CompileState()
+
+        joinParameterCopy(plan.parameters, state)
+        if discriminators.Length == 0
+          return RelationBuildResult<D>.Failure(QueryFailure.UnsupportedCapability("hierarchy subtype requires a discriminator"))
+        end
+        var predicate = ""
+
+        for discriminator in discriminators
+          state.bind(Parameter.Text(discriminator))
+          predicate = predicate + (predicate == "" ? "" : " OR ") + quoted(
+            "__neri_hierarchy",
+            discriminatorColumn
+          ) + " = " + dialectPlaceholder(
+            dialect,
+            state.count
+          )
+        end
+        let sql = "SELECT * FROM (" + plan.sql + ") AS \"__neri_hierarchy\" WHERE (" + predicate + ")"
+        let read: fn(RawRow): DecodeResult<D> = fn(row: RawRow): DecodeResult<D> do
+          match plan.decoder.decode(row)
+            case DecodeResult.Failure(error)
+              return DecodeResult<D>.Failure(error)
+            case DecodeResult.Value(root)
+              let child = downcast(root)
+
+              if child == null
+                return DecodeResult<D>.Failure(QueryFailure.TypeMismatch(
+                    discriminatorColumn,
+                    "selected hierarchy subtype",
+                    "incompatible concrete subtype"
+                  ))
+              end
+              return DecodeResult<D>.Value(child)
+          end
+        end
+
+        return RelationBuildResult<D>.Plan(new RelationPlan<D>(
+            sql, new ParameterValues(state.head, state.count), plan.columns,
+            new Decoder<D>(read, plan.columns), mapping, plan.checkedScalars, plan.order
+          ))
+    end
+  end
+  let factory: fn(): AsyncRowResolver<D>? = fn(): AsyncRowResolver<D>? do
+    let resolve = source.resolutionFactory()
+
+    if resolve == null
+      return null
+    end
+    let root = resolve()
+
+    if root == null
+      return null
+    end
+    let resolver: AsyncRowResolver<D> = new HierarchyRowResolver<B, D>(root, upcast, downcast)
+
+    return resolver
+  end
+
+  return new Relation<D>(
+    build,
+    source.provider(),
+    resolver: factory,
+    owner: source.contextOwner(),
+    physicalSource: source.physicalEntitySource(),
+    trackingActive: source.tracksEntities()
+  )
+end

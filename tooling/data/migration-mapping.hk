@@ -11,6 +11,10 @@ def dataMigrationType(kind: DataScalarKind): neri_data::SchemaType
       return neri_data::SchemaType.Float()
     case DataScalarKind.String()
       return neri_data::SchemaType.Text()
+    case DataScalarKind.Binary()
+      return neri_data::SchemaType.Binary()
+    case DataScalarKind.Decimal()
+      return neri_data::SchemaType.Text()
   end
 end
 
@@ -25,7 +29,7 @@ def dataMigrationDefault(field: DataField): neri_data::SchemaDefault?
   end
   match field.domain
     case DataScalarKind.Bool()
-      return neri_data::SchemaDefault.Bool(node.isTrue())
+      return field.boolToInt ? neri_data::SchemaDefault.Int(node.isTrue() ? 1 : 0) : neri_data::SchemaDefault.Bool(node.isTrue())
     case DataScalarKind.Int()
       let value = host::parseInt(node.scalarText())
 
@@ -36,6 +40,12 @@ def dataMigrationDefault(field: DataField): neri_data::SchemaDefault?
       return value == null ? null : neri_data::SchemaDefault.Float(value)
     case DataScalarKind.String()
       return neri_data::SchemaDefault.Text(node.scalarText())
+    case DataScalarKind.Binary()
+      return null
+    case DataScalarKind.Decimal()
+      let text = dataDecimalLiteral(node.scalarText())
+
+      return text == null ? null : neri_data::SchemaDefault.Text(text)
   end
 end
 
@@ -72,11 +82,13 @@ def dataMigrationEntityAt(mapping: DataMapping, position: Int): DataEntity?
   var index = 0
 
   while entity != null
-    if index == position
-      return entity
+    if !entity.keyless && !entity.view
+      if index == position
+        return entity
+      end
+      index = index + 1
     end
     entity = entity.nextEntity
-    index = index + 1
   end
   return null
 end
@@ -92,7 +104,7 @@ def dataMigrationModel(mapping: DataMapping): DataMigrationSnapshot
   var entity = mapping.firstEntity
 
   while entity != null
-    tableCount = tableCount + 1
+    tableCount = tableCount + 1 if !entity.keyless && !entity.view
     entity = entity.nextEntity
   end
   let tables: neri_data::SchemaTable[] = arrays::generate(tableCount) do |tableIndex|
@@ -108,18 +120,32 @@ def dataMigrationModel(mapping: DataMapping): DataMigrationSnapshot
       fieldCount = fieldCount + 1
       field = field.nextField
     end
+    fieldCount = fieldCount + 1 if current.discriminatorColumn != ""
     let fields: neri_data::SchemaField[] = arrays::generate(fieldCount) do |fieldIndex|
       let member = dataMigrationFieldAt(current, fieldIndex)
 
       if member == null
+        if current.discriminatorColumn != ""
+          return new neri_data::SchemaField(
+            current.typeName + ".__discriminator",
+            new neri_data::SchemaColumn(current.discriminatorColumn, neri_data::SchemaType.Text())
+          )
+        end
         return new neri_data::SchemaField("", new neri_data::SchemaColumn("", neri_data::SchemaType.Int()))
       end
       let column = new neri_data::SchemaColumn(
         member.columnName,
-        dataMigrationType(member.domain),
-        nullable: member.optional,
-        primaryKey: member.memberName == current.keyMember,
-        defaultValue: dataMigrationDefault(member)
+        member.boolToInt ? neri_data::SchemaType.Int() : dataMigrationType(member.domain),
+        nullable: member.optional || member.hierarchyType != "",
+        primaryKey: member.hierarchyType == "" && current.isKeyMember(member.memberName),
+        defaultValue: dataMigrationDefault(member),
+        reference: dataMigrationReference(mapping, current, member),
+        keyPosition: dataKeyPosition(current, member.memberName),
+        defaultSql: member.defaultSql == "" ? null : member.defaultSql,
+        computedSql: member.computedSql == "" ? null : member.computedSql,
+        computedStored: member.computedStored,
+        checkSql: member.checkSql == "" ? null : member.checkSql,
+        collation: member.collation == "" ? null : member.collation
       )
 
       return new neri_data::SchemaField(dataFieldIdentity(member), column)
@@ -141,10 +167,49 @@ def dataMigrationModel(mapping: DataMapping): DataMigrationSnapshot
         return definition.fields.get(memberIndex)
       end
 
-      return new neri_data::SchemaIndex(definition.name, identities, definition.unique)
+      let descending = arrays::generate<Bool>(definition.descending.size) do |position|
+        return definition.descending.get(position) == "true"
+      end
+      let expressions = arrays::generate<String>(definition.expressions.size) do |position|
+        return definition.expressions.get(position)
+      end
+      let included = arrays::generate<String>(definition.included.size) do |position|
+        return definition.included.get(position)
+      end
+
+      return new neri_data::SchemaIndex(
+        definition.name,
+        identities,
+        definition.unique,
+        descending,
+        definition.predicate == "" ? null : definition.predicate,
+        expressions,
+        included
+      )
     end
 
-    return new neri_data::SchemaTable(current.typeName, current.tableName, fields, indexes)
+    var seedCount = 0
+    var seed = current.firstSeed
+
+    while seed != null
+      seedCount = seedCount + 1
+      seed = seed.nextSeed
+    end
+    let seeds = arrays::generate<neri_data::SchemaSeed>(seedCount) do |position|
+      var item = current.firstSeed
+      var index = 0
+
+      while item != null
+        if index == position
+          return dataMigrationMappedSeed(current, item)
+        end
+        item = item.nextSeed
+        index = index + 1
+      end
+      return new neri_data::SchemaSeed([], [], [], [])
+    end
+
+    return new neri_data::SchemaTable(current.typeName, current.tableName, fields, indexes, seeds)
   end
   let model = new neri_data::SchemaModel(tables)
   let invalid = model.validate()
@@ -155,4 +220,118 @@ def dataMigrationModel(mapping: DataMapping): DataMigrationSnapshot
     result.model = model
   end
   return result
+end
+
+def dataMigrationMappedSeed(entity: DataEntity, seed: DataSeed): neri_data::SchemaSeed
+  var count = 0
+  var field = entity.firstField
+
+  while field != null
+    count = count + 1 if !entity.isKeyMember(field.memberName) && !seed.node.get(field.memberName).isMissing()
+    field = field.nextField
+  end
+  let keys = arrays::generate<String>(entity.keyMembers.size) do |index|
+    let key = entity.field(entity.keyMembers.get(index))
+
+    return key == null ? "" : dataFieldIdentity(key)
+  end
+  let keyValues = arrays::generate<neri_data::Cell>(entity.keyMembers.size) do |index|
+    let key = entity.field(entity.keyMembers.get(index))
+
+    return key == null ? neri_data::Cell.Null() : dataMigrationMappedSeedValue(key, seed.node.get(key.memberName))
+  end
+  let fields = arrays::generate<String>(count) do |index|
+    let member = dataMigrationSeedFieldAt(entity, seed, index)
+
+    return member == null ? "" : dataFieldIdentity(member)
+  end
+  let values = arrays::generate<neri_data::Cell>(count) do |index|
+    let member = dataMigrationSeedFieldAt(entity, seed, index)
+
+    return member == null ? neri_data::Cell.Null() : dataMigrationMappedSeedValue(
+      member,
+      seed.node.get(member.memberName)
+    )
+  end
+
+  return new neri_data::SchemaSeed(keys, keyValues, fields, values)
+end
+
+def dataMigrationSeedFieldAt(entity: DataEntity, seed: DataSeed, position: Int): DataField?
+  var index = 0
+  var field = entity.firstField
+
+  while field != null
+    if !entity.isKeyMember(field.memberName) && !seed.node.get(field.memberName).isMissing()
+      if index == position
+        return field
+      end
+      index = index + 1
+    end
+    field = field.nextField
+  end
+  return null
+end
+
+def dataMigrationMappedSeedValue(field: DataField, node: LspJson): neri_data::Cell
+  if node.isNull()
+    return neri_data::Cell.Null()
+  end
+  if field.boolToInt
+    return neri_data::Cell.Int(node.isTrue() ? 1 : 0)
+  end
+  match field.domain
+    case DataScalarKind.Bool()
+      return neri_data::Cell.Bool(node.isTrue())
+    case DataScalarKind.Int()
+      let value = host::parseInt(node.scalarText())
+
+      return neri_data::Cell.Int(value == null ? 0 : value)
+    case DataScalarKind.Float()
+      let value = host::parseFloat(node.scalarText())
+
+      return neri_data::Cell.Float(value == null ? 0.0 : value)
+    case DataScalarKind.String()
+      return neri_data::Cell.Text(node.scalarText())
+    case DataScalarKind.Decimal()
+      let value = dataDecimalLiteral(node.scalarText())
+
+      return neri_data::Cell.Text(value == null ? "" : value)
+    case DataScalarKind.Binary()
+      let bytes = crypto::decodeHex(node.get("hex").scalarText(), 1048576).bytes()
+
+      return bytes == null ? neri_data::Cell.Null() : neri_data::cellBinaryBytes(bytes)
+  end
+end
+
+def dataMigrationReference(mapping: DataMapping, entity: DataEntity, field: DataField): neri_data::SchemaReference?
+  var relation = mapping.firstRelation
+
+  while relation != null
+    let principal = relation.principal
+
+    if relation.dependentType == entity.typeName && dataReferenceAnchor(relation) == field.memberName && principal != null
+      let selectedRelation = relation
+      let columns: String[] = arrays::generate(selectedRelation.keyMembers.size) do |index|
+        let member = principal.field(selectedRelation.keyMembers.get(index))
+
+        return member == null ? "" : member.columnName
+      end
+      let fields: String[] = arrays::generate(selectedRelation.foreignKeyMembers.size) do |index|
+        let member = entity.field(selectedRelation.foreignKeyMembers.get(index))
+
+        return member == null ? "" : member.columnName
+      end
+
+      return new neri_data::SchemaReference(
+        principal.tableName,
+        columns,
+        fields,
+        onDelete: relation.databaseOnDelete,
+        deferred: relation.deferred
+      )
+    end
+    relation = relation.nextRelation
+  end
+  return null
 end
