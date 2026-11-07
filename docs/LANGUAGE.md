@@ -500,9 +500,9 @@ end
 Each requirement is a unique public, safe instance signature with no body,
 defaults, abstract or static modifier, or type parameters. A requirement can use
 `Self`, `Self?`, or `Self[]`; a nested generic use such as `Box<Self>` is not supported.
-A contract itself has no type parameters. A generic module function may put one
-source-declared contract after each type parameter's colon. Class bounds and
-generic compiler operations do not accept contracts.
+A contract itself has no type parameters. A generic class or module function
+may put one source-declared contract after each type parameter's colon.
+Compiler operations retain their fixed signatures.
 
 Requirements match structurally. An implementing class supplies an accessible
 public instance method with the exact parameter and result types after replacing
@@ -524,13 +524,20 @@ implementations and source classes are checked against the same requirement.
 states callable shape only; it does not promise algebraic laws such as
 reflexivity, symmetry, or transitivity.
 
-Constrained templates are checked at their declaration with their type parameters
-opaque. Unconstrained generic functions retain specialization-time body checking.
-This is Neri's current design, not a claim of formal proof or a full trait system.
-It follows the general idea of stated generic requirements in
-[Siek and Lumsdaine](https://arxiv.org/pdf/0708.2255),
-[Go interface method sets](https://go.dev/ref/spec#Interface_types), and
-[Rust trait bounds](https://doc.rust-lang.org/reference/trait-bounds.html).
+The compiler checks constrained declarations even when the program never
+specializes them. It treats all their type parameters as opaque and makes the
+declared requirements available to the body. For a class this includes its base
+type, fields, initializers, and ordinary methods. A bound can satisfy a
+requirement on another generic class or function used in the declaration.
+Concrete specializations check their arguments against the same requirements.
+Unconstrained generic templates and independently generic methods check their
+bodies at specialization time.
+
+Neri follows the idea of checking generic bodies against declared requirements
+and checking bounds again when a concrete type is supplied. The source rules
+above define Neri's checked behavior. [Siek and Lumsdaine](https://arxiv.org/abs/0708.2255)
+describe modular checking for G. The [Rust Reference](https://doc.rust-lang.org/reference/trait-bounds.html#bound.satisfaction)
+shows how a declared bound satisfies the requirements of another generic type.
 
 The current generic surface consists of module functions, classes, and
 method-level type parameters. A method can introduce its own type parameters
@@ -550,8 +557,8 @@ are invariant: inheriting from `Box<Int>` does not make a class assignable to
 `Box<String>`. Generic inheritance is checked when the class is specialized,
 including base restrictions and inheritance cycles.
 
-Class bounds, multiple bounds, generic contracts, and higher-kinded types are
-outside this surface. Templates are supplied as source files in the same
+Multiple bounds per parameter, parameterized contracts, and higher-kinded types
+are outside this surface. Templates are supplied as source files in the same
 compilation invocation, including across namespaces. A compiled specialization is concrete; it is not a separately
 importable generic template or a package ABI promise.
 
