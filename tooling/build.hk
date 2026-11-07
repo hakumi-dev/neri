@@ -829,35 +829,50 @@ class Build
   def copyDataProject(tree: String): Void
     let source = this.root + "/experiments/neri-data"
     let destination = tree + "/share/neri/data"
+    let postgresqlDestination = tree + "/share/neri/data-postgresql"
     let runtimeManifest = this.root + "/tooling/data-package-runtime.json"
     let sqliteManifest = this.root + "/tooling/data-package-sqlite.json"
+    let postgresqlManifest = this.root + "/tooling/data-package-postgresql.json"
     let runtime = dataPackageUnit(runtimeManifest, "runtime")
     let sqlite = dataPackageUnit(sqliteManifest, "sqlite")
+    let postgresql = dataPackageUnit(postgresqlManifest, "postgresql")
     let runtimeSources = dataPackageSources(runtime)
     let sqliteSources = dataPackageSources(sqlite)
+    let postgresqlSources = dataPackageSources(postgresql)
     let versions = lines(requiredText(this.root + "/VERSION"))
 
     if versions.Length != 1 || versions[0] == ""
       fail("invalid VERSION for Data package metadata")
     end
 
-    execute("mkdir", ["-p", destination + "/sqlite"])
+    execute("mkdir", ["-p", destination + "/sqlite", postgresqlDestination])
     for file in runtimeSources
       execute("cp", [source + "/" + file, destination + "/" + file])
     end
     for file in sqliteSources
       execute("cp", [source + "/providers/sqlite/" + file, destination + "/sqlite/" + file])
     end
+    for file in postgresqlSources
+      execute("cp", [source + "/providers/postgresql/" + file, postgresqlDestination + "/" + file])
+    end
     execute("cp", [runtimeManifest, destination + "/manifest.json"])
     execute("cp", [sqliteManifest, destination + "/sqlite/manifest.json"])
+    execute("cp", [postgresqlManifest, postgresqlDestination + "/manifest.json"])
     let metadata = dataPackageMetadata(
       versions[0],
       dataPackageLibrary(runtime, runtimeSources, ""),
       dataPackageLibrary(sqlite, sqliteSources, "sqlite/")
     )
+    let postgresqlMetadata = dataPackagePostgresqlMetadata(
+      versions[0],
+      dataPackageLibrary(postgresql, postgresqlSources, "", true)
+    )
 
     if !host::writeText(destination + "/package.json", metadata)
       fail("Cannot write Data package metadata")
+    end
+    if !host::writeText(postgresqlDestination + "/package.json", postgresqlMetadata)
+      fail("Cannot write PostgreSQL Data package metadata")
     end
   end
 
@@ -926,7 +941,7 @@ class Build
         [this.root + "/tests/session-package-consumer/" + file, tree + "/examples/session-consumer/" + file]
       )
     end
-    for file in ["manifest.json", "entities.hk", "mapping.json", "main.hk"]
+    for file in ["manifest.json", "entities.hk", "mapping.json", "main.hk", "postgresql.hk"]
       execute("cp", [this.root + "/tests/data-package-consumer/" + file, tree + "/examples/data-consumer/" + file])
     end
     for doc in documents
@@ -1319,6 +1334,10 @@ class Build
     execute("mkdir", ["-p", this.work + "/examples", this.work + "/share/neri"])
     execute("cp", ["-R", documentedToolchain + "/examples/data-consumer", dataExample])
     execute("cp", ["-R", documentedToolchain + "/share/neri/data", this.work + "/share/neri/data"])
+    execute(
+      "cp",
+      ["-R", documentedToolchain + "/share/neri/data-postgresql", this.work + "/share/neri/data-postgresql"]
+    )
     execute("mkdir", ["-p", dataExample + "/scaffold"])
     let dataMapping = dataExample + "/mapping.json"
     let installedEnvironment = [
@@ -1378,6 +1397,20 @@ class Build
       end
       fail("installed Data libraries cannot build an independent consumer")
     end
+    let dataDependencies = this.target.isMacOS() ? [
+      "otool",
+      "-L",
+      this.work + "/data-consumer"
+    ] : [
+      "ldd",
+      this.work + "/data-consumer"
+    ]
+
+    if this.capture(dataDependencies, "installed-data-native-dependencies", 60) != 0 || contains(
+      requiredText(this.work + "/installed-data-native-dependencies.stdout"), "libpq"
+    )
+      fail("installed SQLite-only consumer must not depend on libpq")
+    end
     let dataRun = ["-i", "PATH=" + envOr("PATH", "/usr/bin:/bin"), "LC_ALL=C", "TZ=UTC",
       "NERI_HOST=" + documentedToolchain + "/libexec/neri-host",
       "NERI_CODEGEN=" + documentedToolchain + "/bin/neri-codegen",
@@ -1392,6 +1425,26 @@ class Build
       60
     ) != 0 || !contains(requiredText(this.work + "/installed-data-run.stdout"), "Installed Neri Data consumer passed\n")
       fail("installed Data consumer failed")
+    end
+    var postgresqlBuild = host::appendString(installedEnvironment, "NERI_LIBRARY_PATH=" + this.nativeDirectory())
+
+    for argument in [launcher, "build", "--project", dataExample + "/manifest.json", "--unit", "postgresql",
+      "--release", "--output", this.work + "/data-postgresql-consumer"]
+      postgresqlBuild = host::appendString(postgresqlBuild, argument)
+    end
+    if this.capture(postgresqlBuild, "installed-data-postgresql-build", 300) != 0
+      console::print(requiredText(this.work + "/installed-data-postgresql-build.stdout"))
+      console::print(requiredText(this.work + "/installed-data-postgresql-build.stderr"))
+      fail("installed PostgreSQL Data library cannot build an independent consumer")
+    end
+    let postgresqlRun = ["-i", "PATH=" + envOr("PATH", "/usr/bin:/bin"), "LC_ALL=C", "TZ=UTC",
+      this.work + "/data-postgresql-consumer"]
+
+    if this.capture(postgresqlRun, "installed-data-postgresql-run", 60) != 0 || !contains(
+      requiredText(this.work + "/installed-data-postgresql-run.stdout"),
+      "Installed Neri Data PostgreSQL consumer passed\n"
+    )
+      fail("installed PostgreSQL Data consumer failed")
     end
     execute(this.packagedTree + "/install.sh", ["--no-doc", "--prefix", prefix])
     let noDocumentationToolchain = this.installedToolchain(prefix, "installed-no-documentation-link")
@@ -1419,7 +1472,16 @@ class Build
     ) || !contains(
       noDocumentationManifest,
       "  share/neri/data/sqlite/manifest.json\n"
-    ) || !contains(noDocumentationManifest, "  share/neri/data/package.json\n")
+    ) || !contains(
+      noDocumentationManifest,
+      "  share/neri/data-postgresql/manifest.json\n"
+    ) || !contains(
+      noDocumentationManifest,
+      "  share/neri/data-postgresql/package.json\n"
+    ) || !contains(
+      noDocumentationManifest,
+      "  share/neri/data/package.json\n"
+    )
       fail("--no-doc installation omitted Data libraries")
     end
     let packageManifest = requiredText(this.packagedTree + "/ARTIFACTS.sha256")

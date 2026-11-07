@@ -50,14 +50,16 @@ def dataParseSeeds(mapping: DataMapping, entity: DataEntity, node: LspJson, cont
   if node.isMissing()
     return true
   end
-  if !node.isArray() || entity.keyless || entity.discriminatorColumn != ""
-    return mapping.fail(context + " requires a seed array on a keyed non-hierarchy entity.")
+  let symbol = entity.symbol
+
+  if !node.isArray() || entity.keyless || entity.view || (node.first != null && symbol != null && symbol.isAbstract)
+    return mapping.fail(context + " requires a seed array on a concrete keyed entity with a managed table.")
   end
   var count = 0
   var field = entity.firstField
 
   while field != null
-    count = count + 1
+    count = count + 1 if field.hierarchyType == ""
     field = field.nextField
   end
   let members = arrays::generate<String>(count) do |index|
@@ -65,64 +67,183 @@ def dataParseSeeds(mapping: DataMapping, entity: DataEntity, node: LspJson, cont
     var position = 0
 
     while current != null
-      if position == index
-        return current.memberName
+      if current.hierarchyType == ""
+        if position == index
+          return current.memberName
+        end
+        position = position + 1
       end
       current = current.nextField
-      position = position + 1
     end
     return ""
   end
   var row = node.first
   var rowCount = 0
+  let keys = new StringTable<Bool>()
 
   while row != null
     if rowCount >= 1000 || !dataObject(mapping, row, context, members)
       return mapping.fail(context + " seed rows must be objects, bounded to 1000 entries.")
     end
-    let seed = new DataSeed(row)
-    var keys = "["
-    var keyValues = "["
-    var fields = "["
-    var values = "["
+    let seed = new DataSeed(row, entity, new StringTable<String>())
 
     field = entity.firstField
     while field != null
-      let value = row.get(field.memberName)
+      if field.hierarchyType == ""
+        let value = row.get(field.memberName)
 
-      if value.isMissing()
-        if entity.isKeyMember(field.memberName) || (!field.optional && field.defaultCode == "")
-          return mapping.fail(context + " seed rows require assigned keys and values for every required field without a default.")
-        end
-      else
-        let code = dataSeedCellCode(mapping, field, value, context + "." + field.memberName)
-
-        if code == ""
-          return false
-        end
-        if entity.isKeyMember(field.memberName)
-          keys = keys + (keys == "[" ? "" : ", ") + lspQuote(dataFieldIdentity(field))
-          keyValues = keyValues + (keyValues == "[" ? "" : ", ") + code
+        if value.isMissing()
+          if entity.isKeyMember(field.memberName) || (!field.optional && field.defaultCode == "" && field.defaultSql == "" && field.computedSql == "")
+            return mapping.fail(context + " seed rows require assigned keys and values for every required field without a default.")
+          end
         else
-          fields = fields + (fields == "[" ? "" : ", ") + lspQuote(dataFieldIdentity(field))
-          values = values + (values == "[" ? "" : ", ") + code
+          if field.computedSql != ""
+            return mapping.fail(context + " seed rows omit computed fields.")
+          end
+          let code = dataSeedCellCode(mapping, field, value, context + "." + field.memberName)
+
+          if code == ""
+            return false
+          end
+          seed.cellCodes.add(field.memberName, code)
         end
       end
       field = field.nextField
     end
-    seed.code = "new neri_data::SchemaSeed(" + keys + "], " + keyValues + "], " + fields + "], " + values + "])"
-    seed.keyCode = keyValues
-    var previous = entity.firstSeed
+    var keyIndex = 0
 
-    while previous != null
-      if previous.keyCode == seed.keyCode
-        return mapping.fail(context + " repeats an assigned primary-key tuple.")
+    while keyIndex < entity.keyMembers.size
+      let value = seed.cellCodes.find(entity.keyMembers.get(keyIndex))
+
+      if value == null
+        return mapping.fail(context + " seed rows require assigned keys.")
       end
-      previous = previous.nextSeed
+      seed.keyCode = seed.keyCode + (keyIndex == 0 ? "" : ", ") + value.value
+      keyIndex = keyIndex + 1
     end
+    if keys.find(seed.keyCode) != null
+      return mapping.fail(context + " repeats an assigned primary-key tuple.")
+    end
+    keys.add(seed.keyCode, true)
     entity.addSeed(seed)
     row = row.next
     rowCount = rowCount + 1
   end
   return true
+end
+
+def dataAppendSeeds(target: DataEntity, source: DataEntity): Void
+  var seed = source.firstSeed
+
+  # Declared rows precede rows projected from descendants.
+  while seed != null && seed.owner.typeName == source.typeName
+    target.addSeed(new DataSeed(seed.node, seed.owner, seed.cellCodes, seed.keyCode))
+    seed = seed.nextSeed
+  end
+end
+
+def dataHierarchySeeds(mapping: DataMapping, root: DataEntity, context: String): Bool
+  if root.hierarchyStrategy == ""
+    return true
+  end
+  let keys = new StringTable<Bool>()
+  var seed = root.firstSeed
+
+  while seed != null
+    keys.add(seed.keyCode, true)
+    seed = seed.nextSeed
+  end
+  var derived = root.firstDerived
+
+  while derived != null
+    seed = derived.entity.firstSeed
+    while seed != null
+      if keys.find(seed.keyCode) != null
+        return mapping.fail(context + " repeats an assigned primary-key tuple across the hierarchy.")
+      end
+      keys.add(seed.keyCode, true)
+      seed = seed.nextSeed
+    end
+    derived = derived.nextDerived
+  end
+  if root.hierarchyStrategy == "tpc"
+    return true
+  end
+  derived = root.firstDerived
+  while derived != null
+    let source = derived.entity
+    let first = source.firstSeed
+
+    if first != null && first.owner.typeName == source.typeName
+      var table: DataEntity? = root.hierarchyStrategy == "tph" ? root : source.hierarchyParent
+
+      while table != null
+        dataAppendSeeds(table, source)
+        table = table.hierarchyParent
+      end
+    end
+    derived = derived.nextDerived
+  end
+  return true
+end
+
+def dataSeedSibling(seed: DataSeed, field: DataField): Bool
+  if field.hierarchyType == ""
+    return false
+  end
+  var owner: DataEntity? = seed.owner
+
+  while owner != null
+    if owner.typeName == field.hierarchyType
+      return false
+    end
+    owner = owner.hierarchyParent
+  end
+  return true
+end
+
+def dataSeedFieldCode(seed: DataSeed, field: DataField): String?
+  if field.computedSql != ""
+    return null
+  end
+  if dataSeedSibling(seed, field)
+    return "neri_data::Cell.Null()"
+  end
+  let code = seed.cellCodes.find(field.memberName)
+
+  return code == null ? null : code.value
+end
+
+def dataSeedSource(entity: DataEntity, seed: DataSeed): String
+  var keys = "["
+  var fields = "["
+  var values = "["
+  var keyIndex = 0
+
+  while keyIndex < entity.keyMembers.size
+    let key = entity.field(entity.keyMembers.get(keyIndex))
+
+    if key != null
+      keys = keys + (keyIndex == 0 ? "" : ", ") + lspQuote(dataFieldIdentity(key))
+    end
+    keyIndex = keyIndex + 1
+  end
+  var field = entity.firstField
+
+  while field != null
+    if !entity.isKeyMember(field.memberName)
+      let code = dataSeedFieldCode(seed, field)
+
+      if code != null
+        fields = fields + (fields == "[" ? "" : ", ") + lspQuote(dataFieldIdentity(field))
+        values = values + (values == "[" ? "" : ", ") + code
+      end
+    end
+    field = field.nextField
+  end
+  if entity.discriminatorColumn != ""
+    fields = fields + (fields == "[" ? "" : ", ") + lspQuote(entity.typeName + ".__discriminator")
+    values = values + (values == "[" ? "" : ", ") + "neri_data::Cell.Text(" + dataStringLiteral(seed.owner.discriminatorValue) + ")"
+  end
+  return "new neri_data::SchemaSeed(" + keys + "], [" + seed.keyCode + "], " + fields + "], " + values + "])"
 end

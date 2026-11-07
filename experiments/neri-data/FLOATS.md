@@ -13,6 +13,12 @@ quoted comparisons, `orderByFloat`, and `thenByFloat`. Nullable equality keeps
 the existing Boolean NULL compensation; nullable ordered comparisons remain
 unsupported.
 
+`optionalFloatField` and `optionalIntField` expose explicit `lessThan`,
+`lessThanOrEqual`, `greaterThan`, and `greaterThanOrEqual` predicates over
+same-type nullable numeric expressions. Apply them with `matchingComputed`.
+Each ordered comparison returns false when either operand is NULL and composes
+with nullable numeric casts. These operations execute in SQL on both providers.
+
 The quotation ABI includes `FloatLiteral`, `Node.floatValue()`, and
 `CaptureValue.Float`.
 Computed Float arithmetic and negation follow the

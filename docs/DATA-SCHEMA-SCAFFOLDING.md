@@ -8,6 +8,20 @@ project manifest, entity unit and generated output directory. The caller saves
 the two artifacts, adds the model source to its entity unit, and runs the
 ordinary data generator with the mapping.
 
+Set `SchemaScaffoldOptions.tables` to physical table and view names to scaffold
+a selection; its default empty array selects all visible relations. Names match
+exactly and use ASCII identifier names of at most 63 bytes. Both entry points
+reject duplicate, invalid or oversized selections. Scaffolding also rejects
+missing names; inspection returns metadata for the matching visible relations.
+Both providers apply selection before
+reading column, foreign-key and index metadata, so unsupported definitions in
+unselected relations do not prevent scaffolding. A foreign key is included when
+both its dependent and principal tables are selected in the inspected schema.
+Cross-schema foreign keys are omitted because mapping uses unqualified table names.
+Physical column and table
+ordering remains deterministic. The same options can select `inspectSchema`
+metadata without generating source.
+
 The generated classes preserve physical column order, nullable types and
 ordered primary-key members. A single generated integer key uses `onAdd`;
 defaulted non-key fields use `onAdd`; computed fields use `onAddOrUpdate`.
@@ -28,11 +42,21 @@ or newer, matching the provider minimum. PostgreSQL scaffolding accepts the
 `public` schema; other schemas require schema-qualified mapping support.
 
 SQLite accepts the exact declared types `INTEGER`, `REAL`, `TEXT` and `BLOB`.
-PostgreSQL accepts `bigint`, `boolean`, `double precision`, `text` and `bytea`.
-Other types and type modifiers fail instead of applying an affinity or losing
-precision. Unsupported generated key combinations and nullable primary keys
-also fail. SQLite rowid aliases are distinguished from assigned keys in
-WITHOUT ROWID tables and indexed primary keys.
+PostgreSQL accepts `bigint`, `boolean`, `double precision`, `text` and `bytea`,
+plus `smallint`, `integer`, `real` and `character varying` with an optional length.
+Scaffolding maps these additional types to `Int`, `Float` and `String` and emits
+the `postgresqlType` facet so migration DDL recreates the original storage type.
+The type retains PostgreSQL's range, precision and length rules.
+[PostgreSQL 14 numeric types](https://www.postgresql.org/docs/14/datatype-numeric.html)
+and [character types](https://www.postgresql.org/docs/14/datatype-character.html).
+For the additional integer types, scaffolding accepts assigned keys and rejects
+identity columns and SQL-defaulted keys whose generation definitions require
+authored schema.
+Other types and modifiers fail inspection-to-source conversion. The portable
+decimal and date/time codecs use text storage, so native PostgreSQL `numeric`
+and date/time types require additional codecs. Unsupported generated key
+combinations and nullable primary keys also fail. SQLite rowid aliases are
+distinguished from assigned keys in WITHOUT ROWID tables and indexed primary keys.
 
 Physical identifiers must fit the mapping's identifier contract. Neri class,
 set and field names have deterministic prefixes and byte escapes, with collision
@@ -41,7 +65,14 @@ components and indexes.
 
 Authored mappings accept column `defaultSql`, `computedSql`, `computedStored`,
 `checkSql` and `collation` facets. `SchemaColumn` carries the same facets through
-migration signatures, snapshots, scripts and provider execution. SQL expressions
+migration signatures, snapshots, scripts and provider execution. The optional
+`postgresqlType` facet accepts the additional PostgreSQL types listed above and
+requires a matching model storage codec. SQLite rejects DDL using this facet.
+Changing the facet of an existing column requires explicit migration SQL to
+choose how existing values convert. An explicit cast to a shorter `character
+varying` can truncate existing values. [PostgreSQL 14 ALTER TABLE](https://www.postgresql.org/docs/14/sql-altertable.html)
+and [character cast rules](https://www.postgresql.org/docs/14/datatype-character.html).
+SQL expressions
 must be bounded and balanced, with no statement separators or comments outside
 quoted literals. Index mapping facets are `descending`, `expressions`, `include`
 and `predicate`. Member and include lists use model members; expressions and

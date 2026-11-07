@@ -159,7 +159,16 @@ enum PostgreSQLSchemaResult
   case Failure(error: ProviderFailure)
 end
 
-def pgInspectSchema(provider: PostgreSQLProvider, schema: String?): PostgreSQLSchemaResult
+def pgInspectSchema(
+  provider: PostgreSQLProvider,
+  schema: String?,
+  options: SchemaScaffoldOptions? = null
+): PostgreSQLSchemaResult
+  let invalid = scaffoldSelectionFailure(options)
+
+  if invalid != null
+    return PostgreSQLSchemaResult.Failure(invalid)
+  end
   var ownedLease: Int? = null
 
   if provider.nativeTransactionLease() == null
@@ -180,7 +189,7 @@ def pgInspectSchema(provider: PostgreSQLProvider, schema: String?): PostgreSQLSc
       case PostgreSQLCommandResult.Completed(count, row)
     end
   end
-  let result = pgInspectSchemaCurrent(provider, schema)
+  let result = pgInspectSchemaCurrent(provider, schema, options)
   let lease = ownedLease
 
   if lease != null
@@ -201,7 +210,16 @@ def pgInspectSchema(provider: PostgreSQLProvider, schema: String?): PostgreSQLSc
   return result
 end
 
-def pgInspectSchemaCurrent(provider: PostgreSQLProvider, schema: String?): PostgreSQLSchemaResult
+def pgInspectSchemaCurrent(
+  provider: PostgreSQLProvider,
+  schema: String?,
+  options: SchemaScaffoldOptions?
+): PostgreSQLSchemaResult
+  let invalid = scaffoldSelectionFailure(options)
+
+  if invalid != null
+    return PostgreSQLSchemaResult.Failure(invalid)
+  end
   if schema != null && (!identifierValid(schema) || pgHasNul(schema))
     return PostgreSQLSchemaResult.Failure(ProviderFailure.State("PostgreSQL schema inspection requires a valid schema identifier"))
   end
@@ -212,6 +230,7 @@ def pgInspectSchemaCurrent(provider: PostgreSQLProvider, schema: String?): Postg
     parameters.bind(Parameter.Text(schema))
     filter = "n.nspname = $1"
   end
+  filter = filter + scaffoldSelectionSql(options, "c.relname")
   let sql = "SELECT n.nspname::text AS schema_name,c.relname::text AS table_name,a.attname::text AS column_name,pg_catalog.format_type(a.atttypid,a.atttypmod)::text AS declared_type,pg_catalog.pg_get_expr(d.adbin,d.adrelid)::text AS default_sql,a.attnotnull AS required,COALESCE((SELECT k.ordinality FROM pg_catalog.pg_index i CROSS JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS k(attnum,ordinality) WHERE i.indrelid=c.oid AND i.indisprimary AND k.attnum=a.attnum LIMIT 1),0)::bigint AS key_position,a.attgenerated::text AS generated,a.attidentity::text AS identity,(c.relkind IN ('v','m')) AS is_view,(SELECT coll.collname::text FROM pg_catalog.pg_collation coll JOIN pg_catalog.pg_type typ ON typ.oid=a.atttypid WHERE coll.oid=a.attcollation AND a.attcollation<>typ.typcollation) AS collation_name,(SELECT string_agg('(' || pg_catalog.pg_get_expr(ch.conbin,ch.conrelid) || ')',' AND ' ORDER BY ch.conname) FROM pg_catalog.pg_constraint ch WHERE ch.conrelid=c.oid AND ch.contype='c' AND ((array_length(ch.conkey,1)=1 AND ch.conkey[1]=a.attnum) OR (COALESCE(array_length(ch.conkey,1),0)<>1 AND a.attnum=(SELECT min(f.attnum) FROM pg_catalog.pg_attribute f WHERE f.attrelid=c.oid AND f.attnum>0 AND NOT f.attisdropped)))) AS check_sql FROM pg_catalog.pg_namespace n JOIN pg_catalog.pg_class c ON c.relnamespace=n.oid JOIN pg_catalog.pg_attribute a ON a.attrelid=c.oid LEFT JOIN pg_catalog.pg_attrdef d ON d.adrelid=c.oid AND d.adnum=a.attnum WHERE " + filter + " AND c.relkind IN ('r','p','v','m') AND a.attnum > 0 AND NOT a.attisdropped AND left(lower(c.relname),7) <> '__neri_' ORDER BY n.nspname COLLATE \"C\",c.relname COLLATE \"C\",a.attnum LIMIT 1001"
   let columns = new ResultColumns([
       new ResultColumn("schema_name", ResultColumnKind.Text()),
@@ -245,7 +264,7 @@ def pgInspectSchemaCurrent(provider: PostgreSQLProvider, schema: String?): Postg
             return PostgreSQLSchemaResult.Failure(error)
         end
       end
-      let failure = pgInspectSchemaMetadata(provider, snapshot, filter, parameters)
+      let failure = pgInspectSchemaMetadata(provider, snapshot, filter, parameters, options)
 
       return failure == null ? PostgreSQLSchemaResult.Snapshot(snapshot) : PostgreSQLSchemaResult.Failure(failure)
   end
@@ -340,19 +359,34 @@ def pgScaffoldSchema(snapshot: readonly PostgreSQLSchemaSnapshot, options: Schem
       return new SchemaScaffoldColumn("", "", "", true)
     end
     var type = ""
+    let declaredType = column.declaredType()
+    let physicalType = schemaPostgresStorageType(declaredType)
 
-    if column.declaredType() == "bigint"
+    if declaredType == "bigint"
       type = "Int"
-    else if column.declaredType() == "double precision"
+    else if declaredType == "double precision"
       type = "Float"
-    else if column.declaredType() == "boolean"
+    else if declaredType == "boolean"
       type = "Bool"
-    else if column.declaredType() == "text"
+    else if declaredType == "text"
       type = "String"
-    else if column.declaredType() == "bytea"
+    else if declaredType == "bytea"
       type = "ByteBuffer"
+    else if physicalType != null
+      match physicalType
+        case SchemaType.Int()
+          type = "Int"
+        case SchemaType.Float()
+          type = "Float"
+        case SchemaType.Text()
+          type = "String"
+        case SchemaType.Bool()
+        case SchemaType.Binary()
+      end
     end
-    if column.schema() != "public"
+    let unsupportedGeneration = physicalType != null && (column.identity() != "" || (column.keyPosition() > 0 && column.defaultSql() != null))
+
+    if column.schema() != "public" || unsupportedGeneration
       type = ""
     end
     let generated = column.generated() != ""
@@ -360,7 +394,7 @@ def pgScaffoldSchema(snapshot: readonly PostgreSQLSchemaSnapshot, options: Schem
     return new SchemaScaffoldColumn(
       column.table(), column.name(), type, !column.required(),
       column.keyPosition(), generated || column.identity() != "" || column.defaultSql() != null,
-      generated, column.view(), generated ? null : column.defaultSql(), generated ? column.defaultSql() : null, column.generated() != "v", column.checkSql(), column.collation()
+      generated, column.view(), generated ? null : column.defaultSql(), generated ? column.defaultSql() : null, column.generated() != "v", column.checkSql(), column.collation(), physicalType == null ? null : declaredType
     )
   end
 
@@ -409,9 +443,18 @@ def pgInspectSchemaMetadata(
   provider: PostgreSQLProvider,
   snapshot: PostgreSQLSchemaSnapshot,
   filter: String,
-  parameters: CompileState
+  parameters: CompileState,
+  options: SchemaScaffoldOptions?
 ): ProviderFailure?
-  let foreignSql = "SELECT c.relname::text AS table_name,p.relname::text AS parent_name,con.conname::text AS constraint_name,k.ordinality::bigint AS ordinal,a.attname::text AS field_name,b.attname::text AS key_name,con.confdeltype::text AS delete_code,(con.condeferrable AND con.condeferred) AS deferred FROM pg_catalog.pg_namespace n JOIN pg_catalog.pg_class c ON c.relnamespace=n.oid JOIN pg_catalog.pg_constraint con ON con.conrelid=c.oid AND con.contype='f' JOIN pg_catalog.pg_class p ON p.oid=con.confrelid CROSS JOIN LATERAL unnest(con.conkey,con.confkey) WITH ORDINALITY AS k(field,key,ordinality) JOIN pg_catalog.pg_attribute a ON a.attrelid=c.oid AND a.attnum=k.field JOIN pg_catalog.pg_attribute b ON b.attrelid=p.oid AND b.attnum=k.key WHERE " + filter + " AND left(lower(c.relname),7)<>'__neri_' ORDER BY n.nspname COLLATE \"C\",c.relname COLLATE \"C\",con.conname COLLATE \"C\",k.ordinality LIMIT 1001"
+  let invalid = scaffoldSelectionFailure(options)
+
+  if invalid != null
+    return invalid
+  end
+  let foreignSql = "SELECT c.relname::text AS table_name,p.relname::text AS parent_name,con.conname::text AS constraint_name,k.ordinality::bigint AS ordinal,a.attname::text AS field_name,b.attname::text AS key_name,con.confdeltype::text AS delete_code,(con.condeferrable AND con.condeferred) AS deferred FROM pg_catalog.pg_namespace n JOIN pg_catalog.pg_class c ON c.relnamespace=n.oid JOIN pg_catalog.pg_constraint con ON con.conrelid=c.oid AND con.contype='f' JOIN pg_catalog.pg_class p ON p.oid=con.confrelid AND p.relnamespace=c.relnamespace CROSS JOIN LATERAL unnest(con.conkey,con.confkey) WITH ORDINALITY AS k(field,key,ordinality) JOIN pg_catalog.pg_attribute a ON a.attrelid=c.oid AND a.attnum=k.field JOIN pg_catalog.pg_attribute b ON b.attrelid=p.oid AND b.attnum=k.key WHERE " + filter + scaffoldSelectionSql(
+    options,
+    "p.relname"
+  ) + " AND left(lower(c.relname),7)<>'__neri_' ORDER BY n.nspname COLLATE \"C\",c.relname COLLATE \"C\",con.conname COLLATE \"C\",k.ordinality LIMIT 1001"
   let foreignColumns = new ResultColumns([
       new ResultColumn("table_name", ResultColumnKind.Text()), new ResultColumn("parent_name", ResultColumnKind.Text()),
       new ResultColumn("constraint_name", ResultColumnKind.Text()), new ResultColumn("ordinal", ResultColumnKind.Int()),

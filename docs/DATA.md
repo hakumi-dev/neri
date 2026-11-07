@@ -11,16 +11,21 @@ compiler's typed expression trees described in [Quotations](QUOTATIONS.md).
 
 The toolchain includes the runtime source project at
 `share/neri/data/manifest.json` (unit `runtime`) and its SQLite source project at
-`share/neri/data/sqlite/manifest.json` (unit `sqlite`). The generation commands
+`share/neri/data/sqlite/manifest.json` (unit `sqlite`) and PostgreSQL source project
+at `share/neri/data-postgresql/manifest.json` (unit `postgresql`). The generation commands
 `neri-data-generate` and `neri-data-migration` use the standard library from their
 own installed toolchain. Keep those commands and the Data source projects from
 the same release.
 
 `neri-data-migration` also requires the platform's libpq 14 or later shared
-library, including when managing SQLite migrations. Install the PostgreSQL
+library, including when managing SQLite migrations. Applications using the
+PostgreSQL provider also require this library; SQLite-only applications retain
+their SQLite native dependency without linking libpq. Install the PostgreSQL
 client library used by the package build and keep it available to the system
 loader. Release CI uses Homebrew `libpq` on macOS and Debian/Ubuntu `libpq-dev`
 on Linux; deployed Linux installations need its `libpq5` runtime package.
+Set `NERI_LIBRARY_PATH` to the directory containing libpq when its installation
+is outside the platform linker's standard library search paths.
 
 The installed Data package is verified on Apple silicon with macOS 15 or newer
 and LLVM 22.1.8. This release gate does not establish installed Data support on
@@ -29,7 +34,8 @@ other targets.
 An application references the source projects using ordinary relative project
 references. To keep the application portable, copy the complete
 `share/neri/data` directory into its vendor directory and reference those copied
-manifests. Preserve the relative `sqlite` directory. Generated source remains
+manifests. PostgreSQL applications also copy the sibling `share/neri/data-postgresql`
+directory and preserve its position beside `data`. Generated source remains
 application-owned output; regenerate it when the mapping or generator changes.
 
 The same directory includes an Ito `package.json` exporting the `runtime` and
@@ -48,14 +54,25 @@ Include the entity and generated source directories in the application's
 `package.json` `neri.sources`, alongside its other application sources, for
 example `["app", "data/entities", "data/generated"]`. Keep the mapping's Neri
 project focused on its entity declarations so generation can run before those
-generated files exist. Ito supplies both exported libraries to the application;
+generated files exist. Ito supplies the exported libraries to the application;
 it runs the Data generator before preparing application sources when the
 application declares `neri.dataMappings`, for example `["data/mapping.json"]`.
 `ito prepare`, `build`, `run` and `test` use `neri-data-generate --ensure` under
 the application lock. `NERI_DATA_GENERATE` selects that generator executable.
 Without this declaration, regenerate explicitly when mapping inputs change.
 Installed Data metadata and copied source files use the packaged Neri manifests
-as their source inventory, including the owning `SQLiteSession` resource.
+as their source inventory, including the owning `SQLiteSession` and
+`PostgreSQLSession` resources. PostgreSQL has a separate opt-in Ito package at
+`share/neri/data-postgresql`, named `neri-data-postgresql`. It exports the
+`postgresql` unit and depends on the adjacent `data` package. Add that
+directory when the application uses PostgreSQL:
+
+```sh
+ito --project /path/to/app add ../toolchain/share/neri/data-postgresql
+```
+
+Keep both directories together when copying the provider. SQLite-only Ito
+applications depend on `neri-data` and do not import the PostgreSQL provider.
 
 `neri-data-generate --check <mapping.json>` validates inputs, output ownership,
 the generation manifest and every generated artifact without writing files.
@@ -63,7 +80,10 @@ It exits unsuccessfully when output is missing, stale or invalid. `--ensure`
 publishes changed output and reuses a current revision without rewriting it.
 
 The packaged `examples/data-consumer` project exercises installed generation and
-SQLite persistence. Its mapping and entity declarations provide a minimal
+SQLite persistence, plus a `postgresql` unit that validates the installed
+PostgreSQL adapter without requiring a running server. Set
+`NERI_POSTGRES_CONNINFO` when running that unit to verify a live connection.
+Its mapping and entity declarations provide a minimal
 starting point. SQLite requires the platform's native SQLite 3.37.2 or newer
 library and its exported C API; the provider
 checks capabilities such as window functions on the actual open connection.

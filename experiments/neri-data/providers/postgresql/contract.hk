@@ -53,11 +53,110 @@ def asyncContract(provider: PostgreSQLProvider): resources::Outcome<Int, QueryFa
   return 1
 end
 
+def verifyPostgreSQLConnectionLoss(conninfo: String): resources::Outcome<Int, ProviderFailure>
+  using victim <- PostgreSQLSession.open(conninfo)
+    let provider = victim.provider()
+    let pidColumns = new ResultColumns([new ResultColumn("pid", ResultColumnKind.Int())])
+    let pidPlan = new SqlPlan("SELECT pg_backend_pid() AS pid", new ParameterValues(), 1, pidColumns)
+    var pid = 0
+
+    match provider.execute(pidPlan)
+      case ProviderResult.Failure(error)
+        return error
+      case ProviderResult.Rows(rows)
+        if rows.Length != 1
+          return ProviderFailure.State("PostgreSQL backend PID query must return one row")
+        end
+        match decodeInt(rows[0], "pid")
+          case DecodeResult.Value(value)
+            pid = value
+          case DecodeResult.Failure(error)
+            return ProviderFailure.State("PostgreSQL backend PID must be an integer")
+        end
+    end
+    var lease = 0
+
+    match provider.beginTransaction()
+      case TransactionOpenResult.Failure(error)
+        return ProviderFailure.State(writeFailureMessage(error))
+      case TransactionOpenResult.Begun(value)
+        lease = value
+    end
+    using controller <- PostgreSQLSession.open(conninfo)
+      let bound = new CompileState()
+      let columns = new ResultColumns([new ResultColumn("terminated", ResultColumnKind.Bool())])
+
+      bound.bind(Parameter.Int(pid))
+      let terminate = new SqlPlan(
+        "SELECT pg_terminate_backend($1::integer, 5000) AS terminated",
+        new ParameterValues(bound.head, bound.count), 1, columns
+      )
+
+      match controller.provider().execute(terminate)
+        case ProviderResult.Failure(error)
+          return error
+        case ProviderResult.Rows(rows)
+          if rows.Length != 1
+            return ProviderFailure.State("PostgreSQL backend termination must return one row")
+          end
+          match decodeBool(rows[0], "terminated")
+            case DecodeResult.Value(terminated)
+              test::assertTrue(terminated)
+            case DecodeResult.Failure(error)
+              return ProviderFailure.State("PostgreSQL backend termination must return a Boolean")
+          end
+      end
+    end
+    match provider.execute(pidPlan)
+      case ProviderResult.Failure(error)
+        match error
+          case ProviderFailure.Driver(driver)
+            test::assertEqual(driver.provider(), "postgresql")
+          case ProviderFailure.State(message)
+            return error
+          case ProviderFailure.Cleanup(cleanup)
+            return error
+        end
+      case ProviderResult.Rows(rows)
+        return ProviderFailure.State("PostgreSQL read succeeded after its backend terminated")
+    end
+    match provider.transactionState(lease)
+      case TransactionState.Failed()
+      case TransactionState.Active()
+        return ProviderFailure.State("PostgreSQL transaction stayed active after connection loss")
+      case TransactionState.Invalid()
+        return ProviderFailure.State("PostgreSQL transaction lost its lease state after connection loss")
+      case TransactionState.Committed()
+        return ProviderFailure.State("PostgreSQL transaction appeared committed after connection loss")
+      case TransactionState.RolledBack()
+        return ProviderFailure.State("PostgreSQL transaction reported a confirmed rollback after connection loss")
+    end
+    match provider.commitTransaction(lease)
+      case WriteResult.Failure(error)
+      case WriteResult.Saved(count)
+        return ProviderFailure.State("PostgreSQL commit succeeded after connection loss")
+      case WriteResult.SavedWithValues(count, outputs)
+        return ProviderFailure.State("PostgreSQL commit returned rows after connection loss")
+    end
+    return 0
+  end
+  return 1
+end
+
 def runContract(): resources::Outcome<Int, ProviderFailure>
   let conninfo = host::environment("NERI_POSTGRES_CONNINFO")
 
   if conninfo == null
     return ProviderFailure.State("NERI_POSTGRES_CONNINFO is required for the PostgreSQL provider contract")
+  end
+  let connectionLoss = verifyPostgreSQLConnectionLoss(conninfo)
+
+  test::assertEqual(connectionLoss.closeFailures.count(), 0)
+  match connectionLoss.completion
+    case resources::Completion.Value(code)
+      test::assertEqual(code, 0)
+    case resources::Completion.Failure(error)
+      return error == null ? ProviderFailure.State("PostgreSQL connection-loss fixture cleanup failed") : error
   end
   using session <- PostgreSQLSession.open(conninfo)
     let provider = session.provider()
