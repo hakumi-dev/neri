@@ -3079,31 +3079,78 @@ def compilePipeline<T, R>(
   unbounded: Bool = false,
   rawDistinct: Bool = false
 ): CompileResult<R>
+  return attachSqlPlan<R>(
+    compilePipelineSql<T>(
+      query,
+      deferredResultColumns<R>(decoder),
+      selected,
+      limit,
+      dialect,
+      ordered,
+      inner,
+      unbounded,
+      rawDistinct
+    ),
+    decoder
+  )
+end
+
+def attachSqlPlan<R>(planned: result::Result<SqlPlan, QueryFailure>, decoder: Decoder<R>): CompileResult<R>
+  match planned
+    case result::Result.Error(error)
+      return CompileResult<R>.Failure(error)
+    case result::Result.Ok(plan)
+      return CompileResult<R>.Plan(new TypedPlan<R>(plan, decoder))
+  end
+end
+
+def deferredResultColumns<R>(decoder: Decoder<R>): fn(): readonly ResultColumns
+  let read: fn(): readonly ResultColumns = fn(): readonly ResultColumns do
+    return decoder.columns()
+  end
+
+  return read
+end
+
+def compilePipelineSql<T>(
+  query: Query<T>,
+  resultColumns: fn(): readonly ResultColumns,
+  selected: readonly SqlSelection?,
+  limit: Int?,
+  dialect: SqlDialect,
+  ordered: Bool = true,
+  inner: Bool = false,
+  unbounded: Bool = false,
+  rawDistinct: Bool = false
+): result::Result<SqlPlan, QueryFailure>
   let failure = query.queryFailure()
 
   if failure != null
-    return CompileResult<R>.Failure(failure)
+    return result::Result<SqlPlan, QueryFailure>.Error(failure)
   end
   let mapping = query.entityMapping()
 
   if mapping != null
     if mapping.table() != query.sourceName()
-      return CompileResult<R>.Failure(QueryFailure.SourceMismatch(query.sourceName(), mapping.table()))
+      return result::Result<SqlPlan, QueryFailure>.Error(QueryFailure.SourceMismatch(
+          query.sourceName(),
+          mapping.table()
+        ))
     end
     let invalid = mapping.failure(dialect)
 
     if invalid != null
-      return CompileResult<R>.Failure(invalid)
+      return result::Result<SqlPlan, QueryFailure>.Error(invalid)
     end
   end
 
   if query.isDistinct() && !rawDistinct
     if mapping == null
-      return CompileResult<R>.Failure(QueryFailure.UnsupportedCapability("distinct requires entity mapping metadata"))
+      return result::Result<SqlPlan, QueryFailure>.Error(QueryFailure.UnsupportedCapability("distinct requires entity mapping metadata"))
     end
-    match compilePipeline<T, T>(
+    match compilePipelineSql<T>(
       query,
-      query.rowDecoder(),
+      deferredResultColumns<T>(query.rowDecoder()),
       mappedSelection(mapping),
       null,
       dialect,
@@ -3112,12 +3159,12 @@ def compilePipeline<T, R>(
       unbounded: true,
       rawDistinct: true
     )
-      case CompileResult.Failure(error)
-        return CompileResult<R>.Failure(error)
-      case CompileResult.Plan(distinctPlan)
+      case result::Result.Error(error)
+        return result::Result<SqlPlan, QueryFailure>.Error(error)
+      case result::Result.Ok(distinctPlan)
         let fromSql = new SqlSource(
-          "(" + distinctPlan.sql().sql() + ") AS \"" + query.sourceName() + "\"",
-          distinctPlan.sql().requiresCheckedScalars()
+          "(" + distinctPlan.sql() + ") AS \"" + query.sourceName() + "\"",
+          distinctPlan.requiresCheckedScalars()
         )
         var orderTable: String? = null
         var orderColumn: String? = null
@@ -3136,9 +3183,9 @@ def compilePipeline<T, R>(
         if finalLimit == null && query.hasBound() && !inner && !unbounded
           finalLimit = queryRowLimit()
         end
-        return compileQuery<R>(
+        return compileQuerySql(
           query.sourceName(),
-          decoder,
+          resultColumns,
           null,
           orderTable,
           orderColumn,
@@ -3147,7 +3194,7 @@ def compilePipeline<T, R>(
           dialect,
           selected,
           fromSql,
-          distinctPlan.sql().parameters(),
+          distinctPlan.parameters(),
           offset: query.rowOffset(),
           allowUnbounded: inner || unbounded,
           secondary: secondary,
@@ -3163,25 +3210,25 @@ def compilePipeline<T, R>(
 
   if previous != null
     if mapping == null
-      return CompileResult<R>.Failure(QueryFailure.UnsupportedCapability("staged queries require entity mapping metadata"))
+      return result::Result<SqlPlan, QueryFailure>.Error(QueryFailure.UnsupportedCapability("staged queries require entity mapping metadata"))
     end
-    match compilePipeline<T, T>(
+    match compilePipelineSql<T>(
       previous,
-      query.rowDecoder(),
+      deferredResultColumns<T>(query.rowDecoder()),
       mappedSelection(mapping),
       previous.rowLimit(),
       dialect,
       true,
       true
     )
-      case CompileResult.Failure(error)
-        return CompileResult<R>.Failure(error)
-      case CompileResult.Plan(priorPlan)
+      case result::Result.Error(error)
+        return result::Result<SqlPlan, QueryFailure>.Error(error)
+      case result::Result.Ok(priorPlan)
         fromSql = new SqlSource(
-          "(" + priorPlan.sql().sql() + ") AS \"" + query.sourceName() + "\"",
-          priorPlan.sql().requiresCheckedScalars()
+          "(" + priorPlan.sql() + ") AS \"" + query.sourceName() + "\"",
+          priorPlan.requiresCheckedScalars()
         )
-        prefix = priorPlan.sql().parameters()
+        prefix = priorPlan.parameters()
     end
   end
   var bounded = limit
@@ -3204,9 +3251,9 @@ def compilePipeline<T, R>(
     secondary = query.secondaryOrder()
     primaryTree = query.primaryOrderingTree()
   end
-  return compileQuery<R>(
+  return compileQuerySql(
     query.sourceName(),
-    decoder,
+    resultColumns,
     query.filterExpression(),
     orderTable,
     orderColumn,
@@ -3254,16 +3301,16 @@ def compileTerminal<T, R>(
   if configured != null
     bounded = configured < maximum ? configured : maximum
   end
-  var orderTable: String? = null
-  var orderColumn: String? = null
-  var descending = false
-
   if ordered
-    orderTable = query.orderingTable()
-    orderColumn = query.orderingColumn()
-    descending = query.orderingDescending()
+    # Preserve observable order metadata reads before pipeline planning.
+    query.orderingTable()
+    query.orderingColumn()
+    query.orderingDescending()
   end
-  return compilePipeline<T, R>(query, decoder, selected, bounded, dialect, ordered)
+  return attachSqlPlan<R>(
+    compilePipelineSql<T>(query, deferredResultColumns<R>(decoder), selected, bounded, dialect, ordered),
+    decoder
+  )
 end
 
 class Projection<T, R>
@@ -3327,13 +3374,18 @@ class Projection<T, R>
               column.typeName()
             ))
         end
-        return compilePipeline<T, R>(
-          this.query,
-          this.codec.decoder(column.column()),
-          null,
-          this.query.rowLimit(),
-          dialect,
-          unbounded: unbounded
+        let decoder = this.codec.decoder(column.column())
+
+        return attachSqlPlan<R>(
+          compilePipelineSql<T>(
+            this.query,
+            deferredResultColumns<R>(decoder),
+            null,
+            this.query.rowLimit(),
+            dialect,
+            unbounded: unbounded
+          ),
+          decoder
         )
     end
   end
@@ -3470,13 +3522,18 @@ class Projection2<T, A, B, R>
                 secondColumn.column()
               ) + " AS \"" + secondAlias + "\"")
 
-            return compilePipeline<T, R>(
-              this.query,
-              select2Decoder(this.firstCodec, firstAlias, this.secondCodec, secondAlias, this.materialize),
-              selected,
-              this.query.rowLimit(),
-              dialect,
-              unbounded: unbounded
+            let decoder = select2Decoder(this.firstCodec, firstAlias, this.secondCodec, secondAlias, this.materialize)
+
+            return attachSqlPlan<R>(
+              compilePipelineSql<T>(
+                this.query,
+                deferredResultColumns<R>(decoder),
+                selected,
+                this.query.rowLimit(),
+                dialect,
+                unbounded: unbounded
+              ),
+              decoder
             )
         end
     end
@@ -3560,16 +3617,45 @@ def compileQuery<T>(
   orderMapping: EntityMapping? = null,
   comments: String = ""
 ): CompileResult<T>
+  return attachSqlPlan<T>(
+    compileQuerySql(
+      source, deferredResultColumns<T>(decoder), predicate, orderTable, orderColumn, descending, limit, dialect,
+      selected, fromSql, prefix, offset, unique, allowUnbounded, secondary, primaryOrderTree, orderMapping, comments
+    ),
+    decoder
+  )
+end
+
+def compileQuerySql(
+  source: String,
+  resultColumns: fn(): readonly ResultColumns,
+  predicate: Expression?,
+  orderTable: String?,
+  orderColumn: String?,
+  descending: Bool,
+  limit: Int?,
+  dialect: SqlDialect,
+  selected: readonly SqlSelection? = null,
+  fromSql: readonly SqlSource? = null,
+  prefix: readonly ParameterValues? = null,
+  offset: Int = 0,
+  unique: Bool = false,
+  allowUnbounded: Bool = false,
+  secondary: OrderTerm? = null,
+  primaryOrderTree: readonly quotation::Tree? = null,
+  orderMapping: EntityMapping? = null,
+  comments: String = ""
+): result::Result<SqlPlan, QueryFailure>
   if !dialectIdentifierValid(source, dialect)
-    return CompileResult<T>.Failure(QueryFailure.InvalidIdentifier(source))
+    return result::Result<SqlPlan, QueryFailure>.Error(QueryFailure.InvalidIdentifier(source))
   end
   let bounded = limit
 
   if bounded == null && !allowUnbounded
-    return CompileResult<T>.Failure(QueryFailure.MissingLimit(queryRowLimit()))
+    return result::Result<SqlPlan, QueryFailure>.Error(QueryFailure.MissingLimit(queryRowLimit()))
   end
   if bounded != null && (bounded < 1 || bounded > queryRowLimit())
-    return CompileResult<T>.Failure(QueryFailure.InvalidLimit(bounded, queryRowLimit()))
+    return result::Result<SqlPlan, QueryFailure>.Error(QueryFailure.InvalidLimit(bounded, queryRowLimit()))
   end
   let state = new CompileState()
   let customSelection = selected
@@ -3593,7 +3679,7 @@ def compileQuery<T>(
         state.bind(Parameter.Int(value))
       case Parameter.Float(value)
         if !dataFloatFinite(value)
-          return CompileResult<T>.Failure(QueryFailure.UnsupportedCapability("Float parameter must be finite"))
+          return result::Result<SqlPlan, QueryFailure>.Error(QueryFailure.UnsupportedCapability("Float parameter must be finite"))
         end
         state.bind(Parameter.Float(value))
       case Parameter.Text(value)
@@ -3617,7 +3703,7 @@ def compileQuery<T>(
         state.bind(Parameter.Int(value))
       case Parameter.Float(value)
         if !dataFloatFinite(value)
-          return CompileResult<T>.Failure(QueryFailure.UnsupportedCapability("Float parameter must be finite"))
+          return result::Result<SqlPlan, QueryFailure>.Error(QueryFailure.UnsupportedCapability("Float parameter must be finite"))
         end
         state.bind(Parameter.Float(value))
       case Parameter.Text(value)
@@ -3627,10 +3713,10 @@ def compileQuery<T>(
     end
     priorParameter = priorParameter.next()
   end
-  let columns = decoder.columns()
+  let columns = resultColumns()
 
   if columns.count() == 0
-    return CompileResult<T>.Failure(QueryFailure.Provider(ProviderFailure.State("decoder has no result columns")))
+    return result::Result<SqlPlan, QueryFailure>.Error(QueryFailure.Provider(ProviderFailure.State("decoder has no result columns")))
   end
   var selection = ""
 
@@ -3643,13 +3729,13 @@ def compileQuery<T>(
     let column = columns.at(columnIndex)
 
     if !dialectIdentifierValid(column.name(), dialect)
-      return CompileResult<T>.Failure(QueryFailure.InvalidIdentifier(column.name()))
+      return result::Result<SqlPlan, QueryFailure>.Error(QueryFailure.InvalidIdentifier(column.name()))
     end
     var previous = 0
 
     while previous < columnIndex
       if columns.at(previous).name() == column.name()
-        return CompileResult<T>.Failure(QueryFailure.Provider(ProviderFailure.State("decoder result columns must be unique")))
+        return result::Result<SqlPlan, QueryFailure>.Error(QueryFailure.Provider(ProviderFailure.State("decoder result columns must be unique")))
       end
       previous = previous + 1
     end
@@ -3664,7 +3750,7 @@ def compileQuery<T>(
     let shifted = joinShiftSql(fromSql.sql(), selectionCount, dialect)
 
     if shifted == null
-      return CompileResult<T>.Failure(QueryFailure.Provider(ProviderFailure.State("projection parameter index exceeds supported range")))
+      return result::Result<SqlPlan, QueryFailure>.Error(QueryFailure.Provider(ProviderFailure.State("projection parameter index exceeds supported range")))
     end
     relation = shifted
   end
@@ -3673,7 +3759,7 @@ def compileQuery<T>(
   if predicate != null
     match compileExpression(predicate, state, source, dialect)
       case ExpressionCompileResult.Failure(error)
-        return CompileResult<T>.Failure(error)
+        return result::Result<SqlPlan, QueryFailure>.Error(error)
       case ExpressionCompileResult.Sql(value)
         sql = sql + " WHERE " + value
     end
@@ -3681,27 +3767,27 @@ def compileQuery<T>(
   if primaryOrderTree != null || (orderTable != null && orderColumn != null)
     if primaryOrderTree != null
       if orderMapping == null || orderMapping.table() != source
-        return CompileResult<T>.Failure(QueryFailure.UnsupportedCapability("computed ordering requires matching entity mapping"))
+        return result::Result<SqlPlan, QueryFailure>.Error(QueryFailure.UnsupportedCapability("computed ordering requires matching entity mapping"))
       end
       match compileOrderQuotation(orderMapping, primaryOrderTree, state, dialect)
         case ScalarSqlResult.Failure(error)
-          return CompileResult<T>.Failure(error)
+          return result::Result<SqlPlan, QueryFailure>.Error(error)
         case ScalarSqlResult.Value(value)
           state.requiresCheckedScalars = state.requiresCheckedScalars || value.checkedScalars
           sql = sql + " ORDER BY " + value.sql + (descending ? " DESC" : " ASC")
       end
     else
       if orderTable == null || orderColumn == null
-        return CompileResult<T>.Failure(QueryFailure.Provider(ProviderFailure.State("ordering is missing a mapped column")))
+        return result::Result<SqlPlan, QueryFailure>.Error(QueryFailure.Provider(ProviderFailure.State("ordering is missing a mapped column")))
       end
       if !dialectIdentifierValid(orderTable, dialect)
-        return CompileResult<T>.Failure(QueryFailure.InvalidIdentifier(orderTable))
+        return result::Result<SqlPlan, QueryFailure>.Error(QueryFailure.InvalidIdentifier(orderTable))
       end
       if !dialectIdentifierValid(orderColumn, dialect)
-        return CompileResult<T>.Failure(QueryFailure.InvalidIdentifier(orderColumn))
+        return result::Result<SqlPlan, QueryFailure>.Error(QueryFailure.InvalidIdentifier(orderColumn))
       end
       if orderTable != source
-        return CompileResult<T>.Failure(QueryFailure.SourceMismatch(source, orderTable))
+        return result::Result<SqlPlan, QueryFailure>.Error(QueryFailure.SourceMismatch(source, orderTable))
       end
       sql = sql + " ORDER BY " + mappedOrderSql(orderMapping, orderTable, orderColumn) + (descending ? " DESC" : " ASC")
     end
@@ -3712,18 +3798,18 @@ def compileQuery<T>(
 
       if tree != null
         if orderMapping == null || orderMapping.table() != source
-          return CompileResult<T>.Failure(QueryFailure.UnsupportedCapability("computed ordering requires matching entity mapping"))
+          return result::Result<SqlPlan, QueryFailure>.Error(QueryFailure.UnsupportedCapability("computed ordering requires matching entity mapping"))
         end
         match compileOrderQuotation(orderMapping, tree, state, dialect)
           case ScalarSqlResult.Failure(error)
-            return CompileResult<T>.Failure(error)
+            return result::Result<SqlPlan, QueryFailure>.Error(error)
           case ScalarSqlResult.Value(value)
             state.requiresCheckedScalars = state.requiresCheckedScalars || value.checkedScalars
             sql = sql + ", " + value.sql + (nextOrder.descending ? " DESC" : " ASC")
         end
       else
         if !dialectIdentifierValid(nextOrder.column, dialect)
-          return CompileResult<T>.Failure(QueryFailure.InvalidIdentifier(nextOrder.column))
+          return result::Result<SqlPlan, QueryFailure>.Error(QueryFailure.InvalidIdentifier(nextOrder.column))
         end
         sql = sql + ", " + mappedOrderSql(
           orderMapping,
@@ -3758,9 +3844,12 @@ def compileQuery<T>(
   end
   let requiresCheckedScalars = state.requiresCheckedScalars || (customSelection != null && customSelection.requiresCheckedScalars()) || (fromSql != null && fromSql.requiresCheckedScalars())
 
-  return CompileResult<T>.Plan(new TypedPlan<T>(
-      new SqlPlan(sql, parameters, planLimit, columns, requiresCheckedScalars),
-      decoder
+  return result::Result<SqlPlan, QueryFailure>.Ok(new SqlPlan(
+      sql,
+      parameters,
+      planLimit,
+      columns,
+      requiresCheckedScalars
     ))
 end
 
