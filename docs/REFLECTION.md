@@ -32,6 +32,15 @@ evaluates once per call and must be a non-optional instance of the declaring
 class or a subclass. Reading through a readonly receiver preserves readonly
 member rules.
 
+`write(receiver, value)` is a statement that assigns the reflected field using
+its declared type. The receiver must be a mutable, non-optional instance of the
+declaring class or a subclass. The value follows ordinary assignment compatibility,
+including optional values. Receiver and value expressions evaluate once, in that
+order. Writes invalidate guarded member-path refinements as ordinary field
+assignments do. Both arguments are positional; writes accept no type arguments.
+For example, a generic field-copy loop can use
+`field.write(target, field.read(source))`.
+
 Each expansion has its own local scope. Nested compile-time field loops and
 closures can use descriptors from their enclosing expansion. An empty class
 produces no statements. Private, protected, and internal fields are omitted.

@@ -34,8 +34,24 @@ Neri does not use C#'s warning-and-shadowing rule. Generic constructors, abstrac
 methods, overrides, method annotations, and labels parameters remain unsupported.
 Inherited generic methods retain the specialized base class as their owner.
 Separately compiled generic template ABIs retain the existing language restrictions.
-Generic methods are called through their receiver; extracting one as a function
-value reports `NR220`. Generic module function values remain a separate feature.
+
+A generic method can also become an ordinary function value. An expected `fn`
+signature infers the method's type arguments from parameter and result types.
+Explicit type arguments supply a specialization without an expected signature.
+
+```neri
+let textIdentity: fn(String): String = selector.identity
+let intIdentity = selector.identity<Int>
+```
+
+An instance method value evaluates its receiver once and retains that object.
+Invocation uses the retained receiver and the specialized method. A static
+method value names the class. Visibility and readonly receiver rules apply at
+extraction. Function values require the method's full positional parameter list,
+including parameters that have defaults on direct calls. Unsafe methods,
+resource receivers, and shared or parallel callback contexts produce diagnostics.
+A missing function type context reports `NR220` when there are no explicit
+type arguments. An argument left unresolved by inference reports `NR221`.
 
 ## References
 
