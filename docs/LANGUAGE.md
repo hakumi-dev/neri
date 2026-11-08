@@ -570,13 +570,16 @@ are outside this surface. Templates are supplied as source files in the same
 compilation invocation, including across namespaces. A compiled specialization is concrete; it is not a separately
 importable generic template or a package ABI promise.
 
-Compilation permits 4096 distinct generic specializations in total and 128
-specializations of each generic template. It also permits 32 nested class
-instantiations, 64 levels of written type nesting, and canonical type arguments
-of at most 1024 UTF-8 bytes. Ordinary recursion reuses the same specialization;
-recursion that creates an unbounded sequence of new types reports `NR222`.
-`NR220` reports invalid generic declarations or type-argument counts; `NR221`
-reports arguments that cannot be inferred or used as safe value types.
+Compilation permits 4096 generic specialization reservations in total and 128
+specializations per template. It also permits 32 active generic class
+registrations, 64 levels of written type nesting, and canonical type arguments
+of at most 1024 UTF-8 bytes each. Ordinary recursion reuses its specialization.
+`NR222` identifies the limit that rejects a type or specialization request.
+
+`NR220` reports invalid generic declarations or type-argument counts. `NR221`
+reports arguments that remain unresolved or fail the safe value type rules.
+An inference position blocked by an erroneous argument can still be filled
+from another argument. Explicit type arguments retain their written types.
 
 ## Closed alternatives
 
