@@ -129,6 +129,50 @@ postfix guards retain their layout when whitespace edits cannot split them safel
 Such expressions can be extracted into named values when needed. The configured width
 counts Unicode scalars and expands tabs according to `tab_width`.
 
+## Naming
+
+Project names and prose use English. Use these conventions when naming or
+renaming authored Neri code:
+
+| Element | Convention | Examples |
+| --- | --- | --- |
+| Classes, contracts and enums | `PascalCase` | `EntityTracker`, `Equality`, `QueryFailure` |
+| Enum cases | `PascalCase` | `Value`, `Failure`, `Unchanged` |
+| Functions, methods, fields, parameters and local values | `lowerCamelCase` | `saveChanges`, `rowCount`, `target` |
+| Type parameters | `PascalCase`, with concise names in small scopes | `T`, `R`, `Key`, `Value` |
+| Namespaces | `snake_case` | `neri_data`, `neri_data_sqlite` |
+| Authored implementation and contract source files | `snake_case.hk` | `entity_tracker.hk`, `query_parity_contract.hk` |
+| Project directories, package names and manifest unit identifiers | `kebab-case` | `concurrency-tokens`, `neri-data-postgresql` |
+
+Choose names for their role at the call site. Types describe a domain concept or
+capability; operations describe the action or value they expose. Boolean names
+form predicates such as `hasRows` or `isClosed`. Each parameter carries input,
+context or a capability the operation uses. Fixed callback and native signatures retain the
+parameters required by their contracts. Public parameter names participate in
+named calls, so changing them changes the source API.
+
+Use established technical terms and the spelling of the surrounding API family:
+`SqlPlan`, `LspJson`, `SQLiteSession` and `PostgreSQLProvider`. Source filenames
+lowercase these terms as words, such as `sqlite_session.hk`. Language-defined
+members, native symbols and generated artifacts retain their required spelling;
+examples include `Length`, `PQsendQueryParams` and `Account.entity.hk`.
+
+Directory names describe ownership or a responsibility, such as `query`,
+`persistence` or `schema`. Use the containing directory's context when naming
+fixtures. Keep a distinguishing prefix when declarations share a compilation
+scope. Package manifests define source ownership; physical folders do not create
+Neri namespaces.
+
+These are Neri conventions. The [Swift API guidelines](https://www.swift.org/documentation/api-design-guidelines/)
+inform role-based names and the type/member case distinction. The
+[Rust API guidelines](https://rust-lang.github.io/api-guidelines/naming.html)
+provide precedents for type and enum-case names and snake_case modules; Neri
+retains lowerCamelCase functions. The [Cargo project layout](https://doc.rust-lang.org/cargo/guide/project-layout.html)
+distinguishes source/module naming from target names. The
+[Go package naming guidance](https://go.dev/blog/package-names) supports focused,
+purpose-based ownership names. Naming is reviewed with API and source-organization
+changes; the NRSTYLE rules listed in this document define the automated checks.
+
 ## Source organization
 
 Namespace separators have no surrounding spaces: `App::Nested::Type`.
@@ -186,10 +230,9 @@ overlapping rule requests, multiline expressions, comments and UTF-16 coordinate
 
 `scripts/build.sh test` checks formatting and lints owned project sources with
 the freshly bootstrapped compiler before running the language contracts.
-The CI jobs that run this entry point,
-including packaging, enforce the same checks. Its scope covers the root manifest,
-ABI tooling and Neri Data generation/runtime/verification/example manifests.
-The standard-library manifest receives the same formatting and lint checks.
+The CI package jobs run the same checks. The gate covers the root and
+standard-library manifests, ABI and Kinds tooling, Data tooling and package
+manifests, and selected Data contract and fixture projects.
 Manifest-owned sources are deduplicated and declared generated outputs
 are excluded. Parser fixtures outside these units retain their purpose-specific
 layout; source snippets inside test literals remain unchanged.
