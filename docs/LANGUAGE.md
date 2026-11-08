@@ -251,6 +251,14 @@ one non-namespaced top-level `main(): Void` with no parameters. Library units
 must not declare `main`. Non-Void functions
 return on every statically recognized path. Overloading is outside this surface.
 
+A callable with a declared or contextual non-`Void` result can return its final
+direct expression without writing `return`. The expression is checked against
+the result type by the same rules as an explicit return. Function and method
+signatures still declare their result types. Use `return` for an early exit.
+Statement forms such as `if`, `match`, loops and `using` use explicit returns
+within their bodies. A conditional expression in tail position returns its
+value. Calls in a `Void` body may discard their results.
+
 Calls to declared functions, methods and constructors accept named arguments:
 
 ```neri
@@ -621,11 +629,14 @@ def apply(value: Int, operation: fn(Int): Int): Int
 end
 
 def offsetBy(offset: Int): fn(Int): Int
-  return fn(value) do
+  fn(value) do
     return value + offset
   end
 end
 ```
+
+The final expression of `offsetBy` returns the closure. The inner `return`
+supplies the result of each closure invocation.
 
 Use a trailing `do` block to pass an inline callback to a call:
 
@@ -1035,6 +1046,10 @@ A callable containing `using` returns `resources::Outcome<T, E>`. Its
 each cleanup failure in close order. A `using` acquisition may return a resource
 or `result::Result<Resource, E>`; the result error type matches the enclosing
 outcome error type.
+
+`using name <- acquisition` binds the acquired resource to `name` for the body
+of the statement. A failed `Result` acquisition skips the body and propagates
+its error into the enclosing `Outcome`.
 
 Factories may return `Result<R, E>.Ok(transfer owned)` from a fresh local `R`.
 The move invalidates the local binding. Static factories have no owned receiver.
