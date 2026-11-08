@@ -462,9 +462,83 @@ name. Adding a library type requires no new compiler case for its name.
 See [text](TEXT.md) for `text::Scalar`, a library class with validated construction,
 explicit conversion to `Int` and Unicode encoding implemented in Neri.
 
+## Interfaces
+
+An `interface` declares a nominal reference type with public, safe instance
+method signatures. Each signature has explicit parameter and result types and
+ends at the newline. Interfaces have no instance storage, constructors, method
+bodies, parameter defaults, static methods, or independently generic methods.
+Interface declarations default to `internal`; their methods are public.
+
+```neri
+interface Reader<T>
+  readonly def read(): T
+end
+
+class TextReader implements Reader<String>
+  private value: String
+
+  def init(value: String): Void
+    this.value = value
+  end
+
+  readonly def read(): String
+    this.value
+  end
+end
+
+def readText<T: Reader<String>>(reader: T): String
+  reader.read()
+end
+```
+
+A class declares conformance with `implements`. It may name several interfaces
+after a comma and retain one ordinary base class before that clause:
+`class Store: BaseStore implements Reader<String>, Named`. Method names,
+parameter types and modes, and result types match exactly. Implementations are
+public and safe; a readonly requirement requires a readonly implementation.
+An inherited class method can satisfy a requirement. Concrete descendants
+implement every requirement left open by an abstract class.
+
+An interface names its parent interfaces after `:`, as in
+`interface NamedReader: Reader<String>, Named`. Identical inherited signatures
+share a requirement. Conflicting signatures, duplicate direct parents, and
+inheritance cycles are rejected. An empty interface provides nominal membership.
+
+Interface values can be stored in fields, passed as parameters, and returned.
+Conversion preserves the original object and its reference identity. Calls
+dispatch to the concrete object's implementation, including derived overrides.
+The garbage collector traces the underlying object through an interface value.
+Checked reference casts use the declared interface graph. Interface type
+arguments are invariant.
+
+A generic class or module function may use one interface as its bound, including
+a parameterized interface with concrete arguments such as `Reader<String>`.
+The body can use that interface's declared methods and inherited requirements.
+Constraint arguments are concrete types; dependent and self-referential bounds
+are outside this surface. Structural `contract` requirements retain their
+existing meaning and generic-only use.
+
+`resource interface` preserves affine ownership. Its parent interfaces and
+implementing classes also carry `resource`. Borrowing, transfer, and `using`
+keep the existing resource rules, and `using` calls the concrete implementation
+of the public safe `close(): result.Failure?` requirement. A resource interface
+bound also preserves ownership checks for an opaque type parameter.
+
+Interface dispatch has general dynamic effects across compiled packages.
+Parallel closures require more specific effects and reject interface calls.
+Calls through a concrete class use the ordinary class capability analysis.
+
+The nominal conformance and multiple-interface model follows the
+[Java Language Specification](https://docs.oracle.com/javase/specs/jls/se25/html/jls-9.html).
+Parameterized signatures and explicit implementation relationships also have
+precedents in the
+[C# interface specification](https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/language-specification/interfaces).
+The rules above define Neri's supported surface.
+
 ## Generics
 
-Module functions and classes may declare type parameters:
+Module functions, classes, and interfaces may declare type parameters:
 
 ```ruby
 def identity<T>(value: T): T
@@ -523,7 +597,7 @@ Each requirement is a unique public, safe instance signature with no body,
 defaults, abstract or static modifier, or type parameters. A requirement can use
 `Self`, `Self?`, or `Self[]`; a nested generic use such as `Box<Self>` is not supported.
 A contract itself has no type parameters. A generic class or module function
-may put one source-declared contract after each type parameter's colon.
+may put one structural contract or nominal interface after each type parameter's colon.
 Compiler operations retain their fixed signatures.
 
 Requirements match structurally. An implementing class supplies an accessible
@@ -561,7 +635,7 @@ above define Neri's checked behavior. [Siek and Lumsdaine](https://arxiv.org/abs
 describe modular checking for G. The [Rust Reference](https://doc.rust-lang.org/reference/trait-bounds.html#bound.satisfaction)
 shows how a declared bound satisfies the requirements of another generic type.
 
-The current generic surface consists of module functions, classes, and
+The current generic surface consists of module functions, classes, interfaces, and
 method-level type parameters. A method can introduce its own type parameters
 on an ordinary or specialized generic class; for example,
 `receiver.identity<String>("value")` or an inferred `receiver.identity("value")`.
@@ -579,7 +653,7 @@ are invariant: inheriting from `Box<Int>` does not make a class assignable to
 `Box<String>`. Generic inheritance is checked when the class is specialized,
 including base restrictions and inheritance cycles.
 
-Multiple bounds per parameter, parameterized contracts, and higher-kinded types
+Multiple bounds per parameter, parameterized structural contracts, and higher-kinded types
 are outside this surface. Templates are supplied as source files in the same
 compilation invocation, including across namespaces. A compiled specialization is concrete; it is not a separately
 importable generic template or a package ABI promise.

@@ -60,6 +60,64 @@ References may target only library units. The complete reference closure is
 deterministic: missing units, cycles and overlapping ownership of a canonical
 source file are configuration errors. A diamond dependency is loaded once.
 
+## Locked source packages
+
+A unit can reference an offline package by exact name, release, descriptor
+checksum and exported library unit:
+
+```json
+{
+  "package": "shape",
+  "version": "1.2.3",
+  "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+  "unit": "library"
+}
+```
+
+The referring manifest selects its local `vendor` directory. Neri reads
+`vendor/shape/1.2.3/neri-package.json` relative to that manifest. Package
+references within the installed package use the same vendor directory.
+Names start with a lowercase ASCII letter and use lowercase letters, digits,
+hyphens or underscores. Versions use three decimal components without leading
+zeros. One compilation selects one descriptor location and checksum for a
+given name and version.
+
+Place the package's `manifest.json` and source files beside its descriptor.
+The descriptor declares the exported units and the SHA-256 of each file:
+
+```json
+{
+  "format": 1,
+  "name": "shape",
+  "version": "1.2.3",
+  "exports": ["library"],
+  "files": {
+    "manifest.json": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "src/box.hk": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+  }
+}
+```
+
+Replace the example digests with the lowercase SHA-256 of the exact UTF-8 file
+bytes. The reference pins the descriptor bytes. The descriptor pins its
+manifest and source bytes. Neri verifies the inventory before loading units
+and retains the verified bytes for the consumer. A missing package, changed
+file, mismatched identity, or unexported unit fails project loading.
+
+Package manifests declare library units with explicit inventoried `.hk` paths.
+Units can reference other units in the same package by name and other packages
+by their own exact locks. The format uses normalized relative paths and regular
+files beneath the vendor directory. It excludes symlinks, source discovery,
+generated manifests, source maps and workspace members. Packages enter the
+consumer's compilation closure as immutable dependencies and use ordinary
+declaration visibility and generic specialization.
+
+The local vendor directory and manifest locks are sufficient for resolution.
+Neri's prepared native dependency artifacts retain their
+[local cache contract](DEPENDENCY-LIBRARIES.md). For comparable offline and
+checksum contracts, see [Cargo vendoring](https://doc.rust-lang.org/cargo/commands/cargo-vendor.html)
+and [Go module checksums](https://go.dev/ref/mod#go-sum-files).
+
 ## Source identity mapping
 
 A version-2 manifest may declare a top-level `sourceMap` when its source files
@@ -261,8 +319,8 @@ project boundaries take effect without restarting the server.
 Compilation units describe source and type dependencies. The compiler flattens
 only the selected unit's reference closure into one analysis. Declared workspace
 members provide a bounded project-wide inventory without inferring membership
-from the directory tree. Neri does not provide dependency artifact distribution,
-package version resolution or package fetching. Agent operations reuse unchanged
+from the directory tree. Locked source packages use explicit local versions and checksums. Prepared native
+package distribution and dependency fetching require separate contracts. Agent operations reuse unchanged
 unit analyses as described in
 [revisions and snapshots](AGENT-FEEDBACK.md#revisions-and-snapshots).
 

@@ -3,6 +3,7 @@
 #include "neri/codegen/reader.h"
 #include "neri/abi_runtime_imports.h"
 #include "neri/ir_transport.h"
+#include "ir_interfaces.h"
 #include "numeric_types.h"
 #include "native_layout.h"
 
@@ -28,7 +29,7 @@
 namespace neri::codegen {
 namespace {
 
-constexpr std::uint32_t c_call_effects = NERI_IR_EFFECT_READ_V1 |
+constexpr std::uint32_t conservative_call_effects = NERI_IR_EFFECT_READ_V1 |
     NERI_IR_EFFECT_WRITE_V1 | NERI_IR_EFFECT_MAY_PANIC_V1 |
     NERI_IR_EFFECT_MANAGED_ALLOCATE_V1 | NERI_IR_EFFECT_NATIVE_ALLOCATE_V1 |
     NERI_IR_EFFECT_SAFEPOINT_V1 | NERI_IR_EFFECT_UNSAFE_V1;
@@ -372,6 +373,9 @@ struct module_verification_index final {
   std::map<decltype(symbol_key(symbol_id{})), const global_declaration *> globals;
   std::map<decltype(symbol_key(symbol_id{})), const import_declaration *> imports;
   std::map<decltype(symbol_key(symbol_id{})), const function *> functions;
+  std::map<decltype(symbol_key(symbol_id{})), const function *> interface_slots;
+  std::map<const class_declaration *, std::vector<const class_declaration *>>
+      implemented_interfaces;
 };
 
 [[nodiscard]] const function *find_function(const module_verification_index &index,
@@ -390,6 +394,154 @@ find_import(const module_verification_index &index, const symbol_id &id) {
     const module_verification_index &index, const symbol_id &id) {
   const auto found = index.classes.find(symbol_key(id));
   return found == index.classes.end() ? nullptr : found->second;
+}
+
+[[nodiscard]] bool implements_interface(const module_verification_index &index,
+                                        const symbol_id &source,
+                                        const symbol_id &target) {
+  const auto *interface_type = find_class(index, target);
+  if (interface_type == nullptr || !interface_type->is_interface) return false;
+  const auto found = index.implemented_interfaces.find(find_class(index, source));
+  return found != index.implemented_interfaces.end() &&
+         std::ranges::find(found->second, interface_type) != found->second.end();
+}
+
+[[nodiscard]] const method *effective_class_method(
+    const module_verification_index &index, const class_declaration &declaration,
+    const symbol_id &slot) {
+  const auto *current = &declaration;
+  while (current != nullptr) {
+    const auto found = std::ranges::find_if(current->methods, [&](const method &item) {
+      return item.dispatch_slot && same_symbol(*item.dispatch_slot, slot);
+    });
+    if (found != current->methods.end()) return &*found;
+    current = current->base ? find_class(index, *current->base) : nullptr;
+  }
+  return nullptr;
+}
+
+void verify_interface_graph(const module_verification_index &index) {
+  std::map<const class_declaration *, bool> completed;
+  for (const auto &declaration : index.module.classes) {
+    if (!declaration.is_interface ||
+        !completed.try_emplace(&declaration, false).second) continue;
+    std::vector<std::pair<const class_declaration *, std::size_t>> pending{
+        {&declaration, 0U}};
+    while (!pending.empty()) {
+      auto &[current, next] = pending.back();
+      if (next == current->interfaces.size()) {
+        completed.at(current) = true;
+        pending.pop_back();
+        continue;
+      }
+      const auto *parent = find_class(index, current->interfaces[next++]);
+      const auto [position, inserted] = completed.try_emplace(parent, false);
+      if (inserted) {
+        pending.emplace_back(parent, 0U);
+      } else if (!position->second) {
+        fail(reader_error_kind::malformed_module,
+             "Interface inheritance contains a cycle.");
+      }
+    }
+  }
+}
+
+void verify_interface_metadata(module_verification_index &index) {
+  using key_type = decltype(symbol_key(symbol_id{}));
+  for (const auto &declaration : index.module.classes) {
+    if (declaration.is_interface &&
+        (declaration.base || !declaration.fields.empty() ||
+         !declaration.interface_methods.empty())) {
+      fail(reader_error_kind::malformed_module,
+           "Interfaces may declare only parent interfaces and abstract methods.");
+    }
+    if (declaration.base && find_class(index, *declaration.base)->is_interface) {
+      fail(reader_error_kind::invalid_reference,
+           "A class base must be a class. Declare interface conformance separately.");
+    }
+    std::set<const class_declaration *> direct;
+    for (const auto &symbol : declaration.interfaces) {
+      const auto *interface_type = find_class(index, symbol);
+      if (interface_type == nullptr || !interface_type->is_interface ||
+          !direct.insert(interface_type).second) {
+        fail(reader_error_kind::invalid_reference,
+             "Direct interface references must identify distinct interfaces.");
+      }
+    }
+    std::set<key_type> own_slots;
+    for (const auto &item : declaration.methods) {
+      if (item.dispatch_slot &&
+          !own_slots.insert(symbol_key(*item.dispatch_slot)).second) {
+        fail(reader_error_kind::invalid_reference,
+             "A class declares the same virtual dispatch slot more than once.");
+      }
+      if (item.is_abstract && (!item.dispatch_slot ||
+          (!declaration.is_abstract && !declaration.is_interface))) {
+        fail(reader_error_kind::invalid_reference,
+             "An abstract method requires an abstract declaring type and a virtual slot.");
+      }
+      if (!declaration.is_interface) continue;
+      if (!item.is_abstract || !item.dispatch_slot ||
+          !same_symbol(*item.dispatch_slot, item.function_id)) {
+        fail(reader_error_kind::invalid_reference,
+             "An interface method must declare its own abstract virtual slot.");
+      }
+      const auto *signature = find_function(index, item.function_id);
+      index.interface_slots.emplace(symbol_key(*item.dispatch_slot), signature);
+    }
+  }
+  verify_interface_graph(index);
+  for (const auto &declaration : index.module.classes) {
+    const auto interfaces = transitive_interfaces(declaration, [&](const symbol_id &id) {
+      return find_class(index, id);
+    });
+    if (!interfaces.empty()) {
+      index.implemented_interfaces.emplace(&declaration, interfaces);
+    }
+    if (declaration.is_interface) continue;
+    for (const auto &item : declaration.methods) {
+      if (item.dispatch_slot &&
+          index.interface_slots.contains(symbol_key(*item.dispatch_slot))) {
+        fail(reader_error_kind::invalid_reference,
+             "A class virtual slot cannot alias an interface declaration slot.");
+      }
+    }
+    std::set<key_type> required;
+    for (const auto *interface_type : interfaces) {
+      for (const auto &item : interface_type->methods) {
+        required.insert(symbol_key(*item.dispatch_slot));
+      }
+    }
+    for (const auto &binding : declaration.interface_methods) {
+      const auto slot = symbol_key(binding.slot);
+      if (required.erase(slot) != 1U) {
+        fail(reader_error_kind::invalid_reference,
+             "Interface method binding is duplicate or belongs to an unimplemented interface.");
+      }
+      const auto *item = effective_class_method(index, declaration,
+                                                 binding.implementation_slot);
+      if (item == nullptr || item->is_abstract) {
+        fail(reader_error_kind::invalid_reference,
+             "Interface binding requires an effective class virtual implementation.");
+      }
+      const auto *implementation = find_function(index, item->function_id);
+      const auto &signature = *index.interface_slots.at(slot);
+      if (signature.unsafe_call != implementation->unsafe_call ||
+          signature.parameter_types.empty() ||
+          signature.parameter_types.size() != implementation->parameter_types.size() ||
+          !same_type(signature.result_type, implementation->result_type) ||
+          !std::equal(signature.parameter_types.begin() + 1,
+                      signature.parameter_types.end(),
+                      implementation->parameter_types.begin() + 1, same_type)) {
+        fail(reader_error_kind::invalid_reference,
+             "Interface method binding has an incompatible signature.");
+      }
+    }
+    if (!declaration.is_abstract && !required.empty()) {
+      fail(reader_error_kind::invalid_reference,
+           "A concrete class is missing interface method bindings.");
+    }
+  }
 }
 
 [[nodiscard]] std::optional<found_field> find_field(
@@ -616,6 +768,11 @@ void require_binary(const function_context &context, const instruction &value,
     result = &target->result_type;
     effects = target->effects;
   } else {
+    if (!context.index.interface_slots.empty() &&
+        context.index.interface_slots.contains(symbol_key(*value.symbol))) {
+      fail(reader_error_kind::invalid_reference,
+           "Interface methods require virtual dispatch.");
+    }
     const auto *target = find_function(context.index, *value.symbol);
     const auto valid_kind = target != nullptr &&
                             (unsafe_call
@@ -701,7 +858,7 @@ void require_binary(const function_context &context, const instruction &value,
   for (std::size_t index = 1U; index < signature.arguments.size(); ++index)
     require_operand_type(context, value, index + 1U, signature.arguments[index]);
   if (!is_void(result)) require_result_type(value, 0U, result);
-  return c_call_effects;
+  return conservative_call_effects;
 }
 
 [[nodiscard]] std::uint32_t verify_virtual_call(function_context &context,
@@ -712,50 +869,56 @@ void require_binary(const function_context &context, const instruction &value,
          "Virtual call requires a dispatch-slot method symbol.");
   }
 
-  std::vector<const function *> candidates;
-  for (const auto &candidate : context.module.functions) {
-    if (candidate.dispatch_slot.has_value() &&
-        same_symbol(*candidate.dispatch_slot, *value.symbol)) {
-      candidates.push_back(&candidate);
-    }
-  }
-  if (candidates.empty()) {
-    fail(reader_error_kind::invalid_reference,
-         "Virtual call references a dispatch slot without implementations.");
-  }
-
-  const function *signature = candidates.front();
-  // Unsafe virtual calls carry the capability in the IR, just like unsafe
-  // direct calls. The capability is verifier-only and is not part of the
-  // physical dispatch-table ABI.
-  const bool unsafe_call = signature->unsafe_call;
+  const function *signature = nullptr;
   std::uint32_t effects = 0U;
-  for (const auto *candidate : candidates) {
-    if (candidate->unsafe_call != unsafe_call ||
-        candidate->kind != NERI_IR_INSTANCE_METHOD_V1 ||
-        candidate->parameter_types.empty() ||
-        !is_class(candidate->parameter_types.front()) ||
-        candidate->parameter_types.size() != signature->parameter_types.size() ||
-        !same_type(candidate->result_type, signature->result_type)) {
-      fail(reader_error_kind::invalid_reference,
-           "Virtual dispatch slot has an incompatible implementation.");
-    }
-    for (std::size_t index = 1U; index < candidate->parameter_types.size();
-         ++index) {
-      if (!same_type(candidate->parameter_types[index],
-                     signature->parameter_types[index])) {
-        fail(reader_error_kind::invalid_reference,
-             "Virtual dispatch slot has incompatible parameter types.");
+  const auto interface_slot = context.index.interface_slots.empty()
+      ? context.index.interface_slots.end()
+      : context.index.interface_slots.find(symbol_key(*value.symbol));
+  if (interface_slot != context.index.interface_slots.end()) {
+    signature = interface_slot->second;
+    // A reusable native caller can receive conformers emitted later.
+    effects = conservative_call_effects;
+  } else {
+    std::vector<const function *> candidates;
+    for (const auto &candidate : context.module.functions) {
+      if (candidate.dispatch_slot.has_value() &&
+          same_symbol(*candidate.dispatch_slot, *value.symbol)) {
+        candidates.push_back(&candidate);
       }
     }
-    if (is_same_or_base(context.index,
-                        *signature->parameter_types.front().symbol,
-                        *candidate->parameter_types.front().symbol)) {
-      signature = candidate;
+    if (candidates.empty()) {
+      fail(reader_error_kind::invalid_reference,
+           "Virtual call references a dispatch slot without implementations.");
     }
-    effects |= candidate->effects;
+    signature = candidates.front();
+    for (const auto *candidate : candidates) {
+      if (candidate->unsafe_call != signature->unsafe_call ||
+          candidate->kind != NERI_IR_INSTANCE_METHOD_V1 ||
+          candidate->parameter_types.empty() ||
+          !is_class(candidate->parameter_types.front()) ||
+          candidate->parameter_types.size() != signature->parameter_types.size() ||
+          !same_type(candidate->result_type, signature->result_type)) {
+        fail(reader_error_kind::invalid_reference,
+             "Virtual dispatch slot has an incompatible implementation.");
+      }
+      for (std::size_t index = 1U; index < candidate->parameter_types.size(); ++index) {
+        if (!same_type(candidate->parameter_types[index],
+                       signature->parameter_types[index])) {
+          fail(reader_error_kind::invalid_reference,
+               "Virtual dispatch slot has incompatible parameter types.");
+        }
+      }
+      if (is_same_or_base(context.index,
+                          *signature->parameter_types.front().symbol,
+                          *candidate->parameter_types.front().symbol)) {
+        signature = candidate;
+      }
+      effects |= candidate->effects;
+    }
   }
 
+  // Unsafe virtual calls carry a verifier-only capability.
+  const bool unsafe_call = signature->unsafe_call;
   const auto result_count = is_void(signature->result_type) ? 0U : 1U;
   const auto operand_offset = unsafe_call ? 1U : 0U;
   verify_instruction_shape(value, result_count,
@@ -929,8 +1092,17 @@ void require_binary(const function_context &context, const instruction &value,
     const auto &source = definition_type(context, value.operands.front());
     const auto &target = value.results.front().value_type;
     if (!is_class(source) || !is_class(target) ||
-        same_symbol(*source.symbol, *target.symbol) ||
-        !is_same_or_base(context.index, *source.symbol, *target.symbol)) {
+        same_symbol(*source.symbol, *target.symbol)) {
+      fail(reader_error_kind::invalid_type,
+           "class.upcast requires a strict declared base-class conversion.");
+    }
+    const auto *declaration = find_class(context.index, *target.symbol);
+    if (declaration != nullptr && declaration->is_interface) {
+      if (!implements_interface(context.index, *source.symbol, *target.symbol)) {
+        fail(reader_error_kind::invalid_type,
+             "class.upcast requires a declared interface conformance.");
+      }
+    } else if (!is_same_or_base(context.index, *source.symbol, *target.symbol)) {
       fail(reader_error_kind::invalid_type,
            "class.upcast requires a strict declared base-class conversion.");
     }
@@ -1102,11 +1274,14 @@ void require_binary(const function_context &context, const instruction &value,
   }
   case NERI_IR_OPCODE_OBJECT_ALLOC_V1: {
     verify_instruction_shape(value, 1U, 0U, 0U, true, false, false);
-    if (!value.symbol.has_value() ||
-        value.symbol->kind != NERI_IR_SYMBOL_CLASS_V1 ||
-        find_class(context.index, *value.symbol) == nullptr) {
+    const auto *declaration = value.symbol ? find_class(context.index, *value.symbol) : nullptr;
+    if (declaration == nullptr || value.symbol->kind != NERI_IR_SYMBOL_CLASS_V1) {
       fail(reader_error_kind::invalid_reference,
            "object.alloc references a missing or wrong-kind class.");
+    }
+    if (declaration->is_interface || declaration->is_abstract) {
+      fail(reader_error_kind::invalid_type,
+           "object.alloc requires a concrete class.");
     }
     const type expected{NERI_IR_TYPE_CLASS_V1, value.symbol, {}};
     require_result_type(value, 0U, expected);
@@ -1640,8 +1815,14 @@ void verify_function(const module_verification_index &index,
          "Function has inconsistent method and declaring-class metadata.");
   }
   if (value.declaring_class.has_value()) {
-    if (find_class(index, *value.declaring_class) == nullptr) {
+    const auto *declaration = find_class(index, *value.declaring_class);
+    if (declaration == nullptr) {
       fail(reader_error_kind::invalid_reference, "Method references a missing declaring class.");
+    }
+    if (declaration->is_interface &&
+        !index.interface_slots.contains(symbol_key(value.id))) {
+      fail(reader_error_kind::invalid_reference,
+           "An interface callable must be a declared interface method.");
     }
     if (value.kind == NERI_IR_INSTANCE_METHOD_V1 ||
         value.kind == NERI_IR_CONSTRUCTOR_V1) {
@@ -1957,7 +2138,9 @@ void verify_supported_module(const ir_module &value) {
     return symbol_key(item.id);
   });
 
-  const module_verification_index index(value);
+  module_verification_index index(value);
+  const auto explicit_interfaces = std::ranges::find(value.required_features,
+      ir_feature::ExplicitInterfaces) != value.required_features.end();
 
   std::set<decltype(symbol_key(symbol_id{}))> declarations;
   const auto valid_access = [](neri_ir_access_v1 access) {
@@ -1977,6 +2160,12 @@ void verify_supported_module(const ir_module &value) {
          find_class(index, *declaration.base) == nullptr)) {
       fail(reader_error_kind::invalid_reference, "Class references a missing base class.");
     }
+    if (!explicit_interfaces &&
+        (declaration.is_interface || declaration.is_abstract ||
+         !declaration.interfaces.empty() || !declaration.interface_methods.empty())) {
+      fail(reader_error_kind::unsupported_feature,
+           "Interface and abstract metadata require explicit-interfaces-v1.");
+    }
 
     std::set<decltype(symbol_key(symbol_id{}))> fields;
     for (const auto &item : declaration.fields) {
@@ -1994,6 +2183,10 @@ void verify_supported_module(const ir_module &value) {
     std::set<decltype(symbol_key(symbol_id{}))> methods;
     for (const auto &item : declaration.methods) {
       verify_location(item.location, index);
+      if (item.is_abstract && !explicit_interfaces) {
+        fail(reader_error_kind::unsupported_feature,
+             "Abstract method metadata requires explicit-interfaces-v1.");
+      }
       if (!methods.insert(symbol_key(item.function_id)).second) {
         fail(reader_error_kind::malformed_module, "Class has a duplicate method entry.");
       }
@@ -2034,6 +2227,7 @@ void verify_supported_module(const ir_module &value) {
       }
     }
   }
+  if (explicit_interfaces) verify_interface_metadata(index);
   for (const auto &global : value.globals) {
     verify_location(global.location, index);
     if (global.id.module != value.id ||
@@ -2086,7 +2280,7 @@ void verify_supported_module(const ir_module &value) {
           import.link_name == "neri_rt_v1_foreign_leave" ||
           neri_abi_runtime_import(import.link_name.c_str()) != nullptr)
         fail(reader_error_kind::invalid_reference, "C ABI import names a compiler-controlled runtime symbol.");
-      if ((import.effects & c_call_effects) != c_call_effects) {
+      if ((import.effects & conservative_call_effects) != conservative_call_effects) {
         fail(reader_error_kind::invalid_safety,
              "C ABI import weakens the conservative effect contract.");
       }

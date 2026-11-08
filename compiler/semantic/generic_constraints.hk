@@ -59,22 +59,42 @@ def semanticResolveContract(
   return result
 end
 
-def semanticGenericContract(
+def semanticBoundDependsOnParameter(syntax: SyntaxArena, node: Int, parameters: String[]): Bool
+  let type = syntax.nodeAt(node)
+
+  if !type.kind.isType()
+    return false
+  end
+  if type.typeSyntax.kind.isNominal()
+    for name in parameters
+      return true if type.typeSyntax.name == name
+    end
+  end
+  for argument in type.typeArguments
+    return true if semanticBoundDependsOnParameter(syntax, argument, parameters)
+  end
+  for child in type.children
+    return true if semanticBoundDependsOnParameter(syntax, child, parameters)
+  end
+  return false
+end
+
+def semanticGenericCapability(
   owner: BootstrapBinder,
   template: Int,
   index: Int,
   report: Bool,
   namespaceOverride: String = ""
-): SemanticContract?
+): String
   let constraints = owner.syntax.nodeAt(template).typeParameterConstraints
 
-  return null if index < 0 || index >= constraints.Length || constraints[index] < 0
+  return "" if index < 0 || index >= constraints.Length || constraints[index] < 0
   let node = constraints[index]
   let bound = owner.syntax.nodeAt(node)
   let declaration = semanticDeclaration(owner, template)
 
   if declaration == null
-    return null
+    return ""
   end
   let namespaceName = namespaceOverride != "" ? namespaceOverride : declaration.namespaceName
 
@@ -89,22 +109,49 @@ def semanticGenericContract(
     owner.model.completionSites = site
   end
 
-  if !bound.kind.isType() || !bound.typeSyntax.kind.isNominal() || bound.typeSyntax.suffixes != null || bound.typeArguments.Length != 0 || bound.children.Length != 1 || !owner.syntax.kindAt(bound.children[0]).isQualifiedName()
+  if !bound.kind.isType() || !bound.typeSyntax.kind.isNominal() || bound.typeSyntax.suffixes != null || bound.children.Length != 1 || !owner.syntax.kindAt(bound.children[0]).isQualifiedName()
     if report
       owner.report(
         "NR250",
         node,
-        "A generic constraint names one source-declared contract without type arguments."
+        "A generic constraint names one structural contract or nominal interface."
       )
     end
-    return null
+    return ""
   end
-  return report ? semanticResolveContract(
-    owner,
-    bound.typeSyntax.name,
-    namespaceName,
-    node
-  ) : semanticFindContract(owner.model, bound.typeSyntax.name, namespaceName)
+  if semanticBoundDependsOnParameter(owner.syntax, node, owner.syntax.nodeAt(template).typeParameters)
+    owner.report("NR250", node, "A generic interface constraint requires concrete type arguments.") if report
+    return ""
+  end
+  let written = bound.typeSyntax.name
+
+  if bound.typeArguments.Length == 0
+    let contract = semanticFindContract(owner.model, written, namespaceName)
+
+    if contract != null
+      semanticResolveContract(owner, written, namespaceName, node) if report
+      return contract.fullName
+    end
+    let resolved = semanticResolveType(owner.model, written, namespaceName)
+    let interfaceType = owner.model.findClass(resolved)
+
+    if interfaceType != null && interfaceType.isInterface
+      owner.resolveTypeNode(node, namespaceName, "") if report
+      return resolved
+    end
+    semanticResolveContract(owner, written, namespaceName, node) if report
+    return ""
+  end
+  let target = findGenericTemplate(owner, written, namespaceName, owner.syntax.kinds.getClass())
+  let interfaceDeclaration = target < 0 ? null : semanticDeclaration(owner, target)
+
+  if interfaceDeclaration == null || !interfaceDeclaration.isInterface
+    owner.report("NR250", node, "A parameterized generic constraint must name a nominal interface.") if report
+    return ""
+  end
+  let resolved = owner.resolveTypeNode(node, namespaceName, "")
+
+  return resolved == "Error" ? "" : resolved
 end
 
 def semanticHasGenericConstraints(owner: BootstrapBinder, template: Int): Bool
@@ -139,13 +186,13 @@ def semanticGenericConstraintsValid(
   var index = 0
 
   while index < source.typeParameterConstraints.Length
-    if source.typeParameterConstraints[index] >= 0 && semanticGenericContract(
+    if source.typeParameterConstraints[index] >= 0 && semanticGenericCapability(
       owner,
       template,
       index,
       report,
       namespaceOverride
-    ) == null
+    ) == ""
       valid = false
     end
     index = index + 1
@@ -179,22 +226,18 @@ def semanticFindContractMethod(model: SemanticModel, typeName: String, name: Str
   if abstract != null && abstract.parameterCount == arity
     return abstract
   end
-  var owner = model.findClass(semanticMutableType(typeName))
-  var steps = 0
+  let owner = model.findClass(semanticMutableType(typeName))
 
-  while owner != null && steps < 256
-    var method = owner.firstMethod
-
-    while method != null
-      if method.name == name
-        return method
-      end
-      method = method.nextCallable
-    end
-    owner = model.findClass(owner.baseName)
-    steps = steps + 1
-  end
-  return null
+  return null if owner == null
+  return owner.isAbstract ? semanticFindInterfaceMethod(
+    model,
+    owner,
+    name
+  ) : semanticFindClassMethod(
+    model,
+    owner,
+    name
+  )
 end
 
 def semanticRequirementMatches(requirement: SemanticCallable, implementation: SemanticCallable, typeName: String): Bool
@@ -253,16 +296,25 @@ def semanticCheckGenericConstraints(
   var index = 0
 
   while index < source.typeParameters.Length && index < arguments.size
-    let contract = semanticGenericContract(owner, template, index, false, namespaceOverride)
+    let capability = semanticGenericCapability(owner, template, index, false, namespaceOverride)
 
-    if contract != null
-      let satisfied = semanticTypeSatisfiesContract(owner.model, arguments.get(index), contract)
+    if capability != ""
+      let contract = owner.model.findContract(capability)
+      let satisfied = contract == null ? semanticAssignable(
+        owner.model,
+        capability,
+        arguments.get(index)
+      ) : semanticTypeSatisfiesContract(
+        owner.model,
+        arguments.get(index),
+        contract
+      )
 
       if !satisfied
         owner.report(
           "NR251",
           node,
-          "Type '" + arguments.get(index) + "' does not satisfy '" + contract.fullName + "' required by type parameter '" + source.typeParameters[index] + "' of '" + genericName(
+          "Type '" + arguments.get(index) + "' does not satisfy '" + capability + "' required by type parameter '" + source.typeParameters[index] + "' of '" + genericName(
             owner,
             template
           ) + "'."
@@ -273,4 +325,13 @@ def semanticCheckGenericConstraints(
     index = index + 1
   end
   return valid
+end
+
+def validateGenericConstraintDeclarations(owner: BootstrapBinder): Void
+  var index = 0
+
+  while index < owner.model.genericTemplates.size && owner.checkpoint()
+    semanticGenericConstraintsValid(owner, owner.model.genericTemplates.get(index))
+    index = index + 1
+  end
 end

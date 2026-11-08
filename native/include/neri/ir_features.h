@@ -14,6 +14,7 @@ enum class ir_feature : std::uint8_t {
   AutomaticRegions,
   CInterop,
   DebugScopes,
+  ExplicitInterfaces,
   ExtendedScalars,
   IsolatedWorkers,
   NativeLibraries,
@@ -35,10 +36,11 @@ struct ir_feature_contract final {
   std::string_view transport_diagnostic;
 };
 
-inline constexpr std::array<ir_feature_contract, 13> ir_feature_contracts{{
+inline constexpr std::array<ir_feature_contract, 14> ir_feature_contracts{{
   {ir_feature::AutomaticRegions, "automatic-regions-v1", 1, 36, UINT64_C(0), "Automatic regions require IR transport 1.1."},
   {ir_feature::CInterop, "c-interop-v1", 8, 27, UINT64_C(0), "C interoperability requires IR transport 1.8."},
   {ir_feature::DebugScopes, "debug-scopes-v1", 6, 1, UINT64_C(0), "Debug scopes require IR transport 1.6."},
+  {ir_feature::ExplicitInterfaces, "explicit-interfaces-v1", 10, 1, UINT64_C(0), "Explicit interfaces require IR transport 1.10."},
   {ir_feature::ExtendedScalars, "extended-scalars-v1", 2, 9, UINT64_C(512), "Extended scalars require transport 1.2."},
   {ir_feature::IsolatedWorkers, "isolated-workers-v1", 9, 32, UINT64_C(1073741824), "Isolated workers require IR transport 1.9."},
   {ir_feature::NativeLibraries, "native-libraries-v1", 2, 1, UINT64_C(0), "Native libraries require IR transport 1.2."},
@@ -63,16 +65,17 @@ inline constexpr const ir_feature_contract &ir_feature_metadata(ir_feature featu
   case ir_feature::AutomaticRegions: return ir_feature_contracts[0];
   case ir_feature::CInterop: return ir_feature_contracts[1];
   case ir_feature::DebugScopes: return ir_feature_contracts[2];
-  case ir_feature::ExtendedScalars: return ir_feature_contracts[3];
-  case ir_feature::IsolatedWorkers: return ir_feature_contracts[4];
-  case ir_feature::NativeLibraries: return ir_feature_contracts[5];
-  case ir_feature::NativeRecords: return ir_feature_contracts[6];
-  case ir_feature::NativeStrings: return ir_feature_contracts[7];
-  case ir_feature::RetainedModules: return ir_feature_contracts[8];
-  case ir_feature::ScopedTasks: return ir_feature_contracts[9];
-  case ir_feature::SequentialArrays: return ir_feature_contracts[10];
-  case ir_feature::SessionModule: return ir_feature_contracts[11];
-  case ir_feature::StringData: return ir_feature_contracts[12];
+  case ir_feature::ExplicitInterfaces: return ir_feature_contracts[3];
+  case ir_feature::ExtendedScalars: return ir_feature_contracts[4];
+  case ir_feature::IsolatedWorkers: return ir_feature_contracts[5];
+  case ir_feature::NativeLibraries: return ir_feature_contracts[6];
+  case ir_feature::NativeRecords: return ir_feature_contracts[7];
+  case ir_feature::NativeStrings: return ir_feature_contracts[8];
+  case ir_feature::RetainedModules: return ir_feature_contracts[9];
+  case ir_feature::ScopedTasks: return ir_feature_contracts[10];
+  case ir_feature::SequentialArrays: return ir_feature_contracts[11];
+  case ir_feature::SessionModule: return ir_feature_contracts[12];
+  case ir_feature::StringData: return ir_feature_contracts[13];
   }
   throw std::invalid_argument("Unknown IR feature.");
 }

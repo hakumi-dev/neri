@@ -349,7 +349,14 @@ def neriExpandUnitDirectory(
   return true
 end
 
-def neriLoadUnitSources(project: NeriProject, projectRoot: String, owner: String, own: Bool, unit: LspJson): Bool
+def neriLoadUnitSources(
+  project: NeriProject,
+  projectRoot: String,
+  owner: String,
+  own: Bool,
+  unit: LspJson,
+  sourcePackage: NeriSourcePackage? = null
+): Bool
   if !project.continueLoading()
     return false
   end
@@ -380,7 +387,30 @@ def neriLoadUnitSources(project: NeriProject, projectRoot: String, owner: String
     if !project.continueLoading()
       return false
     end
-    if semanticEndsWith(source.scalarText(), ".hk")
+    if sourcePackage != null
+      let relative = source.scalarText()
+
+      if !semanticEndsWith(relative, ".hk") || !sourcePackage.inventory.get(relative).isString()
+        neriPackageError(
+          project,
+          sourcePackage.root,
+          "Unit source must be an explicit inventoried .hk file: " + relative
+        )
+        return false
+      end
+      if !neriUnitExcluded(
+        relative,
+        exclusions
+      ) && !neriAddUnitSource(
+        project,
+        projectRoot + "/" + relative,
+        relative,
+        owner,
+        own
+      )
+        return false
+      end
+    else if semanticEndsWith(source.scalarText(), ".hk")
       if !neriUnitExcluded(source.scalarText(), exclusions)
         let fullPath = neriCanonicalPath(projectRoot + "/" + source.scalarText())
 
@@ -701,15 +731,21 @@ def neriValidateProjectShape(config: LspJson, project: NeriProject): Bool
 
     while reference != null
       if reference.isObject()
-        if !neriProjectObjectKeysValid(reference, ["project", "unit"], "external reference", project)
-          return false
-        end
-        let referenceProject = reference.get("project")
-        let referenceUnit = reference.get("unit")
+        if !reference.get("package").isMissing()
+          if !neriPackageReferenceValid(project, reference)
+            return false
+          end
+        else
+          if !neriProjectObjectKeysValid(reference, ["project", "unit"], "external reference", project)
+            return false
+          end
+          let referenceProject = reference.get("project")
+          let referenceUnit = reference.get("unit")
 
-        if !referenceProject.isString() || !neriProjectReferencePathValid(referenceProject.scalarText()) || !neriProjectManifestName(referenceProject.scalarText()) || !referenceUnit.isString() || referenceUnit.scalarText() == ""
-          project.fail("External unit references require project and unit strings.")
-          return false
+          if !referenceProject.isString() || !neriProjectReferencePathValid(referenceProject.scalarText()) || !neriProjectManifestName(referenceProject.scalarText()) || !referenceUnit.isString() || referenceUnit.scalarText() == ""
+            project.fail("External unit references require project and unit strings.")
+            return false
+          end
         end
       else if !reference.isString() || reference.scalarText() == ""
         project.fail("Unit references must be strings or external reference objects.")
@@ -732,7 +768,8 @@ def neriLoadUnitManifest(
   selectedUnit: String,
   own: Bool,
   active: NeriProjectReference?,
-  visited: StringBuffer
+  visited: StringBuffer,
+  sourcePackage: NeriSourcePackage? = null
 ): Bool
   if !project.continueLoading()
     return false
@@ -743,7 +780,16 @@ def neriLoadUnitManifest(
     project.fail("Cannot resolve project path: " + path)
     return false
   end
-  let text = host::readText(absolute)
+  let lock = sourcePackage == null ? "" : sourcePackage.digest
+
+  if sourcePackage != null && absolute != sourcePackage.root + "/manifest.json"
+    neriPackageError(project, sourcePackage.root, "Manifest path changed during resolution.")
+    return false
+  end
+  if !project.observeManifestLock(absolute, lock)
+    return false
+  end
+  let text = neriProjectManifestText(project, absolute, sourcePackage != null)
 
   if text == null
     project.fail("Cannot read project: " + absolute)
@@ -832,7 +878,7 @@ def neriLoadUnitManifest(
   end
   let before = project.sources.size
 
-  if !neriLoadUnitSources(project, projectRoot, key, own, definition)
+  if !neriLoadUnitSources(project, projectRoot, key, own, definition, sourcePackage)
     return false
   end
   if !neriLoadGeneratedSources(project, projectRoot, key, own, definition.get("generated"))
@@ -853,9 +899,24 @@ def neriLoadUnitManifest(
   while reference != null
     var referenceManifest = absolute
     var referenceUnit = ""
+    var referencePackage = sourcePackage
 
     if reference.isString()
       referenceUnit = reference.scalarText()
+    else if reference.isObject() && !reference.get("package").isMissing()
+      let storeRoot = sourcePackage == null ? projectRoot : sourcePackage.storeRoot
+      let locked = neriLoadSourcePackage(project, storeRoot, reference)
+
+      if locked == null
+        return false
+      end
+      referenceUnit = reference.get("unit").scalarText()
+      if !neriProjectListed(locked.exports, referenceUnit)
+        neriPackageError(project, locked.root, "Library unit is not exported: " + referenceUnit)
+        return false
+      end
+      referenceManifest = locked.root + "/manifest.json"
+      referencePackage = locked
     else if reference.isObject()
       let referenceProject = reference.get("project")
       let referenceName = reference.get("unit")
@@ -872,6 +933,7 @@ def neriLoadUnitManifest(
       end
       referenceManifest = resolved
       referenceUnit = referenceName.scalarText()
+      referencePackage = null
       let externalOwnership = new NeriProject()
 
       externalOwnership.control = project.control
@@ -889,7 +951,8 @@ def neriLoadUnitManifest(
       referenceUnit,
       false,
       new NeriProjectReference(key, active),
-      visited
+      visited,
+      referencePackage
     )
       if project.continueLoading() && project.error() == ""
         project.fail("Unit references require nonempty unit names.")
@@ -901,7 +964,16 @@ def neriLoadUnitManifest(
   return true
 end
 
-def neriValidateRootUnitOwnership(project: NeriProject, path: String): Bool
+def neriProjectManifestText(project: NeriProject, path: String, locked: Bool): String?
+  if !locked
+    return host::readText(path)
+  end
+  let retained = project.verifiedTextTable.find(path)
+
+  return retained == null ? null : retained.value
+end
+
+def neriValidateRootUnitOwnership(project: NeriProject, path: String, sourcePackage: NeriSourcePackage? = null): Bool
   if !project.continueLoading()
     return false
   end
@@ -911,7 +983,11 @@ def neriValidateRootUnitOwnership(project: NeriProject, path: String): Bool
     project.fail("Cannot resolve project path: " + path)
     return false
   end
-  let text = host::readText(absolute)
+  if sourcePackage != null && absolute != sourcePackage.root + "/manifest.json"
+    neriPackageError(project, sourcePackage.root, "Manifest path changed during resolution.")
+    return false
+  end
+  let text = neriProjectManifestText(project, absolute, sourcePackage != null)
 
   if text == null
     project.fail("Cannot read project: " + absolute)
@@ -933,6 +1009,9 @@ def neriValidateRootUnitOwnership(project: NeriProject, path: String): Bool
   if !neriValidateProjectShape(config, project)
     return false
   end
+  if sourcePackage != null && !neriPackageManifestValid(project, config, sourcePackage)
+    return false
+  end
   let scratch = new NeriProject()
   let projectRoot = bootstrapDirectory(absolute)
   var unit = units.first
@@ -948,7 +1027,7 @@ def neriValidateRootUnitOwnership(project: NeriProject, path: String): Bool
     end
     let before = scratch.sources.size
 
-    if !neriLoadUnitSources(scratch, projectRoot, neriUnitKey(absolute, unit.key), true, unit)
+    if !neriLoadUnitSources(scratch, projectRoot, neriUnitKey(absolute, unit.key), true, unit, sourcePackage)
       project.copyError(scratch)
       return false
     end

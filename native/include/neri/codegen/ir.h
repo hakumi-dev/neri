@@ -61,6 +61,12 @@ struct method final {
   neri_ir_dispatch_kind_v1 dispatch{};
   std::optional<symbol_id> dispatch_slot;
   std::optional<source_location> location;
+  bool is_abstract{};
+};
+
+struct interface_method_binding final {
+  symbol_id slot;
+  symbol_id implementation_slot;
 };
 
 struct class_declaration final {
@@ -71,6 +77,10 @@ struct class_declaration final {
   std::vector<field> fields;
   std::vector<method> methods;
   std::optional<source_location> location;
+  bool is_interface{};
+  bool is_abstract{};
+  std::vector<symbol_id> interfaces{};
+  std::vector<interface_method_binding> interface_methods{};
 };
 
 struct native_record final {

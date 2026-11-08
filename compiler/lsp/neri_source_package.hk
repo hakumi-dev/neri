@@ -1,0 +1,303 @@
+class NeriSourcePackage
+  public root: String
+  public storeRoot: String
+  public digest: String
+  public exports: StringBuffer
+  public inventory: LspJson
+
+  def init(root: String, storeRoot: String, digest: String, exports: StringBuffer, inventory: LspJson): Void
+    this.root = root
+    this.storeRoot = storeRoot
+    this.digest = digest
+    this.exports = exports
+    this.inventory = inventory
+  end
+end
+
+def neriPackageNameValid(name: String): Bool
+  let length = host::stringByteLength(name)
+
+  if length == 0 || length > 64
+    return false
+  end
+  var index = 0
+
+  while index < length
+    let byte = host::stringByteAt(name, index) as Int
+    let letter = byte >= 97 && byte <= 122
+    let other = (byte >= 48 && byte <= 57) || byte == 45 || byte == 95
+
+    if !letter && (index == 0 || !other)
+      return false
+    end
+    index = index + 1
+  end
+  return true
+end
+
+def neriPackageVersionValid(version: String): Bool
+  let length = host::stringByteLength(version)
+
+  if length < 5 || length > 32
+    return false
+  end
+  var index = 0
+  var start = 0
+  var components = 0
+
+  while index <= length
+    if index == length || host::stringByteAt(version, index) == (46 as Byte)
+      if index == start || (index - start > 1 && host::stringByteAt(version, start) == (48 as Byte))
+        return false
+      end
+      components = components + 1
+      start = index + 1
+    else
+      let byte = host::stringByteAt(version, index) as Int
+
+      if byte < 48 || byte > 57
+        return false
+      end
+    end
+    index = index + 1
+  end
+  return components == 3
+end
+
+def neriPackageReferenceValid(project: NeriProject, reference: LspJson): Bool
+  if !neriProjectObjectKeysValid(reference, ["package", "version", "sha256", "unit"], "package reference", project)
+    return false
+  end
+  let name = reference.get("package")
+  let version = reference.get("version")
+  let unit = reference.get("unit")
+
+  if !name.isString() || !neriPackageNameValid(name.scalarText()) || !version.isString() || !neriPackageVersionValid(version.scalarText()) || !neriSha256Digest(reference.get("sha256")) || !unit.isString() || unit.scalarText() == ""
+    project.fail("Package references require a name, exact numeric release version, lowercase SHA-256 and library unit.")
+    return false
+  end
+  return true
+end
+
+def neriPackageError(project: NeriProject, path: String, message: String): Void
+  project.fail("Source package " + path + ": " + message)
+end
+
+def neriPackageAbsolutePath(storeRoot: String, relative: String): String
+  return storeRoot + (storeRoot == "/" ? "" : "/") + relative
+end
+
+def neriPackageReadText(directory: files::Root, path: String, maximum: Int): String?
+  let read = directory.readBytes(path, maximum)
+  let bytes = read.bytes
+
+  if read.failure != null || read.closeFailure != null || bytes == null
+    return null
+  end
+  return host::stringFromBytes(bytes)
+end
+
+def neriPackageLoadInventory(
+  project: NeriProject,
+  directory: files::Root,
+  storeRoot: String,
+  relativeRoot: String,
+  inventory: LspJson
+): Bool
+  let root = neriPackageAbsolutePath(storeRoot, relativeRoot)
+
+  if !inventory.isObject() || !neriSha256Digest(inventory.get("manifest.json"))
+    neriPackageError(project, root, "File inventory must include manifest.json.")
+    return false
+  end
+  let paths = new StringTable<Bool>()
+  var item = inventory.first
+  var count = 0
+  var total = 0
+
+  while item != null
+    if !project.continueLoading()
+      return false
+    end
+    let relative = item.key
+
+    count = count + 1
+    if count > 4096 || !neriRelativeProjectPath(relative) || !neriSourceMapTextValid(relative) || (relative != "manifest.json" && !semanticEndsWith(
+        relative,
+        ".hk"
+      )) || !neriSha256Digest(item) || !paths.add(
+      relative,
+      true
+    )
+      neriPackageError(project, root, "Invalid or duplicate file inventory entry: " + relative)
+      return false
+    end
+    let path = root + "/" + relative
+    let text = neriPackageReadText(directory, relativeRoot + "/" + relative, 16777216)
+
+    if text == null || neriCanonicalPath(path) != path || sha256FastText(text) != item.scalarText()
+      neriPackageError(project, root, "Cannot verify file checksum or canonical path: " + relative)
+      return false
+    end
+    total = total + host::stringByteLength(text)
+    if total > 134217728 || !neriProjectStoreVerified(project, path, text, item.scalarText())
+      neriPackageError(project, root, "File inventory exceeds the size limit or conflicts with verified content.")
+      return false
+    end
+    project.packageInputs.add(path)
+    project.packageSources.add(path, true) if semanticEndsWith(relative, ".hk")
+    item = item.next
+  end
+  return true
+end
+
+def neriLoadSourcePackage(project: NeriProject, storeRoot: String, reference: LspJson): NeriSourcePackage?
+  let name = reference.get("package").scalarText()
+  let version = reference.get("version").scalarText()
+  let digest = reference.get("sha256").scalarText()
+  let identity = name + "@" + version
+  let relativeRoot = "vendor/" + name + "/" + version
+  let root = neriPackageAbsolutePath(storeRoot, relativeRoot)
+  let previous = project.sourcePackages.find(identity)
+
+  if previous != null
+    if previous.value.digest != digest || previous.value.root != root
+      neriPackageError(project, root, "Conflicting descriptor checksums or locations for one package version.")
+      return null
+    end
+    return previous.value
+  end
+  let opened = files::Root.open(storeRoot)
+  let directory = opened.root
+
+  if directory == null
+    neriPackageError(project, root, "Cannot open the referring project's package store.")
+    return null
+  end
+  let package = neriReadSourcePackage(project, directory, storeRoot, relativeRoot, name, version, digest)
+  let closeFailure = directory.close()
+
+  if closeFailure != null && package != null
+    neriPackageError(project, root, "Cannot close the package store.")
+    return null
+  end
+  if package == null || !neriValidateRootUnitOwnership(project, root + "/manifest.json", package)
+    return null
+  end
+  project.sourcePackages.add(identity, package)
+  return package
+end
+
+def neriReadSourcePackage(
+  project: NeriProject,
+  directory: files::Root,
+  storeRoot: String,
+  relativeRoot: String,
+  name: String,
+  version: String,
+  digest: String
+): NeriSourcePackage?
+  let root = neriPackageAbsolutePath(storeRoot, relativeRoot)
+  let descriptor = relativeRoot + "/neri-package.json"
+  let text = neriPackageReadText(directory, descriptor, 1048576)
+
+  if text == null || sha256FastText(text) != digest
+    neriPackageError(project, root, "Cannot verify descriptor checksum or canonical path.")
+    return null
+  end
+  let parser = new LspJsonParser(text)
+  let definition = parser.parse()
+
+  parser.spaces()
+  if parser.failed || parser.position != host::stringByteLength(text) || !definition.isObject() || !neriProjectObjectKeysValid(
+    definition,
+    ["format", "name", "version", "exports", "files"],
+    "package descriptor",
+    project
+  )
+    neriPackageError(project, root, "Invalid descriptor JSON or properties.")
+    return null
+  end
+  let format = definition.get("format")
+  let declaredName = definition.get("name")
+  let declaredVersion = definition.get("version")
+
+  if !format.isNumber() || format.scalarText() != "1" || !declaredName.isString() || declaredName.scalarText() != name || !declaredVersion.isString() || declaredVersion.scalarText() != version
+    neriPackageError(project, root, "Descriptor format, name or version does not match the lock.")
+    return null
+  end
+  let exports = definition.get("exports")
+  let names = new StringBuffer()
+  let unique = new StringTable<Bool>()
+
+  if !exports.isArray() || exports.first == null
+    neriPackageError(project, root, "Exports must list one or more library units.")
+    return null
+  end
+  var entry = exports.first
+
+  while entry != null
+    if !entry.isString() || entry.scalarText() == "" || !unique.add(entry.scalarText(), true)
+      neriPackageError(project, root, "Exports must contain unique, nonempty library unit names.")
+      return null
+    end
+    names.add(entry.scalarText())
+    entry = entry.next
+  end
+  let inventory = definition.get("files")
+
+  let path = neriPackageAbsolutePath(storeRoot, descriptor)
+
+  if !neriPackageLoadInventory(
+    project,
+    directory,
+    storeRoot,
+    relativeRoot,
+    inventory
+  ) || !project.observeManifest(
+    path,
+    text
+  )
+    return null
+  end
+  project.packageInputs.add(path)
+  return new NeriSourcePackage(root, storeRoot, digest, names, inventory)
+end
+
+def neriPackageManifestValid(project: NeriProject, config: LspJson, package: NeriSourcePackage): Bool
+  if !config.get("sourceMap").isMissing() || config.get("projects").first != null
+    neriPackageError(project, package.root, "Package manifests use their own source paths and library units.")
+    return false
+  end
+  let units = config.get("units")
+  var unit = units.first
+
+  while unit != null
+    if unit.get("kind").scalarText() != "library" || unit.get("generated").first != null
+      neriPackageError(project, package.root, "Package units must be libraries with explicit source files.")
+      return false
+    end
+    var reference = unit.get("references").first
+
+    while reference != null
+      if reference.isObject() && reference.get("package").isMissing()
+        neriPackageError(project, package.root, "External dependencies of a package must use package locks.")
+        return false
+      end
+      reference = reference.next
+    end
+    unit = unit.next
+  end
+  var index = 0
+
+  while index < package.exports.size
+    let name = package.exports.get(index)
+
+    if !units.get(name).isObject()
+      neriPackageError(project, package.root, "Exported library unit does not exist: " + name)
+      return false
+    end
+    index = index + 1
+  end
+  return true
+end

@@ -86,6 +86,129 @@ def exited(result: process::PollResult, expected: Int): Void
   end
 end
 
+def packageLockDigest(text: String): String
+  var bytes: Byte[] = []
+  var index = 0
+
+  while index < host::stringByteLength(text)
+    bytes = host::appendByte(bytes, host::stringByteAt(text, index))
+    index = index + 1
+  end
+  match crypto::sha256Outcome(bytes)
+    case result::Result.Ok(digest)
+      var hex = ""
+
+      for byte in digest
+        let high = (byte as Int) / 16
+        let low = (byte as Int) - high * 16
+        let digits = "0123456789abcdef"
+
+        hex = hex + host::stringSlice(digits, high, 1) + host::stringSlice(digits, low, 1)
+      end
+      return hex
+    case result::Result.Error(failure)
+      test::assertTrue(false)
+      return ""
+  end
+end
+
+def packageLockReference(name: String, digest: String, unit: String = "api"): String
+  return "{\"package\":\"" + name + "\",\"version\":\"1.2.3\",\"sha256\":\"" + digest + "\",\"unit\":\"" + unit + "\"}"
+end
+
+def packageLockLibrary(app: String, name: String, manifest: String, source: String): String
+  let root = app + "/vendor/" + name + "/1.2.3"
+  let descriptor = "{\"format\":1,\"name\":\"" + name + "\",\"version\":\"1.2.3\",\"exports\":[\"api\"],\"files\":{\"manifest.json\":\"" + packageLockDigest(manifest) + "\",\"library.hk\":\"" + packageLockDigest(source) + "\"}}\n"
+
+  directory(root)
+  write(root + "/manifest.json", manifest)
+  write(root + "/library.hk", source)
+  write(root + "/neri-package.json", descriptor)
+  return packageLockDigest(descriptor)
+end
+
+def packageLockAppManifest(app: String, reference: String): Void
+  write(
+    app + "/manifest.json",
+    "{\"version\":2,\"defaultUnit\":\"app\",\"units\":{\"app\":{\"kind\":\"executable\",\"sources\":[\"z_main.hk\"],\"references\":[" + reference + "]}}}"
+  )
+end
+
+def packageLockContracts(compiler: String, work: String, target: String): Void
+  let app = work + "/locked-source-packages"
+  let valueSource = "namespace locked_value\n\npublic interface Reader<T>\n  def get(): T\nend\n\npublic class Box<T> implements Reader<T>\n  private value: T\n\n  def init(value: T): Void\n    this.value = value\n  end\n\n  public def get(): T\n    return this.value\n  end\nend\n\ndef readLocked(value: Reader<Int>): Int\n  return value.get()\nend\n\ndef packageReader(value: Int): Reader<Int>\n  return new Box<Int>(value)\nend\n"
+  let valueManifest = "{\"version\":2,\"units\":{\"api\":{\"kind\":\"library\",\"sources\":[\"library.hk\"]}}}"
+  let valueDigest = packageLockLibrary(app, "value", valueManifest, valueSource)
+  let mapSource = "use locked_value\nnamespace locked_map\n\ndef transform<T, U>(value: Box<T>, project: fn(T): U): Box<U>\n  return new Box<U>(project(value.get()))\nend"
+  let mapManifest = "{\"version\":2,\"units\":{\"api\":{\"kind\":\"library\",\"sources\":[\"library.hk\"],\"references\":[" + packageLockReference(
+    "value",
+    valueDigest
+  ) + "]}}}"
+  let mapDigest = packageLockLibrary(app, "transform", mapManifest, mapSource)
+
+  let consumer = "use locked_map\nuse locked_value\n\n@cabiImport(\"neri_rt_v1_gc_collect\")\nunsafe def collectGarbage(): Void\nend\n\nclass LocalReader implements Reader<Int>\n  public def get(): Int\n    return 23\n  end\nend\n\nclass ReaderShelf\n  public reader: Reader<Int>\n\n  def init(reader: Reader<Int>): Void\n    this.reader = reader\n  end\nend\n\ndef main(): Void\n  let project: fn(Int): String = fn(value: Int): String do\n    return value as String\n  end\n  let transformed: Box<String> = transform(new Box<Int>(42), project)\n  let shelf = new ReaderShelf(packageReader(17))\n\n  unsafe\n    collectGarbage()\n  end\n\n  console::println(transformed.get())\n  console::println(readLocked(shelf.reader) as String)\n  console::println(readLocked(new LocalReader()) as String)\nend\n"
+
+  write(app + "/z_main.hk", consumer)
+  packageLockAppManifest(app, packageLockReference("transform", mapDigest))
+  let cache = work + "/locked-source-cache"
+
+  directory(cache + "/semantic")
+  let cacheCreated = host::run("chmod", ["700", cache, cache + "/semantic"])
+
+  test::assertTrue(cacheCreated != null && cacheCreated == 0)
+  let coldProgram = app + "/cold-program"
+  let warmProgram = app + "/warm-program"
+  let cold = invoke(
+    compiler,
+    ["build", "--target", target, "--project", app, "--timings", "--output", coldProgram],
+    cache
+  )
+
+  exited(cold, 0)
+  write(app + "/z_main.hk", consumer + "\n")
+  let warm = invoke(
+    compiler,
+    ["build", "--target", target, "--project", app, "--timings", "--output", warmProgram],
+    cache
+  )
+
+  exited(warm, 0)
+  let coldRun = invoke(coldProgram, [])
+  let warmRun = invoke(warmProgram, [])
+
+  exited(coldRun, 0)
+  exited(warmRun, 0)
+
+  test::assertEqual(output(coldRun), "42\n17\n23\n")
+  test::assertEqual(output(warmRun), output(coldRun))
+  write(work + "/locked-source-build-timings.log", errors(cold) + errors(warm))
+  assertSemanticTiming(cold, "dependency-semantic-miss")
+  assertSemanticTiming(warm, "dependency-semantic-hit")
+  assertSemanticTiming(warm, "dependency-native-hit")
+  write(app + "/vendor/value/1.2.3/library.hk", valueSource + "\n")
+  let changed = invoke(compiler, ["check", "--project", app, "--output", app + "/probe.ir"])
+
+  exited(changed, 2)
+
+  test::assertTrue(containsText(output(changed), "Cannot verify file checksum or canonical path: library.hk"))
+  write(app + "/vendor/value/1.2.3/library.hk", valueSource)
+  packageLockAppManifest(app, packageLockReference("transform", mapDigest, "private"))
+  let hidden = invoke(compiler, ["check", "--project", app, "--output", app + "/probe.ir"])
+
+  exited(hidden, 2)
+
+  test::assertTrue(containsText(output(hidden), "Library unit is not exported: private"))
+  let unpinnedManifest = "{\"version\":2,\"units\":{\"api\":{\"kind\":\"library\",\"sources\":[\"library.hk\"],\"references\":[{\"project\":\"../../value/1.2.3/manifest.json\",\"unit\":\"api\"}]}}}"
+  let unpinnedDigest = packageLockLibrary(app, "transform", unpinnedManifest, mapSource)
+
+  packageLockAppManifest(app, packageLockReference("transform", unpinnedDigest))
+  let escaped = invoke(compiler, ["check", "--project", app, "--output", app + "/probe.ir"])
+
+  exited(escaped, 2)
+
+  test::assertTrue(containsText(output(escaped), "External dependencies of a package must use package locks."))
+end
+
 def main(): Void
   let compiler = host::argumentAt(0)
   let work = host::argumentAt(1)
@@ -100,6 +223,7 @@ def main(): Void
   packageDocumentsContracts(root)
   batchBuildContracts(compiler, work, target)
   semanticDependencyContracts(compiler, work, target)
+  packageLockContracts(compiler, work, target)
 
   let implicit = work + "/implicit"
 

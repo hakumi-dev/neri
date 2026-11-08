@@ -201,6 +201,23 @@ struct neri_type_descriptor_v1 {
 #define NERI_TYPE_DESCRIPTOR_V1_4_SIZE UINT32_C(104)
 #define NERI_TYPE_DESCRIPTOR_V1_CLASS_BASE_SIZE UINT32_C(112)
 
+typedef struct neri_interface_dispatch_entry_v1 {
+  const neri_type_descriptor_v1 *interface_type;
+  const uint32_t *vtable_slots;
+  uint64_t slot_count;
+} neri_interface_dispatch_entry_v1;
+
+/* Optional class descriptor tail, present when base.struct_size covers it.
+ * Slots index the object's dynamic class method table. UINT32_MAX denotes
+ * an unresolved slot on an abstract class. */
+typedef struct neri_type_descriptor_interfaces_v1 {
+  neri_type_descriptor_v1 base;
+  const neri_interface_dispatch_entry_v1 *entries;
+  uint64_t entry_count;
+} neri_type_descriptor_interfaces_v1;
+
+#define NERI_TYPE_DESCRIPTOR_V1_INTERFACES_SIZE UINT32_C(128)
+
 typedef struct neri_runtime_abi_requirements_v1 {
   uint32_t struct_size;
   uint16_t major;

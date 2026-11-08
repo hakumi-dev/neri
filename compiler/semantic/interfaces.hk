@@ -1,0 +1,278 @@
+use host
+
+
+## Returns the distinct nominal interfaces of a type in declaration order.
+## An interface contributes its parents, and a class contributes its own
+## interfaces followed by those of its base classes.
+def semanticImplementedInterfaces(model: SemanticModel, source: SemanticClass): SemanticClass[]
+  if source.interfaces.Length == 0 && source.baseName == ""
+    return []
+  end
+  let names = new StringBuffer()
+  let seen = new StringTable<Bool>()
+  let interfaces = new ValueBuffer<SemanticClass>(source)
+  var current: SemanticClass? = source
+  var depth = 0
+
+  seen.add(source.fullName, true)
+  while current != null && depth < 256
+    for name in current.interfaces
+      names.add(name)
+    end
+    current = model.findClass(current.baseName)
+    depth = depth + 1
+  end
+  var index = 0
+
+  while index < names.size
+    let name = names.get(index)
+
+    if seen.add(name, true)
+      let symbol = model.findClass(name)
+
+      if symbol != null && symbol.isInterface
+        interfaces.add(symbol)
+        for parent in symbol.interfaces
+          names.add(parent)
+        end
+      end
+    end
+    index = index + 1
+  end
+  return arrays::generate<SemanticClass>(interfaces.size) do |offset|
+    return interfaces.get(offset)
+  end
+end
+
+def semanticImplementsInterface(model: SemanticModel, source: SemanticClass, target: String): Bool
+  for symbol in semanticImplementedInterfaces(model, source)
+    return true if symbol.fullName == target
+  end
+  return false
+end
+
+def semanticFindClassMethod(model: SemanticModel, source: SemanticClass, name: String): SemanticCallable?
+  var current: SemanticClass? = source
+  var depth = 0
+
+  while current != null && depth < 256
+    var method = current.firstMethod
+
+    while method != null
+      return method if method.name == name
+      method = method.nextCallable
+    end
+    current = model.findClass(current.baseName)
+    depth = depth + 1
+  end
+  return null
+end
+
+def semanticFindInterfaceMethod(model: SemanticModel, source: SemanticClass, name: String): SemanticCallable?
+  let declared = semanticFindClassMethod(model, source, name)
+
+  if declared != null
+    return declared
+  end
+  for parent in semanticImplementedInterfaces(model, source)
+    let method = semanticFindClassMethod(model, parent, name)
+
+    return method if method != null
+  end
+  return null
+end
+
+def semanticResolveInterfaces(owner: BootstrapBinder, symbol: SemanticClass): Void
+  let declared = owner.syntax.nodeAt(symbol.syntaxNode).interfaceTypes
+  let seen = new StringTable<Bool>()
+
+  for node in declared
+    return if !owner.checkpoint()
+    let name = owner.resolveTypeNode(node, symbol.namespaceName, "")
+    let target = owner.model.findClass(name)
+
+    if name == "Error"
+      continue
+    end
+    if target == null || !target.isInterface
+      owner.report("NR304", node, "Type '" + name + "' must be an interface.")
+    else if target.isResource != symbol.isResource
+      owner.report("NR304", node, "Interface '" + name + "' requires matching resource ownership.")
+    else if !seen.add(name, true)
+      owner.report("NR304", node, "Interface '" + name + "' is listed more than once.")
+    else
+      symbol.interfaces = host::appendString(symbol.interfaces, name)
+    end
+  end
+end
+
+def semanticValidateInterfaceMethod(owner: BootstrapBinder, methodNode: Int): Bool
+  let syntax = owner.syntax
+  let method = semanticDeclaration(owner, methodNode)
+
+  return false if method == null
+  let node = syntax.childAt(methodNode, method.annotationCount)
+  let declaration = semanticDeclaration(owner, node)
+
+  return false if declaration == null
+  semanticValidateMethodModifiers(owner, node)
+  if method.annotationCount != 0 || declaration.annotationCount != 0
+    owner.report("NR303", node, "An interface method cannot declare annotations.")
+    return false
+  end
+  let valid = declaration.name != "init" && method.access.isPublic() && !declaration.isStatic && !declaration.isUnsafe && declaration.bodyCount == 0 && syntax.nodeAt(node).typeParameters.Length == 0 && !syntaxHasModifier(
+    syntax,
+    node,
+    syntax.modifiers.getOverride()
+  )
+
+  if !valid
+    owner.report("NR303", node, "An interface member must be a public, safe, non-generic instance method signature.")
+    return false
+  end
+  var index = 0
+
+  while index < declaration.parameterCount
+    let parameter = syntax.childAt(node, declaration.annotationCount + index)
+
+    if syntax.childCountAt(parameter) > 1
+      owner.report("NR303", parameter, "An interface method parameter cannot have a default argument.")
+      return false
+    end
+    index = index + 1
+  end
+  return true
+end
+
+def semanticCollectInterfaceRequirements(
+  owner: BootstrapBinder,
+  symbol: SemanticClass,
+  source: SemanticClass,
+  requirements: StringTable<SemanticCallable>
+): Void
+  var method = source.firstMethod
+
+  while method != null && owner.checkpoint()
+    let previous = requirements.find(method.name)
+
+    if previous != null
+      if !owner.compatibleMethods(previous.value, method)
+        owner.report(
+          "NR306",
+          symbol.syntaxNode,
+          "Interface requirements for method '" + method.name + "' have conflicting signatures on '" + symbol.fullName + "'."
+        )
+      end
+    else
+      requirements.add(method.name, method)
+      if !symbol.isInterface
+        let implementation = semanticFindClassMethod(owner.model, symbol, method.name)
+
+        if implementation != null && (implementation.isStatic || !owner.compatibleMethods(implementation, method))
+          owner.report(
+            "NR307",
+            implementation.syntaxNode,
+            "Method '" + implementation.fullName + "' does not match interface requirement '" + method.fullName + "'."
+          )
+        else if !symbol.isAbstract && (implementation == null || implementation.isAbstract)
+          owner.report(
+            "NR307",
+            symbol.syntaxNode,
+            "Class '" + symbol.fullName + "' must implement interface method '" + method.fullName + "'."
+          )
+        end
+      end
+    end
+    method = method.nextCallable
+  end
+end
+
+def semanticValidateInterfaces(owner: BootstrapBinder): Void
+  var symbol = owner.model.firstClass
+
+  while symbol != null && owner.checkpoint()
+    if symbol.isInterface
+      for name in symbol.interfaces
+        let parent = owner.model.findClass(name)
+
+        if name == symbol.fullName || (parent != null && semanticImplementsInterface(
+            owner.model,
+            parent,
+            symbol.fullName
+          ))
+          owner.report(
+            "NR305",
+            symbol.syntaxNode,
+            "Interface inheritance cycle detected for '" + symbol.fullName + "'."
+          )
+          symbol.interfaces = []
+          break
+        end
+      end
+    end
+    symbol = symbol.nextClass
+  end
+  symbol = owner.model.firstClass
+  while symbol != null && owner.checkpoint()
+    let interfaces = semanticImplementedInterfaces(owner.model, symbol)
+
+    if interfaces.Length > 0
+      let requirements = new StringTable<SemanticCallable>()
+
+      if symbol.isInterface
+        semanticCollectInterfaceRequirements(owner, symbol, symbol, requirements)
+      end
+      for source in interfaces
+        semanticCollectInterfaceRequirements(owner, symbol, source, requirements)
+      end
+    end
+    symbol = symbol.nextClass
+  end
+end
+
+def semanticTypeParameterInterface(model: SemanticModel, typeName: String): SemanticClass?
+  let parameter = model.findTypeParameter(semanticMutableType(typeName))
+
+  if parameter == null || parameter.capability == ""
+    return null
+  end
+  let symbol = model.findClass(parameter.capability)
+
+  return symbol if symbol != null && symbol.isInterface
+  return null
+end
+
+def semanticClassOrBoundInterface(model: SemanticModel, typeName: String): SemanticClass?
+  let symbol = model.findClass(semanticMutableType(typeName))
+
+  return symbol != null ? symbol : semanticTypeParameterInterface(model, typeName)
+end
+
+def semanticResourceClass(model: SemanticModel, typeName: String): SemanticClass?
+  let symbol = semanticClassOrBoundInterface(model, typeName)
+
+  return symbol if symbol != null && symbol.isResource
+  return null
+end
+
+def semanticValidateInterfaceDeclaration(owner: BootstrapBinder, node: Int): Void
+  let syntax = owner.syntax
+
+  semanticValidateClassModifiers(owner, node)
+  if syntaxHasModifier(
+    syntax,
+    node,
+    syntax.modifiers.getSealed()
+  ) || syntaxHasModifier(
+    syntax,
+    node,
+    syntax.modifiers.getAbstract()
+  )
+    owner.report("NR303", node, "An interface is implicitly abstract and cannot use sealed or abstract modifiers.")
+  end
+  for annotation in syntax.nodeAt(node).classAnnotations
+    if syntax.annotationAt(annotation).isRepresentation()
+      owner.report("NR303", annotation, "An interface cannot declare a native representation.")
+    end
+  end
+end

@@ -350,6 +350,7 @@ public:
       if (feature == ir_feature::SessionModule) session_module_ = true;
       if (feature == ir_feature::RetainedModules) retained_modules_ = true;
       if (feature == ir_feature::CInterop) c_interop_ = true;
+      if (feature == ir_feature::ExplicitInterfaces) explicit_interfaces_ = true;
     }
     if (!std::ranges::is_sorted(result.required_features, {}, ir_feature_name) ||
         std::adjacent_find(result.required_features.begin(), result.required_features.end()) !=
@@ -555,6 +556,7 @@ private:
                                           "dispatch-kind", dispatch_offset);
     result.dispatch_slot =
         read_optional<symbol_id>(input_, [this] { return read_symbol(); });
+    if (explicit_interfaces_) result.is_abstract = input_.boolean();
     result.location = read_location();
     return result;
   }
@@ -569,6 +571,16 @@ private:
                                         NERI_IR_ACCESS_INTERNAL_V1,
                                         "access-modifier", access_offset);
     if (retained_modules_) result.retained = input_.boolean();
+    if (explicit_interfaces_) {
+      result.is_interface = input_.boolean();
+      result.is_abstract = input_.boolean();
+      result.interfaces = read_vector<symbol_id>(
+          input_, "direct interfaces", [this] { return read_symbol(); });
+      result.interface_methods = read_vector<interface_method_binding>(
+          input_, "interface method bindings", [this] {
+            return interface_method_binding{read_symbol(), read_symbol()};
+          });
+    }
     result.fields = read_vector<field>(input_, "class fields",
                                        [this] { return read_field(); });
     result.methods = read_vector<method>(input_, "class methods",
@@ -792,6 +804,7 @@ private:
   bool session_module_{};
   bool retained_modules_{};
   bool c_interop_{};
+  bool explicit_interfaces_{};
 };
 
 void validate_options(const reader_options &options) {

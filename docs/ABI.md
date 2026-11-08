@@ -296,13 +296,45 @@ storage. Slot tracing performs no managed allocation; the collector's mark
 worklist can grow through the native allocator.
 Runtime contract failures panic; no exception unwinds into Neri code.
 
+## Interface dispatch
+
+A managed interface view uses the object's `neri_ref_v1` pointer. Classes with
+interface conformance use `neri_type_descriptor_interfaces_v1`, whose prefix is
+`neri_type_descriptor_v1`. Generated code reads the tail when `struct_size`
+covers it. Its entries include inherited interfaces and zero-method marker
+interfaces.
+
+Each entry identifies the interface by its linked nominal descriptor pointer.
+The slot array maps that interface's declared method order to indices in the
+dynamic class method table. A virtual call uses the implementation at that
+class slot, including an override. Checked casts to interfaces search the
+dynamic descriptor's interface entries. Checked casts to classes follow the
+class ancestry chain.
+
+All virtual interface calls carry the conservative effects `read`, `write`,
+`may-panic`, managed and native allocation, `safepoint`, and `unsafe`, covering
+implementations emitted after the caller.
+
 ## IR transport
 
 The compiler emits canonical Neri IR with transport 1.1, 1.2 for extended
 scalars or external library metadata, 1.3 for native records and fixed arrays,
 1.4 for `scoped-tasks-v1`, 1.5 for `session-module-v1`, 1.6 for
-`debug-scopes-v1`, 1.7 for `retained-modules-v1`, 1.8 for `c-interop-v1`,
-and 1.9 for `isolated-workers-v1`.
+`debug-scopes-v1`, 1.7 for `retained-modules-v1`, 1.8 for `c-interop-v1`
+and `sequential-arrays-v1`, 1.9 for `isolated-workers-v1`, and 1.10 for
+`explicit-interfaces-v1`.
+
+Each envelope selects the transport minor required by its feature set.
+The runtime manifest records the toolchain's maximum transport version.
+Native linking matches that version, the toolchain version, target and ABI
+major, then checks the minimum ABI minor and required runtime features.
+
+`explicit-interfaces-v1` carries interface and abstract flags on class
+records, direct interface symbols, interface-slot-to-class-slot bindings,
+and an abstract flag on method records. The verifier checks the nominal
+conformance graph and method signatures. Concrete classes carry every
+transitive binding, and abstract classes can omit unresolved bindings.
+Object allocation requires a concrete class.
 The `native-libraries-v1` feature carries a library
 name after each import's source location; empty names retain platform-default
 symbol resolution. Only C ABI imports may declare a library. The transport header
@@ -335,8 +367,9 @@ entry invocation, and returns normally. Runtime worker initialization and
 shutdown surround the adapter call; no parent managed reference is captured.
 
 `retained-modules-v1` marks class shapes and function signatures whose storage
-and bodies are owned by an earlier immutable session module. Retained functions
-carry no blocks, values, or debug state. Native lowering emits external typed
+and bodies are defined in an earlier immutable session module or another AOT
+compilation unit. Retained functions carry no blocks, values, or debug state.
+Native lowering emits external typed
 declarations for retained functions and class descriptors and emits definitions
 only for the current module.
 

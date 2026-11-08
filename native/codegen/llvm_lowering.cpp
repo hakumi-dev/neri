@@ -1,5 +1,6 @@
 #include "llvm_lowering.h"
 #include "allocation_regions.h"
+#include "ir_interfaces.h"
 #include "llvm_numeric.h"
 #include "native_layout.h"
 
@@ -1398,7 +1399,7 @@ private:
       llvm::Value *callee = nullptr;
       if (const auto *exact = allocated_class(instruction.operands[1])) {
         const auto &layout = module_.layout_for_class(*exact);
-        const auto index = layout.dispatch_slots.at(symbol_key(*instruction.symbol));
+        const auto index = module_.class_virtual_slot_index(layout, *instruction.symbol);
         callee = module_.functions_.at(symbol_key(layout.virtual_methods.at(index)->id));
       } else {
         callee = module_.virtual_target(builder_, callback, *instruction.symbol);
@@ -1608,13 +1609,16 @@ private:
       case NERI_IR_OPCODE_CLASS_UPCAST_V1:
         result = value(instruction.operands[0]);
         break;
-      case NERI_IR_OPCODE_CLASS_CHECKED_CAST_V1:
+      case NERI_IR_OPCODE_CLASS_CHECKED_CAST_V1: {
+        const auto &target = *instruction.type_arguments.front().symbol;
+        auto *cast = module_.find_class(target).is_interface
+                         ? module_.checked_interface_cast_function()
+                         : module_.checked_class_cast_function();
         result = builder_.CreateCall(
-            module_.checked_class_cast_function(),
-            {value(instruction.operands[0]),
-             module_.class_descriptor(*instruction.type_arguments.front().symbol)},
+            cast, {value(instruction.operands[0]), module_.class_descriptor(target)},
             "class.cast.checked");
         break;
+      }
       case NERI_IR_OPCODE_OPTIONAL_NONE_V1:
         if (uses_null_representation(instruction.results.front().value_type)) {
           result = llvm::ConstantPointerNull::get(
@@ -2134,6 +2138,8 @@ private:
     std::vector<lowered_field> fields;
     std::vector<const function *> virtual_methods;
     std::map<decltype(symbol_key(symbol_id{})), std::size_t> dispatch_slots;
+    std::vector<const class_declaration *> interfaces;
+    std::map<decltype(symbol_key(symbol_id{})), std::size_t> interface_slots;
   };
 
   [[nodiscard]] static std::uint64_t align_up(std::uint64_t value,
@@ -2166,6 +2172,7 @@ private:
       result.fields = base.fields;
       result.virtual_methods = base.virtual_methods;
       result.dispatch_slots = base.dispatch_slots;
+      result.interfaces = base.interfaces;
     }
     for (const auto &item : declaration.fields) {
       const auto alignment = storage_alignment(item.value_type);
@@ -2183,6 +2190,9 @@ private:
         continue;
       }
       const auto slot = symbol_key(*item.dispatch_slot);
+      if (declaration.is_interface) {
+        interface_slot_owners_.emplace(slot, &declaration);
+      }
       const auto *implementation = &find_function(item.function_id);
       if (const auto found = result.dispatch_slots.find(slot);
           found != result.dispatch_slots.end()) {
@@ -2192,6 +2202,16 @@ private:
         result.dispatch_slots.emplace(slot, index);
         result.virtual_methods.push_back(implementation);
       }
+    }
+
+    if (!declaration.interfaces.empty()) {
+      result.interfaces = transitive_interfaces(declaration, [&](const symbol_id &id) {
+        return &find_class(id);
+      });
+    }
+    for (const auto &binding : declaration.interface_methods) {
+      const auto index = result.dispatch_slots.at(symbol_key(binding.implementation_slot));
+      result.interface_slots.emplace(symbol_key(binding.slot), index);
     }
 
     const auto [inserted, ignored] =
@@ -2231,8 +2251,12 @@ private:
     return field_layout(id).offset;
   }
 
-  [[nodiscard]] std::size_t dispatch_slot_index(const symbol_id &id) const {
-    return dispatch_slot_indices_.at(symbol_key(id));
+  [[nodiscard]] std::size_t class_virtual_slot_index(
+      const lowered_class &layout, const symbol_id &slot) const {
+    const auto key = symbol_key(slot);
+    const auto found = layout.interface_slots.find(key);
+    return found == layout.interface_slots.end()
+               ? layout.dispatch_slots.at(key) : found->second;
   }
 
   [[nodiscard]] llvm::Value *virtual_target(llvm::IRBuilder<> &builder,
@@ -2244,8 +2268,16 @@ private:
         10U, "object.method.table.slot");
     auto *table = builder.CreateAlignedLoad(pointer, table_slot,
         llvm::Align(alignof(void *)), "object.method.table");
-    auto *method_slot = builder.CreateInBoundsGEP(pointer, table,
-        builder.getInt64(dispatch_slot_index(slot)), "object.method.slot");
+    const auto key = symbol_key(slot);
+    const auto interface_owner = interface_slot_owners_.find(key);
+    llvm::Value *index = builder.getInt64(dispatch_slot_indices_.at(key));
+    if (interface_owner != interface_slot_owners_.end()) {
+      index = builder.CreateCall(interface_vtable_index_function(),
+          {descriptor, class_descriptor(interface_owner->second->id), index},
+          "object.interface.method.index");
+    }
+    auto *method_slot = builder.CreateInBoundsGEP(pointer, table, index,
+                                                 "object.method.slot");
     return builder.CreateAlignedLoad(pointer, method_slot,
         llvm::Align(alignof(void *)), "object.method");
   }
@@ -2601,6 +2633,20 @@ private:
     return type_descriptor_type_;
   }
 
+  [[nodiscard]] llvm::StructType *interface_descriptor_type() {
+    static_assert(sizeof(neri_type_descriptor_interfaces_v1) ==
+                  NERI_TYPE_DESCRIPTOR_V1_INTERFACES_SIZE);
+    return llvm::StructType::get(
+        context_, {type_descriptor_type(), llvm::PointerType::getUnqual(context_),
+                   llvm::Type::getInt64Ty(context_)});
+  }
+
+  [[nodiscard]] llvm::StructType *interface_entry_type() {
+    auto *pointer = llvm::PointerType::getUnqual(context_);
+    return llvm::StructType::get(
+        context_, {pointer, pointer, llvm::Type::getInt64Ty(context_)});
+  }
+
   [[nodiscard]] llvm::GlobalVariable *descriptor_name(
       std::string_view key, std::string_view mangled_name) {
     if (const auto found = descriptor_names_.find(std::string(key));
@@ -2832,6 +2878,131 @@ private:
     return class_descriptors_.at(symbol_key(id));
   }
 
+  [[nodiscard]] llvm::Function *interface_entry_lookup_function() {
+    constexpr std::string_view name = ".hk.interface.entry";
+    if (auto *existing = output_->getFunction(name)) return existing;
+    auto *pointer = llvm::PointerType::getUnqual(context_);
+    auto *signature = llvm::FunctionType::get(pointer, {pointer, pointer}, false);
+    auto *function = llvm::Function::Create(
+        signature, llvm::GlobalValue::PrivateLinkage, name, output_.get());
+    function->addFnAttr(llvm::Attribute::NoUnwind);
+    auto *entry = llvm::BasicBlock::Create(context_, "entry", function);
+    auto *size_check = llvm::BasicBlock::Create(context_, "size", function);
+    auto *initial = llvm::BasicBlock::Create(context_, "initial", function);
+    auto *loop = llvm::BasicBlock::Create(context_, "interfaces", function);
+    auto *compare = llvm::BasicBlock::Create(context_, "compare", function);
+    auto *advance = llvm::BasicBlock::Create(context_, "advance", function);
+    auto *success = llvm::BasicBlock::Create(context_, "success", function);
+    auto *failure = llvm::BasicBlock::Create(context_, "failure", function);
+    auto *descriptor = function->getArg(0);
+    auto *target = function->getArg(1);
+    auto *none = llvm::ConstantPointerNull::get(pointer);
+    llvm::IRBuilder<> builder(entry);
+    builder.CreateCondBr(builder.CreateICmpEQ(descriptor, none), failure,
+                         size_check);
+    builder.SetInsertPoint(size_check);
+    auto *size = builder.CreateAlignedLoad(builder.getInt32Ty(), descriptor,
+                                           llvm::Align(4));
+    builder.CreateCondBr(builder.CreateICmpUGE(
+        size, builder.getInt32(NERI_TYPE_DESCRIPTOR_V1_INTERFACES_SIZE)),
+        initial, failure);
+    builder.SetInsertPoint(initial);
+    auto *descriptor_type = interface_descriptor_type();
+    auto *entries = builder.CreateAlignedLoad(
+        pointer, builder.CreateStructGEP(descriptor_type, descriptor, 1U),
+        llvm::Align(8));
+    auto *count = builder.CreateAlignedLoad(
+        builder.getInt64Ty(), builder.CreateStructGEP(descriptor_type, descriptor, 2U),
+        llvm::Align(8));
+    builder.CreateBr(loop);
+    builder.SetInsertPoint(loop);
+    auto *index = builder.CreatePHI(builder.getInt64Ty(), 2U);
+    index->addIncoming(builder.getInt64(0U), initial);
+    builder.CreateCondBr(builder.CreateICmpULT(index, count), compare, failure);
+    builder.SetInsertPoint(compare);
+    auto *entry_type = interface_entry_type();
+    auto *candidate = builder.CreateInBoundsGEP(entry_type, entries, index);
+    auto *identity = builder.CreateAlignedLoad(
+        pointer, builder.CreateStructGEP(entry_type, candidate, 0U), llvm::Align(8));
+    builder.CreateCondBr(builder.CreateICmpEQ(identity, target), success, advance);
+    builder.SetInsertPoint(advance);
+    auto *next = builder.CreateAdd(index, builder.getInt64(1U));
+    index->addIncoming(next, advance);
+    builder.CreateBr(loop);
+    builder.SetInsertPoint(success);
+    builder.CreateRet(candidate);
+    builder.SetInsertPoint(failure);
+    builder.CreateRet(none);
+    return function;
+  }
+
+  [[nodiscard]] llvm::Function *checked_interface_cast_function() {
+    constexpr std::string_view name = ".hk.interface.cast.checked";
+    if (auto *existing = output_->getFunction(name)) return existing;
+    auto *pointer = llvm::PointerType::getUnqual(context_);
+    auto *signature = llvm::FunctionType::get(pointer, {pointer, pointer}, false);
+    auto *function = llvm::Function::Create(
+        signature, llvm::GlobalValue::PrivateLinkage, name, output_.get());
+    function->addFnAttr(llvm::Attribute::NoUnwind);
+    auto *entry = llvm::BasicBlock::Create(context_, "entry", function);
+    auto *lookup = llvm::BasicBlock::Create(context_, "lookup", function);
+    auto *failure = llvm::BasicBlock::Create(context_, "failure", function);
+    auto *object = function->getArg(0);
+    auto *none = llvm::ConstantPointerNull::get(pointer);
+    llvm::IRBuilder<> builder(entry);
+    builder.CreateCondBr(builder.CreateICmpEQ(object, none), failure, lookup);
+    builder.SetInsertPoint(lookup);
+    auto *descriptor = builder.CreateAlignedLoad(pointer, object, llvm::Align(8));
+    auto *found = builder.CreateCall(interface_entry_lookup_function(),
+                                     {descriptor, function->getArg(1)});
+    builder.CreateRet(builder.CreateSelect(builder.CreateICmpNE(found, none),
+                                           object, none));
+    builder.SetInsertPoint(failure);
+    builder.CreateRet(none);
+    return function;
+  }
+
+  [[nodiscard]] llvm::Function *interface_vtable_index_function() {
+    constexpr std::string_view name = ".hk.interface.vtable.index";
+    if (auto *existing = output_->getFunction(name)) return existing;
+    auto *pointer = llvm::PointerType::getUnqual(context_);
+    auto *integer = llvm::Type::getInt64Ty(context_);
+    auto *signature = llvm::FunctionType::get(integer, {pointer, pointer, integer}, false);
+    auto *function = llvm::Function::Create(
+        signature, llvm::GlobalValue::PrivateLinkage, name, output_.get());
+    function->addFnAttr(llvm::Attribute::NoUnwind);
+    auto *entry = llvm::BasicBlock::Create(context_, "entry", function);
+    auto *range = llvm::BasicBlock::Create(context_, "range", function);
+    auto *load = llvm::BasicBlock::Create(context_, "load", function);
+    auto *success = llvm::BasicBlock::Create(context_, "success", function);
+    auto *failure = llvm::BasicBlock::Create(context_, "failure", function);
+    llvm::IRBuilder<> builder(entry);
+    auto *binding = builder.CreateCall(interface_entry_lookup_function(),
+                                       {function->getArg(0), function->getArg(1)});
+    auto *none = llvm::ConstantPointerNull::get(pointer);
+    builder.CreateCondBr(builder.CreateICmpEQ(binding, none), failure, range);
+    builder.SetInsertPoint(range);
+    auto *entry_type = interface_entry_type();
+    auto *ordinal = function->getArg(2);
+    auto *count = builder.CreateAlignedLoad(
+        integer, builder.CreateStructGEP(entry_type, binding, 2U), llvm::Align(8));
+    builder.CreateCondBr(builder.CreateICmpULT(ordinal, count), load, failure);
+    builder.SetInsertPoint(load);
+    auto *slots = builder.CreateAlignedLoad(
+        pointer, builder.CreateStructGEP(entry_type, binding, 1U), llvm::Align(8));
+    auto *slot = builder.CreateAlignedLoad(
+        builder.getInt32Ty(), builder.CreateInBoundsGEP(builder.getInt32Ty(), slots, ordinal),
+        llvm::Align(4));
+    builder.CreateCondBr(builder.CreateICmpEQ(slot, builder.getInt32(UINT32_MAX)),
+                         failure, success);
+    builder.SetInsertPoint(success);
+    builder.CreateRet(builder.CreateZExt(slot, integer));
+    builder.SetInsertPoint(failure);
+    emit_panic(builder, NERI_PANIC_RUNTIME_CONTRACT_V1,
+               "Invalid interface method dispatch.", std::nullopt);
+    return function;
+  }
+
   [[nodiscard]] llvm::Function *checked_class_cast_function() {
     if (auto *existing = output_->getFunction(".hk.class.cast.checked"))
       return existing;
@@ -2893,12 +3064,54 @@ private:
     value.setDSOLocal(true);
   }
 
+  [[nodiscard]] llvm::Constant *class_interface_entries(
+      const lowered_class &layout, const std::string &key) {
+    auto *pointer = llvm::PointerType::getUnqual(context_);
+    auto *null_pointer = llvm::ConstantPointerNull::get(pointer);
+    auto *i32 = llvm::Type::getInt32Ty(context_);
+    auto *i64 = llvm::Type::getInt64Ty(context_);
+    auto *entry_type = interface_entry_type();
+    std::vector<llvm::Constant *> entries;
+    entries.reserve(layout.interfaces.size());
+    for (const auto *interface_type : layout.interfaces) {
+      std::vector<llvm::Constant *> slots;
+      slots.reserve(interface_type->methods.size());
+      for (const auto &method : interface_type->methods) {
+        const auto found = layout.interface_slots.find(symbol_key(*method.dispatch_slot));
+        const auto index = found == layout.interface_slots.end() ? UINT32_MAX : found->second;
+        slots.push_back(llvm::ConstantInt::get(i32, index));
+      }
+      llvm::Constant *slot_pointer = null_pointer;
+      if (!slots.empty()) {
+        auto *array_type = llvm::ArrayType::get(i32, slots.size());
+        auto *slot_array = new llvm::GlobalVariable(
+            *output_, array_type, true, llvm::GlobalValue::PrivateLinkage,
+            llvm::ConstantArray::get(array_type, slots),
+            ".hk.interface.slots." + key + "." + std::to_string(entries.size()));
+        slot_array->setAlignment(llvm::Align(alignof(std::uint32_t)));
+        slot_pointer = slot_array;
+      }
+      entries.push_back(llvm::ConstantStruct::get(entry_type,
+          {class_descriptor(interface_type->id), slot_pointer,
+           llvm::ConstantInt::get(i64, slots.size())}));
+    }
+    auto *table_type = llvm::ArrayType::get(entry_type, entries.size());
+    auto *table = new llvm::GlobalVariable(
+        *output_, table_type, true, llvm::GlobalValue::PrivateLinkage,
+        llvm::ConstantArray::get(table_type, entries), ".hk.interfaces." + key);
+    table->setAlignment(llvm::Align(alignof(void *)));
+    return table;
+  }
+
   void declare_class_metadata() {
     for (const auto &declaration : input_.classes) {
       const auto key = type_code(
           type{NERI_IR_TYPE_CLASS_V1, declaration.id, {}});
+      const auto has_interfaces = !declaration.is_interface &&
+          !layout_for_class(declaration.id).interfaces.empty();
       auto *descriptor = new llvm::GlobalVariable(
-          *output_, type_descriptor_type(), true,
+          *output_, has_interfaces ? interface_descriptor_type() : type_descriptor_type(),
+          true,
           declaration.retained ? llvm::GlobalValue::ExternalLinkage
                                : (retained_modules_
                                       ? llvm::GlobalValue::ExternalLinkage
@@ -2917,8 +3130,9 @@ private:
       const auto &layout = layout_for_class(declaration.id);
       const auto key = type_code(
           type{NERI_IR_TYPE_CLASS_V1, declaration.id, {}});
+      const auto has_interfaces = !declaration.is_interface && !layout.interfaces.empty();
       llvm::Constant *method_table = null_pointer;
-      if (!layout.virtual_methods.empty()) {
+      if (!declaration.is_interface && !layout.virtual_methods.empty()) {
         auto *table_type =
             llvm::ArrayType::get(pointer, layout.virtual_methods.size());
         std::vector<llvm::Constant *> methods;
@@ -2944,10 +3158,11 @@ private:
                                         class_trace_function(layout))
                                   : null_pointer;
       const auto flags = has_references ? NERI_TYPE_FLAG_CONTAINS_REFS_V1 : 0U;
-      class_descriptor(declaration.id)->setInitializer(llvm::ConstantStruct::get(
+      auto *initializer = llvm::ConstantStruct::get(
           type_descriptor_type(),
           {llvm::ConstantInt::get(llvm::Type::getInt32Ty(context_),
-                                  sizeof(neri_type_descriptor_v1)),
+                                  has_interfaces ? sizeof(neri_type_descriptor_interfaces_v1)
+                                                 : sizeof(neri_type_descriptor_v1)),
            llvm::ConstantInt::get(llvm::Type::getInt16Ty(context_),
                                   NERI_RUNTIME_ABI_MAJOR),
            llvm::ConstantInt::get(llvm::Type::getInt16Ty(context_),
@@ -2967,7 +3182,14 @@ private:
            llvm::ConstantInt::get(llvm::Type::getInt32Ty(context_),
                                   NERI_SCALAR_KIND_NONE_V1),
            llvm::ConstantInt::get(llvm::Type::getInt32Ty(context_), 0U),
-           declaration.base ? static_cast<llvm::Constant *>(class_descriptor(*declaration.base)) : null_pointer}));
+           declaration.base ? static_cast<llvm::Constant *>(class_descriptor(*declaration.base)) : null_pointer});
+      if (has_interfaces) {
+        initializer = llvm::ConstantStruct::get(interface_descriptor_type(),
+            {initializer, class_interface_entries(layout, key),
+             llvm::ConstantInt::get(llvm::Type::getInt64Ty(context_),
+                                    layout.interfaces.size())});
+      }
+      class_descriptor(declaration.id)->setInitializer(initializer);
     }
   }
 
@@ -3028,6 +3250,23 @@ private:
       for (const auto &parameter : implementation->parameter_types)
         result += session_canonical_type(parameter) + ",";
       result += ")->" + session_canonical_type(implementation->result_type) + ";";
+    }
+    if (layout.value->is_interface) {
+      result += "interface(";
+      for (const auto &method : layout.value->methods) {
+        result += session_symbol_id(*method.dispatch_slot) + ";";
+      }
+      result += ");";
+    }
+    for (const auto *interface_type : layout.interfaces) {
+      result += "conforms(" + session_symbol_id(interface_type->id) + "){";
+      for (const auto &method : interface_type->methods) {
+        const auto binding = layout.interface_slots.find(symbol_key(*method.dispatch_slot));
+        result += session_symbol_id(*method.dispatch_slot) + "=" +
+                  (binding == layout.interface_slots.end()
+                       ? "-" : std::to_string(binding->second)) + ";";
+      }
+      result += "};";
     }
     return result;
   }
@@ -3739,6 +3978,8 @@ private:
   std::map<decltype(symbol_key(symbol_id{})), lowered_field> field_layouts_;
   std::map<decltype(symbol_key(symbol_id{})), std::size_t>
       dispatch_slot_indices_;
+  std::map<decltype(symbol_key(symbol_id{})), const class_declaration *>
+      interface_slot_owners_;
   std::map<decltype(symbol_key(symbol_id{})), llvm::GlobalVariable *>
       class_descriptors_;
   std::map<decltype(symbol_key(symbol_id{})), llvm::GlobalVariable *>

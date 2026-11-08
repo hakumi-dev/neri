@@ -43,7 +43,7 @@ outside that guarantee.
 | `NRSTYLE004` | Add a final newline to a nonempty file that lacks one. | Enabled, warning |
 | `NRSTYLE005` | Indent parser-defined block bodies and parenthesized/bracketed continuations. | Enabled, warning |
 | `NRSTYLE006` | Normalize horizontal spacing around commas, colons, dots, delimiter interiors, assignments, casts and syntax-resolved unary/binary operators. | Enabled, warning |
-| `NRSTYLE007` | Report each class or enum declaration after the first top-level class or enum in a file. | Disabled, warning; enabled for `compiler/`, `tooling/` and `stdlib/` |
+| `NRSTYLE007` | Report each class, interface, or enum declaration after the first top-level class, interface, or enum in a file. | Disabled, warning; enabled for `compiler/`, `tooling/` and `stdlib/` |
 | `NRSTYLE008` | Wrap long comma-separated argument, parameter and array lists, preserving tokens. | Enabled, warning; 120 columns |
 | `NRSTYLE009` | Separate function and method blocks from surrounding declarations with a blank line, regardless of modifiers. | Enabled, warning |
 
@@ -179,7 +179,7 @@ Namespace separators have no surrounding spaces: `App::Nested::Type`.
 Member access also has no surrounding spaces: `App::Type.create()`.
 Namespace aliases use assignment spacing: `use IO = App::Nested`.
 
-Compiler, tooling and standard-library sources keep one top-level class or enum
+Compiler, tooling and standard-library sources keep one top-level class, interface, or enum
 per file, grouped in directories by responsibility. Extracted types use their full name in
 snake_case, for example `IrFunction` in `compiler/ir/ir_function.hk`. Related
 top-level functions can share a file. The project manifest determines source
