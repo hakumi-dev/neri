@@ -1,4 +1,5 @@
 use host
+use neri_data
 
 def dataObject(mapping: DataMapping, node: LspJson, context: String, keys: String[]): Bool
   if !node.isObject()
@@ -352,6 +353,43 @@ def dataFindField(model: SemanticModel?, symbol: SemanticClass, name: String): S
   return null
 end
 
+def dataComplexInitializerMatches(entity: DataEntity, initializer: SemanticCallable): Bool
+  var count = 0
+  var field = entity.firstField
+
+  while field != null
+    count = count + 1 if field.pathCode == ""
+    field = field.nextField
+  end
+  var complex = entity.firstComplex
+
+  while complex != null
+    count = count + 1 if dataComplexRootLength(complex.memberName) == host::stringByteLength(complex.memberName)
+    complex = complex.nextComplex
+  end
+  if count != initializer.parameterCount
+    return false
+  end
+  var parameter = initializer.firstParameter
+
+  while parameter != null
+    let mapped = entity.field(parameter.name)
+    let nested = entity.complex(parameter.name)
+
+    if mapped != null && mapped.pathCode == ""
+      return false if mapped.typeName != parameter.typeName
+    else if nested != null
+      let expected = nested.typeName + (nested.optional ? "?" : "")
+
+      return false if expected != parameter.typeName
+    else
+      return false
+    end
+    parameter = parameter.nextParameter
+  end
+  return true
+end
+
 def dataInitializer(entity: DataEntity): Bool
   let symbol = entity.symbol
 
@@ -381,7 +419,7 @@ def dataInitializer(entity: DataEntity): Bool
         parameter = parameter.nextParameter if parameter != null
         field = field.nextField if field != null
       end
-      if compatible
+      if compatible || (entity.firstComplex != null && dataComplexInitializerMatches(entity, method))
         entity.initializer = method
         entity.initializeWithFields = false
         return true
@@ -697,7 +735,7 @@ def dataParseField(mapping: DataMapping, entity: DataEntity, node: LspJson, inde
     if accessor
       return mapping.fail(context + ".valueGeneration requires a declared scalar field.")
     end
-    if field.conversionEncode != ""
+    if field.conversionEncode != "" && postgresNativeScalarOid(field.postgresqlType) == 0
       return mapping.fail(context + ".valueGeneration requires a built-in scalar readback codec.")
     end
     if entity.keyless
@@ -781,35 +819,52 @@ def dataParseIndex(mapping: DataMapping, entity: DataEntity, node: LspJson, inde
 end
 
 def dataValidateSchemaNames(mapping: DataMapping): Bool
-  var entity = mapping.firstEntity
-
-  while entity != null
-    var index = entity.firstIndex
+  let tables = new StringBuffer()
+  let indexes = new StringBuffer()
+  let collect: fn(DataEntity, Int): Void = fn(table: DataEntity, position: Int): Void do
+    tables.add(table.tableName)
+    var index = table.firstIndex
 
     while index != null
-      var table = mapping.firstEntity
-      var matches = 0
-
-      while table != null
-        if dataSqlSameIdentifier(index.name, table.tableName)
-          return mapping.fail("Index '" + index.name + "' collides with mapped table '" + table.tableName + "'.")
-        end
-        var other = table.firstIndex
-
-        while other != null
-          if dataSqlSameIdentifier(index.name, other.name)
-            matches = matches + 1
-            if matches > 1
-              return mapping.fail("Mapped index '" + index.name + "' is duplicated without regard to ASCII case.")
-            end
-          end
-          other = other.nextIndex
-        end
-        table = table.nextEntity
-      end
+      indexes.add(index.name)
       index = index.nextIndex
     end
-    entity = entity.nextEntity
+  end
+
+  dataVisitSchemaTables(mapping, collect)
+  var position = 0
+
+  while position < tables.size
+    var previous = 0
+
+    while previous < position
+      if dataSqlSameIdentifier(tables.get(position), tables.get(previous))
+        return mapping.fail("Mapped table '" + tables.get(position) + "' is duplicated without regard to ASCII case.")
+      end
+      previous = previous + 1
+    end
+    position = position + 1
+  end
+  position = 0
+  while position < indexes.size
+    let name = indexes.get(position)
+    var table = 0
+
+    while table < tables.size
+      if dataSqlSameIdentifier(name, tables.get(table))
+        return mapping.fail("Index '" + name + "' collides with mapped table '" + tables.get(table) + "'.")
+      end
+      table = table + 1
+    end
+    var previous = 0
+
+    while previous < position
+      if dataSqlSameIdentifier(name, indexes.get(previous))
+        return mapping.fail("Mapped index '" + name + "' is duplicated without regard to ASCII case.")
+      end
+      previous = previous + 1
+    end
+    position = position + 1
   end
   return true
 end
@@ -1141,6 +1196,28 @@ def dataParseEntity(mapping: DataMapping, node: LspJson, index: Int): Bool
   return dataHierarchySeeds(mapping, entity, context + ".seeds")
 end
 
+def dataNavigationScopeIncludes(endpoint: DataEntity, selected: DataEntity): Bool
+  var current: DataEntity? = selected
+
+  while current != null
+    if current.typeName == endpoint.typeName
+      return true
+    end
+    current = current.hierarchyParent
+  end
+  return false
+end
+
+def dataNavigationScopesOverlap(endpoint: DataEntity, existing: DataEntity?): Bool
+  return existing != null && (dataNavigationScopeIncludes(
+      endpoint,
+      existing
+    ) || dataNavigationScopeIncludes(
+      existing,
+      endpoint
+    ))
+end
+
 def dataParseRelation(mapping: DataMapping, node: LspJson, index: Int): Bool
   let context = "relations[" + (index as String) + "]"
 
@@ -1230,7 +1307,7 @@ def dataParseRelation(mapping: DataMapping, node: LspJson, index: Int): Bool
   let collection = node.get("collection")
   let reference = node.get("reference")
 
-  let declaredDependent = mapping.entity(relation.dependentType)
+  let declaredDependent = mapping.navigationEntity(relation.dependentType)
   let keylessReference = declaredDependent != null && declaredDependent.keyless && collection.isMissing() && !reference.isMissing()
 
   if collection.isMissing() != reference.isMissing() && !keylessReference
@@ -1246,8 +1323,8 @@ def dataParseRelation(mapping: DataMapping, node: LspJson, index: Int): Bool
   if mapping.error != ""
     return false
   end
-  let principal = mapping.entity(relation.principalType)
-  let dependent = mapping.entity(relation.dependentType)
+  let principal = mapping.navigationEntity(relation.principalType)
+  let dependent = declaredDependent
 
   if principal == null
     return mapping.fail(context + ".principal must name a mapped entity.")
@@ -1286,7 +1363,7 @@ def dataParseRelation(mapping: DataMapping, node: LspJson, index: Int): Bool
       return mapping.fail(context + " keys must name mapped non-optional Int or String principal members.")
     end
     if principalField.hierarchyType != "" || dependentField.hierarchyType != ""
-      return mapping.fail(context + " subtype navigation fields require a separately supported hierarchy navigation contract.")
+      return mapping.fail(context + " subtype navigation fields require the declaring subtype or one of its mapped descendants as the relation endpoint.")
     end
     let foreignType = dependentField.optional ? semanticInnerType(dependentField.typeName) : dependentField.typeName
 
@@ -1363,13 +1440,16 @@ def dataParseRelation(mapping: DataMapping, node: LspJson, index: Int): Bool
   var existing = mapping.firstRelation
 
   while existing != null
-    if existing.dependentType == relation.dependentType && dataMembersEqual(
+    let sameDependentScope = dataNavigationScopesOverlap(dependent, existing.dependent)
+    let samePrincipalScope = dataNavigationScopesOverlap(principal, existing.principal)
+
+    if sameDependentScope && dataMembersEqual(
       existing.foreignKeyMembers,
       relation.foreignKeyMembers
     )
       return mapping.fail(context + " repeats an existing foreign-key tuple; each mapped tuple has one principal relation.")
     end
-    if (relation.collectionMember != "" && existing.principalType == relation.principalType && existing.collectionMember == relation.collectionMember) || (relation.referenceMember != "" && existing.dependentType == relation.dependentType && existing.referenceMember == relation.referenceMember)
+    if (relation.collectionMember != "" && samePrincipalScope && existing.collectionMember == relation.collectionMember) || (relation.referenceMember != "" && sameDependentScope && existing.referenceMember == relation.referenceMember)
       return mapping.fail(context + " reuses a navigation member from another relation.")
     end
     existing = existing.nextRelation

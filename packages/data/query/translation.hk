@@ -107,6 +107,7 @@ class MappingColumn
   private storedBoolToInt: Bool
   private storedStorageType: String?
   private storedConversionId: String?
+  private nativePostgresqlType: String?
 
   def init(
     identity: String,
@@ -115,7 +116,8 @@ class MappingColumn
     path: readonly MappingPath? = null,
     boolToInt: Bool = false,
     storageType: String? = null,
-    conversionId: String? = null
+    conversionId: String? = null,
+    postgresqlType: String? = null
   ): Void
     this.storedIdentity = identity
     this.storedTypeName = typeName
@@ -123,6 +125,7 @@ class MappingColumn
     this.storedBoolToInt = boolToInt
     this.storedStorageType = storageType
     this.storedConversionId = conversionId
+    this.nativePostgresqlType = postgresqlType
 
     if path == null
       this.storedPath = new MappingPath(identity, typeName)
@@ -165,6 +168,10 @@ class MappingColumn
 
   internal readonly def path(): readonly MappingPath
     return this.storedPath
+  end
+
+  public readonly def postgresqlType(): String?
+    return this.nativePostgresqlType
   end
 end
 
@@ -276,6 +283,26 @@ class EntityMapping
 
   public readonly def entityType(): String
     return this.storedEntityType
+  end
+
+  internal readonly def filterColumn(identity: String): readonly MappingColumn?
+    let label = translationFieldLabel(identity)
+    var found: readonly MappingColumn? = null
+    var current = this.firstColumn
+
+    while current != null
+      let column = current.value
+      let path = column.path()
+
+      if path.parent == null && translationFieldLabel(path.identity) == label
+        if found != null
+          return null
+        end
+        found = column
+      end
+      current = current.next
+    end
+    return found
   end
 
   public readonly def table(): String
@@ -698,7 +725,8 @@ def translationEqual(mapping: EntityMapping, column: readonly MappingColumn, par
     mapping.table(),
     column.column(),
     stored,
-    comparisonPrefixLength: mappingComparisonPrefix(column)
+    comparisonPrefixLength: mappingComparisonPrefix(column),
+    postgresqlType: column.postgresqlType()
   )
 
   if translationOptional(column.typeName())
@@ -752,13 +780,32 @@ def translationConjoin(left: Expression?, right: Expression): Expression
   return new Expression(ExpressionKind.And(), left: left, right: right)
 end
 
-def translateFields(mapping: EntityMapping, pack: readonly fields::Pack): TranslationResult
+def translationFieldValueType(column: readonly MappingColumn): String
+  let physical = column.postgresqlType()
+
+  if physical != null
+    return postgresNativeScalarOid(physical) == 1186 ? "Int" : "String"
+  end
+  return semanticTranslationInner(column.conversionId() == null ? column.typeName() : column.storageTypeName())
+end
+
+def translationFieldLabel(identity: String): String
+  let length = host::stringByteLength(identity)
+  var start = length
+
+  while start > 0 && (host::stringByteAt(identity, start - 1) as Int) != 46
+    start = start - 1
+  end
+  return host::stringSlice(identity, start, length - start)
+end
+
+def translateFields(mapping: EntityMapping, pack: readonly fields::Pack, mappedLabels: Bool = false): TranslationResult
   let invalid = mapping.failure()
 
   if invalid != null
     return TranslationResult.Failure(invalid)
   end
-  if pack.entityType() != mapping.entityType()
+  if !mappedLabels && pack.entityType() != mapping.entityType()
     return translationFailure("field pack entity does not match mapping")
   end
   var result: Expression? = null
@@ -770,7 +817,7 @@ def translateFields(mapping: EntityMapping, pack: readonly fields::Pack): Transl
     if entry == null
       return translationFailure("field pack contains a missing entry")
     end
-    let column = mapping.find(entry.identity())
+    let column = mappedLabels ? mapping.filterColumn(entry.identity()) : mapping.find(entry.identity())
 
     if column == null || column.typeName() != entry.typeName()
       return translationFailure("field pack identity or type does not match mapping")
@@ -799,7 +846,7 @@ def translateFields(mapping: EntityMapping, pack: readonly fields::Pack): Transl
       end
       expression = new Expression(ExpressionKind.IsNull(), mapping.table(), column.column())
     else
-      if semanticTranslationInner(column.conversionId() == null ? column.typeName() : column.storageTypeName()) != actual
+      if translationFieldValueType(column) != actual
         return translationFailure("field filter scalar type does not match mapping")
       end
       let parameter = translationParameter(value)
@@ -1609,6 +1656,9 @@ class QuotationTranslator
     let secondColumn = right.column
 
     if firstColumn != null && secondColumn != null
+      if postgresNativeScalarOid(firstColumn.postgresqlType()) != postgresNativeScalarOid(secondColumn.postgresqlType())
+        return translationFailure("quotation comparison requires matching native scalar storage")
+      end
       if firstColumn.boolToInt() != secondColumn.boolToInt() || firstColumn.conversionId() != secondColumn.conversionId() || firstColumn.storageTypeName() != secondColumn.storageTypeName()
         return translationFailure("mixed storage conversions require scalar comparison translation")
       end
@@ -1712,7 +1762,8 @@ class QuotationTranslator
         this.mapping.table(),
         column.column(),
         value.parameter,
-        comparisonPrefixLength: mappingComparisonPrefix(column)
+        comparisonPrefixLength: mappingComparisonPrefix(column),
+        postgresqlType: column.postgresqlType()
       ))
   end
 
@@ -2038,10 +2089,12 @@ end
 class ScalarSql
   internal sql: String
   internal checkedScalars: Bool
+  internal postgresqlType: String?
 
-  def init(sql: String, checkedScalars: Bool = false): Void
+  def init(sql: String, checkedScalars: Bool = false, postgresqlType: String? = null): Void
     this.sql = sql
     this.checkedScalars = checkedScalars
+    this.postgresqlType = postgresqlType
   end
 end
 
@@ -2249,7 +2302,10 @@ def compileScalarNode(
     if scalar == null || scalar.typeName() != node.typeName()
       return scalarSqlFailure("computed scalar root requires a matching scalar mapping")
     end
-    return scalarSqlValue(mappingColumnSql(source, scalar))
+    return ScalarSqlResult.Value(new ScalarSql(
+        mappingColumnSql(source, scalar),
+        postgresqlType: scalar.postgresqlType()
+      ))
   end
 
   if code >= 1 && code <= 6 || code == 17
@@ -2269,7 +2325,10 @@ def compileScalarNode(
         let column = value.column
 
         if column != null
-          return scalarSqlValue(mappingColumnSql(mapping, column))
+          return ScalarSqlResult.Value(new ScalarSql(
+              mappingColumnSql(mapping, column),
+              postgresqlType: column.postgresqlType()
+            ))
         end
         if value.isNull
           if node.typeName() != "Null" && !translationOptional(node.typeName())
@@ -2438,6 +2497,9 @@ def compileScalarNode(
           case ScalarSqlResult.Failure(error)
             return ScalarSqlResult.Failure(error)
           case ScalarSqlResult.Value(second)
+            if postgresNativeScalarOid(first.postgresqlType) != postgresNativeScalarOid(second.postgresqlType)
+              return scalarSqlFailure("computed comparison requires matching native scalar storage")
+            end
             var operation = "="
 
             if code == 7 || code == 8

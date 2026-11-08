@@ -51,9 +51,10 @@ connection and reports cleanup failures, following the standard workers resource
 contract. Dispose active operations and complete pending rollback before closing
 the session. Set-based update/delete and migration execution also expose owned
 polling operations. Set writes use a transaction or recovery savepoint and report
-the actual affected count. Migration history, schema changes and stamps share
-one transaction; PostgreSQL retains its advisory transaction lock and SQLite
-copies complete schema metadata to its worker. See the
+the actual affected count. Atomic migration history, schema changes and stamps
+share one transaction. Outside-transaction operations use the
+[migration recovery journal](MIGRATION-RECOVERY.md). PostgreSQL takes its advisory
+transaction lock and SQLite copies migration metadata to its worker. See the
 [asynchronous relational operation contract](../../../docs/DATA-ASYNC.md).
 
 Stable, context-owned `CollectionNavigation` objects record Unknown, Loading,

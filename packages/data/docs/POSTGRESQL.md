@@ -41,9 +41,11 @@ Cancellation after that boundary preserves the command's actual outcome. Driver
 polls copy and clear each native result, and abort the owned connection if an
 unsupported COPY response changes the wire protocol.
 
-Migrations take a transaction-scoped advisory lock, validate the catalog history
-prefix and signatures, apply the requested target, and commit schema and stamps
-together. `migrationHistory` is read-only outside a lease and takes the same lock
+Atomic migrations take a transaction-scoped advisory lock, validate the catalog
+history prefix and signatures, apply the requested target, and commit schema and
+stamps together. An [outside-transaction migration](MIGRATION-RECOVERY.md) uses
+the same lock to claim and finalize its attempt. `migrationHistory` is read-only
+outside a lease and takes the same lock
 inside a caller-owned transaction. Initial tables are created before deferred
 foreign-key constraints, including cycles; migration schema scripts drain all
 libpq results.

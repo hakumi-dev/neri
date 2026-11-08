@@ -55,3 +55,21 @@ all dependent primary key columns for a stable tie-break order.
 The [expanded scalar fixture](../../../tests/data/expanded-scalars/mapping.json) combines a composite
 primary key, composite alternate key, composite navigation, exact decimals and
 nullable binary buffers.
+
+## Complex JSON values
+
+Set `"json": true` on a direct complex member to map its value as JSON. The
+member's declared class determines the stored shape. The encoder writes public
+instance fields in base-first declaration order, and the decoder constructs the
+declared class and assigns those fields. A value from a runtime subtype
+round-trips through the declared shape.
+
+Each class shape consists entirely of public instance fields, with up to 256
+fields across its ancestry. Shapes form acyclic trees with up to 16 levels of
+nested objects. Each decoded class is concrete and supports zero-argument
+construction from safe code. An implicit constructor
+uses the nearest declared base initializer with its default arguments under
+the [language construction contract](../../../docs/LANGUAGE.md).
+
+Runtime subtype reconstruction uses a separate type metadata contract in
+[System.Text.Json polymorphism](https://learn.microsoft.com/en-us/dotnet/standard/serialization/system-text-json/polymorphism).

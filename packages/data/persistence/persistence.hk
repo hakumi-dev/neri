@@ -60,10 +60,12 @@ end
 
 class WriteValueNode
   private stored: Cell
+  private nativePostgresqlType: String?
   private following: WriteValueNode?
 
-  def init(value: Cell): Void
+  def init(value: Cell, postgresqlType: String?): Void
     this.stored = value
+    this.nativePostgresqlType = postgresqlType
   end
 
   public readonly def value(): readonly Cell
@@ -77,6 +79,10 @@ class WriteValueNode
   internal def append(node: WriteValueNode): Void
     this.following = node
   end
+
+  public readonly def postgresqlType(): String?
+    return this.nativePostgresqlType
+  end
 end
 
 class WriteValues
@@ -84,8 +90,8 @@ class WriteValues
   private tail: WriteValueNode?
   private size: Int = 0
 
-  public def add(value: Cell): Void
-    let node = new WriteValueNode(value)
+  public def add(value: Cell, postgresqlType: String? = null): Void
+    let node = new WriteValueNode(value, postgresqlType)
     let current = this.tail
 
     if current == null
@@ -263,11 +269,28 @@ class GeneratedValueColumn
   private storedColumn: ResultColumn
   private storedTiming: GeneratedValueTiming
   private storedCanonicalDecimal: Bool
+  private storedHierarchyValues: String[]
+  private storedBoolToInt: Bool
 
-  def init(column: ResultColumn, timing: GeneratedValueTiming, canonicalDecimal: Bool = false): Void
-    this.storedColumn = new ResultColumn(column.name(), copyResultColumnKind(column.kind()), column.nullable())
+  def init(
+    column: ResultColumn,
+    timing: GeneratedValueTiming,
+    canonicalDecimal: Bool = false,
+    hierarchyValues: String[] = [],
+    boolToInt: Bool = false
+  ): Void
+    this.storedColumn = new ResultColumn(
+      column.name(),
+      copyResultColumnKind(column.kind()),
+      column.nullable(),
+      column.postgresqlType()
+    )
     this.storedTiming = copyGeneratedValueTiming(timing)
     this.storedCanonicalDecimal = canonicalDecimal
+    this.storedBoolToInt = boolToInt
+    this.storedHierarchyValues = tasks::generate(hierarchyValues.Length, 1) do |index|
+      return hierarchyValues[index]
+    end
   end
 
   public readonly def column(): readonly ResultColumn
@@ -278,8 +301,48 @@ class GeneratedValueColumn
     return this.storedCanonicalDecimal
   end
 
+  public readonly def boolToInt(): Bool
+    return this.storedBoolToInt
+  end
+
   public readonly def timing(): readonly GeneratedValueTiming
     return this.storedTiming
+  end
+
+  public readonly def hierarchyValues(): String[]
+    return tasks::generate(this.storedHierarchyValues.Length, 1) do |index|
+      return this.storedHierarchyValues[index]
+    end
+  end
+
+  public readonly def hasHierarchyScope(): Bool
+    return this.storedHierarchyValues.Length > 0
+  end
+
+  internal readonly def appliesTo(row: readonly RawRow, hierarchyColumn: String?): Bool
+    if this.storedHierarchyValues.Length == 0
+      return true
+    end
+    if hierarchyColumn == null
+      return false
+    end
+    let discriminator = cellFromRow(row, hierarchyColumn)
+
+    if discriminator == null
+      return false
+    end
+    match discriminator
+      case Cell.Text(value)
+        for selected in this.storedHierarchyValues
+          return true if selected == value
+        end
+      case Cell.Null()
+      case Cell.Int(value)
+      case Cell.Bool(value)
+      case Cell.Float(value)
+      case Cell.Binary(value)
+    end
+    return false
   end
 
 end
@@ -667,7 +730,9 @@ class TrackedHandle<T>
     return new CascadeNode(this.identity, this.changeSetOwner, validate, remove)
   end
 
-  internal def hasScalarSlot(slot: String, kind: ResultColumnKind, optional: Bool, allowKey: Bool = false): Bool
+  internal def hasScalarSlot(
+    slot: String, kind: ResultColumnKind, optional: Bool, allowKey: Bool = false, subtype: Bool = false
+  ): Bool
     for key in this.mappedKeyColumns
       if slot == key && !allowKey
         return false
@@ -691,7 +756,7 @@ class TrackedHandle<T>
       let column = this.mappedColumns.at(index)
 
       if column.name() == slot
-        if column.nullable() != optional
+        if column.nullable() != optional && !(subtype && column.nullable())
           return false
         end
         match kind
@@ -1263,6 +1328,7 @@ class ScalarRelationshipLink<P, D>
   private deletePolicy: RelationshipDeletePolicy
   private slotName: String
   private tupleColumns: ResultColumns?
+  private dependentScope: (fn(D): Bool)?
   private cachedEdge: RelationshipEdge?
   private orphanForeignKey: Cell?
   private lastAssignedForeignKey: Cell?
@@ -1277,7 +1343,8 @@ class ScalarRelationshipLink<P, D>
     optional: Bool,
     slot: String = "",
     deletePolicy: RelationshipDeletePolicy = RelationshipDeletePolicy.Restrict(),
-    tupleColumns: ResultColumns? = null
+    tupleColumns: ResultColumns? = null,
+    dependentScope: (fn(D): Bool)? = null
   ): Void
     this.principal = principal
     this.dependent = dependent
@@ -1289,6 +1356,7 @@ class ScalarRelationshipLink<P, D>
     this.deletePolicy = deletePolicy
     this.slotName = slot
     this.tupleColumns = tupleColumns
+    this.dependentScope = dependentScope
     if tupleColumns != null && tupleColumns.count() > 1
       this.slotName = relationshipTupleSlot(tupleColumns)
     end
@@ -1317,7 +1385,7 @@ class ScalarRelationshipLink<P, D>
       return link.principal.valid()
     end
     let dependentValid: fn(): Bool = fn(): Bool do
-      return link.dependent.valid()
+      return link.dependent.valid() && link.dependentApplies()
     end
     let principalId: fn(): Int = fn(): Int do
       return link.principal.entry().actionId
@@ -1604,7 +1672,17 @@ class ScalarRelationshipLink<P, D>
     end
   end
 
+  private def dependentApplies(): Bool
+    let scope = this.dependentScope
+
+    return scope == null || scope(this.dependent.entity())
+  end
+
   private def hasMappedTuple(allowKey: Bool): Bool
+    if !this.dependentApplies()
+      return false
+    end
+    let scoped = this.dependentScope != null
     let columns = this.tupleColumns
     let preservesIdentifyingKey = this.sameCell(
       this.readForeignKey(this.dependent.entry().entity),
@@ -1613,7 +1691,13 @@ class ScalarRelationshipLink<P, D>
     let identifying = allowKey || this.dependent.identifyingAdded() || preservesIdentifyingKey
 
     if columns == null
-      return this.dependent.hasScalarSlot(this.slotName, this.keyKind, this.nullableForeignKey, identifying)
+      return this.dependent.hasScalarSlot(
+        this.slotName,
+        this.keyKind,
+        this.nullableForeignKey,
+        identifying,
+        subtype: scoped
+      )
     end
     var index = 0
 
@@ -1624,7 +1708,7 @@ class ScalarRelationshipLink<P, D>
         column.name(),
         copyResultColumnKind(column.kind()),
         column.nullable(),
-        identifying
+        identifying, subtype: scoped
       )
         return false
       end
@@ -1979,7 +2063,7 @@ class WriteActionList
 end
 
 ## Tracks one mapped entity type by its assigned scalar key.
-class EntityTracker<T>: AsyncRowResolver<T>
+class EntityTracker<T>: NavigationTracker<T>
   private navigationIdentityToken: NavigationTrackerIdentity = new NavigationTrackerIdentity()
   private materializationObservers: MaterializationObserver?
   private enrollmentObservers: MaterializationObserver?
@@ -1996,6 +2080,7 @@ class EntityTracker<T>: AsyncRowResolver<T>
   private setGeneratedKey: (fn(T, Int): Void)?
   private generatedColumns: GeneratedValueColumn[]
   private applyGenerated: (fn(T, readonly RawRow): Void)?
+  private generatedValuesObserver: (fn(T, readonly RawRow): Void)?
   private concurrencyColumns: String[]?
   private generatedKey: Bool = false
   private nextTemporaryKey: Int = -1
@@ -2013,7 +2098,7 @@ class EntityTracker<T>: AsyncRowResolver<T>
   private tableSegments: Bool
   private setWriteSegments: TypedRows<TrackedWriteLayout>?
 
-  internal def navigationIdentity(): NavigationTrackerIdentity
+  internal override def navigationIdentity(): NavigationTrackerIdentity
     return this.navigationIdentityToken
   end
 
@@ -2062,9 +2147,16 @@ class EntityTracker<T>: AsyncRowResolver<T>
       let column = item.column()
 
       return new GeneratedValueColumn(
-        new ResultColumn(column.name(), copyResultColumnKind(column.kind()), column.nullable()),
+        new ResultColumn(
+          column.name(),
+          copyResultColumnKind(column.kind()),
+          column.nullable(),
+          column.postgresqlType()
+        ),
         copyGeneratedValueTiming(item.timing()),
-        item.canonicalDecimal()
+        item.canonicalDecimal(),
+        item.hierarchyValues(),
+        item.boolToInt()
       )
     end
     this.applyGenerated = applyGenerated
@@ -2078,6 +2170,10 @@ class EntityTracker<T>: AsyncRowResolver<T>
   end
 
   ## A query-local tracker resolves duplicates without enrolling in a context.
+  internal override def navigationIdentityResolver(): NavigationTracker<T>
+    return this.identityResolver()
+  end
+
   public def identityResolver(): EntityTracker<T>
     let resolver = new EntityTracker<T>(
       this.tableName,
@@ -2126,6 +2222,28 @@ class EntityTracker<T>: AsyncRowResolver<T>
       this.setWriteSegments = first
     else
       segments.add(layout)
+    end
+  end
+
+  internal def observeGeneratedValues(observer: fn(T, readonly RawRow): Void): Void
+    this.generatedValuesObserver = observer
+  end
+
+  internal def acceptSegmentValues(entity: T, returned: readonly RawRow): Void
+    var entry = this.entries
+
+    while entry != null
+      if trackingStateActive(entry.state) && reference::same(entry.entity, entity)
+        let pending = entry.pending
+
+        if pending == null
+          entry.original = overlayReturnedRow(entry.original, returned)
+        else
+          entry.pending = overlayReturnedRow(pending, returned)
+        end
+        return
+      end
+      entry = entry.next
     end
   end
 
@@ -3142,7 +3260,7 @@ class EntityTracker<T>: AsyncRowResolver<T>
   end
 
   ## Returns the state of the entry identified by the entity's assigned key.
-  public def stateOf(entity: T): TrackingState?
+  public override def stateOf(entity: T): TrackingState?
     let key = this.key(this.captureRow(entity))
 
     if key == null
@@ -3168,7 +3286,7 @@ class EntityTracker<T>: AsyncRowResolver<T>
     end
   end
 
-  internal def ownsPersistedForNavigation(entity: T): Bool
+  internal override def ownsPersistedForNavigation(entity: T): Bool
     if this.asyncSaving()
       return false
     end
@@ -3202,7 +3320,7 @@ class EntityTracker<T>: AsyncRowResolver<T>
     end
   end
 
-  internal def visitTracked(visitor: fn(T): Bool): Bool
+  internal override def visitTracked(visitor: fn(T): Bool): Bool
     var current = this.entries
 
     while current != null
@@ -3227,7 +3345,7 @@ class EntityTracker<T>: AsyncRowResolver<T>
   end
 
   ## Returns the tracked scalar baseline for this key, when attached.
-  public def original(entity: T): RawRow?
+  public override def original(entity: T): RawRow?
     let key = this.key(this.captureRow(entity))
 
     if key == null
@@ -3251,7 +3369,7 @@ class EntityTracker<T>: AsyncRowResolver<T>
   end
 
   ## Captures current mapped scalar values of the tracked entry for this key.
-  public def current(entity: T): RawRow?
+  public override def current(entity: T): RawRow?
     let key = this.key(this.captureRow(entity))
 
     if key == null
@@ -3363,7 +3481,7 @@ class EntityTracker<T>: AsyncRowResolver<T>
     if !sameOptionalCell(key, this.key(entry.original)) || !sameOptionalCell(key, this.key(fresh))
       return QueryFailure.Provider(ProviderFailure.State("rebase key mismatch"))
     end
-    let generated = this.returningColumns(false)
+    let generated = this.returningColumns(false, fresh)
 
     if generated != null
       let applyGenerated = this.applyGenerated
@@ -3775,7 +3893,7 @@ class EntityTracker<T>: AsyncRowResolver<T>
   end
 
   ## Reuses tracked instances for rows with the same key.
-  public def observeMaterialization(action: fn(): QueryFailure?): Void
+  public override def observeMaterialization(action: fn(): QueryFailure?): Void
     this.materializationObservers = new MaterializationObserver(action, this.materializationObservers)
   end
 
@@ -3783,7 +3901,7 @@ class EntityTracker<T>: AsyncRowResolver<T>
     this.enrollmentObservers = new MaterializationObserver(action, this.enrollmentObservers)
   end
 
-  public def observeClear(action: fn(): Void): Void
+  public override def observeClear(action: fn(): Void): Void
     let callback: fn(): QueryFailure? = fn(): QueryFailure? do
       action()
       return null
@@ -4066,7 +4184,9 @@ class EntityTracker<T>: AsyncRowResolver<T>
           return error
         end
         current.pendingWrite = true
-        current.pendingCommandIndex = batch.count() - 1
+        if this.returningColumns(true, snapshot) != null
+          current.pendingCommandIndex = batch.count() - 1
+        end
       case EntityState.Unchanged()
         let captured = this.captureRow(current.entity)
         let snapshot = copyRow(captured, this.columns)
@@ -4093,7 +4213,7 @@ class EntityTracker<T>: AsyncRowResolver<T>
           return error
         end
         current.pendingWrite = batch.count() > beforeCommands
-        if current.pendingWrite && this.returningColumns(false) != null
+        if current.pendingWrite && this.returningColumns(false, snapshot) != null
           current.pendingCommandIndex = batch.count() - 1
         end
       case EntityState.Deleted()
@@ -4288,10 +4408,19 @@ class EntityTracker<T>: AsyncRowResolver<T>
     var generated = 0
 
     while generated < this.generatedColumns.Length
-      let definition = this.generatedColumns[generated].column()
+      let generatedValue = this.generatedColumns[generated]
+      let definition = generatedValue.column()
+
+      if generatedValue.hasHierarchyScope() && this.hierarchyColumn == null
+        return "hierarchy-scoped generated column requires a discriminator"
+      end
 
       if this.generatedColumns[generated].canonicalDecimal() && generatedKindCode(definition.kind()) != 4
         return "canonical decimal generated column requires text storage"
+      end
+
+      if generatedValue.boolToInt() && generatedKindCode(definition.kind()) != 1
+        return "boolToInt generated column requires integer storage"
       end
 
       if this.isKeyColumn(definition.name())
@@ -4304,7 +4433,9 @@ class EntityTracker<T>: AsyncRowResolver<T>
         let column = this.columns.at(mapped)
 
         if column.name() == definition.name()
-          if column.nullable() != definition.nullable() || generatedKindCode(column.kind()) != generatedKindCode(definition.kind())
+          let nullableMatches = column.nullable() == definition.nullable() || (generatedValue.hasHierarchyScope() && column.nullable() && !definition.nullable())
+
+          if !nullableMatches || generatedKindCode(column.kind()) != generatedKindCode(definition.kind())
             return "generated column descriptor does not match mapped column: " + definition.name()
           end
           matching = true
@@ -4399,15 +4530,17 @@ class EntityTracker<T>: AsyncRowResolver<T>
     end
   end
 
-  private def returningColumns(insert: Bool): ResultColumns?
+  private def returningColumns(insert: Bool, row: readonly RawRow): ResultColumns?
     var count = insert && this.generatedKey ? 1 : 0
 
     for definition in this.generatedColumns
-      match definition.timing()
-        case GeneratedValueTiming.OnAdd()
-          count = count + 1 if insert
-        case GeneratedValueTiming.OnAddOrUpdate()
-          count = count + 1
+      if definition.appliesTo(row, this.hierarchyColumn)
+        match definition.timing()
+          case GeneratedValueTiming.OnAdd()
+            count = count + 1 if insert
+          case GeneratedValueTiming.OnAddOrUpdate()
+            count = count + 1
+        end
       end
     end
     if count == 0
@@ -4430,11 +4563,16 @@ class EntityTracker<T>: AsyncRowResolver<T>
               included = true
           end
         end
-        if included
+        if included && definition.appliesTo(row, this.hierarchyColumn)
           if position == index
             let column = definition.column()
 
-            return new ResultColumn(column.name(), copyResultColumnKind(column.kind()), column.nullable())
+            return new ResultColumn(
+              column.name(),
+              copyResultColumnKind(column.kind()),
+              column.nullable(),
+              column.postgresqlType()
+            )
           end
           position = position + 1
         end
@@ -4563,7 +4701,15 @@ class EntityTracker<T>: AsyncRowResolver<T>
     if this.writeLayout == null
       return null
     end
-    return layout.failure(row, this.columns, this.keyColumns, this.concurrencyColumns, this.generatedColumns, dialect)
+    return layout.failure(
+      row,
+      this.columns,
+      this.keyColumns,
+      this.concurrencyColumns,
+      this.generatedColumns,
+      dialect,
+      this.hierarchyColumn
+    )
   end
 
   private def prepareInsert(batch: WriteBatch, row: RawRow, dialect: SqlDialect): String?
@@ -4580,7 +4726,8 @@ class EntityTracker<T>: AsyncRowResolver<T>
     var index = 0
 
     while index < columns.count()
-      let column = columns.at(index).name()
+      let definition = columns.at(index)
+      let column = definition.name()
 
       if !identifierValid(column)
         return "invalid tracked column identifier"
@@ -4593,13 +4740,13 @@ class EntityTracker<T>: AsyncRowResolver<T>
             let separator = values.count() == 0 ? "" : ", "
 
             names = names + separator + "\"" + column + "\""
-            values.add(value)
+            values.add(value, definition.postgresqlType())
             markers = markers + separator + dialectPlaceholder(dialect, values.count())
         end
       end
       index = index + 1
     end
-    let returning = this.returningColumns(true)
+    let returning = this.returningColumns(true, row)
     let suffix = returning == null ? "" : this.returningSql(returning)
 
     if values.count() == 0
@@ -4632,7 +4779,8 @@ class EntityTracker<T>: AsyncRowResolver<T>
     var index = 0
 
     while index < columns.count()
-      let column = columns.at(index).name()
+      let definition = columns.at(index)
+      let column = definition.name()
 
       if !identifierValid(column)
         return "invalid tracked column identifier"
@@ -4648,7 +4796,7 @@ class EntityTracker<T>: AsyncRowResolver<T>
           return "store-generated column changed by application: " + column
         end
         if !this.generatedOnUpdate(column) && !sameCell(before, after)
-          values.add(after)
+          values.add(after, definition.postgresqlType())
           assignments = assignments + separator + "\"" + column + "\" = " + dialectPlaceholder(dialect, values.count())
           separator = ", "
         end
@@ -4682,7 +4830,7 @@ class EntityTracker<T>: AsyncRowResolver<T>
     if predicate == null
       return "captured entity column is missing"
     end
-    let returning = this.returningColumns(false)
+    let returning = this.returningColumns(false, snapshot)
     let suffix = returning == null ? "" : this.returningSql(returning)
 
     batch.add(
@@ -4727,7 +4875,8 @@ class EntityTracker<T>: AsyncRowResolver<T>
     var index = 0
 
     while index < columns.count()
-      let column = columns.at(index).name()
+      let definition = columns.at(index)
+      let column = definition.name()
 
       if this.predicateIncludes(column)
         let cell = cellFromRow(row, column)
@@ -4740,19 +4889,19 @@ class EntityTracker<T>: AsyncRowResolver<T>
           case Cell.Null()
             sql = sql + " IS NULL"
           case Cell.Bool(value)
-            values.add(cell)
+            values.add(cell, definition.postgresqlType())
             sql = sql + " = " + dialectPlaceholder(dialect, values.count())
           case Cell.Int(value)
-            values.add(cell)
+            values.add(cell, definition.postgresqlType())
             sql = sql + " = " + dialectPlaceholder(dialect, values.count())
           case Cell.Float(value)
-            values.add(cell)
+            values.add(cell, definition.postgresqlType())
             sql = sql + " = " + dialectPlaceholder(dialect, values.count())
           case Cell.Text(value)
-            values.add(cell)
+            values.add(cell, definition.postgresqlType())
             sql = sql + " = " + dialectPlaceholder(dialect, values.count())
           case Cell.Binary(value)
-            values.add(cell)
+            values.add(cell, definition.postgresqlType())
             sql = sql + " = " + dialectPlaceholder(dialect, values.count())
         end
       end
@@ -4780,7 +4929,12 @@ class EntityTracker<T>: AsyncRowResolver<T>
           case EntityState.Deleted()
           case EntityState.Detached()
         end
-        let expected = this.returningColumns(inserting)
+        let snapshot = current.pending
+
+        if snapshot == null
+          return "generated write has no captured snapshot"
+        end
+        let expected = this.returningColumns(inserting, snapshot)
 
         if expected == null || row.count() != expected.count()
           return "generated write returned an invalid column count"
@@ -4799,10 +4953,16 @@ class EntityTracker<T>: AsyncRowResolver<T>
           if value == null || !writeCellMatches(value, descriptor)
             return "generated write returned a type or nullability mismatch: " + descriptor.name()
           end
+          if !postgresNativeGeneratedValueValid(value, descriptor)
+            return "generated write returned an invalid native scalar: " + descriptor.name()
+          end
           let definition = this.generatedColumn(descriptor.name())
 
-          if definition != null && definition.canonicalDecimal() && !generatedDecimalMatches(value)
+          if definition != null && definition.canonicalDecimal() && descriptor.postgresqlType() == null && !generatedDecimalMatches(value)
             return "generated write returned invalid or noncanonical decimal text: " + descriptor.name()
+          end
+          if definition != null && definition.boolToInt() && !generatedBoolToIntMatches(value)
+            return "generated write returned a Boolean integer outside 0 or 1: " + descriptor.name()
           end
           index = index + 1
         end
@@ -4926,6 +5086,11 @@ class EntityTracker<T>: AsyncRowResolver<T>
 
         if pending != null && returned != null
           current.pending = overlayReturnedRow(pending, returned)
+        end
+        let observer = this.generatedValuesObserver
+
+        if returned != null && observer != null
+          observer(current.entity, returned)
         end
         current.pendingGeneratedKey = null
         current.pendingGeneratedValues = null
@@ -7877,4 +8042,18 @@ def generatedDecimalMatches(value: readonly Cell): Bool
     case Cell.Binary(value)
       return false
   end
+end
+
+def generatedBoolToIntMatches(value: readonly Cell): Bool
+  match value
+    case Cell.Null()
+      return true
+    case Cell.Int(number)
+      return number == 0 || number == 1
+    case Cell.Bool(boolean)
+    case Cell.Float(number)
+    case Cell.Text(text)
+    case Cell.Binary(bytes)
+  end
+  return false
 end

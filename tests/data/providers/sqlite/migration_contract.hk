@@ -343,6 +343,74 @@ def verifyDeferredForeignKeyGuard(path: String): Void
     ))
 end
 
+def pendingRecovery(provider: SQLiteProvider, migrations: MigrationSet): MigrationProgress?
+  match provider.migrationJournal(migrations)
+    case MigrationJournalResult.Failure(error)
+      test::assertTrue(false)
+      return null
+    case MigrationJournalResult.Loaded(stamps, pending)
+      test::assertEqual(stamps.Length, 1)
+      test::assertTrue(pending != null && pending.id() == "outside_index" && pending.forward())
+      return pending
+  end
+end
+
+def verifyOutsideMigrationRecovery(path: String): Void
+  let initial = new Migration(
+    "outside_initial",
+    [SchemaOp.Sql("CREATE TABLE recover_items (id INTEGER PRIMARY KEY)")],
+    [SchemaOp.DropTable("recover_items")]
+  )
+  let outside = new Migration(
+    "outside_index",
+    [SchemaOp.Sql("CREATE INDEX recover_items_lookup ON recover_items (id)")],
+    [SchemaOp.DropIndex("recover_items_lookup")],
+    upExecution: MigrationExecution.OutsideTransaction()
+  )
+  let migrations = new MigrationSet([initial, outside])
+
+  match SQLiteProvider.createWritable(path)
+    case SQLiteOpenResult.Failure(error)
+      test::assertTrue(false)
+    case SQLiteOpenResult.Opened(provider)
+      rejected(provider.migrate(migrations))
+      applied(provider.migrate(migrations, "outside_initial"), 1)
+
+      test::assertTrue(provider.close())
+  end
+
+  test::assertTrue(createSQLiteFixture(path, "CREATE INDEX recover_items_lookup ON recover_items (id)"))
+  match SQLiteProvider.openWritable(path)
+    case SQLiteOpenResult.Failure(error)
+      test::assertTrue(false)
+    case SQLiteOpenResult.Opened(provider)
+      rejected(provider.migrate(migrations))
+
+      test::assertTrue(provider.close())
+  end
+  match SQLiteProvider.openWritable(path)
+    case SQLiteOpenResult.Failure(error)
+      test::assertTrue(false)
+    case SQLiteOpenResult.Opened(provider)
+      let first = pendingRecovery(provider, migrations)
+
+      if first != null
+        drift(provider.migrate(migrations))
+        applied(provider.recoverMigration(migrations, first, MigrationRecoveryDecision.ConfirmReverted()), 0)
+        rejected(provider.migrate(migrations))
+        let second = pendingRecovery(provider, migrations)
+
+        if second != null
+          drift(provider.recoverMigration(migrations, first, MigrationRecoveryDecision.ConfirmCompleted()))
+          applied(provider.recoverMigration(migrations, second, MigrationRecoveryDecision.ConfirmCompleted()), 1)
+          applied(provider.migrate(migrations), 0)
+        end
+      end
+
+      test::assertTrue(provider.close())
+  end
+end
+
 def verifyFiles(): resources::Outcome<Int, result::Failure>
   using temporary <- files::TemporaryDirectory.create("neri-migrations-")
     verifyFile(temporary.path() + "/new.sqlite")
@@ -351,6 +419,7 @@ def verifyFiles(): resources::Outcome<Int, result::Failure>
     verifyHistoryDrift(temporary.path() + "/history.sqlite")
     verifyForeignKeyProtection(temporary.path() + "/foreign-key.sqlite")
     verifyDeferredForeignKeyGuard(temporary.path() + "/deferred-commit.sqlite")
+    verifyOutsideMigrationRecovery(temporary.path() + "/outside-transaction.sqlite")
     return 0
   end
   return 1

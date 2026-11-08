@@ -139,6 +139,11 @@ unsafe def pgDecodeRow(result: Void*, row: Int, columns: readonly ResultColumns)
       end
     else
       let oid = pgFtype(result, index as Int32) as Int
+      let physical = expected.postgresqlType()
+
+      if physical != null && postgresNativeScalarOid(physical) != oid
+        return PostgreSQLRowResult.Failure(ProviderFailure.State("PostgreSQL result does not match its native scalar type"))
+      end
       let pointer = pgGetvalue(result, row as Int32, index as Int32)
       let length = pgGetlength(result, row as Int32, index as Int32) as Int
       let value = pgText(pointer, length)
@@ -153,12 +158,21 @@ unsafe def pgDecodeRow(result: Void*, row: Int, columns: readonly ResultColumns)
           end
           cell = Cell.Bool(value == "t")
         case ResultColumnKind.Int()
-          let parsed = host::parseInt(value)
+          if physical != null && oid == 1186
+            let ticks = pgNativeIntervalTicks(value)
 
-          if (oid != 20 && oid != 21 && oid != 23) || parsed == null
-            return PostgreSQLRowResult.Failure(ProviderFailure.State("PostgreSQL integer requires an integer OID and in-range Int"))
+            if ticks == null || !postgresNativeIntervalFits(ticks, postgresNativeTemporalPrecision(physical, oid))
+              return PostgreSQLRowResult.Failure(ProviderFailure.State("PostgreSQL interval requires an exact duration without calendar fields"))
+            end
+            cell = Cell.Int(ticks)
+          else
+            let parsed = host::parseInt(value)
+
+            if (oid != 20 && oid != 21 && oid != 23) || parsed == null
+              return PostgreSQLRowResult.Failure(ProviderFailure.State("PostgreSQL integer requires an integer OID and in-range Int"))
+            end
+            cell = Cell.Int(parsed)
           end
-          cell = Cell.Int(parsed)
         case ResultColumnKind.Float()
           let floatValue = host::parseFloat(value)
 
@@ -167,10 +181,19 @@ unsafe def pgDecodeRow(result: Void*, row: Int, columns: readonly ResultColumns)
           end
           cell = Cell.Float(floatValue)
         case ResultColumnKind.Text()
-          if oid != 25 && oid != 1042 && oid != 1043
-            return PostgreSQLRowResult.Failure(ProviderFailure.State("PostgreSQL String requires text, varchar or char"))
+          if physical == null
+            if oid != 25 && oid != 1042 && oid != 1043
+              return PostgreSQLRowResult.Failure(ProviderFailure.State("PostgreSQL String requires text, varchar or char"))
+            end
+            cell = Cell.Text(value)
+          else
+            let canonical = pgNativeScalarText(oid, value)
+
+            if canonical == null || !postgresNativeTextFits(physical, oid, canonical)
+              return PostgreSQLRowResult.Failure(ProviderFailure.State("PostgreSQL native scalar result is outside its exact logical domain"))
+            end
+            cell = Cell.Text(canonical)
           end
-          cell = Cell.Text(value)
         case ResultColumnKind.Binary()
           if oid != 17
             return PostgreSQLRowResult.Failure(ProviderFailure.State("PostgreSQL Binary requires bytea"))
@@ -225,6 +248,18 @@ unsafe def pgDecodeRow(result: Void*, row: Int, columns: readonly ResultColumns)
   return PostgreSQLRowResult.Row(new RawRow(values))
 end
 
+unsafe def pgParameterBytes(bytes: Byte[]): Byte*
+  let pointer = native::alloc<Byte>(bytes.Length + 1)
+  var offset = 0
+
+  while offset < bytes.Length
+    pointer[offset] = bytes[offset]
+    offset = offset + 1
+  end
+  pointer[bytes.Length] = 0 as Byte
+  return pointer
+end
+
 ## Parameters are copied into libpq's output buffer before this function returns.
 unsafe def pgSend(connection: Void*, sql: String, values: readonly WriteValues): ProviderFailure?
   if pgHasNul(sql) || values.count() > 65535
@@ -246,14 +281,34 @@ unsafe def pgSend(connection: Void*, sql: String, values: readonly WriteValues):
     types[index] = 0 as UInt32
     var text: String? = null
 
+    let physical = current.postgresqlType()
+    let nativeOid = postgresNativeScalarOid(physical)
+
+    if physical != null && nativeOid == 0
+      failure = ProviderFailure.State("PostgreSQL parameter uses an unsupported native scalar type")
+    end
     match current.value()
       case Cell.Null()
+        types[index] = nativeOid as UInt32
       case Cell.Bool(value)
         text = value ? "true" : "false"
         types[index] = 16 as UInt32
       case Cell.Int(value)
-        text = value as String
-        types[index] = 20 as UInt32
+        if physical != null && nativeOid == 1186
+          let interval = pgNativeIntervalParameter(value, postgresNativeTemporalPrecision(physical, nativeOid))
+
+          types[index] = 1186 as UInt32
+          if interval == null
+            failure = ProviderFailure.State("PostgreSQL interval parameter requires exact microsecond ticks")
+          else
+            pointers[index].value = pgParameterBytes(interval)
+            lengths[index] = interval.Length as Int32
+            formats[index] = 1 as Int32
+          end
+        else
+          text = value as String
+          types[index] = 20 as UInt32
+        end
       case Cell.Float(value)
         if !dataFloatFinite(value)
           failure = ProviderFailure.State("PostgreSQL Float parameter must be finite")
@@ -261,22 +316,26 @@ unsafe def pgSend(connection: Void*, sql: String, values: readonly WriteValues):
         text = value as String
         types[index] = 701 as UInt32
       case Cell.Text(value)
-        text = value
-        types[index] = 25 as UInt32
+        if physical == null || nativeOid == 0
+          text = value
+          types[index] = 25 as UInt32
+        else
+          text = pgNativeScalarParameter(nativeOid, value)
+          types[index] = nativeOid as UInt32
+          if text == null || !postgresNativeTextFits(physical, nativeOid, text)
+            failure = ProviderFailure.State("PostgreSQL native scalar parameter is outside its exact logical domain")
+          end
+        end
       case Cell.Binary(value)
         let bytes = value.snapshot()
-        let pointer = native::alloc<Byte>(bytes.Length + 1)
-        var offset = 0
 
-        while offset < bytes.Length
-          pointer[offset] = bytes[offset]
-          offset = offset + 1
-        end
-        pointer[bytes.Length] = 0 as Byte
-        pointers[index].value = pointer
+        pointers[index].value = pgParameterBytes(bytes)
         lengths[index] = bytes.Length as Int32
         formats[index] = 1 as Int32
         types[index] = 17 as UInt32
+    end
+    if nativeOid != 0 && (types[index] as Int) != nativeOid
+      failure = ProviderFailure.State("PostgreSQL parameter cell does not match its native scalar type")
     end
     if text != null
       if pgHasNul(text)

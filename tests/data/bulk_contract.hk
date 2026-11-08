@@ -1,6 +1,7 @@
 use neri_data
 use test
 use host
+use resources
 
 class BulkRecord
   public id: Int
@@ -28,14 +29,41 @@ def decodeCompoundBulkRecord(row: RawRow): DecodeResult<CompoundBulkRecord>
   return DecodeResult<CompoundBulkRecord>.Failure(QueryFailure.Provider(ProviderFailure.State("bulk must not decode rows")))
 end
 
+class BulkFilterFields
+  public id: Int
+end
+
+class BulkContractWrite: AsyncWriteDriver
+  private onClose: fn(): Void
+
+  def init(onClose: fn(): Void): Void
+    this.onClose = onClose
+  end
+
+  public override def poll(): AsyncWritePoll
+    return AsyncWritePoll.Completed(WriteResult.Saved(2048))
+  end
+
+  public override def cancel(): Void
+  end
+
+  public override def close(): WriteFailure?
+    this.onClose()
+    return null
+  end
+end
+
 class BulkProvider: Provider
   public seenSql: String = ""
   public first: Cell? = null
   public second: Cell? = null
   public third: Cell? = null
   public fourth: Cell? = null
+  public firstPostgresqlType: String? = null
+  public secondPostgresqlType: String? = null
   public count: Int = 0
   public leased: Bool = false
+  public asyncClosed: Int = 0
   private checkedExpressions: Bool
   private postgreSql: Bool
 
@@ -86,6 +114,17 @@ class BulkProvider: Provider
     return WriteResult.Saved(0)
   end
 
+  public override def beginSetAsync(
+    plan: readonly SetWritePlan, options: StreamOptions? = null, lease: Int? = null
+  ): AsyncWriteStart
+    this.inspect(plan)
+    let onClose: fn(): Void = fn(): Void do
+      this.asyncClosed = this.asyncClosed + 1
+    end
+
+    return AsyncWriteStart.Started(new BulkContractWrite(onClose))
+  end
+
   public override def beginTransaction(): TransactionOpenResult
     return TransactionOpenResult.Begun(9)
   end
@@ -108,6 +147,7 @@ class BulkProvider: Provider
     let first = plan.parameters().first()
 
     if first != null
+      this.firstPostgresqlType = first.postgresqlType()
       match first.value()
         case Cell.Null()
           this.first = Cell.Null()
@@ -125,6 +165,7 @@ class BulkProvider: Provider
       let second = first.next()
 
       if second != null
+        this.secondPostgresqlType = second.postgresqlType()
         match second.value()
           case Cell.Null()
             this.second = Cell.Null()
@@ -312,7 +353,69 @@ def compoundBulkWrites(): Void
   test::assertEqual(setFailureCategory(query.executeUpdate(sequence: 7)), "validation")
 end
 
+def bulkCompletedRows(result: AsyncWritePoll): Int
+  match result
+    case AsyncWritePoll.Completed(value)
+      match value
+        case WriteResult.Saved(count)
+          return count
+        case WriteResult.SavedWithValues(count, rows)
+        case WriteResult.Failure(error)
+          console::println(writeFailureMessage(error))
+      end
+    case AsyncWritePoll.Pending(socket, interest)
+  end
+  return -1
+end
+
+def mappedAsyncWrites(): resources::Outcome<Int, WriteFailure>
+  let provider = new BulkProvider()
+  let query = new MappedQuery<BulkRecord, BulkFilterFields>(bulkQuery(provider)).where(id: 7)
+
+  using operation <- query.query().executeUpdateAsync(nickname: "ordinary async")
+    test::assertEqual(bulkCompletedRows(operation.poll()), 2048)
+  end
+  using operation <- query.executeUpdateAsync(nickname: "async nickname")
+    test::assertEqual(bulkCompletedRows(operation.poll()), 2048)
+  end
+
+  test::assertEqual(provider.count, 2)
+  test::assertTrue(sameOptionalCell(provider.first, Cell.Int(7)) || sameOptionalCell(provider.second, Cell.Int(7)))
+  test::assertTrue(sameOptionalCell(
+      provider.first,
+      Cell.Text("async nickname")
+    ) || sameOptionalCell(
+      provider.second,
+      Cell.Text("async nickname")
+    ))
+  using operation <- query.executeUpdateMappedCellAsync("nickname", Cell.Text("mapped async"))
+    test::assertEqual(bulkCompletedRows(operation.poll()), 2048)
+  end
+  let setters = updateSet<BulkRecord>().set(bulkActive(), calculatedActive(3, 5))
+
+  using operation <- query.executeUpdateSetAsync(setters)
+    test::assertEqual(bulkCompletedRows(operation.poll()), 2048)
+  end
+  using operation <- query.executeDeleteAsync()
+    test::assertEqual(bulkCompletedRows(operation.poll()), 2048)
+  end
+
+  test::assertEqual(provider.count, 1)
+  test::assertTrue(sameOptionalCell(provider.first, Cell.Int(7)))
+  return provider.asyncClosed
+end
+
 def main(): Void
+  let asyncWrites = mappedAsyncWrites()
+
+  test::assertEqual(asyncWrites.closeFailures.count(), 0)
+  match asyncWrites.completion
+    case resources::Completion.Value(closed)
+      test::assertEqual(closed, 5)
+    case resources::Completion.Failure(error)
+      test::assertTrue(false)
+  end
+  nativePostgresqlBulkWrites()
   compoundBulkWrites()
   let provider = new BulkProvider()
   let ordered: quote fn(BulkRecord): Int = quote do |record: BulkRecord|: Int
@@ -681,4 +784,68 @@ def main(): Void
     "validation"
   )
   test::assertEqual(mismatchProvider.seenSql, "")
+end
+
+class NativeBulkRecord
+  public id: Int
+  public day: DateOnly = DateOnly.minimum()
+  public duration: TimeSpan = TimeSpan.zero()
+end
+
+def decodeNativeBulkRecord(row: RawRow): DecodeResult<NativeBulkRecord>
+  return DecodeResult<NativeBulkRecord>.Failure(QueryFailure.Provider(ProviderFailure.State("bulk must not decode rows")))
+end
+
+def nativePostgresqlBulkWrites(): Void
+  let provider = new BulkProvider(true)
+  let mapping = new EntityMapping(
+    "NativeBulkRecord",
+    "records",
+    [
+      new MappingColumn("NativeBulkRecord.id", "Int", "id"),
+      new MappingColumn(
+        "NativeBulkRecord.day",
+        "neri_data.DateOnly",
+        "day",
+        storageType: "String",
+        conversionId: "neri_data.cellDateOnly",
+        postgresqlType: "date"
+      ),
+      new MappingColumn(
+        "NativeBulkRecord.duration",
+        "neri_data.TimeSpan",
+        "duration",
+        storageType: "Int",
+        conversionId: "neri_data.cellTimeSpan",
+        postgresqlType: "interval(3)"
+      )
+    ],
+    "id"
+  )
+  let columns = new ResultColumns([new ResultColumn("id", ResultColumnKind.Int())])
+  let query = new Query<NativeBulkRecord>(
+    "records",
+    new Decoder<NativeBulkRecord>(decodeNativeBulkRecord, columns),
+    mapping: mapping,
+    provider: provider
+  )
+  let day = DateOnly.minimum()
+  let duration = TimeSpan.fromTicks(10000)
+  let result = query.executeUpdate(day: day, duration: duration)
+
+  test::assertEqual(setFailureCategory(result), "saved")
+  test::assertTrue(sameOptionalCell(provider.first, cellDateOnly(day)) && provider.firstPostgresqlType == "date")
+  test::assertTrue(sameOptionalCell(
+      provider.second,
+      cellTimeSpan(duration)
+    ) && provider.secondPostgresqlType == "interval(3)")
+
+  match compileSetMappedCell(query, "duration", cellTimeSpan(duration), SqlDialect.PostgreSql())
+    case SetPlanResult.Failure(error)
+      test::assertTrue(false)
+    case SetPlanResult.Plan(plan)
+      let parameter = plan.parameters().first()
+
+      test::assertTrue(parameter != null && parameter.postgresqlType() == "interval(3)")
+  end
 end

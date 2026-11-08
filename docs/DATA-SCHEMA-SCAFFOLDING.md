@@ -52,10 +52,29 @@ and [character types](https://www.postgresql.org/docs/14/datatype-character.html
 For the additional integer types, scaffolding accepts assigned keys and rejects
 identity columns and SQL-defaulted keys whose generation definitions require
 authored schema.
-Other types and modifiers fail inspection-to-source conversion. The portable
-decimal and date/time codecs use text storage, so native PostgreSQL `numeric`
-and date/time types require additional codecs. Unsupported generated key
-combinations and nullable primary keys also fail. SQLite rowid aliases are
+Native PostgreSQL scalar facets map to the following model types.
+
+| PostgreSQL type | Neri model type | Exact domain |
+| --- | --- | --- |
+| `numeric`, `numeric(p,s)` | `Decimal` | Finite values within the Decimal digit bound and declared precision and scale. |
+| `date` | `DateOnly` | Gregorian dates from year 0001 through 9999. |
+| `time without time zone` | `TimeOnly` | Clock times before 24:00 at the declared precision. |
+| `timestamp without time zone` | `DateTime` | The stored wall-clock value is interpreted in UTC. |
+| `timestamp with time zone` | `DateTime` | UTC instants within the DateTime range, normalized from the server offset. |
+| `interval` | `TimeSpan` | Exact signed durations with zero calendar months and days. |
+
+Time, timestamp and full-range interval facets accept fractional precision from
+0 through 6. Typed parameters that would require rounding fail before dispatch.
+Date and timestamp results use PostgreSQL ISO date output. Interval results use
+the `postgres` interval style. Nonfinite values, calendar intervals,
+`time with time zone` and offset-preserving native `DateTimeOffset` storage are
+outside the native scalar contract. Portable codecs retain their existing
+storage and representation. [PostgreSQL 14 date and time types](https://www.postgresql.org/docs/14/datatype-datetime.html)
+and [libpq parameters](https://www.postgresql.org/docs/14/libpq-exec.html).
+
+Native scalar facets apply to non-key fields with their built-in model codec.
+Other types and modifiers fail inspection-to-source conversion. Unsupported
+generated key combinations and nullable primary keys also fail. SQLite rowid aliases are
 distinguished from assigned keys in WITHOUT ROWID tables and indexed primary keys.
 
 Physical identifiers must fit the mapping's identifier contract. Neri class,
@@ -95,9 +114,10 @@ quotes; backslash escapes are rejected. PostgreSQL dollar quoting can carry
 backslashes inside function bodies. SQL text comes from application source;
 runtime data uses the parameterized seed operations.
 
-Custom SQL uses the provider's transactional capabilities. PostgreSQL concurrent
-index creation and other operations requiring execution outside a transaction
-remain unsupported by the atomic migration contract. PostgreSQL index methods,
+Scaffolded migrations and guarded SQL scripts use atomic ranges. Author operations
+that require autocommit, such as PostgreSQL concurrent index creation, as
+[isolated runtime migrations](../packages/data/docs/MIGRATION-RECOVERY.md).
+PostgreSQL index methods,
 operator classes, null-distinct policies and storage options can be authored as
 custom SQL; reverse engineering accepts the index facets represented by the typed
 mapping and rejects unsupported index definitions.

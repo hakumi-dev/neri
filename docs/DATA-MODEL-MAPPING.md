@@ -188,10 +188,17 @@ rows. Predicates, projection, ordering, and joins use the subtype's mapped field
 Nested descendants register after their mapped base and inherit its mapped
 fields. Roots and intermediate nodes may be abstract; their constructors are
 never used for materialization. `ofType_BaseSubtype()` includes its registered
-concrete descendants. Subtype navigation fields and subtype store-generated
-values require additional contracts. Concrete roots and derived entries accept
-`seeds` with inherited and local mapped values. The mapping supplies the
-discriminator and checks assigned keys across the whole hierarchy.
+concrete descendants. Generated subtype navigation endpoints use their declared
+entity types and resolve identity through the hierarchy root tracker. Navigation
+queries retain the mandatory type scope for each subtype endpoint. Scalar
+foreign-key reassignment updates the mapped key values. Navigation setters also
+reconcile tracked references and collections.
+
+Store-generated fields apply to their declaring subtype and its descendants;
+returned values retain the field's declared type and nullability. Concrete roots
+and derived entries accept `seeds` with inherited and local mapped values. The
+mapping supplies the discriminator and checks assigned keys across the whole
+hierarchy.
 
 `strategy: "tpt"` gives every mapped descendant a distinct `table`. Reads join
 all hierarchy tables and choose the deepest concrete node. The root owns shared
@@ -201,14 +208,27 @@ after attachment. Base concurrency tokens protect leaf-only updates. Root custom
 snapshot comparers are restricted to each segment by holding other values at
 their original snapshot.
 
+Each TPT segment reads back its own generated values. Returned cells also update
+the root's saved snapshot, so a subsequent save observes only application edits.
+Transaction and savepoint recovery restore both the values and the saved snapshots.
+
+Derived entries accept `indexes`. A TPH subtype index includes a discriminator
+predicate covering that subtype and its descendants; an authored predicate adds
+another condition. TPT index members and included columns belong to one physical
+table, including its inherited key columns. An index cannot span columns stored
+in different TPT tables. This follows the relational layout described in
+[EF Core's inheritance mapping](https://learn.microsoft.com/en-us/ef/core/modeling/inheritance).
+
 `strategy: "tpc"` gives each concrete node a distinct `table`; abstract nodes
 have no physical table. Reads use a union with virtual discriminators, and the
 root tracker selects the concrete write table. Hierarchy keys are assigned and
 globally unique across concrete tables; duplicate keys fail materialization.
-Root indexes apply to each concrete table. Runtime relationships to polymorphic
-roots work without a database FK to a shared root table. Descendant-specific
-index declarations, generated values, and complex JSON inheritance combinations
-require additional contracts.
+Indexes declared on a node apply to its concrete table and concrete descendants;
+physical index names use the concrete table name as a prefix. Generated-value
+readback selects only fields present on the concrete type. Runtime relationships
+to polymorphic roots work without a database FK to a shared root table. JSON
+decodes the declared concrete class shape, including inherited public fields.
+[JSON class shape contract](../packages/data/docs/SCALARS-KEYS.md)
 
 ## Skip navigations
 

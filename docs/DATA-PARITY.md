@@ -38,12 +38,13 @@ contract is established. Distribution is separate from source capability.
 | Persistence | Interceptors | Supported | Save callbacks and read/write/set command planning, result suppression and replacement across sync/async execution |
 | Models | Required/optional scalar properties | Supported | Int, Bool, Float, String, Binary, Decimal and optional forms |
 | Models | Guid, date/time and native enum scalar families | Supported | Canonical portable Guid, DateTime, DateOnly, TimeOnly, DateTimeOffset and TimeSpan codecs; explicit enum converters |
+| Models | PostgreSQL native scalar facets | Supported | Built-in codecs for numeric, date, time without time zone, timestamps with or without time zone, and fixed-duration interval on non-key fields |
 | Models | Primary and alternate tuple keys | Supported | Ordered assigned tuples; single generated Int key |
 | Models | Generated values and concurrency tokens | Supported | Typed RETURNING with validation before commit |
 | Models | One-to-many/reference relationships | Supported | Explicit tuple keys, loading and write links |
 | Models | Many-to-many skip navigations | Supported | Explicit or synthesized join models, directed self relationships, tracked edits and loading fixup |
 | Models | Keyless entities and views | Supported | Detached keyless roots with references to keyed principals; keyed read views can write through a separate mapped table |
-| Models | Inheritance mapping | Partial | Nested TPH, TPT and TPC share root identity and project seed rows to their physical tables; subtype-only navigation/generated-value/index combinations remain restricted |
+| Models | Inheritance mapping | Partial | Nested TPH, TPT and TPC support subtype generated-value readback, physical-table indexes and seed projection. Typed subtype navigation shares root identity and retains type scope. JSON decodes the declared concrete shape, including inherited fields. |
 | Models | Owned/complex values | Supported | Required/optional nested complexes, defining-navigation instance ownership, identifying owned collections and JSON storage |
 | Models | Value converters/comparers | Supported | Explicit typed encoders/decoders and snapshot comparers; converted SQL values require the registered encoder identity |
 | Models | Shadow/indexer properties | Supported | Typed getter/setter mappings and bounded reference-identity shadow storage with logical-property query access |
@@ -55,7 +56,7 @@ contract is established. Distribution is separate from source capability.
 | Schema | Async migration application | Supported | SQLite worker and PostgreSQL native guarded catalogs, history checks and rollback |
 | Schema | Database reverse engineering | Partial | Scaffold all or selected SQLite and public-schema PostgreSQL tables and views, including indexes, checks, collations, generated expressions and relationships within the selection. Unsupported selected definitions fail explicitly. |
 | Schema | Seeding | Supported | Immutable snapshots, parameterized writes, deferred cyclic references and retained-relationship rewrites before principal removal |
-| Schema | Custom migration operations | Partial | Validated transactional single-statement SQL supports authored DDL/DML, triggers and functions; operations requiring execution outside a transaction remain unsupported |
+| Schema | Custom migration operations | Partial | Trusted SQL supports transactional DDL/DML, triggers and functions. Isolated `MigrationExecution.OutsideTransaction()` directions use a durable journal and explicit recovery. |
 | Lifecycle | Context pooling | Supported | Bounded sequential owned leases, explicit application reset and generated context reset |
 | Lifecycle | Provider diagnostics | Supported | Structured native failures and bounded operation summaries |
 | Lifecycle | Provider breadth | Supported | SQLite and PostgreSQL are the providers in this comparison |
@@ -76,7 +77,7 @@ Query contracts are described in [query composition](DATA-QUERIES.md); live data
 
 | Application operation | Language support | Current boundary |
 | --- | --- | --- |
-| Filter a mapped entity by field name | Named field packs check labels and value types against the entity declaration. | Mapping membership is checked when the query is translated. A public field can exist only in the application model. |
+| Filter a mapped entity by field name | Generated mapped query carriers check field membership and value types at compile time. | Call `.query()` to use the underlying raw query, where entity fields are checked against the mapping during translation. |
 | Translate a predicate or projection | Typed quotations expose a single expression, its resolved members and captured values. | SQL translation accepts a defined vocabulary. DTO construction uses explicit row shapes, and application callbacks execute as Neri code. |
 | Inspect or populate an entity | Compile-time field reflection reads and writes typed public instance fields, including inherited fields. | Descriptors exist during expansion. Properties, methods and enum cases are outside field reflection. |
 | Build generic query APIs | Generic classes, methods and structural constraints preserve entity and result types. Generic methods can be captured as ordinary function values. | Generic abstract methods and overrides require additional language support. |

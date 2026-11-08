@@ -2,11 +2,6 @@ use host
 use neri_data
 namespace neri_data_sqlite
 
-enum SQLiteMigrationHistory
-  case Loaded(stamps: MigrationStamp[])
-  case Failure(error: MigrationFailure)
-end
-
 def sqliteMigrationFailureMessage(error: MigrationFailure): String
   match error
     case MigrationFailure.Validation(message)
@@ -38,7 +33,7 @@ unsafe def sqlitePrepareMigration(database: Void*, sql: String, statement: Void*
   return status
 end
 
-unsafe def sqliteMigrationHistory(database: Void*, maximum: Int): SQLiteMigrationHistory
+unsafe def sqliteMigrationJournal(database: Void*, maximum: Int): MigrationJournalResult
   let statement = stackalloc Void*[1]
   let status = sqlitePrepareMigration(
     database,
@@ -54,18 +49,19 @@ unsafe def sqliteMigrationHistory(database: Void*, maximum: Int): SQLiteMigratio
     if partial != null
       message = sqliteFinalizeFailure(database, partial, message)
     end
-    return SQLiteMigrationHistory.Failure(MigrationFailure.Provider(message))
+    return MigrationJournalResult.Failure(MigrationFailure.Provider(message))
   end
   let prepared: Void*? = statement[0]
 
   if prepared == null
-    return SQLiteMigrationHistory.Failure(MigrationFailure.Provider(ProviderFailure.State("SQLite migration history query has no statement")))
+    return MigrationJournalResult.Failure(MigrationFailure.Provider(ProviderFailure.State("SQLite migration history query has no statement")))
   end
   let capacity = maximum + 1
   let stored: MigrationStamp[] = tasks::generate(capacity, 1) do |index|
     return new MigrationStamp("", "")
   end
   var count = 0
+  var pending: MigrationProgress? = null
   var failure: MigrationFailure? = null
   var step = sqliteStep(prepared)
 
@@ -74,9 +70,8 @@ unsafe def sqliteMigrationHistory(database: Void*, maximum: Int): SQLiteMigratio
       failure = MigrationFailure.Drift("SQLite migration history exceeds catalog")
     else if sqliteColumnType(prepared, 0 as Int32) != (1 as Int32) || sqliteColumnType(prepared, 1 as Int32) != (3 as Int32) || sqliteColumnType(prepared, 2 as Int32) != (3 as Int32)
       failure = MigrationFailure.Drift("SQLite migration history has invalid storage types")
-    else if sqliteColumnInt(prepared, 0 as Int32) != count + 1
-      failure = MigrationFailure.Drift("SQLite migration history has a missing or duplicate ordinal")
     else
+      let ordinal = sqliteColumnInt(prepared, 0 as Int32)
       let idPointer = sqliteColumnText(prepared, 1 as Int32)
       let signaturePointer = sqliteColumnText(prepared, 2 as Int32)
 
@@ -88,9 +83,16 @@ unsafe def sqliteMigrationHistory(database: Void*, maximum: Int): SQLiteMigratio
 
         if id == null || signature == null
           failure = MigrationFailure.Drift("SQLite migration history is invalid UTF-8")
-        else
+        else if ordinal == 0 && count == 0 && pending == null
+          pending = parseMigrationProgress(id, signature)
+          if pending == null
+            failure = MigrationFailure.Drift("SQLite migration recovery marker is invalid")
+          end
+        else if ordinal == count + 1
           stored[count] = new MigrationStamp(id, signature)
           count = count + 1
+        else
+          failure = MigrationFailure.Drift("SQLite migration history has a missing or duplicate ordinal")
         end
       end
     end
@@ -103,7 +105,7 @@ unsafe def sqliteMigrationHistory(database: Void*, maximum: Int): SQLiteMigratio
   end
   failure = sqliteMigrationFinalize(database, prepared, failure)
   if failure != null
-    return SQLiteMigrationHistory.Failure(failure)
+    return MigrationJournalResult.Failure(failure)
   end
   let exact: MigrationStamp[] = tasks::generate(count, 1) do |index|
     let stamp = stored[index]
@@ -111,7 +113,7 @@ unsafe def sqliteMigrationHistory(database: Void*, maximum: Int): SQLiteMigratio
     return new MigrationStamp(stamp.id(), stamp.signature())
   end
 
-  return SQLiteMigrationHistory.Loaded(exact)
+  return MigrationJournalResult.Loaded(exact, pending)
 end
 
 unsafe def sqliteMigrationText(value: String): Byte*

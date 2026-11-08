@@ -536,19 +536,23 @@ class SQLiteProvider: neri_data::Provider
   end
 
   public override def migrationHistory(catalog: readonly MigrationSet): MigrationHistoryResult
+    return migrationHistoryFromJournal(this.migrationJournal(catalog))
+  end
+
+  public def migrationJournal(catalog: readonly MigrationSet): MigrationJournalResult
     if this.closed || this.streaming || this.poisoned
-      return MigrationHistoryResult.Failure(MigrationFailure.Unsupported("SQLite provider is unavailable for migration history"))
+      return MigrationJournalResult.Failure(MigrationFailure.Unsupported("SQLite provider is unavailable for migration history"))
     end
     let invalid = catalog.validate()
 
     if invalid != null
-      return MigrationHistoryResult.Failure(MigrationFailure.Validation(invalid))
+      return MigrationJournalResult.Failure(MigrationFailure.Validation(invalid))
     end
     unsafe
       let database = this.database
 
       if database == null
-        return MigrationHistoryResult.Failure(MigrationFailure.Provider(ProviderFailure.State("SQLite handle is unavailable")))
+        return MigrationJournalResult.Failure(MigrationFailure.Provider(ProviderFailure.State("SQLite handle is unavailable")))
       end
       let present = sqliteRebuildCheck(
         database,
@@ -557,21 +561,21 @@ class SQLiteProvider: neri_data::Provider
       )
 
       if present == null
-        return MigrationHistoryResult.Loaded([])
+        return MigrationJournalResult.Loaded([], null)
       end
       match present
         case MigrationFailure.Validation(message)
           if message != "history exists"
-            return MigrationHistoryResult.Failure(present)
+            return MigrationJournalResult.Failure(present)
           end
         case MigrationFailure.Drift(message)
-          return MigrationHistoryResult.Failure(present)
+          return MigrationJournalResult.Failure(present)
         case MigrationFailure.Unsupported(message)
-          return MigrationHistoryResult.Failure(present)
+          return MigrationJournalResult.Failure(present)
         case MigrationFailure.Provider(error)
-          return MigrationHistoryResult.Failure(present)
+          return MigrationJournalResult.Failure(present)
         case MigrationFailure.Cleanup(error)
-          return MigrationHistoryResult.Failure(present)
+          return MigrationJournalResult.Failure(present)
       end
       let wrongKind = sqliteRebuildCheck(
         database,
@@ -580,18 +584,18 @@ class SQLiteProvider: neri_data::Provider
       )
 
       if wrongKind != null
-        return MigrationHistoryResult.Failure(wrongKind)
+        return MigrationJournalResult.Failure(wrongKind)
       end
-      match sqliteMigrationHistory(database, catalog.count())
-        case SQLiteMigrationHistory.Failure(error)
-          return MigrationHistoryResult.Failure(error)
-        case SQLiteMigrationHistory.Loaded(stamps)
+      match sqliteMigrationJournal(database, catalog.count())
+        case MigrationJournalResult.Failure(error)
+          return MigrationJournalResult.Failure(error)
+        case MigrationJournalResult.Loaded(stamps, pending)
           let mismatch = catalog.historyPrefix(stamps)
 
           if mismatch != null
-            return MigrationHistoryResult.Failure(MigrationFailure.Drift(mismatch))
+            return MigrationJournalResult.Failure(MigrationFailure.Drift(mismatch))
           end
-          return MigrationHistoryResult.Loaded(stamps)
+          return MigrationJournalResult.Loaded(stamps, pending)
       end
     end
   end
@@ -704,14 +708,20 @@ class SQLiteProvider: neri_data::Provider
               historyCreated
             )))
       end
-      match sqliteMigrationHistory(database, catalog.count())
-        case SQLiteMigrationHistory.Failure(message)
+      match sqliteMigrationJournal(database, catalog.count())
+        case MigrationJournalResult.Failure(message)
           return this.failMigration(message)
-        case SQLiteMigrationHistory.Loaded(stamps)
+        case MigrationJournalResult.Loaded(stamps, pending)
+          if pending != null
+            return this.failMigration(migrationPendingFailure(pending))
+          end
           let mismatch = catalog.historyPrefix(stamps)
 
           if mismatch != null
             return this.failMigration(MigrationFailure.Drift(mismatch))
+          end
+          if migrationRangeHasOutsideTransaction(catalog, stamps.Length, targetCount)
+            return this.migrateOutsideTransaction(database, catalog, stamps.Length, targetCount)
           end
           var count = 0
 
@@ -773,22 +783,183 @@ class SQLiteProvider: neri_data::Provider
           if foreignKeyCheck != null
             return this.failMigration(foreignKeyCheck)
           end
-          let committed = sqliteExecuteLiteral(database, "COMMIT")
-
-          if committed != (0 as Int32)
-            return this.failMigration(MigrationFailure.Provider(sqliteFailure(database, "migration.commit", committed)))
-          end
-          if sqliteAutoCommit(database) == (0 as Int32)
-            return this.failMigration(MigrationFailure.Provider(ProviderFailure.State("SQLite migration commit did not end the transaction")))
-          end
-          let restored = this.restoreMigrationPragmas()
-
-          if restored != null
-            this.poisoned = true
-            return MigrationResult.Failure(MigrationFailure.Provider(restored))
-          end
-          return MigrationResult.Applied(count)
+          return this.commitMigration(database, count)
       end
+    end
+  end
+
+  private unsafe def commitMigration(database: Void*, count: Int): MigrationResult
+    let committed = sqliteExecuteLiteral(database, "COMMIT")
+
+    if committed != (0 as Int32)
+      return this.failMigration(MigrationFailure.Provider(sqliteFailure(database, "migration.commit", committed)))
+    end
+    if sqliteAutoCommit(database) == (0 as Int32)
+      return this.failMigration(MigrationFailure.Provider(ProviderFailure.State("SQLite migration commit did not end the transaction")))
+    end
+    let restored = this.restoreMigrationPragmas()
+
+    if restored != null
+      this.poisoned = true
+      return MigrationResult.Failure(MigrationFailure.Provider(restored))
+    end
+    return MigrationResult.Applied(count)
+  end
+
+  private unsafe def migrateOutsideTransaction(
+    database: Void*,
+    catalog: readonly MigrationSet,
+    applied: Int,
+    target: Int
+  ): MigrationResult
+    if !this.ownsHandle
+      return this.failMigration(MigrationFailure.Unsupported("outside-transaction migrations require an owned SQLite connection"))
+    end
+    if target != applied + 1 && target != applied - 1
+      return this.failMigration(MigrationFailure.Validation("an outside-transaction migration must be the only selected migration"))
+    end
+    let forward = applied < target
+    let migration = catalog.at(forward ? applied : target)
+
+    if migration == null
+      return this.failMigration(MigrationFailure.Validation("migration catalog has a missing entry"))
+    end
+    match compileOutsideMigration(migration, forward, SqlDialect.QuestionMark())
+      case SchemaCompileResult.Failure(message)
+        return this.failMigration(MigrationFailure.Validation(message))
+      case SchemaCompileResult.Statement(sql)
+        let progress = createMigrationProgress(migration, forward)
+
+        if progress == null
+          return this.failMigration(MigrationFailure.Provider(ProviderFailure.State("cannot create migration attempt identifier")))
+        end
+        let recorded = sqliteMigrationRecord(database, 0, progress.marker())
+
+        if recorded != null
+          return this.failMigration(MigrationFailure.Provider(recorded))
+        end
+        match this.commitMigration(database, 0)
+          case MigrationResult.Failure(error)
+            return MigrationResult.Failure(error)
+          case MigrationResult.Applied(count)
+        end
+        let status = sqliteExecuteLiteral(database, sql)
+
+        if status != (0 as Int32)
+          return MigrationResult.Failure(MigrationFailure.Provider(sqliteFailure(
+                database,
+                "migration.outside_transaction",
+                status
+              )))
+        end
+        return this.recoverMigration(catalog, progress, MigrationRecoveryDecision.ConfirmCompleted())
+    end
+  end
+
+  public def recoverMigration(
+    catalog: readonly MigrationSet,
+    expected: readonly MigrationProgress,
+    decision: MigrationRecoveryDecision
+  ): MigrationResult
+    match this.beginTransaction()
+      case TransactionOpenResult.Failure(error)
+        return MigrationResult.Failure(MigrationFailure.Provider(sqliteAsyncWriteProviderFailure(error)))
+      case TransactionOpenResult.Begun(lease)
+        match this.migrationJournal(catalog)
+          case MigrationJournalResult.Failure(error)
+            return this.failMigrationRecovery(lease, error)
+          case MigrationJournalResult.Loaded(stamps, pending)
+            if pending == null || !pending.sameAttempt(expected)
+              return this.failMigrationRecovery(
+                lease,
+                MigrationFailure.Drift("migration recovery attempt does not match the journal")
+              )
+            end
+            let ordinal = migrationRecoveryOrdinal(catalog, stamps.Length, pending)
+
+            if ordinal < 1
+              return this.failMigrationRecovery(
+                lease,
+                MigrationFailure.Drift("migration recovery does not match the catalog boundary")
+              )
+            end
+            var changed = 0
+
+            unsafe
+              let database = this.database
+
+              if database == null
+                return this.failMigrationRecovery(
+                  lease,
+                  MigrationFailure.Provider(ProviderFailure.State("SQLite database handle unavailable"))
+                )
+              end
+              match decision
+                case MigrationRecoveryDecision.ConfirmCompleted()
+                  let failure = sqliteRebuildCheck(
+                    database,
+                    "PRAGMA main.foreign_key_check",
+                    MigrationFailure.Validation("migration violates a database foreign key")
+                  )
+
+                  if failure != null
+                    return this.failMigrationRecovery(lease, failure)
+                  end
+                  let stamped = pending.forward() ? sqliteMigrationRecord(
+                    database,
+                    ordinal,
+                    pending.stamp()
+                  ) : sqliteMigrationForget(
+                    database,
+                    ordinal
+                  )
+
+                  if stamped != null
+                    return this.failMigrationRecovery(lease, MigrationFailure.Provider(stamped))
+                  end
+                  changed = 1
+                case MigrationRecoveryDecision.ConfirmReverted()
+              end
+              let cleared = sqliteMigrationForget(database, 0)
+
+              if cleared != null
+                return this.failMigrationRecovery(lease, MigrationFailure.Provider(cleared))
+              end
+            end
+            match this.commitTransaction(lease)
+              case WriteResult.Failure(error)
+                return this.failMigrationRecovery(
+                  lease,
+                  MigrationFailure.Provider(sqliteAsyncWriteProviderFailure(error))
+                )
+              case WriteResult.Saved(count)
+                return MigrationResult.Applied(changed)
+              case WriteResult.SavedWithValues(count, outputs)
+                return MigrationResult.Applied(changed)
+            end
+        end
+    end
+  end
+
+  private def failMigrationRecovery(lease: Int, primary: MigrationFailure): MigrationResult
+    match this.transactionState(lease)
+      case TransactionState.RolledBack()
+        return MigrationResult.Failure(primary)
+      case TransactionState.Active()
+      case TransactionState.Failed()
+      case TransactionState.Invalid()
+      case TransactionState.Committed()
+    end
+    match this.rollbackTransaction(lease)
+      case WriteResult.Failure(error)
+        return MigrationResult.Failure(MigrationFailure.Cleanup(new MigrationCleanupFailure(
+              primary,
+              sqliteAsyncWriteProviderFailure(error)
+            )))
+      case WriteResult.Saved(count)
+        return MigrationResult.Failure(primary)
+      case WriteResult.SavedWithValues(count, outputs)
+        return MigrationResult.Failure(primary)
     end
   end
 

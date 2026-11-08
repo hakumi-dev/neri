@@ -4,13 +4,15 @@ namespace neri_data_postgresql
 
 class PostgreSQLHistoryRead
   public failure: String?
+  public pending: MigrationProgress?
+  public offset: Int = 0
 end
 
-def pgMigrationHistory(provider: PostgreSQLProvider, catalog: readonly MigrationSet): MigrationHistoryResult
+def pgMigrationJournal(provider: PostgreSQLProvider, catalog: readonly MigrationSet): MigrationJournalResult
   let invalid = catalog.validate()
 
   if invalid != null || catalog.count() > 1000
-    return MigrationHistoryResult.Failure(MigrationFailure.Validation(invalid == null ? "PostgreSQL migration catalog exceeds 1000 entries" : invalid))
+    return MigrationJournalResult.Failure(MigrationFailure.Validation(invalid == null ? "PostgreSQL migration catalog exceeds 1000 entries" : invalid))
   end
   let existsColumns = new ResultColumns([new ResultColumn("present", ResultColumnKind.Bool())])
 
@@ -21,30 +23,30 @@ def pgMigrationHistory(provider: PostgreSQLProvider, catalog: readonly Migration
       existsColumns
     ))
     case ProviderResult.Failure(error)
-      return MigrationHistoryResult.Failure(MigrationFailure.Provider(error))
+      return MigrationJournalResult.Failure(MigrationFailure.Provider(error))
     case ProviderResult.Rows(rows)
       if rows.Length != 1
-        return MigrationHistoryResult.Failure(MigrationFailure.Drift("PostgreSQL migration history presence is invalid"))
+        return MigrationJournalResult.Failure(MigrationFailure.Drift("PostgreSQL migration history presence is invalid"))
       end
       match rows[0].value("present")
         case CellLookup.Missing()
-          return MigrationHistoryResult.Failure(MigrationFailure.Drift("PostgreSQL migration history presence is missing"))
+          return MigrationJournalResult.Failure(MigrationFailure.Drift("PostgreSQL migration history presence is missing"))
         case CellLookup.Found(value)
           match value
             case Cell.Bool(present)
               if !present
-                return MigrationHistoryResult.Loaded([])
+                return MigrationJournalResult.Loaded([], null)
               end
             case Cell.Null()
-              return MigrationHistoryResult.Failure(MigrationFailure.Drift("PostgreSQL migration history presence is not boolean"))
+              return MigrationJournalResult.Failure(MigrationFailure.Drift("PostgreSQL migration history presence is not boolean"))
             case Cell.Int(number)
-              return MigrationHistoryResult.Failure(MigrationFailure.Drift("PostgreSQL migration history presence is not boolean"))
+              return MigrationJournalResult.Failure(MigrationFailure.Drift("PostgreSQL migration history presence is not boolean"))
             case Cell.Float(number)
-              return MigrationHistoryResult.Failure(MigrationFailure.Drift("PostgreSQL migration history presence is not boolean"))
+              return MigrationJournalResult.Failure(MigrationFailure.Drift("PostgreSQL migration history presence is not boolean"))
             case Cell.Text(text)
-              return MigrationHistoryResult.Failure(MigrationFailure.Drift("PostgreSQL migration history presence is not boolean"))
+              return MigrationJournalResult.Failure(MigrationFailure.Drift("PostgreSQL migration history presence is not boolean"))
             case Cell.Binary(bytes)
-              return MigrationHistoryResult.Failure(MigrationFailure.Drift("PostgreSQL migration history presence is not boolean"))
+              return MigrationJournalResult.Failure(MigrationFailure.Drift("PostgreSQL migration history presence is not boolean"))
           end
       end
   end
@@ -55,13 +57,13 @@ def pgMigrationHistory(provider: PostgreSQLProvider, catalog: readonly Migration
     ])
 
   match provider.execute(new SqlPlan(
-      "SELECT ordinal, id, signature FROM __neri_migrations ORDER BY ordinal LIMIT 1001",
+      pgMigrationHistorySql(),
       new ParameterValues(),
-      1001,
+      1002,
       columns
     ))
     case ProviderResult.Failure(error)
-      return MigrationHistoryResult.Failure(MigrationFailure.Provider(error))
+      return MigrationJournalResult.Failure(MigrationFailure.Provider(error))
     case ProviderResult.Rows(rows)
       let state = new PostgreSQLHistoryRead()
       let stamps = arrays::generate<MigrationStamp>(rows.Length) do |index|
@@ -108,7 +110,13 @@ def pgMigrationHistory(provider: PostgreSQLProvider, catalog: readonly Migration
             end
           case CellLookup.Missing()
         end
-        if ordinal != index + 1
+        if index == 0 && ordinal == 0
+          state.offset = 1
+          state.pending = parseMigrationProgress(id, signature)
+          if state.pending == null
+            state.failure = "PostgreSQL migration recovery marker is invalid"
+          end
+        else if ordinal != index + 1 - state.offset
           state.failure = "PostgreSQL migration history ordinal is not contiguous"
         end
         return new MigrationStamp(id, signature)
@@ -117,11 +125,66 @@ def pgMigrationHistory(provider: PostgreSQLProvider, catalog: readonly Migration
       let failure = state.failure
 
       if failure != null
-        return MigrationHistoryResult.Failure(MigrationFailure.Drift(failure))
+        return MigrationJournalResult.Failure(MigrationFailure.Drift(failure))
       end
-      let drift = catalog.historyPrefix(stamps)
+      var applied = stamps
 
-      return drift == null ? MigrationHistoryResult.Loaded(stamps) : MigrationHistoryResult.Failure(MigrationFailure.Drift(drift))
+      if state.offset != 0
+        applied = arrays::generate<MigrationStamp>(stamps.Length - state.offset) do |index|
+          return stamps[index + state.offset]
+        end
+      end
+      let drift = catalog.historyPrefix(applied)
+
+      return drift == null ? MigrationJournalResult.Loaded(
+        applied,
+        state.pending
+      ) : MigrationJournalResult.Failure(MigrationFailure.Drift(drift))
+  end
+end
+
+def pgMigrationHistorySql(): String
+  return "SELECT ordinal, id, signature FROM __neri_migrations ORDER BY ordinal LIMIT 1002"
+end
+
+def pgMigrationSetupSql(): String
+  return "DO $$BEGIN PERFORM pg_advisory_xact_lock(1852142185); END$$; CREATE TABLE IF NOT EXISTS __neri_migrations (ordinal BIGINT PRIMARY KEY, id TEXT NOT NULL, signature TEXT NOT NULL)"
+end
+
+def pgMigrationStampSql(stamp: readonly MigrationStamp?): String
+  return stamp == null ? "DELETE FROM __neri_migrations WHERE ordinal=$1" : "INSERT INTO __neri_migrations(ordinal,id,signature) VALUES($1,$2,$3)"
+end
+
+def pgMigrationStampValues(ordinal: Int, stamp: readonly MigrationStamp?): WriteValues
+  let values = new WriteValues()
+
+  values.add(Cell.Int(ordinal))
+  if stamp != null
+    values.add(Cell.Text(stamp.id()))
+    values.add(Cell.Text(stamp.signature()))
+  end
+  return values
+end
+
+def pgWriteMigrationStamp(
+  provider: PostgreSQLProvider,
+  ordinal: Int,
+  stamp: readonly MigrationStamp?
+): MigrationFailure?
+  match provider.command(pgMigrationStampSql(stamp), pgMigrationStampValues(ordinal, stamp))
+    case PostgreSQLCommandResult.Failure(error)
+      return MigrationFailure.Provider(error)
+    case PostgreSQLCommandResult.Completed(count, row)
+      return count == 1 ? null : MigrationFailure.Drift("PostgreSQL migration stamp write count mismatch")
+  end
+end
+
+def pgMigrationSetup(provider: PostgreSQLProvider): MigrationFailure?
+  match provider.command(pgMigrationSetupSql(), new WriteValues(), script: true)
+    case PostgreSQLCommandResult.Failure(error)
+      return MigrationFailure.Provider(error)
+    case PostgreSQLCommandResult.Completed(count, row)
+      return null
   end
 end
 
@@ -144,6 +207,17 @@ def pgMigrationFailure(provider: PostgreSQLProvider, lease: Int, primary: Migrat
       return MigrationResult.Failure(primary)
     case WriteResult.SavedWithValues(count, outputs)
       return MigrationResult.Failure(primary)
+  end
+end
+
+def pgCommitMigration(provider: PostgreSQLProvider, lease: Int, changed: Int): MigrationResult
+  match provider.commitTransaction(lease)
+    case WriteResult.Failure(error)
+      return pgMigrationFailure(provider, lease, MigrationFailure.Provider(pgWriteProviderFailure(error)))
+    case WriteResult.Saved(count)
+      return MigrationResult.Applied(changed)
+    case WriteResult.SavedWithValues(count, outputs)
+      return MigrationResult.Applied(changed)
   end
 end
 
@@ -235,21 +309,24 @@ def pgMigrate(provider: PostgreSQLProvider, catalog: readonly MigrationSet, targ
     case TransactionOpenResult.Failure(error)
       return MigrationResult.Failure(MigrationFailure.Provider(pgWriteProviderFailure(error)))
     case TransactionOpenResult.Begun(lease)
-      match provider.command(
-        "DO $$BEGIN PERFORM pg_advisory_xact_lock(1852142185); END$$; CREATE TABLE IF NOT EXISTS __neri_migrations (ordinal BIGINT PRIMARY KEY, id TEXT NOT NULL, signature TEXT NOT NULL)",
-        new WriteValues(),
-        script: true
-      )
-        case PostgreSQLCommandResult.Failure(error)
-          return pgMigrationFailure(provider, lease, MigrationFailure.Provider(error))
-        case PostgreSQLCommandResult.Completed(count, row)
+      let setup = pgMigrationSetup(provider)
+
+      if setup != null
+        return pgMigrationFailure(provider, lease, setup)
       end
-      match pgMigrationHistory(provider, catalog)
-        case MigrationHistoryResult.Failure(error)
+      match pgMigrationJournal(provider, catalog)
+        case MigrationJournalResult.Failure(error)
           return pgMigrationFailure(provider, lease, error)
-        case MigrationHistoryResult.Loaded(stamps)
+        case MigrationJournalResult.Loaded(stamps, pending)
+          if pending != null
+            return pgMigrationFailure(provider, lease, migrationPendingFailure(pending))
+          end
           var applied = stamps.Length
           var changed = 0
+
+          if migrationRangeHasOutsideTransaction(catalog, applied, targetCount)
+            return pgMigrateOutsideTransaction(provider, lease, catalog, applied, targetCount)
+          end
 
           while applied != targetCount
             let forward = applied < targetCount
@@ -268,43 +345,125 @@ def pgMigrate(provider: PostgreSQLProvider, catalog: readonly MigrationSet, targ
             if operationFailure != null
               return pgMigrationFailure(provider, lease, operationFailure)
             end
-            let values = new CompileState()
+            let stamp = forward ? new MigrationStamp(migration.id(), migration.signature()) : null
+            let failed = pgWriteMigrationStamp(provider, index + 1, stamp)
 
-            values.bind(Parameter.Int(index + 1))
-            var sql = "DELETE FROM __neri_migrations WHERE ordinal=$1"
-
-            if forward
-              sql = "INSERT INTO __neri_migrations(ordinal,id,signature) VALUES($1,$2,$3)"
-              values.bind(Parameter.Text(migration.id()))
-              values.bind(Parameter.Text(migration.signature()))
-            end
-            match provider.command(sql, readWriteParameters(new ParameterValues(values.head, values.count)))
-              case PostgreSQLCommandResult.Failure(error)
-                return pgMigrationFailure(provider, lease, MigrationFailure.Provider(error))
-              case PostgreSQLCommandResult.Completed(count, row)
-                if count != 1
-                  return pgMigrationFailure(
-                    provider,
-                    lease,
-                    MigrationFailure.Drift("PostgreSQL migration stamp write count mismatch")
-                  )
-                end
+            if failed != null
+              return pgMigrationFailure(provider, lease, failed)
             end
             applied = forward ? applied + 1 : applied - 1
             changed = changed + 1
           end
-          match provider.commitTransaction(lease)
-            case WriteResult.Failure(error)
-              return pgMigrationFailure(
-                provider,
-                lease,
-                MigrationFailure.Provider(pgWriteProviderFailure(error))
-              )
-            case WriteResult.Saved(count)
-              return MigrationResult.Applied(changed)
-            case WriteResult.SavedWithValues(count, outputs)
-              return MigrationResult.Applied(changed)
+          return pgCommitMigration(provider, lease, changed)
+      end
+  end
+end
+
+def pgMigrateOutsideTransaction(
+  provider: PostgreSQLProvider,
+  lease: Int,
+  catalog: readonly MigrationSet,
+  applied: Int,
+  target: Int
+): MigrationResult
+  if target != applied + 1 && target != applied - 1
+    return pgMigrationFailure(
+      provider,
+      lease,
+      MigrationFailure.Validation("an outside-transaction migration must be the only selected migration")
+    )
+  end
+  let forward = applied < target
+  let migration = catalog.at(forward ? applied : target)
+
+  if migration == null
+    return pgMigrationFailure(provider, lease, MigrationFailure.Validation("migration catalog has a missing entry"))
+  end
+  match compileOutsideMigration(migration, forward, SqlDialect.PostgreSql())
+    case SchemaCompileResult.Failure(message)
+      return pgMigrationFailure(provider, lease, MigrationFailure.Validation(message))
+    case SchemaCompileResult.Statement(sql)
+      let progress = createMigrationProgress(migration, forward)
+
+      if progress == null
+        return pgMigrationFailure(
+          provider,
+          lease,
+          MigrationFailure.Provider(ProviderFailure.State("cannot create migration attempt identifier"))
+        )
+      end
+      let recorded = pgWriteMigrationStamp(provider, 0, progress.marker())
+
+      if recorded != null
+        return pgMigrationFailure(provider, lease, recorded)
+      end
+      match pgCommitMigration(provider, lease, 0)
+        case MigrationResult.Failure(error)
+          return MigrationResult.Failure(error)
+        case MigrationResult.Applied(count)
+      end
+      match provider.command(sql, new WriteValues())
+        case PostgreSQLCommandResult.Failure(error)
+          return MigrationResult.Failure(MigrationFailure.Provider(error))
+        case PostgreSQLCommandResult.Completed(count, row)
+          return pgRecoverMigration(provider, catalog, progress, MigrationRecoveryDecision.ConfirmCompleted())
+      end
+  end
+end
+
+def pgRecoverMigration(
+  provider: PostgreSQLProvider,
+  catalog: readonly MigrationSet,
+  expected: readonly MigrationProgress,
+  decision: MigrationRecoveryDecision
+): MigrationResult
+  match provider.beginTransaction()
+    case TransactionOpenResult.Failure(error)
+      return MigrationResult.Failure(MigrationFailure.Provider(pgWriteProviderFailure(error)))
+    case TransactionOpenResult.Begun(lease)
+      let setup = pgMigrationSetup(provider)
+
+      if setup != null
+        return pgMigrationFailure(provider, lease, setup)
+      end
+      match pgMigrationJournal(provider, catalog)
+        case MigrationJournalResult.Failure(error)
+          return pgMigrationFailure(provider, lease, error)
+        case MigrationJournalResult.Loaded(stamps, pending)
+          if pending == null || !pending.sameAttempt(expected)
+            return pgMigrationFailure(
+              provider,
+              lease,
+              MigrationFailure.Drift("migration recovery attempt does not match the journal")
+            )
           end
+          let ordinal = migrationRecoveryOrdinal(catalog, stamps.Length, pending)
+
+          if ordinal < 1
+            return pgMigrationFailure(
+              provider,
+              lease,
+              MigrationFailure.Drift("migration recovery does not match the catalog boundary")
+            )
+          end
+          var changed = 0
+
+          match decision
+            case MigrationRecoveryDecision.ConfirmCompleted()
+              let failed = pgWriteMigrationStamp(provider, ordinal, pending.forward() ? pending.stamp() : null)
+
+              if failed != null
+                return pgMigrationFailure(provider, lease, failed)
+              end
+              changed = 1
+            case MigrationRecoveryDecision.ConfirmReverted()
+          end
+          let cleared = pgWriteMigrationStamp(provider, 0, null)
+
+          if cleared != null
+            return pgMigrationFailure(provider, lease, cleared)
+          end
+          return pgCommitMigration(provider, lease, changed)
       end
   end
 end

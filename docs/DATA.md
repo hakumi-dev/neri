@@ -110,6 +110,33 @@ provider when finished. Generated source is published at stable paths such as
 
 ## Supported behavior
 
+Generated context sets carry the filter shape of their mapping. Named labels
+in `.where(...)` complete and type-check against the directly mapped fields
+for that set. Two contexts can map the same entity type with different labels.
+Same-entity modifiers such as `take`, `orderBy`, `matching`, and
+`ignoreQueryFilters` preserve the shape. Read and set-write terminals, including
+`allAsync`, `executeDeleteAsync`, `executeUpdateAsync`, `executeUpdateSetAsync`,
+and `executeUpdateMappedCellAsync`, execute through the existing query and
+provider. Their asynchronous operations retain the ordinary query's explicit
+ownership, polling and cleanup contract.
+
+Call `.query()` to use a generated set with an API that accepts an ordinary
+`Query<T>`. Ordinary queries accept the entity's declared field labels and
+validate mapping membership when translating a filter. Generated queries also
+validate mapped membership and value conversion when translating filters.
+
+A collection or reference relation can name a mapped subtype. The generated
+`query_<Subtype>()` retains the mapping's filter labels and scopes reads to
+that type and its mapped descendants. The scope also applies when
+`ignoreQueryFilters()` disables model filters. Tracked subtype queries and navigation
+loads share the root entity set's tracked instances.
+
+Generated link and reassign methods for subtype relations take the typed
+endpoint instances and resolve their existing root handles in the context.
+They update the tracked relationship edge and foreign key. Collection and
+reference fixup runs during navigation loading. Graph enrollment visits the
+relation only for applicable subtype instances.
+
 - Typed filters, scalar projections, ordering, pagination, joins and aggregates
   compile to parameterized SQL. Unsupported expression shapes fail explicitly.
 - Generated contexts track entity identity and original values. Saves use
@@ -128,7 +155,9 @@ provider when finished. Generated source is published at stable paths such as
   cascades, orphan removal and nullable foreign-key updates.
 - Mapping snapshots and migration scaffolding produce reviewable up/down source.
   SQLite applies supported schema changes transactionally and rejects unsupported
-  dependencies before rebuilding tables.
+  dependencies before rebuilding tables. Both providers support explicitly
+  isolated [outside-transaction migrations](../packages/data/docs/MIGRATION-RECOVERY.md)
+  with a persistent recovery marker.
 - Managed migration catalogs discover immutable bundles, report pending model
   changes, generate guarded SQL scripts, and check live database history before
   removing the last unapplied migration. Physical foreign keys support ordered

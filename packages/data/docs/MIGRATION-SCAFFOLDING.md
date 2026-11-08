@@ -99,7 +99,7 @@ inside `.neri-migrations.lock` before catalog publication; publication failure
 restores the directory. Cleanup failure preserves remaining staged files and
 the lock for explicit recovery. The command does not downgrade a database.
 
-`script` accepts exact starting/ending identifiers or `empty`, and a
+`script` accepts an atomic range with exact starting/ending identifiers or `empty`, and a
 `sqlite` or `postgres` dialect. It writes a new SQL file, verifies the starting
 history prefix inside the script, emits the selected up/down operations, and
 updates migration stamps transactionally. PostgreSQL scripts share the provider's
@@ -110,6 +110,8 @@ on the first error, rolls back an open transaction, and restores SQLite foreign
 keys after failure. Scripts contain DDL and history checks; the SQLite provider
 also performs live schema and strict copied-value validation during rebuilds.
 Scripts do not reproduce that provider inspection.
+Use [outside-transaction provider execution](MIGRATION-RECOVERY.md) for an
+authored operation that requires autocommit.
 
 Catalog artifacts are generated ownership boundaries. Authored edits require
 consistent snapshots, operations and digests before managed discovery; the

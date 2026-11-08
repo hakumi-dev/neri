@@ -144,9 +144,9 @@ end
 
 class Decoder<T>
   private read: fn(RawRow): DecodeResult<T>
-  private resultColumns: ResultColumns
+  private resultColumns: readonly ResultColumns
 
-  def init(read: fn(RawRow): DecodeResult<T>, columns: ResultColumns): Void
+  def init(read: fn(RawRow): DecodeResult<T>, columns: readonly ResultColumns): Void
     this.read = read
     this.resultColumns = columns
   end
@@ -265,10 +265,12 @@ end
 
 class ParameterNode
   private storedValue: Parameter
+  private nativePostgresqlType: String?
   private following: ParameterNode?
 
-  def init(value: Parameter, next: ParameterNode? = null): Void
+  def init(value: Parameter, next: ParameterNode? = null, postgresqlType: String? = null): Void
     this.storedValue = value
+    this.nativePostgresqlType = postgresqlType
     this.following = next
   end
 
@@ -282,6 +284,10 @@ class ParameterNode
 
   internal def append(node: ParameterNode): Void
     this.following = node
+  end
+
+  public readonly def postgresqlType(): String?
+    return this.nativePostgresqlType
   end
 end
 
@@ -315,11 +321,13 @@ class ResultColumn
   private columnName: String
   private columnKind: ResultColumnKind
   private optional: Bool
+  private nativePostgresqlType: String?
 
-  def init(name: String, kind: ResultColumnKind, nullable: Bool = false): Void
+  def init(name: String, kind: ResultColumnKind, nullable: Bool = false, postgresqlType: String? = null): Void
     this.columnName = name
     this.columnKind = kind
     this.optional = nullable
+    this.nativePostgresqlType = postgresqlType
   end
 
   public readonly def name(): String
@@ -333,6 +341,10 @@ class ResultColumn
   public readonly def nullable(): Bool
     return this.optional
   end
+
+  public readonly def postgresqlType(): String?
+    return this.nativePostgresqlType
+  end
 end
 
 class ResultColumnNode
@@ -345,7 +357,7 @@ class ResultColumnNode
 end
 
 class ResultColumns
-  private head: ResultColumnNode?
+  private head: readonly ResultColumnNode?
   private size: Int = 0
   private empty: ResultColumn[] = []
 
@@ -367,6 +379,14 @@ class ResultColumns
 
   public readonly def count(): Int
     return this.size
+  end
+
+  internal readonly def copy(): ResultColumns
+    let result = new ResultColumns([])
+
+    result.head = this.head
+    result.size = this.size
+    return result
   end
 
   public readonly def at(index: Int): readonly ResultColumn
@@ -540,6 +560,7 @@ class Expression
   internal hasScalar: Bool
   internal decimalBuilder: (fn(EntityMapping, CompileState, SqlDialect): ScalarSqlResult)?
   internal comparisonPrefixLength: Int
+  internal postgresqlType: String?
 
   def init(
     kind: ExpressionKind,
@@ -553,7 +574,8 @@ class Expression
     scalarTree: readonly quotation::Tree? = null,
     scalarMapping: EntityMapping? = null,
     decimalBuilder: (fn(EntityMapping, CompileState, SqlDialect): ScalarSqlResult)? = null,
-    comparisonPrefixLength: Int = 0
+    comparisonPrefixLength: Int = 0,
+    postgresqlType: String? = null
   ): Void
     this.kind = kind
     this.table = table
@@ -567,6 +589,7 @@ class Expression
     this.scalarMapping = scalarMapping
     this.decimalBuilder = decimalBuilder
     this.comparisonPrefixLength = comparisonPrefixLength
+    this.postgresqlType = postgresqlType
     this.hasScalar = decimalBuilder != null || scalarTree != null || (left != null && left.hasScalar) || (right != null && right.hasScalar)
   end
 end
@@ -601,11 +624,18 @@ class SqlSource
   private text: String
   private checkedScalars: Bool
   private mappedRootWrites: Bool
+  internal hierarchyScope: Expression?
 
-  def init(sql: String, requiresCheckedScalars: Bool = false, mappedRootWrites: Bool = false): Void
+  def init(
+    sql: String,
+    requiresCheckedScalars: Bool = false,
+    mappedRootWrites: Bool = false,
+    hierarchyScope: Expression? = null
+  ): Void
     this.text = sql
     this.checkedScalars = requiresCheckedScalars
     this.mappedRootWrites = mappedRootWrites
+    this.hierarchyScope = hierarchyScope
   end
 
   internal readonly def sql(): String
@@ -678,6 +708,17 @@ def queryFilterIgnored(names: QueryFilterName?, name: String): Bool
   return false
 end
 
+def hierarchyNamedFilters<B, D>(filters: NamedQueryFilter<B>?): NamedQueryFilter<D>?
+  if filters == null
+    return null
+  end
+  return new NamedQueryFilter<D>(
+    filters.name,
+    new Predicate<D>(filters.predicate.expression),
+    hierarchyNamedFilters<B, D>(filters.next)
+  )
+end
+
 def queryFilterRemove<T>(filters: NamedQueryFilter<T>?, name: String): NamedQueryFilter<T>?
   if filters == null
     return null
@@ -698,8 +739,8 @@ class CompileState
   public count: Int = 0
   public requiresCheckedScalars: Bool = false
 
-  public def bind(value: Parameter): Void
-    let node = new ParameterNode(value)
+  public def bind(value: Parameter, postgresqlType: String? = null): Void
+    let node = new ParameterNode(value, postgresqlType: postgresqlType)
     let existing = this.tail
 
     if existing == null
@@ -916,7 +957,7 @@ def compileLeaf(
       case Parameter.Text(value)
       case Parameter.Binary(value)
     end
-    state.bind(parameter)
+    state.bind(parameter, expression.postgresqlType)
     suffix = suffix + comparisonStorageSql(dialectPlaceholder(dialect, state.count), expression.comparisonPrefixLength)
   end
   return ExpressionCompileResult.Sql(comparisonStorageSql(
@@ -958,6 +999,7 @@ class Query<T>
   private failure: QueryFailure?
   private boundProvider: Provider?
   private tracker: EntityTracker<T>?
+  private viewTracker: NavigationTracker<T>?
   private previous: Query<T>?
   private offset: Int
   private unique: Bool
@@ -1000,7 +1042,8 @@ class Query<T>
     rawSource: SqlSource? = null,
     rawParameters: readonly ParameterValues? = null,
     namedFilters: NamedQueryFilter<T>? = null,
-    ignoredFilterNames: QueryFilterName? = null
+    ignoredFilterNames: QueryFilterName? = null,
+    viewTracker: NavigationTracker<T>? = null
   ): Void
     this.source = source
     this.decoder = decoder
@@ -1013,6 +1056,7 @@ class Query<T>
     this.failure = failure
     this.boundProvider = provider
     this.tracker = tracker
+    this.viewTracker = viewTracker
     this.previous = previous
     this.offset = offset
     this.unique = unique
@@ -1069,7 +1113,8 @@ class Query<T>
       rawSource: rawSource == null ? this.rawSource : rawSource,
       rawParameters: rawParameters == null ? this.rawParameters : rawParameters,
       namedFilters: namedFilters == null ? this.namedFilters : namedFilters,
-      ignoredFilterNames: ignoredFilterNames == null ? this.ignoredFilterNames : ignoredFilterNames
+      ignoredFilterNames: ignoredFilterNames == null ? this.ignoredFilterNames : ignoredFilterNames,
+      viewTracker: this.viewTracker
     )
   end
 
@@ -1082,7 +1127,7 @@ class Query<T>
   public def asNoTrackingWithIdentityResolution(): Query<T>
     let mapping = this.mapping
 
-    if this.tracker == null && (mapping == null || !mapping.readOnly())
+    if this.navigationTracking() == null && (mapping == null || !mapping.readOnly())
       return this.failed(QueryFailure.UnsupportedCapability("identity resolution requires entity tracker metadata"))
     end
     return this.configured(true, true, this.globalFilter, this.filtersDisabled, this.previous)
@@ -1095,26 +1140,28 @@ class Query<T>
   ## Creates an isolated identity scope for a detached navigation graph.
   ## Reuse this query for every occurrence of the same entity set in that graph.
   public def detachedGraph(): Query<T>
-    let tracker = this.tracker
+    let tracker = this.navigationTracking()
 
     if tracker == null
       return this.failed(QueryFailure.UnsupportedCapability("detached graph loading requires entity identity metadata"))
     end
-    return this.withNavigationTracker(tracker.identityResolver())
+    return this.withNavigationTracker(tracker.navigationIdentityResolver())
   end
 
-  internal def withNavigationTracker(tracker: EntityTracker<T>): Query<T>
+  internal def withNavigationTracker(tracker: NavigationTracker<T>): Query<T>
     let prior = this.previous
+    let concrete = reference::cast<EntityTracker<T>, NavigationTracker<T>>(tracker)
 
     return new Query<T>(
       this.source, this.decoder, this.predicate, this.orderTable, this.orderColumn,
       this.descending, this.limit, this.mapping, this.failure, this.boundProvider,
-      tracker, prior == null ? null : prior.withNavigationTracker(tracker),
+      concrete, prior == null ? null : prior.withNavigationTracker(tracker),
       this.offset, this.unique, this.thenTerms, changes: this.changes,
       primaryOrderTree: this.primaryOrderTree, globalFilter: this.globalFilter,
       filtersDisabled: this.filtersDisabled, tagComments: this.tagComments,
       rawSource: this.rawSource, rawParameters: this.rawParameters,
-      namedFilters: this.namedFilters, ignoredFilterNames: this.ignoredFilterNames
+      namedFilters: this.namedFilters, ignoredFilterNames: this.ignoredFilterNames,
+      viewTracker: concrete == null ? tracker : null
     )
   end
 
@@ -1126,7 +1173,8 @@ class Query<T>
       identityOnly: this.identityOnly, globalFilter: this.globalFilter,
       filtersDisabled: this.filtersDisabled, tagComments: this.tagComments,
       rawSource: this.rawSource, rawParameters: this.rawParameters,
-      namedFilters: this.namedFilters, ignoredFilterNames: this.ignoredFilterNames
+      namedFilters: this.namedFilters, ignoredFilterNames: this.ignoredFilterNames,
+      viewTracker: this.viewTracker
     )
   end
 
@@ -1162,7 +1210,8 @@ class Query<T>
       identityOnly: this.identityOnly, globalFilter: this.globalFilter,
       filtersDisabled: this.filtersDisabled, tagComments: this.tagComments,
       rawSource: this.rawSource, rawParameters: this.rawParameters,
-      namedFilters: this.namedFilters, ignoredFilterNames: this.ignoredFilterNames
+      namedFilters: this.namedFilters, ignoredFilterNames: this.ignoredFilterNames,
+      viewTracker: this.viewTracker
     )
   end
 
@@ -1343,7 +1392,7 @@ class Query<T>
       match compilePipeline<T, T>(
         this,
         this.rowDecoder(),
-        mappedSelection(mapping),
+        this.hasHierarchyScope() ? hierarchySelection(this.source, this.decoder.columns()) : mappedSelection(mapping),
         this.rowLimit(),
         dialect,
         inner: true
@@ -1372,7 +1421,59 @@ class Query<T>
       resolver: resolve,
       owner: this.changeOwner(),
       physicalSource: this.source,
-      trackingActive: this.tracker != null && !this.trackingDisabled
+      trackingActive: this.navigationTracking() != null && !this.trackingDisabled
+    )
+  end
+
+  internal def hierarchyView<D>(
+    mapping: EntityMapping, discriminatorColumn: String, discriminators: String[],
+    upcast: fn(D): T, downcast: fn(T): D?
+  ): Query<D>
+    let decode = hierarchyDecoder<T, D>(this.decoder, discriminatorColumn, downcast, this.decoder.columns())
+    let rootTracker = this.navigationTracking()
+
+    if this.mapping == null || rootTracker == null || !this.isUnfilteredRoot() || this.hasHierarchyScope() || discriminators.Length == 0
+      return new Query<D>(
+        this.source,
+        decode,
+        mapping: mapping,
+        failure: QueryFailure.UnsupportedCapability("subtype navigation requires a tracked hierarchy root and discriminator")
+      )
+    end
+    var scope = new Expression(
+      ExpressionKind.Equal(),
+      this.source,
+      discriminatorColumn,
+      Parameter.Text(discriminators[0])
+    )
+    var index = 1
+
+    while index < discriminators.Length
+      let next = new Expression(
+        ExpressionKind.Equal(),
+        this.source,
+        discriminatorColumn,
+        Parameter.Text(discriminators[index])
+      )
+
+      scope = new Expression(ExpressionKind.Or(), left: scope, right: next)
+      index = index + 1
+    end
+    let raw = this.rawSource
+    let source = new SqlSource(
+      raw == null ? "\"" + this.source + "\"" : raw.sql(),
+      raw != null && raw.requiresCheckedScalars(),
+      hierarchyScope: scope
+    )
+    let global = this.globalFilter
+
+    return new Query<D>(
+      this.source, decode, mapping: mapping, failure: this.failure, provider: this.boundProvider,
+      changes: this.changes, trackingDisabled: this.trackingDisabled, identityOnly: this.identityOnly,
+      globalFilter: global == null ? null : new Predicate<D>(global.expression), filtersDisabled: this.filtersDisabled,
+      tagComments: this.tagComments, rawSource: source, rawParameters: this.rawParameters,
+      namedFilters: hierarchyNamedFilters<T, D>(this.namedFilters), ignoredFilterNames: this.ignoredFilterNames,
+      viewTracker: new HierarchyNavigationTracker<T, D>(rootTracker, upcast, downcast)
     )
   end
 
@@ -1402,12 +1503,16 @@ class Query<T>
 
   ## Adds equality filters checked against the entity's declared public fields.
   public def where(labels filters: fields of T): Query<T>
+    return this.whereFields(filters.pack())
+  end
+
+  internal def whereFields(filters: readonly fields::Pack, mappedLabels: Bool = false): Query<T>
     let mapping = this.mapping
 
     if mapping == null
       return this.failed(QueryFailure.UnsupportedCapability("query requires entity mapping metadata"))
     end
-    return this.translated(translateFields(mapping, filters.pack()))
+    return this.translated(translateFields(mapping, filters, mappedLabels))
   end
 
   ## Adds a typed expression using resolved entity fields and captured values.
@@ -1522,7 +1627,8 @@ class Query<T>
       rawSource: this.rawSource,
       rawParameters: this.rawParameters,
       namedFilters: this.namedFilters,
-      ignoredFilterNames: this.ignoredFilterNames
+      ignoredFilterNames: this.ignoredFilterNames,
+      viewTracker: this.viewTracker
     )
   end
 
@@ -1559,7 +1665,8 @@ class Query<T>
         rawSource: this.rawSource,
         rawParameters: this.rawParameters,
         namedFilters: this.namedFilters,
-        ignoredFilterNames: this.ignoredFilterNames
+        ignoredFilterNames: this.ignoredFilterNames,
+        viewTracker: this.viewTracker
       )
     end
     return new Query<T>(
@@ -1588,7 +1695,8 @@ class Query<T>
       rawSource: this.rawSource,
       rawParameters: this.rawParameters,
       namedFilters: this.namedFilters,
-      ignoredFilterNames: this.ignoredFilterNames
+      ignoredFilterNames: this.ignoredFilterNames,
+      viewTracker: this.viewTracker
     )
   end
 
@@ -1784,7 +1892,8 @@ class Query<T>
       rawSource: this.rawSource,
       rawParameters: this.rawParameters,
       namedFilters: this.namedFilters,
-      ignoredFilterNames: this.ignoredFilterNames
+      ignoredFilterNames: this.ignoredFilterNames,
+      viewTracker: this.viewTracker
     )
   end
 
@@ -1829,7 +1938,8 @@ class Query<T>
       rawSource: this.rawSource,
       rawParameters: this.rawParameters,
       namedFilters: this.namedFilters,
-      ignoredFilterNames: this.ignoredFilterNames
+      ignoredFilterNames: this.ignoredFilterNames,
+      viewTracker: this.viewTracker
     )
   end
 
@@ -1873,7 +1983,8 @@ class Query<T>
       rawSource: this.rawSource,
       rawParameters: this.rawParameters,
       namedFilters: this.namedFilters,
-      ignoredFilterNames: this.ignoredFilterNames
+      ignoredFilterNames: this.ignoredFilterNames,
+      viewTracker: this.viewTracker
     )
   end
 
@@ -1908,7 +2019,8 @@ class Query<T>
       rawSource: this.rawSource,
       rawParameters: this.rawParameters,
       namedFilters: this.namedFilters,
-      ignoredFilterNames: this.ignoredFilterNames
+      ignoredFilterNames: this.ignoredFilterNames,
+      viewTracker: this.viewTracker
     )
   end
 
@@ -2007,7 +2119,8 @@ class Query<T>
           rawSource: this.rawSource,
           rawParameters: this.rawParameters,
           namedFilters: this.namedFilters,
-          ignoredFilterNames: this.ignoredFilterNames
+          ignoredFilterNames: this.ignoredFilterNames,
+          viewTracker: this.viewTracker
         )
       case SelectionResult.Column(column)
         return new Query<T>(
@@ -2036,7 +2149,8 @@ class Query<T>
           rawSource: this.rawSource,
           rawParameters: this.rawParameters,
           namedFilters: this.namedFilters,
-          ignoredFilterNames: this.ignoredFilterNames
+          ignoredFilterNames: this.ignoredFilterNames,
+          viewTracker: this.viewTracker
         )
     end
   end
@@ -2075,7 +2189,8 @@ class Query<T>
           rawSource: this.rawSource,
           rawParameters: this.rawParameters,
           namedFilters: this.namedFilters,
-          ignoredFilterNames: this.ignoredFilterNames
+          ignoredFilterNames: this.ignoredFilterNames,
+          viewTracker: this.viewTracker
         )
       case SelectionResult.Column(column)
         return new Query<T>(
@@ -2102,7 +2217,8 @@ class Query<T>
           rawSource: this.rawSource,
           rawParameters: this.rawParameters,
           namedFilters: this.namedFilters,
-          ignoredFilterNames: this.ignoredFilterNames
+          ignoredFilterNames: this.ignoredFilterNames,
+          viewTracker: this.viewTracker
         )
     end
   end
@@ -2192,12 +2308,7 @@ class Query<T>
     options: StreamOptions? = null,
     labels changes: fields of T
   ): result::Result<AsyncWrite, WriteFailure>
-    let provider = this.boundProvider
-
-    if provider == null
-      return result::Result<AsyncWrite, WriteFailure>.Error(WriteFailure.Unsupported("bulk update requires a provider"))
-    end
-    match this.startSetAsync(compileSetUpdate<T>(this, changes.pack(), provider.dialect()), provider, options)
+    match this.startUpdateFieldsAsync(changes.pack(), options)
       case AsyncWriteStart.Failure(error)
         return result::Result<AsyncWrite, WriteFailure>.Error(error)
       case AsyncWriteStart.Started(driver)
@@ -2205,6 +2316,15 @@ class Query<T>
 
         return result::Result<AsyncWrite, WriteFailure>.Ok(transfer owned)
     end
+  end
+
+  internal def startUpdateFieldsAsync(changes: readonly fields::Pack, options: StreamOptions?): AsyncWriteStart
+    let provider = this.boundProvider
+
+    if provider == null
+      return AsyncWriteStart.Failure(WriteFailure.Unsupported("bulk update requires a provider"))
+    end
+    return this.startSetAsync(compileSetUpdate<T>(this, changes, provider.dialect()), provider, options)
   end
 
   public def executeUpdateSetAsync(
@@ -2272,6 +2392,10 @@ class Query<T>
 
   ## Updates mapped non-key scalar fields without materializing selected rows.
   public def executeUpdate(labels changes: fields of T): WriteResult
+    return this.executeUpdateFields(changes.pack())
+  end
+
+  internal def executeUpdateFields(changes: readonly fields::Pack): WriteResult
     let provider = this.boundProvider
 
     if provider == null
@@ -2280,7 +2404,7 @@ class Query<T>
     if !provider.supports(ProviderCapability.SetWrites())
       return WriteResult.Failure(WriteFailure.Unsupported("provider does not support set writes"))
     end
-    match compileSetUpdate<T>(this, changes.pack(), provider.dialect())
+    match compileSetUpdate<T>(this, changes, provider.dialect())
       case SetPlanResult.Failure(error)
         return WriteResult.Failure(error)
       case SetPlanResult.Plan(plan)
@@ -2670,7 +2794,7 @@ class Query<T>
   end
 
   public def stateOf(entity: T): TrackingState?
-    let tracker = this.tracker
+    let tracker = this.navigationTracking()
 
     if tracker == null
       return null
@@ -2679,7 +2803,7 @@ class Query<T>
   end
 
   public def original(entity: T): RawRow?
-    let tracker = this.tracker
+    let tracker = this.navigationTracking()
 
     if tracker == null
       return null
@@ -2688,7 +2812,7 @@ class Query<T>
   end
 
   public def current(entity: T): RawRow?
-    let tracker = this.tracker
+    let tracker = this.navigationTracking()
 
     if tracker == null
       return null
@@ -2783,8 +2907,19 @@ class Query<T>
   end
 
   internal def filterExpression(): Expression?
-    let value = this.predicate
+    var value = this.predicate
     var global = this.globalFilter
+    let source = this.rawSource
+
+    if this.previous == null && source != null
+      let scope = source.hierarchyScope
+
+      if scope != null
+        let fixed = new Predicate<T>(scope)
+
+        value = value == null ? fixed : fixed.and(value)
+      end
+    end
 
     if !this.filtersDisabled && this.previous == null
       var named = this.namedFilters
@@ -2862,20 +2997,34 @@ class Query<T>
     return this.boundProvider
   end
 
-  internal def rowTracker(): EntityTracker<T>?
+  private def navigationTracking(): NavigationTracker<T>?
+    let view = this.viewTracker
+
+    if view != null
+      return view
+    end
+    let root = this.tracker
+
+    if root == null
+      return null
+    end
+    return root
+  end
+
+  internal def rowTracker(): NavigationTracker<T>?
     let mapping = this.mapping
-    let tracker = this.tracker
+    let tracker = this.navigationTracking()
 
     if mapping != null && mapping.readOnly()
       return null
     end
     if this.trackingDisabled
       if this.identityOnly && tracker != null
-        return tracker.identityResolver()
+        return tracker.navigationIdentityResolver()
       end
       return null
     end
-    return this.tracker
+    return tracker
   end
 
   ## Physical write metadata is independent of the materialization policy.
@@ -2893,6 +3042,12 @@ class Query<T>
 
   internal def sqlSource(): SqlSource?
     return this.rawSource
+  end
+
+  internal def hasHierarchyScope(): Bool
+    let source = this.rawSource
+
+    return source != null && source.hierarchyScope != null
   end
 
   internal readonly def sqlSourceParameters(): readonly ParameterValues?
@@ -2914,6 +3069,17 @@ def mappedSelection(mapping: EntityMapping): SqlSelection
     if column != null
       text = text + (index == 0 ? "" : ", ") + quoted(mapping.table(), column.column())
     end
+    index = index + 1
+  end
+  return new SqlSelection(text)
+end
+
+def hierarchySelection(table: String, columns: readonly ResultColumns): SqlSelection
+  var text = ""
+  var index = 0
+
+  while index < columns.count()
+    text = text + (index == 0 ? "" : ", ") + quoted(table, columns.at(index).name())
     index = index + 1
   end
   return new SqlSelection(text)
@@ -2953,15 +3119,16 @@ def compileQueryRelationPlan<T>(
     return sourcePlan.decode(row)
   end
   # The mapped SQL source can expose more fields than a terminal decoder consumes.
-  var sourceColumns = new ResultColumns([])
+  let scoped = query.hasHierarchyScope()
+  let decoderColumns = query.rowDecoder().columns()
+  var sourceColumns = scoped ? decoderColumns.copy() : new ResultColumns([])
   var fieldIndex = 0
 
-  while fieldIndex < mapping.count()
+  while !scoped && fieldIndex < mapping.count()
     let field = mapping.columnAt(fieldIndex)
 
     if field != null
       var nullable = false
-      let decoderColumns = query.rowDecoder().columns()
       var decoderIndex = 0
 
       while decoderIndex < decoderColumns.count()
@@ -3674,18 +3841,18 @@ def compileQuerySql(
   while selectionParameter != null
     match selectionParameter.value()
       case Parameter.Bool(value)
-        state.bind(Parameter.Bool(value))
+        state.bind(Parameter.Bool(value), selectionParameter.postgresqlType())
       case Parameter.Int(value)
-        state.bind(Parameter.Int(value))
+        state.bind(Parameter.Int(value), selectionParameter.postgresqlType())
       case Parameter.Float(value)
         if !dataFloatFinite(value)
           return result::Result<SqlPlan, QueryFailure>.Error(QueryFailure.UnsupportedCapability("Float parameter must be finite"))
         end
-        state.bind(Parameter.Float(value))
+        state.bind(Parameter.Float(value), selectionParameter.postgresqlType())
       case Parameter.Text(value)
-        state.bind(Parameter.Text(value))
+        state.bind(Parameter.Text(value), selectionParameter.postgresqlType())
       case Parameter.Binary(value)
-        state.bind(Parameter.Binary(copyBinary(value)))
+        state.bind(Parameter.Binary(copyBinary(value)), selectionParameter.postgresqlType())
     end
     selectionParameter = selectionParameter.next()
   end
@@ -3698,18 +3865,18 @@ def compileQuerySql(
   while priorParameter != null
     match priorParameter.value()
       case Parameter.Bool(value)
-        state.bind(Parameter.Bool(value))
+        state.bind(Parameter.Bool(value), priorParameter.postgresqlType())
       case Parameter.Int(value)
-        state.bind(Parameter.Int(value))
+        state.bind(Parameter.Int(value), priorParameter.postgresqlType())
       case Parameter.Float(value)
         if !dataFloatFinite(value)
           return result::Result<SqlPlan, QueryFailure>.Error(QueryFailure.UnsupportedCapability("Float parameter must be finite"))
         end
-        state.bind(Parameter.Float(value))
+        state.bind(Parameter.Float(value), priorParameter.postgresqlType())
       case Parameter.Text(value)
-        state.bind(Parameter.Text(value))
+        state.bind(Parameter.Text(value), priorParameter.postgresqlType())
       case Parameter.Binary(value)
-        state.bind(Parameter.Binary(copyBinary(value)))
+        state.bind(Parameter.Binary(copyBinary(value)), priorParameter.postgresqlType())
     end
     priorParameter = priorParameter.next()
   end

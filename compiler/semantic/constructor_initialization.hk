@@ -1,0 +1,341 @@
+def semanticFieldHasDefault(typeName: String): Bool
+  let mutableType = semanticMutableType(typeName)
+
+  return semanticIsNumeric(mutableType) || mutableType == "Bool" || mutableType == "String" || semanticIsOptional(mutableType)
+end
+
+## Checks that construction establishes every field before it can be observed.
+class ConstructorInitialization
+  private binder: BootstrapBinder
+  private owner: SemanticClass
+  private arena: BoundArena
+  private fields: StringBuffer = new StringBuffer()
+
+  def init(binder: BootstrapBinder, owner: SemanticClass): Void
+    this.binder = binder
+    this.owner = owner
+    this.arena = binder.model.bound
+  end
+
+  def check(): Void
+    let state = new IntBuffer()
+    var field = this.owner.firstField
+
+    while field != null
+      this.fields.add(field.owner + "." + field.name)
+      state.add(0)
+      field = field.nextField
+    end
+    field = this.owner.firstField
+    var index = 0
+
+    while field != null && this.binder.checkpoint()
+      let initializer = field.boundInitializer
+
+      if initializer >= 0
+        this.expression(initializer, state, true)
+        state.set(index, 1)
+      else if field.typeName == "Error" || semanticFieldHasDefault(field.typeName)
+        state.set(index, 1)
+      end
+      index = index + 1
+      field = field.nextField
+    end
+    let constructor = this.binder.findDeclaredMethod(this.owner, "init")
+
+    if constructor == null
+      this.complete(
+        state,
+        this.binder.syntax.startAt(this.owner.syntaxNode),
+        this.binder.syntax.lengthAt(this.owner.syntaxNode)
+      )
+      return
+    end
+    var parameter = constructor.firstParameter
+
+    while parameter != null
+      if parameter.boundDefault >= 0
+        this.expression(parameter.boundDefault, state, false)
+      end
+      parameter = parameter.nextParameter
+    end
+    if constructor.baseCallNode >= 0
+      this.expression(constructor.baseCallNode, state, false)
+    end
+    let body = constructor.boundNode
+
+    if body >= 0
+      let remaining = this.range(body, 0, this.arena.childCountAt(body), state)
+
+      if remaining != null && !this.binder.cancelled()
+        this.complete(remaining, this.arena.startAt(body), this.arena.lengthAt(body))
+      end
+    end
+  end
+
+  private def complete(state: IntBuffer, start: Int, length: Int): Void
+    var field = this.owner.firstField
+    var index = 0
+
+    while field != null
+      if state.get(index) == 0
+        this.binder.model.diagnostics.add(
+          "NR300",
+          start,
+          length,
+          "Constructor can complete before field '" + field.name + "' is initialized."
+        )
+      end
+      index = index + 1
+      field = field.nextField
+    end
+  end
+
+  private def copy(state: IntBuffer): IntBuffer
+    let result = new IntBuffer()
+    var index = 0
+
+    while index < state.size
+      result.add(state.get(index))
+      index = index + 1
+    end
+    return result
+  end
+
+  private def join(left: IntBuffer?, right: IntBuffer?): IntBuffer?
+    if left == null
+      return right
+    end
+    if right == null
+      return left
+    end
+    var index = 0
+
+    while index < left.size
+      left.set(index, left.get(index) * right.get(index))
+      index = index + 1
+    end
+    return left
+  end
+
+  private def fieldIndex(identity: String): Int
+    var index = 0
+
+    while index < this.fields.size
+      if this.fields.get(index) == identity
+        return index
+      end
+      index = index + 1
+    end
+    return -1
+  end
+
+  private def receiverMember(node: Int): Bool
+    return this.arena.kindAt(node).isMember() && this.arena.childCountAt(node) == 1 && this.arena.kindAt(this.arena.childAt(
+        node,
+        0
+      )).isThis()
+  end
+
+  private def report(code: String, node: Int, message: String): Void
+    this.binder.model.diagnostics.add(code, this.arena.startAt(node), this.arena.lengthAt(node), message)
+  end
+
+  private def helper(node: Int, receiver: Int): SemanticCallable?
+    let target = this.arena.dataAt(node)
+    let receiverClass = this.binder.model.findClass(semanticMutableType(this.arena.typeAt(receiver)))
+    let direct = this.arena.valueAt(node) == "direct" || (receiverClass != null && (receiverClass.isResource || receiverClass.isSealed))
+    let specialized = this.binder.model.findFunction(target)
+
+    if specialized != null && specialized.genericOrigin >= 0 && specialized.boundNode >= 0
+      return specialized
+    end
+    var owner = receiverClass
+    var depth = 0
+
+    while owner != null && depth < 256
+      var method = owner.firstMethod
+
+      while method != null
+        if method.fullName == target
+          return method if method.name != "init" && method.boundNode >= 0 && (direct || method.genericOrigin >= 0)
+          return null
+        end
+        method = method.nextCallable
+      end
+      owner = this.binder.model.findClass(owner.baseName)
+      depth = depth + 1
+    end
+    return null
+  end
+
+  private def checkHelper(node: Int, helper: SemanticCallable, state: IntBuffer, active: String[]): Void
+    let count = this.arena.childCountAt(node)
+    var index = 1
+
+    while index < count
+      this.expression(this.arena.childAt(node, index), state, true, active)
+      index = index + 1
+    end
+    let invocation = helper.fullName + "/" + (count as String)
+
+    for checked in active
+      return if checked == invocation
+    end
+    let nested = host::appendString(active, invocation)
+    var parameter = helper.firstParameter
+
+    index = 1
+    while parameter != null
+      if index >= count && parameter.boundDefault >= 0
+        this.expression(parameter.boundDefault, state, true, nested)
+      end
+      parameter = parameter.nextParameter
+      index = index + 1
+    end
+    this.expression(helper.boundNode, state, true, nested)
+  end
+
+  private def expression(node: Int, state: IntBuffer, receiverReady: Bool, active: String[] = []): Void
+    if node <= 0 || !this.binder.checkpoint()
+      return
+    end
+    if this.receiverMember(node) && receiverReady
+      let identity = this.arena.dataAt(node)
+      let index = this.fieldIndex(identity)
+
+      if index >= 0 && state.get(index) == 0
+        this.report("NR301", node, "Field '" + identity + "' is read before initialization.")
+      end
+      return
+    end
+    let kind = this.arena.kindAt(node)
+    let count = this.arena.childCountAt(node)
+
+    if kind.isThis()
+      this.report("NR302", node, "Cannot expose 'this' or call an overridable method during initialization.")
+      return
+    end
+    if receiverReady && kind.isAssignment() && count == 2 && this.receiverMember(this.arena.childAt(node, 0))
+      this.expression(this.arena.childAt(node, 1), state, true, active)
+      return
+    end
+    if receiverReady && kind.isInstanceCall() && count > 0
+      let receiver = this.arena.childAt(node, 0)
+
+      if this.arena.kindAt(receiver).isThis()
+        let helper = this.helper(node, receiver)
+
+        if helper != null
+          this.checkHelper(node, helper, state, active)
+          return
+        end
+      end
+    end
+    var index = 0
+
+    while index < count
+      this.expression(this.arena.childAt(node, index), state, receiverReady, active)
+      index = index + 1
+    end
+  end
+
+  private def range(
+    parent: Int,
+    start: Int,
+    endOffset: Int,
+    state: IntBuffer,
+    breaks: ConstructorLoopExits? = null
+  ): IntBuffer?
+    var remaining: IntBuffer? = state
+    var index = start
+
+    while index < endOffset && this.binder.checkpoint()
+      let current = remaining
+
+      if current == null
+        return null
+      end
+      remaining = this.statement(this.arena.childAt(parent, index), current, breaks)
+      index = index + 1
+    end
+    return remaining
+  end
+
+  private def statement(node: Int, state: IntBuffer, breaks: ConstructorLoopExits?): IntBuffer?
+    let kind = this.arena.kindAt(node)
+    let count = this.arena.childCountAt(node)
+
+    if kind.isAssignment() && count == 2
+      let target = this.arena.childAt(node, 0)
+      let value = this.arena.childAt(node, 1)
+
+      if this.receiverMember(target)
+        let index = this.fieldIndex(this.arena.dataAt(target))
+
+        this.expression(value, state, true)
+        if index >= 0
+          state.set(index, 1)
+        end
+        return state
+      end
+    else if kind.isIf()
+      let thenEnd = 1 + semanticIntField(this.arena.dataAt(node), 0)
+
+      this.expression(this.arena.childAt(node, 0), state, true)
+      let left = this.range(node, 1, thenEnd, this.copy(state), breaks)
+      let right = this.range(node, thenEnd, count, state, breaks)
+
+      return this.join(left, right)
+    else if kind.isMatch()
+      this.expression(this.arena.childAt(node, 0), state, true)
+      var remaining: IntBuffer? = null
+      var index = 1
+
+      while index < count
+        let arm = this.arena.childAt(node, index)
+        let bindings = semanticIntField(this.arena.dataAt(arm), 1)
+
+        remaining = this.join(
+          remaining,
+          this.range(arm, bindings, this.arena.childCountAt(arm), this.copy(state), breaks)
+        )
+        index = index + 1
+      end
+      return remaining
+    else if kind.isWhile() || kind.isFor()
+      let source = this.arena.childAt(node, 0)
+      let exits = new ConstructorLoopExits()
+      let literalWhile = kind.isWhile() && this.arena.kindAt(source).isBoolLiteral()
+      let encoded = this.arena.valueAt(source)
+      let truth = literalWhile ? host::stringSlice(encoded, 2, host::stringByteLength(encoded) - 2) : ""
+
+      this.expression(source, state, true)
+      if truth != "true"
+        exits.state = state
+      end
+      if truth != "false"
+        this.range(node, 1, count, this.copy(state), exits)
+      end
+      return exits.state
+    else if kind.isUsingBlock() || kind.isBorrowBlock()
+      this.expression(this.arena.childAt(node, 0), state, true)
+      return this.range(node, 1, count, state, breaks)
+    else if kind.isUnsafeBlock()
+      return this.range(node, 0, count, state, breaks)
+    else if kind.isReturn()
+      this.expression(node, state, true)
+      this.complete(state, this.arena.startAt(node), this.arena.lengthAt(node))
+      return null
+    else if kind.isBreak()
+      if breaks != null
+        breaks.state = this.join(breaks.state, state)
+      end
+      return null
+    else if kind.isContinue()
+      return null
+    end
+    this.expression(node, state, true)
+    return state
+  end
+end

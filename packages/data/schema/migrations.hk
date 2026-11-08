@@ -136,6 +136,11 @@ enum SchemaCompileResult
   case Failure(message: String)
 end
 
+enum MigrationExecution
+  case Atomic()
+  case OutsideTransaction()
+end
+
 enum MigrationFailure
   case Validation(message: String)
   case Drift(message: String)
@@ -262,6 +267,11 @@ end
 
 ## Physical PostgreSQL types that use the existing portable result codecs.
 def schemaPostgresStorageType(value: String): SchemaType?
+  let nativeOid = postgresNativeScalarOid(value)
+
+  if nativeOid != 0
+    return nativeOid == 1186 ? SchemaType.Int() : SchemaType.Text()
+  end
   if value == "smallint" || value == "integer"
     return SchemaType.Int()
   end
@@ -803,9 +813,27 @@ class Migration
   private forward: SchemaOp[]
   private reverse: SchemaOp[]
   private storedSignature: String
+  private upOutsideTransaction: Bool = false
+  private downOutsideTransaction: Bool = false
 
-  def init(id: String, up: SchemaOp[], down: SchemaOp[]): Void
+  def init(
+    id: String,
+    up: SchemaOp[],
+    down: SchemaOp[],
+    upExecution: MigrationExecution = MigrationExecution.Atomic(),
+    downExecution: MigrationExecution = MigrationExecution.Atomic()
+  ): Void
     this.storedId = id
+    match upExecution
+      case MigrationExecution.OutsideTransaction()
+        this.upOutsideTransaction = true
+      case MigrationExecution.Atomic()
+    end
+    match downExecution
+      case MigrationExecution.OutsideTransaction()
+        this.downOutsideTransaction = true
+      case MigrationExecution.Atomic()
+    end
     this.forward = arrays::generate(up.Length) do |index|
       return schemaCloneOp(up[index])
     end
@@ -822,6 +850,9 @@ class Migration
     for op in this.reverse
       content = content + schemaPiece(schemaOpCode(op))
     end
+    if this.upOutsideTransaction || this.downOutsideTransaction
+      content = content + "NT1" + (this.upOutsideTransaction ? "1" : "0") + (this.downOutsideTransaction ? "1" : "0")
+    end
     this.storedSignature = content
   end
 
@@ -831,6 +862,10 @@ class Migration
 
   public readonly def signature(): String
     return this.storedSignature
+  end
+
+  public readonly def executesOutsideTransaction(forward: Bool): Bool
+    return forward ? this.upOutsideTransaction : this.downOutsideTransaction
   end
 
   public readonly def upCount(): Int
@@ -863,7 +898,13 @@ class Migration
       return schemaCloneOp(this.reverse[index])
     end
 
-    return new Migration(this.storedId, up, down)
+    return new Migration(
+      this.storedId,
+      up,
+      down,
+      this.upOutsideTransaction ? MigrationExecution.OutsideTransaction() : MigrationExecution.Atomic(),
+      this.downOutsideTransaction ? MigrationExecution.OutsideTransaction() : MigrationExecution.Atomic()
+    )
   end
 end
 
@@ -899,6 +940,15 @@ class MigrationSet
       if current.upCount() == 0 || current.downCount() == 0
         return "migration requires forward and reverse operations"
       end
+      for forward in [true, false]
+        if current.executesOutsideTransaction(forward)
+          match compileOutsideMigration(current, forward, SqlDialect.PostgreSql())
+            case SchemaCompileResult.Failure(message)
+              return message
+            case SchemaCompileResult.Statement(sql)
+          end
+        end
+      end
       var earlier = 0
 
       while earlier < index
@@ -915,7 +965,7 @@ class MigrationSet
         if op == null
           return "missing migration operation"
         end
-        let invalidOp = schemaOperationValidation(op)
+        let invalidOp = current.executesOutsideTransaction(true) ? null : schemaOperationValidation(op)
 
         if invalidOp != null
           return invalidOp
@@ -940,7 +990,7 @@ class MigrationSet
         if op == null
           return "missing reverse migration operation"
         end
-        let invalidOp = schemaOperationValidation(op)
+        let invalidOp = current.executesOutsideTransaction(false) ? null : schemaOperationValidation(op)
 
         if invalidOp != null
           return invalidOp
@@ -1071,7 +1121,7 @@ def schemaColumnSql(
   var sql = schemaQuote(column.name()) + " " + kind
 
   if collation != null
-    if schemaTypeCode(column.type()) != schemaTypeCode(SchemaType.Text())
+    if schemaTypeCode(column.type()) != schemaTypeCode(SchemaType.Text()) || (postgresqlType != null && postgresNativeScalarOid(postgresqlType) != 0)
       return SchemaCompileResult.Failure("collation requires a text column")
     end
     sql = sql + " COLLATE " + schemaQuote(collation)
@@ -1171,10 +1221,10 @@ def schemaTableValid(table: String): Bool
   return identifierValid(table) && !schemaReserved(table)
 end
 
-def compileSchema(op: readonly SchemaOp, dialect: SqlDialect): SchemaCompileResult
+def compileSchema(op: readonly SchemaOp, dialect: SqlDialect, outsideTransaction: Bool = false): SchemaCompileResult
   match op
     case SchemaOp.Sql(statement)
-      let failure = schemaTrustedSqlFailure(statement, dialect)
+      let failure = schemaTrustedSqlFailure(statement, dialect, outsideTransaction)
 
       return failure == null ? SchemaCompileResult.Statement(statement) : SchemaCompileResult.Failure(failure)
     case SchemaOp.CreateTable(table, columns)

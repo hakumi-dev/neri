@@ -1,0 +1,108 @@
+use host
+use neri_data
+use neri_data_async_contract
+use neri_data_postgresql
+use result
+use test
+
+def failedOutsideMigration(result: MigrationResult): Void
+  match result
+    case MigrationResult.Applied(count)
+      test::assertTrue(false)
+    case MigrationResult.Failure(error)
+  end
+end
+
+def verifyInvalidIndex(provider: PostgreSQLProvider): Void
+  let columns = new ResultColumns([new ResultColumn("valid", ResultColumnKind.Bool())])
+
+  match provider.execute(new SqlPlan(
+      "SELECT indisvalid AS valid FROM pg_index WHERE indexrelid = 'neri_recover_lookup'::regclass",
+      new ParameterValues(),
+      1,
+      columns
+    ))
+    case ProviderResult.Failure(error)
+      test::assertTrue(false)
+    case ProviderResult.Rows(rows)
+      test::assertEqual(rows.Length, 1)
+      match decodeBool(rows[0], "valid")
+        case DecodeResult.Value(valid)
+          test::assertFalse(valid)
+        case DecodeResult.Failure(error)
+          test::assertTrue(false)
+      end
+  end
+end
+
+def verifyRecovery(conninfo: String): Void
+  let initial = new Migration("recovery_base", [
+      SchemaOp.Sql("CREATE TABLE neri_recover_items (id INTEGER PRIMARY KEY, value INTEGER NOT NULL)"),
+      SchemaOp.Sql("INSERT INTO neri_recover_items (id, value) VALUES (1, 7), (2, 7)")
+    ], [SchemaOp.DropTable("neri_recover_items")])
+  let outside = new Migration(
+    "recovery_lookup",
+    [SchemaOp.Sql("CREATE UNIQUE INDEX CONCURRENTLY neri_recover_lookup ON neri_recover_items (value)")],
+    [SchemaOp.Sql("DROP INDEX CONCURRENTLY neri_recover_lookup")],
+    upExecution: MigrationExecution.OutsideTransaction(),
+    downExecution: MigrationExecution.OutsideTransaction()
+  )
+  let catalog = new MigrationSet([initial, outside])
+
+  match PostgreSQLProvider.open(conninfo)
+    case result::Result.Error(error)
+      test::assertTrue(false)
+    case result::Result.Ok(provider)
+      asyncMigrationApplied(provider.migrate(catalog, initial.id()), 1)
+      failedOutsideMigration(awaitAsyncMigration(provider.beginMigrationAsync(catalog)))
+
+      test::assertTrue(provider.closeFailure() == null)
+  end
+  match PostgreSQLProvider.open(conninfo)
+    case result::Result.Error(error)
+      test::assertTrue(false)
+    case result::Result.Ok(provider)
+      verifyInvalidIndex(provider)
+      failedOutsideMigration(provider.migrate(catalog))
+      match provider.migrationJournal(catalog)
+        case MigrationJournalResult.Failure(error)
+          test::assertTrue(false)
+        case MigrationJournalResult.Loaded(stamps, pending)
+          test::assertEqual(stamps.Length, 1)
+          test::assertTrue(pending != null && pending.id() == outside.id() && pending.forward())
+          if pending != null
+            match provider.command("DROP INDEX CONCURRENTLY neri_recover_lookup", new WriteValues())
+              case PostgreSQLCommandResult.Failure(error)
+                test::assertTrue(false)
+              case PostgreSQLCommandResult.Completed(count, row)
+            end
+            asyncMigrationApplied(
+              provider.recoverMigration(catalog, pending, MigrationRecoveryDecision.ConfirmReverted()),
+              0
+            )
+          end
+      end
+      match provider.executeSet(new SetWritePlan("DELETE FROM neri_recover_items WHERE id = 2", new WriteValues()))
+        case WriteResult.Failure(error)
+          test::assertTrue(false)
+        case WriteResult.Saved(count)
+          test::assertEqual(count, 1)
+        case WriteResult.SavedWithValues(count, rows)
+          test::assertTrue(false)
+      end
+      asyncMigrationApplied(provider.migrate(catalog), 1)
+      asyncMigrationApplied(awaitAsyncMigration(provider.beginMigrationAsync(catalog, initial.id())), 1)
+      asyncMigrationApplied(provider.migrate(catalog, ""), 1)
+
+      test::assertTrue(provider.closeFailure() == null)
+  end
+end
+
+def main(): Void
+  let conninfo = host::environment("NERI_POSTGRES_CONNINFO")
+
+  test::assertTrue(conninfo != null)
+  if conninfo != null
+    verifyRecovery(conninfo)
+  end
+end

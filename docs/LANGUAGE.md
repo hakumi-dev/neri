@@ -409,6 +409,20 @@ its default arguments, then initializes the remaining fields in inheritance
 order. That initializer must accept zero supplied arguments. Intermediate
 classes cannot skip initialization.
 
+Within each class, field initializers run in declaration order before its
+constructor body. Scalar numeric, Boolean, String and optional fields have
+defaults of zero, false, empty String and null respectively. Other fields
+need an explicit initializer or an assignment on every normally completing
+constructor path. A branch that returns must initialize its fields before
+returning. Continuing branches and reachable loop exits join their initialized
+fields. A loop that can execute zero times cannot establish initialization by
+its body alone.
+
+During construction, field reads require initialization and constructor code
+cannot publish or capture `this` or dispatch to an overridable method. A call
+with a fixed target is allowed when its bound body and used default arguments
+can be checked against the same initialized fields.
+
 Constructors are always public. Declare them as `def init(...): Void` with no
 access modifier. Explicit `public` is unnecessary; `private`, `protected`, and
 `internal` conflict with constructor access. All explicit constructor access
@@ -575,11 +589,15 @@ specializations per template. It also permits 32 active generic class
 registrations, 64 levels of written type nesting, and canonical type arguments
 of at most 1024 UTF-8 bytes each. Ordinary recursion reuses its specialization.
 `NR222` identifies the limit that rejects a type or specialization request.
+The CLI, language server, and semantic sessions use the same limits during
+binding.
 
 `NR220` reports invalid generic declarations or type-argument counts. `NR221`
 reports arguments that remain unresolved or fail the safe value type rules.
 An inference position blocked by an erroneous argument can still be filled
 from another argument. Explicit type arguments retain their written types.
+The compiler keeps checking independent operands, repeated argument labels,
+and argument order after a rejected specialization.
 
 ## Closed alternatives
 

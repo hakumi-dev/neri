@@ -1,0 +1,194 @@
+use arrays
+use host
+use neri_data
+namespace neri_data_postgresql
+
+## Converts native wire text to the same canonical text used by portable codecs.
+def pgNativeScalarText(oid: Int, value: String): String?
+  if oid == 1700
+    let parsed = Decimal.parse(value)
+
+    return parsed == null ? null : parsed.text()
+  end
+  if oid == 1082
+    let parsed = DateOnly.parse(value)
+
+    return parsed == null || parsed.toText() != value ? null : value
+  end
+  if oid == 1083
+    let parsed = TimeOnly.parse(value)
+
+    if parsed == null
+      return null
+    end
+    let canonical = parsed.toText()
+
+    return (host::stringByteAt(canonical, 15) as Int) == 48 ? canonical : null
+  end
+  if oid == 1114 || oid == 1184
+    return pgNativeTimestampText(oid, value)
+  end
+  return null
+end
+
+def pgUtcOffsetSeconds(value: String, start: Int): Int?
+  let length = host::stringByteLength(value) - start
+  let sign = host::stringByteAt(value, start) as Int
+
+  if (sign != 43 && sign != 45) || (length != 3 && length != 6 && length != 9)
+    return null
+  end
+  let hour = calendarDigits(value, start + 1, 2)
+  var minute = 0
+  var second = 0
+
+  if length >= 6
+    if (host::stringByteAt(value, start + 3) as Int) != 58
+      return null
+    end
+    minute = calendarDigits(value, start + 4, 2)
+  end
+  if length == 9
+    if (host::stringByteAt(value, start + 6) as Int) != 58
+      return null
+    end
+    second = calendarDigits(value, start + 7, 2)
+  end
+  if hour < 0 || hour > 15 || minute < 0 || minute > 59 || second < 0 || second > 59
+    return null
+  end
+  return (sign == 45 ? -1 : 1) * (hour * 3600 + minute * 60 + second)
+end
+
+def pgNativeTimestampText(oid: Int, value: String): String?
+  let length = host::stringByteLength(value)
+
+  if length < 19 || length > 35 || (host::stringByteAt(value, 10) as Int) != 32
+    return null
+  end
+  var endTime = length
+  var offset = 0
+
+  if oid == 1184
+    endTime = 19
+    while endTime < length
+      let byte = host::stringByteAt(value, endTime) as Int
+
+      break if byte == 43 || byte == 45
+      endTime = endTime + 1
+    end
+    if endTime == length
+      return null
+    end
+    let parsedOffset = pgUtcOffsetSeconds(value, endTime)
+
+    if parsedOffset == null
+      return null
+    end
+    offset = parsedOffset
+  end
+  let parsed = DateTime.parse(host::stringSlice(value, 0, 10) + "T" + host::stringSlice(value, 11, endTime - 11) + "Z")
+
+  if parsed == null
+    return null
+  end
+  let canonical = parsed.toText()
+
+  if (host::stringByteAt(canonical, 26) as Int) != 48
+    return null
+  end
+  return calendarTicksText(calendarDateTimeTicks(canonical) - offset * 10000000)
+end
+
+def pgNativeScalarParameter(oid: Int, value: String): String?
+  if oid != 1114 && oid != 1184
+    return pgNativeScalarText(oid, value)
+  end
+  let parsed = DateTime.parse(value)
+
+  if parsed == null
+    return null
+  end
+  let canonical = parsed.toText()
+
+  if (host::stringByteAt(canonical, 26) as Int) != 48
+    return null
+  end
+  return oid == 1114 ? host::stringSlice(canonical, 0, 27) : canonical
+end
+
+## PostgreSQL's postgres interval style prints a pure duration as signed HH:MM:SS.
+def pgNativeIntervalTicks(value: String): Int?
+  let length = host::stringByteLength(value)
+
+  if length < 7 || length > 23
+    return null
+  end
+  let sign = host::stringByteAt(value, 0) as Int
+  let start = sign == 45 || sign == 43 ? 1 : 0
+  var separator = start
+
+  while separator < length && (host::stringByteAt(value, separator) as Int) != 58
+    separator = separator + 1
+  end
+  if separator == start || separator - start > 9 || separator + 6 > length || (host::stringByteAt(
+      value,
+      separator + 3
+    ) as Int) != 58
+    return null
+  end
+  let hours = calendarDigits(value, start, separator - start)
+  let minutes = calendarDigits(value, separator + 1, 2)
+  let seconds = calendarDigits(value, separator + 4, 2)
+
+  if hours < 0 || hours > 256204778 || minutes < 0 || minutes > 59 || seconds < 0 || seconds > 59
+    return null
+  end
+  let fractionLength = length - separator - 6
+  var fraction = 0
+
+  if fractionLength > 0
+    if fractionLength < 2 || fractionLength > 7 || (host::stringByteAt(value, separator + 6) as Int) != 46
+      return null
+    end
+    fraction = calendarDigits(value, separator + 7, fractionLength - 1)
+    if fraction < 0
+      return null
+    end
+    var width = fractionLength - 1
+
+    while width < 6
+      fraction = fraction * 10
+      width = width + 1
+    end
+  end
+  let micros = (hours * 3600 + minutes * 60 + seconds) * 1000000 + fraction
+
+  if micros > 922337203685477580
+    return null
+  end
+  return (sign == 45 ? -micros : micros) * 10
+end
+
+def pgNativeIntervalParameter(ticks: Int, precision: Int = 6): Byte[]?
+  if !postgresNativeIntervalFits(ticks, precision)
+    return null
+  end
+  let micros = ticks / 10
+  # Binary interval is signed microseconds, then zero days and months.
+  let bytes = arrays::generate<Byte>(16) do |index|
+    return 0 as Byte
+  end
+  var remaining = micros < 0 ? -(micros + 1) : micros
+  var position = 7
+
+  while position >= 0
+    let rest = remaining / 256
+    let byte = remaining - rest * 256
+
+    bytes[position] = (micros < 0 ? 255 - byte : byte) as Byte
+    remaining = rest
+    position = position - 1
+  end
+  return bytes
+end

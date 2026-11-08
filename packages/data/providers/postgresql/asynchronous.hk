@@ -529,6 +529,8 @@ class PostgreSQLAsyncMigration: AsyncMigrationDriver
   private applied: Int = 0
   private changed: Int = 0
   private operationIndex: Int = 0
+  private outsideSql: String = ""
+  private progress: MigrationProgress?
   private terminal: MigrationResult?
   private failure: MigrationFailure?
   private cancelled: Bool = false
@@ -604,10 +606,28 @@ class PostgreSQLAsyncMigration: AsyncMigrationDriver
     return this.control(AsyncTransactionAction.Rollback(this.lease), 7)
   end
 
-  private def history(cursor: PostgreSQLCommandCursor): MigrationFailure?
+  private def readHistory(phase: Int): AsyncMigrationPoll
+    let columns = new ResultColumns([
+        new ResultColumn("ordinal", ResultColumnKind.Int()),
+        new ResultColumn("id", ResultColumnKind.Text()),
+        new ResultColumn("signature", ResultColumnKind.Text())
+      ])
+
+    this.cursor = PostgreSQLCommandCursor.start(
+      this.owner,
+      pgMigrationHistorySql(),
+      new WriteValues(),
+      columns,
+      history: true
+    )
+    this.phase = phase
+    return AsyncMigrationPoll.Pending(-1, AsyncInterest.Write())
+  end
+
+  private def history(cursor: PostgreSQLCommandCursor, expected: readonly MigrationProgress? = null): MigrationFailure?
     let rows = cursor.historyRows()
 
-    if rows == null || rows.count() > 1000
+    if rows == null || rows.count() > 1001
       return MigrationFailure.Drift("PostgreSQL migration history exceeds catalog bounds")
     end
     let stamps = arrays::generate<MigrationStamp>(rows.count()) do |index|
@@ -615,6 +635,7 @@ class PostgreSQLAsyncMigration: AsyncMigrationDriver
     end
     var current = rows.first()
     var index = 0
+    var pending: MigrationProgress? = null
 
     while current != null
       var ordinal = -1
@@ -660,17 +681,77 @@ class PostgreSQLAsyncMigration: AsyncMigrationDriver
           end
         case CellLookup.Missing()
       end
-      if ordinal != index + 1
+      if ordinal == 0 && index == 0 && pending == null
+        let marker = parseMigrationProgress(id, signature)
+
+        if marker == null
+          return MigrationFailure.Drift("PostgreSQL migration recovery marker is invalid")
+        end
+        if expected == null
+          return migrationPendingFailure(marker)
+        end
+        pending = marker
+      else if ordinal != index + 1
         return MigrationFailure.Drift("PostgreSQL migration history ordinal is not contiguous")
+      else
+        stamps[index] = new MigrationStamp(id, signature)
+        index = index + 1
       end
-      stamps[index] = new MigrationStamp(id, signature)
-      index = index + 1
       current = current.next
     end
-    let drift = this.catalog.historyPrefix(stamps)
+    if expected != null && (pending == null || !pending.sameAttempt(expected))
+      return MigrationFailure.Drift("migration recovery attempt does not match the journal")
+    end
+    var applied = stamps
 
-    this.applied = stamps.Length
+    if pending != null
+      applied = arrays::generate<MigrationStamp>(index) do |position|
+        return stamps[position]
+      end
+    end
+    let drift = this.catalog.historyPrefix(applied)
+
+    this.applied = applied.Length
     return drift == null ? null : MigrationFailure.Drift(drift)
+  end
+
+  private def interrupted(): Bool
+    let token = this.token
+
+    return this.cancelled || (token != null && token.cancelled()) || streamTimedOut(this.deadline)
+  end
+
+  private def committing(): Bool
+    return this.phase == 6 || this.phase == 10
+  end
+
+  private def stamp(ordinal: Int, value: readonly MigrationStamp?, phase: Int): AsyncMigrationPoll
+    return this.command(pgMigrationStampSql(value), phase, pgMigrationStampValues(ordinal, value))
+  end
+
+  private def claimOutsideTransaction(): AsyncMigrationPoll
+    if this.target != this.applied + 1 && this.target != this.applied - 1
+      return this.recover(MigrationFailure.Validation("an outside-transaction migration must be the only selected migration"))
+    end
+    let forward = this.applied < this.target
+    let migration = this.catalog.at(forward ? this.applied : this.target)
+
+    if migration == null
+      return this.recover(MigrationFailure.Validation("migration catalog has a missing entry"))
+    end
+    match compileOutsideMigration(migration, forward, SqlDialect.PostgreSql())
+      case SchemaCompileResult.Failure(message)
+        return this.recover(MigrationFailure.Validation(message))
+      case SchemaCompileResult.Statement(sql)
+        let progress = createMigrationProgress(migration, forward)
+
+        if progress == null
+          return this.recover(MigrationFailure.Provider(ProviderFailure.State("cannot create migration attempt identifier")))
+        end
+        this.progress = progress
+        this.outsideSql = sql
+        return this.stamp(0, progress.marker(), 9)
+    end
   end
 
   public override def poll(): AsyncMigrationPoll
@@ -679,9 +760,7 @@ class PostgreSQLAsyncMigration: AsyncMigrationDriver
     if terminal != null
       return AsyncMigrationPoll.Completed(terminal)
     end
-    let token = this.token
-
-    if this.phase != 6 && this.phase != 7 && (this.cancelled || (token != null && token.cancelled()) || streamTimedOut(this.deadline))
+    if !this.committing() && this.phase != 7 && this.interrupted()
       this.close()
       let stopped = this.terminal
 
@@ -698,7 +777,7 @@ class PostgreSQLAsyncMigration: AsyncMigrationDriver
           return AsyncMigrationPoll.Pending(socket, interest)
         case PostgreSQLCommandPoll.Failure(error)
           this.cursor = null
-          if this.phase == 6 && !this.owner.supports(ProviderCapability.BoundedTypedReads())
+          if this.committing() && !this.owner.supports(ProviderCapability.BoundedTypedReads())
             return this.complete(MigrationResult.Failure(MigrationFailure.Provider(ProviderFailure.State("PostgreSQL migration commit outcome is unknown after connection loss: " + providerFailureMessage(error)))))
           end
           if this.phase == 7
@@ -727,32 +806,17 @@ class PostgreSQLAsyncMigration: AsyncMigrationDriver
             end
           end
           if this.phase == 1
-            return this.command(
-              "DO $$BEGIN PERFORM pg_advisory_xact_lock(1852142185); END$$; CREATE TABLE IF NOT EXISTS __neri_migrations (ordinal BIGINT PRIMARY KEY, id TEXT NOT NULL, signature TEXT NOT NULL)",
-              2,
-              script: true
-            )
+            return this.command(pgMigrationSetupSql(), 2, script: true)
           else if this.phase == 2
-            let columns = new ResultColumns([
-                new ResultColumn("ordinal", ResultColumnKind.Int()),
-                new ResultColumn("id", ResultColumnKind.Text()),
-                new ResultColumn("signature", ResultColumnKind.Text())
-              ])
-
-            this.cursor = PostgreSQLCommandCursor.start(
-              this.owner,
-              "SELECT ordinal, id, signature FROM __neri_migrations ORDER BY ordinal LIMIT 1001",
-              new WriteValues(),
-              columns,
-              history: true
-            )
-            this.phase = 3
-            return AsyncMigrationPoll.Pending(-1, AsyncInterest.Write())
+            return this.readHistory(3)
           else if this.phase == 3
             let drift = this.history(cursor)
 
             if drift != null
               return this.recover(drift)
+            end
+            if migrationRangeHasOutsideTransaction(this.catalog, this.applied, this.target)
+              return this.claimOutsideTransaction()
             end
           else if this.phase == 4
             return this.nextOperation()
@@ -773,6 +837,51 @@ class PostgreSQLAsyncMigration: AsyncMigrationDriver
             let primary = this.failure
 
             return this.complete(MigrationResult.Failure(primary == null ? MigrationFailure.Provider(ProviderFailure.State("PostgreSQL migration rolled back")) : primary))
+          else if this.phase == 9
+            if count != 1
+              return this.recover(MigrationFailure.Drift("PostgreSQL migration recovery marker write count mismatch"))
+            end
+            return this.control(AsyncTransactionAction.Commit(this.lease), 10)
+          else if this.phase == 10
+            this.lease = 0
+            if this.interrupted()
+              return this.complete(MigrationResult.Failure(MigrationFailure.Provider(pgInterrupted("async.migration"))))
+            end
+            return this.command(this.outsideSql, 11)
+          else if this.phase == 11
+            return this.control(AsyncTransactionAction.Begin(), 12)
+          else if this.phase == 12
+            return this.command(pgMigrationSetupSql(), 13, script: true)
+          else if this.phase == 13
+            return this.readHistory(14)
+          else if this.phase == 14
+            let expected = this.progress
+
+            if expected == null
+              return this.recover(MigrationFailure.Drift("migration recovery attempt is missing"))
+            end
+            let drift = this.history(cursor, expected)
+
+            if drift != null
+              return this.recover(drift)
+            end
+            let ordinal = migrationRecoveryOrdinal(this.catalog, this.applied, expected)
+
+            if ordinal < 1
+              return this.recover(MigrationFailure.Drift("migration recovery does not match the catalog boundary"))
+            end
+            return this.stamp(ordinal, expected.forward() ? expected.stamp() : null, 15)
+          else if this.phase == 15
+            if count != 1
+              return this.recover(MigrationFailure.Drift("PostgreSQL migration stamp write count mismatch"))
+            end
+            return this.stamp(0, null, 16)
+          else if this.phase == 16
+            if count != 1
+              return this.recover(MigrationFailure.Drift("PostgreSQL migration recovery marker delete count mismatch"))
+            end
+            this.changed = 1
+            return this.control(AsyncTransactionAction.Commit(this.lease), 6)
           end
       end
     end
@@ -794,18 +903,7 @@ class PostgreSQLAsyncMigration: AsyncMigrationDriver
     let count = forward ? migration.upCount() : migration.downCount()
 
     if this.operationIndex == count
-      let values = new WriteValues()
-
-      values.add(Cell.Int(index + 1))
-      if forward
-        values.add(Cell.Text(migration.id()))
-        values.add(Cell.Text(migration.signature()))
-      end
-      return this.command(
-        forward ? "INSERT INTO __neri_migrations(ordinal,id,signature) VALUES($1,$2,$3)" : "DELETE FROM __neri_migrations WHERE ordinal=$1",
-        5,
-        values
-      )
+      return this.stamp(index + 1, forward ? new MigrationStamp(migration.id(), migration.signature()) : null, 5)
     end
     let operation = forward ? migration.upAt(this.operationIndex) : migration.downAt(this.operationIndex)
 
@@ -847,7 +945,7 @@ class PostgreSQLAsyncMigration: AsyncMigrationDriver
       this.owner.abortOperation()
       let primary = this.failure
 
-      if this.phase == 6
+      if this.committing()
         let unknown = MigrationFailure.Provider(ProviderFailure.State("PostgreSQL migration commit outcome is unknown because the operation was closed before its response"))
 
         this.terminal = MigrationResult.Failure(unknown)
