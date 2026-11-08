@@ -571,12 +571,14 @@ return annotation or an expected result type at the call site. `null` and an
 untyped empty array alone do not determine a type parameter. Conflicting arguments
 produce a type error; inference introduces no numeric or unchecked conversions.
 
-Signatures name every parameter and return type. Each used specialization is
-type-checked with concrete arguments, including its body and initializers, and
-compiled once per compilation module. Unconstrained generic bodies are checked when
-specialized. Type parameters accept safe value types; `Void`, raw pointers and
-unresolved types cannot be type arguments. The entry point and C ABI imports have
-concrete signatures.
+Signatures name every parameter and return type. The compiler checks every
+generic definition with opaque type parameters, including unused definitions.
+It checks each used specialization again with concrete arguments, including its
+body and initializers, and compiles it once per compilation module. Type
+parameters accept safe value types. `Void`, raw pointers and unresolved types
+cannot be type arguments. The entry point and C ABI imports have concrete
+signatures.
+
 
 ### Generic contracts
 
@@ -596,9 +598,10 @@ end
 Each requirement is a unique public, safe instance signature with no body,
 defaults, abstract or static modifier, or type parameters. A requirement can use
 `Self`, `Self?`, or `Self[]`; a nested generic use such as `Box<Self>` is not supported.
-A contract itself has no type parameters. A generic class or module function
-may put one structural contract or nominal interface after each type parameter's colon.
-Compiler operations retain their fixed signatures.
+A contract itself has no type parameters. A generic class, module function, or
+method may put one bound after each type parameter's colon. A bound may name a
+structural contract, a nominal interface, or the `class` kind. Compiler
+operations retain their fixed signatures.
 
 Requirements match structurally. An implementing class supplies an accessible
 public instance method with the exact parameter and result types after replacing
@@ -620,14 +623,21 @@ implementations and source classes are checked against the same requirement.
 states callable shape only; it does not promise algebraic laws such as
 reflexivity, symmetry, or transitivity.
 
-The compiler checks constrained declarations even when the program never
-specializes them. It treats all their type parameters as opaque and makes the
-declared requirements available to the body. For a class this includes its base
-type, fields, initializers, and ordinary methods. A bound can satisfy a
-requirement on another generic class or function used in the declaration.
-Concrete specializations check their arguments against the same requirements.
-Unconstrained generic templates and independently generic methods check their
-bodies at specialization time.
+The compiler checks definitions using the evidence declared for each opaque type
+parameter. For a class this covers its base type, fields, initializers, and
+methods, including methods that introduce their own parameters. A bound can
+satisfy a requirement on another generic class or function used in a definition.
+Each concrete specialization also checks its arguments against the requirements.
+
+`T: class` accepts ordinary mutable, non-null managed class types. It permits
+managed reference identity and casts where the other operands meet their
+intrinsic requirements. Values, arrays, readonly and optional views, resources,
+and interface types do not satisfy this bound. It supplies no members,
+constructors, equality operation, or nominal interface implementation.
+
+In a generic definition, `element of T` represents the element of an opaque
+type. With a concrete array or optional type it resolves to the inner type.
+With a concrete unwrapped type it resolves to that type.
 
 Neri follows the idea of checking generic bodies against declared requirements
 and checking bounds again when a concrete type is supplied. The source rules
