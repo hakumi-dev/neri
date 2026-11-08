@@ -115,13 +115,13 @@ from local effects and adding only required bits yields the least fixed point.
 This is a finite monotone dataflow analysis; the general foundation is
 [Kildall's global analysis framework (1973)](https://doi.org/10.1145/512927.512945).
 
-For `V` functions and `E` call edges, propagation takes `O(V + 8E)` work and
-scratch storage takes `O(V + E)`. Building the reverse graph still uses linear
-name lookup and can take `O(VE)` work. These bounds describe this pass, not the
-whole compiler. Queue and reverse-edge state are private to analysis and are
-absent from serialized IR. Read/write summaries do not distinguish local mutable
-state from shared state and are not a proof that a closure is safe to run on
-another thread.
+The solver indexes functions in module order, keeping the first function for
+each symbol name. Graph construction resolves each callee through this index.
+For `V` functions and `E` call edges, propagation takes `O(V + 8E)` work
+after graph construction. The graph and index use `O(V + E)` scratch storage.
+The index, queue and reverse edges are private to analysis. Serialized IR stores
+the inferred effect summaries, whose read/write bits cover both local mutable
+and shared state.
 
 `compiler/ir/parallel.hk` checks the `parallel fn` effect contract using the same
 worklist solver. Its compiler-local graph preserves receiver types before IR
