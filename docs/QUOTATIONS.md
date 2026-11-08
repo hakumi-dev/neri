@@ -65,7 +65,10 @@ quotation signature produce compile-time diagnostics.
 
 ## Expression and capture contract
 
-The body contains one `return` expression. Supported bound operations are
+The body supplies one expression. Use `return` or a final direct expression
+when the result type is declared or supplied by context. When inferring the
+result from the body, use an expression lambda or a single explicit `return`.
+Supported bound operations are
 parameter reads, field reads, scalar captures, `Int`, `Float`, `Bool`, `String` and null
 literals, primitive comparisons, Boolean conjunction and disjunction, Boolean
 negation, numeric negation and numeric `+`, `-`, `*` and `/` on operands of the
