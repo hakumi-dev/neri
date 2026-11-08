@@ -2,6 +2,7 @@ use host
 namespace neri_data
 
 class SchemaScaffoldOptions
+  public tables: String[] = []
   public modelNamespace: String = "scaffolded_model"
   public dataNamespace: String = "scaffolded_data"
   public context: String = "ScaffoldedContext"
@@ -25,6 +26,7 @@ class SchemaScaffoldColumn
   public computedStored: Bool
   public checkSql: String?
   public collation: String?
+  public postgresqlType: String?
 
   def init(
     table: String,
@@ -39,7 +41,8 @@ class SchemaScaffoldColumn
     computedSql: String? = null,
     computedStored: Bool = true,
     checkSql: String? = null,
-    collation: String? = null
+    collation: String? = null,
+    postgresqlType: String? = null
   ): Void
     this.table = table
     this.name = name
@@ -54,6 +57,7 @@ class SchemaScaffoldColumn
     this.computedStored = computedStored
     this.checkSql = checkSql
     this.collation = collation
+    this.postgresqlType = postgresqlType
   end
 end
 
@@ -176,6 +180,67 @@ def scaffoldInitialValue(column: readonly SchemaScaffoldColumn): String
   return column.type == "String" ? "\"\"" : "new ByteBuffer(33554432, 0)"
 end
 
+def scaffoldSelectionNameValid(table: String): Bool
+  return host::stringByteLength(table) <= 63 && identifierValid(table)
+end
+
+def scaffoldSelectionFailure(options: readonly SchemaScaffoldOptions?): ProviderFailure?
+  if options == null
+    return null
+  end
+  if options.tables.Length > 1000
+    return ProviderFailure.State("schema scaffolding exceeds 1000 selected tables")
+  end
+  var index = 0
+
+  for table in options.tables
+    if !scaffoldSelectionNameValid(table)
+      return ProviderFailure.State("schema scaffolding selected table identifier is invalid")
+    end
+    var earlier = 0
+
+    while earlier < index
+      if options.tables[earlier] == table
+        return ProviderFailure.State("schema scaffolding has a duplicate selected table: " + table)
+      end
+      earlier = earlier + 1
+    end
+    index = index + 1
+  end
+  return null
+end
+
+## Provider entries report invalid selections. This builder validates its SQL fragments.
+def scaffoldSelectionSql(options: readonly SchemaScaffoldOptions?, column: String): String
+  if options == null || options.tables.Length == 0
+    return ""
+  end
+  if options.tables.Length > 1000 || (column != "s.name" && column != "s.tbl_name" && column != "f.\"table\"" && column != "c.relname" && column != "p.relname")
+    return " AND 1=0"
+  end
+  var values = ""
+
+  for table in options.tables
+    if !scaffoldSelectionNameValid(table)
+      return " AND 1=0"
+    end
+    values = values + (values == "" ? "" : ",") + "'" + table + "'"
+  end
+  return " AND " + column + " IN (" + values + ")"
+end
+
+def scaffoldTableSelected(options: readonly SchemaScaffoldOptions, table: String): Bool
+  if options.tables.Length == 0
+    return true
+  end
+  for selected in options.tables
+    if selected == table
+      return true
+    end
+  end
+  return false
+end
+
 def scaffoldSchema(
   columns: readonly SchemaScaffoldColumn[],
   options: SchemaScaffoldOptions? = null,
@@ -190,12 +255,37 @@ def scaffoldSchema(
   if columns.Length > 1000 || references.Length > 1000 || indexes.Length > 1000
     return SchemaScaffoldResult.Failure(ProviderFailure.State("schema scaffolding exceeds 1000 columns"))
   end
+  let invalidSelection = scaffoldSelectionFailure(settings)
+
+  if invalidSelection != null
+    return SchemaScaffoldResult.Failure(invalidSelection)
+  end
+
+  for selected in settings.tables
+    var found = false
+
+    for column in columns
+      if column.table == selected
+        found = true
+      end
+    end
+    if !found
+      return SchemaScaffoldResult.Failure(ProviderFailure.State("schema scaffolding selected table was not found: " + selected))
+    end
+  end
   var source = "use buffers\nnamespace " + settings.modelNamespace + "\n\n# Database scaffolding preserves query/write and database schema metadata.\n"
   var entities = ""
   var index = 0
 
   while index < columns.Length
     let table = columns[index].table
+
+    if !scaffoldTableSelected(settings, table)
+      while index < columns.Length && columns[index].table == table
+        index = index + 1
+      end
+      continue
+    end
     let entity = scaffoldIdentifier(table, "Entity_")
     let set = scaffoldIdentifier(table, "set_")
     let start = index
@@ -207,13 +297,13 @@ def scaffoldSchema(
     var earlier = 0
 
     while earlier < start
-      if schemaSameIdentifier(
-        columns[earlier].table,
-        table
-      ) || scaffoldIdentifier(
-        columns[earlier].table,
-        "Entity_"
-      ) == entity
+      if scaffoldTableSelected(settings, columns[earlier].table) && (schemaSameIdentifier(
+          columns[earlier].table,
+          table
+        ) || scaffoldIdentifier(
+          columns[earlier].table,
+          "Entity_"
+        ) == entity)
         return SchemaScaffoldResult.Failure(ProviderFailure.State("schema scaffolding has a relation identifier collision or noncontiguous relation"))
       end
       earlier = earlier + 1
@@ -299,7 +389,7 @@ def scaffoldSchema(
       if !keyless && column.keyPosition == 0 && column.generatedOnAdd
         fields = fields + ",\"valueGeneration\":" + scaffoldJson(column.generatedOnUpdate ? "onAddOrUpdate" : "onAdd")
       end
-      for facet in ["defaultSql", "computedSql", "checkSql", "collation"]
+      for facet in ["defaultSql", "computedSql", "checkSql", "collation", "postgresqlType"]
         var value: String? = null
 
         if facet == "defaultSql" && column.keyPosition == 0 && column.computedSql == null
@@ -310,6 +400,8 @@ def scaffoldSchema(
           value = column.checkSql
         else if facet == "collation"
           value = column.collation
+        else if facet == "postgresqlType"
+          value = column.postgresqlType
         end
         if value != null
           fields = fields + "," + scaffoldJson(facet) + ":" + scaffoldJson(value)
@@ -357,11 +449,13 @@ def scaffoldSchema(
       end
     end
     entities = entities + (indexJson == "" ? "" : ",\"indexes\":[" + indexJson + "]") + "}"
-
   end
   var relations = ""
 
   for reference in references
+    if !scaffoldTableSelected(settings, reference.table) || !scaffoldTableSelected(settings, reference.parent)
+      continue
+    end
     if reference.fields.Length == 0 || reference.fields.Length != reference.keys.Length || !schemaTableValid(reference.table) || !schemaTableValid(reference.parent) || (reference.deleteBehavior != "NO ACTION" && reference.deleteBehavior != "RESTRICT" && reference.deleteBehavior != "CASCADE" && reference.deleteBehavior != "SET NULL")
       return SchemaScaffoldResult.Failure(ProviderFailure.State("schema scaffolding has invalid foreign-key metadata"))
     end

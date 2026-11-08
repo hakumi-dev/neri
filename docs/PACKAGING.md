@@ -51,12 +51,18 @@ are preserved. The manifest declares module membership through library units;
 compilation, editor analysis, sessions and documentation share its resolution.
 
 Neri Data is distributed as source projects under `share/neri/data`, with its
-SQLite adapter in `share/neri/data/sqlite`. The native `neri-data-generate` and
+SQLite adapter in `share/neri/data/sqlite` and PostgreSQL adapter in
+`share/neri/data-postgresql`. The root Ito package exports `runtime` and
+`sqlite`; the separate `neri-data-postgresql` package exports `postgresql` and
+depends on that root package. The native `neri-data-generate` and
 `neri-data-migration` commands use the matching installed standard library.
 `examples/data-consumer` provides a mapped SQLite application for the installed
 generator and migration commands. The package gate copies this example and the
 installed Data sources into a writable relocated directory, generates and compiles
 the consumer, and checks migration, persistence and filtered navigation behavior.
+It also builds and runs the copied PostgreSQL consumer against the platform's
+libpq without requiring a database server. SQLite-only consumers do not link
+the PostgreSQL client library.
 See [Neri Data](DATA.md) for the supported API and bounds.
 
 The driver creates two separate trees, normalizes permissions and timestamps,

@@ -6,7 +6,8 @@ other sockets can be registered with an event loop. Polling never waits for
 network or database I/O. PostgreSQL sends commands through nonblocking libpq;
 SQLite runs database work on the session's isolated worker heap.
 
-`Query<T>.executeDeleteAsync`, `executeUpdateAsync` and `executeUpdateSetAsync`
+`Query<T>.executeDeleteAsync`, `executeUpdateAsync`, `executeUpdateSetAsync`
+and `executeUpdateMappedCellAsync`
 return `Result<AsyncWrite, WriteFailure>`. Set writes report the actual affected
 row count, including zero. They preserve tracked instances and original
 snapshots. A query bound to a change context uses that context's active lease

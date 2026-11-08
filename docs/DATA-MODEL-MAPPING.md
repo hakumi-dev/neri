@@ -168,7 +168,7 @@ their current contents as JSON text.
 
 A keyed root can declare `hierarchy` with `strategy: "tph"`, a
 `discriminatorColumn`, its own discriminator `value`, and `derivedTypes` entries.
-Each entry names an accessible concrete subclass, its distinct `value`,
+Each entry names an accessible subclass, its distinct `value`,
 and its additional mapped `columns`. The root set owns the shared table and key;
 subtypes use the root set rather than separate sets.
 
@@ -189,8 +189,9 @@ Nested descendants register after their mapped base and inherit its mapped
 fields. Roots and intermediate nodes may be abstract; their constructors are
 never used for materialization. `ofType_BaseSubtype()` includes its registered
 concrete descendants. Subtype navigation fields and subtype store-generated
-values require additional contracts. Hierarchy seeds require a discriminator
-model and are rejected by the current mapping parser.
+values require additional contracts. Concrete roots and derived entries accept
+`seeds` with inherited and local mapped values. The mapping supplies the
+discriminator and checks assigned keys across the whole hierarchy.
 
 `strategy: "tpt"` gives every mapped descendant a distinct `table`. Reads join
 all hierarchy tables and choose the deepest concrete node. The root owns shared
@@ -314,10 +315,14 @@ including flattened member paths. Every row supplies the complete assigned
 primary key and all required fields without defaults. Optional fields and fields
 with defaults may be omitted. Scalar values use their model JSON types; Decimal
 uses an exact decimal string, and binary values use `{"hex":"00ff"}`.
-Boolean storage conversion also applies to seed values.
+Boolean storage conversion also applies to seed values. Omit computed fields
+and supply required fields that have no literal or SQL default.
 
 Schema emission and migration snapshots preserve logical field identities and
 typed values, including null and binary data. Migration source preserves
 `InsertData`, `UpdateData`, and `DeleteData` operations and their parameters.
 Rows are bounded to 1000 per entity and binary seed values to 1048576 bytes.
+For inheritance, declare each row on its concrete type. TPH inserts a row in
+the shared table, TPT inserts rows along the root-to-concrete table path, and
+TPC inserts a row in the concrete table.
 The seed migration dependency rules are described in [seed data](DATA-SEEDING.md).

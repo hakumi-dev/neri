@@ -30,6 +30,7 @@ class SchemaColumn
   private storedComputedStored: Bool
   private storedCheckSql: String?
   private storedCollation: String?
+  private storedPostgresqlType: String?
 
   def init(
     name: String,
@@ -43,7 +44,8 @@ class SchemaColumn
     computedSql: String? = null,
     computedStored: Bool = true,
     checkSql: String? = null,
-    collation: String? = null
+    collation: String? = null,
+    postgresqlType: String? = null
   ): Void
     this.storedName = name
     this.storedType = type
@@ -57,6 +59,7 @@ class SchemaColumn
     this.storedComputedStored = computedStored
     this.storedCheckSql = checkSql
     this.storedCollation = collation
+    this.storedPostgresqlType = postgresqlType
   end
 
   public readonly def name(): String
@@ -105,6 +108,10 @@ class SchemaColumn
 
   public readonly def collation(): String?
     return this.storedCollation
+  end
+
+  public readonly def postgresqlType(): String?
+    return this.storedPostgresqlType
   end
 end
 
@@ -244,11 +251,35 @@ def schemaColumnFacetsCode(column: readonly SchemaColumn): String
   let computedSql = column.computedSql()
   let checkSql = column.checkSql()
   let collation = column.collation()
+  let postgresqlType = column.postgresqlType()
+  let storageCode = postgresqlType == null ? "" : "P1" + schemaPiece(postgresqlType)
 
   if defaultSql == null && computedSql == null && checkSql == null && collation == null
-    return ""
+    return storageCode
   end
-  return "E1" + schemaPiece(defaultSql == null ? "" : defaultSql) + schemaPiece(computedSql == null ? "" : computedSql) + (column.computedStored() ? "1" : "0") + schemaPiece(checkSql == null ? "" : checkSql) + schemaPiece(collation == null ? "" : collation)
+  return "E1" + schemaPiece(defaultSql == null ? "" : defaultSql) + schemaPiece(computedSql == null ? "" : computedSql) + (column.computedStored() ? "1" : "0") + schemaPiece(checkSql == null ? "" : checkSql) + schemaPiece(collation == null ? "" : collation) + storageCode
+end
+
+## Physical PostgreSQL types that use the existing portable result codecs.
+def schemaPostgresStorageType(value: String): SchemaType?
+  if value == "smallint" || value == "integer"
+    return SchemaType.Int()
+  end
+  if value == "real"
+    return SchemaType.Float()
+  end
+  if value == "character varying"
+    return SchemaType.Text()
+  end
+  let length = host::stringByteLength(value)
+
+  if length < 20 || length > 27 || !value.startsWith("character varying(") || !value.endsWith(")")
+    return null
+  end
+  let lengthText = host::stringSlice(value, 18, length - 19)
+  let limit = host::parseInt(lengthText)
+
+  return limit != null && limit > 0 && limit <= 10485760 && (limit as String) == lengthText ? SchemaType.Text() : null
 end
 
 ## Authored DDL accepts one bounded expression with balanced delimiters and literals.
@@ -343,7 +374,8 @@ def schemaCloneColumn(column: readonly SchemaColumn): SchemaColumn
     column.computedSql(),
     column.computedStored(),
     column.checkSql(),
-    column.collation()
+    column.collation(),
+    column.postgresqlType()
   )
 end
 
@@ -685,6 +717,9 @@ def schemaRebuildValidation(before: readonly SchemaTable, after: readonly Schema
       end
       let previous = before.find(target.identity())
 
+      if previous != null && previous.column().postgresqlType() != target.column().postgresqlType()
+        return "changing a physical PostgreSQL column type requires explicit migration SQL"
+      end
       if previous != null && previous.column().name() != target.column().name() && schemaSameIdentifier(
         previous.column().name(),
         target.column().name()
@@ -740,8 +775,12 @@ def schemaOperationValidation(op: readonly SchemaOp): String?
     case SchemaOp.RebuildTable(before, after)
       return schemaRebuildValidation(before, after)
     case SchemaOp.CreateTable(table, columns)
+      for column in columns
+        dialect = SqlDialect.PostgreSql() if column.postgresqlType() != null
+      end
     case SchemaOp.DropTable(table)
     case SchemaOp.AddColumn(table, column)
+      dialect = SqlDialect.PostgreSql() if column.postgresqlType() != null
     case SchemaOp.DropColumn(table, column)
     case SchemaOp.RenameTable(from, to)
     case SchemaOp.RenameColumn(table, from, to)
@@ -1019,10 +1058,20 @@ def schemaColumnSql(
       end
       kind = postgres ? "BYTEA" : "BLOB"
   end
+  let postgresqlType = column.postgresqlType()
+
+  if postgresqlType != null
+    let storage = schemaPostgresStorageType(postgresqlType)
+
+    if !postgres || storage == null || schemaTypeCode(storage) != schemaTypeCode(column.type())
+      return SchemaCompileResult.Failure("physical PostgreSQL type requires a compatible PostgreSQL column")
+    end
+    kind = postgresqlType
+  end
   var sql = schemaQuote(column.name()) + " " + kind
 
   if collation != null
-    if kind != "TEXT"
+    if schemaTypeCode(column.type()) != schemaTypeCode(SchemaType.Text())
       return SchemaCompileResult.Failure("collation requires a text column")
     end
     sql = sql + " COLLATE " + schemaQuote(collation)

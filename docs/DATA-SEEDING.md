@@ -8,6 +8,14 @@ arrays and binary values. Canonical ordering makes signatures independent of row
 field input order. Duplicate keys, unknown fields, mismatched types, null keys and
 missing required values are rejected before any migration executes.
 
+Hierarchy seed rows belong to a concrete root or a `derivedTypes` entry and
+provide the assigned key and mapped values, including inherited fields. Keys
+are unique across the hierarchy. TPH stores the concrete discriminator and
+writes NULL to writable fields of other branches. TPT repeats the key in each
+table on the type's ancestor path and stores each non-key value in its declaring
+table. TPC stores the full row in the concrete table. Generated schema metadata
+and migration scaffolding use the same physical tables and seed layout.
+
 `diffSchema` produces parameterized `InsertData`, `UpdateData` and `DeleteData`
 operations in both directions. It deletes removed rows before schema changes and
 applies inserted/updated rows after them. Seed tables follow foreign-key dependency

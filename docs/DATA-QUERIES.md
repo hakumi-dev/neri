@@ -53,9 +53,10 @@ including shadow and indexer properties. The value uses the property's storage
 type. Mapping validation resolves the logical name and checks the value; property
 names are never inserted into SQL directly.
 
-`executeUpdateMappedCell(logicalName, value)` writes one declared logical
-property from a validated storage cell. It rejects primary-key changes and uses
-the complete query pipeline to select the affected keys.
+`executeUpdateMappedCell(logicalName, value)` and its owned async counterpart
+`executeUpdateMappedCellAsync` write one declared logical property from a
+validated storage cell. The complete query pipeline selects the affected keys.
+Primary keys are immutable.
 
 `UpdateSet<T>` combines typed SQL assignments for `executeUpdateSet` and
 `executeUpdateSetAsync`. Use `setString`, `setOptionalString`, `setNumeric` and
@@ -65,9 +66,12 @@ it captures the encoded value once and copies binary storage. Converted targets
 require this explicit encoder API. Assignments preserve SQL NULL and validate
 required values, numeric bounds and finite Float results.
 
-Set writes target one physical table. A TPT update may assign base-table fields
-while selecting keys through predicates on the joined read source. Assignments
-and computed values that depend on another physical table fail before SQL.
+Set writes target one physical table. In a TPT hierarchy, typed setters update
+base-table fields. A mapped-cell setter can also update a column on its owning
+descendant table. For example, a query over all employees can filter by a root
+field and set a manager-only column. The affected count includes only selected
+employees with a manager row. Computed setters require all referenced fields on
+the base table.
 Segmented inheritance deletion and TPC mappings that select a table per entity
 use tracked writes.
 

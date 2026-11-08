@@ -29,7 +29,7 @@ projections; unmapped physical columns do not participate in that comparison.
 
 | Terminal | Result | Limit and tracking |
 | --- | --- | --- |
-| `all()` | `QueryResult<T>` | Requires a bound in the pipeline; materializes bounded rows and tracks generated entities. |
+| `all()` | `QueryResult<T>` | Buffers explicitly bounded queries and collects streaming reads for unbounded queries. Reads through the generated context's bound provider track entities. |
 | `stream(visitor, options)` | `StreamResult` | Visits untracked decoded rows synchronously; unbounded input is allowed. Supports explicit stop, cooperative cancellation, and provider deadlines. |
 | `first()` | `QueryValue<T?>` | Reads at most one entity, tracks it, and returns null for an empty result. This has first-or-default semantics. |
 | `firstOrDefault()` | `QueryValue<T?>` | Explicitly named alias for `first`. |
