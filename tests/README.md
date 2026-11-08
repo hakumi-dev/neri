@@ -49,6 +49,7 @@ test main must construct the same suite when reinvoked as a child.
 The hello and functions programs in `examples/` run as language cases. The package
 gate additionally checks the documented arguments example through the installed
 launcher. These checks keep the getting-started commands executable.
+[Data contracts and fixtures](data/README.md) live in the Data test projects.
 The full gate also builds SQLite lifecycle, persistence, streaming and concurrency
 contracts in Debug and Release. Separate worker heaps exercise writer contention,
 stale updates, rollback on return or failure, cooperative job cancellation and

@@ -27,9 +27,8 @@ on Linux; deployed Linux installations need its `libpq5` runtime package.
 Set `NERI_LIBRARY_PATH` to the directory containing libpq when its installation
 is outside the platform linker's standard library search paths.
 
-The installed Data package is verified on Apple silicon with macOS 15 or newer
-and LLVM 22.1.8. This release gate does not establish installed Data support on
-other targets.
+Full package validation runs the installed SQLite example on macOS arm64 and
+Linux x86-64 with LLVM 22.1.8.
 
 An application references the source projects using ordinary relative project
 references. To keep the application portable, copy the complete
@@ -60,8 +59,8 @@ application declares `neri.dataMappings`, for example `["data/mapping.json"]`.
 `ito prepare`, `build`, `run` and `test` use `neri-data-generate --ensure` under
 the application lock. `NERI_DATA_GENERATE` selects that generator executable.
 Without this declaration, regenerate explicitly when mapping inputs change.
-Installed Data metadata and copied source files use the packaged Neri manifests
-as their source inventory, including the owning `SQLiteSession` and
+Installed Neri manifests and Ito metadata use the same runtime and provider
+source inventories, including the owning `SQLiteSession` and
 `PostgreSQLSession` resources. PostgreSQL has a separate opt-in Ito package at
 `share/neri/data-postgresql`, named `neri-data-postgresql`. It exports the
 `postgresql` unit and depends on the adjacent `data` package. Add that
@@ -169,13 +168,13 @@ numbers or integers into booleans other than `0` and `1`.
 
 Optional fields additionally accept SQL NULL. Required fields reject NULL.
 Declare Float columns with REAL affinity; see the
-[floating-point contract](../experiments/neri-data/FLOATS.md).
+[floating-point contract](../packages/data/docs/FLOATS.md).
 Primary keys contain one or more required `Int` or `String` fields, in declared
 order. Alternate keys use unique tuples; relationships can target either key.
 Foreign keys use matching scalar types and optional forms for nullable
 relationships. Identity resolution and tracked UPDATE/DELETE operations use the
 complete primary-key tuple. Generated integer keys retain their single-key
-contract. See [scalars and keys](../experiments/neri-data/SCALARS-KEYS.md).
+contract. See [scalars and keys](../packages/data/docs/SCALARS-KEYS.md).
 
 Binary and decimal equality use `whereBinary(column, value)` and
 `whereDecimal(column, value)` with validated mapping metadata. Decimal parsing,
@@ -187,7 +186,7 @@ Typed shape projections compose mapped scalar fields and supported expression
 quotations; arbitrary application constructors and narrower integer field types
 remain unsupported.
 
-The [PostgreSQL provider](../experiments/neri-data/POSTGRESQL.md) links libpq 14
+The [PostgreSQL provider](../packages/data/docs/POSTGRESQL.md) links libpq 14
 or later and implements parameterized typed reads, tracked writes, transaction
 leases, savepoints and migrations against a real database. Its text values use
 UTF-8 and reject embedded NUL. PostgreSQL implements checked scalar arithmetic
@@ -202,13 +201,13 @@ text values containing NUL without relying on text length semantics.
 PostgreSQL uses nonblocking libpq; `SQLiteAsyncSession` performs database I/O on
 an isolated worker and exposes an asynchronous provider. Socket interest and
 local rescheduling are explicit, so applications can integrate their event loop.
-See [asynchronous operations and lazy loading](../experiments/neri-data/ASYNC-AND-LAZY.md).
+See [asynchronous operations and lazy loading](../packages/data/docs/ASYNC-AND-LAZY.md).
 
 Generated contexts expose `saveChangesAsync`, asynchronous transaction controls,
 and polling methods for cleanup after pending resource disposal. Tracked saves
 preserve dependency order, generated values and transaction checkpoints while
 allowing later application edits to remain dirty. See
-[asynchronous tracked saves and transactions](../experiments/neri-data/ASYNC-SAVING.md).
+[asynchronous tracked saves and transactions](../packages/data/docs/ASYNC-SAVING.md).
 
 Neri Data is an explicit relational API for this release. Its supported
 surface is defined here and compared explicitly in the
